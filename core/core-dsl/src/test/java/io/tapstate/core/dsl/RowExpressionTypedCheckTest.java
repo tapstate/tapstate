@@ -128,6 +128,15 @@ class RowExpressionTypedCheckTest {
     }
 
     @Test
+    void theExactLiteralRangeIsCheckedOnlyForTypedDecimalOperands() {
+        String predicate = "after.amount < 1e999999999999999999999";
+        assertThat(RowExpressions.predicateError(predicate)).isNull();
+        assertThat(RowExpressions.typedPredicateError(predicate, Map.of("amount", TapstateType.DOUBLE))).isNull();
+        assertThat(RowExpressions.typedPredicateError(predicate, columns()))
+                .isEqualTo(DecimalComparisonFunctions.EXACT_LITERAL_RANGE);
+    }
+
+    @Test
     @DisplayName("temporal opaque types refuse numerical comparisons")
     void temporalComparisonIsRefused() {
         Map<String, TapstateType> temporal = Map.of("d", TapstateType.DATE);

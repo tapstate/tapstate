@@ -1,12 +1,14 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.schema.value.TapNumberValue;
 import io.tapstate.adapters.pdk.TapEventCodec;
 import io.tapstate.adapters.transform.StatelessTransforms;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.ValidationPredicateCompiler;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
@@ -45,6 +47,7 @@ class DecimalFilterParityTest {
         "after.amount == 1.0000000000000001, 1.0000000000000001, 1.0",
         "1.0000000000000001 == after.amount, 1.0000000000000001, 1.0",
         "after.amount < 1e-400, 0, 1e-400",
+        "after.amount < 1e-20000, 0, 1e-500",
         "after.amount == - 1.0000000000000001, -1.0000000000000001, -1.0"
     })
     void validationAndRuntimeSelectTheSameDecimalRows(String expression, String match, String miss) {
@@ -62,6 +65,26 @@ class DecimalFilterParityTest {
                         .isEqualTo(new ValidationPredicate.Result(expected, null));
             }
         }
+    }
+
+    @Test
+    void anExponentOutsideDecimalRangeKeepsItsBinaryComparison() {
+        String expression = "after.ratio < 1e999999999999999999999";
+        Map<String, Object> row = Map.of("ratio", 0.5d);
+        var event = Envelope.insert(1, "orders", row, null);
+        var filter = StatelessTransforms.filter(expression);
+        assertThat(filter.transform(event)).containsExactly(event);
+        var snapshot = ValidationPredicateCompiler.compile("filter", expression,
+                new ValidationPredicate.Limits(ROW, 10000, false));
+        assertThat(snapshot.evaluate(ValidationValues.ownRow(row, ROW)))
+                .isEqualTo(new ValidationPredicate.Result(true, null));
+        Map<String, Object> decimal = Map.of("ratio", new BigDecimal("0.5"));
+        assertThatThrownBy(() -> filter.transform(Envelope.insert(1, "orders", decimal, null)))
+                .isInstanceOf(TapstateException.class)
+                .hasStackTraceContaining("outside the exact decimal comparison range");
+        var decimalRow = ValidationValues.ownRow(decimal, ROW);
+        assertThat(snapshot.evaluate(decimalRow)).isEqualTo(new ValidationPredicate.Result(null,
+                new ValidationPredicate.Problem(ValidationPredicate.ProblemKind.UNSUPPORTED_VALUE, List.of("ratio"))));
     }
 
     private static Envelope decode(Decimal128 amount) {

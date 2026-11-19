@@ -5,7 +5,6 @@ import dev.cel.common.ast.CelExpr;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationPredicate;
-import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
@@ -101,21 +100,12 @@ public final class ValidationPredicateCompiler {
     }
 
     private Expr comparisonOperand(CelExpr operand, int depth) {
-        try {
-            BigDecimal exact = DecimalComparisonFunctions.sourceDecimal(ast, operand);
-            if (exact != null) {
-                visit(depth);
-                return new FloatingLiteral(binaryLiteral(operand), exact);
-            }
-        } catch (NumberFormatException outsideDecimalRange) {
-            throw unsupported(operand, "filter.numericLiteralRange");
+        var literal = DecimalComparisonFunctions.floatingConstant(ast, operand);
+        if (literal != null) {
+            visit(depth);
+            return new FloatingLiteral(literal.binary(), literal.exact());
         }
         return expression(operand, depth);
-    }
-
-    private static double binaryLiteral(CelExpr operand) {
-        return operand.getKind() == CelExpr.ExprKind.Kind.CONSTANT
-                ? operand.constant().doubleValue() : -binaryLiteral(operand.call().args().getFirst());
     }
 
     private Access fieldPath(CelExpr expression, int depth) {

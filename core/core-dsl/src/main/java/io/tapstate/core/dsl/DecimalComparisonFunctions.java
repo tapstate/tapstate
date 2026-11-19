@@ -48,6 +48,7 @@ import java.util.regex.Pattern;
 public final class DecimalComparisonFunctions {
 
     public static final CelType DECIMAL_TYPE = OpaqueType.create("tapstate.decimal");
+    static final String EXACT_LITERAL_RANGE = "the numeric literal is outside the exact decimal comparison range";
 
     private static final String OP_EQUALS = "equals";
     private static final String OP_NOT_EQUALS = "not_equals";
@@ -210,7 +211,7 @@ public final class DecimalComparisonFunctions {
         for (CelExpr expression : comparisonCalls(ast)) {
             var call = expression.call();
             ComparisonOp op = OPERATORS.get(call.function());
-            LiteralOperand literal = literalOperand(ast, call);
+            LiteralOperand literal = literalOperand(ast, call, true);
             var reference = ast.getReferenceOrThrow(expression.id());
             List<String> candidates = reference.overloadIds();
             if (literal == null && candidates.stream().noneMatch(id -> id.contains("_decimal"))) {
@@ -240,10 +241,9 @@ public final class DecimalComparisonFunctions {
                             ast.getType(arg.id()).orElse(SimpleType.DYN)))) {
                 return "an ordering comparison cannot have a statically null operand";
             }
-            try {
-                literalOperand(ast, call);
-            } catch (NumberFormatException e) {
-                return "the numeric literal is outside the exact decimal comparison range";
+            LiteralOperand literal = literalOperand(ast, call, false);
+            if (literal != null && literal.value() == null) {
+                return EXACT_LITERAL_RANGE;
             }
         }
         return null;
@@ -260,22 +260,27 @@ public final class DecimalComparisonFunctions {
     private record LiteralOperand(int index, BigDecimal value) {
     }
 
-    private static LiteralOperand literalOperand(CelAbstractSyntaxTree ast, CelExpr.CelCall call) {
+    private static LiteralOperand literalOperand(CelAbstractSyntaxTree ast, CelExpr.CelCall call,
+            boolean includeDynamic) {
         for (int i = 0; i < 2; i++) {
             CelType type = ast.getType(call.args().get(1 - i).id()).orElse(SimpleType.DYN);
-            if (type.equals(SimpleType.DYN) || type.equals(DECIMAL_TYPE)) {
-                BigDecimal literal = sourceDecimal(ast, call.args().get(i));
-                if (literal != null) return new LiteralOperand(i, literal);
+            if (type.equals(DECIMAL_TYPE) || (includeDynamic && type.equals(SimpleType.DYN))) {
+                FloatingConstant literal = floatingConstant(ast, call.args().get(i));
+                if (literal != null) return new LiteralOperand(i, literal.exact());
             }
         }
         return null;
     }
 
-    static BigDecimal sourceDecimal(CelAbstractSyntaxTree ast, CelExpr expr) {
+    /** A null exact value denotes a CEL literal outside BigDecimal's exponent range. */
+    record FloatingConstant(double binary, BigDecimal exact) {}
+
+    static FloatingConstant floatingConstant(CelAbstractSyntaxTree ast, CelExpr expr) {
         if (expr.getKind() == CelExpr.ExprKind.Kind.CALL
                 && expr.call().function().equals(Operator.NEGATE.getFunction())) {
-            BigDecimal operand = sourceDecimal(ast, expr.call().args().getFirst());
-            return operand == null ? null : operand.negate();
+            FloatingConstant operand = floatingConstant(ast, expr.call().args().getFirst());
+            if (operand == null) return null;
+            return new FloatingConstant(-operand.binary(), operand.exact() == null ? null : operand.exact().negate());
         }
         if (expr.getKind() != CelExpr.ExprKind.Kind.CONSTANT
                 || expr.constant().getKind() != CelConstant.Kind.DOUBLE_VALUE) {
@@ -289,8 +294,13 @@ public final class DecimalComparisonFunctions {
         if (!matcher.lookingAt()) {
             throw new IllegalStateException("CEL double literal has no matching source token");
         }
-        BigDecimal value = new BigDecimal(matcher.group());
-        return Double.doubleToRawLongBits(expr.constant().doubleValue()) < 0 ? value.negate() : value;
+        double binary = expr.constant().doubleValue();
+        try {
+            BigDecimal value = new BigDecimal(matcher.group());
+            return new FloatingConstant(binary, Double.doubleToRawLongBits(binary) < 0 ? value.negate() : value);
+        } catch (NumberFormatException outsideDecimalRange) {
+            return new FloatingConstant(binary, null);
+        }
     }
 
     private static boolean isFloatTokenCharacter(int codePoint) {
@@ -308,9 +318,13 @@ public final class DecimalComparisonFunctions {
                 || (!literalEquality && !matchesDecimalOverload(op, candidates, left, right))) {
             throw new IllegalArgumentException("No matching decimal comparison operands");
         }
-        Number a = literal != null && literal.index() == 0 ? literal.value() : (Number) left;
-        Number b = literal != null && literal.index() == 1 ? literal.value() : (Number) right;
-        return compare(a, b, op);
+        if (literal == null) return compare((Number) left, (Number) right, op);
+        if (literal.value() == null) {
+            if (isDecimal(left) || isDecimal(right)) throw new IllegalArgumentException(EXACT_LITERAL_RANGE);
+            return compare((Number) left, (Number) right, op);
+        }
+        return literal.index() == 0 ? compare(literal.value(), (Number) right, op)
+                : compare((Number) left, literal.value(), op);
     }
 
     private static boolean matchesDecimalOverload(ComparisonOp op, List<String> candidates, Object left, Object right) {

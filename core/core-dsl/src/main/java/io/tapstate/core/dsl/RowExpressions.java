@@ -319,9 +319,7 @@ public final class RowExpressions {
     }
 
     /**
-     * Whether CEL has no exact counterpart for {@code type}, so a column holding it can be carried
-     * through an expression but not computed on. Derived from the mapping itself rather than restated,
-     * so the two can never disagree about which types those are.
+     * Whether a column of {@code type} is represented by a named opaque CEL type.
      */
     static boolean withoutExactCelType(TapstateType type) {
         return celTypeOf(type) instanceof OpaqueType;
