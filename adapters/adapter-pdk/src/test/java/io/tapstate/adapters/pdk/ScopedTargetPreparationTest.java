@@ -19,6 +19,209 @@ class ScopedTargetPreparationTest {
     private static final PipelineNode NODE=new PipelineNode("pipeline","sink");
     private static final WorkloadClaimFence CLAIM=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"pipeline"),new WorkloadOwner("node","boot"),3,4,1);
     private static final TargetTable TARGET=new TargetTable("orders",List.of(new TargetField("id","bigint",true)),List.of(new TargetIndex(List.of("id"),true)));
+    private static final TargetTable DEFERRED = new TargetTable("orders", List.of(
+            new TargetField("id", "bigint", true), TargetField.deferredDecimal("amount", decimalType())),
+            List.of(new TargetIndex(List.of("id"), true)));
+
+    @Test
+    void emptyDeferredSnapshotPreparesAtTheDeliveredBoundaryWithoutWritingRows(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        var connector = PdkConnector.open("demo", new ConnectorRef(List.of(Synthetic.countingSink(directory)),
+                "synthetic.CountingSink", "2.0.8", null), Map.of());
+        var configured = functions(calls);
+        connector.functions().supportCreateTableV2(configured.getCreateTableV2Function());
+        connector.functions().supportClearTable(configured.getClearTableFunction());
+        connector.functions().supportCreateIndex(configured.getCreateIndexFunction());
+        var config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null,
+                NODE, OnFullLoad.CLEAR, true);
+        try (var writer = new PdkSinkWriter(connector,
+                (context, events, table, result) -> { throw new AssertionError("an empty snapshot cannot write rows"); },
+                config, Map.of("input", DEFERRED), null, true, null, PipelineNode.Purpose.SYNC, binding(store))) {
+            writer.prepareTargets();
+            assertThat(calls).isEmpty();
+            writer.snapshotDelivered("input");
+            writer.snapshotDelivered("input");
+            assertThat(calls).containsExactly("issued", "create", "clear", "ready", "index");
+            assertThat(store.held.phase()).isEqualTo(SinkPreparationStore.Phase.READY);
+        }
+    }
+
+    @Test
+    void invalidDeferredValuesCannotClearOrWriteTheTarget(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        var connector = PdkConnector.open("demo", new ConnectorRef(List.of(Synthetic.countingSink(directory)),
+                "synthetic.CountingSink", "2.0.8", null), Map.of());
+        connector.functions().supportClearTable((context, event) -> calls.add("clear"));
+        var config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null,
+                NODE, OnFullLoad.CLEAR, true);
+        var event = io.tapstate.core.event.Envelope.insert(1L, "input", Map.of("id", 1L, "amount", new BigDecimal("1.25")), null);
+        try (var writer = new PdkSinkWriter(connector,
+                (context, events, table, result) -> { throw new AssertionError("unvalidated output cannot be written"); },
+                config, Map.of("input", DEFERRED), null, true, null, PipelineNode.Purpose.SYNC, binding(store))) {
+            assertThatThrownBy(() -> writer.write(List.of(event)).toCompletableFuture().get(3, java.util.concurrent.TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(TapstateException.class)
+                    .hasStackTraceContaining("matching source numeric descriptor");
+            assertThat(calls).isEmpty();
+            assertThat(store.held.revision()).isZero();
+        }
+    }
+
+    @Test
+    void deferredWritesPrepareOnceAfterBothImagesHaveBeenValidated(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        var connector = PdkConnector.open("demo", new ConnectorRef(List.of(Synthetic.countingSink(directory)),
+                "synthetic.CountingSink", "2.0.8", null), Map.of());
+        var configured = functions(calls);
+        connector.functions().supportCreateTableV2(configured.getCreateTableV2Function());
+        connector.functions().supportClearTable(configured.getClearTableFunction());
+        connector.functions().supportCreateIndex(configured.getCreateIndexFunction());
+        var number = decimalType();
+        var type = new io.tapdata.entity.schema.type.TapNumber().fixed(number.fixed()).precision(number.precision())
+                .scale(number.scale()).minValue(number.minValue()).maxValue(number.maxValue());
+        var original = new io.tapstate.core.event.ConvertedValue(new BigDecimal("1.25"), "DECIMAL128",
+                "TapNumberValue", PdkJsonProvider.parser().toJson(type), null);
+        var event = io.tapstate.core.event.Envelope.update(1L, "input",
+                Map.of("id", 1L, "amount", original), Map.of("id", 1L, "amount", "changed"), null);
+        var config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null,
+                NODE, OnFullLoad.CLEAR, true);
+        try (var writer = new PdkSinkWriter(connector, (context, events, table, result) -> {
+            assertThat(store.held.phase()).isEqualTo(SinkPreparationStore.Phase.READY);
+            assertThat(table.getNameFieldMap()).containsOnlyKeys("id");
+            var update = (io.tapdata.entity.event.dml.TapUpdateRecordEvent) events.getFirst();
+            assertThat(update.getBefore()).containsEntry("amount", new BigDecimal("1.25"));
+            assertThat(update.getAfter()).containsEntry("amount", "changed");
+            calls.add("write");
+            result.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>(0L, 1L, 0L));
+        }, config, Map.of("input", DEFERRED), null, true, null, PipelineNode.Purpose.SYNC, binding(store))) {
+            assertThat(writer.write(List.of(event)).toCompletableFuture().get(3, java.util.concurrent.TimeUnit.SECONDS).written())
+                    .isEqualTo(1);
+            assertThat(writer.write(List.of(event)).toCompletableFuture().get(3, java.util.concurrent.TimeUnit.SECONDS).written())
+                    .isEqualTo(1);
+        }
+        assertThat(calls).containsExactly("issued", "create", "clear", "ready", "index", "write", "write");
+    }
+
+    @Test
+    void theEmptySnapshotBoundaryRetainsCodedFailuresAndCodesConnectorFailures(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
+        var ref = new ConnectorRef(List.of(Synthetic.countingSink(directory)), "synthetic.CountingSink", "2.0.8", null);
+        var coded = new TapstateException(ConnectorError.WRITE_FAILED, Map.of("connector", "demo"), null);
+        for (var failure : List.of(coded, new IllegalStateException("clear failed"))) {
+            var calls = new ArrayList<String>();
+            var store = new Receipts(calls, DEFERRED);
+            var connector = PdkConnector.open("demo", ref, Map.of());
+            connector.functions().supportCreateTableV2((context, event) -> CreateTableOptions.create().tableExists(true));
+            connector.functions().supportClearTable((context, event) -> { throw failure; });
+            var config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null,
+                    NODE, OnFullLoad.CLEAR, true);
+            try (var writer = new PdkSinkWriter(connector,
+                    (context, events, table, result) -> { throw new AssertionError("no rows expected"); },
+                    config, Map.of("input", DEFERRED), null, true, null, PipelineNode.Purpose.SYNC, binding(store))) {
+                if (failure == coded) {
+                    assertThatThrownBy(() -> writer.snapshotDelivered("input")).isSameAs(coded);
+                } else {
+                    assertThatThrownBy(() -> writer.snapshotDelivered("input"))
+                            .isInstanceOfSatisfying(TapstateException.class,
+                                    error -> assertThat(error.code()).isEqualTo(ConnectorError.WRITE_FAILED))
+                            .hasCause(failure);
+                }
+                assertThat(store.held.phase()).isEqualTo(SinkPreparationStore.Phase.PREPARING);
+            }
+        }
+    }
+
+    @Test
+    void aDeferredPreparedWriterClaimsClearOnceAndReusesTheConfirmedReceipt() throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        var functions = functions(calls);
+        var first = deferredPreparation(functions, store, () -> {});
+
+        first.prepareForWrite(DEFERRED, TargetTapTable.build(DEFERRED));
+        int readsAfterPreparing = store.reads;
+        first.prepareForWrite(DEFERRED, TargetTapTable.build(DEFERRED));
+        assertThat(store.reads).isEqualTo(readsAfterPreparing);
+        assertThat(calls).containsExactly("issued", "clear", "create", "ready", "index");
+        assertThat(store.held.phase()).isEqualTo(SinkPreparationStore.Phase.READY);
+
+        calls.clear();
+        deferredPreparation(functions, store, () -> {}).prepareForWrite(DEFERRED, TargetTapTable.build(DEFERRED));
+        assertThat(calls).containsExactly("index");
+    }
+
+    @Test
+    void aDeferredWriterLosingTheClaimUsesTheOtherWritersReadyReceipt() throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        store.beforeBegin = () -> {
+            store.held = new SinkPreparationStore.Snapshot(store.held.input(), store.held.operationId(), 2,
+                    SinkPreparationStore.Phase.READY, CLAIM, new SinkPreparationStore.Result(false));
+        };
+
+        deferredPreparation(functions(calls), store, () -> {}).prepareForWrite(DEFERRED, TargetTapTable.build(DEFERRED));
+
+        assertThat(calls).containsExactly("index");
+        assertThat(store.held.phase()).isEqualTo(SinkPreparationStore.Phase.READY);
+    }
+
+    @Test
+    void anInterruptedDeferredWaitDoesNotReplayAnUnknownClear() {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        store.begin(store.held.input());
+        calls.clear();
+        var preparation = deferredPreparation(functions(calls), store, () -> {});
+        var table = TargetTapTable.build(DEFERRED);
+        Thread.currentThread().interrupt();
+        try {
+            assertThatThrownBy(() -> preparation.prepareForWrite(DEFERRED, table))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_STATE_REBUILD_REQUIRED));
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            assertThat(store.held.revision()).isEqualTo(1);
+            assertThat(calls).isEmpty();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void waitingDeferredWritersObserveTheFirstWritersCompletion() throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        store.begin(store.held.input());
+        calls.clear();
+        var waitingReads = new java.util.concurrent.CountDownLatch(1);
+        store.onLoad = () -> {
+            if (store.reads >= 3) waitingReads.countDown();
+        };
+        try (var workers = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var waiting = workers.submit(() -> org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
+                    deferredPreparation(functions(calls), store, () -> {})
+                            .prepareForWrite(DEFERRED, TargetTapTable.build(DEFERRED))));
+            assertThat(waitingReads.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(waiting).isNotDone();
+            store.complete(new Receipts.Original(store.held), new SinkPreparationStore.Result(false));
+            waiting.get(3, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        assertThat(calls).containsExactly("ready", "index");
+    }
+
+    private static NumericType decimalType() {
+        return new NumericType(null, true, null, null, new BigDecimal("-99999999.99"),
+                new BigDecimal("99999999.99"), 10, 2);
+    }
+
+    private static PdkTargetPreparation deferredPreparation(ConnectorFunctions functions, Receipts store, Runnable active) {
+        return new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true,
+                NODE, null, true, PipelineNode.Purpose.SYNC, active, binding(store));
+    }
     @Test void knownPreparationIsPublishedBeforeIndexAndRestartNeverClearsOrCreatesAgain()throws Throwable {
         var calls=new ArrayList<String>();var store=new Receipts(calls);var functions=functions(calls);
         functions.supportCreateIndex((context,table,event) -> {assertThat(store.held.phase()).isEqualTo(SinkPreparationStore.Phase.READY);calls.add("index-failed");throw new IllegalStateException("index failed");});
@@ -128,12 +331,15 @@ class ScopedTargetPreparationTest {
     private static ConnectorFunctions functions(List<String> calls){var functions=new ConnectorFunctions();functions.supportCreateTableV2((context,event) -> {calls.add("create");return new CreateTableOptions().tableExists(true);});functions.supportClearTable((context,event) -> calls.add("clear"));functions.supportCreateIndex((context,table,event) -> calls.add("index"));return functions;}
     private static TapstateException refused(){return new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",SCOPE.pipelineId()),null);}
     private static final class Receipts implements SinkPreparationStore {
-        private final List<String> calls;private Snapshot held;private int reads;
-        Receipts(List<String> calls){this.calls=calls;held=new Snapshot(PdkSinkPreparations.input(SCOPE,NODE,PipelineNode.Purpose.SYNC,OnFullLoad.CLEAR,true,TARGET),UUID.randomUUID().toString(),0,Phase.PREPARING,null,null);}
+        private final List<String> calls;private volatile Snapshot held;private int reads;
+        private Runnable beforeBegin = () -> {};
+        private Runnable onLoad = () -> {};
+        Receipts(List<String> calls){this(calls, TARGET);}
+        Receipts(List<String> calls, TargetTable target){this.calls=calls;held=new Snapshot(PdkSinkPreparations.input(SCOPE,NODE,PipelineNode.Purpose.SYNC,OnFullLoad.CLEAR,true,target),UUID.randomUUID().toString(),0,Phase.PREPARING,null,null);}
         public void prepareTargets(List<Input> inputs){throw new AssertionError("plugin code cannot grant its own preparation roster");}
-        public Snapshot load(Input input){reads++;if(!input.equals(held.input()))throw refused();return held;}
-        public Attempt begin(Input input){load(input);if(held.revision()!=0)throw refused();held=new Snapshot(input,held.operationId(),1,Phase.PREPARING,CLAIM,null);calls.add("issued");return new Original(held);}
-        public Snapshot complete(Attempt attempt,Result result){assertThat(attempt.original()).isEqualTo(held);held=new Snapshot(held.input(),held.operationId(),2,Phase.READY,CLAIM,result);calls.add("ready");return held;}
+        public synchronized Snapshot load(Input input){reads++;if(!input.equals(held.input()))throw refused();onLoad.run();return held;}
+        public synchronized Attempt begin(Input input){beforeBegin.run();load(input);if(held.revision()!=0)throw refused();held=new Snapshot(input,held.operationId(),1,Phase.PREPARING,CLAIM,null);calls.add("issued");return new Original(held);}
+        public synchronized Snapshot complete(Attempt attempt,Result result){assertThat(attempt.original()).isEqualTo(held);held=new Snapshot(held.input(),held.operationId(),2,Phase.READY,CLAIM,result);calls.add("ready");return held;}
         private record Original(Snapshot original)implements Attempt{}
     }
 }

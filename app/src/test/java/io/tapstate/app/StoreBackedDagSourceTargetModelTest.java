@@ -169,16 +169,20 @@ class StoreBackedDagSourceTargetModelTest {
         var decimal = new io.tapstate.core.common.NumericType(null, true, null, null,
                 new java.math.BigDecimal("-99999999.99"), new java.math.BigDecimal("99999999.99"), 10, 2);
         store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
-                new SourceField("id", "INT", io.tapstate.core.common.TapstateType.INT64),
+                new SourceField("id", "decimal(10,2)", io.tapstate.core.common.TapstateType.DECIMAL,
+                        null, decimal),
                 new SourceField("amount", "decimal(10,2)", io.tapstate.core.common.TapstateType.DECIMAL,
-                        null, decimal)), List.of("id"), List.of())));
+                        null, decimal),
+                new SourceField("unbounded", "decimal", io.tapstate.core.common.TapstateType.DECIMAL)),
+                List.of("id"), List.of())));
         List<TargetTable> bound = new ArrayList<>();
 
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
 
-        TargetField amount = bound.getFirst().fields().stream()
-                .filter(field -> field.name().equals("amount")).findFirst().orElseThrow();
-        assertThat(amount).isEqualTo(TargetField.deferredDecimal("amount", decimal));
+        assertThat(bound.getFirst().fields()).containsExactlyInAnyOrder(
+                TargetField.deferredDecimal("amount", decimal),
+                new TargetField("id", null, true, io.tapstate.core.common.TapstateType.DECIMAL),
+                new TargetField("unbounded", null, false, io.tapstate.core.common.TapstateType.DECIMAL));
     }
 
     @Test
