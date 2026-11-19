@@ -90,6 +90,65 @@ python3 -B benchmarks/runner.py run --manifest /tmp/perf-manifest.json --batch 0
 The manifest binds the exact checkout, definitions and effective load. A missing
 estimate or case that does not fit is recorded in the allocation and blocks replay.
 
+## Walk through a delivery candidate on local OP
+
+Use a clean checkout of the candidate with JDK 21, Maven, Python 3 and a running
+Docker daemon. The runner starts a fresh single-node OP and its MongoDB test
+replica set. Use a host with enough memory for Docker and an OP JVM with a
+768 MiB heap. Check Docker access before building or running the walkthrough.
+
+```sh
+docker info
+git switch --detach "$CANDIDATE_SHA"
+git status --short
+git rev-parse HEAD
+java -version
+mvn -B -pl app,cli,e2e -am -DskipTests package
+java -jar cli/target/cli-0.8.0.jar --version
+
+evidence=$(mktemp -d "${TMPDIR:-/tmp}/tapstate-perf.XXXXXXXX")
+python3 -B deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy \
+  --output "$evidence/connectors"
+git rev-parse HEAD > "$evidence/revision.txt"
+shasum -a 256 app/target/app-0.8.0-boot.jar cli/target/cli-0.8.0.jar \
+  "$evidence/connectors/"*.jar > "$evidence/artifacts.sha256"
+python3 -B benchmarks/runner.py list --format json > "$evidence/catalog.json"
+```
+
+The connector preparer downloads the published artifacts and checks them against
+the lock in the same checkout. Keep the CLI's neighboring `target/lib` directory.
+The benchmark runner drives OP through the control plane. The product CLI is a
+separate executable from the same candidate.
+
+Describe each representative case to record the version and effective definition,
+then run the snapshot composition, live Copy, fixed backlog Copy and paired Nest
+memory case. The bounded overrides keep the walkthrough short. Run each command
+separately so a failure still leaves evidence and the other cases can run.
+
+```sh
+for case_id in mixed.snapshot.map-nest.standard copy.live.basic.standard \
+  copy.backlog.fixed-iud.standard nest.snapshot.fanout.wide; do
+  python3 -B benchmarks/runner.py describe "$case_id" --format json \
+    > "$evidence/$case_id.definition.json"
+  python3 -B benchmarks/runner.py run --id "$case_id" --repeats 1 \
+    --rows 96 --backlog-events 20 --rate 8 --measurement-seconds 6 \
+    --timeout-seconds 90 --boot-jar app/target/app-0.8.0-boot.jar \
+    --connectors "$evidence/connectors" --output "$evidence/$case_id"
+done
+```
+
+Record the operator, date, OS, architecture, JDK, Docker and MongoDB version, and
+retain the request and summary from each command. Check Map-to-Nest document
+contents and confirmed writes, live warm-up and window counts and final readback,
+and backlog source history, zero snapshot rows on resume, confirmed writes and
+final readback. Review `measurement_status` independently from execution `status`.
+Live Copy may report `insufficient-event-correlation` and backlog Copy may
+report `insufficient-source-end-evidence`. Record those limits, including when
+target contents and counts agree. For Nest, check the identical root counts and
+the four versus sixteen children per root, then inspect `op-resource.jsonl`,
+`gc.log`, and the per-window coverage in both arms. Re-run the same command with
+a fresh output directory to reproduce the window under the same definition.
+
 ## Operator cases
 
 List the operator definitions with readiness and blockers in structured output.

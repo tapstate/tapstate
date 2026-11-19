@@ -865,26 +865,32 @@ class BenchmarkRunIT {
     private static void awaitOperatorPhase(BsonDocument entry, ControlPlane control, MongoDatabase target,
             BenchmarkOperators operators, Map<String, BsonDocument> expected, Map<String, Long> before,
             MongoWorkloadGenerator.PhaseReport phase, long minimumTargetExclusive) {
+        var expectedInputs = new LinkedHashMap<String, Long>();
+        phase.streams().forEach((name, stream) -> expectedInputs.put(name,
+                before.getOrDefault(name, 0L) + stream.observed().total()));
         try {
-            waitFor(entry, "per-input operator phase and independent target rows", () -> {
-                var current = capturedChanges(control);
-                boolean matched = true;
-                for (var stream : phase.streams().entrySet()) {
-                    long expectedCount = before.getOrDefault(stream.getKey(), 0L) + stream.getValue().observed().total();
-                    long actualCount = current.getOrDefault(stream.getKey(), 0L);
-                    if (actualCount > expectedCount) {
-                        throw new Unverified("Captured extra changes for " + stream.getKey() + ": expected "
-                                + expectedCount + " and observed " + actualCount);
-                    }
-                    matched &= actualCount == expectedCount;
-                }
-                return matched && (minimumTargetExclusive < 0 || settled(control) > minimumTargetExclusive)
-                        && BenchmarkOperatorOracle.difference(operators, target, expected) == null;
-            });
+            waitFor(entry, "per-input operator phase and independent target rows", () ->
+                    capturedInputsMatch(expectedInputs, capturedChanges(control))
+                    && (minimumTargetExclusive < 0 || settled(control) > minimumTargetExclusive)
+                    && BenchmarkOperatorOracle.difference(operators, target, expected) == null);
         } catch (Limit failure) {
             throw new Limit(failure.getMessage() + ": input " + capturedChanges(control)
                     + ": " + BenchmarkOperatorOracle.difference(operators, target, expected));
         }
+    }
+
+    static boolean capturedInputsMatch(Map<String, Long> expected, Map<String, Long> current) {
+        boolean matched = true;
+        for (var input : expected.entrySet()) {
+            long expectedCount = input.getValue();
+            long actualCount = current.getOrDefault(input.getKey(), 0L);
+            if (actualCount > expectedCount) {
+                throw new Unverified("Captured extra changes for " + input.getKey() + ": expected "
+                        + expectedCount + " and observed " + actualCount);
+            }
+            matched &= actualCount == expectedCount;
+        }
+        return matched;
     }
 
     private static Map<String, String> operatorPositions(ControlPlane control, List<String> inputs, String field) {

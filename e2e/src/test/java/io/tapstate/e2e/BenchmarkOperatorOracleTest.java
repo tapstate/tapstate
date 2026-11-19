@@ -2,6 +2,8 @@ package io.tapstate.e2e;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import java.util.Map;
@@ -20,9 +22,21 @@ class BenchmarkOperatorOracleTest {
         var actual = BenchmarkOperatorOracle.expected("map-basic", input);
         var expected = BsonDocument.parse("{'_id':2,'payload':'right','display_label':'even','marker':'mapped','adjusted_value':8}");
         assertEquals(2, actual.size());
-        org.junit.jupiter.api.Assertions.assertTrue(BenchmarkOperatorOracle.equivalent(expected, actual.get("2")));
+        assertTrue(BenchmarkOperatorOracle.equivalent(expected, actual.get("2")));
         var wrong = BsonDocument.parse("{'_id':2,'payload':'left','display_label':'even','marker':'mapped','adjusted_value':8}");
         assertFalse(BenchmarkOperatorOracle.equivalent(wrong, actual.get("2")));
+        var wrongKey = BsonDocument.parse("{'_id':9,'payload':'right','display_label':'even','marker':'mapped','adjusted_value':8}");
+        assertFalse(BenchmarkOperatorOracle.equivalent(wrongKey, actual.get("2")));
+    }
+
+    @Test
+    void aMissingUnionInputCannotBeReplacedByExtraChangesFromTheOtherInput() {
+        var expected = Map.of("left", 2L, "right", 2L);
+        assertFalse(BenchmarkRunIT.capturedInputsMatch(expected, Map.of("left", 2L)));
+        var excess = assertThrows(RuntimeException.class,
+                () -> BenchmarkRunIT.capturedInputsMatch(expected, Map.of("left", 4L)));
+        assertTrue(excess.getMessage().contains("Captured extra changes for left"));
+        assertTrue(BenchmarkRunIT.capturedInputsMatch(expected, Map.of("left", 2L, "right", 2L)));
     }
 
     @Test
