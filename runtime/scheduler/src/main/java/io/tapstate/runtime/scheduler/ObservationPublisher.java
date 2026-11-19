@@ -46,6 +46,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -453,7 +454,8 @@ public final class ObservationPublisher {
     private final Function<String, SnapshotReading> snapshots;
     private final Function<String, SnapshotReading> runSnapshots;
     private final Function<String, InitialLoad> initialLoads;
-    private volatile Function<String, Map<String, Long>> aggregateReadings = id -> Map.of();
+    private final AtomicReference<Function<String, Map<String, Long>>> aggregateReadings =
+            new AtomicReference<>(id -> Map.of());
     private final Function<String, Map<String, Long>> frontierGaps;
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
@@ -815,7 +817,7 @@ public final class ObservationPublisher {
      * with no aggregate step yields none.
      */
     public ObservationPublisher withAggregateReadings(Function<String, Map<String, Long>> readings) {
-        this.aggregateReadings = Objects.requireNonNull(readings, "readings");
+        this.aggregateReadings.set(Objects.requireNonNull(readings, "readings"));
         return this;
     }
 
@@ -916,7 +918,7 @@ public final class ObservationPublisher {
                 List<MetricFact> measured = new ArrayList<>(facts(pipelineId, actual, at, readings, gaps, pinned,
                         nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
                         joinRecomputeExpected.apply(pipelineId), loaded, readThisRun));
-                measured.addAll(aggregateFacts(pipelineId, at, aggregateReadings.apply(pipelineId)));
+                measured.addAll(aggregateFacts(pipelineId, at, aggregateReadings.get().apply(pipelineId)));
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                         loaded.byTable(), positions.apply(pipelineId), carried, at, measured, initialLoadAt(pipelineId, at));
