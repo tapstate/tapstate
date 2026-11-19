@@ -60,6 +60,8 @@ def check(workflows, contexts, inputs):
     for role in ('snapshot-lock', 'test-shards', 'build'):
         assert 'Verify exact Java build' in ci[role] and 'java.runtime.version' in ci[role], \
             'each receipt producer must verify the resolved Java build'
+        assert '.github/scripts/ci-pinned-maven.sh' in ci[role], \
+            'each receipt producer must use the pinned Maven release'
     assert 'mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/snapshot-m2" -DskipTests install' in ci['snapshot-lock'], \
         'snapshot inputs must come from a complete reactor preparation'
     lock = ci['snapshot-lock']
@@ -256,6 +258,7 @@ for original, replacement in [
     ('python3 .github/scripts/ci-snapshot-lock-smoke.py', 'echo snapshot-smoke-removed'),
     ("java-version: '21.0.13+9.0.LTS'", "java-version: '21.0.12+8.0.LTS'"),
     ('Verify exact Java build', 'Missing exact Java build'),
+    ('run: .github/scripts/ci-pinned-maven.sh', 'run: mvn --version'),
     (MAVEN_ARGS, ''),
     (MAVEN_ARGS, MAVEN_ARGS.replace('1.44', '1.32')),
     (MAVEN_ARGS, '    env:\n' + '\n'.join('      ' + line[10:] for line in MAVEN_ARGS.splitlines())),
