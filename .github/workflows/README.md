@@ -212,20 +212,45 @@ with its own environment configuration and approval. This lane adds no automatic
 PR/main test suite; its runner cost is incurred on manual dev dispatch and once
 per release attempt after the release gates pass.
 
-Choose a location for new work before adding a workflow:
+## Test placement
 
-- Add ordinary unit, integration, or specification tests to the existing
-  reactor. Source discovery assigns them to the existing shards. Add an
-  integration test to the fast policy only when it provides a basic check
-  needed on every PR and main push.
-- Use a separate path- or label-gated lane for a distinct, expensive capability
-  whose evidence cannot come from the ordinary suite. Run only that capability's
-  selected tests, and explain its trigger and additional runner cost in review.
-- Put broad external-system, upstream-drift, and trend measurements in a
-  scheduled lane, with manual dispatch for investigation and release consumers.
-  Preserve a stable, non-matrix aggregate name when another workflow requires
-  its check. New required checks must execute on every event that requires them;
-  do not hide one behind a path or label filter.
+Add new tests to the existing Maven reactor. Choose their placement by the
+behavior they verify and the feedback needed on each change.
+
+| Test | Where it runs | What belongs there |
+| --- | --- | --- |
+| Unit and architecture tests | PR, main, and Nightly | Use the existing unit test naming convention, such as `*Test`, for focused checks of parsing, validation, state transitions, error codes, and architecture rules. CI discovers these tests automatically. |
+| Essential integration or end-to-end smoke | PR, main, and Nightly | Cover a critical path that every change must preserve, such as application startup, basic store reads and writes, or snapshot and CDC delivery. Keep the fixture and execution small. Add the reviewed selection to [the fast integration list](../ci-fast-integration.json). |
+| Integration and end-to-end regression | Nightly by default | Add a discovered `*IT` or a published `spec.e2e.yml` under `e2e/examples/`. Put multi-node recovery, connector combinations, long observation windows, large datasets, and performance regression here. Use the existing specialized lane for tests that require external systems or inputs. |
+
+Nightly full regression also runs the PR/main selection. When expanding the fast
+list, reuse a smoke test where practical, or select a single-invocation method
+or one published example. A published example selected for fast CI runs on both
+tiers. A class listed without a method or example qualifier runs as a whole,
+including new methods. Put heavier scenarios in separate integration test
+classes. The existing hundred-table witness is an approved fast smoke case.
+
+A product change still needs a discriminating end-to-end case under the
+[contribution guide](../../CONTRIBUTING.md#end-to-end-cases). If the new case runs
+in Nightly, name it in the PR and provide evidence from a focused execution or
+a manual branch regression. Use the existing mutation evidence when introducing
+or changing an end-to-end assertion. A bug regression should fail before the fix
+and pass afterward.
+
+In the PR's **CI cost delta and lane placement** field, list where new tests run.
+For a fast-list addition, state which critical path it protects, why it needs
+per-change feedback, and the measured cost. Use roughly 20 minutes as the PR
+feedback target during review. Build and Sonar still run on PR and main.
+
+Use a separate path- or label-gated lane for a distinct, expensive capability
+whose evidence requires its own inputs or execution. Run that capability's
+selected tests and explain its trigger and runner cost in review. Keep broad
+external-system, upstream-drift, and trend measurements on scheduled lanes with
+manual dispatch for investigation. Preserve a stable, non-matrix aggregate
+name when another workflow requires its check. Required checks run on every
+event that requires them.
+
+### Measuring CI cost
 
 Measure with the same tool for the current change and its baseline, for example:
 
