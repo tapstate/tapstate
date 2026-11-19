@@ -1,0 +1,26 @@
+name: Set up the CI Maven toolchain
+description: Install the same verified Maven distribution on every independent CI producer.
+runs:
+  using: composite
+  steps:
+    - name: Install and verify pinned Maven
+      shell: bash
+      env:
+        MAVEN_VERSION: "3.10.1"
+        MAVEN_SHA512: "8af2fcc48ee6b8f8fc0b21054226e14404b88500df6483cdeb3ae603408f6de27b1397ac591a9fb0d98fee64f4f624fee1383efd25b8998786cda1598fb9ea39"
+      run: |
+        set -euo pipefail
+        maven_home="$RUNNER_TEMP/apache-maven-$MAVEN_VERSION"
+        archive="$maven_home-bin.tar.gz"
+        curl --fail --silent --show-error --location --retry 3 \
+          "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/$MAVEN_VERSION/apache-maven-$MAVEN_VERSION-bin.tar.gz" \
+          --output "$archive"
+        checksum="$(sha512sum "$archive")"
+        if [[ "${checksum%% *}" != "$MAVEN_SHA512" ]]; then
+          echo "::error::Maven $MAVEN_VERSION distribution checksum mismatch"
+          exit 1
+        fi
+        tar -xzf "$archive" -C "$RUNNER_TEMP"
+        "$maven_home/bin/mvn" --version
+        printf '%s\n' "$maven_home/bin" >> "$GITHUB_PATH"
+        printf 'MAVEN_HOME=%s\n' "$maven_home" >> "$GITHUB_ENV"
