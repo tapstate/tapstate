@@ -18,9 +18,9 @@ jobs:
       - name: Allocate the two qualification batches
         run: |
           cat > "$RUNNER_TEMP/estimates.json" <<'JSON'
-          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"nest.backlog.basic.standard": 65, "join.backlog.basic.standard": 60, "union.live.basic.standard": 45, "join.live.hot-update.standard": 100, "nest.live.child-update.standard": 100}}
+          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"js.snapshot.basic.small": 50, "js.snapshot.basic.standard": 50, "js.snapshot.basic.wide": 55, "js.snapshot.basic.large": 60, "js.live.basic.standard": 70, "js.backlog.basic.standard": 75, "mixed.snapshot.double-map.standard": 55}}
           JSON
-          python3 -B benchmarks/runner.py allocate --id nest.backlog.basic.standard --id join.backlog.basic.standard --id union.live.basic.standard --id join.live.hot-update.standard --id nest.live.child-update.standard --repeats 1 --rows 128 --slots 2 --batch-seconds 600 --deadline-seconds 900 --reserve-seconds 120 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
+          python3 -B benchmarks/runner.py allocate --id js.snapshot.basic.small --id js.snapshot.basic.standard --id js.snapshot.basic.wide --id js.snapshot.basic.large --id js.live.basic.standard --id js.backlog.basic.standard --id mixed.snapshot.double-map.standard --repeats 1 --rows 128 --timeout-seconds 55 --slots 2 --batch-seconds 600 --deadline-seconds 900 --reserve-seconds 120 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
       - uses: actions/upload-artifact@v4
         with:
           name: operator-qualification-manifest
