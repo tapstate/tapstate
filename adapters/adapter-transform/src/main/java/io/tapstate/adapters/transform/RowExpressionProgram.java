@@ -121,6 +121,9 @@ final class RowExpressionProgram {
         // fails nor warns. The carrier is not restored on the way out - what an expression produces is
         // a new value, and it is only the row's own untouched values that keep travelling as they came.
         if (value instanceof ConvertedValue carried) {
+            if ("DECIMAL128".equalsIgnoreCase(carried.originType()) && carried.value() instanceof Double number) {
+                return DecimalComparisonFunctions.DecimalSpecialValue.bind(number);
+            }
             return bound(carried.value());
         }
         if (value == null) {
@@ -136,6 +139,9 @@ final class RowExpressionProgram {
     // language's own wrappers; a sink is owed the row's values, so a value that merely travelled
     // through an expression leaves as the kind of value it arrived as.
     private static Object unbound(Object value) {
+        if (value instanceof DecimalComparisonFunctions.DecimalSpecialValue number) {
+            return number.doubleValue();
+        }
         if (value == NullValue.NULL_VALUE) {
             return null;
         }

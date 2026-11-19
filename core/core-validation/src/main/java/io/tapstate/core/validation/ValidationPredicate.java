@@ -13,9 +13,13 @@ import java.util.Set;
 
 /** A bounded independent current-row predicate. It contains no expression-runtime or event-envelope API. */
 public final class ValidationPredicate {
-    public sealed interface Expr permits Constant, Field, Present, Compare, And, Or, Not, ArraySize, Exists {}
+    public sealed interface Expr permits Constant, FloatingLiteral, Field, Present, Compare, And, Or, Not, ArraySize, Exists {}
     /** Only immutable scalar constants are admitted by compile. */
     public record Constant(Object value) implements Expr {}
+    /** A direct CEL floating literal retains both its binary value and its decimal source value. */
+    public record FloatingLiteral(double binary, BigDecimal decimal) implements Expr {
+        public FloatingLiteral { Objects.requireNonNull(decimal); }
+    }
     /** Binding -1 names the current row; nonnegative slots name explicitly scoped array members. */
     public record Field(int binding, List<String> path) implements Expr {
         public Field(List<String> path) { this(-1, path); }
@@ -103,6 +107,7 @@ public final class ValidationPredicate {
                     if (constant.value() != null && domain(constant.value()) == null) throw ValidationError.invalid("predicate.literal");
                     constants.put(Integer.toString(nodes), constant.value());
                 }
+                case FloatingLiteral literal -> constants.put(Integer.toString(nodes), literal.decimal());
                 case Field field -> { requireScope(field.binding(), frame.scope()); metadata += pathBytes(field.path()); }
                 case Present present -> { requireScope(present.binding(), frame.scope()); metadata += pathBytes(present.path()); }
                 case ArraySize size -> pending.push(new Frame(size.array(), frame.depth() + 1, frame.scope()));
@@ -180,6 +185,7 @@ public final class ValidationPredicate {
         budget.spend(1);
         return switch (expression) {
             case Constant constant -> value(constant.value());
+            case FloatingLiteral literal -> value(literal.binary());
             case Field field -> field(row, bindings, field.binding(), field.path(), false, budget);
             case Present present -> field(row, bindings, present.binding(), present.path(), true, budget);
             case ArraySize size -> {
@@ -193,7 +199,7 @@ public final class ValidationPredicate {
             }
             case And and -> logical(and.left(), and.right(), false, row, budget, bindings);
             case Or or -> logical(or.left(), or.right(), true, row, budget, bindings);
-            case Compare compare -> compare(compare.operator(), evaluate(compare.left(), row, budget, bindings), evaluate(compare.right(), row, budget, bindings), budget);
+            case Compare compare -> compare(compare, evaluate(compare.left(), row, budget, bindings), evaluate(compare.right(), row, budget, bindings), budget);
         };
     }
 
@@ -207,10 +213,13 @@ public final class ValidationPredicate {
         return value(!decisive);
     }
 
-    private Value compare(Operator operator, Value left, Value right, Budget budget) {
+    private Value compare(Compare comparison, Value left, Value right, Budget budget) {
         var a = scalar(left, budget); var b = scalar(right, budget);
         if (a.problem() != null) return problem(a.problem());
         if (b.problem() != null) return problem(b.problem());
+        a = decimalLiteral(comparison.left(), a, comparison.right(), b);
+        b = decimalLiteral(comparison.right(), b, comparison.left(), a);
+        Operator operator = comparison.operator();
         boolean equality = operator == Operator.EQ || operator == Operator.NE;
         if (a.value() == null || b.value() == null) {
             if (!equality) return problem(ProblemKind.INCOMPATIBLE_TYPE, a.value() == null ? a.path() : b.path());
@@ -237,6 +246,16 @@ public final class ValidationPredicate {
             case EQ -> order == 0; case NE -> order != 0; case LT -> order < 0;
             case LE -> order <= 0; case GT -> order > 0; case GE -> order >= 0;
         });
+    }
+
+    private static Scalar decimalLiteral(Expr expression, Scalar value, Expr otherExpression, Scalar other) {
+        // The portable row distinguishes decimal fields from CEL int/uint constants and binary floats.
+        // Only a direct literal paired with a decimal field uses the original source magnitude.
+        if (expression instanceof FloatingLiteral literal && otherExpression instanceof Field
+                && (other.value() instanceof BigDecimal || other.value() instanceof BigInteger)) {
+            return new Scalar(literal.decimal(), domain(literal.decimal()), value.path(), null);
+        }
+        return value;
     }
 
     private Value exists(Exists exists, Map<String, Object> row, Budget budget, Binding bindings) {

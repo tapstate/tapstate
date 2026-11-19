@@ -180,6 +180,25 @@ public final class DecimalComparisonFunctions {
     public record RuntimeExpression(CelAbstractSyntaxTree ast, CelFunctionResolver functions) {
     }
 
+    /** CEL-only value for a Decimal128 special carried as a Double. */
+    public static final class DecimalSpecialValue extends Number {
+        private final double value;
+
+        private DecimalSpecialValue(double value) {
+            this.value = value;
+        }
+
+        public static Number bind(double value) {
+            return !Double.isFinite(value) || Double.doubleToRawLongBits(value) == Long.MIN_VALUE
+                    ? new DecimalSpecialValue(value) : value;
+        }
+
+        @Override public int intValue() { return (int) value; }
+        @Override public long longValue() { return (long) value; }
+        @Override public float floatValue() { return (float) value; }
+        @Override public double doubleValue() { return value; }
+    }
+
     /**
      * Constant doubles in the AST have already been rounded by CEL. Keep the source token beside
      * comparison calls that can see a decimal, leaving the original operands and standard overloads
@@ -252,7 +271,7 @@ public final class DecimalComparisonFunctions {
         return null;
     }
 
-    private static BigDecimal sourceDecimal(CelAbstractSyntaxTree ast, CelExpr expr) {
+    static BigDecimal sourceDecimal(CelAbstractSyntaxTree ast, CelExpr expr) {
         if (expr.getKind() == CelExpr.ExprKind.Kind.CALL
                 && expr.call().function().equals(Operator.NEGATE.getFunction())) {
             BigDecimal operand = sourceDecimal(ast, expr.call().args().getFirst());
@@ -314,7 +333,7 @@ public final class DecimalComparisonFunctions {
     }
 
     private static boolean isDecimal(Object value) {
-        return value instanceof BigDecimal || value instanceof BigInteger;
+        return value instanceof BigDecimal || value instanceof BigInteger || value instanceof DecimalSpecialValue;
     }
 
     private static boolean isSpecialDouble(Object value) {
@@ -329,10 +348,10 @@ public final class DecimalComparisonFunctions {
     }
 
     private static boolean objectEquals(Object x, Object y) {
-        if (x == y) return true;
         if (isDecimal(x) || isDecimal(y)) {
             return isNumeric(x) && isNumeric(y) && compare((Number) x, (Number) y, ComparisonOp.EQ);
         }
+        if (x == y) return true;
         if (x instanceof List<?> left && y instanceof List<?> right) {
             var other = right.iterator();
             return left.size() == right.size() && every(left.iterator(), value -> objectEquals(value, other.next()));
@@ -369,14 +388,18 @@ public final class DecimalComparisonFunctions {
     }
 
     private static boolean isNan(Number value) {
-        return (value instanceof Double || value instanceof Float) && Double.isNaN(value.doubleValue());
+        return isFloating(value) && Double.isNaN(value.doubleValue());
     }
 
     private static int infinity(Number value) {
-        if (!(value instanceof Double || value instanceof Float)) return 0;
+        if (!isFloating(value)) return 0;
         double number = value.doubleValue();
         if (number == Double.POSITIVE_INFINITY) return 1;
         return number == Double.NEGATIVE_INFINITY ? -1 : 0;
+    }
+
+    private static boolean isFloating(Number value) {
+        return value instanceof Double || value instanceof Float || value instanceof DecimalSpecialValue;
     }
 
     private static BigDecimal finiteDecimal(Number value) {
@@ -387,6 +410,7 @@ public final class DecimalComparisonFunctions {
             // Use the exact binary value held by a DOUBLE row operand. valueOf uses its printed form.
             case Double number -> new BigDecimal(number);
             case Float number -> new BigDecimal(number.doubleValue());
+            case DecimalSpecialValue ignored -> BigDecimal.ZERO;
             default -> BigDecimal.valueOf(value.longValue());
         };
     }
