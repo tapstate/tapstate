@@ -2,9 +2,13 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AiProviderClient;
 import io.tapstate.control.core.AiProviderSettings;
+import io.tapstate.control.core.OpenAiCompatibleClient;
 import io.tapstate.control.core.PipelineDraftService;
+import io.tapstate.control.core.SchemaReport;
 import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.SourceSchemaQueryService;
+import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.common.JsonWriter;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.SpringBootConfiguration;
@@ -12,6 +16,7 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -20,23 +25,131 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** A real MVC response must release small SSE frames while the provider remains active. */
 class PipelineAssistantStreamingSocketTest {
+    @Test void proposalExplanationRespectsTheRequestedReplyLanguage() throws Exception {
+        String request = "I would like to create an enriched order table";
+        String frenchRequest = request + ". Please reply in French.";
+        String frenchExplanation = "Je propose de copier le champ id de la table orders dans enriched_orders.";
+        String englishExplanation = "I propose copying the id field from orders into enriched_orders.";
+        var candidate = Map.of(
+                "root", Map.of("source", "src", "table", "orders", "keys", List.of("id"), "columns", List.of(),
+                        "transforms", List.of()),
+                "relations", List.of(), "transforms", List.of(), "destinationSourceId", "dst",
+                "destinationTable", "enriched_orders", "destinationWriteMode", "upsert");
+        var outbound = new CopyOnWriteArrayList<List<Map<String, Object>>>();
+        var firstDefaultReply = new AtomicBoolean(true);
+        var upstream = com.sun.net.httpserver.HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        upstream.createContext("/v1/chat/completions", exchange -> {
+            var body = AssistantWizardJson.object(JsonReader.parse(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            var userTurns = AssistantWizardJson.list(body.get("messages")).stream()
+                    .map(AssistantWizardJson::object).filter(message -> "user".equals(message.get("role"))).toList();
+            outbound.add(userTurns);
+            boolean explicitlyFrench = userTurns.stream().anyMatch(turn -> frenchRequest.equals(turn.get("content")));
+            // Replay one wrong-language response. The same provider can answer in English on retry.
+            String explanation = explicitlyFrench || firstDefaultReply.getAndSet(false)
+                    ? frenchExplanation : englishExplanation;
+            var arguments = new LinkedHashMap<String, Object>();
+            arguments.put("explanation", explanation);
+            arguments.put("candidateWizard", candidate);
+            var call = Map.of("index", 0, "function", Map.of("name", "propose_pipeline",
+                    "arguments", JsonWriter.write(arguments)));
+            String stream = frame(Map.of("choices", List.of(Map.of("delta", Map.of("tool_calls", List.of(call)),
+                    "finish_reason", "tool_calls")))) + "data: [DONE]\n\n";
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, 0);
+            try (var output = exchange.getResponseBody()) { output.write(stream.getBytes(StandardCharsets.UTF_8)); }
+        });
+        upstream.start();
+        try (var context = new SpringApplicationBuilder(TestApp.class, OrderSchema.class)
+                .run("--server.address=127.0.0.1", "--server.port=0", "--spring.main.banner-mode=off");
+                var client = HttpClient.newHttpClient()) {
+            var gate = context.getBean(Gate.class);
+            var constructor = OpenAiCompatibleClient.class.getDeclaredConstructor(java.util.function.Function.class);
+            constructor.setAccessible(true);
+            var baseUrl = "http://127.0.0.1:" + upstream.getAddress().getPort() + "/v1";
+            gate.model.set(constructor.newInstance((java.util.function.Function<String, URI>) base -> URI.create(base)));
+            gate.modelSettings.set(new AiProviderSettings("openai-compatible", baseUrl, "test-model", "test-key"));
+            int port = ((WebServerApplicationContext) context).getWebServer().getPort();
+            URI draft = URI.create("http://127.0.0.1:" + port + "/api/pipelines/orders/");
+            var explanations = new ArrayList<String>();
+            for (String prompt : List.of(frenchRequest, request)) {
+                var reply = post(client, draft.resolve("./draft:assistant"), Map.of("revision", 1,
+                        "messages", List.of(Map.of("role", "user", "text", prompt))));
+                assertThat(reply.body()).contains("data: [DONE]");
+                var events = reply.body().lines().filter(line -> line.startsWith("data: {"))
+                        .map(line -> AssistantWizardJson.object(JsonReader.parse(line.substring("data: ".length()))))
+                        .toList();
+                assertThat(events).anySatisfy(event -> assertThat(event).containsEntry("type", "finish")
+                        .containsEntry("finishReason", "stop"));
+                var proposal = events.stream().filter(event -> "data-proposal".equals(event.get("type")))
+                        .map(event -> AssistantWizardJson.object(event.get("data"))).findFirst().orElseThrow();
+                var wizard = AssistantWizardJson.object(proposal.get("candidateWizard"));
+                assertThat(wizard).containsEntry("destinationTable", "enriched_orders");
+                assertThat(AssistantWizardJson.object(wizard.get("root")))
+                        .containsEntry("table", "orders").containsEntry("keys", List.of("id"));
+                var review = post(client, draft.resolve("./draft:assistant-validate"),
+                        Map.of("revision", proposal.get("baseRevision"), "candidateWizard", wizard));
+                var validated = AssistantWizardJson.object(JsonReader.parse(review.body()));
+                assertThat(validated).containsEntry("valid", true).containsEntry("candidateWizard", wizard);
+                assertThat(AssistantWizardJson.object(validated.get("diff")).get("after"))
+                        .asString().contains("src.orders", "enriched_orders");
+                explanations.add(events.stream().filter(event -> "text-delta".equals(event.get("type")))
+                        .map(event -> (String) event.get("delta")).collect(Collectors.joining()));
+            }
+            assertThat(outbound).startsWith(List.of(Map.of("role", "user", "content", frenchRequest)),
+                    List.of(Map.of("role", "user", "content", request)));
+            assertThat(explanations.getFirst()).as("explicit French reply").isEqualTo(frenchExplanation);
+            assertThat(explanations.getLast()).as("English proposal explanation for the unqualified English request")
+                    .contains("id", "orders", "enriched_orders")
+                    .containsPattern("(?i)\\b(?:the|from|into|with|will)\\b")
+                    .doesNotContain(frenchExplanation);
+        } finally { upstream.stop(0); }
+    }
+
+    private static HttpResponse<String> post(HttpClient client, URI uri, Map<String, Object> body) throws Exception {
+        var request = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(15)).header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(body))).build();
+        var response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).as("POST %s", uri.getPath()).isEqualTo(200);
+        return response;
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class OrderSchema {
+        @Bean SourceSchemaQueryService schemas() {
+            var schemas = mock(SourceSchemaQueryService.class);
+            when(schemas.find("src")).thenReturn(Optional.of(new SchemaReport("src", "mysql", List.of(
+                    new SchemaReport.Table("orders", List.of(new SchemaReport.Field("id", "integer")),
+                            List.of("id"), List.of())), 1)));
+            return schemas;
+        }
+    }
+
     @Test void aResponsesSummaryReachesTheServletBeforeTheProviderCompletes() throws Exception {
         var release = new CountDownLatch(1);
         var requested = new java.util.concurrent.atomic.AtomicReference<Map<?, ?>>();
