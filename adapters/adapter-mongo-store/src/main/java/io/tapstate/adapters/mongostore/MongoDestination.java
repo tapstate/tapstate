@@ -1,4 +1,4 @@
-package io.tapstate.app;
+package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.ServerAddress;
@@ -10,9 +10,9 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /** A MongoDB destination that can be compared from catalog configuration without contacting it. */
-record CatalogMongoDestination(String database, String srvService, Set<String> hosts) {
+public record MongoDestination(String database, String srvService, Set<String> hosts) {
 
-    static CatalogMongoDestination from(SourceResource source) {
+    public static MongoDestination from(SourceResource source) {
         if (!Set.of("mongodb", "mongodb-atlas").contains(source.connector())) return null;
         var config = source.config();
         try {
@@ -31,7 +31,7 @@ record CatalogMongoDestination(String database, String srvService, Set<String> h
         return null;
     }
 
-    private static CatalogMongoDestination from(ConnectionString connection, String database) {
+    private static MongoDestination from(ConnectionString connection, String database) {
         if (database == null || database.isBlank()) return null;
         boolean srv = connection.isSrvProtocol();
         Set<String> hosts = connection.getHosts().stream()
@@ -39,6 +39,6 @@ record CatalogMongoDestination(String database, String srvService, Set<String> h
                 .map(host -> host.toLowerCase(Locale.ROOT))
                 .collect(Collectors.toUnmodifiableSet());
         String srvService = srv ? Objects.requireNonNullElse(connection.getSrvServiceName(), "mongodb") : null;
-        return new CatalogMongoDestination(database, srvService, hosts);
+        return new MongoDestination(database, srvService, hosts);
     }
 }

@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoDestination;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
@@ -3951,12 +3952,12 @@ final class StoreBackedDagSource implements DagSource {
 
     private Set<PipelineOutputNames.Output> sharedOutputTargets(List<PipelineOutputNames.Output> outputs) {
         record Target(String collection, String connection, String database, String srvService, String host) { }
-        Map<String, Optional<CatalogMongoDestination>> mongoDestinations = new HashMap<>();
+        Map<String, Optional<MongoDestination>> mongoDestinations = new HashMap<>();
         Map<Target, List<PipelineOutputNames.Output>> writers = new HashMap<>();
         for (var output : outputs) {
             var mongo = mongoDestinations.computeIfAbsent(output.connection(), id -> artifacts().get(id)
                     .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)
-                    .map(CatalogMongoDestination::from));
+                    .map(MongoDestination::from));
             var targets = mongo.map(destination -> destination.hosts().stream()
                             .map(host -> new Target(output.table(), null, destination.database(), destination.srvService(), host)).toList())
                     .orElseGet(() -> List.of(new Target(output.table(), output.connection(), null, null, null)));
