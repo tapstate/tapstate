@@ -1,7 +1,11 @@
 package io.tapstate.runtime.engine.nest;
 
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.aggregate.ValueType;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupFunction;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -9,6 +13,7 @@ import java.io.IOException;
 import java.io.ObjectOutputStream;
 import java.time.LocalDate;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -135,6 +140,36 @@ class RollupFieldsAreRenderedWithTheRowsTheySummarizeTest {
         withRollups.render(TREE.slots(), prizes(5L, 3L), "t1");
         withoutRollups.render(plain.slots(), prizes(5L, 3L), "t1");
         assertThat(serialized(withRollups)).isEqualTo(serialized(withoutRollups));
+    }
+
+    @Test
+    void anItemWhoseAlternativeNamesAMissingRowMakesTheDependentTotalNull() {
+        Map<String, NestTable> tables = new HashMap<>(RollupFieldsAreCheckedWithTheTreeTest.TABLES);
+        tables.put("i", new NestTable("items", List.of("id"), List.of(),
+                List.of("id", "transaction_id", "prize_definition_id", "prize_code_ref", "amount"),
+                Map.of("id", ValueType.INT64, "transaction_id", ValueType.INT64,
+                        "prize_definition_id", ValueType.INT64,
+                        "prize_code_ref", ValueType.of(TapstateType.STRING), "amount", ValueType.INT64)));
+        Embed prize = new Embed("pd", Map.of("id", "prize_definition_id"), EmbedAs.OBJECT, "prize_definition",
+                null, null, null, null, null, List.of(Map.of("prize_code", "prize_code_ref")));
+        Map<String, RollupField> rollups = new LinkedHashMap<>();
+        rollups.put("amount", RollupField.of(RollupFunction.SUM,
+                "=after.amount * after.prize_definition.prize_value", null, null, 0));
+        NestTopology tree = RollupFieldsAreCheckedWithTheTreeTest.compile(tables::get,
+                new Embed("i", Map.of("transaction_id", "id"), EmbedAs.ARRAY, "item_movement", null,
+                        List.of("id"), null, null, List.of(prize), rollups));
+
+        assertThat(withItem(tree, "GONE")).as("the code names a row that is not there").containsEntry("amount", null);
+        assertThat(withItem(tree, null)).as("an item naming nothing by either key is missing nothing")
+                .containsEntry("amount", 0L);
+    }
+
+    private static Map<String, Object> withItem(NestTopology tree, String code) {
+        RootAssembly t1 = new RootAssembly();
+        t1.applyRoot(row("id", 1L, "player_id", 9L), at(1));
+        t1.applyElement(item(1L), row("id", 1L, "transaction_id", 1L, "prize_definition_id", null,
+                "prize_code_ref", code, "amount", 4L), at(2), noPositions());
+        return t1.render(tree.slots(), Map.of(), "t1").orElseThrow();
     }
 
     // ---- fixtures -------------------------------------------------------------------------------------

@@ -1345,7 +1345,8 @@ public final class RootAssembly implements Serializable {
     /**
      * The live elements of a level a rollup folds over: each rendered exactly as the array would show it -
      * references resolved, its own levels' rollups written - with its key and the references it names that
-     * rendered absent. A reference that names nothing (its key all null) is not missing; it was never there.
+     * rendered absent. A reference that names nothing (its own key and every alternative's all null) is
+     * not missing; it was never there.
      */
     private List<RollupElement> liveElementsOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
             Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
@@ -1364,8 +1365,7 @@ public final class RootAssembly implements Serializable {
                 if (!child.isReference() || child.path() == null) {
                     continue;
                 }
-                List<Object> named = NestKeys.valuesOf(element.fields(), child.referenceFields());
-                if (named.stream().allMatch(Objects::isNull)) {
+                if (namesNothing(element.fields(), child)) {
                     continue;
                 }
                 Object at = rendered.get(child.path());
@@ -1380,6 +1380,20 @@ public final class RootAssembly implements Serializable {
             live.add(new RollupElement(entry.getKey(), rendered, plain, missing));
         }
         return live;
+    }
+
+    /**
+     * Whether an element names no row for a referenced slot: every place the slot may be read from - its own
+     * reference and each alternative - is keyed by nulls only. An element that names a row through any one
+     * of them is missing that row when the slot renders absent.
+     */
+    private static boolean namesNothing(Map<String, Object> fields, EmbedSlot child) {
+        for (EmbedSlot.Reference reference : child.references()) {
+            if (!NestKeys.valuesOf(fields, reference.referenceFields()).stream().allMatch(Objects::isNull)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
