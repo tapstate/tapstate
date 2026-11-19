@@ -7,160 +7,91 @@ permissions:
   contents: read
 
 jobs:
-  overlap:
+  map-nest-control:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: candidate
+            revision: 4f23665a4f1bc4ac6bb07af8c7ed2c192caf9ee2
     runs-on: ubuntu-24.04
-    timeout-minutes: 28
+    timeout-minutes: 24
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4f23665a4f1bc4ac6bb07af8c7ed2c192caf9ee2
-          path: candidate
+          ref: ${{ matrix.revision }}
           persist-credentials: false
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
           cache: maven
-      - name: Prepare two isolated reactor worktrees
-        working-directory: candidate
+      - name: Prepare locked inputs and the matching OP build
         run: |
-          out="$RUNNER_TEMP/overlap"
+          out="$RUNNER_TEMP/control"
           mkdir -p "$out"
           docker info > "$out/docker-info.txt"
-          python3 -B deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy --output "$out/connectors"
-          git worktree add --detach "$RUNNER_TEMP/peer" HEAD
-          for checkout in "$PWD" "$RUNNER_TEMP/peer"; do
-            for attempt in 1 2 3; do
-              if mvn -B -f "$checkout/pom.xml" -pl e2e -am -DskipTests package > "$out/build-$(basename "$checkout")-$attempt.log" 2>&1; then
-                break
-              fi
-              tail -60 "$out/build-$(basename "$checkout")-$attempt.log"
-              if [ "$attempt" = 3 ] || ! grep -q 'HTTP Status: 429' "$out/build-$(basename "$checkout")-$attempt.log"; then
-                exit 1
-              fi
-              sleep "$((20 * attempt))"
-            done
+          docker pull mongo:7.0
+          docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$out/mongo-image.json"
+          python3 -B deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy --output "$RUNNER_TEMP/connectors"
+          for attempt in 1 2 3; do
+            if mvn -B -pl e2e -am -DskipTests package > "$out/build-$attempt.log" 2>&1; then
+              sha256sum app/target/app-0.8.0-boot.jar "$RUNNER_TEMP/connectors/"*.jar > "$out/artifacts.sha256"
+              exit 0
+            fi
+            tail -60 "$out/build-$attempt.log"
+            if ! grep -q 'HTTP Status: 429' "$out/build-$attempt.log"; then
+              exit 1
+            fi
+            sleep "$((20 * attempt))"
           done
-          sha256sum app/target/app-0.8.0-boot.jar "$out/connectors/"*.jar > "$out/artifacts.sha256"
-      - name: Observe failure cleanup while the peer continues
-        working-directory: candidate
+          exit 1
+      - name: Record terminal target inventory independently of the oracle
         run: |
-          out="$RUNNER_TEMP/overlap"
-          cat > "$out/overlap.py" <<'PYTHON'
-          import json
-          import os
-          import subprocess
-          import sys
-          import time
+          python3 - <<'PYTHON'
           from pathlib import Path
-
-          root = Path(__file__).resolve().parent
-          primary, secondary = [Path(arg).resolve() for arg in sys.argv[1:3]]
-          connectors = root / "connectors"
-          boot = primary / "app/target/app-0.8.0-boot.jar"
-          good = root / "overlap-good"
-          bad = root / "overlap-failed"
-          good_case = "join.live.steady-state.standard"
-          bad_case = "copy.live.basic.standard"
-          events = []
-          children = []
-
-          def read(path):
-              return json.loads(path.read_text())
-
-          def run(checkout, out, case, args):
-              command = ["python3", "-B", "benchmarks/runner.py", "run", "--id", case,
-                         "--repeats", "1", "--timeout-seconds", "90", "--boot-jar", str(boot),
-                         "--connectors", str(connectors), "--output", str(out), *args]
-              process = subprocess.Popen(command, cwd=checkout, start_new_session=True)
-              children.append(process)
-              events.append({"event": "launch", "unix_time": time.time(), "output": out.name, "arguments": command})
-              return process
-
-          def inventory(out):
-              if not (out / "request.json").exists():
-                  return {}
-              owner = read(out / "request.json")["run_id"]
-              ids = subprocess.check_output(["docker", "ps", "-q", "--filter",
-                                             f"label=io.tapstate.e2e.resource-owner={owner}"], text=True, timeout=6).split()
-              datastores = {}
-              for container in ids:
-                  result = subprocess.run(["docker", "exec", container, "mongosh", "--quiet", "--norc",
-                                           "mongodb://127.0.0.1:27017/?directConnection=true", "--eval",
-                                           "JSON.stringify(db.adminCommand({listDatabases:1,nameOnly:true}).databases.map(x=>x.name))"],
-                                          text=True, capture_output=True, timeout=8)
-                  if result.returncode == 0:
-                      datastores[container] = json.loads(result.stdout)
-              return datastores
-
-          def until(predicate, deadline, description, process):
-              while time.monotonic() < deadline and process.poll() is None:
-                  value = predicate()
-                  if value:
-                      return value
-                  time.sleep(0.4)
-              raise AssertionError(description)
-
-          latest_inventory = {}
-
-          def owned_state(out):
-              observed = inventory(out)
-              if observed:
-                  latest_inventory[out.name] = observed
-              if any(any(name.endswith("_config") for name in names)
-                     and any(name.endswith("_tgt") for name in names) for names in observed.values()):
-                  return observed
-
-          try:
-              good_process = run(secondary, good, good_case,
-                                 ["--rows", "96", "--rate", "8", "--measurement-seconds", "120"])
-              good_state = until(lambda: owned_state(good), time.monotonic() + 150,
-                                 "Successful arm did not start its real target and native storage", good_process)
-              bad_process = run(primary, bad, bad_case,
-                                ["--rows", "8", "--rate", "10", "--measurement-seconds", "2", "--mix", "0/0/100"])
-              bad_state = until(lambda: owned_state(bad), time.monotonic() + 100,
-                                "Failed arm did not expose its owned namespaces before cleanup", bad_process)
-              good_state = owned_state(good)
-              assert good_state and good_state.keys().isdisjoint(bad_state)
-              assert {n for names in good_state.values() for n in names if n.startswith(("perf_", "e2e_"))}.isdisjoint(
-                  n for names in bad_state.values() for n in names if n.startswith(("perf_", "e2e_")))
-              events.append({"event": "both-active", "unix_time": time.time(), "good": good_state, "bad": bad_state})
-              assert bad_process.wait(timeout=120) == 1
-              assert good_process.poll() is None
-              until(lambda: inventory(bad) == {}, time.monotonic() + 12,
-                    "Failed arm still owns a running MongoDB container", good_process)
-              good_after_cleanup = owned_state(good)
-              assert good_after_cleanup == good_state
-              events.append({"event": "failure-cleaned-peer-active", "unix_time": time.time(), "good": good_after_cleanup})
-              assert good_process.wait(timeout=180) == 0
-              left = read(bad / "summary.json")["results"][0]
-              right = read(good / "summary.json")["results"][0]
-              assert left["status"] == "failed" and "Insufficient pre-existing keys" in left["reason"], left.get("reason")
-              assert "cleanup" in left["phase_nanos"]
-              assert right["status"] == "completed" and right["target_readback_rows"] > 0
-              assert right["started_epoch_ms"] < left["started_epoch_ms"] < left["finished_epoch_ms"] < right["finished_epoch_ms"]
-              assert left["source_data"]["source"]["namespace"] != right["source_data"]["source"]["namespace"]
-              cleanup_deadline = time.monotonic() + 12
-              while inventory(good) and time.monotonic() < cleanup_deadline:
-                  time.sleep(0.4)
-              assert inventory(good) == {}
-              events.append({"event": "peer-completed", "unix_time": time.time(), "good_run_id": right["run_id"],
-                             "failed_run_id": left["run_id"], "peer_readback_rows": right["target_readback_rows"]})
-          finally:
-              events.append({"event": "last-inventories", "databases": latest_inventory})
-              (root / "overlap-receipt.json").write_text(json.dumps(events, indent=2) + "\n")
-              for child in children:
-                  if child.poll() is None:
-                      os.killpg(child.pid, 2)
-                      child.wait(timeout=30)
+          path = Path("e2e/src/test/java/io/tapstate/e2e/BenchmarkRunIT.java")
+          source = path.read_text()
+          needle = """        String difference = BenchmarkOperatorOracle.difference(operators, target, expected);
+                  if (difference != null) {"""
+          insert = """        String difference = BenchmarkOperatorOracle.difference(operators, target, expected);
+                  if (operators.scenario.equals("mixed-map-nest")) {
+                      var rows = new ArrayList<Map<String, Object>>();
+                      for (var table : operators.targets()) {
+                          var collection = target.getCollection(table, BsonDocument.class);
+                          var keys = collection.listIndexes(BsonDocument.class).into(new ArrayList<>()).stream()
+                                  .map(index -> index.getDocument("key").toJson()).toList();
+                          for (var row : collection.find()) {
+                              var children = row.getArray("children").stream()
+                                      .map(child -> child.asDocument().getNumber("_id").longValue()).toList();
+                              rows.add(Map.of("table", table, "indexes", keys, "stored_id", row.get("_id").toString(),
+                                      "root", row.getNumber("root_key").longValue(), "children", children));
+                          }
+                      }
+                      evidence.result.put("terminal_target_inventory", rows);
+                  }
+                  if (difference != null) {"""
+          # Keep the original readback and failure. Record only the bounded fixture's identities.
+          needle = needle.replace("\n                  ", "\n        ")
+          insert = insert.replace("\n                  ", "\n        ")
+          assert source.count(needle) == 1
+          path.write_text(source.replace(needle, insert))
           PYTHON
-          python3 -B "$out/overlap.py" "$PWD" "$RUNNER_TEMP/peer"
+          git diff -- e2e/src/test/java/io/tapstate/e2e/BenchmarkRunIT.java > "$RUNNER_TEMP/control/instrumentation.diff"
+      - name: Compare the snapshot composition at both input sizes
+        run: |
+          status=0
+          for rows in 96 128; do
+            python3 -B benchmarks/runner.py run --id mixed.snapshot.map-nest.standard \
+              --repeats 3 --rows "$rows" --rate 8 --measurement-seconds 6 --timeout-seconds 95 \
+              --connectors "$RUNNER_TEMP/connectors" --output "$RUNNER_TEMP/control/rows-$rows" || status=1
+          done
+          exit "$status"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: candidate-overlap
+          name: map-nest-terminal-inventory-${{ matrix.label }}
           path: |
-            ${{ runner.temp }}/overlap/
-            !${{ runner.temp }}/overlap/connectors/**
-            !${{ runner.temp }}/overlap/**/runtime-input/**
+            ${{ runner.temp }}/control/
+            !${{ runner.temp }}/control/**/runtime-input/**
           if-no-files-found: error
