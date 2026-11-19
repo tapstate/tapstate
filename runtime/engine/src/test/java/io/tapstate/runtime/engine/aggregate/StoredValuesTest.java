@@ -84,8 +84,9 @@ class StoredValuesTest {
     @DisplayName("a value of an unlisted kind is refused rather than stored as its text")
     void anUnlistedKindIsRefused() {
         DataOutputStream out = new DataOutputStream(new ByteArrayOutputStream());
+        UUID unlisted = UUID.randomUUID();
 
-        assertThatThrownBy(() -> StoredValues.write(out, UUID.randomUUID()))
+        assertThatThrownBy(() -> StoredValues.write(out, unlisted))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining(UUID.class.getName());
     }
