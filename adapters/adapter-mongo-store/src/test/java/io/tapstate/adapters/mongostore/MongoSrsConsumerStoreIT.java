@@ -955,6 +955,156 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @Test void renewalCanCommitDuringSnapshotPreparationAndThePinLandsOnce() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "seam", refs);
+            var before = f.consumers().progress(A).orElseThrow();
+            long initialChainFence = root(f).getLong("modelWriteFence");
+            var reserved = new CountDownLatch(1);
+            var resume = new CountDownLatch(1);
+            var claims = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {});
+            var pauseOnce = new java.util.concurrent.atomic.AtomicBoolean(true);
+            var commands = new java.util.concurrent.ConcurrentHashMap<Integer, String>();
+            var commits = new java.util.concurrent.atomic.AtomicInteger();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    var command = event.getCommand().get(event.getCommandName());
+                    if (command != null && command.isString())
+                        commands.put(event.getRequestId(), command.asString().getValue());
+                }
+
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if ("commitTransaction".equals(event.getCommandName())) commits.incrementAndGet();
+                    var collection = commands.remove(event.getRequestId());
+                    if ("findAndModify".equals(event.getCommandName()) && "srs_chains".equals(collection)
+                            && pauseOnce.compareAndSet(true, false)) {
+                        reserved.countDown();
+                        try { assertThat(resume.await(10, TimeUnit.SECONDS)).isTrue(); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+                    }
+                }
+
+                @Override public void commandFailed(com.mongodb.event.CommandFailedEvent event) {
+                    commands.remove(event.getRequestId());
+                }
+            };
+            try (var client = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build());
+                 var executor = Executors.newSingleThreadExecutor()) {
+                var consumers = new MongoSrsConsumerStore(client, client.getDatabase(f.database().getName()), SCOPE,
+                        () -> {}, () -> {}, MongoSrsLease.perTransaction(), true);
+                var pending = executor.submit(() -> consumers.pinSnapshot(A, member.revision(), before.revision(), pin, f.fenceA()));
+                try {
+                    assertThat(reserved.await(5, TimeUnit.SECONDS)).isTrue();
+                    var renewed = claims.withRenewalDeadline(System.nanoTime() + TimeUnit.SECONDS.toNanos(5),
+                            () -> {}, () -> claims.renew(f.pipelineA(), Duration.ofSeconds(30))).orElseThrow();
+                    assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(f.fenceA());
+                    assertThat(renewed.leaseUntil()).isAfter(f.pipelineA().leaseUntil());
+                    assertThat(pending.isDone()).isFalse();
+                    assertThat(f.consumers().progress(A)).contains(before);
+                } finally {
+                    resume.countDown();
+                }
+                assertThat(pending.get(10, TimeUnit.SECONDS)).isTrue();
+                assertThat(commits.get()).isEqualTo(1);
+                var after = f.consumers().progress(A).orElseThrow();
+                assertThat(after.snapshot()).isEqualTo(pin);
+                assertThat(after.revision()).isEqualTo(before.revision() + 1);
+                assertThat(root(f).getLong("modelWriteFence")).isEqualTo(initialChainFence + 1);
+            }
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"expired-before", "expires-pending", "owner-pending", "retired-pending"})
+    void latePinClaimProofStillRejectsLostAuthority(String scenario) {
+        withBusiness(f -> {
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var snapshot = new SrsSnapshotPin(1, "seam", refs);
+            var originalRoot = root(f);
+            var originalCursor = cursor(f, A);
+            var stateCollection = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var originalState = stateCollection.find(new Document("_id", A.key().pipelineId())).first();
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var paused = new CountDownLatch(1);
+            var resume = new CountDownLatch(1);
+            var firstOffsetWrite = new java.util.concurrent.atomic.AtomicInteger(-1);
+            var blockOnce = new java.util.concurrent.atomic.AtomicBoolean();
+            var commits = new java.util.concurrent.atomic.AtomicInteger();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    var cmd = event.getCommand();
+                    if ("update".equals(event.getCommandName())
+                            && "srs_consumer_offsets".equals(cmd.getString("update").getValue())
+                            && blockOnce.compareAndSet(false, true)) firstOffsetWrite.set(event.getRequestId());
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if ("commitTransaction".equals(event.getCommandName())) commits.incrementAndGet();
+                    if (event.getRequestId() != firstOffsetWrite.get()) return;
+                    paused.countDown();
+                    try {
+                        if (!resume.await(8, TimeUnit.SECONDS)) throw new AssertionError("pin barrier not released");
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(interrupted);
+                    }
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build());
+                 var executor = Executors.newSingleThreadExecutor()) {
+                var pin = new MongoSrsConsumerStore(observed, observed.getDatabase(f.database().getName()), SCOPE,
+                        () -> {}, () -> {}, MongoSrsLease.perTransaction(), true);
+                if (scenario.equals("expired-before")) {
+                    assertThat(claims.release(f.pipelineA())).isTrue();
+                    assertThatThrownBy(() -> pin.pinSnapshot(A, member.revision(), 0, snapshot, f.fenceA()))
+                            .isInstanceOfSatisfying(TapstateException.class,
+                                    error -> assertThat(error.code()).isIn(IoError.WORKLOAD_CLAIM_FENCED, IoError.CACHE_BUSINESS_FENCED));
+                } else {
+                    var task = executor.submit(() -> pin.pinSnapshot(A, member.revision(), 0, snapshot, f.fenceA()));
+                    try {
+                        assertThat(paused.await(5, TimeUnit.SECONDS)).isTrue();
+                        if (scenario.equals("retired-pending")) {
+                            try (var session = f.client().startSession()) {
+                                session.withTransaction(() -> {
+                                    new MongoCacheBusinessIdentity(f.database(), SCOPE).retire(session, "pin-safety-retirement");
+                                    return null;
+                                });
+                            }
+                        } else {
+                            assertThat(claims.release(f.pipelineA())).isTrue();
+                            if (scenario.equals("owner-pending")) {
+                                var replacement = claims.acquire(f.pipelineA().key(),
+                                        new WorkloadOwner("replacement-node", "replacement-boot"), 1, Duration.ofSeconds(30));
+                                assertThat(replacement.acquired()).isTrue();
+                                assertThat(replacement.claim().owner()).isNotEqualTo(f.pipelineA().owner());
+                            }
+                        }
+                    } finally {
+                        resume.countDown();
+                    }
+                    assertThatThrownBy(() -> task.get(5, TimeUnit.SECONDS))
+                            .isInstanceOfSatisfying(java.util.concurrent.ExecutionException.class,
+                                    error -> code(error.getCause(), scenario.equals("retired-pending")
+                                            ? IoError.CACHE_BUSINESS_FENCED : IoError.WORKLOAD_CLAIM_FENCED));
+                }
+                assertThat(commits).hasValue(0);
+                assertThat(root(f)).isEqualTo(originalRoot);
+                assertThat(cursor(f, A)).isEqualTo(originalCursor);
+                assertThat(stateCollection.find(new Document("_id", A.key().pipelineId())).first()).isEqualTo(originalState);
+            }
+        });
+    }
+
     @Test void pinReservesTheChainBeforeReadingProgressAndReplaysDoNotAdvanceFences() {
         withBusiness(f -> {
             var refs = publishSnapshotModels(f, Set.of("orders"));
@@ -976,8 +1126,9 @@ class MongoSrsConsumerStoreIT {
                 var original = new MongoSrsConsumerStore(observed, observed.getDatabase(f.database().getName()), SCOPE);
                 var before = root(f).getLong("modelWriteFence");
                 assertThat(original.pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
-                assertThat(commands).startsWith("update/workload_claims", "findAndModify/srs_chains")
+                assertThat(commands).startsWith("findAndModify/srs_chains").endsWith("update/workload_claims")
                         .contains("update/srs_consumer_offsets").doesNotContain("update/srs_chains");
+                assertThat(java.util.Collections.frequency(commands, "update/workload_claims")).isEqualTo(1);
                 var root = root(f);
                 var offset = cursor(f, A);
                 var pipeline = SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id", A.key().pipelineId())).first();

@@ -1152,22 +1152,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         requireRevision(membershipRevision); requireRevision(expectedProgressRevision); String chain = context.key().miningChainId();
         var pipeline = pipelineAccess(context, fence);
         return changingTheConsumer(() -> pinTransaction(session -> {
-            // Retain the claim-before-chain write order. Take the chain fence before
-            // a checkpoint can invalidate a snapshot held through the model and cursor reads.
-            var business = new MongoCacheBusinessIdentity(database, scope);
-            try {
-                pipeline.proveConsumerClaim(session, true);
-            } catch (TapstateException refusal) {
-                if (refusal.code() == IoError.WORKLOAD_CLAIM_FENCED) {
-                    // Preserve the original stale-scope diagnostic without delaying a live claim.
-                    business.requireReady(session);
-                    pipeline.state(session, true);
-                }
-                throw refusal;
-            }
+            // Reserve the chain before reading its model and cursor facts.
             var root = chains.reserveSnapshotPin(session, chain);
-            business.requireReady(session);
-            var state = pipeline.state(session, true);
+            new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+            var state = pipeline.stateForWriterProgress(session, true);
             pipeline.updateState(session, state, new Document(), false);
             var view = root == null ? view(session, chain) : relations(session, chain, root, chains.state(session, root));
             var member = view.members().get(context.key().consumerId());
@@ -1181,7 +1169,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (before != null && (before.snapshotEpoch() != snapshot.snapshotEpoch() || !before.sourcePosition().equals(snapshot.sourcePosition())
                     || before.models().entrySet().stream().anyMatch(entry -> !entry.getValue().equals(snapshot.models().get(entry.getKey()))))) throw unavailable(chain);
             validateSnapshot(session, context, snapshot);
-            if (snapshot.equals(before)) throw new UnchangedPin(true);
+            if (snapshot.equals(before)) {
+                pipeline.proveConsumerClaim(session, true);
+                throw new UnchangedPin(true);
+            }
             if (held.revision() >= Long.MAX_VALUE - 1) throw unavailable(chain);
             ConsumerOffset old = held.value();
             var progress = new ConsumerOffset(old.pipelineId(), old.perTableSeq(), old.sinkAcked(), old.snapshotCompletedTables(),
@@ -1192,6 +1183,8 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                             .append("progressRevision", expectedProgressRevision), row).getMatchedCount() != 1) throw unavailable(chain);
             // An exhausted chain fence can still answer a replay above, but cannot publish a new pin.
             if (root == null) chains.replace(session, view.root(), new Document(view.root()));
+            // Keep the exact claim write in this transaction without blocking renewals during preparation.
+            pipeline.proveConsumerClaim(session, true);
             return true;
         }));
     }
