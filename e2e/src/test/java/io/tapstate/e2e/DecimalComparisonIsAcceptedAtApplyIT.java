@@ -48,12 +48,12 @@ class DecimalComparisonIsAcceptedAtApplyIT {
 
                 control.discoverSchema(NumericSource.SOURCE_ID, "mysql", config);
 
-                // Comparing a DECIMAL column with a literal and mixed integral column is accepted:
+                // A mixed numeric predicate and a quoted envelope condition survive YAML apply.
                 control.apply(NumericSource.filterWorkspace(
                         config,
                         SharedMongo.replicaSetUrl("decimal_accept_target_" + suffix),
                         ACCEPTED_PIPELINE,
-                        "after.amount > 25 && after.qty > 5"));
+                        "after.amount > 25 && after.qty > 5 && op != \"d\""));
 
                 assertThat(control.artifactIds())
                         .as("the pipeline is accepted and stored because exact decimal comparisons are supported")

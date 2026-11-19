@@ -4,6 +4,7 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.NullValue;
 import dev.cel.common.CelAbstractSyntaxTree;
 import dev.cel.runtime.CelEvaluationException;
+import dev.cel.runtime.CelFunctionResolver;
 import dev.cel.runtime.CelRuntime;
 import dev.cel.runtime.CelRuntimeFactory;
 import io.tapstate.core.dsl.DecimalComparisonFunctions;
@@ -15,6 +16,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.UnaryOperator;
 
 /**
@@ -38,11 +40,13 @@ final class RowExpressionProgram {
             CelRuntimeFactory.standardCelRuntimeBuilder()).build();
 
     private final CelRuntime.Program program;
+    private final CelFunctionResolver functions;
     // The source expression, kept so an evaluation failure can name the expression that failed.
     private final String expr;
 
-    private RowExpressionProgram(CelRuntime.Program program, String expr) {
+    private RowExpressionProgram(CelRuntime.Program program, CelFunctionResolver functions, String expr) {
         this.program = program;
+        this.functions = functions;
         this.expr = expr;
     }
 
@@ -58,7 +62,8 @@ final class RowExpressionProgram {
 
     private static RowExpressionProgram of(CelAbstractSyntaxTree ast, String expr) {
         try {
-            return new RowExpressionProgram(RUNTIME.createProgram(ast), expr);
+            var prepared = DecimalComparisonFunctions.forRuntime(ast);
+            return new RowExpressionProgram(RUNTIME.createProgram(prepared.ast()), prepared.functions(), expr);
         } catch (CelEvaluationException e) {
             // A checked AST builds into a program; a failure here is an invariant violation, not a
             // user condition.
@@ -81,7 +86,7 @@ final class RowExpressionProgram {
         vars.put("after", bind(after));
         vars.put("schema", bind(event.schema()));
         try {
-            return unbound(program.eval(vars));
+            return unbound(program.eval(name -> Optional.ofNullable(vars.get(name)), functions));
         } catch (CelEvaluationException e) {
             // A row-level evaluation failure (a missing field, a type clash on a dyn value, a function
             // that type-checks but is unbound at runtime) is a user-diagnosable condition: surface it
@@ -117,11 +122,6 @@ final class RowExpressionProgram {
         // a new value, and it is only the row's own untouched values that keep travelling as they came.
         if (value instanceof ConvertedValue carried) {
             return bound(carried.value());
-        }
-        // BigInteger is classified as DECIMAL in the value model. CEL functions bind tapstate.decimal
-        // to BigDecimal, so adapt BigInteger to BigDecimal so operator overloads match at runtime.
-        if (value instanceof java.math.BigInteger number) {
-            return new java.math.BigDecimal(number);
         }
         if (value == null) {
             return NullValue.NULL_VALUE;

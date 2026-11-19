@@ -5,10 +5,17 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.model.TransformResource;
 import io.tapstate.spi.transform.TransformPort;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
@@ -149,6 +156,94 @@ class FilterTransformTest {
         assertThat(filterGt.transform(row)).containsExactly(row);
         assertThat(filterEq.transform(row)).containsExactly(row);
         assertThat(filterLt.transform(row)).isEmpty();
+    }
+
+    @Test
+    void aDecimalComparisonUsesTheOriginalFractionalLiteralInEitherOperandOrder() {
+        Envelope exact = decimalRow("1.0000000000000001");
+        Envelope rounded = decimalRow("1.0");
+        assertFilter("after.amount == 1.0000000000000001", exact, rounded);
+        assertFilter("1.0000000000000001 == after.amount", exact, rounded);
+        assertFilter("1.0000000000000001 > after.amount", rounded, exact);
+        assertFilter("after.amount >= 10000000000000001e-16", exact, rounded);
+        assertFilter("after.amount == - 1.0000000000000001", decimalRow("-1.0000000000000001"),
+                decimalRow("-1.0"));
+    }
+
+    @Test
+    void aDoubleRowOperandUsesItsActualBinaryValueInEitherOperandOrder() {
+        Envelope equal = withFactor("-9223372036854775808", -0x1.0p63);
+        Envelope higher = withFactor("-9223372036854775807", -0x1.0p63);
+        Envelope lower = withFactor("-9223372036854775809", -0x1.0p63);
+        assertFilter("after.amount == after.factor && after.factor == after.amount", equal, higher);
+        assertFilter("after.amount >= after.factor && after.factor <= after.amount", equal, lower);
+        assertFilter("after.amount > after.factor && after.factor < after.amount", higher, equal);
+        assertFilter("after.amount < after.factor && after.factor > after.amount", lower, equal);
+        assertFilter("after.amount != after.factor && after.factor != after.amount", lower, equal);
+        assertFilter("after.factor == 1.0000000000000001", withFactor("1", 1.0), withFactor("1", 1.5));
+    }
+
+    @Test
+    void aDecimalCanBeComparedWithAnIntegerLiteralEmittedByAMap() {
+        TransformResource resource = (TransformResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: transform
+                id: threshold
+                type: map
+                fields: { limit: 25 }
+                """);
+        TransformPort map = StatelessTransforms.map(MapSpec.from((TransformBody.MapProjection) resource.body()));
+        Envelope match = map.transform(decimalRow("30.00")).getFirst();
+        Envelope noMatch = map.transform(decimalRow("25.00")).getFirst();
+        assertThat(match.after().get("limit")).isInstanceOf(Integer.class);
+        assertFilter("after.amount > after.limit && after.limit < after.amount", match, noMatch);
+    }
+
+    @Test
+    void aBareComputedReadKeepsABigInteger() {
+        BigInteger original = new BigInteger("18446744073709551615");
+        Envelope row = Envelope.insert(1L, "orders", Map.of("amount", original), null);
+        TransformPort map = StatelessTransforms.map(MapSpec.from(new TransformBody.MapProjection(
+                Map.of("out", FieldRule.computed("after.amount")))));
+        assertThat(map.transform(row).getFirst().after().get("out")).isEqualTo(original);
+    }
+
+    @Test
+    void decimal128SpecialValuesAreOrderedWithoutFailingTheFilter() {
+        Envelope nan = decimal128Special(Double.NaN);
+        Envelope infinity = decimal128Special(Double.POSITIVE_INFINITY);
+        Envelope negativeInfinity = decimal128Special(Double.NEGATIVE_INFINITY);
+        assertFilter("after.amount > 25 && 25 < after.amount", infinity, nan);
+        assertFilter("after.amount < 25 && 25 > after.amount", negativeInfinity, nan);
+        assertFilter("after.amount != 25", nan, decimalRow("25.00"));
+    }
+
+    @Test
+    void equalityRecursesIntoListsAndMapsAndPreservesCelKeyEquality() {
+        Envelope equal = withFactor("25.000", new BigDecimal("25.00"));
+        Envelope different = withFactor("25.001", new BigDecimal("25.00"));
+        assertFilter("[after.amount, {1: after.factor}] == [after.factor, {1u: after.amount}]",
+                equal, different);
+        assertFilter("{'v': [after.amount]} != {'v': [after.factor]}", different, equal);
+        assertFilter("[after.amount] == [after.factor]", equal, different);
+    }
+
+    private static Envelope decimalRow(String amount) {
+        return Envelope.insert(1L, "orders", Map.of("amount", new BigDecimal(amount)), null);
+    }
+
+    private static Envelope withFactor(String amount, Number factor) {
+        return Envelope.insert(1L, "orders", Map.of("amount", new BigDecimal(amount), "factor", factor), null);
+    }
+
+    private static Envelope decimal128Special(double number) {
+        return Envelope.insert(1L, "orders", Map.of("amount", new ConvertedValue(number, "DECIMAL128")), null);
+    }
+
+    private static void assertFilter(String expression, Envelope match, Envelope noMatch) {
+        TransformPort filter = StatelessTransforms.filter(expression);
+        assertThat(filter.transform(match)).as(expression).containsExactly(match);
+        assertThat(filter.transform(noMatch)).as(expression).isEmpty();
     }
 
     @Test

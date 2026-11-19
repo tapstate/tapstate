@@ -2,24 +2,39 @@ package io.tapstate.core.dsl;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.primitives.UnsignedLong;
+import dev.cel.common.CelAbstractSyntaxTree;
 import dev.cel.common.CelFunctionDecl;
 import dev.cel.common.CelOptions;
 import dev.cel.common.CelOverloadDecl;
+import dev.cel.common.ast.CelConstant;
+import dev.cel.common.ast.CelExpr;
+import dev.cel.common.ast.CelReference;
 import dev.cel.common.internal.DefaultMessageFactory;
 import dev.cel.common.internal.DynamicProto;
+import dev.cel.common.navigation.CelNavigableAst;
+import dev.cel.common.navigation.CelNavigableExpr;
 import dev.cel.common.types.CelType;
 import dev.cel.common.types.OpaqueType;
 import dev.cel.common.types.SimpleType;
 import dev.cel.parser.Operator;
 import dev.cel.runtime.CelFunctionBinding;
+import dev.cel.runtime.CelFunctionResolver;
+import dev.cel.runtime.CelLateFunctionBindings;
 import dev.cel.runtime.CelRuntimeBuilder;
 import dev.cel.runtime.CelStandardFunctions;
-import dev.cel.runtime.RuntimeEquality;
 import dev.cel.runtime.ProtoMessageRuntimeEquality;
+import dev.cel.runtime.RuntimeEquality;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
 
 /**
  * Exact numerical comparison declarations and runtime bindings for tapstate.decimal.
@@ -45,8 +60,36 @@ public final class DecimalComparisonFunctions {
     private static final String SUFFIX_DOUBLE_DECIMAL = "_double_decimal";
 
     private enum ComparisonOp {
-        LT, LE, GT, GE, EQ, NE
+        LT(Operator.LESS, "less"),
+        LE(Operator.LESS_EQUALS, "less_equals"),
+        GT(Operator.GREATER, "greater"),
+        GE(Operator.GREATER_EQUALS, "greater_equals"),
+        EQ(Operator.EQUALS, OP_EQUALS),
+        NE(Operator.NOT_EQUALS, OP_NOT_EQUALS);
+
+        private final Operator operator;
+        private final String prefix;
+
+        ComparisonOp(Operator operator, String prefix) {
+            this.operator = operator;
+            this.prefix = prefix;
+        }
+
+        boolean equality() {
+            return this == EQ || this == NE;
+        }
     }
+
+    private static final Map<String, ComparisonOp> OPERATORS = Map.of(
+            Operator.LESS.getFunction(), ComparisonOp.LT,
+            Operator.LESS_EQUALS.getFunction(), ComparisonOp.LE,
+            Operator.GREATER.getFunction(), ComparisonOp.GT,
+            Operator.GREATER_EQUALS.getFunction(), ComparisonOp.GE,
+            Operator.EQUALS.getFunction(), ComparisonOp.EQ,
+            Operator.NOT_EQUALS.getFunction(), ComparisonOp.NE);
+
+    private static final Pattern FLOAT_TOKEN = Pattern.compile(
+            "(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?");
 
     private static final RuntimeEquality DEFAULT_EQUALITY =
             ProtoMessageRuntimeEquality.create(DynamicProto.create(DefaultMessageFactory.INSTANCE), CelOptions.DEFAULT);
@@ -57,8 +100,6 @@ public final class DecimalComparisonFunctions {
             .addAll(ORDERING_DECLARATIONS)
             .addAll(CROSS_TYPE_EQUALITY_DECLARATIONS)
             .build();
-
-    private static final ImmutableList<CelFunctionBinding> BINDINGS = buildBindings();
 
     private DecimalComparisonFunctions() {
     }
@@ -78,13 +119,8 @@ public final class DecimalComparisonFunctions {
         return CROSS_TYPE_EQUALITY_DECLARATIONS;
     }
 
-    /** Runtime bindings for all decimal comparisons. */
-    public static ImmutableList<CelFunctionBinding> bindings() {
-        return BINDINGS;
-    }
-
     /**
-     * Configures the CEL runtime builder with decimal comparison bindings and exact equality.
+     * Installs decimal-aware equality alongside CEL's standard runtime functions.
      *
      * <p>Equality fallback for non-decimal operands defaults to {@link CelOptions#DEFAULT} and
      * standard protobuf message equality. Callers configuring runtime builders with non-default
@@ -98,23 +134,21 @@ public final class DecimalComparisonFunctions {
                                 CelStandardFunctions.StandardFunction.EQUALS,
                                 CelStandardFunctions.StandardFunction.NOT_EQUALS)
                         .build())
-                .addFunctionBindings(BINDINGS);
+                .addFunctionBindings(
+                        CelFunctionBinding.from(OP_EQUALS, Object.class, Object.class,
+                                DecimalComparisonFunctions::objectEquals),
+                        CelFunctionBinding.from(OP_NOT_EQUALS, Object.class, Object.class,
+                                (Object x, Object y) -> !objectEquals(x, y)));
     }
 
     private static ImmutableList<CelFunctionDecl> buildOrderingDeclarations() {
-        List<CelFunctionDecl> decls = new ArrayList<>();
-        decls.add(buildOrderingDecl(Operator.LESS, "less"));
-        decls.add(buildOrderingDecl(Operator.LESS_EQUALS, "less_equals"));
-        decls.add(buildOrderingDecl(Operator.GREATER, "greater"));
-        decls.add(buildOrderingDecl(Operator.GREATER_EQUALS, "greater_equals"));
-        return ImmutableList.copyOf(decls);
+        return Arrays.stream(ComparisonOp.values()).filter(op -> !op.equality())
+                .map(op -> buildOrderingDecl(op.operator, op.prefix)).collect(ImmutableList.toImmutableList());
     }
 
     private static ImmutableList<CelFunctionDecl> buildCrossTypeEqualityDeclarations() {
-        List<CelFunctionDecl> decls = new ArrayList<>();
-        decls.add(buildCrossTypeEqualityDecl(Operator.EQUALS, OP_EQUALS));
-        decls.add(buildCrossTypeEqualityDecl(Operator.NOT_EQUALS, OP_NOT_EQUALS));
-        return ImmutableList.copyOf(decls);
+        return Arrays.stream(ComparisonOp.values()).filter(ComparisonOp::equality)
+                .map(op -> buildCrossTypeEqualityDecl(op.operator, op.prefix)).collect(ImmutableList.toImmutableList());
     }
 
     private static CelFunctionDecl buildOrderingDecl(Operator operator, String prefix) {
@@ -142,150 +176,218 @@ public final class DecimalComparisonFunctions {
         );
     }
 
-    private static ImmutableList<CelFunctionBinding> buildBindings() {
-        List<CelFunctionBinding> bindings = new ArrayList<>();
-        addOrderingBindings(bindings, "less", ComparisonOp.LT);
-        addOrderingBindings(bindings, "less_equals", ComparisonOp.LE);
-        addOrderingBindings(bindings, "greater", ComparisonOp.GT);
-        addOrderingBindings(bindings, "greater_equals", ComparisonOp.GE);
+    /** A runtime AST and the decimal overloads it can dispatch after standard CEL dispatch. */
+    public record RuntimeExpression(CelAbstractSyntaxTree ast, CelFunctionResolver functions) {
+    }
 
-        // Standard equals / not_equals overload replacement to handle exact equality:
-        bindings.add(CelFunctionBinding.from(OP_EQUALS, Object.class, Object.class, DecimalComparisonFunctions::objectEquals));
-        bindings.add(CelFunctionBinding.from(OP_NOT_EQUALS, Object.class, Object.class,
-                (Object x, Object y) -> !objectEquals(x, y)));
+    /**
+     * Constant doubles in the AST have already been rounded by CEL. Keep the source token beside
+     * comparison calls that can see a decimal, leaving the original operands and standard overloads
+     * in place. An ordinary DOUBLE column uses its binary value, not this source-token path.
+     */
+    public static RuntimeExpression forRuntime(CelAbstractSyntaxTree ast) {
+        Map<Long, CelReference> references = new HashMap<>(ast.getReferenceMap());
+        List<CelFunctionBinding> overloads = new ArrayList<>();
+        for (CelExpr expression : comparisonCalls(ast)) {
+            var call = expression.call();
+            ComparisonOp op = OPERATORS.get(call.function());
+            LiteralOperand literal = literalOperand(ast, call);
+            var reference = ast.getReferenceOrThrow(expression.id());
+            List<String> candidates = reference.overloadIds();
+            if (literal == null && candidates.stream().noneMatch(id -> id.contains("_decimal"))) {
+                continue;
+            }
+            String id = "tapstate_decimal_comparison_" + expression.id();
+            overloads.add(CelFunctionBinding.from(id, Object.class, Object.class,
+                    (Object left, Object right) -> compareOperands(left, right, literal, op, candidates)));
+            var replacement = CelReference.newBuilder().setName(reference.name()).addOverloadIds(id);
+            if (literal == null || !op.equality()) {
+                // Standard CEL dispatch runs before the late bindings. Only equality with a
+                // literal needs to replace the built-in catch-all and provide its own fallback.
+                replacement.addOverloadIds(candidates);
+            }
+            references.put(expression.id(), replacement.build());
+        }
+        CelAbstractSyntaxTree runtimeAst = overloads.isEmpty() ? ast
+                : CelAbstractSyntaxTree.newCheckedAst(ast.getExpr(), ast.getSource(), references, ast.getTypeMap());
+        return new RuntimeExpression(runtimeAst, CelLateFunctionBindings.from(overloads));
+    }
 
-        // Concrete cross-type equality bindings matching typed check overloads:
-        addCrossTypeBindings(bindings, OP_EQUALS, ComparisonOp.EQ);
-        addCrossTypeBindings(bindings, OP_NOT_EQUALS, ComparisonOp.NE);
+    static String validationError(CelAbstractSyntaxTree ast) {
+        for (CelExpr expression : comparisonCalls(ast)) {
+            var call = expression.call();
+            if (!OPERATORS.get(call.function()).equality()
+                    && call.args().stream().anyMatch(arg -> SimpleType.NULL_TYPE.equals(
+                            ast.getType(arg.id()).orElse(SimpleType.DYN)))) {
+                return "an ordering comparison cannot have a statically null operand";
+            }
+            try {
+                literalOperand(ast, call);
+            } catch (NumberFormatException e) {
+                return "the numeric literal is outside the exact decimal comparison range";
+            }
+        }
+        return null;
+    }
 
-        return ImmutableList.copyOf(bindings);
+    private static List<CelExpr> comparisonCalls(CelAbstractSyntaxTree ast) {
+        return CelNavigableAst.fromAst(ast).getRoot().allNodes()
+                .map(CelNavigableExpr::expr)
+                .filter(expr -> expr.getKind() == CelExpr.ExprKind.Kind.CALL)
+                .filter(expr -> expr.call().args().size() == 2 && OPERATORS.containsKey(expr.call().function()))
+                .toList();
+    }
+
+    private record LiteralOperand(int index, BigDecimal value) {
+    }
+
+    private static LiteralOperand literalOperand(CelAbstractSyntaxTree ast, CelExpr.CelCall call) {
+        for (int i = 0; i < 2; i++) {
+            CelType type = ast.getType(call.args().get(1 - i).id()).orElse(SimpleType.DYN);
+            if (type.equals(SimpleType.DYN) || type.equals(DECIMAL_TYPE)) {
+                BigDecimal literal = sourceDecimal(ast, call.args().get(i));
+                if (literal != null) return new LiteralOperand(i, literal);
+            }
+        }
+        return null;
+    }
+
+    private static BigDecimal sourceDecimal(CelAbstractSyntaxTree ast, CelExpr expr) {
+        if (expr.getKind() == CelExpr.ExprKind.Kind.CALL
+                && expr.call().function().equals(Operator.NEGATE.getFunction())) {
+            BigDecimal operand = sourceDecimal(ast, expr.call().args().getFirst());
+            return operand == null ? null : operand.negate();
+        }
+        if (expr.getKind() != CelExpr.ExprKind.Kind.CONSTANT
+                || expr.constant().getKind() != CelConstant.Kind.DOUBLE_VALUE) {
+            return null;
+        }
+        int position = ast.getSource().getPositionsMap().get(expr.id());
+        var content = ast.getSource().getContent();
+        int end = position;
+        while (end < content.size() && isFloatTokenCharacter(content.get(end))) end++;
+        var matcher = FLOAT_TOKEN.matcher(content.slice(position, end).toString());
+        if (!matcher.lookingAt()) {
+            throw new IllegalStateException("CEL double literal has no matching source token");
+        }
+        BigDecimal value = new BigDecimal(matcher.group());
+        return Double.doubleToRawLongBits(expr.constant().doubleValue()) < 0 ? value.negate() : value;
+    }
+
+    private static boolean isFloatTokenCharacter(int codePoint) {
+        return codePoint >= '0' && codePoint <= '9' || codePoint == '.' || codePoint == 'e'
+                || codePoint == 'E' || codePoint == '+' || codePoint == '-';
+    }
+
+    private static boolean compareOperands(Object left, Object right, LiteralOperand literal,
+            ComparisonOp op, List<String> candidates) {
+        boolean literalEquality = literal != null && op.equality();
+        if (literalEquality && !isDecimal(left) && !isDecimal(right)) {
+            return (op == ComparisonOp.EQ) == objectEquals(left, right);
+        }
+        if (!isNumeric(left) || !isNumeric(right)
+                || (!literalEquality && !matchesDecimalOverload(op, candidates, left, right))) {
+            throw new IllegalArgumentException("No matching decimal comparison operands");
+        }
+        Number a = literal != null && literal.index() == 0 ? literal.value() : (Number) left;
+        Number b = literal != null && literal.index() == 1 ? literal.value() : (Number) right;
+        return compare(a, b, op);
+    }
+
+    private static boolean matchesDecimalOverload(ComparisonOp op, List<String> candidates, Object left, Object right) {
+        String a = numericKind(left);
+        String b = numericKind(right);
+        if (candidates.contains(op.prefix + "_" + a + "_" + b)) return true;
+        // A Decimal128 special value travels as a portable Double. Use it as a decimal only
+        // if ordinary CEL dispatch did not match and the checker admitted its decimal position.
+        boolean specialLeft = isSpecialDouble(left);
+        boolean specialRight = isSpecialDouble(right);
+        return (specialLeft && candidates.contains(op.prefix + "_decimal_" + b))
+                || (specialRight && candidates.contains(op.prefix + "_" + a + "_decimal"))
+                || (specialLeft && specialRight && candidates.contains(op.prefix + SUFFIX_DECIMAL_DECIMAL));
+    }
+
+    private static String numericKind(Object value) {
+        if (isDecimal(value)) return "decimal";
+        if (value instanceof UnsignedLong) return "uint64";
+        return value instanceof Double || value instanceof Float ? "double" : "int64";
+    }
+
+    private static boolean isDecimal(Object value) {
+        return value instanceof BigDecimal || value instanceof BigInteger;
+    }
+
+    private static boolean isSpecialDouble(Object value) {
+        return value instanceof Double number
+                && (!Double.isFinite(number) || Double.doubleToRawLongBits(number) == Long.MIN_VALUE);
+    }
+
+    private static boolean isNumeric(Object value) {
+        return isDecimal(value) || value instanceof Double || value instanceof Float
+                || value instanceof UnsignedLong || value instanceof Long || value instanceof Integer
+                || value instanceof Short || value instanceof Byte;
     }
 
     private static boolean objectEquals(Object x, Object y) {
-        if (x instanceof BigDecimal a) {
-            return decimalEquals(a, y);
+        if (x == y) return true;
+        if (isDecimal(x) || isDecimal(y)) {
+            return isNumeric(x) && isNumeric(y) && compare((Number) x, (Number) y, ComparisonOp.EQ);
         }
-        if (y instanceof BigDecimal b) {
-            return decimalEquals(b, x);
+        if (x instanceof List<?> left && y instanceof List<?> right) {
+            var other = right.iterator();
+            return left.size() == right.size() && every(left.iterator(), value -> objectEquals(value, other.next()));
         }
-        if (x instanceof java.math.BigInteger a) {
-            return decimalEquals(new BigDecimal(a), y);
-        }
-        if (y instanceof java.math.BigInteger b) {
-            return decimalEquals(new BigDecimal(b), x);
+        if (x instanceof Map<?, ?> left && y instanceof Map<?, ?> right) {
+            return left.size() == right.size() && every(left.entrySet().iterator(), entry ->
+                    DEFAULT_EQUALITY.findInMap(right, entry.getKey())
+                            .filter(value -> objectEquals(entry.getValue(), value)).isPresent());
         }
         return DEFAULT_EQUALITY.objectEquals(x, y);
     }
 
-    private static boolean decimalEquals(BigDecimal dec, Object other) {
-        if (other instanceof BigDecimal b) {
-            return compareDecimalDecimal(dec, b, ComparisonOp.EQ);
-        }
-        if (other instanceof java.math.BigInteger b) {
-            return compareDecimalDecimal(dec, new BigDecimal(b), ComparisonOp.EQ);
-        }
-        if (other instanceof Double || other instanceof Float) {
-            return compareDecimalDouble(dec, ((Number) other).doubleValue(), ComparisonOp.EQ);
-        }
-        if (other instanceof UnsignedLong b) {
-            return compareDecimalUint64(dec, b, ComparisonOp.EQ);
-        }
-        if (other instanceof Number n) {
-            return compareDecimalInt64(dec, n.longValue(), ComparisonOp.EQ);
-        }
-        return DEFAULT_EQUALITY.objectEquals(dec, other);
-    }
-
-    private static void addOrderingBindings(List<CelFunctionBinding> bindings, String prefix, ComparisonOp op) {
-        bindings.add(CelFunctionBinding.from(
-                prefix + SUFFIX_DECIMAL_DECIMAL, BigDecimal.class, BigDecimal.class,
-                (BigDecimal x, BigDecimal y) -> compareDecimalDecimal(x, y, op)));
-
-        addCrossTypeBindings(bindings, prefix, op);
-    }
-
-    private static void addCrossTypeBindings(List<CelFunctionBinding> bindings, String prefix, ComparisonOp op) {
-        bindings.add(CelFunctionBinding.from(
-                prefix + SUFFIX_DECIMAL_INT64, BigDecimal.class, Long.class,
-                (BigDecimal x, Long y) -> compareDecimalInt64(x, y, op)));
-
-        bindings.add(CelFunctionBinding.from(
-                prefix + SUFFIX_INT64_DECIMAL, Long.class, BigDecimal.class,
-                (Long x, BigDecimal y) -> compareInt64Decimal(x, y, op)));
-
-        bindings.add(CelFunctionBinding.from(
-                prefix + SUFFIX_DECIMAL_UINT64, BigDecimal.class, UnsignedLong.class,
-                (BigDecimal x, UnsignedLong y) -> compareDecimalUint64(x, y, op)));
-
-        bindings.add(CelFunctionBinding.from(
-                prefix + SUFFIX_UINT64_DECIMAL, UnsignedLong.class, BigDecimal.class,
-                (UnsignedLong x, BigDecimal y) -> compareUint64Decimal(x, y, op)));
-
-        bindings.add(CelFunctionBinding.from(
-                prefix + SUFFIX_DECIMAL_DOUBLE, BigDecimal.class, Double.class,
-                (BigDecimal x, Double y) -> compareDecimalDouble(x, y, op)));
-
-        bindings.add(CelFunctionBinding.from(
-                prefix + SUFFIX_DOUBLE_DECIMAL, Double.class, BigDecimal.class,
-                (Double x, BigDecimal y) -> compareDoubleDecimal(x, y, op)));
-    }
-
-    private static boolean compareDecimalDecimal(BigDecimal a, BigDecimal b, ComparisonOp op) {
-        int cmp = a.compareTo(b);
-        return evaluateResult(cmp, op);
-    }
-
-    private static boolean compareDecimalInt64(BigDecimal a, Long b, ComparisonOp op) {
-        int cmp = a.compareTo(BigDecimal.valueOf(b));
-        return evaluateResult(cmp, op);
-    }
-
-    private static boolean compareInt64Decimal(Long a, BigDecimal b, ComparisonOp op) {
-        return compareDecimalInt64(b, a, mirror(op));
-    }
-
-    private static boolean compareDecimalUint64(BigDecimal a, UnsignedLong b, ComparisonOp op) {
-        int cmp = a.compareTo(new BigDecimal(b.bigIntegerValue()));
-        return evaluateResult(cmp, op);
-    }
-
-    private static boolean compareUint64Decimal(UnsignedLong a, BigDecimal b, ComparisonOp op) {
-        return compareDecimalUint64(b, a, mirror(op));
-    }
-
-    private static boolean compareDecimalDouble(BigDecimal decimal, Double d, ComparisonOp op) {
-        if (d.isNaN()) {
-            return op == ComparisonOp.NE;
-        }
-        if (Double.isInfinite(d)) {
-            if (d > 0) {
-                return switch (op) {
-                    case LT, LE, NE -> true;
-                    case GT, GE, EQ -> false;
-                };
-            } else {
-                return switch (op) {
-                    case GT, GE, NE -> true;
-                    case LT, LE, EQ -> false;
-                };
+    // Match CEL's aggregate equality: a false element overrides an error in an earlier element.
+    private static <T> boolean every(Iterator<T> values, Predicate<T> equals) {
+        IllegalArgumentException error = null;
+        while (values.hasNext()) {
+            try {
+                if (!equals.test(values.next())) return false;
+            } catch (IllegalArgumentException e) {
+                error = e;
             }
         }
-        int cmp = decimal.compareTo(BigDecimal.valueOf(d));
-        return evaluateResult(cmp, op);
+        if (error != null) throw error;
+        return true;
     }
 
-    private static boolean compareDoubleDecimal(Double d, BigDecimal decimal, ComparisonOp op) {
-        return compareDecimalDouble(decimal, d, mirror(op));
+    private static boolean compare(Number a, Number b, ComparisonOp op) {
+        if (isNan(a) || isNan(b)) return op == ComparisonOp.NE;
+        int infiniteA = infinity(a);
+        int infiniteB = infinity(b);
+        int result = infiniteA != 0 || infiniteB != 0
+                ? Integer.compare(infiniteA, infiniteB) : finiteDecimal(a).compareTo(finiteDecimal(b));
+        return evaluateResult(result, op);
     }
 
-    private static ComparisonOp mirror(ComparisonOp op) {
-        return switch (op) {
-            case LT -> ComparisonOp.GT;
-            case LE -> ComparisonOp.GE;
-            case GT -> ComparisonOp.LT;
-            case GE -> ComparisonOp.LE;
-            case EQ -> ComparisonOp.EQ;
-            case NE -> ComparisonOp.NE;
+    private static boolean isNan(Number value) {
+        return (value instanceof Double || value instanceof Float) && Double.isNaN(value.doubleValue());
+    }
+
+    private static int infinity(Number value) {
+        if (!(value instanceof Double || value instanceof Float)) return 0;
+        double number = value.doubleValue();
+        if (number == Double.POSITIVE_INFINITY) return 1;
+        return number == Double.NEGATIVE_INFINITY ? -1 : 0;
+    }
+
+    private static BigDecimal finiteDecimal(Number value) {
+        return switch (value) {
+            case BigDecimal decimal -> decimal;
+            case BigInteger integer -> new BigDecimal(integer);
+            case UnsignedLong unsigned -> new BigDecimal(unsigned.bigIntegerValue());
+            // Use the exact binary value held by a DOUBLE row operand. valueOf uses its printed form.
+            case Double number -> new BigDecimal(number);
+            case Float number -> new BigDecimal(number.doubleValue());
+            default -> BigDecimal.valueOf(value.longValue());
         };
     }
 

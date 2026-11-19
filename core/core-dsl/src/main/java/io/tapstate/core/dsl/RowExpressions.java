@@ -211,7 +211,7 @@ public final class RowExpressions {
             return result.getErrorString();
         }
         CelAbstractSyntaxTree ast = checked(result);
-        String diagnostic = indexedRow(ast);
+        String diagnostic = checkedExpressionError(ast);
         if (diagnostic == null && ast.getResultType().equals(celTypeOf(TapstateType.DECIMAL))
                 && movedColumn(ast.getExpr()) == null) {
             return "a computed tapstate.decimal result has no declared precision, scale or bounds; "
@@ -350,7 +350,12 @@ public final class RowExpressions {
         if (result.hasError()) {
             return result.getErrorString();
         }
-        return indexedRow(checked(result));
+        return checkedExpressionError(checked(result));
+    }
+
+    private static String checkedExpressionError(CelAbstractSyntaxTree ast) {
+        String diagnostic = indexedRow(ast);
+        return diagnostic == null ? DecimalComparisonFunctions.validationError(ast) : diagnostic;
     }
 
     /**

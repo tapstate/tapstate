@@ -22,6 +22,16 @@ import org.junit.jupiter.api.Test;
  */
 class RowExpressionTypedCheckTest {
 
+    @Test
+    void orderingRejectsStaticallyNullOperandsButEqualityStillAcceptsThem() {
+        for (String expression : List.of("null > 25", "25 < null", "after.amount <= null")) {
+            assertThat(RowExpressions.predicateError(expression)).as(expression).isNotNull();
+            assertThat(RowExpressions.typedPredicateError(expression, columns())).as(expression).isNotNull();
+        }
+        assertThat(RowExpressions.typedPredicateError("after.amount > 25", columns())).isNull();
+        assertThat(RowExpressions.typedPredicateError("after.amount == null", columns())).isNull();
+    }
+
     private static Map<String, TapstateType> columns() {
         Map<String, TapstateType> types = new LinkedHashMap<>();
         types.put("id", TapstateType.INT64);

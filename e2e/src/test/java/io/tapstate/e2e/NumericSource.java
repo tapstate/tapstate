@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Map;
 
 import org.testcontainers.containers.MySQLContainer;
+import org.yaml.snakeyaml.DumperOptions;
+import org.yaml.snakeyaml.Yaml;
 
 /**
  * The one real numeric table the two type-gate witnesses are written against, and the workspace they
@@ -130,6 +132,10 @@ final class NumericSource {
     }
 
     private static String filterPipelineYaml(String pipelineId, String filterExpr) {
+        DumperOptions scalar = new DumperOptions();
+        scalar.setDefaultScalarStyle(DumperOptions.ScalarStyle.DOUBLE_QUOTED);
+        scalar.setSplitLines(false);
+        String expression = new Yaml(scalar).dump(filterExpr).stripTrailing();
         return """
                 version: tapstate/v1
                 kind: pipeline
@@ -137,13 +143,13 @@ final class NumericSource {
                 source: %s
                 settings: { read_mode: snapshot_and_cdc }
                 transforms:
-                  - { id: filtered, from: [%s], type: filter, expr: "%s" }
+                  - { id: filtered, from: [%s], type: filter, expr: %s }
                 serve:
                   from: filtered
                   sync:
                     - source: %s
                 """
-                .formatted(pipelineId, SOURCE_ID, TABLE, filterExpr, TARGET_ID);
+                .formatted(pipelineId, SOURCE_ID, TABLE, expression, TARGET_ID);
     }
 
     private static String sourceYaml(Map<String, Object> config) {

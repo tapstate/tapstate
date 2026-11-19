@@ -17,6 +17,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 
 import java.math.BigDecimal;
 import java.util.Map;
+import java.util.Optional;
 
 class DecimalComparisonFunctionsTest {
 
@@ -36,7 +37,9 @@ class DecimalComparisonFunctionsTest {
     private static boolean eval(String expr, Map<String, Object> vars) {
         try {
             CelAbstractSyntaxTree ast = COMPILER.compile(expr).getAst();
-            return (Boolean) RUNTIME.createProgram(ast).eval(vars);
+            var prepared = DecimalComparisonFunctions.forRuntime(ast);
+            return (Boolean) RUNTIME.createProgram(prepared.ast())
+                    .eval(name -> Optional.ofNullable(vars.get(name)), prepared.functions());
         } catch (Exception e) {
             throw new RuntimeException("failed evaluating: " + expr + " with vars: " + vars, e);
         }
@@ -57,33 +60,18 @@ class DecimalComparisonFunctionsTest {
     }
 
     @Test
-    @DisplayName("decimal vs fractional double literal compares exactly without binary float drift")
-    void decimalVsFractionalDoubleLiteral() {
+    @DisplayName("runtime float compares by its binary value while direct CEL literals retain their decimal text")
+    void decimalLiteralAndDoubleColumnHaveDifferentRepresentations() {
         Map<String, Object> vars = Map.of("dec1", new BigDecimal("25.1000"), "d", 25.1);
-        assertThat(eval("dec1 == d", vars)).isTrue();
-        assertThat(eval("d == dec1", vars)).isTrue();
-        assertThat(eval("dec1 >= d", vars)).isTrue();
-        assertThat(eval("d >= dec1", vars)).isTrue();
-        assertThat(eval("dec1 <= d", vars)).isTrue();
-        assertThat(eval("d <= dec1", vars)).isTrue();
-        assertThat(eval("dec1 > d", vars)).isFalse();
-        assertThat(eval("d > dec1", vars)).isFalse();
-        assertThat(eval("dec1 < d", vars)).isFalse();
-        assertThat(eval("d < dec1", vars)).isFalse();
-        assertThat(eval("dec1 != d", vars)).isFalse();
-        assertThat(eval("d != dec1", vars)).isFalse();
+        assertThat(eval("dec1 == 25.1", vars)).isTrue();
+        assertThat(eval("25.1 == dec1", vars)).isTrue();
+        assertThat(eval("dec1 < d", vars)).isTrue();
+        assertThat(eval("d > dec1", vars)).isTrue();
+        assertThat(eval("dec1 == d", vars)).isFalse();
 
-        Map<String, Object> pointOne = Map.of("dec1", new BigDecimal("0.1"), "d", 0.1);
-        assertThat(eval("dec1 == d", pointOne)).isTrue();
-        assertThat(eval("d == dec1", pointOne)).isTrue();
-        assertThat(eval("dec1 != d", pointOne)).isFalse();
-        assertThat(eval("d != dec1", pointOne)).isFalse();
-
-        Map<String, Object> slightlyAbove = Map.of("dec1", new BigDecimal("25.100000000000001421"), "d", 25.1);
-        assertThat(eval("dec1 > d", slightlyAbove)).isTrue();
-        assertThat(eval("d < dec1", slightlyAbove)).isTrue();
-        assertThat(eval("dec1 >= d", slightlyAbove)).isTrue();
-        assertThat(eval("dec1 == d", slightlyAbove)).isFalse();
+        Map<String, Object> powerOfTwo = Map.of("dec1", new BigDecimal("4611686018427387904"), "d", 0x1.0p62);
+        assertThat(eval("dec1 == d", powerOfTwo)).isTrue();
+        assertThat(eval("d == dec1", powerOfTwo)).isTrue();
     }
 
     @Test
