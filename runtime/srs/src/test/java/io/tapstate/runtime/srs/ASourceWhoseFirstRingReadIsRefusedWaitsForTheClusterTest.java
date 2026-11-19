@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import static com.hazelcast.jet.core.Edge.between;
 import static io.tapstate.runtime.srs.SplitBrainProtectionTestSupport.awaitMinimumSize;
+import static io.tapstate.runtime.srs.SrsClusterTestSupport.startMember;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.config.Config;
@@ -9,7 +10,6 @@ import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.config.SplitBrainProtectionConfig;
-import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.config.JobConfig;
@@ -28,7 +28,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -70,9 +69,8 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
 
     @Test
     void aSourceRefusedItsFirstReadWaitsForTheClusterInsteadOfEndingTheRun() throws Exception {
-        first = Hazelcast.newHazelcastInstance(member(List.of()));
-        var seed = List.of("127.0.0.1:" + first.getCluster().getLocalMember().getAddress().getPort());
-        second = Hazelcast.newHazelcastInstance(member(seed));
+        first = startMember(memberConfig());
+        second = startMember(memberConfig(), first);
         awaitMembers(first, 2, Duration.ofSeconds(10));
         awaitMinimumSize(PROTECTION, first, second);
         awaitClusterSafe(first, Duration.ofSeconds(10));
@@ -107,7 +105,7 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
                 .as("and it really was refused -- nothing was read while the cluster said no")
                 .isEmpty();
 
-        second = Hazelcast.newHazelcastInstance(member(seed));
+        second = startMember(memberConfig(), first);
         awaitMinimumSize(PROTECTION, first, second);
 
         awaitSize(first, CHANGES);
@@ -119,16 +117,9 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
     }
 
     /** A member of a cluster whose change rings are only readable while both members are present. */
-    private Config member(List<String> seeds) {
+    private Config memberConfig() {
         Config config = new Config();
         config.setClusterName(cluster);
-        config.setProperty("hazelcast.phone.home.enabled", "false");
-        config.setProperty("hazelcast.shutdownhook.enabled", "false");
-        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
-        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
-        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
-        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
-        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true).setMembers(seeds);
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(PROTECTION, true)
                 .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
