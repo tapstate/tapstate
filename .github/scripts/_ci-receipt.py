@@ -717,6 +717,19 @@ def build_toolchain_identity(value):
     return identity
 
 
+def toolchain_difference(expected, observed):
+    # Name each differing toolchain entry with both observations, so a runner
+    # mismatch can be diagnosed from the job log alone.
+    if not isinstance(expected, dict) or not isinstance(observed, dict):
+        return ' (toolchain is not an object)'
+    parts = []
+    for key in sorted(expected.keys() | observed.keys()):
+        if expected.get(key) != observed.get(key):
+            parts.append(key + ': build=' + json.dumps(expected.get(key))[:600]
+                         + ' shard=' + json.dumps(observed.get(key))[:600])
+    return ' (' + '; '.join(parts) + ')'
+
+
 def compare_input_snapshots(plan, aggregate, workers):
     require(isinstance(plan, dict) and isinstance(aggregate, dict) and isinstance(workers, dict),
             'invalid independent input snapshot objects')
@@ -745,6 +758,8 @@ def compare_input_snapshots(plan, aggregate, workers):
             observed, expected = value.get(field), aggregate[field]
             if field == 'toolchain':
                 observed, expected = build_toolchain_identity(observed), build_toolchain_identity(expected)
+                require(observed == expected, 'independent build input differs: ' + name + '/' + field
+                        + toolchain_difference(expected, observed))
             require(observed == expected, 'independent build input differs: ' + name + '/' + field)
         available = value.get('dependency_repository_files')
         require(isinstance(available, dict), 'dependency hash map missing: ' + name)
