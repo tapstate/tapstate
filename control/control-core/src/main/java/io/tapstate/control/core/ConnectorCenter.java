@@ -14,5 +14,5 @@ public interface ConnectorCenter {
     Map<String, Object> operation(String operationId);
 
     /** Consumes the caller-owned stream during this call before returning an installation operation. */
-    Map<String, Object> upload(InputStream artifact, long contentLength);
+    Map<String, Object> upload(InputStream artifact, long contentLength, String expectedConnectorId);
 }

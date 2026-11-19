@@ -71,11 +71,13 @@ final class ConnectorCenterController {
 
     @Verb("connector-center.upload")
     @PostMapping(value = "/connector-center:upload", consumes = {"application/java-archive", "application/octet-stream"})
-    Map<String, Object> upload(HttpServletRequest request) {
+    Map<String, Object> upload(HttpServletRequest request,
+            @RequestParam(name = "connectorId", required = false) String expectedConnectorId) {
+        if (expectedConnectorId != null) MalformedRequest.requireText(expectedConnectorId, "a connector id is required");
         var service = service();
         String principal = AuthenticatedCaller.subject();
         try {
-            return service.upload(request.getInputStream(), request.getContentLengthLong(), principal);
+            return service.upload(request.getInputStream(), request.getContentLengthLong(), expectedConnectorId, principal);
         } catch (IOException unreadable) {
             throw MalformedRequest.rejecting("the connector artifact could not be read", null);
         }

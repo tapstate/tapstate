@@ -73,6 +73,10 @@ class ConnectorCenterControllerTest {
             mvc.perform(post("/api/connector-center:upload").contentType("application/java-archive").content(artifact))
                     .andExpect(status().isOk());
 
+            assertThat(center.expectedConnectorId).isNull();
+            mvc.perform(post("/api/connector-center:upload").param("connectorId", "mysql")
+                    .contentType("application/java-archive").content(artifact)).andExpect(status().isOk());
+            assertThat(center.expectedConnectorId).isEqualTo("mysql");
             assertThat(center.uploaded).isEqualTo(artifact);
             assertThat(center.length).isEqualTo(artifact.length);
             assertThat(center.download).isEqualTo("mongodb");
@@ -113,6 +117,7 @@ class ConnectorCenterControllerTest {
     static final class CapturedCenter implements ConnectorCenter {
         private byte[] uploaded;
         private long length;
+        private String expectedConnectorId;
         private String download;
         private String operation;
 
@@ -120,13 +125,14 @@ class ConnectorCenterControllerTest {
         @Override public Map<String, Object> refresh() { return Map.of("stage", "refreshed"); }
         @Override public Map<String, Object> download(String id) { download = id; return Map.of("id", "original-operation"); }
         @Override public Map<String, Object> operation(String id) { operation = id; return Map.of("stage", "installing"); }
-        @Override public Map<String, Object> upload(InputStream artifact, long contentLength) {
+        @Override public Map<String, Object> upload(InputStream artifact, long contentLength, String expectedConnectorId) {
             try {
                 uploaded = artifact.readAllBytes();
             } catch (IOException failure) {
                 throw new UncheckedIOException(failure);
             }
             length = contentLength;
+            this.expectedConnectorId = expectedConnectorId;
             return Map.of("id", "uploaded-operation");
         }
     }

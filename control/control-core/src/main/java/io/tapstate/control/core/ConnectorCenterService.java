@@ -32,9 +32,9 @@ public final class ConnectorCenterService {
         return center.operation(operationId);
     }
 
-    public Map<String, Object> upload(InputStream artifact, long contentLength, String principal) {
+    public Map<String, Object> upload(InputStream artifact, long contentLength, String expectedConnectorId, String principal) {
         Objects.requireNonNull(artifact, "artifact");
         return audit.dispatch(ControlOperations.CONNECTOR_CENTER_UPLOAD,
-                new AuditContext(principal, "connector-upload"), () -> center.upload(artifact, contentLength));
+                new AuditContext(principal, "connector-upload"), () -> center.upload(artifact, contentLength, expectedConnectorId));
     }
 }

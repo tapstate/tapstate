@@ -110,7 +110,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
     }
 
     @Override
-    public Map<String, Object> upload(InputStream artifact, long size) {
+    public Map<String, Object> upload(InputStream artifact, long size, String expectedConnectorId) {
         if (cloud) throw new TapstateException(ConnectorError.CLOUD_UPLOAD_DISABLED, Map.of(), null);
         var operation = begin(null, size);
         LocalConnectorArtifacts.StagedArtifact staged;
@@ -124,7 +124,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
         try {
             workers.submit(() -> {
                 try (staged) {
-                    install(operation, staged, Origin.UPLOAD, null, null);
+                    install(operation, staged, Origin.UPLOAD, expectedConnectorId, null);
                 } catch (TapstateException failure) {
                     operation.fail(failure.code().code());
                 } catch (RuntimeException bug) {
