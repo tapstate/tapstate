@@ -14,6 +14,7 @@ import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.dsl.PipelineInputs;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -636,18 +637,34 @@ class PipelineOutputNamesTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"managed", "target"})
-    void aNestViewRequiresExclusiveWritesToItsStoreAndCollection(String syncStore) {
+    @CsvSource({"managed, mongodb://localhost/views, 'uri: mongodb://localhost/views', combined, true",
+            "target, mongodb://localhost/views, 'uri: \"mongodb://sink:secret@LOCALHOST:27017/views?authSource=admin\"', combined, true",
+            "target, mongodb://localhost/views, 'isUri: false, host: LOCALHOST:27017, database: views', combined, true",
+            "target, mongodb://localhost/views, 'uri: \"mongodb://otherhost,localhost/views\"', combined, true",
+            "target, mongodb://localhost/views, 'uri: mongodb://localhost/dest', combined, false",
+            "target, mongodb://localhost/views, 'uri: mongodb://otherhost/views', combined, false",
+            "managed, mongodb://localhost/views, 'uri: mongodb://localhost/views', copied, false",
+            "target, mongodb+srv://views.example.invalid/views, 'uri: mongodb+srv://VIEWS.EXAMPLE.INVALID/views', combined, true",
+            "target, mongodb+srv://views.example.invalid/views, 'uri: \"mongodb+srv://views.example.invalid/views?srvServiceName=other\"', combined, false"})
+    void aNestViewRequiresExclusiveWritesToItsStoreAndCollection(
+            String syncStore, String viewUri, String syncConfig, String syncCollection, boolean shared) {
         var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: target
+                connector: mongodb
+                config: {%s}
+                """.formatted(syncConfig)));
         store.artifacts().save(new DslParser().parse("""
                 version: tapstate/v1
                 kind: source
                 id: managed
                 metadata: {labels: {store: "true"}}
                 connector: mongodb
-                config: {uri: "mongodb://localhost/views"}
-                """));
-        pipeline(store, """
+                config: {uri: "%s"}
+                """.formatted(viewUri)));
+        var pipeline = pipeline(store, """
                 transforms:
                   - id: assembled
                     type: nest
@@ -659,17 +676,19 @@ class PipelineOutputNamesTest {
                 view: {id: combined, from: assembled, primary_key: id}
                 serve:
                   from: customers
-                  sync: [{id: sink, source: %s, rename: {map: {customers: combined}}}]
-                """.formatted(syncStore));
+                  sync: [{id: sink, source: %s, rename: {map: {customers: %s}}}]
+                """.formatted(syncStore, syncCollection));
+        var bindings = buildViewFixture(store, pipeline);
+        assertThat(bindings.get("combined")).containsEntry("assembled", "combined");
+        assertThat(bindings.get("sink")).containsEntry("customers", syncCollection);
         lag(store, Map.of("assembled", 5L, "orders", 1L, "customers", 900L));
         var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
 
-        assertThat(rows).hasSize(2).allSatisfy(row ->
-                assertThat(row.location().collection()).isEqualTo("combined"));
-        assertThat(rows).anySatisfy(row -> {
+        assertThat(rows).hasSize(2).anySatisfy(row -> {
             assertThat(row.id()).isEqualTo("p:combined");
+            assertThat(row.location().collection()).isEqualTo("combined");
             assertThat(row.location().storeId()).isEqualTo("managed");
-            if (syncStore.equals("managed")) {
+            if (shared) {
                 assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
                 assertThat(row.status().eventAgeSeconds()).isNull();
             } else {
@@ -678,6 +697,7 @@ class PipelineOutputNamesTest {
             }
         }).anySatisfy(row -> {
             assertThat(row.id()).isEqualTo("p:sink:customers");
+            assertThat(row.location().collection()).isEqualTo(syncCollection);
             assertThat(row.location().storeId()).isEqualTo(syncStore);
             assertThat(row.status().eventAgeSeconds()).isEqualTo(901);
         });
@@ -687,12 +707,13 @@ class PipelineOutputNamesTest {
     @ValueSource(strings = {"orders", "forwarded"})
     void aPassthroughNestUsesTheStreamItsSinkConfirms(String root) {
         var store = sources();
-        pipeline(store, """
+        var pipeline = pipeline(store, """
                 transforms:
                   - {id: forwarded, type: nest, from: {o: orders}, root: {from: o, key: [id]}}
-                  - {id: materialized, type: nest, from: {o: %s}, root: {from: o, key: [id]}}
+                  - {id: materialized, type: nest, from: {input: %s}, root: {from: input, key: [id]}}
                 view: {id: combined, from: materialized, primary_key: id}
                 """.formatted(root));
+        assertThat(buildViewFixture(store, pipeline).get("combined")).containsEntry("orders", "combined");
         var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
 
         lag(store, Map.of("orders", 5L, "materialized", 900L));
@@ -727,6 +748,64 @@ class PipelineOutputNamesTest {
             assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
             assertThat(row.status().eventAgeSeconds()).isNull();
         });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"orders", "customers"})
+    void aPassthroughNestCountsEveryStreamForwardedByAnotherSink(String root) {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                transforms:
+                  - {id: selected, type: nest, from: {one: %s}, root: {from: one, key: [id]}}
+                  - {id: merged, type: union, from: [orders, customers]}
+                  - {id: forwarded, type: nest, from: {both: merged}, root: {from: both, key: [id]}}
+                view: {id: combined, from: selected, primary_key: id}
+                serve:
+                  from: forwarded
+                  sync: [{id: sink, source: target}]
+                """.formatted(root));
+        var bindings = buildViewFixture(store, pipeline);
+        assertThat(bindings.get("combined")).containsEntry(root, "combined");
+        assertThat(bindings.get("sink")).containsKeys("orders", "customers");
+        lag(store, Map.of("orders", 5L, "customers", 20L));
+        assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list())
+                .filteredOn(row -> row.id().equals("p:combined")).singleElement().satisfies(row -> {
+                    assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+                    assertThat(row.status().eventAgeSeconds()).isNull();
+                });
+    }
+
+    @Test
+    void aNestViewWaitsForLookupSnapshotDeliveryEvenWithoutAnEstimate() {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                view: {id: combined, from: assembled, primary_key: id}
+                """);
+        buildViewFixture(store, pipeline);
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        var landed = new TableSnapshot(5, 5L, 100, true);
+
+        lag(store, Map.of("assembled", 5L), Map.of("orders", landed,
+                "customers", new TableSnapshot(2, null, null, false)));
+        var loading = query.list().getFirst().status();
+        assertThat(loading.state()).isEqualTo("loading");
+        assertThat(loading.reason()).isEqualTo("snapshot-loading");
+        assertThat(loading.percent()).isNull();
+        assertThat(loading.eventAgeSeconds()).isNull();
+
+        lag(store, Map.of("assembled", 5L), Map.of("orders", landed, "customers", landed,
+                "unrelated", new TableSnapshot(2, null, null, false)));
+        var fresh = query.list().getFirst().status();
+        assertThat(fresh.state()).isEqualTo("fresh");
+        assertThat(fresh.eventAgeSeconds()).isEqualTo(6);
     }
 
     @Test
@@ -910,10 +989,55 @@ class PipelineOutputNamesTest {
 
     private static final Instant LAG_AT = Instant.parse("2026-10-29T00:00:00Z");
     private static void lag(InMemoryStorePort store, Map<String, Long> tables) {
+        lag(store, tables, Map.of());
+    }
+
+    private static void lag(InMemoryStorePort store, Map<String, Long> tables, Map<String, TableSnapshot> snapshot) {
         var points = tables.entrySet().stream().map(entry -> MetricPoint.reading(
                 Map.of(MetricAttributes.PIPELINE_ID, "p", MetricAttributes.TABLE_ID, entry.getKey()), LAG_AT, entry.getValue())).toList();
-        store.observations().save(new Observation("p", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, LAG_AT,
+        store.observations().save(new Observation("p", PipelineState.RUNNING, Map.of(), snapshot, Map.of(), null, LAG_AT,
                 List.of(new MetricFact("tapstate.pipeline.lag", MetricType.GAUGE, "s", points))));
+    }
+
+    private static Map<String, Map<String, String>> buildViewFixture(InMemoryStorePort store, PipelineResource pipeline) {
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: views
+                connector: mongodb
+                config: {uri: "mongodb://localhost/default_views"}
+                """));
+        io.tapstate.core.dsl.Workspace.of(store.artifacts().list());
+        var fields = List.of(new io.tapstate.spi.store.SourceField("id", "long"),
+                new io.tapstate.spi.store.SourceField("customer_id", "long"));
+        var tables = List.of("orders", "customers").stream()
+                .map(table -> new io.tapstate.spi.store.SourceTable(table, fields, List.of("id"), List.of())).toList();
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("src", "mongodb", 0L,
+                new io.tapstate.spi.store.SourceModel(tables)));
+        OpenRingGenerations.forSources(store, "src");
+        Map<String, Map<String, String>> bindings = new java.util.HashMap<>();
+        var binder = new StoreBackedDagSource.SinkWriterBinder() {
+            @Override
+            public com.hazelcast.function.SupplierEx<io.tapstate.spi.sink.SinkWriter> bind(
+                    String connector, Map<String, Object> config, io.tapstate.spi.sink.WriteMode mode,
+                    io.tapstate.spi.sink.DdlPolicy ddl, io.tapstate.spi.sink.TargetTable target,
+                    io.tapstate.core.model.PipelineNode node) {
+                throw new AssertionError("Expected a stream-keyed binding");
+            }
+
+            @Override
+            public com.hazelcast.function.SupplierEx<io.tapstate.spi.sink.SinkWriter> bind(
+                    String connector, Map<String, Object> config, io.tapstate.spi.sink.WriteMode mode,
+                    io.tapstate.spi.sink.DdlPolicy ddl, Map<String, io.tapstate.spi.sink.TargetTable> targets,
+                    io.tapstate.core.model.PipelineNode node) {
+                var collections = new java.util.HashMap<String, String>();
+                targets.forEach((stream, target) -> collections.put(stream, target.name()));
+                bindings.put(node.nodeId(), collections);
+                return () -> null;
+            }
+        };
+        new StoreBackedDagSource(store, binder).dagFor(pipeline.id());
+        return bindings;
     }
 
     private static InMemoryStorePort sources() {
@@ -924,6 +1048,7 @@ class PipelineOutputNamesTest {
                 kind: source
                 id: src
                 connector: mongodb
+                mode: cdc
                 config: {uri: "mongodb://localhost/input"}
                 tables: [orders, customers]
                 """));

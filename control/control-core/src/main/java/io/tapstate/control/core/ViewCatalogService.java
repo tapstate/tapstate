@@ -5,6 +5,7 @@ import java.util.Set;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -135,10 +136,13 @@ public final class ViewCatalogService {
         if (age > FRESH_LIMIT_SECONDS)
             return freshness("stale", eventAge, age, observed, now, null, aggregation, "observation-stale");
         var tables = inputTables(inputs, qualifiedTables);
-        Integer progress = snapshot == null ? null : snapshot.snapshot().entrySet().stream()
-                .filter(entry -> tables.contains(entry.getKey())).map(entry -> entry.getValue().donePct())
+        List<TableSnapshot> progressByTable = snapshot == null ? List.of() : snapshot.snapshot().entrySet().stream()
+                .filter(entry -> tables.contains(entry.getKey())).map(Map.Entry::getValue).toList();
+        boolean awaitingDelivery = progressByTable.stream().anyMatch(table -> !table.landed());
+        boolean unknown = progressByTable.stream().anyMatch(table -> !table.landed() && table.donePct() == null);
+        Integer progress = unknown ? null : progressByTable.stream().map(TableSnapshot::donePct)
                 .filter(Objects::nonNull).min(Integer::compareTo).orElse(null);
-        if (progress != null && progress < 100)
+        if (awaitingDelivery || progress != null && progress < 100)
             return freshness("loading", null, age, observed, now, progress, aggregation, "snapshot-loading");
         if (measurement == null)
             return freshness("stale", null, age, observed, now, null, aggregation, "measurement-unavailable");
