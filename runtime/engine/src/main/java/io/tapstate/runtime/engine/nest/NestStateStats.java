@@ -2,7 +2,9 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.lifecycle.HistogramBounds;
+import java.util.Arrays;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAccumulator;
 import java.util.concurrent.atomic.LongAdder;
@@ -161,6 +163,53 @@ public final class NestStateStats {
     public record Weight(long documents, long[] documentBuckets, long documentBytes, long largestDocument,
             long groups, long[] groupBuckets, long groupBytes, long folds, long[] foldBuckets, long foldNanos,
             long countingSinceMillis) {
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Weight that
+                    && documents == that.documents
+                    && Arrays.equals(documentBuckets, that.documentBuckets)
+                    && documentBytes == that.documentBytes
+                    && largestDocument == that.largestDocument
+                    && groups == that.groups
+                    && Arrays.equals(groupBuckets, that.groupBuckets)
+                    && groupBytes == that.groupBytes
+                    && folds == that.folds
+                    && Arrays.equals(foldBuckets, that.foldBuckets)
+                    && foldNanos == that.foldNanos
+                    && countingSinceMillis == that.countingSinceMillis;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Long.hashCode(documents);
+            result = 31 * result + Arrays.hashCode(documentBuckets);
+            result = 31 * result + Long.hashCode(documentBytes);
+            result = 31 * result + Long.hashCode(largestDocument);
+            result = 31 * result + Long.hashCode(groups);
+            result = 31 * result + Arrays.hashCode(groupBuckets);
+            result = 31 * result + Long.hashCode(groupBytes);
+            result = 31 * result + Long.hashCode(folds);
+            result = 31 * result + Arrays.hashCode(foldBuckets);
+            result = 31 * result + Long.hashCode(foldNanos);
+            result = 31 * result + Long.hashCode(countingSinceMillis);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Weight["
+                    + "documents=" + documents
+                    + ", documentBuckets=" + Arrays.toString(documentBuckets)
+                    + ", documentBytes=" + documentBytes
+                    + ", largestDocument=" + largestDocument
+                    + ", groups=" + groups
+                    + ", groupBuckets=" + Arrays.toString(groupBuckets)
+                    + ", groupBytes=" + groupBytes
+                    + ", folds=" + folds
+                    + ", foldBuckets=" + Arrays.toString(foldBuckets)
+                    + ", foldNanos=" + foldNanos
+                    + ", countingSinceMillis=" + countingSinceMillis + "]";
+        }
     }
 
     long commitGroups(String namespace) {

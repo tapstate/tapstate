@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.aggregate;
 import com.hazelcast.core.HazelcastInstance;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -69,6 +70,33 @@ public final class AggregateRequests {
         public static Request page(Action action, byte[] after, int groups) {
             return new Request(action, null, after, groups);
         }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Request that
+                    && Objects.equals(action, that.action)
+                    && Objects.equals(group, that.group)
+                    && Arrays.equals(after, that.after)
+                    && groups == that.groups;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hashCode(action);
+            result = 31 * result + Objects.hashCode(group);
+            result = 31 * result + Arrays.hashCode(after);
+            result = 31 * result + groups;
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Request["
+                    + "action=" + action
+                    + ", group=" + group
+                    + ", after=" + Arrays.toString(after)
+                    + ", groups=" + groups + "]";
+        }
     }
 
     /**
@@ -117,6 +145,42 @@ public final class AggregateRequests {
         /** A request that was not carried out: the code travels as its text, never as the constant. */
         public static Report refused(String code, Map<String, String> args) {
             return new Report(0, List.of(), null, 0, 0, Objects.requireNonNull(code, "code"), args);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Report that
+                    && groups == that.groups
+                    && Objects.equals(findings, that.findings)
+                    && Arrays.equals(next, that.next)
+                    && conflicts == that.conflicts
+                    && withheld == that.withheld
+                    && Objects.equals(refusal, that.refusal)
+                    && Objects.equals(refusalArgs, that.refusalArgs);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = groups;
+            result = 31 * result + Objects.hashCode(findings);
+            result = 31 * result + Arrays.hashCode(next);
+            result = 31 * result + Long.hashCode(conflicts);
+            result = 31 * result + Long.hashCode(withheld);
+            result = 31 * result + Objects.hashCode(refusal);
+            result = 31 * result + Objects.hashCode(refusalArgs);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Report["
+                    + "groups=" + groups
+                    + ", findings=" + findings
+                    + ", next=" + Arrays.toString(next)
+                    + ", conflicts=" + conflicts
+                    + ", withheld=" + withheld
+                    + ", refusal=" + refusal
+                    + ", refusalArgs=" + refusalArgs + "]";
         }
     }
 

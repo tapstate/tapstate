@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.aggregate;
 
 import io.tapstate.core.event.SourceOrder;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.ArrayList;
 import java.util.List;
@@ -59,5 +60,32 @@ public record GroupChange(List<Object> group, byte[] inputKey, SourceOrder order
         public static FieldInput of(Object value, List<Object> by) {
             return new FieldInput(true, value, by);
         }
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        return this == other || other instanceof GroupChange that
+                && Objects.equals(group, that.group)
+                && Arrays.equals(inputKey, that.inputKey)
+                && Objects.equals(order, that.order)
+                && Objects.equals(inputs, that.inputs);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = Objects.hashCode(group);
+        result = 31 * result + Arrays.hashCode(inputKey);
+        result = 31 * result + Objects.hashCode(order);
+        result = 31 * result + Objects.hashCode(inputs);
+        return result;
+    }
+
+    @Override
+    public String toString() {
+        return "GroupChange["
+                + "group=" + group
+                + ", inputKey=" + Arrays.toString(inputKey)
+                + ", order=" + order
+                + ", inputs=" + inputs + "]";
     }
 }

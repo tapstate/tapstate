@@ -1,5 +1,6 @@
 package io.tapstate.spi.store;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -32,6 +33,27 @@ public interface OrderedStateStore {
         public Entry {
             Objects.requireNonNull(key, "key");
             Objects.requireNonNull(state, "state");
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Entry that
+                    && Arrays.equals(key, that.key)
+                    && Arrays.equals(state, that.state);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Arrays.hashCode(key);
+            result = 31 * result + Arrays.hashCode(state);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Entry["
+                    + "key=" + Arrays.toString(key)
+                    + ", state=" + Arrays.toString(state) + "]";
         }
     }
 

@@ -32,6 +32,7 @@ import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -152,6 +153,29 @@ public final class GroupStage {
      * @param order    the order of the event that took the row out
      */
     public record Leaving(List<Object> group, byte[] inputKey, SourceOrder order) {
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Leaving that
+                    && Objects.equals(group, that.group)
+                    && Arrays.equals(inputKey, that.inputKey)
+                    && Objects.equals(order, that.order);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hashCode(group);
+            result = 31 * result + Arrays.hashCode(inputKey);
+            result = 31 * result + Objects.hashCode(order);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Leaving["
+                    + "group=" + group
+                    + ", inputKey=" + Arrays.toString(inputKey)
+                    + ", order=" + order + "]";
+        }
     }
 
     /**
@@ -231,6 +255,26 @@ public final class GroupStage {
      * @param next where the next page starts, or null when this page was the last
      */
     public record Groups(List<List<Object>> groups, byte[] next) {
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Groups that
+                    && Objects.equals(groups, that.groups)
+                    && Arrays.equals(next, that.next);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hashCode(groups);
+            result = 31 * result + Arrays.hashCode(next);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Groups["
+                    + "groups=" + groups
+                    + ", next=" + Arrays.toString(next) + "]";
+        }
     }
 
     /** Whether the store holds anything under {@code group}: its totals, or any entry of its rows. */
@@ -262,6 +306,35 @@ public final class GroupStage {
      * @param largest the most rows any of them holds
      */
     public record Counted(byte[] next, int entries, int groups, int failed, long largest) {
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Counted that
+                    && Arrays.equals(next, that.next)
+                    && entries == that.entries
+                    && groups == that.groups
+                    && failed == that.failed
+                    && largest == that.largest;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Arrays.hashCode(next);
+            result = 31 * result + entries;
+            result = 31 * result + groups;
+            result = 31 * result + failed;
+            result = 31 * result + Long.hashCode(largest);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Counted["
+                    + "next=" + Arrays.toString(next)
+                    + ", entries=" + entries
+                    + ", groups=" + groups
+                    + ", failed=" + failed
+                    + ", largest=" + largest + "]";
+        }
     }
 
     /** Counts one page of everything stored on the group side, in key order, and changes nothing. */
@@ -376,6 +449,42 @@ public final class GroupStage {
         /** Whether the store holds no entry of any kind under the group's key. */
         boolean nothingHeld() {
             return storedTotals == null && !anyEntry;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Rebuilt that
+                    && Objects.equals(fold, that.fold)
+                    && Objects.equals(totals, that.totals)
+                    && Arrays.equals(storedTotals, that.storedTotals)
+                    && Objects.equals(held, that.held)
+                    && Objects.equals(wanted, that.wanted)
+                    && Objects.equals(differing, that.differing)
+                    && anyEntry == that.anyEntry;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hashCode(fold);
+            result = 31 * result + Objects.hashCode(totals);
+            result = 31 * result + Arrays.hashCode(storedTotals);
+            result = 31 * result + Objects.hashCode(held);
+            result = 31 * result + Objects.hashCode(wanted);
+            result = 31 * result + Objects.hashCode(differing);
+            result = 31 * result + Boolean.hashCode(anyEntry);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Rebuilt["
+                    + "fold=" + fold
+                    + ", totals=" + totals
+                    + ", storedTotals=" + Arrays.toString(storedTotals)
+                    + ", held=" + held
+                    + ", wanted=" + wanted
+                    + ", differing=" + differing
+                    + ", anyEntry=" + anyEntry + "]";
         }
     }
 
@@ -947,6 +1056,12 @@ public final class GroupStage {
         public int hashCode() {
             return Arrays.hashCode(bytes);
         }
+
+        @Override
+        public String toString() {
+            return "Key["
+                    + "bytes=" + Arrays.toString(bytes) + "]";
+        }
     }
 
     private static final class Count {
@@ -1009,6 +1124,29 @@ public final class GroupStage {
 
     /** One input row as stored in its group: the order that wrote it, and what it gives, or nothing once it left. */
     private record StoredRow(SourceOrder order, byte[] payload, long unusable) {
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof StoredRow that
+                    && Objects.equals(order, that.order)
+                    && Arrays.equals(payload, that.payload)
+                    && unusable == that.unusable;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hashCode(order);
+            result = 31 * result + Arrays.hashCode(payload);
+            result = 31 * result + Long.hashCode(unusable);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "StoredRow["
+                    + "order=" + order
+                    + ", payload=" + Arrays.toString(payload)
+                    + ", unusable=" + unusable + "]";
+        }
     }
 
     private final class Totals {

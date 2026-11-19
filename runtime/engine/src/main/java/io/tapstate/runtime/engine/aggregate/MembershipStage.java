@@ -82,6 +82,36 @@ public final class MembershipStage {
         public static RowEvent gone(byte[] inputKey, String chain, SourceOrder order) {
             return new RowEvent(inputKey, chain, order, null, null);
         }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof RowEvent that
+                    && Arrays.equals(inputKey, that.inputKey)
+                    && Objects.equals(chain, that.chain)
+                    && Objects.equals(order, that.order)
+                    && Objects.equals(group, that.group)
+                    && Objects.equals(inputs, that.inputs);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Arrays.hashCode(inputKey);
+            result = 31 * result + Objects.hashCode(chain);
+            result = 31 * result + Objects.hashCode(order);
+            result = 31 * result + Objects.hashCode(group);
+            result = 31 * result + Objects.hashCode(inputs);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "RowEvent["
+                    + "inputKey=" + Arrays.toString(inputKey)
+                    + ", chain=" + chain
+                    + ", order=" + order
+                    + ", group=" + group
+                    + ", inputs=" + inputs + "]";
+        }
     }
 
     /**
@@ -191,6 +221,38 @@ public final class MembershipStage {
      * @param kept     entries of the page still stored after it
      */
     public record Reclaimed(byte[] next, int rows, int leavings, int members, int waiting, int kept) {
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Reclaimed that
+                    && Arrays.equals(next, that.next)
+                    && rows == that.rows
+                    && leavings == that.leavings
+                    && members == that.members
+                    && waiting == that.waiting
+                    && kept == that.kept;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Arrays.hashCode(next);
+            result = 31 * result + rows;
+            result = 31 * result + leavings;
+            result = 31 * result + members;
+            result = 31 * result + waiting;
+            result = 31 * result + kept;
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Reclaimed["
+                    + "next=" + Arrays.toString(next)
+                    + ", rows=" + rows
+                    + ", leavings=" + leavings
+                    + ", members=" + members
+                    + ", waiting=" + waiting
+                    + ", kept=" + kept + "]";
+        }
     }
 
     /**
