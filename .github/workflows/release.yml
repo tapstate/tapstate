@@ -76,6 +76,7 @@ jobs:
       tag: ${{ steps.next.outputs.tag }}
       is_latest: ${{ steps.next.outputs.is_latest }}
       sha: ${{ steps.sha.outputs.sha }}
+      full_ci_already_required: ${{ steps.sha.outputs.full_ci_already_required }}
       web_sha: ${{ steps.web-pin.outputs.sha }}
       # The tag the version was counted up from. Two jobs downstream need the same range -- the
       # documentation gate and the notes -- and working it out a second time is a second chance to
@@ -104,6 +105,10 @@ jobs:
             exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # Earlier commits already had to pass the full reactor in their main build.
+          if [[ ! -f .github/ci-fast-integration.json ]]; then
+            echo "full_ci_already_required=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - id: next
         run: .github/scripts/next-version.sh "${{ inputs.bump }}" HEAD >> "$GITHUB_OUTPUT"
@@ -273,10 +278,17 @@ jobs:
       source-sha: ${{ needs.version.outputs.sha }}
       trend-workflow: release.yml
 
+  reactor-regression:
+    needs: version
+    uses: ./.github/workflows/reactor-regression.yml
+    with:
+      source-sha: ${{ needs.version.outputs.sha }}
+      full-ci-already-verified: ${{ needs.version.outputs.full_ci_already_required == 'true' }}
+
   gates:
-    # The native CLI, paired Cloud/OP smoke, connector shards and full join matrix must
+    # The reactor regression, native CLI, paired Cloud/OP smoke, connector shards and full join matrix must
     # succeed in this run on the selected source before the draft or approval can open.
-    needs: [version, connectors, join-perf, cli-native, release-images]
+    needs: [version, reactor-regression, connectors, join-perf, cli-native, release-images]
     runs-on: ubuntu-latest
     permissions:
       contents: read
