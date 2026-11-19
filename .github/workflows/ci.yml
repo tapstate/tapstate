@@ -85,8 +85,8 @@ jobs:
           cache: maven
       - name: Verify exact Java build
         run: java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
-      - name: Use the pinned Maven release
-        run: .github/scripts/ci-pinned-maven.sh
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
       - name: Resolve the reactor's snapshot inputs
         run: |
           .github/scripts/ci-maven-cache.sh seed-stable "$HOME/.m2/repository" "$RUNNER_TEMP/snapshot-m2"
@@ -135,8 +135,8 @@ jobs:
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
-      - name: Use the pinned Maven release
-        run: .github/scripts/ci-pinned-maven.sh
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
       - uses: actions/download-artifact@v4
         with:
           name: ci-shard-plan
@@ -335,8 +335,8 @@ jobs:
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
-      - name: Use the pinned Maven release
-        run: .github/scripts/ci-pinned-maven.sh
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
       - name: Check secret availability
         id: guard
         env:
@@ -1007,8 +1007,8 @@ jobs:
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
-      - name: Use the pinned Maven release
-        run: .github/scripts/ci-pinned-maven.sh
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
       - name: image smoke (builds the boot jar + image, then runs the black-box checks)
         env:
           TAPSTATE_TEST_CLOUD_RELEASE_DIR: ${{ runner.temp }}/image-test-release
