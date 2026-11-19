@@ -7,6 +7,7 @@ import io.tapstate.core.event.Op;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.model.*;
 import io.tapstate.core.model.canonical.SourceCaptureIdentity;
+import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.srs.*;
 import io.tapstate.spi.capture.*;
 import io.tapstate.spi.store.*;
@@ -1190,7 +1191,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if (held == null || !held.snapshot || held.bounded || held.sources.isEmpty() || held.bindings == null
                 || held.sources.values().stream().anyMatch(source -> !source.shared || source.prepared == null
                         || source.consumer == null || source.snapshotEpoch < 1)) return Optional.empty();
-        requireSessionLocal(held);
+        if (!observationSessionCurrent(held)) return Optional.empty();
         var tables = new LinkedHashMap<SrsConsumerRun, io.tapstate.adapters.mongostore.MongoCacheDomain.ObservationSource>();
         var preparations = new LinkedHashMap<String, CapturePreparation>();
         for (var source : held.sources.values()) {
@@ -1231,10 +1232,22 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 if (ack != null && ack.token() != null) positions.put(table, ack.token());
             }
         }
-        requireSessionLocal(held);
+        if (!observationSessionCurrent(held)) return Optional.empty();
         return Optional.of(new io.tapstate.runtime.scheduler.ObservationPublisher.CaptureSample(
                 new SnapshotReading(loaded, held.began), new SnapshotReading(readThisRun, held.began), positions,
                 new InitialLoad(InitialLoad.executionKey(plan), at, held.mode.name().toLowerCase(Locale.ROOT), stages)));
+    }
+
+    private boolean observationSessionCurrent(Session session) {
+        active();
+        if (session.ended.get()) throw refused();
+        try {
+            execution.authorization().requireLocal(session.original);
+            return true;
+        } catch (TapstateException unavailable) {
+            if (unavailable.code() != EngineError.EXECUTION_NOT_AUTHORIZED) throw unavailable;
+            return false;
+        }
     }
 
     private SnapshotReading snapshotReading(Session session) {

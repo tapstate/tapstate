@@ -273,13 +273,18 @@ public final class MongoSrsChainStore implements SrsChainStore {
     boolean referencesProved(Document row,String fingerprint){
         return controlLease.enabled()&&controlProofs.matches(scope,row.getString("_id"),fingerprint);
     }
-    void rememberReferences(ClientSession session,Document row,String fingerprint,long started){
+    record ReferenceCheck(long started,MongoSrsLease owner,MongoSrsLease.Lease before,long generation) { }
+    ReferenceCheck beginReferences(){
+        var owner=controlLease.fork();
+        return new ReferenceCheck(System.nanoTime(),owner,owner.observe(),controlProofs.generation());
+    }
+    void rememberReferences(ClientSession session,Document row,String fingerprint,ReferenceCheck check){
         if(!controlLease.enabled())return;
         try{
             var fence=WorkloadClaimDocuments.readCapture(row.get("captureFence",Document.class));
             long remaining=MongoSrsLease.remainingMillis(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),session,fence);
-            var lease=controlLease.fork();var published=lease.proved(lease.observe(),started,remaining);
-            controlProofs.remember(scope,row.getString("_id"),fingerprint,lease,published);
+            var lease=check.owner();var published=lease.proved(check.before(),check.started(),remaining);
+            controlProofs.remember(scope,row.getString("_id"),fingerprint,lease,published,check.generation());
         }catch(TapstateException expired){if(expired.code()!=IoError.WORKLOAD_CLAIM_FENCED)throw expired;}
     }
     void invalidateControlProofs(){controlProofs.clear();}
@@ -290,8 +295,8 @@ public final class MongoSrsChainStore implements SrsChainStore {
             if(!businessChecked)new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             return decoded;
         }
-        long started=System.nanoTime();var state=state(session,row,businessChecked);
-        rememberReferences(session,row,fingerprint,started);return state;
+        var check=beginReferences();var state=state(session,row,businessChecked);
+        rememberReferences(session,row,fingerprint,check);return state;
     }
     Document readRoot(ClientSession session,String chain){
         var row=root(session,chain);if(row==null&&hasRetainedFacts(session,chain))throw unproven(chain);return row;

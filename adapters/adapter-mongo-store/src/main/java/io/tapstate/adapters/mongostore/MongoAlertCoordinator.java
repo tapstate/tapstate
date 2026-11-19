@@ -118,11 +118,7 @@ final class MongoAlertCoordinator implements AlertStore {
     private HostReading currentHost(ClientSession session, boolean write, boolean includeDelivery) {
         if(!write){
             host.locallyActive().run();var facts=bindings.admittedAlertHost(session, includeDelivery);
-            if(facts!=null){
-                if(!MongoAlertHostIdentity.current(facts.setup(),host.setup(),facts.binding()))throw stale("host-installation");
-                if((facts.binding().mode()==StorageBinding.Mode.OP)!=(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM))throw stale("deployment");
-                return new HostReading(hostMarker(facts.schema(),facts.version(),domain.alertReadKeyId(facts.key())), facts.version(), facts.deliveryIntentsEmpty());
-            }
+            if(facts!=null)return admittedHost(facts);
         }
         host.locallyActive().run();var scope=host.setup();
         var facts=bindings.readForTransaction(session);
@@ -133,6 +129,11 @@ final class MongoAlertCoordinator implements AlertStore {
         Document schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
         Document version=SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first();
         return new HostReading(hostMarker(schema,version,write?keys.currentForWrite().activeKeyId():domain.alertReadKeyId(session)), version, null);
+    }
+    private HostReading admittedHost(MongoStorageBindingStore.AlertHostFacts facts) {
+        if(!MongoAlertHostIdentity.current(facts.setup(),host.setup(),facts.binding()))throw stale("host-installation");
+        if((facts.binding().mode()==StorageBinding.Mode.OP)!=(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM))throw stale("deployment");
+        return new HostReading(hostMarker(facts.schema(),facts.version(),domain.alertReadKeyId(facts.key())), facts.version(), facts.deliveryIntentsEmpty());
     }
     private Document hostMarker(Document schema,Document version,String keyId){
         if(schema==null)throw unreadable("schema-capability");
@@ -430,14 +431,19 @@ final class MongoAlertCoordinator implements AlertStore {
     private <T> T poll(boolean includeDelivery, java.util.function.BiFunction<ClientSession, HostReading, T> read) {
         host.locallyActive().run();
         var verified = domain.currentAlertSchema();
-        return domain.alertPollingRead(new MongoReadBudget(Duration.ofSeconds(10)), session -> {
-            var current = currentHost(session, false, includeDelivery);
+        var budget = new MongoReadBudget(Duration.ofSeconds(10));
+        java.util.function.BiFunction<ClientSession, HostReading, T> checked = (session, current) -> {
             domain.requireVerifiedAlertSchema(current.marker());
             T value = read.apply(session, current);
             domain.requireVerifiedAlertSchema(verified);
             host.locallyActive().run();
             return value;
-        });
+        };
+        return domain.alertPollingRead(budget, session -> {
+            host.locallyActive().run();
+            var facts = bindings.admittedAlertHost(session, includeDelivery, budget);
+            return facts == null ? null : checked.apply(session, admittedHost(facts));
+        }, session -> checked.apply(session, currentHost(session, false, includeDelivery)));
     }
 
     private Planning planning(ClientSession s,Document version){

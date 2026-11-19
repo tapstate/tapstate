@@ -593,7 +593,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     @Override public Optional<RetentionSnapshot> retentionSnapshot(String chain) {
-        return readControlSnapshot(chain, view -> {
+        return readControlSnapshot(chain, true, view -> {
             var consumers = activeConsumers(view).stream()
                     .map(member -> new RetentionConsumer(member,
                             view.cursors().get(member.context().key().consumerId()).ringDoneThrough()))
@@ -608,18 +608,23 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private <T> Optional<T> readControlSnapshot(String chain, Function<View, T> project) {
+        return readControlSnapshot(chain, false, project);
+    }
+
+    private <T> Optional<T> readControlSnapshot(String chain, boolean retention, Function<View, T> project) {
         requireChainName(chain);
         return readSnapshot(
                 session -> Optional.ofNullable(controlView(session, chain))
-                        .map(view -> projectControlSnapshot(session, chain, view, project)),
+                        .map(view -> projectControlSnapshot(session, chain, view, retention, project)),
                 session -> Optional.ofNullable(readReadyControlView(session, chain))
-                        .map(view -> Optional.of(projectControlSnapshot(session, chain, view, project))));
+                        .map(view -> Optional.of(projectControlSnapshot(session, chain, view, retention, project))));
     }
 
-    private <T> T projectControlSnapshot(ClientSession session, String chain, View view, Function<View, T> project) {
+    private <T> T projectControlSnapshot(ClientSession session, String chain, View view, boolean retention, Function<View, T> project) {
         var root = view.root();
         var models=new java.util.HashSet<SrsModelKey>();
-        for(var member:view.members().values())if(!member.detached()){
+        for(var member:view.members().values())if(!member.detached()
+                && (!retention || !java.util.Collections.disjoint(member.tables(),view.state().servingTables()))){
             var pin=view.cursors().get(member.context().key().consumerId()).snapshot();
             if(pin!=null)for(var key:pin.models().values()){
                 if(!chain.equals(key.miningChainId())||!scope.cacheIncarnation().equals(key.cacheIncarnation()))throw unavailable(chain);
@@ -627,11 +632,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             }
         }
         var ordered=models.stream().map(key->MongoSrsModelStore.key(key).toJson()).sorted().toList();
-        String fingerprint=io.tapstate.core.model.canonical.CanonicalHash.ofText(MongoSrsChainStore.controlFingerprint(root)+ordered);
+        String fingerprint=io.tapstate.core.model.canonical.CanonicalHash.ofText(MongoSrsChainStore.controlFingerprint(root)+retention+ordered);
         if(!chains.referencesProved(root,fingerprint)){
-            long started=System.nanoTime();chains.state(session,root,true);
+            var check=chains.beginReferences();chains.state(session,root,true);
             if(!models.isEmpty())new MongoSrsModelStore(client,database,scope,requireActive,requireStructure).requireSnapshotReferences(session,models);
-            chains.rememberReferences(session,root,fingerprint,started);
+            chains.rememberReferences(session,root,fingerprint,check);
         }
         return project.apply(view);
     }
@@ -1448,7 +1453,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     private View readView(ClientSession session,String chain){
         Document root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
         if(root==null)throw unavailable(chain);
-        return relations(session,chain,root,chains.readState(session,root,true));
+        return relations(session,chain,root,chains.state(session,root,true));
     }
 
     private View view(ClientSession session, String chain) {

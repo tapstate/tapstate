@@ -689,6 +689,47 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void anExpiredLocalProofFallsBackWhileFullAuthorityStillStands() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            assertThat(f.coordinator.observationSelection(ORIGINAL)).isPresent();
+            var pass = mock(PipelineConvergencePass.class);
+            when(pass.scope()).thenReturn(SCOPE);
+            when(pass.claim()).thenReturn(PIPELINE);
+            var state = mock(StateStore.class);
+            var observations = mock(ObservationStore.class);
+            when(pass.state()).thenReturn(state);
+            when(pass.observationSample()).thenReturn(observations);
+            var result = mock(io.tapstate.runtime.scheduler.ConvergeResult.class);
+            when(result.checkpoint()).thenReturn(Optional.of(CheckpointDoc.initial("flow", "RUNNING", Instant.now())));
+            var observation = mock(Observation.class);
+            when(observation.state()).thenReturn(PipelineState.RUNNING);
+            var publisher = mock(io.tapstate.runtime.scheduler.ObservationPublisher.class);
+            when(publisher.publishScoped(SCOPE, state, observations, null)).thenAnswer(call -> {
+                f.authorization.require(ORIGINAL);
+                return Optional.of(observation);
+            });
+            var cache = mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class);
+            var sampling = new NativeObservationSampling(
+                    mock(io.tapstate.adapters.mongostore.MongoConfigurationDomain.class), cache, f.coordinator,
+                    id -> Optional.of(ORIGINAL), id -> null, "views", Clock.systemUTC());
+            var config = new PipelineIntentStore.ActuationReading(null, OptionalLong.of(1));
+            assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            when(f.authorization.requireLocal(ORIGINAL)).thenThrow(new TapstateException(
+                    io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "flow"), null));
+            assertThat(f.authorization.require(ORIGINAL)).isEqualTo(PIPELINE);
+            assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            verify(publisher, times(2)).publishScoped(SCOPE, state, observations, null);
+            verifyNoInteractions(cache);
+            assertThat(f.coordinator.observationSelection(ORIGINAL)).isEmpty();
+            var fenced = new TapstateException(io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED,
+                    Map.of("pipeline", "flow"), null);
+            when(f.authorization.require(ORIGINAL)).thenThrow(fenced);
+            assertThatThrownBy(() -> sampling.publish(publisher, pass, result, config, null)).isSameAs(fenced);
+            assertThatThrownBy(() -> run.snapshotProgress("flow")).isSameAs(fenced);
+        }
+    }
     private static OwnedShared ownedShared(Fixture f) {
         return ownedShared(f,false);
     }

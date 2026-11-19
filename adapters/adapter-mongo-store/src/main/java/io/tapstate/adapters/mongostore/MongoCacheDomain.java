@@ -461,6 +461,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 public void run() { if (!expected.equals(admittedCaptureStartup.get())) physical.run(); }
                 public void invalidate() { structures.clear(); }
                 public long remainingNanos() { return structures.remainingSrs(); }
+                public long generation() { return structures.currentGeneration(); }
             };
         }
         var lease = MongoSrsLease.selected(verifyStructure);

@@ -493,7 +493,47 @@ class MongoSrsConsumerStoreIT {
         return rows;
     }
 
-    @Test void aWideSnapshotProgressReadProvesItsExactReferencesInOneBoundedTransaction() {
+    @Test void aWarmAttachedReadMustRejectAMissingCheckpointEvent(){
+        withBusiness(f -> {
+            preparedTrimLog(f);
+            f.chains().requestTables(CHAIN,Set.of("orders"),f.captureFence());
+            f.chains().publishServingTables(CHAIN,1,Set.of("orders"),f.captureFence());
+            var key=new SrsModelKey(CHAIN,"orders",SCOPE.cacheIncarnation(),1,0);
+            var ck=new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1,4),"t4"),
+                    Map.of("orders",new io.tapstate.spi.store.SrsTableCheckpoint(key,4)));
+            f.chains().checkpoint(CHAIN,0,ck,f.captureFence()).orElseThrow();
+            try(var domain=openRuntimeReclaim(f)){
+                var runtime=domain.runtimeSrs(SCOPE,()->{}).consumers();
+                assertThat(runtime.attachedWithChain(CHAIN).chain().checkpoint()).isEqualTo(ck);
+                var events=SystemCollections.SRS_EVENTS.on(f.database());
+                var last=events.find().sort(new Document("seq",-1).append("_id",-1)).first();
+                assertThat(events.deleteOne(new Document("_id",last.get("_id"))).getDeletedCount()).isOne();
+                assertThatThrownBy(()->f.chains().load(CHAIN)).satisfies(e->code(e,IoError.SRS_CHECKPOINT_UNPROVEN));
+                assertThatThrownBy(()->runtime.attachedWithChain(CHAIN)).satisfies(e->code(e,IoError.SRS_CHECKPOINT_UNPROVEN));
+            }
+        });
+    }
+
+    @Test void aFutureOnlyMissingModelCannotBlockServingRetentionPlanning(){
+        withBusiness(f -> {
+            var refs=publishSnapshotModels(f,Set.of("orders","future"));
+            f.chains().requestTables(CHAIN,Set.of("orders"),f.captureFence());
+            f.chains().publishServingTables(CHAIN,1,Set.of("orders"),f.captureFence());
+            var a=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var b=f.consumers().attach(B,0,Set.of("future"),f.fenceB()).orElseThrow();
+            assertThat(f.consumers().startReadingAfter(A,a.revision(),0,Map.of("orders",4L),f.fenceA())).isTrue();
+            var pin=new SrsSnapshotPin(1,"future-only",Map.of("future",refs.get("future")));
+            assertThat(f.consumers().pinSnapshot(B,b.revision(),0,pin,f.fenceB())).isTrue();
+            var models=SystemCollections.SRS_MODELS.on(f.database());
+            assertThat(models.deleteOne(new Document("_id",MongoSrsModelStore.key(refs.get("future")))).getDeletedCount()).isOne();
+            var reader=f.consumers();
+            assertThat(reader.attachedWithChain(CHAIN).topology().consumers()).hasSize(2);
+            assertThat(reader.progress(A).orElseThrow().ringDoneThrough()).containsEntry("orders",4L);
+            assertThat(reader.retentionSnapshot(CHAIN)).isPresent();
+        });
+    }
+    @ParameterizedTest @ValueSource(booleans = {true, false})
+    void aWideProgressReadProvesItsReferencesInOneSnapshot(boolean snapshotSupported) {
         withBusiness(f -> {
             var tables = java.util.stream.IntStream.range(0, 12).mapToObj(i -> "table-" + i)
                     .collect(java.util.stream.Collectors.toSet());
@@ -501,23 +541,40 @@ class MongoSrsConsumerStoreIT {
             var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
             var pin = new SrsSnapshotPin(1, "original-seam", refs);
             assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
-            var reads = new java.util.concurrent.atomic.AtomicInteger();
-            var unbound = new java.util.concurrent.atomic.AtomicBoolean();
-            var transactions = new java.util.HashSet<String>();
+            record Read(String session, Long transaction, String level, Long atClusterTime) {}
+            var reads = new java.util.ArrayList<Read>();
             var listener = new com.mongodb.event.CommandListener() {
                 @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
                     if (!event.getDatabaseName().equals(f.database().getName()) || !event.getCommandName().equals("find")) return;
-                    reads.incrementAndGet();
-                    if (!event.getCommand().containsKey("txnNumber")) unbound.set(true);
-                    else transactions.add(event.getCommand().get("txnNumber").toString());
+                    var command = event.getCommand();
+                    var concern = command.getDocument("readConcern", new org.bson.BsonDocument());
+                    reads.add(new Read(command.getDocument("lsid").toJson(),
+                            command.containsKey("txnNumber") ? command.getNumber("txnNumber").longValue() : null,
+                            concern.containsKey("level") ? concern.getString("level").getValue() : null,
+                            concern.containsKey("atClusterTime") ? concern.getTimestamp("atClusterTime").getValue() : null));
                 }
             };
             try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
                     .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
-                var consumers = new MongoSrsConsumerStore(observed, observed.getDatabase(f.database().getName()), SCOPE);
-                assertThat(consumers.progress(A).orElseThrow().snapshot()).isEqualTo(pin);
-                assertThat(unbound).isFalse(); assertThat(transactions).hasSize(1);
-                assertThat(reads.get()).as("one progress read must not reopen the same snapshot proof for every table").isLessThanOrEqualTo(14);
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                try (var topology = org.mockito.Mockito.mockStatic(MongoReadBudget.class, org.mockito.Mockito.CALLS_REAL_METHODS)) {
+                    topology.when(() -> MongoReadBudget.supportsSnapshotReads(observed)).thenReturn(snapshotSupported);
+                    var consumers = new MongoSrsConsumerStore(observed, observed.getDatabase(f.database().getName()), SCOPE);
+                    assertThat(consumers.progress(A).orElseThrow().snapshot()).isEqualTo(pin);
+                }
+                assertThat(reads.size()).isBetween(2, 14);
+                assertThat(reads).extracting(Read::session).containsOnly(reads.getFirst().session());
+                if (snapshotSupported) {
+                    assertThat(reads).extracting(Read::transaction).containsOnlyNulls();
+                    assertThat(reads).extracting(Read::level).containsOnly("snapshot");
+                    var pinned = reads.getLast().atClusterTime();
+                    assertThat(pinned).isNotNull();
+                    assertThat(reads.subList(1, reads.size())).extracting(Read::atClusterTime).containsOnly(pinned);
+                } else {
+                    var transaction = reads.getFirst().transaction();
+                    assertThat(transaction).isNotNull();
+                    assertThat(reads).extracting(Read::transaction).containsOnly(transaction);
+                }
             }
         });
     }

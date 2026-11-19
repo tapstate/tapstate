@@ -7,6 +7,7 @@ import java.util.LinkedHashMap;
 final class MongoSrsControlProofs {
     private record Key(CacheBusinessScope scope,String chain,String fingerprint) { }
     private record Proof(String fingerprint,MongoSrsLease owner,MongoSrsLease.Lease lease) { }
+    private long generation;
     private final LinkedHashMap<Key,Proof> proofs=new LinkedHashMap<>(16,0.75f,true);
     synchronized boolean matches(CacheBusinessScope scope,String chain,String fingerprint){
         var key=new Key(scope,chain,fingerprint);var proof=proofs.get(key);
@@ -14,10 +15,12 @@ final class MongoSrsControlProofs {
         if(!proof.owner().stands(proof.lease())){proofs.remove(key);return false;}
         return proof.fingerprint().equals(fingerprint);
     }
-    synchronized void remember(CacheBusinessScope scope,String chain,String fingerprint,MongoSrsLease owner,MongoSrsLease.Lease lease){
+    synchronized void remember(CacheBusinessScope scope,String chain,String fingerprint,MongoSrsLease owner,MongoSrsLease.Lease lease,long observedGeneration){
+        if(observedGeneration!=generation)return;
         if(lease==null||!owner.stands(lease))return;
         proofs.put(new Key(scope,chain,fingerprint),new Proof(fingerprint,owner,lease));
         if(proofs.size()>256)proofs.remove(proofs.keySet().iterator().next());
     }
-    synchronized void clear(){proofs.clear();}
+    synchronized long generation(){return generation;}
+    synchronized void clear(){generation++;proofs.clear();}
 }

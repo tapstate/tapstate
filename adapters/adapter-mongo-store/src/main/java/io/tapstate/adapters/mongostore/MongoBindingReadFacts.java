@@ -77,9 +77,9 @@ final class MongoBindingReadFacts {
     record AlertHost(Document identity,Document setup,Document binding,Document schema,Document version,Document recovery,Document key,
             Boolean deliveryIntentsEmpty) { }
     static AlertHost alertHost(ClientSession session,com.mongodb.client.MongoDatabase database) {
-        return alertHost(session, database, false);
+        return alertHost(session, database, false, null);
     }
-    static AlertHost alertHost(ClientSession session,com.mongodb.client.MongoDatabase database, boolean includeDelivery) {
+    static AlertHost alertHost(ClientSession session,com.mongodb.client.MongoDatabase database, boolean includeDelivery, MongoReadBudget budget) {
         var identity=SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database);
         var setup=SystemCollections.STORAGE_SETUP.on(database);var binding=SystemCollections.STORAGE_BINDING.on(database);
         var schema=SystemCollections.SCHEMA_MIGRATIONS.on(database);var version=SystemCollections.CONFIGURATION_VERSION.on(database);
@@ -89,15 +89,15 @@ final class MongoBindingReadFacts {
                 probe(schema,"schema",2,captured()),probe(version,"version",2,captured()),
                 probe(recovery,"recovery",2,captured()),probe(key,"key",2,captured())));
         if (includeDelivery) pipeline.add(probe(SystemCollections.ALERT_DELIVERY_INTENTS.on(database), "delivery", 1, presence()));
-        var row=identity.aggregate(session,pipeline).first();
+        var row=timed(identity, budget).aggregate(session,pipeline).first();
         if(row==null)return new AlertHost(null,null,null,null,null,null,null,null);
-        return new AlertHost(unpack(session,row,identity,SINGLETON_ID),
-                singleton(session,row.getList("setup",Document.class),setup,SINGLETON_ID),
-                singleton(session,row.getList("binding",Document.class),binding,SINGLETON_ID),
-                singleton(session,row.getList("schema",Document.class),schema,"config"),
-                singleton(session,row.getList("version",Document.class),version,ConfigurationVersion.ID),
+        return new AlertHost(unpack(session,row,identity,SINGLETON_ID,budget),
+                singleton(session,row.getList("setup",Document.class),setup,SINGLETON_ID,budget),
+                singleton(session,row.getList("binding",Document.class),binding,SINGLETON_ID,budget),
+                singleton(session,row.getList("schema",Document.class),schema,"config",budget),
+                singleton(session,row.getList("version",Document.class),version,ConfigurationVersion.ID,budget),
                 unambiguous(row.getList("recovery",Document.class),"cluster"),
-                singleton(session,row.getList("key",Document.class),key,SINGLETON_ID),
+                singleton(session,row.getList("key",Document.class),key,SINGLETON_ID,budget),
                 includeDelivery ? row.getList("delivery", Document.class).isEmpty() : null);
     }
 
@@ -129,12 +129,17 @@ final class MongoBindingReadFacts {
 
     private static Document singleton(ClientSession session, List<Document> rows,
             MongoCollection<Document> table, Object id) {
+        return singleton(session, rows, table, id, null);
+    }
+
+    private static Document singleton(ClientSession session, List<Document> rows, MongoCollection<Document> table,
+            Object id, MongoReadBudget budget) {
         if (rows.isEmpty()) return null;
         if (rows.size() == 1 && !Boolean.TRUE.equals(rows.getFirst().get(LARGE))) {
             Document value = rows.getFirst().get(VALUE, Document.class);
             if (exactId(id, value.get("_id"))) return value;
         }
-        return table.find(session, new Document("_id", id)).first();
+        return timed(table, budget).find(session, new Document("_id", id)).first();
     }
 
     private static boolean exactId(Object expected, Object actual) {
@@ -146,7 +151,16 @@ final class MongoBindingReadFacts {
     }
 
     private static Document unpack(ClientSession session, Document row, MongoCollection<Document> table, Object id) {
+        return unpack(session, row, table, id, null);
+    }
+
+    private static MongoCollection<Document> timed(MongoCollection<Document> table, MongoReadBudget budget) {
+        return budget == null ? table : table.withTimeout(budget.operationMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    private static Document unpack(ClientSession session, Document row, MongoCollection<Document> table, Object id,
+            MongoReadBudget budget) {
         return Boolean.TRUE.equals(row.get(LARGE))
-                ? table.find(session, new Document("_id", id)).first() : row.get(VALUE, Document.class);
+                ? timed(table, budget).find(session, new Document("_id", id)).first() : row.get(VALUE, Document.class);
     }
 }

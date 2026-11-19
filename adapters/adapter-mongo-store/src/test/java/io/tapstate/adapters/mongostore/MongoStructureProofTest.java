@@ -35,4 +35,52 @@ class MongoStructureProofTest {
         var check=proof.check(MongoStructureProof.Kind.SRS,()->{calls.incrementAndGet();now.addAndGet(TimeUnit.SECONDS.toNanos(11));});
         check.run();check.run();assertThat(calls).hasValue(2);
     }
+    @Test void refreshedPhysicalProofMustNotReviveAnInvalidatedLease(){
+        var proof = new MongoStructureProof();
+        var physical = proof.check(MongoStructureProof.Kind.SRS, () -> {});
+        physical.run();
+        var leases = MongoSrsLease.selected(physical);
+        var lease = leases.proved(leases.observe(), System.nanoTime(), 30000);
+        assertThat(leases.stands(lease)).isTrue();
+        physical.invalidate();
+        assertThat(leases.stands(lease)).isFalse();
+        physical.run();
+        assertThat(leases.stands(lease)).as("new proof must not revive the old lease").isFalse();
+    }
+
+    @Test void aBlockedCheckpointAuditMustNotBlockWarmClaimProof() throws Exception {
+        var proof = new MongoStructureProof();
+        var claims = proof.check(MongoStructureProof.Kind.CLAIMS, () -> {});
+        claims.run();
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var cold = proof.check(MongoStructureProof.Kind.CHECKPOINT_READ, () -> {
+            entered.countDown();
+            try {
+                if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("probe not released");
+            } catch (InterruptedException e) { throw new AssertionError(e); }
+        });
+        try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var blocked = workers.submit(cold);
+            try {
+                assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+                var warm = workers.submit(claims);
+                warm.get(500, TimeUnit.MILLISECONDS);
+            } finally {
+                release.countDown();
+                blocked.get(2, TimeUnit.SECONDS);
+            }
+        }
+    }
+    @Test void invalidationDuringVerificationPreventsPublishingTheProof(){
+        var proof=new MongoStructureProof();var calls=new AtomicInteger();
+        var check=proof.check(MongoStructureProof.Kind.SRS,()->{calls.incrementAndGet();proof.clear();});
+        check.run();check.run();assertThat(calls).hasValue(2);assertThat(check.remainingNanos()).isZero();
+    }
+    @Test void aPhysicalInvalidationDuringReferenceValidationCannotPublishANewLease(){
+        var proof=new MongoStructureProof();var physical=proof.check(MongoStructureProof.Kind.SRS,()->{});
+        physical.run();var owner=MongoSrsLease.selected(physical);var before=owner.observe();long started=System.nanoTime();
+        physical.invalidate();physical.run();
+        assertThat(owner.proved(before,started,30000)).isNull();
+    }
 }

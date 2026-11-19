@@ -91,6 +91,33 @@ class MongoAlertCoordinatorIT {
             assertThat(nodes.list()).isEmpty();
         });
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"aggregate", "find"})
+    void snapshotPollingBoundsEachDriverCommand(String command) {
+        withStore(f -> {
+            bindForPolling(f);
+            if ("find".equals(command)) {
+                SystemCollections.SCHEMA_MIGRATIONS.on(f.db).updateOne(new Document("_id", "config"),
+                        new Document("$set", new Document("padding", "x".repeat(128 * 1024))));
+            }
+            assertThat(f.store.deliveryIntentsEmpty()).isTrue();
+            try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var admin = client.getDatabase("admin");
+                var point = new Document("configureFailPoint", "failCommand");
+                String collection = "find".equals(command) ? "schema_migrations" : "cluster_identity";
+                admin.runCommand(new Document(point).append("mode", "alwaysOn").append("data",
+                        new Document("failCommands", List.of(command)).append("namespace", f.db.getName() + "." + collection)
+                                .append("blockConnection", true).append("blockTimeMS", 7000)));
+                try {
+                    assertThatThrownBy(f.store::deliveryIntentsEmpty).isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                } finally {
+                    admin.runCommand(point.append("mode", "off"));
+                }
+            }
+        });
+    }
+
     private static void bindForPolling(Fixture f){
         var cache=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,"mongodb://cache.invalid/cache","cache",null);
         f.domain.bindings().commit(f.host.setup(),StorageBinding.Mode.OP,cache,new SourceResource("views",null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null));

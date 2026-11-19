@@ -268,17 +268,18 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return budget.transaction(connection.client(), session -> { requireOpen(); T value = action.apply(session); requireOpen(); return value; });
     }
 
-    <T> T alertPollingRead(MongoReadBudget budget, Function<ClientSession, T> read) {
+    <T> T alertPollingRead(MongoReadBudget budget, Function<ClientSession, T> snapshot, Function<ClientSession, T> fallback) {
         requireOpen();
         return StoreIo.call(() -> {
-            if (!MongoReadBudget.supportsSnapshotReads(connection.client())) return alertTransaction(budget, read);
-            try (var session = connection.client().startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())) {
-                budget.requireRemaining();
-                T result = read.apply(session);
-                budget.requireRemaining();
-                requireOpen();
-                return result;
+            if (MongoReadBudget.supportsSnapshotReads(connection.client())) {
+                try (var session = connection.client().startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())) {
+                    T result = snapshot.apply(session);
+                    budget.requireRemaining();
+                    requireOpen();
+                    if (result != null) return result;
+                }
             }
+            return alertTransaction(budget, fallback);
         });
     }
 

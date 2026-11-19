@@ -30,7 +30,7 @@ final class NativeValidationScheduler implements AutoCloseable {
     private NativeValidationStartCoordinator coordinator;private MemoryValidationSchedules.Writer writer;private ValidationScheduleObservations.Origin origin;
     private String pipeline,afterPipeline,afterTask;private volatile boolean closed;private boolean started;private Instant highWater;private volatile long nextDiscovery;
     private Long scanRevision, completedRevision;
-    private boolean scanFailed;
+    private boolean scanFailed, capacityDeferred;
     NativeValidationScheduler(MongoConfigurationDomain configuration,ValidationMemberResources.Member resources,ValidationMemberResources process,
             Supplier<NativeValidationStartCoordinator> coordinators,MemoryValidationSchedules observations,Clock clock,ValidationSchedule.Calculator calculator,Runnable active){
         this.configuration=Objects.requireNonNull(configuration);this.resources=Objects.requireNonNull(resources);this.process=Objects.requireNonNull(process);
@@ -50,6 +50,7 @@ final class NativeValidationScheduler implements AutoCloseable {
     }
     private void discover(){
         try{scan();}catch(TapstateException unavailable){scanFailed=true;}
+        catch(RuntimeException|Error failure){scanFailed=true;throw failure;}
     }
     /** One identity per pass avoids ambient definition enumeration and starvation behind a damaged task. */
     private void scan(){
@@ -57,14 +58,17 @@ final class NativeValidationScheduler implements AutoCloseable {
         if(scanRevision==null){
             long revision=configuration.configurationRevision();require();
             if(Objects.equals(completedRevision,revision)){nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(1);return;}
-            scanRevision=revision;scanFailed=false;
+            scanRevision=revision;scanFailed=false;capacityDeferred=false;
         }
         final ValidationTaskStore tasks;
         try{tasks=configuration.pollingValidationTasks(this::require);}
         catch(TapstateException unavailable){nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(1);throw unavailable;}
         if(pipeline==null){var found=tasks.pipelines(afterPipeline,1);if(found.isEmpty()){
             long revision=configuration.configurationRevision();require();
-            completedRevision=!scanFailed&&Objects.equals(scanRevision,revision)?revision:null;
+            synchronized(this){
+                completedRevision=!scanFailed&&!(capacityDeferred&&entries.size()<MAX_TASKS)
+                        &&Objects.equals(scanRevision,revision)?revision:null;
+            }
             scanRevision=null;afterPipeline=null;afterTask=null;
             nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(completedRevision==null?0:1);return;
         }pipeline=found.getFirst();afterTask=null;}
@@ -80,7 +84,7 @@ final class NativeValidationScheduler implements AutoCloseable {
             if(saved.full().scheduledAdmission()==null){entries.remove(key);publish(saved.task(),saved.revision(),null,null,ValidationScheduleObservations.State.FAILED,ValidationError.RULE_UNSUPPORTED.code(),null,null);return;}
             var previous=entries.get(key);
             if(previous!=null&&previous.task.equals(saved.task())&&previous.revision==saved.revision())return;
-            if(previous==null&&entries.size()==MAX_TASKS){publish(saved.task(),saved.revision(),null,null,ValidationScheduleObservations.State.FAILED,ValidationError.VALUE_LIMIT_EXCEEDED.code(),null,null);return;}
+            if(previous==null&&entries.size()==MAX_TASKS){capacityDeferred=true;publish(saved.task(),saved.revision(),null,null,ValidationScheduleObservations.State.FAILED,ValidationError.VALUE_LIMIT_EXCEEDED.code(),null,null);return;}
             final Instant next;
             try{next=calculator.nextAfter(full.schedule(),clock.instant(),ValidationSchedule.SearchBudget.DEFAULT);}
             catch(TapstateException invalid){publish(saved.task(),saved.revision(),null,null,ValidationScheduleObservations.State.FAILED,invalid.code().code(),null,null);return;}

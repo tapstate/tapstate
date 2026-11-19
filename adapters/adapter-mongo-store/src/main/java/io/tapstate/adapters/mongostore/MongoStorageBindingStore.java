@@ -456,15 +456,22 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     AlertHostFacts admittedAlertHost(ClientSession session) {
         return admittedAlertHost(session, false);
     }
+    // Alert observations check live cluster, setup, binding, and recovery facts. Their callers validate the
+    // alert schema, version, and key. Full storage admission and alert writes audit the default source and
+    // global note scope independently.
     AlertHostFacts admittedAlertHost(ClientSession session, boolean includeDelivery) {
+        return admittedAlertHost(session, includeDelivery, null);
+    }
+
+    AlertHostFacts admittedAlertHost(ClientSession session, boolean includeDelivery, MongoReadBudget budget) {
         if(!MongoBindingReadFacts.supported(client))return null;
-        var facts=MongoBindingReadFacts.alertHost(session,database,includeDelivery);var cluster=facts.identity();
+        var facts=MongoBindingReadFacts.alertHost(session,database,includeDelivery,budget);var cluster=facts.identity();
         requireClusterIdentity(cluster);long version=cluster.getLong(BINDING_VERSION);
         // An unbound installation retains its full original admission checks.
         if(version==0)return null;
         long generation=requireSetupIdentity(facts.setup(),cluster.getString("clusterId"));
         var bound = decodeBound(facts.binding(), cluster.getString("clusterId"), version, facts.setup(), generation);
-        if (facts.recovery() == null) MongoStorageRecoveryStore.read(session, database, bound, facts.setup());
+        if (facts.recovery() == null) MongoStorageRecoveryStore.read(session, budget == null ? database : budget.database(database), bound, facts.setup());
         else MongoStorageRecoveryStore.read(facts.recovery(), bound.setup(), bound.mode(), version, facts::setup);
         return new AlertHostFacts(facts.setup(), bound, facts.schema(), facts.version(), facts.key(), facts.deliveryIntentsEmpty());
     }
