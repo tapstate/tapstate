@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6e66ffaa7ad85ee45653f80012b4e08bda177c8f
+          ref: 85766c83c59994701cf6699094e6cdfe36714774
           persist-credentials: false
       - uses: actions/setup-java@v4
         with:
@@ -21,9 +21,9 @@ jobs:
       - name: Allocate the candidate qualification batches
         run: |
           cat > "$RUNNER_TEMP/estimates.json" <<'JSON'
-          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"mixed.snapshot.double-map.standard": 230, "copy.live.basic.standard": 240, "copy.backlog.fixed-iud.standard": 245, "union.live.basic.standard": 290, "nest.snapshot.fanout.wide": 530}}
+          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"copy.live.slow-target.large": 950, "nest.snapshot.fanout.wide": 530}}
           JSON
-          python3 -B benchmarks/runner.py allocate --id mixed.snapshot.double-map.standard --id copy.live.basic.standard --id copy.backlog.fixed-iud.standard --id union.live.basic.standard --id nest.snapshot.fanout.wide --repeats 3 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 2 --batch-seconds 1200 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
+          python3 -B benchmarks/runner.py allocate --id copy.live.slow-target.large --id nest.snapshot.fanout.wide --repeats 3 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 2 --batch-seconds 1200 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
       - uses: actions/upload-artifact@v4
         with:
           name: candidate-qualification-manifest
@@ -43,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6e66ffaa7ad85ee45653f80012b4e08bda177c8f
+          ref: 85766c83c59994701cf6699094e6cdfe36714774
           persist-credentials: false
       - uses: actions/setup-java@v4
         with:
