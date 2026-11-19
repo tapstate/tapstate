@@ -14,26 +14,36 @@ import org.bson.BsonValue;
 final class BenchmarkOperators {
     static final String PARENT = "parent_identity";
     static final String ORDINAL = "element_ordinal";
-    private static final Set<String> PAIRED = Set.of("join-hot-update", "nest-child-update");
+    private static final Set<String> PAIRED = Set.of("join-hot-update", "nest-child-update", "nest-fanout");
 
     final String scenario;
     final Map<String, Integer> rows;
     private final List<String> nodes;
     private final BsonDocument specification;
 
-    BenchmarkOperators(BsonDocument definition, int requestedRows) {
+    final Integer fanout;
+
+    BenchmarkOperators(BsonDocument definition, int requestedRows, boolean variant) {
         this.scenario = definition.getString("spec").getValue()
                 .replaceFirst("^specs/", "").replaceFirst("\\.json$", "");
         var spec = definition.getDocument("workload_spec").getDocument("scenario");
         specification = spec;
         nodes = spec.getArray("graph").stream().map(BsonValue::asDocument)
                 .map(node -> node.getString("id").getValue()).toList();
+        fanout = scenario.equals("nest-fanout") ? spec.getDocument("parameters").getDocument("paired_control")
+                .getDocument(variant ? "variant_trial" : "baseline").getInt32("children_per_root").getValue() : null;
         rows = switch (scenario) {
             case "map-basic", "filter-basic", "js-basic", "mixed-double-map" -> Map.of("records", requestedRows);
             case "unwind-basic" -> Map.of("parents", requestedRows);
             case "union-basic" -> Map.of("left", positive(requestedRows / 2), "right", requestedRows - requestedRows / 2);
-            case "join-basic" -> Map.of("facts", requestedRows, "dimensions", Math.max(1, requestedRows / 10));
+            case "join-basic", "join-steady-state", "join-lifecycle-release" -> Map.of("facts", requestedRows, "dimensions", Math.max(1, requestedRows / 10));
             case "join-hot-update" -> Map.of("facts", Math.multiplyExact(requestedRows, 10), "dimensions", requestedRows);
+            case "nest-fanout" -> {
+                if (requestedRows < 4 || requestedRows % 4 != 0) {
+                    throw new IllegalArgumentException("The baseline child count must be a positive multiple of four");
+                }
+                yield Map.of("roots", requestedRows / 4, "children", Math.multiplyExact(requestedRows / 4, fanout));
+            }
             case "nest-basic", "nest-child-update", "mixed-map-nest" -> {
                 int fanout = spec.getDocument("inputs").getDocument("roots").getInt32("children_per_root").getValue();
                 if (requestedRows < fanout || requestedRows % fanout != 0) {
@@ -64,8 +74,8 @@ final class BenchmarkOperators {
         return switch (scenario) {
             case "unwind-basic" -> List.of("parents");
             case "union-basic" -> List.of("left", "right");
-            case "join-basic", "join-hot-update" -> List.of("facts");
-            case "nest-basic", "nest-child-update" -> List.of("roots");
+            case "join-basic", "join-hot-update", "join-steady-state", "join-lifecycle-release" -> List.of("facts");
+            case "nest-basic", "nest-child-update", "nest-fanout" -> List.of("roots");
             case "mixed-map-nest" -> List.of(nodes.getFirst());
             default -> List.of("records");
         };
@@ -81,14 +91,14 @@ final class BenchmarkOperators {
                     "path", "items", "element_key", "k", "element_type", "json",
                     "source_id_field", PARENT, "include_array_index", ORDINAL));
             case "union-basic" -> List.of(Map.of("id", first, "from", List.of("left", "right"), "type", "union"));
-            case "join-basic", "join-hot-update" -> List.of(Map.of(
+            case "join-basic", "join-hot-update", "join-steady-state", "join-lifecycle-release" -> List.of(Map.of(
                     "id", first, "type", "join", "engine", "builtin", "from", Map.of("f", "facts", "d", "dimensions"),
                     "sql", """
                             SELECT f._id AS _id, f.dimension_id AS dimension_id,
                                    f.payload AS fact_value, d.score AS dimension_value
                             FROM f JOIN d ON f.dimension_id = d._id
                             """));
-            case "nest-basic", "nest-child-update" -> List.of(nest(first, "roots", "_id"));
+            case "nest-basic", "nest-child-update", "nest-fanout" -> List.of(nest(first, "roots", "_id"));
             case "mixed-double-map" -> List.of(
                     map(first, List.of("records"), Map.of("value", "=int(after.value) + 1")),
                     filter(nodes.get(1), first),

@@ -131,7 +131,7 @@ import io.tapstate.benchmarks.PerfCase;
 )
 @PerfCase(
         id = "nest.snapshot.fanout.wide",
-        version = 1,
+        version = 2,
         description = "Compare ordinary and high Nest fanout with fixed root count.",
         group = "nest",
         operators = {"nest"},

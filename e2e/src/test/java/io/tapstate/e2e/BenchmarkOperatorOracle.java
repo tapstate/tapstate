@@ -49,7 +49,7 @@ final class BenchmarkOperatorOracle {
             });
             case "union-basic" -> source.forEach((table, rows) ->
                     rows.forEach(row -> put(result, table + "/" + key(row, "_id"), row)));
-            case "join-basic", "join-hot-update" -> {
+            case "join-basic", "join-hot-update", "join-steady-state", "join-lifecycle-release" -> {
                 var byKey = new HashMap<Long, BsonDocument>();
                 source.get("dimensions").forEach(row -> byKey.put(number(row, "_id"), row));
                 for (var fact : source.get("facts")) {
@@ -61,7 +61,7 @@ final class BenchmarkOperatorOracle {
                     }
                 }
             }
-            case "nest-basic", "nest-child-update", "mixed-map-nest" -> {
+            case "nest-basic", "nest-child-update", "nest-fanout", "mixed-map-nest" -> {
                 var children = new HashMap<Long, List<BsonValue>>();
                 for (var row : source.get("children")) {
                     children.computeIfAbsent(number(row, "root_id"), ignored -> new ArrayList<>()).add(row);

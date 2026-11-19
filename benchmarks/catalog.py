@@ -49,6 +49,8 @@ def resolve_case(case, contracts, spec):
         "memory": contracts["memory"],
         "eligibility": contracts["eligibility"],
     }
+    if "memory-regression" in case["tags"]:
+        definition["memory_profile"] = contracts["memory_profile"]
     if case["source"] == "mongodb":
         definition["generation"] = contracts["generation"]
         if case["phase"] != "snapshot":
