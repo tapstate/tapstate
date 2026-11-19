@@ -463,19 +463,26 @@ class BenchmarkRunIT {
         long prepareState = System.nanoTime();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
         waitFor(entry, "settled snapshot state at the target", () -> target.countDocuments() == initial
-                && settled(control) == initial && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
+                && control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == initial
+                && settled(control) >= initial && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
         verifySame(source, target);
         // Updating an existing key establishes a normal runtime frontier before either CDC measurement.
         String preAnchorToken = control.resumePoint(PIPELINE).get("token");
+        long preAnchorSettled = settled(control);
         var key = new BsonDocument("_id", new BsonInt64(1));
         source.updateOne(key, new BsonDocument("$set", new BsonDocument("s0", new BsonString("perf-anchor"))));
         waitFor(entry, "confirmed initial-state anchor", () -> {
             var row = target.find(key).first();
             String current = control.resumePoint(PIPELINE).get("token");
+            long changes = capturedChanges(control).getOrDefault(RECORDS, 0L);
+            long acknowledged = settled(control);
             return row != null && new BsonString("perf-anchor").equals(row.get("s0"))
-                    && settled(control) == initial + 1 && current != null && !current.equals(preAnchorToken);
+                    && acknowledged > preAnchorSettled && changes > 0 && acknowledged == initial + changes
+                    && current != null && !current.equals(preAnchorToken);
         });
         verifySame(source, target);
+        evidence.result.put("initial_settled_target_writes", settled(control));
+        evidence.result.put("initial_captured_changes_including_anchor", capturedChanges(control).getOrDefault(RECORDS, 0L));
         evidence.phase("initial_state", prepareState);
         var mix = mix(entry);
         if (mode.equals("backlog-throughput")) {
