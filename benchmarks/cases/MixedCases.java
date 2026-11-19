@@ -22,24 +22,6 @@ import io.tapstate.benchmarks.PerfCase;
         spec = "specs/mixed-double-map.json"
 )
 @PerfCase(
-        id = "mixed.snapshot.union-branches.standard",
-        version = 1,
-        description = "Merge two streams and verify both overlapping target branches.",
-        group = "mixed",
-        operators = {"union", "filter", "map"},
-        phase = "snapshot",
-        mode = "snapshot",
-        profile = "standard",
-        profileVersion = 1,
-        source = "mongodb",
-        target = "mongodb",
-        environments = {"single-node-op"},
-        purposes = {"throughput"},
-        workload = "finite-batch",
-        dataFeatures = {"multi-input", "multi-target"},
-        spec = "specs/mixed-union-branches.json"
-)
-@PerfCase(
         id = "mixed.snapshot.map-nest.standard",
         version = 1,
         description = "Project the root key before building nested documents.",

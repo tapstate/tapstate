@@ -149,7 +149,7 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
-    void aScriptThatWidensADecimalCannotPublishTheSourcesDeclaredRange() {
+    void aScriptDoesNotDeclareItsSourceDecimalRangeAsAnOutputType() {
         String script = "function process(r, ctx) { r.after.amount = 100000000.00; return r; }";
         var sourceValue = new java.math.BigDecimal("1.00");
         var output = io.tapstate.adapters.transform.StatelessTransforms.js(script)
@@ -178,9 +178,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         TargetField amount = bound.getFirst().fields().stream()
                 .filter(field -> field.name().equals("amount")).findFirst().orElseThrow();
-        assertThat(amount.inferredType()).isEqualTo(io.tapstate.core.common.TapstateType.DECIMAL);
-        assertThat(amount.numericType()).isNull();
-        assertThat(amount.type()).isNull();
+        assertThat(amount).isEqualTo(TargetField.deferredDecimal("amount", decimal));
     }
 
     @Test

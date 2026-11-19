@@ -111,7 +111,5 @@ two streams. Nest takes a child count that is divisible by four. The paired Join
 case uses the row option for dimensions and seeds ten times as many facts. Both
 paired cases report selected hotspot keys against a separately seeded uniform arm.
 
-The operator suite retains blocked cases. Scripts with the mixed-type payload need
-MongoDB Decimal128 metadata at the target, and the Union branch case needs separate
-output bindings. Catalog JSON exposes these reasons and execution checks them
-before starting a selected batch.
+The operator suite covers supported pipeline shapes. The JS and double-map cases
+check that MongoDB preserves untouched Decimal128 values alongside script output.

@@ -18,6 +18,10 @@ import java.util.Set;
 public final class PdkTargetIdentityPlanner {
     private static final Set<String> DOCUMENT_IDENTITIES = Set.of(
             "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb");
+    static boolean hasFlexibleColumns(String connectorId) {
+        return DOCUMENT_IDENTITIES.contains(connectorId);
+    }
+
     private final ConnectorProvisioner provisioner;
 
     public PdkTargetIdentityPlanner(ConnectorProvisioner provisioner) {
@@ -84,7 +88,7 @@ public final class PdkTargetIdentityPlanner {
 
     private static TargetIdentityPlan resolveTarget(PdkConnector connector, SinkConfig config,
             TargetTable target, boolean allowPreparation) throws Throwable {
-        boolean documentIdentity = DOCUMENT_IDENTITIES.contains(connector.connectorId());
+        boolean documentIdentity = hasFlexibleColumns(connector.connectorId());
         TapTable existing = existingTable(connector, target.name(), documentIdentity);
         TargetShape shape = targetShape(existing, documentIdentity);
         var evidence = indexEvidence(connector, target.name(), existing, documentIdentity, shape.primary());

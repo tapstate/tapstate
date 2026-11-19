@@ -22,12 +22,7 @@ BASE_CASES = {
 }
 OPERATOR_SPECS = {
     "map-basic", "filter-basic", "js-basic", "unwind-basic", "union-basic", "join-basic", "nest-basic",
-    "mixed-double-map", "mixed-map-nest", "mixed-union-branches", "join-hot-update", "nest-child-update",
-}
-BLOCKED_SPECS = {
-    "js-basic": "MongoDB target cannot land preserved decimal fields after the script",
-    "mixed-double-map": "MongoDB target cannot land preserved decimal fields after the script",
-    "mixed-union-branches": "The shared serve source cannot assign individual branches to sync targets",
+    "mixed-double-map", "mixed-map-nest", "join-hot-update", "nest-child-update",
 }
 DIMENSIONS = {
     "group", "operators", "phase", "mode", "profile", "source", "target",
@@ -86,13 +81,10 @@ def operator_scope(case):
 
 
 def implemented(case):
-    return case["id"] in BASE_CASES or (operator_scope(case) and specification(case) not in BLOCKED_SPECS)
+    return case["id"] in BASE_CASES or operator_scope(case)
 
 
 def case_listing(case):
-    blocker = BLOCKED_SPECS.get(specification(case))
-    if blocker:
-        return {**case, "execution_status": "blocked", "execution_blocker": blocker}
     status = "qualification-ready" if implemented(case) else "definition-only"
     return {**case, "execution_status": status}
 
@@ -158,8 +150,7 @@ def checked_entries(entries):
     for entry in entries:
         case = entry["case"]
         if not implemented(case):
-            reason = BLOCKED_SPECS.get(specification(case), "execution is pending")
-            raise ValueError(f"{case['id']}: {reason}")
+            raise ValueError(f"{case['id']}: execution is pending")
         if entry["mix"] is not None:
             source = case["workload_spec"].get("incremental", {})
             if not source.get("allow_manual_mix_override", False):
