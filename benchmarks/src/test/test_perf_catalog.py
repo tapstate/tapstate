@@ -20,7 +20,6 @@ SPECIAL_CASES = {
     "copy.snapshot.dummy-baseline.standard",
     "copy.live.handoff.standard",
     "mixed.snapshot.double-map.standard",
-    "mixed.snapshot.union-branches.standard",
     "mixed.snapshot.map-nest.standard",
     "join.live.hot-update.standard",
     "nest.live.child-update.standard",
@@ -126,7 +125,7 @@ class PerfCatalogTest(unittest.TestCase):
         self.assertIn("Group children independently", description)
         self.assertIn("Both all inputs are consumed", description)
         self.assertIn(self.cases[case_id]["definition_sha256"], description)
-        self.assertIn("60 registered cases", catalog_tool.render_markdown(self.catalog))
+        self.assertIn("59 registered cases", catalog_tool.render_markdown(self.catalog))
         invalid = subprocess.run(
             [sys.executable, str(CATALOG), "--case", "missing-case"],
             text=True, capture_output=True, check=False,

@@ -72,11 +72,11 @@ class PerfRunnerTest(unittest.TestCase):
     def test_operator_suite_lists_blocked_definitions_and_preserves_scope(self):
         cases = runner.select(self.cases, [], [], "operators")
         ids = {case["id"] for case in cases}
-        self.assertEqual(51, len(ids))
+        self.assertEqual(50, len(ids))
         self.assertNotIn("join.live.hot-update.wide", ids)
         self.assertNotIn("copy.live.slow-target.large", ids)
         blocked = {case["id"] for case in cases if runner.case_listing(case)["execution_status"] == "blocked"}
-        self.assertEqual(8, len(blocked))
+        self.assertEqual(7, len(blocked))
         self.assertIn("js.live.basic.standard", blocked)
-        self.assertIn("mixed.snapshot.union-branches.standard", blocked)
+        self.assertNotIn("mixed.snapshot.union-branches.standard", ids)
         self.assertIn("mixed.snapshot.double-map.standard", blocked)

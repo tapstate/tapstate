@@ -22,12 +22,11 @@ BASE_CASES = {
 }
 OPERATOR_SPECS = {
     "map-basic", "filter-basic", "js-basic", "unwind-basic", "union-basic", "join-basic", "nest-basic",
-    "mixed-double-map", "mixed-map-nest", "mixed-union-branches", "join-hot-update", "nest-child-update",
+    "mixed-double-map", "mixed-map-nest", "join-hot-update", "nest-child-update",
 }
 BLOCKED_SPECS = {
     "js-basic": "MongoDB target cannot land preserved decimal fields after the script",
     "mixed-double-map": "MongoDB target cannot land preserved decimal fields after the script",
-    "mixed-union-branches": "The shared serve source cannot assign individual branches to sync targets",
 }
 DIMENSIONS = {
     "group", "operators", "phase", "mode", "profile", "source", "target",
