@@ -124,6 +124,55 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void retainedStartReadsAndCommitsInFiveCommandsAndRefusesTheRacingRevision() {
+        withConfiguration((domain, database, scope) -> {
+            var node = new io.tapstate.spi.store.WorkloadClaimFence(
+                    new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),
+                            io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION, "node-a"),
+                    new io.tapstate.spi.store.WorkloadOwner("node-a", "boot-a"), 1, 0, 1);
+            var preparation = new io.tapstate.spi.store.PipelinePreparation(scope.pipelineId(), scope.stateGeneration(),
+                    io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE, scope, UUID.randomUUID().toString(), node);
+            SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(new Document("_id", scope.pipelineId()),
+                    new Document("$set", new Document("cachePreparation", MongoPipelinePreparationFacts.encode(preparation))));
+            var old = intent(PipelineState.STOPPED, false, false, null);
+            assertThat(domain.intents().compareAndSet(scope, 0, old)).isTrue();
+            var next = intent(PipelineState.RUNNING, false, true, 3L);
+            var inputs = io.tapstate.spi.store.PipelinePreparationInputs.of(scope,
+                    (io.tapstate.core.model.PipelineResource) pipeline(), Map.of(), Map.of());
+            var commands = new ArrayList<String>();
+            var witness = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder()
+                    .decode(SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material"))));
+            try (var client = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(witness).build())) {
+                var db = client.getDatabase(database.getName());
+                var bindings = new MongoStorageBindingStore(client, db, ciphers);
+                var store = new MongoPipelineIntentStore(client, db, scope.clusterId(), bindings);
+                var artifacts = new MongoConfigurationArtifactStore(client, db, ciphers);
+                assertThat(store.commitRetainedStart(scope, 1, next, inputs, artifacts))
+                        .isEqualTo(MongoConfigurationDomain.RetainedStart.SAVED);
+                assertThat(commands).containsExactly("aggregate", "update", "update", "update", "commitTransaction");
+                long written = revision(database);
+                assertThatThrownBy(() -> store.commitRetainedStart(scope, 1, next, inputs, artifacts))
+                        .satisfies(MongoPipelineIntentStoreIT::fenced);
+                assertThat(revision(database)).isEqualTo(written);
+                assertThat(domain.intents().load(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 2, next));
+            }
+        });
+    }
+
+    @Test
+    void startSnapshotCannotReadAValidPipelineFromTheWrongCollection() {
+        withConfiguration((domain, database, scope) -> {
+            var row = SystemCollections.PIPELINES.on(database).findOneAndDelete(new Document("_id", scope.pipelineId()));
+            SystemCollections.SOURCES.on(database).insertOne(row);
+            assertThatThrownBy(() -> domain.startSnapshot(scope.pipelineId())).satisfies(MongoPipelineIntentStoreIT::unreadable);
+        });
+    }
+
+    @Test
     void staleRevisionOrArtifactHashCannotOverwriteTheLatestIntentOrAdvanceVersions() {
         withConfiguration((domain, database, scope) -> {
             var store = domain.intents();

@@ -722,6 +722,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         requireOpen();
         var client = connection.client();
         var database = connection.database();
+        if (!MongoValidationClaimObservation.lacksSnapshotRead(client)) {
+            var captured = StoreIo.call(() -> readFastStartEntry(database, pipelineId));
+            if (captured.isPresent()) return captured;
+        }
         return StoreIo.call(() -> {
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> {
@@ -738,6 +742,64 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
             }
         });
+    }
+
+    private Optional<StartSnapshot> readFastStartEntry(MongoDatabase database, String pipelineId) {
+        var stages = MongoStartConfigRead.root();
+        MongoStartConfigRead.addArtifacts(stages, List.of(pipelineId));
+        stages.add(MongoValidationClaimObservation.lookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", pipelineId, null));
+        stages.add(MongoValidationClaimObservation.lookup(SystemCollections.PIPELINE_INTENTS, "intent", pipelineId, null));
+        var snapshot = MongoStartConfigRead.snapshot(database, stages);
+        var resource = artifacts.capturedStartDefinition(snapshot, pipelineId);
+        if (resource.isEmpty() || !(resource.orElseThrow() instanceof io.tapstate.core.model.PipelineResource pipeline))
+            return Optional.empty();
+        var mapping = MongoStartConfigRead.row(snapshot, "mapping", pipelineId);
+        var rawIntent = snapshot.getList("intent", Document.class);
+        var intent = MongoStartConfigRead.row(snapshot, "intent", pipelineId);
+        if (mapping.isEmpty() || (!rawIntent.isEmpty() && intent.isEmpty())) return Optional.empty();
+        var row = mapping.orElseThrow();
+        var prepared = MongoPipelinePreparationFacts.decode(pipelineId, row, clusterId);
+        var decoder = new MongoPipelineIntentStore(connection.client(), database, clusterId, bindings);
+        return Optional.of(new StartSnapshot(pipeline, MongoPipelineStateMappings.decode(pipelineId, row),
+                prepared, intent.map(decoder::decode)));
+    }
+
+    public Optional<ArtifactStore.ReadableInventory> startPlanningInventory(
+            io.tapstate.core.model.PipelineResource pipeline, CacheBusinessScope expected) {
+        requireOpen();
+        return artifacts.capturedStartInventory(pipeline, expected);
+    }
+
+    public Optional<io.tapstate.spi.store.CapturePreparation> startPlanningCapture(
+            io.tapstate.spi.store.PipelineIntentScope original, CacheBusinessScope expected, String capture) {
+        requireOpen();
+        var client = connection.client();
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client))
+            return capturePreparations().read(expected, capture);
+        var id = MongoCapturePreparationFacts.id(expected, capture);
+        return StoreIo.call(() -> {
+            var stages = MongoStartConfigRead.root();
+            MongoStartConfigRead.addBinding(stages);
+            String pipeline = original.pipelineId();
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", pipeline, null));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.PIPELINES, "pipeline", pipeline, new Document("_id", 1)));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.CAPTURE_PREPARATIONS, "capture", id, null));
+            var snapshot = MongoStartConfigRead.snapshot(connection.database(), stages);
+            if (MongoStartConfigRead.binding(snapshot, bindings, expected).isEmpty()) throw startIntentFenced();
+            var mapping = MongoStartConfigRead.row(snapshot, "mapping", pipeline);
+            if (mapping.isEmpty() || MongoStartConfigRead.row(snapshot, "pipeline", pipeline).isEmpty()) throw startIntentFenced();
+            var current = MongoPipelineStateMappings.decode(pipeline, mapping.orElseThrow());
+            if (current.phase() != PipelineStateMapping.Phase.ACTIVE || current.stateGeneration() != original.stateGeneration())
+                throw startIntentFenced();
+            var result = MongoStartConfigRead.row(snapshot, "capture", id);
+            if (result.isEmpty() && !snapshot.getList("capture", Document.class).isEmpty())
+                return capturePreparations().read(expected, capture);
+            return result.map(MongoCapturePreparationFacts::available);
+        });
+    }
+
+    private static TapstateException startIntentFenced() {
+        return new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
     }
 
     public record PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
@@ -1228,6 +1290,18 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public StorageBindingStore bindings() {
         return bindings;
+    }
+
+    public enum RetainedStart { SAVED, VERSION_CONFLICT, FALLBACK }
+
+    public RetainedStart commitRetainedStart(io.tapstate.spi.store.PipelineIntentScope scope, long expected,
+            io.tapstate.core.lifecycle.DesiredState desired, io.tapstate.spi.store.PipelinePreparationInputs inputs,
+            Runnable active) {
+        requireOpen();
+        if (MongoValidationClaimObservation.lacksSnapshotRead(connection.client())) return RetainedStart.FALLBACK;
+        var store = new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings);
+        return ((MongoPipelineIntentStore) store.guardedBy(() -> { requireOpen(); active.run(); }))
+                .commitRetainedStart(scope, expected, desired, inputs, artifacts);
     }
 
     public io.tapstate.spi.store.PipelineIntentStore intents() {

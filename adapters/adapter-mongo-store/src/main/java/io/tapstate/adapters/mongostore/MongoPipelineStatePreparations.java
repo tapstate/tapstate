@@ -228,13 +228,19 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         ids.add(scope.pipelineId());
         if (requested != null) ids.addAll(requested.sourceHashes().keySet());
         var captured = artifacts.preparationInputsInTransaction(session, ids);
+        return verifiedInputs(scope, requested, captured,
+                id -> artifacts.getInTransaction(session, id).orElseThrow(MongoPipelineStatePreparations::fenced));
+    }
+
+    static VerifiedInputs verifiedInputs(PipelineIntentScope scope, PipelinePreparationInputs requested,
+            Map<String, io.tapstate.core.model.Resource> captured,
+            Function<String, io.tapstate.core.model.Resource> uncapturedSource) {
         if (!(captured.get(scope.pipelineId()) instanceof PipelineResource pipeline)) throw fenced();
         if (requested != null && !new java.util.HashSet<>(pipeline.sourceIds()).equals(requested.sourceHashes().keySet()))
             throw fenced();
         var sources = new java.util.HashMap<String,SourceResource>();
         for (var id : pipeline.sourceIds()) {
-            var source = requested == null ? artifacts.getInTransaction(session,id).orElseThrow(MongoPipelineStatePreparations::fenced)
-                    : captured.get(id);
+            var source = requested == null ? uncapturedSource.apply(id) : captured.get(id);
             if (!(source instanceof SourceResource actual) || sources.put(id,actual) != null) throw fenced();
         }
         var selected = new java.util.HashMap<String,java.util.Set<String>>();

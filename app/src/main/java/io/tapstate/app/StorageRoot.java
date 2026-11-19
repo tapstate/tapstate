@@ -174,6 +174,20 @@ final class StorageRoot implements AutoCloseable {
             try{return authenticateCredentialsOwned(presented);}finally{replacements.leave();}
         }
     }
+    Optional<CredentialAuthentication> authenticateStartCredentials(String presented) {
+        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_ENTRY)) {
+            if (!replacements.enter()) throw StorageRuntime.unavailable();
+            try {
+                requireOpen();
+                return authentication.credentials().authenticateStartContext(presented);
+            } catch (TapstateException failure) {
+                throw initializationDiagnostic(failure);
+            } finally {
+                replacements.leave();
+            }
+        }
+    }
+
     private Optional<CredentialAuthentication> authenticateCredentialsOwned(String presented) {
         requireOpen();
         try { return authentication.credentials().authenticateContext(presented); }

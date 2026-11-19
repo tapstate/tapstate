@@ -90,9 +90,18 @@ final class StorageAuthentication implements AutoCloseable {
         Epoch original = selected();
         original.requireActive(budget); return new ManagedAuthenticationContext(original.managed, original::requireActive);
     }
-    CredentialAuthenticator credentials() { return CredentialAuthenticator.scoped(this::authenticate); }
+    CredentialAuthenticator credentials() { return CredentialAuthenticator.scoped(this::authenticate, this::authenticateStart); }
+
+    private Optional<CredentialAuthentication> authenticateStart(String presented) {
+        if (cloud.cloud() || TokenService.isMachineToken(presented)) return authenticate(presented);
+        return authenticate(presented, true);
+    }
 
     private Optional<CredentialAuthentication> authenticate(String presented) {
+        return authenticate(presented, false);
+    }
+
+    private Optional<CredentialAuthentication> authenticate(String presented, boolean start) {
         try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_ATTEMPT)) {
             if (current.get() == null && bootstrap != null) return bootstrap.authenticate(presented);
             long deadline = System.nanoTime() + AUTHORIZATION_READ_BUDGET.toNanos();
@@ -100,11 +109,15 @@ final class StorageAuthentication implements AutoCloseable {
             Epoch original = selected();
             if (cloud.cloud()) return pending.validate(original, presented, deadline,
                     () -> authenticate(original, presented, budget), original::requireLocallyActive);
-            return authenticate(original, presented, budget);
+            return authenticate(original, presented, budget, start);
         }
     }
 
     private Optional<CredentialAuthentication> authenticate(Epoch original, String presented, MongoReadBudget budget) {
+        return authenticate(original, presented, budget, false);
+    }
+
+    private Optional<CredentialAuthentication> authenticate(Epoch original, String presented, MongoReadBudget budget, boolean start) {
         try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_VERIFY)) {
             Optional<VerifiedToken> verified;
             Optional<CredentialEvidence> evidence;
@@ -119,7 +132,7 @@ final class StorageAuthentication implements AutoCloseable {
                 evidence = verified.map(ignored -> new CredentialEvidence(CredentialType.CLOUD_SESSION,
                         Optional.empty(), original::requireLocallyActive));
             } else {
-                var authenticated = original.authenticateTagged(presented, budget);
+                var authenticated = original.authenticateTagged(presented, budget, start);
                 verified = authenticated.map(AuthenticatedIdentity::identity);
                 evidence = authenticated.map(value -> new CredentialEvidence(value.type(), value.configurationBinding(), () -> {
                     original.requireLocallyActive();
@@ -281,14 +294,28 @@ final class StorageAuthentication implements AutoCloseable {
             return authenticateTagged(presented, budget).map(AuthenticatedIdentity::identity);
         }
         Optional<AuthenticatedIdentity> authenticateTagged(String presented, MongoReadBudget budget) {
-            requireActive(budget);
+            return authenticateTagged(presented, budget, false);
+        }
+        Optional<AuthenticatedIdentity> authenticateTagged(String presented, MongoReadBudget budget, boolean start) {
+            if (start) {
+                requirePublished(budget, true);
+                try {
+                    bound.cache().loadRequestAuthScope(bound.preparation().authScope(), budget);
+                } catch (TapstateException unavailable) {
+                    if (unavailable.code() == IoError.STORE_QUOTA_EXCEEDED)
+                        throw new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
+                    throw StorageRuntime.unavailable();
+                }
+                requireLocallyActive();
+            } else requireActive(budget);
             Optional<AuthenticatedIdentity> result = cloud.cloud() ? managed(budget).authenticate(presented)
                     .map(identity -> new AuthenticatedIdentity(identity, CredentialType.CLOUD_SESSION, Optional.empty()))
                     : TokenService.isMachineToken(presented)
                             ? new TokenService(configuration.tokens(budget), secrets, clock).authenticateBound(presented)
                                     .map(value -> new AuthenticatedIdentity(value.identity(), CredentialType.MACHINE_TOKEN, Optional.of(value.configurationBinding())))
                             : signer.verifyDetailed(presented).map(value -> new AuthenticatedIdentity(value.identity(), CredentialType.HUMAN_JWT, Optional.empty(), Optional.of(value.continuation())));
-            requireActive(budget); return result;
+            if (start) requireLocallyActive(); else requireActive(budget);
+            return result;
         }
         void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }
         void requireActive(MongoReadBudget budget) {

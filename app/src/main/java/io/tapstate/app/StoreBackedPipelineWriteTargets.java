@@ -52,7 +52,9 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
         var scope = original.map(store::planningScope).orElseGet(() -> store.planningScope(pipeline.id()));
         var live = store.artifacts();
         var resources = new HashMap<String, Optional<Resource>>();
-        live.startPlanningInventory(pipeline).ifPresent(inventory -> {
+        var inventoryFacts = original.isPresent() ? store.startPlanningInventory(pipeline)
+                .or(() -> live.startPlanningInventory(pipeline)) : live.startPlanningInventory(pipeline);
+        inventoryFacts.ifPresent(inventory -> {
             io.tapstate.core.dsl.ReferenceGraph.declaredReferences(pipeline).forEach(edge ->
                     resources.put(edge.id(), Optional.empty()));
             inventory.resources().forEach(resource -> resources.put(resource.id(), Optional.of(resource)));
@@ -64,7 +66,8 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
             private List<Resource> all;
             @Override public Optional<String> managedDefaultSourceId() {
                 if (!managedLoaded) {
-                    managed = live.managedDefaultSourceId();
+                    managed = inventoryFacts.flatMap(ArtifactStore.ReadableInventory::managedDefaultSourceId)
+                            .or(live::managedDefaultSourceId);
                     managedLoaded = true;
                 }
                 return managed;

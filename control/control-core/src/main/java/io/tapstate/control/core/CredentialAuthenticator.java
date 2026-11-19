@@ -17,6 +17,7 @@ import java.util.Optional;
  */
 public final class CredentialAuthenticator {
 
+    private final java.util.function.Function<String, Optional<CredentialAuthentication>> startContexts;
     private final CredentialVerifier verifier;
     private final java.util.function.Function<String, Optional<CredentialAuthentication>> contexts;
 
@@ -27,22 +28,37 @@ public final class CredentialAuthenticator {
                 ? tokenService.authenticate(presented)
                 : tokenSigner.verify(presented);
         this.contexts = null;
+        this.startContexts = null;
     }
 
     /** Uses the selected deployment's verifier, such as the Cluster-local managed-session verifier. */
     public CredentialAuthenticator(CredentialVerifier verifier) {
         this.verifier = Objects.requireNonNull(verifier, "verifier");
         this.contexts = null;
+        this.startContexts = null;
     }
 
-    private CredentialAuthenticator(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts, boolean scoped) {
+    private CredentialAuthenticator(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts,
+            java.util.function.Function<String, Optional<CredentialAuthentication>> startContexts) {
         this.contexts = Objects.requireNonNull(contexts, "contexts");
+        this.startContexts = Objects.requireNonNull(startContexts, "startContexts");
         this.verifier = credential -> contexts.apply(credential).map(CredentialAuthentication::token);
     }
 
     /** The selected provider supplies a fixed scope and an original-credential guard, never a latest-scope lookup. */
     public static CredentialAuthenticator scoped(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts) {
-        return new CredentialAuthenticator(contexts, true);
+        return new CredentialAuthenticator(contexts, contexts);
+    }
+
+    /** Keeps the selected request admission separate from later credential revalidation. */
+    public static CredentialAuthenticator scoped(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts,
+            java.util.function.Function<String, Optional<CredentialAuthentication>> startContexts) {
+        return new CredentialAuthenticator(contexts, startContexts);
+    }
+
+    public Optional<CredentialAuthentication> authenticateStartContext(String presented) {
+        if (presented == null || presented.isBlank()) return Optional.empty();
+        return startContexts == null ? authenticateContext(presented) : startContexts.apply(presented);
     }
 
     public Optional<CredentialAuthentication> authenticateContext(String presented) {

@@ -285,6 +285,8 @@ public final class PipelineLifecycleService {
                     // over that would run a definition nobody checked.
                     var preparation = checked == null || plan == null
                             ? Optional.<DesiredStore.StartPreparation>empty() : plan.preparation().get();
+                    if (checked != null && preparation.isPresent()
+                            && desired.commitRetainedStart(next, checked.intent(), preparation.orElseThrow())) return next;
                     if (expectedContentHash != null && (checked == null || !desired.defersStart(next, checked.intent(), preparation))
                             && !artifacts.getResource(pipelineId)
                             .map(StoredResource::contentHash).filter(expectedContentHash::equals).isPresent()) {

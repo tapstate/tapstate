@@ -33,10 +33,16 @@ final class MongoCacheSchemaStore implements SchemaStore {
     private static final Set<String> PUBLISHED = Set.of("_id", "cacheScope", WRITERS, REVISION, "modelVersion", "connectorId", "discoveredAt", GENERATION, "tableCount");
     private final MongoCacheMetadataAccess access;
     private final MongoCollection<Document> rows;
+    private final boolean startPlanning;
 
     MongoCacheSchemaStore(MongoCacheMetadataAccess access) {
+        this(access, false);
+    }
+
+    MongoCacheSchemaStore(MongoCacheMetadataAccess access, boolean startPlanning) {
         this.access = Objects.requireNonNull(access, "access");
         this.rows = access.collection.withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+        this.startPlanning = startPlanning;
     }
 
     @Override public void save(DiscoveredSourceModel discovered) {
@@ -113,27 +119,60 @@ final class MongoCacheSchemaStore implements SchemaStore {
         Objects.requireNonNull(id, "connectionId"); ownedKeys(id);
         // The envelope and its complete generation are read in one original CACHE snapshot.
         return access.read(session -> {
-            Document envelope = current(session, id);
+            Document captured = startPlanning ? startRows(session, id) : null;
+            Document envelope = captured == null ? current(session, id) : captured.get("envelope", Document.class);
+            if (captured != null && envelope != null) {
+                if (!access.inScope(envelope, id)) return Optional.empty();
+                validate(envelope, id);
+            }
             if (envelope == null || !envelope.containsKey(GENERATION)) return Optional.empty();
             String generation = envelope.getString(GENERATION);
             var tables = new ArrayList<Document>();
-            try (var cursor = rows.find(session, scoped(new Document("_id", ownedKeys(id)).append(GENERATION, generation)))
-                    .sort(new Document("order", 1)).iterator()) {
-                while (cursor.hasNext()) {
-                    Document row = cursor.next(); int order = tables.size();
-                    if (!access.inScope(row, id) || !Integer.valueOf(order).equals(row.get("order"))
-                            || !tableKey(id, generation, order).equals(row.get("_id"))) throw unreadable(id);
-                    Document payload = access.payload(row); payload.remove("_id"); payload.remove(GENERATION); payload.remove("order");
-                    try {
-                        if (!payload.equals(MongoSchemaStore.tableDocument(MongoSchemaStore.toTable(payload, id)))) throw unreadable(id);
-                    } catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
-                    tables.add(row);
-                }
+            var selected = captured == null ? rows.find(session, scoped(new Document("_id", ownedKeys(id)).append(GENERATION, generation)))
+                    .sort(new Document("order", 1)).into(new ArrayList<>()) : captured.getList("tables", Document.class);
+            for (Document row : selected) {
+                int order = tables.size();
+                if (!access.inScope(row, id) || !Integer.valueOf(order).equals(row.get("order"))
+                        || !tableKey(id, generation, order).equals(row.get("_id"))) throw unreadable(id);
+                Document payload = access.payload(row); payload.remove("_id"); payload.remove(GENERATION); payload.remove("order");
+                try {
+                    if (!payload.equals(MongoSchemaStore.tableDocument(MongoSchemaStore.toTable(payload, id)))) throw unreadable(id);
+                } catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
+                tables.add(row);
             }
             if (tables.size() != envelope.getInteger("tableCount")) throw unreadable(id);
             try { return Optional.of(MongoSchemaStore.toDiscovered(envelope, tables)); }
             catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
         });
+    }
+
+    private Document startRows(ClientSession session, String id) {
+        var filter = scoped(new Document("_id", ownedKeys(id)))
+                .append("$expr", new Document("$eq", List.of("$" + GENERATION, "$$generation")));
+        var envelopeProjection = capturedRow();
+        envelopeProjection.remove("_id");
+        var captured = rows.aggregate(session, List.of(new Document("$match", new Document("_id", id)),
+                new Document("$limit", 1),
+                new Document("$project", new Document("envelope", envelopeProjection)),
+                new Document("$lookup", new Document("from", rows.getNamespace().getCollectionName())
+                        .append("let", new Document("generation", "$envelope.value." + GENERATION))
+                        .append("pipeline", List.of(new Document("$match", filter), new Document("$sort", new Document("order", 1)),
+                                new Document("$limit", 129), new Document("$project", capturedRow())))
+                        .append("as", "tables")))).first();
+        if (captured == null) return new Document("envelope", null).append("tables", List.of());
+        var envelope = captured.get("envelope", Document.class);
+        var tables = captured.getList("tables", Document.class);
+        if (Boolean.TRUE.equals(envelope.get("large")) || tables.size() > 128
+                || tables.stream().anyMatch(row -> Boolean.TRUE.equals(row.get("large")))) return null;
+        return new Document("envelope", envelope.get("value", Document.class))
+                .append("tables", tables.stream().map(row -> row.get("value", Document.class)).toList());
+    }
+
+    private static Document capturedRow() {
+        var size = new Document("$bsonSize", "$$ROOT");
+        return new Document("_id", 0).append("large", new Document("$gt", List.of(size, 64 * 1024)))
+                .append("value", new Document("$cond", java.util.Arrays.asList(
+                        new Document("$lte", List.of(size, 64 * 1024)), "$$ROOT", null)));
     }
 
     private void reclaim(String id) {

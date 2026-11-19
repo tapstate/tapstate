@@ -12,6 +12,7 @@ import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.PipelineConnectorNodes;
 import io.tapstate.spi.store.RequiredNoteOwner;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -647,6 +648,52 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return definitionInventory(candidate, false);
     }
 
+    Optional<Resource> capturedStartDefinition(Document snapshot, String pipelineId) {
+        return MongoStartConfigRead.artifacts(snapshot, List.of(pipelineId))
+                .filter(rows -> rows.size() == 1).map(rows -> decode(rows.getFirst()));
+    }
+
+    Optional<ReadableInventory> capturedStartInventory(PipelineResource candidate,
+            io.tapstate.spi.store.CacheBusinessScope expected) {
+        if (candidate.serve() instanceof io.tapstate.core.model.ServeBlock.Use
+                || MongoValidationClaimObservation.lacksSnapshotRead(client)) return Optional.empty();
+        var refs = new java.util.LinkedHashSet<String>();
+        io.tapstate.core.dsl.ReferenceGraph.declaredReferences(candidate).forEach(edge -> refs.add(edge.id()));
+        // Both reserved IDs are read using the same snapshot as the published binding.
+        refs.add(io.tapstate.spi.store.StorageBinding.defaultSourceId(io.tapstate.spi.store.StorageBinding.Mode.OP));
+        refs.add(io.tapstate.spi.store.StorageBinding.defaultSourceId(io.tapstate.spi.store.StorageBinding.Mode.CLOUD));
+        if (refs.size() > 16) return Optional.empty();
+        var ids = List.copyOf(refs);
+        return StoreIo.call(() -> {
+            var stages = MongoStartConfigRead.root();
+            MongoStartConfigRead.addBinding(stages);
+            MongoStartConfigRead.addArtifacts(stages, ids);
+            var snapshot = MongoStartConfigRead.snapshot(database, stages);
+            var binding = MongoStartConfigRead.binding(snapshot, bindings, expected);
+            var rows = MongoStartConfigRead.artifacts(snapshot, ids);
+            if (binding.isEmpty() || rows.isEmpty()) return Optional.empty();
+            String managed = binding.orElseThrow().defaultSourceId();
+            Object managedHash = MongoStartConfigRead.row(snapshot, "binding", "cluster").orElseThrow().get("sourceHash");
+            var values = new ArrayList<Resource>();
+            var exact = new java.util.HashSet<String>();
+            for (var raw : rows.orElseThrow()) {
+                try {
+                    var value = decode(raw);
+                    exact.add(value.id());
+                    if (managed.equals(value.id()) && (!(value instanceof SourceResource)
+                            || !MongoStorageBindingStore.DEFAULT_ROLE.equals(raw.get("systemRole"))
+                            || !CanonicalHash.of(value).equals(managedHash))) return Optional.empty();
+                    values.add(value);
+                } catch (TapstateException failure) {
+                    if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure;
+                    return Optional.empty();
+                }
+            }
+            if (!exact.contains(managed)) return Optional.empty();
+            return Optional.of(new ReadableInventory(values, Optional.empty(), Optional.of(managed), exact));
+        });
+    }
+
     private Optional<ReadableInventory> definitionInventory(PipelineResource candidate, boolean includePipeline) {
         // A reused Serve may introduce more Source ids after the first lookup.
         if (candidate.serve() instanceof io.tapstate.core.model.ServeBlock.Use) return Optional.empty();
@@ -875,7 +922,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return table;
     }
 
-    private Resource decode(Document document) {
+    Resource decode(Document document) {
         Resource resource = codec.decode(document);
         String id = document.getString("_id");
         if (!id.equals(resource.id()) || !resource.kind().equals(document.get("kind"))

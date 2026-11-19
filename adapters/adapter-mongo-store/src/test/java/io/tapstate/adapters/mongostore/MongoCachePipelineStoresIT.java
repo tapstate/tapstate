@@ -56,6 +56,35 @@ class MongoCachePipelineStoresIT {
     private static final Runnable ACTIVE = () -> {};
     private static final Instant AT = Instant.parse("2026-10-18T00:00:00Z");
 
+    @Test void startCheckpointReadsAdmissionStateAndClaimTogether() {
+        withFixture(f -> {
+            var expected = f.domain().pipelineStates(SCOPE).read(SCOPE.pipelineId()).orElseThrow();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getDatabaseName().equals(f.database().getName()) || event.getCommandName().equals("commitTransaction"))
+                        commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = client(listener)) {
+                var access = new MongoCachePipelineAccess(observed, observed.getDatabase(f.database().getName()), SCOPE, null, ACTIVE);
+                assertThat(access.startCheckpoint()).isEqualTo(expected);
+                assertThat(commands).containsExactly("aggregate", "commitTransaction");
+            }
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).deleteOne(new Document("_id", SCOPE.pipelineId()));
+            assertCode(() -> f.domain().startCheckpoint(SCOPE, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+        });
+    }
+
+    @Test void startCheckpointRequiresItsPreparedClaimAndOriginalCache() {
+        withFixture(f -> {
+            var wrong = new PipelineIntentScope(SCOPE.clusterId(), SCOPE.bindingVersion(), "other-incarnation", SCOPE.pipelineId(), SCOPE.stateGeneration());
+            assertCode(() -> f.domain().startCheckpoint(wrong, ACTIVE), IoError.CACHE_BUSINESS_FENCED);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).deleteOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)));
+            assertCode(() -> f.domain().startCheckpoint(SCOPE, ACTIVE), IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+        });
+    }
+
     @Test void terminalRefreshUsesOneCoherentCheckpointAndProjectionRead() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);

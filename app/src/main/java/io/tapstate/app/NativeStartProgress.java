@@ -57,7 +57,7 @@ final class NativeStartProgress {
         for (String id:pipeline.sourceIds()) {
             var source=StoredArtifacts.requireSource(artifacts,id);
             SourceCaptureResolution.forPipeline(pipeline,source,models.apply(source))
-                    .flatMap(canonical -> store.startPlanningDescriptor(pipeline,source,canonical))
+                    .flatMap(canonical -> store.startPlanningDescriptor(scope,pipeline,source,canonical))
                     .ifPresent(resolved -> groups.computeIfAbsent(resolved.chainId().value(),ignored -> new ArrayList<>())
                             .add(new Selection(id,store.sharedStartSource(pipeline,source))));
         }

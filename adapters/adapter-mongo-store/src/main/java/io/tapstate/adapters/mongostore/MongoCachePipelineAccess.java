@@ -96,6 +96,10 @@ final class MongoCachePipelineAccess {
     }
 
     private <T> T transaction(TransactionOptions options, Function<ClientSession, T> action) {
+        return transaction(options, true, action);
+    }
+
+    private <T> T transaction(TransactionOptions options, boolean checkAdmission, Function<ClientSession, T> action) {
         return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -103,8 +107,10 @@ final class MongoCachePipelineAccess {
                     return session.withTransaction(() -> {
                         MongoStructureFailureScope.beginCallback();
                         requireActive.run();
-                        new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
-                                .requireAdmissionState(session);
+                        if (checkAdmission) {
+                            new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
+                                    .requireAdmissionState(session);
+                        }
                         T result = action.apply(session);
                         requireActive.run();
                         return result;
@@ -358,6 +364,58 @@ final class MongoCachePipelineAccess {
     }
 
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
+
+    io.tapstate.core.lifecycle.CheckpointDoc startCheckpoint() {
+        return transaction(TRANSACTION, false, session -> {
+            var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+            var row = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                    new Document("$match", new Document("_id", "cluster")),
+                    new Document("$project", new Document("identity", "$$ROOT")),
+                    startLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
+                    startLookup(SystemCollections.CACHE_PIPELINE_STATE, "state", scope.pipelineId()),
+                    startLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", MongoWorkloadClaimStore.id(key)))).first();
+            var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+            if (row != null && (!"cluster".equals(row.get("identity", Document.class).get("_id"))
+                    || needsStartLookupFallback(row, "schema", "business")
+                    || needsStartLookupFallback(row, "state", scope.pipelineId())
+                    || needsStartLookupFallback(row, "claim", MongoWorkloadClaimStore.id(key)))) {
+                new MongoCacheBusinessIdentity(database, business).requireAdmissionState(session);
+                return MongoStateStore.toCheckpoint(state(session, true));
+            }
+            MongoCacheBusinessIdentity.requireObservedAdmission(row == null ? null : row.get("identity", Document.class),
+                    startDocument(row, "schema"), business);
+            var state = startDocument(row, "state");
+            validateState(state);
+            requirePreparedClaim(session, startDocument(row, "claim"));
+            return MongoStateStore.toCheckpoint(state);
+        });
+    }
+
+    private static Document startLookup(SystemCollections collection, String field, Object id) {
+        var size = new Document("$bsonSize", "$$ROOT");
+        var projection = new Document("_id", 0).append("large", new Document("$gt", List.of(size, 64 * 1024)))
+                .append("value", new Document("$cond", List.of(new Document("$lte", List.of(size, 64 * 1024)), "$$ROOT", false)));
+        return new Document("$lookup", new Document("from", collection.collectionName())
+                .append("pipeline", List.of(new Document("$match", new Document("_id", id)), new Document("$limit", 2),
+                        new Document("$project", projection)))
+                .append("as", field));
+    }
+
+    private static boolean needsStartLookupFallback(Document row, String field, Object expected) {
+        var records = row.getList(field, Document.class);
+        if (records.isEmpty()) return false;
+        if (records.size() > 1 || Boolean.TRUE.equals(records.getFirst().get("large"))) return true;
+        Object found = records.getFirst().get("value", Document.class).get("_id");
+        if (expected instanceof Document id) return !(found instanceof Document actual)
+                || !new java.util.ArrayList<>(id.keySet()).equals(new java.util.ArrayList<>(actual.keySet())) || !id.equals(actual);
+        return !expected.equals(found);
+    }
+
+    private static Document startDocument(Document row, String field) {
+        if (row == null) return null;
+        var rows = row.getList(field, Document.class);
+        return rows.isEmpty() ? null : rows.getFirst().get("value", Document.class);
+    }
 
     Document state(ClientSession session) {
         return state(session, false);

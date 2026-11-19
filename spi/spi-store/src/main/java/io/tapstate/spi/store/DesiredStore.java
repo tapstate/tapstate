@@ -33,6 +33,11 @@ public interface DesiredStore {
 
     default Optional<StartEntry> startEntry(String pipelineId) { return Optional.empty(); }
 
+    /** Attempts a retained Start with definition validation and the intent fence in the same transaction. */
+    default boolean commitRetainedStart(DesiredState desired, StartIntent original, StartPreparation preparation) {
+        return false;
+    }
+
     /** A deferred native start validates this captured definition before background preparation. */
     default boolean defersStart(DesiredState desired, StartIntent original, Optional<StartPreparation> preparation) { return false; }
 

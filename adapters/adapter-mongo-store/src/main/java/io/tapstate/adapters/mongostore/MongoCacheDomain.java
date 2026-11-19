@@ -80,6 +80,13 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         budget.requireRemaining();
         return expected;
     }
+    /** Request admission reads the original authentication generation once. */
+    public CacheAuthScope loadRequestAuthScope(CacheAuthScope expected, MongoReadBudget budget) {
+        var facts = facts(expected);
+        facts.requireRequestReady(budget);
+        return expected;
+    }
+
     void requireRecoveryTarget(StorageBinding binding) {
         businessActive();
         if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(binding.cache()))) throw MongoCacheIdentity.fenced();
@@ -459,7 +466,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** One validated view for the synchronous reads of a start plan. */
     public io.tapstate.spi.store.SrsStores startPlanningSrs(CacheBusinessScope expected, Runnable requireActive) {
-        return srs(expected, requireActive);
+        return srs(expected, requireActive, false, false);
     }
 
     public io.tapstate.spi.store.SrsStores runtimeSrs(CacheBusinessScope expected, Runnable requireActive) {
@@ -467,9 +474,15 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     private io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive, boolean runtime) {
+        return srs(expected, requireActive, runtime, true);
+    }
+
+    private io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive, boolean runtime,
+            boolean loadScope) {
         Objects.requireNonNull(requireActive, "requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
-        active.run(); loadBusinessScope(expected);
+        active.run();
+        if (loadScope) loadBusinessScope(expected);
         active.run();
         Runnable verifyStructure = () -> {};
         var lease = MongoSrsLease.selected();
@@ -501,7 +514,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** Start planning reads the original schema and business scope. */
     public io.tapstate.spi.store.SchemaStore admittedStartSchemas(CacheBusinessScope expected, Runnable requireActive) {
-        return schemas(expected, requireActive);
+        return new MongoCacheSchemaStore(metadataAccess(expected, SystemCollections.CACHE_SOURCE_SCHEMAS, requireActive), true);
     }
 
     public io.tapstate.spi.store.ConnectorRegistry connectors(CacheBusinessScope expected, Runnable requireActive) {
@@ -659,6 +672,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     /** A fixed read view refuses missing checkpoints rather than interpreting them as a new Pipeline. */
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope) {
         return new MongoCachePipelineStateStore(pipelineAccess(scope, null, () -> {}));
+    }
+
+    /** Reads the original checkpoint, prepared claim and business admission in one snapshot. */
+    public io.tapstate.core.lifecycle.CheckpointDoc startCheckpoint(io.tapstate.spi.store.PipelineIntentScope scope,
+            Runnable requireActive) {
+        return pipelineAccess(scope, null, requireActive).startCheckpoint();
     }
     /** Only the original prepared control header, without positions or operator state materialization. */
     public io.tapstate.core.lifecycle.CheckpointDoc validationPipelineState(io.tapstate.spi.store.PipelineIntentScope scope,Runnable local){

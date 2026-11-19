@@ -154,6 +154,38 @@ final class MongoCacheIdentity {
         requireSchema(session, READY, AUTH_VERSION, row.getString("authPreparationId"));
     }
 
+    void requireRequestReady(MongoReadBudget budget) {
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) {
+            transaction(budget, session -> { requireReady(session); return null; });
+            return;
+        }
+        StoreIo.run(() -> {
+            budget.requireRemaining();
+            var selected = budget.database(database).withReadConcern(ReadConcern.SNAPSHOT);
+            var row = SystemCollections.CACHE_IDENTITY.on(selected).aggregate(java.util.List.of(
+                    new Document("$match", new Document("_id", "cluster")),
+                    new Document("$project", new Document("identity", "$$ROOT")),
+                    new Document("$lookup", new Document("from", schemas.getNamespace().getCollectionName())
+                            .append("pipeline", java.util.List.of(new Document("$match", new Document("_id", "auth")),
+                                    new Document("$limit", 2)))
+                            .append("as", "schema")))).first();
+            if (row != null) {
+                var records = row.getList("schema", Document.class);
+                if (!"cluster".equals(row.get("identity", Document.class).get("_id"))
+                        || records.size() > 1 || (!records.isEmpty() && !"auth".equals(records.getFirst().get("_id")))) {
+                    transaction(budget, session -> { requireReady(session); return null; });
+                    return;
+                }
+            }
+            var admitted = checkedIdentity(row == null ? null : row.get("identity", Document.class));
+            if (!READY.equals(admitted.get("authPhase"))) throw fenced();
+            var markers = row.getList("schema", Document.class);
+            requireSchema(markers.isEmpty() ? null : markers.getFirst(), READY, AUTH_VERSION,
+                    admitted.getString("authPreparationId"));
+            budget.requireRemaining();
+        });
+    }
+
     /** Every security-changing request competes with generation publication on this same cache document. */
     void fence(ClientSession session) {
         Document row = requireIdentity(session);

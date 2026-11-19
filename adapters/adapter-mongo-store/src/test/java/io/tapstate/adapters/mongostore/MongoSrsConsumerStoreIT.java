@@ -87,9 +87,7 @@ class MongoSrsConsumerStoreIT {
                 var admitted = new MongoSrsConsumerStore(f.client(), f.database(), SCOPE, () -> {}, () -> {});
                 var actual = admitted.startLoadProgress(positionScope(A), CHAIN, sources).orElseThrow();
                 assertThat(actual.consumers()).containsExactlyInAnyOrderElementsOf(expected);
-                assertThat(commands).hasSize(5);
-                assertThat(commands.stream().filter(v -> v.equals("find:srs_consumers"))).hasSize(1);
-                assertThat(commands.stream().filter(v -> v.equals("find:srs_consumer_offsets"))).hasSize(1);
+                assertThat(commands).containsExactly("aggregate:cache_identity", "aggregate:srs_chains", "commitTransaction:");
                 assertThat(commands).noneMatch(v -> v.contains("srs_models") || v.contains("srs_events") || v.startsWith("getMore:"));
                 System.out.println("LIGHT_START_PROGRESS own=" + ownSources + " peers=" + peers + " commands=" + commands.size());
             } finally { MongoCommandObservation.COLLECTIONS.remove(); }

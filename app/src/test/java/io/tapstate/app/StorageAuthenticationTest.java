@@ -15,6 +15,42 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class StorageAuthenticationTest {
+    @Test void startAdmissionUsesOneAuthoritySnapshotAndRetainsExplicitRevalidation() {
+        withOpAuthentication(f -> {
+            String jwt = new HmacTokenSigner(new byte[32], HmacTokenSigner.DEFAULT_TTL, f.clock, f.scope)
+                    .issue("admin", Scope.ADMIN);
+            clearInvocations(f.configuration, f.cache);
+            var proof = f.authentication.credentials().authenticateStartContext(jwt).orElseThrow();
+            verify(f.configuration).requireRequestAuthenticationPublished(eq(f.bound.preparation()), any(MongoReadBudget.class));
+            verify(f.cache).loadRequestAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            verify(f.configuration, never()).requireAuthenticationPublished(any(), any(MongoReadBudget.class));
+            verify(f.cache, never()).loadAuthScope(any(), any(MongoReadBudget.class));
+            proof.requireActive().run();
+            verify(f.configuration, times(2)).requireAuthenticationPublished(eq(f.bound.preparation()), any(MongoReadBudget.class));
+            verify(f.cache, times(2)).loadAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            f.now.set(f.clock.instant().plusSeconds(16 * 60));
+            assertThatThrownBy(proof.evidence().orElseThrow().requireLocallyActive()::run)
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+        });
+    }
+
+    @Test void startAdmissionRefusesRetiredCacheAndDoesNotHideRevokedMachineTokens() {
+        withOpAuthentication(f -> {
+            String jwt = new HmacTokenSigner(new byte[32], HmacTokenSigner.DEFAULT_TTL, f.clock, f.scope)
+                    .issue("admin", Scope.ADMIN);
+            doThrow(new TapstateException(IoError.CACHE_AUTH_FENCED, Map.of(), null))
+                    .when(f.cache).loadRequestAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            assertThatThrownBy(() -> f.authentication.credentials().authenticateStartContext(jwt))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            var revoked = new TokenRecord("machine", "ADMIN", f.secrets.hash("test-secret"), true, f.clock.instant());
+            when(f.tokens.find("machine")).thenReturn(Optional.of(revoked));
+            assertThat(f.authentication.credentials().authenticateStartContext("cyxt_machine.test-secret")).isEmpty();
+            verify(f.tokens).find("machine");
+        });
+    }
+
     @Test void formalMachineEvidenceRetainsTheVerifiedRecordAndHasAPureLocalGuard() {
         withOpAuthentication(f -> {
             var record = new TokenRecord("machine", "ADMIN", f.secrets.hash("test-secret"), false, f.clock.instant());

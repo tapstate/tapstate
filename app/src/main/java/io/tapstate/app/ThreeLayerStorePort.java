@@ -136,20 +136,33 @@ final class ThreeLayerStorePort implements StorePort {
                 && (pipeline.settings() == null || pipeline.settings().readMode() != io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY);
     }
 
-    Optional<SourceCaptureResolution> startPlanningDescriptor(io.tapstate.core.model.PipelineResource pipeline,
-            io.tapstate.core.model.SourceResource source, SourceCaptureResolution canonical) {
+    Optional<ArtifactStore.ReadableInventory> startPlanningInventory(io.tapstate.core.model.PipelineResource pipeline) {
         active();
-        if (!sharedStartSource(pipeline,source)) return Optional.of(canonical);
-        var original = scope(pipeline.id());
-        var prepared = sharedCaptureDescriptor(source,canonical);
-        active(); if (!original.equals(scope(pipeline.id()))) throw refused();
-        return prepared.map(fixed -> canonical.onPhysicalChain(fixed.canonicalChainId(),fixed.chainId()));
+        var captured = configuration.startPlanningInventory(pipeline, business());
+        active();
+        return captured;
+    }
+
+    Optional<SourceCaptureResolution> startPlanningDescriptor(PipelineIntentScope original,
+            io.tapstate.core.model.PipelineResource pipeline, io.tapstate.core.model.SourceResource source,
+            SourceCaptureResolution canonical) {
+        active();
+        if (!sharedStartSource(pipeline, source)) return Optional.of(canonical);
+        String capture = io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
+        var prepared = configuration.startPlanningCapture(original, business(), capture);
+        active();
+        return checkedSharedDescriptor(source, canonical, capture, prepared)
+                .map(fixed -> canonical.onPhysicalChain(fixed.canonicalChainId(), fixed.chainId()));
     }
 
     private Optional<CapturePreparation> sharedCaptureDescriptor(io.tapstate.core.model.SourceResource source,
             SourceCaptureResolution canonical) {
         String capture = io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
-        var prepared = configuration.capturePreparations().read(business(),capture);
+        return checkedSharedDescriptor(source, canonical, capture, configuration.capturePreparations().read(business(), capture));
+    }
+
+    private Optional<CapturePreparation> checkedSharedDescriptor(io.tapstate.core.model.SourceResource source,
+            SourceCaptureResolution canonical, String capture, Optional<CapturePreparation> prepared) {
         if (prepared.isPresent()) {
             var fixed = prepared.orElseThrow();
             if (fixed.mode() != CapturePreparation.Mode.SHARED_SRS || !business().equals(fixed.scope()) || !capture.equals(fixed.captureId())
@@ -290,7 +303,7 @@ final class ThreeLayerStorePort implements StorePort {
                     var desired = current.filter(valueAtStart -> !valueAtStart.deleted()).map(PipelineIntentSnapshot::desired);
                     var intent = new StartIntent(desired, Optional.of(original), current.map(PipelineIntentSnapshot::intentRevision).orElse(0L));
                     var checkpoint = desired.isPresent() && value.preparation().phase() == PipelinePreparation.Phase.COMPLETE
-                            ? bound.cache().pipelineStates(original).read(pipeline) : Optional.<CheckpointDoc>empty();
+                            ? Optional.of(bound.cache().startCheckpoint(original, ThreeLayerStorePort.this::active)) : Optional.<CheckpointDoc>empty();
                     active();
                     return new StartEntry(value.pipeline(), intent, checkpoint);
                 });
@@ -305,6 +318,21 @@ final class ThreeLayerStorePort implements StorePort {
             @Override public void saveStart(DesiredState desired, StartIntent original) {
                 saveStart(desired, original, Optional.empty());
             }
+            @Override public boolean commitRetainedStart(DesiredState desired, StartIntent original, StartPreparation captured) {
+                if (!deferFirstStart || original.revision() < 1 || desired.purgeState()) return false;
+                active();
+                var scope = original.scope().orElseThrow(ThreeLayerStorePort::refused);
+                if (!scope.equals(captured.scope()) || !desired.revision().equals(captured.inputs().pipelineHash()))
+                    throw refused();
+                return switch (configuration.commitRetainedStart(scope, original.revision(), desired, captured.inputs(),
+                        ThreeLayerStorePort.this::active)) {
+                    case SAVED -> true;
+                    case FALLBACK -> false;
+                    case VERSION_CONFLICT -> throw new TapstateException(io.tapstate.control.core.PipelineError.VERSION_CONFLICT,
+                            Map.of("id", desired.pipelineId()), null);
+                };
+            }
+
             @Override public boolean defersStart(DesiredState desired, StartIntent original, Optional<StartPreparation> captured) {
                 return deferFirstStart && original.revision() == 0 && desired.targetState() == PipelineState.RUNNING
                         && !desired.purgeState() && captured.isPresent();

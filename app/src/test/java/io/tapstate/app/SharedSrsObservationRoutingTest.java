@@ -39,6 +39,8 @@ class SharedSrsObservationRoutingTest {
         when(configuration.artifacts()).thenReturn(memory.artifacts());when(configuration.pipelineStates()).thenReturn(mappings);
         when(mappings.read("flow")).thenReturn(Optional.of(new PipelineStateMapping("flow",2,PipelineStateMapping.Phase.ACTIVE,null)));
         when(configuration.capturePreparations()).thenReturn(captures);when(captures.read(BUSINESS,preparation.captureId())).thenReturn(Optional.of(preparation));
+        when(configuration.startPlanningCapture(any(),eq(BUSINESS),anyString()))
+                .thenAnswer(call -> captures.read(BUSINESS,call.getArgument(2)));
         when(bound.preparation()).thenReturn(new CachePreparation("auth",new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1)));
         when(bound.cache()).thenReturn(cache);when(cache.schemas(eq(BUSINESS),any())).thenReturn(memory.schemas());
         when(cache.srs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));

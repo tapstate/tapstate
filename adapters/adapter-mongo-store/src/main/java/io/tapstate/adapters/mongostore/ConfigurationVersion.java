@@ -76,6 +76,20 @@ final class ConfigurationVersion {
                         .append("pipeline", java.util.List.of(new Document("$match", new Document("_id", "cluster")),
                                 new Document("$project", new Document("clusterId", 1).append("layoutId", 1))))
                         .append("as", "identity")))).first();
+        return requireNoValidationMaintenance(row, operation, versions, originalDatabase);
+    }
+
+    static void advanceStart(ClientSession session, MongoCollection<Document> versions,
+            com.mongodb.client.MongoDatabase database, Document version, Document schema, Document identity) {
+        long revision = revision(version);
+        var captured = new Document("revision", revision)
+                .append("schema", schema == null ? java.util.List.of() : java.util.List.of(schema))
+                .append("identity", java.util.List.of(identity));
+        advanceRaw(session, versions, requireNoValidationMaintenance(captured, null, versions, database));
+    }
+
+    private static long requireNoValidationMaintenance(Document row, String operation,
+            MongoCollection<Document> versions, com.mongodb.client.MongoDatabase originalDatabase) {
         long revision = revision(row);
         var schemas = row.getList("schema", Document.class);
         if (schemas.isEmpty()) { if (operation != null) throw MongoValidationSchema.refused(); return revision; }

@@ -39,6 +39,28 @@ class MongoCacheDomainIT {
     private static final Runnable ACTIVE = () -> {};
 
     @Test
+    void requestAuthenticationUsesOneSnapshotAndRejectsChangedGenerationOrSchema() {
+        withCache((root, database, binding) -> {
+            root.prepareAuth(OP, "setup-a", ACTIVE);
+            try (var measured = MongoHttpDiagnosticsScope.open()) {
+                assertThat(root.loadRequestAuthScope(OP, new MongoReadBudget(Duration.ofSeconds(10)))).isEqualTo(OP);
+                var stats = (Map<?, ?>) measured.snapshot().get("mongo");
+                assertThat(((Number) stats.get("started")).intValue()).isEqualTo(1);
+            }
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).updateOne(new Document("_id", "auth"),
+                    new Document("$set", new Document("operationId", "different-operation")));
+            assertThatThrownBy(() -> root.loadRequestAuthScope(OP, new MongoReadBudget(Duration.ofSeconds(10))))
+                    .satisfies(MongoCacheDomainIT::unreadable);
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).updateOne(new Document("_id", "auth"),
+                    new Document("$set", new Document("operationId", "setup-a")));
+            SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("authGeneration", 2L)));
+            assertThatThrownBy(() -> root.loadRequestAuthScope(OP, new MongoReadBudget(Duration.ofSeconds(10))))
+                    .satisfies(MongoCacheDomainIT::fenced);
+        });
+    }
+
+    @Test
     void connectivityAndOrdinaryLoadNeverInitializeAnEmptyCache() {
         withCache((root, database, binding) -> {
             assertThat(database.listCollectionNames().into(new ArrayList<>())).isEmpty();

@@ -86,6 +86,30 @@ class MongoCacheSchemaStoreIT {
         });
     }
 
+    @Test void startPlanningReadsOneGenerationWithOneModelCommand() {
+        withFixture(f -> {
+            var original = discovery("source-a", "original", 123L);
+            f.store().save(original);
+            f.store().save(discovery("source-b", "unrelated", 124L));
+            var commands = new ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getDatabaseName().equals(f.database().getName()) || event.getCommandName().equals("commitTransaction"))
+                        commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = client(listener)) {
+                var access = new MongoCacheMetadataAccess(observed, observed.getDatabase(f.database().getName()),
+                        SCOPE, SystemCollections.CACHE_SOURCE_SCHEMAS, ACTIVE);
+                var start = new MongoCacheSchemaStore(access, true);
+                assertThat(start.get("source-a")).contains(original);
+                assertThat(commands).containsExactly("aggregate", "aggregate", "commitTransaction");
+                f.rows().updateOne(new Document("_id", "source-a"), new Document("$inc", new Document("tableCount", 1)));
+                assertUnreadable(() -> start.get("source-a"));
+            }
+        });
+    }
+
     @Test void aSchemaLargerThanOneBsonDocumentStagesTableBatchesOutsideItsSmallPublicationTransaction() {
         withFixture(f -> {
             var fields = new ArrayList<SourceField>(); String padding = "x".repeat(6000);
@@ -100,6 +124,7 @@ class MongoCacheSchemaStoreIT {
             try (var observed = client(listener)) { f.store(observed, ACTIVE).save(large); }
             assertThat(inserted.get()).isGreaterThanOrEqualTo(1); assertThat(published).hasValue(1);
             assertThat(f.store().get("large-source")).contains(large); assertThat(f.rows().countDocuments()).isEqualTo(4);
+            assertThat(f.domain().admittedStartSchemas(SCOPE, ACTIVE).get("large-source")).contains(large);
         });
     }
 

@@ -153,8 +153,16 @@ class RestApiSecurityConfiguration {
 
     private static AuthenticationFilter bearerFilter(
             AuthenticationManager manager, CodedAuthenticationEntryPoint entryPoint, AuthenticationMode mode) {
-        AuthenticationFilter filter = new AuthenticationFilter(manager, mode == AuthenticationMode.CLOUD
-                ? new CloudCookieAuthenticationConverter() : new StrictBearerAuthenticationConverter());
+        var converter = mode == AuthenticationMode.CLOUD
+                ? new CloudCookieAuthenticationConverter() : new StrictBearerAuthenticationConverter();
+        AuthenticationFilter filter = new AuthenticationFilter(manager, request -> {
+            var converted = converter.convert(request);
+            if (converted instanceof TapstateCredentialAuthenticationToken token) {
+                String path = request.getRequestURI().substring(request.getContextPath().length());
+                token.setDetails("POST".equals(request.getMethod()) && path.matches("/api/pipelines/[^/]+:start"));
+            }
+            return converted;
+        });
         filter.setRequestMatcher(new DispatcherTypeRequestMatcher(DispatcherType.REQUEST));
         filter.setSuccessHandler(new ContinuingAuthenticationSuccessHandler());
         filter.setFailureHandler((request, response, failure) -> entryPoint.commence(request, response, failure));

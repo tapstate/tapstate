@@ -536,8 +536,16 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             throw MongoCacheBusinessIdentity.businessFenced();
         if (sources.isEmpty() || sources.stream().anyMatch(String::isBlank))
             throw new IllegalArgumentException("start planning requires source identities");
+        var requested = new HashMap<String, SrsConsumerKey>();
+        for (String source : sources) {
+            var key = new SrsConsumerKey(chain, original.pipelineId(), source);
+            requested.put(key.consumerId(), key);
+        }
         return transaction(session -> {
-            var root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
+            var filter = records.chain(chain).append("_id.consumer", new Document("$in", List.copyOf(requested.keySet())));
+            var captured = requested.size() <= 64 ? startProgressRows(session, chain, filter) : null;
+            var root = captured == null ? SystemCollections.SRS_CHAINS.on(database)
+                    .find(session, new Document("_id", chain)).first() : captured.get("root", Document.class);
             if (root == null) {
                 if (chains.hasRetainedFacts(session, chain))
                     throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null);
@@ -546,49 +554,72 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             // Control parsing establishes the original chain without reading its model or log payloads.
             var state = MongoSrsChainStore.decode(root, scope, new MongoSrsModelContexts(database, scope));
             if (!chain.equals(state.miningChainId())) throw unavailable(chain);
-            var requested = new HashMap<String, SrsConsumerKey>();
-            for (String source : sources) {
-                var key = new SrsConsumerKey(chain, original.pipelineId(), source);
-                requested.put(key.consumerId(), key);
-            }
-            var filter = records.chain(chain).append("_id.consumer", new Document("$in", List.copyOf(requested.keySet())));
             var members = new HashMap<String, SrsConsumerMembership>();
-            try (var rows = SystemCollections.SRS_CONSUMERS.on(database)
-                    .find(session, filter).batchSize(64).iterator()) {
-                while (rows.hasNext()) {
-                    requireActive.run();
-                    var member = records.membership(rows.next());
-                    var context = member.context();
-                    if (!context.key().equals(requested.get(context.key().consumerId()))
-                            || members.put(context.key().consumerId(), member) != null
-                            || context.stateGeneration() > original.stateGeneration()
-                            || !member.detached() && context.stateGeneration() != original.stateGeneration()) throw unavailable(chain);
-                }
+            var membershipRows = captured == null ? SystemCollections.SRS_CONSUMERS.on(database)
+                    .find(session, filter).batchSize(64).into(new ArrayList<>()) : captured.getList("members", Document.class);
+            for (var row : membershipRows) {
+                requireActive.run();
+                var member = records.membership(row);
+                var context = member.context();
+                if (!context.key().equals(requested.get(context.key().consumerId()))
+                        || members.put(context.key().consumerId(), member) != null
+                        || context.stateGeneration() > original.stateGeneration()
+                        || !member.detached() && context.stateGeneration() != original.stateGeneration()) throw unavailable(chain);
             }
             var progress = new HashMap<String, SrsConsumerProgress>();
-            try (var rows = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database)
-                    .find(session, filter).batchSize(64).iterator()) {
-                while (rows.hasNext()) {
-                    requireActive.run();
-                    var row = rows.next();
-                    if (!(row.get("_id") instanceof Document id) || !(id.get("consumer") instanceof String consumer)) throw unavailable(chain);
-                    var member = members.get(consumer);
-                    if (member == null || member.detached()) throw unavailable(chain);
-                    // Keep the exact embedded-ID semantics of the former point lookup.
-                    var codec = new org.bson.codecs.DocumentCodec();
-                    if (!new org.bson.RawBsonDocument(id, codec).getByteBuffer().asNIO().equals(
-                            new org.bson.RawBsonDocument(records.id(member.context().key()), codec).getByteBuffer().asNIO()))
-                        throw unavailable(chain);
-                    var cursor = records.cursor(member, row);
-                    var value = new SrsConsumerProgress(member.context(), member.revision(), cursor.revision(),
-                            cursor.value(), cursor.snapshot(), cursor.writerRun(), cursor.ringDoneThrough());
-                    if (progress.put(consumer, value) != null) throw unavailable(chain);
-                }
+            var cursorRows = captured == null ? SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database)
+                .find(session, filter).batchSize(64).into(new ArrayList<>()) : captured.getList("cursors", Document.class);
+            for (var row : cursorRows) {
+                requireActive.run();
+                if (!(row.get("_id") instanceof Document id) || !(id.get("consumer") instanceof String consumer)) throw unavailable(chain);
+                var member = members.get(consumer);
+                if (member == null || member.detached()) throw unavailable(chain);
+                // Keep the exact embedded-ID semantics of the former point lookup.
+                var codec = new org.bson.codecs.DocumentCodec();
+                if (!new org.bson.RawBsonDocument(id, codec).getByteBuffer().asNIO().equals(
+                        new org.bson.RawBsonDocument(records.id(member.context().key()), codec).getByteBuffer().asNIO()))
+                    throw unavailable(chain);
+                var cursor = records.cursor(member, row);
+                var value = new SrsConsumerProgress(member.context(), member.revision(), cursor.revision(),
+                        cursor.value(), cursor.snapshot(), cursor.writerRun(), cursor.ringDoneThrough());
+                if (progress.put(consumer, value) != null) throw unavailable(chain);
             }
             if (progress.size() != members.values().stream().filter(member -> !member.detached()).count()) throw unavailable(chain);
             return Optional.of(new PlanningProgress(state, progress.values().stream()
                     .sorted(Comparator.comparing(value -> value.context().key().consumerId())).toList()));
         });
+    }
+
+    private Document startProgressRows(ClientSession session, String chain, Document filter) {
+        var rootProjection = capturedStartRow();
+        rootProjection.remove("_id");
+        var pipeline = List.of(new Document("$match", new Document("_id", chain)),
+                new Document("$project", new Document("root", rootProjection)),
+                startProgressLookup(SystemCollections.SRS_CONSUMERS, "members", filter),
+                startProgressLookup(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS, "cursors", filter));
+        var row = SystemCollections.SRS_CHAINS.on(database).aggregate(session, pipeline).first();
+        if (row == null) return null;
+        var root = row.get("root", Document.class);
+        if (Boolean.TRUE.equals(root.get("large"))) return null;
+        var result = new Document("root", root.get("value", Document.class));
+        for (String field : List.of("members", "cursors")) {
+            var rows = row.getList(field, Document.class);
+            if (rows.size() > 64 || rows.stream().anyMatch(value -> Boolean.TRUE.equals(value.get("large")))) return null;
+            result.put(field, rows.stream().map(value -> value.get("value", Document.class)).toList());
+        }
+        return result;
+    }
+
+    private Document startProgressLookup(SystemCollections collection, String field, Document filter) {
+        return new Document("$lookup", new Document("from", collection.collectionName())
+                .append("pipeline", List.of(new Document("$match", filter), new Document("$limit", 65),
+                        new Document("$project", capturedStartRow()))).append("as", field));
+    }
+
+    private static Document capturedStartRow() {
+        var size = new Document("$bsonSize", "$$ROOT");
+        return new Document("_id", 0).append("large", new Document("$gt", List.of(size, 64 * 1024)))
+                .append("value", new Document("$cond", List.of(new Document("$lte", List.of(size, 64 * 1024)), "$$ROOT", false)));
     }
 
     @Override public Optional<PlanningProgress> planningProgress(PipelineIntentScope original, String chain, Set<String> sourceIds) {
