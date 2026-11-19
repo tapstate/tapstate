@@ -6,7 +6,15 @@ target: https://tapstate.dev/docs/reference/error-diagnostics
 
 # Product error diagnostics
 
-This page describes an unshipped migration candidate. The first migrated request
+The implementation verified together uses Server, CLI and MCP revision
+`56f37fab7cd56acae3f8a19679bfbb7e9c784418` and Web revision
+`522652029bb1c372468df2b8b331380b62630d35`. These revisions identify the
+candidate used for the compatibility checks. For ordinary OP and Cloud
+installations, isolate incompatible writers and verify that the recovery
+build can read both diagnostic formats before switching the connection report
+writer. A historical report keeps its recorded code, language and provenance.
+
+The first migrated request
 refusal is `TS0210001`. Authentication rejection, missing authentication,
 insufficient capability and an unreachable control service use `TS0210002`
 through `TS0210005`, respectively. AI assistant and provider refusals use
