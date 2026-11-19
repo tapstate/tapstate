@@ -37,7 +37,7 @@ def write(path, value):
 
 
 def key(test):
-    return class_key(test) + ((test['example'],) if 'example' in test else ())
+    return class_key(test) + tuple(test[field] for field in ('example', 'method') if field in test)
 
 
 def class_key(test):
@@ -150,7 +150,7 @@ def seconds(value):
 
 
 def hint_key(test):
-    return test['class'] + ('#' + test['example'] if 'example' in test else '')
+    return '#'.join([test['class'], *(test[field] for field in ('example', 'method') if field in test)])
 
 
 def balance(tests, count, hints, fallback=1.0):
@@ -176,6 +176,33 @@ def sha(root):
 
 
 LAYOUT_PATH = '.github/ci-shard-layout.json'
+FAST_LAYOUT_PATH = '.github/ci-fast-layout.json'
+FAST_TESTS_PATH = '.github/ci-fast-integration.json'
+
+
+def fast_tests(root, discovered):
+    integrations = {(test['module'], test['class']): test
+                    for test in discovered if test['kind'] == 'it'}
+    selected = [test for test in discovered if test['kind'] == 'unit']
+    for entry in read(owned_path(root, FAST_TESTS_PATH, 'fast integration policy')):
+        require(set(entry) in ({'module', 'class'}, {'module', 'class', 'example'},
+                               {'module', 'class', 'method'}), 'invalid fast test selector')
+        identity = (entry['module'], entry['class'])
+        require(identity in integrations, 'fast integration test missing from reactor: ' + entry['class'])
+        if 'example' in entry:
+            validate_example(root, entry)
+        if 'method' in entry:
+            require(re.fullmatch(r'[A-Za-z_$][\w$]*', entry['method']), 'invalid fast test method')
+        selected.append({**integrations[identity], **entry})
+    return sorted(selected, key=key)
+
+
+def validate_example(root, test):
+    example = safe_path(test['example'])
+    require(test['class'].endswith('.PublishedExamplesIT') and test['module'] == 'e2e'
+            and test.get('kind', 'it') == 'it' and example.parts[0] == 'examples'
+            and example.name.endswith('.e2e.yml') and (root / 'e2e' / example).is_file(),
+            'invalid example scheduling unit')
 
 
 def layout_config(args, root, name=None):
@@ -263,7 +290,7 @@ def default_groups(tests, hints, layout):
 
 
 def matrix(plan):
-    require(plan['selection'] == 'default-reactor' and 'layout' in plan, 'matrix requires a layout-bound default reactor plan')
+    require(plan['selection'] in ('default-reactor', 'fast-reactor') and 'layout' in plan, 'matrix requires a layout-bound default reactor plan')
     expected = default_groups(plan['expected'], {}, plan['layout'])
     require([row[0] for row in expected] == [shard['id'] for shard in plan['shards']], 'matrix shard IDs differ from layout')
     for (name, tests, unused), shard in zip(expected, plan['shards']):
@@ -290,6 +317,8 @@ def matrix(plan):
 
 def make_plan(args, root):
     tests = read(args.inventory) if args.inventory else discover(root)
+    if args.fast:
+        tests = fast_tests(root, tests)
     require(tests and len({key(t) for t in tests}) == len(tests), 'empty or duplicate test inventory')
     hints = read(args.durations) if args.durations else {}
     require(isinstance(hints, dict), 'invalid duration hints')
@@ -298,10 +327,11 @@ def make_plan(args, root):
     if args.inventory:
         groups = [(f'shard-{i+1}', ts, total) for i, (ts, total) in enumerate(balance(tests, args.count, hints))]
     else:
-        layout, source = layout_config(args, root)
+        layout, source = layout_config(args, root, FAST_LAYOUT_PATH if args.fast else None)
         groups = default_groups(tests, hints, layout)
     plan = dict(schema=1, source_sha=sha(root), cohort_hash=cohort(tests),
-                selection='inventory' if args.inventory else 'default-reactor', expected=tests,
+                selection='fast-reactor' if args.fast else 'inventory' if args.inventory else 'default-reactor',
+                expected=tests,
                 shards=[dict(id=name, tests=ts, estimated_seconds=round(total, 3), required_exec=execs(ts))
                         for name, ts, total in groups])
     if not args.inventory:
@@ -323,7 +353,11 @@ def load_plan(args, root):
     require(len({key(t) for t in tests}) == len(tests), 'duplicate expected class')
     discovered = discover(root)
     source_metadata, planned_metadata = cloud_input_metadata(discovered), cloud_input_metadata(tests)
-    if plan['selection'] == 'default-reactor':
+    if plan['selection'] in ('default-reactor', 'fast-reactor'):
+        if plan['selection'] == 'fast-reactor':
+            discovered = fast_tests(root, discovered)
+            source_metadata = cloud_input_metadata(discovered)
+            require(plan.get('layout_source', {}).get('path') == FAST_LAYOUT_PATH, 'fast layout is missing')
         require(cohort(discovered) == plan['cohort_hash'], 'source-selected cohort differs from plan')
         require(source_metadata == planned_metadata, 'source Cloud input metadata differs from plan')
     else:
@@ -332,11 +366,8 @@ def load_plan(args, root):
                 'source Cloud input metadata differs from plan')
         for test in tests:
             if 'example' in test:
-                example = safe_path(test['example'])
-                require(test['class'].endswith('.PublishedExamplesIT') and test['module'] == 'e2e'
-                        and test['kind'] == 'it' and example.parts[0] == 'examples'
-                        and example.name.endswith('.e2e.yml') and (root / 'e2e' / example).is_file(),
-                        'invalid example scheduling unit')
+                validate_example(root, test)
+            require('method' not in test, 'method selector requires the fast reactor')
     ids = [s['id'] for s in plan['shards']]
     require(len(set(ids)) == len(ids), 'duplicate shard ID')
     for shard in plan['shards']:
@@ -857,7 +888,8 @@ def run_shard(args, root, plan):
         write(runtime_directory / 'capture-origin.json', receipt)
     command = ['mvn', '-B', '-Dapi.version=1.44', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
     for kind, flag in [('unit', 'test'), ('it', 'it.test')]:
-        names = sorted({t['class'] for t in shard['tests'] if t['kind'] == kind})
+        names = sorted({t['class'] + ('#' + t['method'] if 'method' in t else '')
+                        for t in shard['tests'] if t['kind'] == kind})
         command.append('-D' + flag + '=' + (','.join(names) if names else '__ci_shard_no_tests__'))
     if args.case_evidence:
         command += ['-Dmaven.test.additionalClasspath=' + str(root / 'test-support/target/test-classes'),
@@ -896,10 +928,35 @@ def run_shard(args, root, plan):
         write(marker, receipt)
 
 
-def reports(root, shard):
+def validate_smoke_reports(tests, cases):
+    rows = []
+    for case in cases:
+        require(case.find('skipped') is None, 'fast integration testcase skipped')
+        markers = [line.removeprefix('tapstate.published-case=')
+                   for out in case.findall('system-out') for line in (out.text or '').splitlines()
+                   if line.startswith('tapstate.published-case=')]
+        rows.append((case.get('name', '').removesuffix('()'), markers))
+    examples = [t['example'] for t in tests if 'example' in t]
+    methods = [t['method'] for t in tests if 'method' in t]
+    if examples:
+        require(all(len(markers) == 1 for _, markers in rows)
+                and Counter(marker for _, markers in rows for marker in markers) ==
+                Counter(f'{example} on {tier}' for example in examples for tier in ('IN_PROCESS', 'REAL_PROCESS')),
+                'published smoke execution differs from selected examples and tiers')
+    elif methods:
+        require(Counter(name for name, _ in rows) == Counter(methods), 'fast smoke method was not executed exactly once')
+    else:
+        require(rows, 'fast integration class executed no testcases')
+
+
+def reports(root, shard, *, fast=False):
     actual = set()
     seen = set()
     paths = []
+    smoke = {}
+    for test in shard['tests']:
+        if fast and test['kind'] == 'it':
+            smoke.setdefault(class_key(test), [])
     statistics = dict(reported_classes=0, tests=0, skipped=0, zero_case_classes=0)
     modules = ({module for module, _ in reactor(root)} if (root / 'pom.xml').exists() else
                {p.parent.parent.parent.relative_to(root).as_posix()
@@ -922,8 +979,12 @@ def reports(root, shard):
                         'non-success test report: ' + name)
                 # Nested JUnit suites belong to the source-selected outer class. A zero-case
                 # outer suite is legitimate; its nested suites and disabled tests still count.
-                actual.add((module, kind, name.split('$', 1)[0]))
-                for case in suite.findall('testcase'):
+                identity = (module, kind, name.split('$', 1)[0])
+                actual.add(identity)
+                cases = suite.findall('testcase')
+                if identity in smoke:
+                    smoke[identity].extend(cases)
+                for case in cases:
                     case_name = case.get('classname', name).split('$', 1)[0]
                     require(case_name == name.split('$', 1)[0], 'testcase outside report class: ' + case_name)
                 count = int(suite.get('tests', '0'))
@@ -936,6 +997,8 @@ def reports(root, shard):
                 paths.append(path)
     expected = {class_key(t) for t in shard['tests']}
     require(actual == expected, 'report class set differs: missing=' + str(sorted(expected - actual)) + ' extra=' + str(sorted(actual - expected)))
+    for identity, cases in smoke.items():
+        validate_smoke_reports([test for test in shard['tests'] if class_key(test) == identity], cases)
     for test in shard['tests']:
         compiled = root / test['module'] / 'target/test-classes' / (test['class'].replace('.', '/') + '.class')
         require(compiled.is_file() and not compiled.is_symlink(), 'missing compiled test class: ' + str(compiled))
@@ -960,7 +1023,7 @@ def pack(args, root, plan):
                     for name, digest in bindings.items()),
                 'case observer classes/service changed after selected verify')
     witness_ledgers = ledger_paths(root, shard)
-    report_paths, statistics, report_classes = reports(root, shard)
+    report_paths, statistics, report_classes = reports(root, shard, fast=plan['selection'] == 'fast-reactor')
     output = Path(args.output)
     require(not output.exists(), 'artifact output already exists: ' + str(output))
     files = output / 'files'
@@ -1028,7 +1091,7 @@ def verify(args, root, plan):
                 'raw run provenance differs: ' + shard['id'])
         actual_ledgers = [p.relative_to(files).as_posix() for p in ledger_paths(files, shard)]
         require(actual_ledgers == ledgers, 'witness ledger file set differs: ' + shard['id'])
-        _, statistics, report_classes = reports(files, shard)
+        _, statistics, report_classes = reports(files, shard, fast=plan['selection'] == 'fast-reactor')
         require(statistics == declared_statistics and report_classes == declared_classes,
                 'report evidence differs from manifest: ' + shard['id'])
         print(shard['id'] + ': ' + json.dumps(statistics, sort_keys=True))
@@ -1093,7 +1156,9 @@ def main():
         command.add_argument('--root', default='.')
         if name == 'plan':
             command.add_argument('--durations')
-            command.add_argument('--inventory')
+            selection = command.add_mutually_exclusive_group()
+            selection.add_argument('--inventory')
+            selection.add_argument('--fast', action='store_true')
             command.add_argument('--count', type=int, default=4)
             command.add_argument('--layout', default=LAYOUT_PATH)
             command.add_argument('--output', required=True)

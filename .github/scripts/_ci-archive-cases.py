@@ -153,6 +153,24 @@ def provider_inventory(refs, root, request, inventory, scope, workers):
     return result, bindings
 
 
+def selected_source_cases(cases, tests):
+    selectors = {}
+    for test in tests:
+        selectors.setdefault(s.class_key(test), []).append(test)
+    selected = []
+    for case in cases:
+        family = (case['module'], case['kind'], case['class'].split('$', 1)[0])
+        for test in selectors.get(family, ()):
+            if 'method' in test and case['method'] != test['method']:
+                continue
+            if 'example' in test and case['parameter'] not in {
+                    test['example'] + ' on IN_PROCESS', test['example'] + ' on REAL_PROCESS'}:
+                continue
+            selected.append(case)
+            break
+    return selected
+
+
 def project(refs, root, request, include_test_observations=False):
     require(type(include_test_observations) is bool, 'invalid full observation export option')
     require(isinstance(request, dict) and set(request) in ({'schema', 'type', 'archive_inputs'}, {'schema', 'type', 'archive_inputs', 'provider_replays'})
@@ -178,8 +196,11 @@ def project(refs, root, request, include_test_observations=False):
         parsed_source(source_raw, tree)
         # Discover classes from the verified default reactor independently of
         # both the plan's union and the producer's expected-case hash document.
-        require(plan['selection'] == 'default-reactor', 'case reader requires default reactor selection')
+        selection = plan['selection']
+        require(selection in ('default-reactor', 'fast-reactor'), 'case reader requires a source-derived reactor selection')
         discovered = s.discover(tree)
+        if selection == 'fast-reactor':
+            discovered = s.fast_tests(tree, discovered)
         require(Counter(s.key(t) for t in discovered) == Counter(s.key(t) for t in plan['expected']),
                 'source-discovered class cohort differs from archived plan')
         require(s.cloud_input_metadata(discovered) == s.cloud_input_metadata(plan['expected']),
@@ -287,10 +308,12 @@ def project(refs, root, request, include_test_observations=False):
                                   'observed_member_sha256': g.checksum(members['observed-case-hashes.json']),
                                   'replayed_cases': replay_cases, 'complete': observation['complete'],
                                   'unresolved': observation['unresolved']}
-        expected_known = Counter(ev.identity(r) for r in inv['cases'])
+        selected_cases = selected_source_cases(inv['cases'], discovered) if selection == 'fast-reactor' else inv['cases']
+        expected_known = Counter(ev.identity(r) for r in selected_cases)
         observed_known = Counter(ev.identity(r) for r in observed if r.get('parameter') is not None and ev.method_key(r) in known)
-        require(expected_known == observed_known, 'source case multiset differs from all original workers')
+        require(expected_known == observed_known, 'selected source case multiset differs from all original workers')
         fully_parsed = inv['complete'] and not gaps and all(v['complete'] for v in worker_reads.values())
+        full_reactor_replayed = selection == 'default-reactor' and fully_parsed
         inventory = {'methods': inv['methods'], 'cases': inv['cases'], 'class_contracts': inv['class_contracts'],
                      'sources': inv['sources'], 'unresolved': inv['unresolved'], 'entry_contract': environment}
         exported = ({'test_observations': {'source_inventory_json': inv_path.read_text(),
@@ -299,12 +322,14 @@ def project(refs, root, request, include_test_observations=False):
     require(reader_hashes == {name: g.checksum(Path(__file__).with_name(name).read_bytes()) for name in reader_paths},
             'trusted case reader changed during replay')
     return {'schema': 1, 'type': 'archived-case-readback', 'scope': readback['scope'], 'checkout': readback['checkout'],
-            'source_class_cohort_verified': True, 'source_case_subset_verified': bool(inv['cases']),
-            'all_source_cases_statically_parsed': fully_parsed and statically_complete,
-            **({'all_source_cases_resolved': fully_parsed, 'provider_case_inputs': provider_bindings} if provider_bindings is not None else {}),
+            'source_class_cohort_verified': True, 'source_case_subset_verified': bool(selected_cases),
+            **({'test_selection': selection} if selection == 'fast-reactor' else {}),
+            'all_source_cases_statically_parsed': full_reactor_replayed and statically_complete,
+            **({'all_source_cases_resolved': full_reactor_replayed, 'provider_case_inputs': provider_bindings} if provider_bindings is not None else {}),
             'source_inventory': inventory, 'source_inventory_digest': g.checksum(g.canonical(inventory)),
             'workers': worker_reads, 'unverified_components': sorted(set(readback['unverified_components'])
-                           | ({'computed_provider_identities'} if not fully_parsed else set())),
+                           | ({'computed_provider_identities'} if not fully_parsed else set())
+                           | ({'full_reactor_case_execution'} if selection == 'fast-reactor' else set())),
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False, 'performance_accepted': False,
             **exported,
             'trusted_reader_hashes': reader_hashes, 'input_files': refs.finish()}
