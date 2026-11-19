@@ -271,18 +271,10 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         seen.forEach((name, declared) -> out.put(name, carriedBy.get(name) == inputs.size()
                 ? declared
                 : JoinSchemaDrift.declaredType(JoinSchemaDrift.typeOf(declared), true)));
-        // An added key column is a claim about every row leaving this node, and a merge forwards
-        // rows from each input as they arrive. So the claim survives only where every input makes
-        // the same one: one branch that expanded a list and one that did not produce rows told apart
-        // by different things, and keying on either branch's answer describes the other's wrongly.
         NodeColumns first = inputs.iterator().next();
-        List<String> agreed = first.key();
         Map<String, String> origins = new LinkedHashMap<>(first.origins());
         boolean expanded = false;
         for (NodeColumns input : inputs) {
-            if (!input.key().equals(agreed)) {
-                agreed = List.of();
-            }
             origins.entrySet().removeIf(entry ->
                     !entry.getValue().equals(input.origins().get(entry.getKey())));
             expanded |= input.expanded();
@@ -291,23 +283,25 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         Map<String, StringType> strings = commonDescriptors(inputs, out.keySet(), NodeColumns::stringTypes);
         Set<String> unchanged = new LinkedHashSet<>(out.keySet());
         inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
-        List<String> mergedKey = agreed.stream().filter(out::containsKey).toList();
-        List<Set<String>> mergedCandidates = new ArrayList<>(mergedKey.stream().map(Set::of).toList());
-        if (!mergedKey.isEmpty() && inputs.stream().allMatch(input ->
-                input.keyCandidates().size() == mergedKey.size()
-                        && input.keyCandidates().stream().noneMatch(Set::isEmpty))) {
-            mergedCandidates = new ArrayList<>();
-            for (int i = 0; i < mergedKey.size(); i++) {
-                Set<String> common = new LinkedHashSet<>(first.keyCandidates().get(i));
-                for (NodeColumns input : inputs) common.retainAll(input.keyCandidates().get(i));
-                mergedCandidates.add(common);
-            }
-        }
-        if (inputs.stream().anyMatch(input -> input.keyCandidates().stream().anyMatch(Set::isEmpty))) {
-            mergedCandidates.add(Set.of());
-        }
+        List<Set<String>> mergedCandidates = mergedKeyCandidates(inputs);
+        List<String> mergedKey = mergedCandidates.stream().filter(names -> !names.isEmpty())
+                .map(names -> names.iterator().next()).toList();
         return new NodeColumns(out, mergedKey, null,
                 origins, expanded, numbers, unchanged, strings, mergedSourceIdentityFields(inputs), mergedCandidates);
+    }
+
+    /** An added key component needs a common alias on every input. */
+    private static List<Set<String>> mergedKeyCandidates(Collection<NodeColumns> inputs) {
+        if (inputs.stream().flatMap(input -> input.keyCandidates().stream()).anyMatch(Set::isEmpty)) {
+            return List.of(Set.of());
+        }
+        List<Set<String>> shared = inputs.iterator().next().keyCandidates();
+        for (NodeColumns input : inputs) {
+            shared = KeyProjection.sharedCandidates(shared, input.keyCandidates(), input.columns()::containsKey)
+                    .orElseGet(List::of);
+            if (shared.isEmpty()) return shared;
+        }
+        return shared;
     }
 
     private static <T> Map<String, T> commonDescriptors(Collection<NodeColumns> inputs, Set<String> columns,

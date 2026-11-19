@@ -150,6 +150,23 @@ class UnwindDerivedKeyTest {
     }
 
     @Test
+    void aCommonLocatorAliasSurvivesConvergenceIntoASecondUnwind() {
+        NodeColumns source = shared("o_id", "INT64 NOT NULL", "items", "ARRAY NULL", "tags", "ARRAY NULL");
+        NodeColumns outer = NodeColumns.of(unwind("item_no", null), one(source), null);
+        List<NodeColumns> branches = List.of("left_no", "right_no").stream().map(branchAlias -> {
+            Map<String, FieldRule> rules = new LinkedHashMap<>();
+            rules.put(branchAlias, FieldRule.computed("after.item_no"));
+            rules.put("shared_no", FieldRule.computed("after.item_no"));
+            rules.put("item_no", FieldRule.drop());
+            return NodeColumns.of(new TransformBody.MapProjection(rules), one(outer), null);
+        }).toList();
+        NodeColumns inner = NodeColumns.of(new TransformBody.Unwind("tags", "tag_no", false, null, null),
+                one(NodeColumns.merged(branches)), null);
+
+        assertThat(publishedKey(inner)).containsExactly("o_id", "shared_no", "tag_no");
+    }
+
+    @Test
     void anUnwindKeyIgnoresAModifiedComputedExpressionInASubsequentMap() {
         NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(atTheSource()), null);
         Map<String, FieldRule> rules = new LinkedHashMap<>();

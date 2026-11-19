@@ -2,9 +2,12 @@ package io.tapstate.app;
 
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.model.FieldRule;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
 
@@ -37,6 +40,52 @@ final class KeyProjection {
             boolean overwritten = names.stream().anyMatch(name -> writesOutput(rules.get(name), mayContain));
             return overwritten ? Set.<String>of() : names;
         }).toList();
+    }
+
+    record GuardedCandidates(List<Set<String>> names, Map<String, String> guardedRenames) {}
+
+    /** A common alias must exist for each ordered key component. */
+    static Optional<List<Set<String>>> sharedCandidates(List<Set<String>> left, List<Set<String>> right,
+            Predicate<String> available) {
+        if (left.size() != right.size()) return Optional.empty();
+        List<Set<String>> shared = new ArrayList<>(left.size());
+        for (int component = 0; component < left.size(); component++) {
+            Set<String> common = new LinkedHashSet<>(left.get(component));
+            common.retainAll(right.get(component));
+            common.removeIf(available.negate());
+            if (common.isEmpty()) return Optional.empty();
+            shared.add(common);
+        }
+        return Optional.of(List.copyOf(shared));
+    }
+
+    /** Prefer aliases that survive every possible rename, then guard any required fallback. */
+    static GuardedCandidates guardedCandidates(List<Set<String>> key, Map<String, FieldRule> rules,
+            Predicate<String> knownFields, Predicate<String> possibleFields) {
+        List<Set<String>> stable = candidates(key, rules, possibleFields);
+        if (stable.stream().noneMatch(Set::isEmpty)) return new GuardedCandidates(stable, Map.of());
+
+        List<Set<String>> fallback = candidates(key, rules, knownFields);
+        List<Set<String>> names = new ArrayList<>(stable);
+        Map<String, String> renames = new LinkedHashMap<>();
+        for (int component = 0; component < stable.size(); component++) {
+            if (stable.get(component).isEmpty()) {
+                Set<String> retained = fallback.get(component);
+                names.set(component, retained);
+                recordGuardedRenames(retained, rules, knownFields, possibleFields, renames);
+            }
+        }
+        return new GuardedCandidates(List.copyOf(names), Map.copyOf(renames));
+    }
+
+    private static void recordGuardedRenames(Set<String> retained, Map<String, FieldRule> rules,
+            Predicate<String> knownFields, Predicate<String> possibleFields, Map<String, String> renames) {
+        for (String output : retained) {
+            if (rules.get(output) instanceof FieldRule.Rename rename
+                    && !knownFields.test(rename.sourceField()) && possibleFields.test(rename.sourceField())) {
+                renames.put(output, rename.sourceField());
+            }
+        }
     }
 
     /** Field presence through a map follows the same output, consumption and drop rules as a row. */

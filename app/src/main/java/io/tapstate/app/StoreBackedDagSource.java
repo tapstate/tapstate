@@ -2360,11 +2360,12 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, Step.Inline> steps, Map<String, SourceVertex> vertices,
             Map<String, String> keysByTable, Map<String, List<String>> keysBySource, Set<String> stepIds,
             String previewExecutionId) {
-        String guardedPath = step instanceof Step.Inline inline
-                && (inline.body() instanceof TransformBody.MapProjection || inline.body() instanceof TransformBody.Js)
+        if (!(step instanceof Step.Inline inline)) {
+            return transformPort(step, List.of(), previewExecutionId);
+        }
+        String guardedPath = (inline.body() instanceof TransformBody.MapProjection || inline.body() instanceof TransformBody.Js)
                 ? downstreamUnwindPath(step.id(), steps, new HashSet<>()) : null;
-        if (!(step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Unwind)
-                && guardedPath == null) {
+        if (!(inline.body() instanceof TransformBody.Unwind) && guardedPath == null) {
             return transformPort(step, List.of(), previewExecutionId);
         }
         Function<FromRef, Map<String, SourceTable>> sourceTables = ref -> {
@@ -2380,26 +2381,30 @@ final class StoreBackedDagSource implements DagSource {
             }
             return byStream;
         };
-        Map<String, List<String>> keys = parentKeysReaching(step, steps, sourceTables);
+        Map<String, ParentKeyState> states = parentKeyCandidates(step.id(), inline.from(),
+                steps, sourceTables, new HashSet<>());
+        Map<String, List<String>> keys = resolveParentKeys(step.id(), states);
         Set<String> guardedStreams = guardedPath == null ? Set.of()
-                : unmodifiedStreamsReaching((Step.Inline) step, steps, sourceTables);
-        return transformPortByStream(step, keys, guardedPath, guardedStreams, previewExecutionId);
+                : unmodifiedStreamsReaching(inline, steps, sourceTables);
+        Map<String, Map<String, String>> guardedRenames = new LinkedHashMap<>();
+        if (inline.body() instanceof TransformBody.MapProjection map) {
+            states.forEach((stream, state) -> {
+                Map<String, String> renames = state.projectKeys(map).guardedRenames();
+                if (!renames.isEmpty()) guardedRenames.put(stream, renames);
+            });
+        }
+        return transformPortByStream(step, keys, guardedPath, guardedStreams, guardedRenames, previewExecutionId);
     }
 
     /** Capture a serializable factory per logical stream; input tables need not share their key names. */
     static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
             Map<String, List<String>> parentKeys, String guardedPath) {
-        return transformPortByStream(step, parentKeys, guardedPath, Set.copyOf(parentKeys.keySet()));
-    }
-
-    private static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
-            Map<String, List<String>> parentKeys, String guardedPath, Set<String> guardedStreams) {
-        return transformPortByStream(step, parentKeys, guardedPath, guardedStreams, null);
+        return transformPortByStream(step, parentKeys, guardedPath, Set.copyOf(parentKeys.keySet()), Map.of(), null);
     }
 
     private static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
             Map<String, List<String>> parentKeys, String guardedPath, Set<String> guardedStreams,
-            String previewExecutionId) {
+            Map<String, Map<String, String>> guardedRenames, String previewExecutionId) {
         Map<String, SupplierEx<? extends TransformPort>> factories = new LinkedHashMap<>();
         parentKeys.forEach((stream, key) -> factories.put(stream,
                 transformPort(step, key, previewExecutionId)));
@@ -2411,6 +2416,7 @@ final class StoreBackedDagSource implements DagSource {
                 throw unresolvedParentKey(step.id(), stream, "the source has no discovered primary key");
             }
         });
+        String stepId = step.id();
         return () -> {
             Map<String, TransformPort> ports = new LinkedHashMap<>();
             for (var entry : factories.entrySet()) {
@@ -2432,6 +2438,8 @@ final class StoreBackedDagSource implements DagSource {
                     if (port == null) {
                         throw new IllegalStateException("No parent-key binding for stream " + event.src());
                     }
+                    Map<String, String> renames = guardedRenames.get(event.src());
+                    if (renames != null) requireNoParentKeyOverwrite(stepId, event, renames);
                     return port.transform(event);
                 }
 
@@ -2441,6 +2449,17 @@ final class StoreBackedDagSource implements DagSource {
                 }
             };
         };
+    }
+
+    private static void requireNoParentKeyOverwrite(String step, Envelope event, Map<String, String> renames) {
+        for (var rename : renames.entrySet()) {
+            String source = rename.getValue();
+            if ((event.before() != null && event.before().containsKey(source))
+                    || (event.after() != null && event.after().containsKey(source))) {
+                throw unresolvedParentKey(step, event.src(),
+                        "renaming " + source + " would overwrite parent-key column " + rename.getKey());
+            }
+        }
     }
 
     /** Check the physical earlier row once, before the first projection can change its shape. */
@@ -2520,15 +2539,19 @@ final class StoreBackedDagSource implements DagSource {
     static Map<String, List<String>> parentKeysReaching(Step step, Map<String, Step.Inline> steps,
             Function<FromRef, Map<String, SourceTable>> sourceTables) {
         if (!(step instanceof Step.Inline inline)) return Map.of();
+        return resolveParentKeys(step.id(),
+                parentKeyCandidates(step.id(), inline.from(), steps, sourceTables, new HashSet<>()));
+    }
+
+    private static Map<String, List<String>> resolveParentKeys(String stepId, Map<String, ParentKeyState> states) {
         Map<String, List<String>> result = new LinkedHashMap<>();
-        parentKeyCandidates(step.id(), inline.from(), steps, sourceTables, new HashSet<>())
-                .forEach((stream, state) -> {
-                    List<Set<String>> key = state.candidates();
-                    if (key.stream().anyMatch(Set::isEmpty)) {
-                        throw unresolvedParentKey(step.id(), stream, "a parent-key column was overwritten");
-                    }
-                    result.put(stream, key.stream().map(names -> names.iterator().next()).toList());
-                });
+        states.forEach((stream, state) -> {
+            List<Set<String>> key = state.candidates();
+            if (key.stream().anyMatch(Set::isEmpty)) {
+                throw unresolvedParentKey(stepId, stream, "a parent-key column was overwritten");
+            }
+            result.put(stream, key.stream().map(names -> names.iterator().next()).toList());
+        });
         return result;
     }
 
@@ -2555,31 +2578,40 @@ final class StoreBackedDagSource implements DagSource {
     private static void mergeParentKey(
             String stepId, Map<String, ParentKeyState> keys, String stream, ParentKeyState state) {
         keys.merge(stream, state, (previous, next) -> {
-            if (!previous.candidates().equals(next.candidates())) {
-                throw unresolvedParentKey(stepId, stream,
-                        "the same stream reaches this step with conflicting parent-key columns");
-            }
-            return new ParentKeyState(previous.candidates(), previous.mayContain().or(next.mayContain()));
+            // A dropped key can remain as a before-image requirement on a single path.
+            List<Set<String>> shared = KeyProjection.sharedCandidates(previous.candidates(), next.candidates(),
+                            previous.possibleFields().and(next.possibleFields()))
+                    .orElseThrow(() -> unresolvedParentKey(stepId, stream,
+                            "the same stream reaches this step with conflicting parent-key columns"));
+            return new ParentKeyState(shared, previous.knownFields().or(next.knownFields()),
+                    previous.possibleFields().or(next.possibleFields()));
         });
     }
 
-    private record ParentKeyState(List<Set<String>> candidates, Predicate<String> mayContain) {
+    private record ParentKeyState(List<Set<String>> candidates, Predicate<String> knownFields,
+            Predicate<String> possibleFields) {
         static ParentKeyState source(SourceTable table) {
-            if (table == null) return new ParentKeyState(List.of(), name -> true);
+            if (table == null) return new ParentKeyState(List.of(), name -> false, name -> true);
             Set<String> fields = new HashSet<>(table.primaryKey());
             table.fields().forEach(field -> fields.add(field.name()));
-            return new ParentKeyState(table.primaryKey().stream().map(Set::of).toList(), fields::contains);
+            return new ParentKeyState(table.primaryKey().stream().map(Set::of).toList(),
+                    fields::contains, fields::contains);
+        }
+
+        KeyProjection.GuardedCandidates projectKeys(TransformBody.MapProjection map) {
+            return KeyProjection.guardedCandidates(candidates, map.fields(), knownFields, possibleFields);
         }
 
         ParentKeyState through(TransformBody body) {
             return switch (body) {
                 case TransformBody.MapProjection map -> new ParentKeyState(
-                        KeyProjection.candidates(candidates, map.fields(), mayContain),
-                        KeyProjection.projectedFields(map.fields(), mayContain));
+                        projectKeys(map).names(),
+                        KeyProjection.projectedFields(map.fields(), knownFields),
+                        KeyProjection.projectedFields(map.fields(), possibleFields));
                 case TransformBody.Unwind unwind -> expanded(unwind);
                 case TransformBody.Filter ignored -> this;
                 case TransformBody.Union ignored -> this;
-                default -> new ParentKeyState(candidates, name -> true);
+                default -> new ParentKeyState(candidates, name -> false, name -> true);
             };
         }
 
@@ -2591,9 +2623,10 @@ final class StoreBackedDagSource implements DagSource {
                 key.add(Set.of(locator));
                 key = List.copyOf(key);
             }
-            return new ParentKeyState(key, name ->
+            Predicate<String> added = name ->
                     name.equals(unwind.path()) || name.equals(unwind.includeArrayIndex())
-                            || name.equals(unwind.elementKey()) || mayContain.test(name));
+                            || name.equals(unwind.elementKey());
+            return new ParentKeyState(key, added.or(knownFields), added.or(possibleFields));
         }
     }
 

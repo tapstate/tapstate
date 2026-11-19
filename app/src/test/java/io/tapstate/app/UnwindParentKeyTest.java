@@ -121,6 +121,34 @@ class UnwindParentKeyTest {
     }
 
     @Test
+    void sameStreamBranchesResolveTheParentKeyTheyBothCarry() {
+        Step.Inline copy = step("copy", "orders", new TransformBody.MapProjection(
+                Map.of("key_copy", FieldRule.computed("after.o_id"))));
+        Step.Inline keep = step("keep", "copy", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.rename("absent"))));
+        Step.Inline drop = step("drop", "copy", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.drop())));
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("keep"), FromRef.literal("drop")),
+                unwind(null, "sku"), null);
+
+        assertThat(keyReaching(expand, copy, keep, drop, expand)).containsExactly("key_copy");
+
+        Step.Inline dropCopy = step("keep", "copy", new TransformBody.MapProjection(
+                Map.of("key_copy", FieldRule.drop())));
+        assertThatThrownBy(() -> keyReaching(expand, copy, dropCopy, drop, expand))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("conflicting parent-key columns");
+
+        Step.Inline discard = step("drop", "discardCopy", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.drop())));
+        Step.Inline discardCopy = step("discardCopy", "copy", new TransformBody.MapProjection(
+                Map.of("key_copy", FieldRule.drop())));
+        assertThatThrownBy(() -> keyReaching(expand, copy, keep, discardCopy, discard, expand))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("conflicting parent-key columns");
+    }
+
+    @Test
     void anOverwrittenParentKeyCannotMasqueradeAsItsOriginalIdentity() {
         Step.Inline map = step("map", "orders", new TransformBody.MapProjection(
                 Map.of("o_id", FieldRule.computed("before.o_id"))));
