@@ -43,6 +43,15 @@ public final class DslErrorDefinitions {
     public static final ProductErrorDefinition SOURCE_READ_NOT_SPLIT =
             DEFINITIONS.define(33, Severity.WARNING, Set.of("source", "requested"));
 
+    public static final ProductErrorDefinition ROLLUP_FUNCTION_UNKNOWN =
+            DEFINITIONS.define(34, Severity.ERROR, Set.of("field", "function", "known", "path"));
+
+    public static final ProductErrorDefinition ROLLUP_ON_SINGLE_ROW_EMBED =
+            DEFINITIONS.define(35, Severity.ERROR, Set.of("as", "path"));
+
+    public static final ProductErrorDefinition ROLLUP_LEVEL_WITHOUT_FIELDS =
+            DEFINITIONS.define(36, Severity.ERROR, Set.of("path"));
+
     private DslErrorDefinitions() {}
 
     private static ProductErrorDefinition error(int serial, String... parameters) {

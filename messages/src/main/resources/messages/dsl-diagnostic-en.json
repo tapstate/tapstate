@@ -130,5 +130,17 @@
   "TS0010033": {
     "message": "Source {source} asks to be read by {requested} processors; one processor reads it.",
     "solution": "No connector has declared a split read yet, so a source is read by one processor whatever is written. Remove the parallelism, or leave it; nothing else changes."
+  },
+  "TS0010034": {
+    "message": "Rollup field `{field}` at {path} names `{function}` as its function; a rollup field names exactly one of {known}.",
+    "solution": "Write one function key with its argument, for example `{field}: \\{ sum: $amount \\}`. The qualifiers `filter`, `type` and `default` go beside it."
+  },
+  "TS0010035": {
+    "message": "The embed at {path} is `as: {as}` and holds at most one row, so it cannot carry rollup fields.",
+    "solution": "Read the row's columns directly, or declare the embed `as: array` (or `as: rollup` when the rows should not be shown) if it gathers many rows."
+  },
+  "TS0010036": {
+    "message": "The embed at {path} is `as: rollup` but declares no `rollup:` fields, so it would be held and never shown.",
+    "solution": "Add the fields to compute over it under `rollup:`, or declare it `as: array` to render its rows."
   }
 }

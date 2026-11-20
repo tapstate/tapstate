@@ -51,7 +51,7 @@ class ScopedOperatorMapsTest {
     }
 
     @Test void everyTypedMapReloadsColdStateWithoutReusingAnotherExecutionOrAddingConfigurations() {
-        var first = Arrays.stream(OperatorPlacement.Resource.values()).map(kind -> binding(placement(SCOPE,kind),1)).toList();
+        var first = Arrays.stream(OperatorPlacement.Resource.values()).filter(OperatorPlacement.Resource::keptInAMap).map(kind -> binding(placement(SCOPE,kind),1)).toList();
         var next = first.stream().map(original -> binding(original.placement(),2)).toList();
         var current = new AtomicReference<Object>("attempt-1"); var scope = new AtomicReference<>(SCOPE); var cold = new Cold();
         HazelcastInstance member = Hazelcast.newHazelcastInstance(config(first));
@@ -146,7 +146,7 @@ class ScopedOperatorMapsTest {
         positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of(),OperatorMapCoordinates.NestMap.PARKING,null));
         positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of("ref"),OperatorMapCoordinates.NestMap.LOOKUP,"dimension"));
         positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of("ref"),OperatorMapCoordinates.NestMap.REFERENCES,"dimension"));
-        for (var kind : OperatorPlacement.Resource.values()) if (kind != OperatorPlacement.Resource.NEST_STATE)
+        for (var kind : OperatorPlacement.Resource.values()) if (kind != OperatorPlacement.Resource.NEST_STATE && kind.keptInAMap())
             positions.add(OperatorMapCoordinates.join(SCOPE,"cache","joined",kind,"dimension"));
         var bindings = positions.stream().map(place -> binding(place,1)).toList(); var manifest = new OperatorRunManifest(SCOPE.pipelineId(),"attempt-1",bindings);
         var cold = new Cold(); var current = new AtomicReference<Object>("attempt-1"); var scope = new AtomicReference<>(SCOPE);

@@ -1,5 +1,7 @@
 package io.tapstate.core.dsl;
 
+import io.tapstate.core.dsl.aggregate.RollupGuidance;
+
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -110,6 +112,7 @@ public final class NestSizingRules {
                     findings);
             sizing.level(ROOT_LEVEL, nest.root().from());
             sizing.descend(nest.root().embed(), List.of());
+            sizing.rollups(nest.root().embed(), nest.root().from(), List.of());
         }
     }
 
@@ -152,6 +155,81 @@ public final class NestSizingRules {
                 level(String.join(PATH_SEPARATOR, path), embed.from());
                 descend(embed.embed(), path);
             }
+        }
+
+        /**
+         * Warns about every level carrying rollup fields whose average width per document - its rows over its
+         * parent level's rows - passes the width rollups keep up with. Leaves included: a rollup level is very
+         * often a leaf, and its width is exactly what its rollups pay for on every send. A level either count
+         * is missing for says nothing here; its width is not known, and the run warns once it is.
+         */
+        void rollups(List<Embed> embeds, String parentAlias, List<String> parentPath) {
+            if (embeds == null) {
+                return;
+            }
+            for (Embed embed : embeds) {
+                List<String> path = new ArrayList<>(parentPath);
+                path.addAll(List.of(embed.treeSegment().split("\\" + PATH_SEPARATOR, -1)));
+                if (!embed.rollupFields().isEmpty()) {
+                    Long children = rowsOfAlias(embed.from());
+                    Long parents = rowsOfAlias(parentAlias);
+                    if (children != null && parents != null && parents > 0) {
+                        long average = children / parents;
+                        int columns = columnsOfAlias(embed.from());
+                        long boundary = RollupGuidance.elementsPerDocument(columns);
+                        if (average > boundary) {
+                            findings.add(new Advisory(NestSizingError.ROLLUP_LEVEL_WIDE, Map.of(
+                                    "pipeline", pipelineId,
+                                    "embedPath", String.join(PATH_SEPARATOR, path),
+                                    "estimatedElements", average,
+                                    "estimatedBytes", average * RollupGuidance.bytesPerElement(columns),
+                                    "boundary", boundary)));
+                        }
+                    }
+                }
+                rollups(embed.embed(), embed.from(), path);
+            }
+        }
+
+        /** The widest discovered table behind {@code alias}, in columns; 0 where none was discovered. */
+        private int columnsOfAlias(String alias) {
+            FromRef ref = aliases.get(alias);
+            int widest = 0;
+            if (ref == null) {
+                return widest;
+            }
+            for (Upstream up : wiring.reaching(ref)) {
+                List<DiscoveredTable> discovered = up.table() == null ? null : tablesBySource.get(up.source());
+                if (discovered != null) {
+                    for (DiscoveredTable table : discovered) {
+                        if (table.name().equals(up.table())) {
+                            widest = Math.max(widest, table.columns().size());
+                        }
+                    }
+                }
+            }
+            return widest;
+        }
+
+        /** Every row the tables behind {@code alias} hold, or null where any of them was not counted. */
+        private Long rowsOfAlias(String alias) {
+            FromRef ref = aliases.get(alias);
+            if (ref == null) {
+                return null;
+            }
+            Set<Upstream> upstream = wiring.reaching(ref);
+            if (upstream.isEmpty()) {
+                return null;
+            }
+            long total = 0L;
+            for (Upstream up : upstream) {
+                Long rows = rowsOf(up);
+                if (rows == null) {
+                    return null;
+                }
+                total += rows;
+            }
+            return total;
         }
 
         /** Sizes the level fed by {@code alias} and reports whatever it has to say about it. */

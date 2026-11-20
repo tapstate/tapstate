@@ -20,6 +20,7 @@ import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
+import io.tapstate.runtime.engine.aggregate.AggregateMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
 import io.tapstate.runtime.engine.nest.NestMemoryBudget;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -593,6 +594,17 @@ public final class Engine {
     }
 
     /**
+     * What the aggregate steps of the pipeline report about themselves, keyed by the reading's name, which
+     * is its kind and then the step; empty when it has no live job or no aggregate step.
+     *
+     * <p>The sizes among them are as of the last pass a step finished over its state, and a step that has
+     * not finished one reports none: absent is "not measured yet", and zero is "measured at nothing".
+     */
+    public Map<String, Long> aggregateReadings(String pipelineId) {
+        return byChain(pipelineId, AggregateMetricNames::readingOf);
+    }
+
+    /**
      * How many rows the large rebuilds of the pipeline have sent so far, keyed by the namespace the
      * rebuilt dimension lives in; empty when it has no live job and while no rebuild large enough to
      * report is under way. Two rebuilds under way in one namespace are added together: the key each one
@@ -974,6 +986,7 @@ public final class Engine {
             if (measured != null) {
                 if (measured.rootsSince() != null) reading = reading.withRootsRendered(measured.rootsRendered(), measured.rootsSince());
                 if (measured.commits() != null) reading = reading.withCommits(measured.commits());
+                if (measured.weight() != null) reading = reading.withWeight(measured.weight());
             }
             readings.put(namespace, reading.withContext(keySamples.get(namespace), originOf(bindings, namespace)));
         });

@@ -1,0 +1,19 @@
+version: tapstate/v1
+kind: pipeline
+id: sales
+source: src_mysql
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: sales_total
+    from: [ orders ]
+    type: aggregate
+    key: [ id ]
+    where: "=after.status != 'cancelled'"
+    fields:
+      order_count: { count: true }
+      revenue: { sum: $amount, default: 0 }
+      max_order: { max: $amount }
+serve:
+  from: sales_total
+  sync:
+    - { source: tgt_mongo, write_mode: upsert, on_full_load: clear }

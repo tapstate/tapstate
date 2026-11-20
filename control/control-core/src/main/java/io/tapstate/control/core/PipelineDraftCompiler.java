@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FieldRule;
@@ -11,6 +12,7 @@ import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameSpec;
+import io.tapstate.core.model.RollupField;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
@@ -35,6 +37,8 @@ import java.util.regex.Pattern;
 /** Deterministic compiler from the server-owned Pipeline authoring model to a runnable Artifact. */
 public final class PipelineDraftCompiler {
 
+    /** Reads a relation's rollup fields under the same rules as a written nest embed's. */
+    private static final DslParser ROLLUP_READER = new DslParser();
     private static final int MAX_GRAPH_NODES = 512;
     private static final int MAX_GRAPH_EDGES = 2048;
     private static final int MAX_GRAPH_DEPTH = 128;
@@ -254,19 +258,26 @@ public final class PipelineDraftCompiler {
         return "map".equals(transform.type()) && transform.fields().isEmpty();
     }
 
+    private static String shapeName(PipelineDraft.Relation relation) {
+        return relation.shape().name().toLowerCase(java.util.Locale.ROOT);
+    }
+
     private static List<Embed> embedsFor(String parentId, Map<String, List<PipelineDraft.Related>> children) {
         List<Embed> result = new ArrayList<>();
         for (PipelineDraft.Related related : children.getOrDefault(parentId, List.of())) {
             PipelineDraft.Relation relation = related.relation();
-            if (relation.shape() == PipelineDraft.Shape.ARRAY && relation.arrayKey().isEmpty()) {
-                throw new IllegalArgumentException("array relation requires an array key");
+            if (relation.shape().holdsRows() && relation.arrayKey().isEmpty()) {
+                throw new IllegalArgumentException(shapeName(relation) + " relation requires an array key");
             }
-            if (relation.shape() == PipelineDraft.Shape.FLAT && relation.path() != null
+            if (!relation.shape().hasPath() && relation.path() != null
                     && !relation.path().isBlank()) {
-                throw new IllegalArgumentException("flat relation must not have a target path");
+                throw new IllegalArgumentException(shapeName(relation) + " relation must not have a target path");
             }
-            if (relation.shape() != PipelineDraft.Shape.FLAT && (relation.path() == null || relation.path().isBlank())) {
+            if (relation.shape().hasPath() && (relation.path() == null || relation.path().isBlank())) {
                 throw new IllegalArgumentException("object and array relations require a target path");
+            }
+            if (relation.shape() == PipelineDraft.Shape.ROLLUP && relation.rollup() == null) {
+                throw new IllegalArgumentException("rollup relation requires at least one rollup field");
             }
             if (relation.on().isEmpty()) {
                 throw new IllegalArgumentException("relation requires at least one association condition");
@@ -283,17 +294,21 @@ public final class PipelineDraftCompiler {
                 }
             });
             List<String> key = relation.key().isEmpty() ? null : relation.key();
-            List<String> arrayKey = relation.shape() == PipelineDraft.Shape.ARRAY ? relation.arrayKey() : null;
+            List<String> arrayKey = relation.shape().holdsRows() ? relation.arrayKey() : null;
             EmbedAs shape = switch (relation.shape()) {
                 case FLAT -> EmbedAs.FLAT;
                 case OBJECT -> EmbedAs.OBJECT;
                 case ARRAY -> EmbedAs.ARRAY;
+                case ROLLUP -> EmbedAs.ROLLUP;
             };
+            Map<String, RollupField> rollup = relation.rollup() == null ? null
+                    : ROLLUP_READER.rollupFieldsFromTree(relation.rollup(),
+                            "wizard.related[" + related.id() + "].relation");
             result.add(new Embed(related.id(), on,
                     shape,
-                    relation.shape() == PipelineDraft.Shape.FLAT ? null : relation.path(),
-                    key, arrayKey, null, null,
-                    embedsFor(related.id(), children)));
+                    relation.shape().hasPath() ? relation.path() : null,
+                    key, arrayKey, null, relation.tracksKeyChanges() ? Boolean.TRUE : null,
+                    embedsFor(related.id(), children), rollup));
         }
         return result;
     }

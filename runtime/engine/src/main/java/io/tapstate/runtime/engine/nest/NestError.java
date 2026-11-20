@@ -78,6 +78,13 @@ public enum NestError implements TapstateErrorCode {
      */
     REFERENCED_LEVEL_CARRIES_EMBEDS(NestErrorDefinitions.REFERENCED_LEVEL_CARRIES_EMBEDS),
 
+    /**
+     * Checking the tree: an embed lists {@code orOn} alternatives and one of them matches on what identifies
+     * the parent. That alternative gathers child rows under the parent rather than pointing at one shared
+     * row, and "this match, or else that one" has no meaning where one match is a whole set of rows.
+     */
+    OR_ON_NOT_A_REFERENCE(NestErrorDefinitions.OR_ON_NOT_A_REFERENCE),
+
     /** Checking the tree: it compiles to more resolver vertices than the limit allows, each taking a thread. */
     RESOLVER_VERTEX_LIMIT_EXCEEDED(NestErrorDefinitions.RESOLVER_VERTEX_LIMIT_EXCEEDED),
 

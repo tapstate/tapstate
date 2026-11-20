@@ -14,10 +14,15 @@ anyone re-running a query.
 teaches the rule that decides which document shapes a nest can express:
 [Assembling one document out of many tables](../tutorials/nest-document-assembly/).
 
-The pages here answer the two questions that come next, once something is running:
+The pages here answer the questions that come next, once something is running:
 
 | Page | Answers |
 |---|---|
+| [Rollup fields](rollup-fields.md) | Counts, sums, averages, extremes and latest values over an embed, written on its parent in the same document as the rows they summarize: the functions, null and number rules, filters, defaults, what a missing reference does, and when to use something else. |
 | [Flat embeds](flat-embeds.md) | Merge one related row directly into its parent, including one-to-one and many-to-one direction, collision checks, one-to-many refusal, and a complete multi-flat example. |
+| [Several tables in one array](several-tables-one-array.md) | Feed one array from several tables, or from one table split into shards: tag each row with its table, merge the streams, and key elements by tag and id so updates and deletes reach only their own element. |
+| [Embeds that match on one column or another](or-embeds.md) | One embed whose row is named by one field on some parents and by another on the rest, with `orOn`: which row wins, what happens under change, and the limits. |
+| [Scripts after a nest](scripts-after-a-nest.md) | Reshape the assembled document with a `js` step: sort an array, join its values, keep the newest element of each kind. What the script is given and when, what it costs, and how to handle money in it. |
 | [Structural key changes](structural-key-changes.md) | A row's key was *edited* - it did not just change, it changed **where it belongs**. What that costs, what you switch on for it to work, what happens when you leave it off, and what it needs from the source. |
+| [Soft delete](../soft-delete/) | Keep a deleted root or child row in the document marked deleted, instead of removing the document or the array element. |
 | [Throughput limits](throughput-limits.md) | The unit a nest sends is the **whole document**, so any row feeding a root rewrites that root in full. Arithmetic you can do on your own numbers, before you run it, to see whether your data shape fits. |

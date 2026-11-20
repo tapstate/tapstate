@@ -98,6 +98,7 @@ class ErrorCodeGatesTest {
                 io.tapstate.core.common.StoreErrorDefinitions.registered(),
                 io.tapstate.core.common.IoErrorDefinitions.registered(),
                 io.tapstate.core.common.NestErrorDefinitions.registered(),
+                io.tapstate.core.common.AggregateErrorDefinitions.registered(),
                 io.tapstate.core.common.ConnectorErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
             assertThat(registered.put(definition.code(), definition)).isNull();
         });
@@ -253,6 +254,7 @@ class ErrorCodeGatesTest {
                                 && io.tapstate.messages.DataBrowserDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.MonitorDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.PositionDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.AggregateDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.MigrationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.RowValueDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.EngineDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()

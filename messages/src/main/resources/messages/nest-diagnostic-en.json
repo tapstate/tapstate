@@ -106,5 +106,47 @@
   "TS0490027": {
     "message": "Stream {alias} behind embed {refPath} sent an update carrying no earlier row, so where that row pointed before is not known.",
     "solution": "Rows pointing at an embedded row are recorded against it, and taking that record back out needs the row the update replaces. Configure that stream's source to send before images - on most databases that is a full replica identity on the table. Without them a re-pointed row stays recorded against the row it left, which is then never reclaimed and counts for ever against the per-row reference limit."
+  },
+  "TS0490029": {
+    "message": "The embed at {embedPath} is one its parent points at, so it holds at most one row and cannot carry rollup fields.",
+    "solution": "Read the referenced row's columns directly, for example in a rollup field one level up: `=after.<path>.<column>`."
+  },
+  "TS0490030": {
+    "message": "Rollup field `{field}` on {level} is already taken by {other}.",
+    "solution": "Rename the rollup field. Columns, embed paths, flat fields and rollup fields share one namespace per level, and none overwrites another by declaration order."
+  },
+  "TS0490031": {
+    "message": "The {part} expression for rollup field `{field}` failed validation.",
+    "solution": "Arguments, orderings and filters read the element as `after`: its own columns, its references' columns (`after.<path>.<column>`) and its child levels' rollup fields. Check the names against the discovered model with `tapstate desc`.",
+    "technicalParams": [
+      "reason"
+    ]
+  },
+  "TS0490032": {
+    "message": "Rollup field `{field}` sums or averages `{expression}`, whose numeric type nothing resolved.",
+    "solution": "Discover the source so the column has a type, or compute over a column whose type is known. A sum's type is fixed when the pipeline is applied, so it is never guessed from the values."
+  },
+  "TS0490033": {
+    "message": "Rollup field `{field}` of document {root} does not fit in {type}.",
+    "solution": "The value is not rounded or wrapped. Check the source rows for an outlier; a total that truly needs more digits than a decimal(38) holds cannot be a rollup field."
+  },
+  "TS0490034": {
+    "message": "Rollup field `{field}` of document {root} met a {actual} value where its column was declared {declared}.",
+    "solution": "The value is not coerced. Fix the row, or rediscover the source if the column's declared type has changed."
+  },
+  "TS0490035": {
+    "message": "Rollup field `{field}` of document {root} is the {from} value that `type: {to}` cannot hold exactly.",
+    "solution": "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal)."
+  },
+  "TS0490036": {
+    "message": "Rollup field `{field}` of document {root} could not evaluate `{expression}`.",
+    "solution": "Check the element's values against what the expression expects; a field the element does not carry reads as null, any other failure stops the document rather than guessing.",
+    "technicalParams": [
+      "reason"
+    ]
+  },
+  "TS0490028": {
+    "message": "Embed {embedPath} lists orOn alternatives, and one of them matches on {fields}, which identifies its parent ({parentKey}).",
+    "solution": "Use orOn only where the parent points at one shared row, such as a location looked up by code or by hub id. An embed that gathers several rows under its parent matches on one condition; give it a single on."
   }
 }

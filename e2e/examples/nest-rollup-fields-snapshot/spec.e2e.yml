@@ -1,0 +1,68 @@
+# Rollup fields over a snapshot. Each transaction document carries, beside its items, the sum of their
+# amounts (qty), the sum of amount times the referenced prize value (amount), the same sum over reward
+# items only (reward_qty), and - from a level kept only for its rollups - the score of its latest rating,
+# ordered by model date and then rating type. Every expected value is the SQL recomputation on the seed:
+#
+#   SELECT t.id,
+#          COALESCE(SUM(i.amount), 0)                                                     AS qty,
+#          COALESCE(SUM(i.amount * pd.prize_value), 0)                                    AS amount,
+#          SUM(CASE WHEN pd.prize_code = 'reward-points' THEN i.amount END)               AS reward_qty
+#   FROM transactions t LEFT JOIN items i ON i.transaction_id = t.id
+#        LEFT JOIN prize_definitions pd ON pd.id = i.prize_definition_id GROUP BY t.id;
+#   -- latest_score: the score of the rating with the greatest (model_date, rating_type) per transaction
+#
+#   t1: qty 7,  amount 2*5 + 1*3 + 4*10 = 53,          reward_qty 2 + 4 = 6, latest_score 690 (B beats A on 2026-03-05)
+#   t2: qty 12, amount 3*5 + 5*3 + 1*3 + 3*10 = 63,    reward_qty 3 + 3 = 6, latest_score 500
+#   t3: no items - qty 0 and amount 0 from their defaults; no ratings
+#
+# What a wrong implementation gives instead: a render that skips the rollup hook writes no qty at all; one
+# that ignores the filter gives t1 reward_qty 7; one that folds before references resolve cannot read
+# prize_value and gives amount 0 (the default) or null; a first/last that ignores the second ordering gives
+# t1 650 or 690 depending on arrival order, and the ratings are seeded so the row arriving last is 650.
+#
+# Read mode is snapshot_only so the result cannot be repaired by CDC after an incomplete snapshot.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: nest-rollup-fields-snapshot
+setup:
+  databases:
+    src: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [ mysql, mongodb ]
+  managed_target: views.tap.yml
+  apply: [src_wallet.tap.yml, pipeline.tap.yml]
+  discover: [ src_wallet ]
+pipeline: pipeline.tap.yml
+seed:
+  src_wallet.transactions:
+    values:
+      - { id: 1, player_id: 9 }
+      - { id: 2, player_id: 9 }
+      - { id: 3, player_id: 7 }
+  src_wallet.prize_definitions:
+    values:
+      - { id: 1, prize_code: reward-points, prize_value: 5 }
+      - { id: 2, prize_code: cash, prize_value: 3 }
+      - { id: 3, prize_code: reward-points, prize_value: 10 }
+  src_wallet.items:
+    values:
+      - { id: 1, transaction_id: 1, prize_definition_id: 1, amount: 2 }
+      - { id: 2, transaction_id: 1, prize_definition_id: 2, amount: 1 }
+      - { id: 3, transaction_id: 1, prize_definition_id: 3, amount: 4 }
+      - { id: 4, transaction_id: 2, prize_definition_id: 1, amount: 3 }
+      - { id: 5, transaction_id: 2, prize_definition_id: 2, amount: 5 }
+      - { id: 6, transaction_id: 2, prize_definition_id: 2, amount: 1 }
+      - { id: 7, transaction_id: 2, prize_definition_id: 3, amount: 3 }
+  src_wallet.ratings:
+    values:
+      - { id: 1, trans_id: 1, rating_type: A, model_date: "2026-03-01", score: 700 }
+      - { id: 2, trans_id: 1, rating_type: B, model_date: "2026-03-05", score: 690 }
+      - { id: 3, trans_id: 2, rating_type: A, model_date: "2026-02-01", score: 500 }
+      - { id: 4, trans_id: 1, rating_type: A, model_date: "2026-03-05", score: 650 }
+steps:
+  - start
+  - await: { count: { views.transaction_state: 3 } }
+  - await: { doc: { views.transaction_state: { where: { id: 1 }, expect: { qty: 7, amount: 53, reward_qty: 6, latest_score: 690 } } } }
+  - await: { doc: { views.transaction_state: { where: { id: 2 }, expect: { qty: 12, amount: 63, reward_qty: 6, latest_score: 500 } } } }
+  - await: { doc: { views.transaction_state: { where: { id: 3 }, expect: { qty: 0, amount: 0 } } } }

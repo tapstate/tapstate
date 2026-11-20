@@ -195,7 +195,9 @@ final class EncryptedDraftCodec {
             for (Document related : documents(value, "related")) {
                 keys(related, "id", "parentId", "sourceId", "table", "relation", "preTransforms");
                 Document relation = related.get("relation", Document.class);
-                keys(relation, "on", "shape", "path", "key", "arrayKey"); strings(relation, "key"); strings(relation, "arrayKey");
+                keysWithOptional(relation, Set.of("rollup", "trackKeyChanges"), "on", "shape", "path", "key", "arrayKey");
+                if (relation.containsKey("rollup")) normalize(relation, "rollup");
+                strings(relation, "key"); strings(relation, "arrayKey");
                 for (Document pair : documents(relation, "on")) keys(pair, "childField", "parentField");
                 transforms(related, "preTransforms");
             }
@@ -222,6 +224,15 @@ final class EncryptedDraftCodec {
     }
     private static void keys(Document document, String... fields) {
         if (document == null || !document.keySet().equals(Set.of(fields))) invalid();
+    }
+    /** Like {@link #keys}, but each of {@code optional} may also be present, as written only when set. */
+    private static void keysWithOptional(Document document, Set<String> optional, String... fields) {
+        if (document == null) invalid();
+        Set<String> required = Set.of(fields);
+        for (String key : document.keySet()) {
+            if (!required.contains(key) && !optional.contains(key)) invalid();
+        }
+        if (!document.keySet().containsAll(required)) invalid();
     }
     private static void invalid() { throw new IllegalArgumentException("Invalid encrypted draft shape"); }
     private static byte[] bytes(Document document) {

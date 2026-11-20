@@ -68,7 +68,9 @@ class DslErrorTest {
                 // a join reading another step or a pattern: the wiring is written in the document, so
                 // an ordinary corpus case witnesses each
                 "TS0010030",
-                "TS0010031");
+                "TS0010031", "TS0010034",
+                "TS0010035", "TS0010036");
+
     }
 
     @Test

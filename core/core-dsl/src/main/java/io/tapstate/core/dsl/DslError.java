@@ -162,7 +162,17 @@ public enum DslError implements TapstateErrorCode {
      *  its SQL names that table's columns and its state is keyed on that table's primary key - and a
      *  pattern names a set whose members can change, so it is refused even where it matches exactly
      *  one table today. */
-    JOIN_INPUT_IS_A_PATTERN("join-input-is-a-pattern", DslErrorDefinitions.JOIN_INPUT_IS_A_PATTERN);
+    JOIN_INPUT_IS_A_PATTERN("join-input-is-a-pattern", DslErrorDefinitions.JOIN_INPUT_IS_A_PATTERN),
+    /** A rollup field names no function, an unknown one, or more than one. {@code field} is the rollup
+     *  field, {@code function} what it gave in the function's place and {@code known} the functions there
+     *  are. One function per field, so which one applies never depends on key order. */
+    ROLLUP_FUNCTION_UNKNOWN("rollup-function-unknown", DslErrorDefinitions.ROLLUP_FUNCTION_UNKNOWN),
+    /** {@code rollup:} on an embed that holds at most one row ({@code as: object} or {@code as: flat}).
+     *  {@code as} is the embed's shape. A value computed over one row is that row's own column. */
+    ROLLUP_ON_SINGLE_ROW_EMBED("rollup-on-single-row-embed", DslErrorDefinitions.ROLLUP_ON_SINGLE_ROW_EMBED),
+    /** {@code as: rollup} with no {@code rollup:} fields: the level would be held and never shown. */
+    ROLLUP_LEVEL_WITHOUT_FIELDS("rollup-level-without-fields", DslErrorDefinitions.ROLLUP_LEVEL_WITHOUT_FIELDS);
+
 
     private final String code;
     private final String symbol;

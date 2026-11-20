@@ -35,7 +35,17 @@ public enum NestSizingError implements TapstateErrorCode {
      * count. {@code counted} of {@code total} is how much of the level the estimate could see; what it
      * did see is a floor rather than an answer.
      */
-    CAPACITY_ESTIMATE_INCOMPLETE(NestSizingErrorDefinitions.CAPACITY_ESTIMATE_INCOMPLETE);
+    CAPACITY_ESTIMATE_INCOMPLETE(NestSizingErrorDefinitions.CAPACITY_ESTIMATE_INCOMPLETE),
+
+    /**
+     * A level carrying rollup fields is estimated to make its documents heavier than a rollup keeps up with:
+     * each change rewrites the document's state and refolds the level, so its cost grows with the level's
+     * elements times their width. {@code estimatedElements} is the level's rows over its parent's, an average a
+     * skewed level exceeds for some documents; {@code estimatedBytes} the state those elements take; {@code
+     * boundary} how many elements of this width a document should hold.
+     */
+    ROLLUP_LEVEL_WIDE(NestSizingErrorDefinitions.ROLLUP_LEVEL_WIDE);
+
 
     private final ProductErrorDefinition definition;
 

@@ -181,6 +181,13 @@ public final class NestDag {
         // by what it carries, which lands it beside its twin, and is refused there rather than passed over.
         draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
                 leavingKey(lookup.referenceFields(), lookup.mapName()), nextOutbound, width);
+        if (lookup.alternative()) {
+            // Keyed by the alternative value each row held before, so a row that moved to another value is
+            // taken out from under the one it left by the instance holding that entry. Only an alternative
+            // needs it: everywhere else rows are filed by what identifies them, which an edit does not move.
+            draw(dag, source, vertex, LookupProcessor.DEPARTED_ROWS,
+                    leavingKey(lookup.partitionKey(), lookup.mapName()), nextOutbound, width);
+        }
 
         Vertex pointing = built.get(lookup.referrerPathId());
         if (pointing == null) {

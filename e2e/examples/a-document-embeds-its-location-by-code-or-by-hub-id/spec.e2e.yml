@@ -1,0 +1,64 @@
+# A transaction names its location by location code or by hub location id, and one nest embed with
+# orOn embeds the location either way: the first alternative that matches wins, and the document
+# follows it as locations arrive, leave and change.
+#
+# What the assertions have to discriminate:
+#
+# - Transaction 12 matches one location by code and another by hub id. Only an implementation that
+#   honours the written order embeds atrium; one that renders whichever lookup answered last does not.
+# - A location inserted with code X takes transaction 11 off its hub id match, and deleting it puts it
+#   back. The second needs the hub id lookup to still hold its answer while the code lookup had one.
+# - A transaction edited to a hub id nobody has yet, and then a location edited to the same hub id,
+#   meet: the lookup follows a key edit on either side, not only rows that arrive new.
+# - A rename of the location matched by hub id reaches transaction 11 and leaves 10 and 12 alone.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: a-document-embeds-its-location-by-code-or-by-hub-id
+setup:
+  databases:
+    wallet: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  managed_target: views.tap.yml
+  apply: [wallet_db.tap.yml, nest_pipeline.tap.yml]
+  discover: [wallet_db]
+pipeline: nest_pipeline.tap.yml
+seed:
+  wallet_db.location:
+    values:
+      - { id: 1, locn_code: A, hub_locn_id: HA, name: atrium }
+      - { id: 2, locn_code: H-ONLY, hub_locn_id: H2, name: harbor }
+  wallet_db.wallet_tran:
+    values:
+      # by code only: its hub id names no location
+      - { id: 10, locn_code: A, hub_locn_id: H9, amount: 5 }
+      # by hub id only: no location has code X
+      - { id: 11, locn_code: X, hub_locn_id: H2, amount: 7 }
+      # both alternatives match different locations: the code is written first and wins
+      - { id: 12, locn_code: A, hub_locn_id: H2, amount: 9 }
+      # neither matches
+      - { id: 13, locn_code: Y, hub_locn_id: H7, amount: 1 }
+steps:
+  - start
+  - await: { count: { views.wallet_doc_state: 4 } }
+  - await: { doc: { views.wallet_doc_state: { where: { id: 10 }, expect: { amount: 5, location.name: atrium } } } }
+  - await: { doc: { views.wallet_doc_state: { where: { id: 11 }, expect: { amount: 7, location.name: harbor } } } }
+  - await: { doc: { views.wallet_doc_state: { where: { id: 12 }, expect: { amount: 9, location.name: atrium } } } }
+  - assert: { doc: { views.wallet_doc_state: { where: { id: 13 }, expect: { amount: 1 } } } }
+  # A location with code X arrives: the first alternative now matches for transaction 11.
+  - cdc: { wallet_db.location: { insert: { values: [ { id: 3, locn_code: X, hub_locn_id: H3, name: bayview } ] } } }
+  - await: { doc: { views.wallet_doc_state: { where: { id: 11 }, expect: { amount: 7, location.name: bayview } } } }
+  # It leaves again, and the hub id match is back.
+  - cdc: { wallet_db.location: { delete: { where: { id: 3 } } } }
+  - await: { doc: { views.wallet_doc_state: { where: { id: 11 }, expect: { amount: 7, location.name: harbor } } } }
+  # A rename of the location matched by hub id reaches only the document matched through it.
+  - cdc: { wallet_db.location: { update: { where: { id: 2 }, set: { name: harbour } } } }
+  - await: { doc: { views.wallet_doc_state: { where: { id: 11 }, expect: { amount: 7, location.name: harbour } } } }
+  - assert: { doc: { views.wallet_doc_state: { where: { id: 12 }, expect: { amount: 9, location.name: atrium } } } }
+  - assert: { doc: { views.wallet_doc_state: { where: { id: 10 }, expect: { amount: 5, location.name: atrium } } } }
+  # The transaction moves to a hub id only location 1 will have, and location 1 follows.
+  - cdc: { wallet_db.wallet_tran: { update: { where: { id: 13 }, set: { hub_locn_id: H8 } } } }
+  - cdc: { wallet_db.location: { update: { where: { id: 1 }, set: { hub_locn_id: H8 } } } }
+  - await: { doc: { views.wallet_doc_state: { where: { id: 13 }, expect: { amount: 1, location.name: atrium } } } }
+  - assert: { count: { views.wallet_doc_state: 4 } }

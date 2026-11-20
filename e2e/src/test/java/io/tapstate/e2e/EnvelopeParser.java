@@ -247,6 +247,20 @@ public final class EnvelopeParser {
         }
     }
 
+    /**
+     * A value a document is held to: the two seed scalars, or a boolean. A boolean is admitted here
+     * and nowhere else, because a flag a pipeline writes - a row marked deleted, say - is read back from
+     * the document, while seeds, cdc settings and locators stay on the two scalars every store spells
+     * the same way.
+     */
+    private static void requireExpectedValue(Object value, String at) {
+        if (!(value instanceof Integer || value instanceof Long || value instanceof String
+                || value instanceof Boolean)) {
+            throw new EnvelopeException(
+                    at + " must be an integer, a string or a boolean, found: " + describe(value));
+        }
+    }
+
     private static List<Step> steps(Object node) {
         if (node == null) {
             throw new EnvelopeException("envelope is missing the required key: steps");
@@ -471,7 +485,7 @@ public final class EnvelopeParser {
         expect.forEach(
                 (path, value) -> {
                     requirePath(path, at + ".expect");
-                    requireScalar(value, at + ".expect." + path);
+                    requireExpectedValue(value, at + ".expect." + path);
                 });
 
         Map<String, Long> size = new LinkedHashMap<>();

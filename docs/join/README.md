@@ -51,6 +51,7 @@ dimension key can still cause substantial recomputation and target writes.
 | INNER / LEFT JOIN | Supported for equality associations directly from the driving source to each dimension. |
 | RIGHT JOIN | Normalized to LEFT JOIN with the sides swapped; the normalized shape must meet the same driving-source restriction. |
 | ON | Conjunctions (`AND`) of qualified-column equalities; composite keys are allowed. |
+| ON with OR | LEFT JOIN onto one table only; each alternative is a conjunction of equalities. The first alternative that matches wins; see [Match on one column or another](#match-on-one-column-or-another). |
 | Projection | Direct columns, aliases, and supported per-row expressions; not arbitrary SQL functions. |
 | FULL OUTER, CROSS/comma, NATURAL, USING, LEFT SEMI | Unsupported. |
 | Non-equality joins, dimension-to-dimension chains, nested joins on the right side | Unsupported. |
@@ -67,6 +68,45 @@ pipeline stays failed until the SQL or the source is corrected and it is started
 Any NULL component makes a join key unmatchable, including when the opposite side also has
 NULL. A LEFT JOIN can publish an unmatched fact row with NULL dimension fields; a dimension
 that arrives later can turn that row into a match.
+
+## Match on one column or another
+
+A dimension row is sometimes named by one column on some fact rows and by another on the rest,
+for example when two upstream systems feed one transaction table. Write the alternatives with
+`OR` in a `LEFT JOIN`:
+
+```sql
+SELECT t.tran_id, l.name AS location_name, l.locn_id AS location_id
+FROM wallet_tran t
+LEFT JOIN location l
+  ON t.locn_code = l.locn_code
+  OR t.hub_locn_id = l.hub_locn_id
+```
+
+The alternatives are tried in the order written, and each fact row takes the dimension row the
+first matching alternative finds. Here a transaction whose location code matches a location
+uses that location even when its hub id names a different one; only a transaction whose code
+matches nothing falls back to its hub id. If no alternative matches, the dimension columns are
+NULL, as for any `LEFT JOIN`. A fact row still produces exactly one output row: an `OR` join
+never publishes one row per matching alternative.
+
+Each alternative is kept up to date on its own. Inserting a location that the first
+alternative now matches switches the affected rows to it; deleting it falls back to the next
+alternative; editing a location's code or hub id moves the rows that matched the old value.
+Every alternative must still be unique on its own key, as in the rest of this page, and NULL
+keys still match nothing.
+
+Limits:
+
+- Only `LEFT JOIN`. An inner or right join on `OR` is refused, because which rows it should
+  publish when several alternatives match is not something one output row per fact row can say.
+- Each alternative is a conjunction of equalities between the joined table and the driving
+  source, and must name the joined table.
+- Read the joined table through qualified columns, such as `l.name`. `SELECT *`, `SELECT l.*`
+  and a later join whose `ON` names the `OR`-joined table are refused, and an unqualified column
+  that only the joined table has is refused as ambiguous.
+- An output column read from the `OR`-joined table is computed, so it carries the SQL type
+  rather than the source column's own type metadata.
 
 ## Publish the output key
 

@@ -37,7 +37,8 @@ public enum ProductErrorModule {
     NEST_SIZING("046", NestSizingErrorDefinitions::registered),
     STORE("047", StoreErrorDefinitions::registered),
     IO("048", IoErrorDefinitions::registered),
-    NEST("049", NestErrorDefinitions::registered);
+    NEST("049", NestErrorDefinitions::registered),
+    AGGREGATE("050", AggregateErrorDefinitions::registered);
 
     private final String number;
 

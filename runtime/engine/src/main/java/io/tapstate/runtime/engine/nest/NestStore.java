@@ -147,6 +147,10 @@ public interface NestStore<S> extends Serializable {
     default void holding(long pending) {
     }
 
+    /** Counts one fold of a document's rollup fields at this level, taking {@code nanos}. */
+    default void folded(long nanos) {
+    }
+
     /**
      * Reports that this vertex has just sent {@code documents} whole documents downstream. Only the vertex
      * that renders documents - the root level - says so, and only once per document actually passed to the

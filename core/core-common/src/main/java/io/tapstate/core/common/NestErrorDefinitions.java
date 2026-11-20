@@ -62,6 +62,33 @@ public final class NestErrorDefinitions {
     public static final ProductErrorDefinition REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE =
             DEFINITIONS.define(27, Severity.ERROR, Set.of("alias", "refPath"));
 
+    public static final ProductErrorDefinition OR_ON_NOT_A_REFERENCE =
+            DEFINITIONS.define(28, Severity.ERROR, Set.of("embedPath", "fields", "parentKey"));
+
+    public static final ProductErrorDefinition ROLLUP_ON_REFERENCE_EMBED =
+            DEFINITIONS.define(29, Severity.ERROR, Set.of("embedPath"));
+
+    public static final ProductErrorDefinition ROLLUP_FIELD_CONFLICT =
+            DEFINITIONS.define(30, Severity.ERROR, Set.of("field", "level", "other"));
+
+    public static final ProductErrorDefinition ROLLUP_EXPRESSION_INVALID =
+            DEFINITIONS.define(31, Severity.ERROR, Set.of("field", "part", "reason"));
+
+    public static final ProductErrorDefinition ROLLUP_TYPE_UNKNOWN =
+            DEFINITIONS.define(32, Severity.ERROR, Set.of("field", "expression"));
+
+    public static final ProductErrorDefinition ROLLUP_OVERFLOW =
+            DEFINITIONS.define(33, Severity.ERROR, Set.of("field", "root", "type"));
+
+    public static final ProductErrorDefinition ROLLUP_VALUE_TYPE_MISMATCH =
+            DEFINITIONS.define(34, Severity.ERROR, Set.of("field", "root", "declared", "actual"));
+
+    public static final ProductErrorDefinition ROLLUP_RESULT_NOT_CONVERTIBLE =
+            DEFINITIONS.define(35, Severity.ERROR, Set.of("field", "root", "from", "to"));
+
+    public static final ProductErrorDefinition ROLLUP_EVALUATION_FAILED =
+            DEFINITIONS.define(36, Severity.ERROR, Set.of("field", "root", "expression", "reason"));
+
     private NestErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

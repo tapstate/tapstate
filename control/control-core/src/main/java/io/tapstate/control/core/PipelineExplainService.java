@@ -8,6 +8,15 @@ import io.tapstate.control.core.PipelineExplanation.Next;
 import io.tapstate.control.core.PipelineExplanation.NextAction;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.RollupExpressions;
+import io.tapstate.core.dsl.AggregateSizingRules;
+import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.RollupPick;
+import io.tapstate.core.model.Step;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
@@ -25,9 +34,11 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Supplier;
 
@@ -85,7 +96,147 @@ public final class PipelineExplainService {
         Observation observation = observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
         ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
         return diagnose(pipelineId, observation)
-                .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
+                .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()))
+                .withRollups(rollupsOf(pipelineId))
+                .withAggregates(aggregatesOf(pipelineId, observation));
+    }
+
+    /** What an aggregate step's count of its own state travels under on the flat face, before the step. */
+    private static final String AGGREGATE_STATE_ENTRIES = "aggregateStateEntries.";
+
+    /**
+     * What each aggregate step the pipeline's stored definition declares keeps in state: the entries per
+     * input row, which the definition alone decides, the total that comes to when the last load said how
+     * many rows the inputs hold, and beside it what the running step last counted.
+     */
+    private List<PipelineExplanation.Aggregate> aggregatesOf(String pipelineId, Observation observation) {
+        List<PipelineExplanation.Aggregate> steps = new ArrayList<>();
+        artifacts.getResource(pipelineId).map(StoredResource::resource).ifPresent(resource -> {
+            if (!(resource instanceof PipelineResource pipeline) || pipeline.transforms() == null) {
+                return;
+            }
+            Map<String, Step.Inline> inline = new LinkedHashMap<>();
+            for (Step step : pipeline.transforms()) {
+                if (step instanceof Step.Inline written) {
+                    inline.put(written.id(), written);
+                }
+            }
+            inline.values().forEach(step -> {
+                if (!(step.body() instanceof TransformBody.Aggregate aggregate)) {
+                    return;
+                }
+                List<String> kept = AggregateSizingRules.keptInputFields(aggregate);
+                int perRow = AggregateSizingRules.entriesPerRow(aggregate);
+                Long rows = inputRows(step, inline, observation, new LinkedHashSet<>());
+                steps.add(new PipelineExplanation.Aggregate(step.id(), perRow, kept, rows,
+                        rows == null ? null : Math.multiplyExact(rows, (long) perRow),
+                        observation.metrics().get(AGGREGATE_STATE_ENTRIES + step.id())));
+            });
+        });
+        return steps;
+    }
+
+    /**
+     * The rows the tables under {@code step} hold by the last load's estimate, added up; null when any of
+     * them has none, since a total with a table missing would read as the whole.
+     */
+    private static Long inputRows(Step.Inline step, Map<String, Step.Inline> inline, Observation observation,
+            Set<String> walked) {
+        if (!(step.from() instanceof FromClause.Flow flow) || !walked.add(step.id())) {
+            return null;
+        }
+        long rows = 0;
+        for (FromRef ref : flow.refs()) {
+            if (!(ref instanceof FromRef.Literal named)) {
+                return null;
+            }
+            Step.Inline above = inline.get(named.ref());
+            Long counted;
+            if (above != null) {
+                counted = inputRows(above, inline, observation, walked);
+            } else {
+                String table = named.ref().substring(named.ref().lastIndexOf('.') + 1);
+                TableSnapshot loaded = observation.snapshot().containsKey(named.ref())
+                        ? observation.snapshot().get(named.ref()) : observation.snapshot().get(table);
+                counted = loaded == null ? null : loaded.rowsTotal();
+            }
+            if (counted == null) {
+                return null;
+            }
+            rows += counted;
+        }
+        return rows;
+    }
+
+    /**
+     * The rollup fields the pipeline's stored definition declares, in tree order. Read from the definition
+     * rather than from the run, since what a field is computed from is a property of what was applied.
+     */
+    private List<PipelineExplanation.Rollup> rollupsOf(String pipelineId) {
+        List<PipelineExplanation.Rollup> rollups = new ArrayList<>();
+        artifacts.getResource(pipelineId).map(StoredResource::resource).ifPresent(resource -> {
+            if (resource instanceof PipelineResource pipeline && pipeline.transforms() != null) {
+                for (Step step : pipeline.transforms()) {
+                    if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
+                            && nest.root() != null) {
+                        collectRollups(step.id(), nest.root().embed(), List.of(), rollups);
+                    }
+                }
+            }
+        });
+        return rollups;
+    }
+
+    private static void collectRollups(String step, List<Embed> embeds, List<String> parent,
+            List<PipelineExplanation.Rollup> into) {
+        if (embeds == null) {
+            return;
+        }
+        String level = parent.isEmpty() ? "$root" : String.join(".", parent);
+        for (Embed embed : embeds) {
+            List<String> path = new ArrayList<>(parent);
+            path.add(embed.treeSegment());
+            Set<String> referencePaths = new LinkedHashSet<>();
+            if (embed.embed() != null) {
+                for (Embed child : embed.embed()) {
+                    if (child.path() != null) {
+                        referencePaths.add(child.path());
+                    }
+                }
+            }
+            embed.rollupFields().forEach((name, field) -> {
+                Object argument = field.argument();
+                List<String> written = new ArrayList<>();
+                String shown;
+                if (argument instanceof RollupPick pick) {
+                    written.add(pick.value());
+                    written.addAll(pick.by());
+                    shown = pick.value() + " by " + String.join(", ", pick.by());
+                } else if (argument instanceof String expression) {
+                    written.add(expression);
+                    shown = expression;
+                } else {
+                    shown = String.valueOf(argument);
+                }
+                if (field.filter() != null) {
+                    written.add(field.filter());
+                }
+                // Which of the embed's children the expressions read. Only a child the element points at can
+                // render absent while the element lives, and only those make the field null; reading a
+                // gathered child is listed too, since the author asked what the field depends on.
+                Set<String> read = new LinkedHashSet<>();
+                for (String expression : written) {
+                    for (String fieldRead : RollupExpressions.fieldsRead(expression)) {
+                        if (referencePaths.contains(fieldRead)) {
+                            read.add(fieldRead);
+                        }
+                    }
+                }
+                into.add(new PipelineExplanation.Rollup(step, level, String.join(".", path), name,
+                        field.function().yaml(), shown, field.filter(), List.copyOf(read)));
+            });
+            collectRollups(step, embed.embed(), path, into);
+        }
     }
 
     private PipelineExplanation diagnose(String pipelineId, Observation observation) {

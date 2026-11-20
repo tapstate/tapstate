@@ -1459,7 +1459,8 @@ class PipelineApiTest {
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "pipeline.metrics.history", "pipeline.explain",
                         "pipeline.position", "pipeline.set-position",
-                        "pipeline.derived-schema", "pipeline.accept-derived-schema");
+                        "pipeline.derived-schema", "pipeline.accept-derived-schema",
+                        "pipeline.aggregate-check", "pipeline.aggregate-repair");
 
         // The other direction, and it is the one that was missing. Above, every projected verb is checked
         // to be a registered one; nothing checked that every registered one is projected. A controller
@@ -1564,7 +1565,7 @@ class PipelineApiTest {
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             PipelinePositionTestConfiguration.class, ClusterTopologyTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class,
+            DerivedSchemaTestConfiguration.class, AggregateStepChecksTestConfiguration.class, ObservabilityTestConfiguration.class,
             StartChecksTestConfiguration.class, PipelinePreviewTestConfiguration.class})
     static class TestApp {
 

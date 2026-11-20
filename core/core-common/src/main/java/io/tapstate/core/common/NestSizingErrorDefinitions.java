@@ -12,6 +12,9 @@ public final class NestSizingErrorDefinitions {
     public static final ProductErrorDefinition CAPACITY_ESTIMATE_INCOMPLETE =
             DEFINITIONS.define(2, Severity.WARNING, Set.of("pipeline", "embedPath", "counted", "total"));
 
+    public static final ProductErrorDefinition ROLLUP_LEVEL_WIDE =
+            DEFINITIONS.define(3, Severity.WARNING, Set.of("pipeline", "embedPath", "estimatedElements", "estimatedBytes", "boundary"));
+
     private NestSizingErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

@@ -123,6 +123,7 @@ public final class MessageCatalog {
                 .or(() -> DataBrowserDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
                 .or(() -> MonitorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
                 .or(() -> PositionDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> AggregateDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
                 .or(() -> MigrationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
                 .or(() -> RowValueDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
                 .or(() -> EngineDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))

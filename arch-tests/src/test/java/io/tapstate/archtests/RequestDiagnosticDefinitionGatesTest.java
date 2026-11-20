@@ -58,6 +58,9 @@ class RequestDiagnosticDefinitionGatesTest {
         assertThat(baseline).hasSize(454).contains("control.malformed-request").doesNotContain("TS0210001");
         // This identity landed on main after the immutable migration snapshot.
         assertThat(baseline.add("actuation.sync-output-identity-unresolved")).isTrue();
+        var aggregateBaseline = readCodes("legacy-error-codes-before-aggregate-migration.golden");
+        assertThat(aggregateBaseline).hasSize(33).doesNotContainAnyElementsOf(baseline);
+        baseline.addAll(aggregateBaseline);
         Set<String> replacements = new TreeSet<>();
         for (String line : Files.readAllLines(Path.of("src/test/resources/product-code-migrations.tsv"))) {
             if (line.isBlank() || line.startsWith("#")) continue;
@@ -66,7 +69,7 @@ class RequestDiagnosticDefinitionGatesTest {
             assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
             assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
         }
-        assertThat(replacements).hasSize(455);
+        assertThat(replacements).hasSize(488);
         baseline.addAll(replacements);
         // Existing migrated contracts stay present; new product identities are append-only.
         assertThat(readCodes("error-codes.golden")).containsAll(baseline);

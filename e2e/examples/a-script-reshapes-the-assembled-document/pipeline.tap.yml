@@ -1,0 +1,35 @@
+version: tapstate/v1
+kind: pipeline
+id: scripted_orders
+source: [ src_js_orders, src_js_items ]
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: order_doc
+    type: nest
+    from: { o: js_orders, i: js_items }
+    root:
+      from: o
+      key: [ id ]
+      embed:
+        - { from: i, on: { order_id: id }, as: array, path: items, arrayKey: [ id ] }
+  # Runs on the whole assembled document: sorts the array by sku, newest first, and writes two
+  # fields computed from it. A deleted order arrives with no after image and passes through as is.
+  - id: order_shaped
+    type: js
+    from: order_doc
+    script: |
+      function process(record, ctx) {
+        var doc = record.after;
+        if (doc) {
+          var items = doc.items || [];
+          items.sort(function (a, b) { return a.sku < b.sku ? 1 : a.sku > b.sku ? -1 : 0; });
+          doc.items = items;
+          doc.skus = items.map(function (item) { return item.sku; }).join(',');
+          doc.item_count = items.length;
+        }
+        return record;
+      }
+view:
+  id: scripted_state
+  from: order_shaped
+  primary_key: id

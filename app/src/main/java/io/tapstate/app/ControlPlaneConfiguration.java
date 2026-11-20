@@ -19,6 +19,7 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
+import io.tapstate.control.core.AggregateSizingAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.ExecutionAdvisories;
 import io.tapstate.control.core.PlanAdvisories;
@@ -78,6 +79,7 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.ResourceAttributionPolicy;
 import io.tapstate.control.core.StateDatabasePolicy;
 import io.tapstate.control.core.DataBrowserFollows;
+import io.tapstate.control.core.AggregateStepChecks;
 import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.SourceConnectionResolver;
@@ -428,7 +430,11 @@ class ControlPlaneConfiguration {
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories(),
-                        new ExecutionAdvisories()),
+                        new ExecutionAdvisories(),
+                        // What each aggregate step will keep in state. Said for every one, since the
+                        // state is the only copy of what its totals come from and its size is known
+                        // from the definition before anything is deployed.
+                        new AggregateSizingAdvisories()),
                 derivation, livePipelines, attribution, stateDatabasePolicy);
     }
 
@@ -497,6 +503,13 @@ class ControlPlaneConfiguration {
         // available when a start has just been refused, which is exactly the moment a data plane may not
         // be running at all.
         return new StoreBackedDerivedSchemas(storePort, auditGate);
+    }
+
+    @Bean
+    AggregateStepChecks aggregateStepChecks(ObjectProvider<HazelcastInstance> member, AuditGate auditGate) {
+        // Answered by the running step on whichever member runs it; a node with no data plane has no
+        // member to ask through and says the step is not running.
+        return new ClusterAggregateStepChecks(member.getIfAvailable(), auditGate);
     }
 
     @Bean
