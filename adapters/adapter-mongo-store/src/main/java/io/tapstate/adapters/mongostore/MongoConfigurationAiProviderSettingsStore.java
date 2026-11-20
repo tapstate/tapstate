@@ -134,6 +134,9 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
     }
 
     private void requireOwner(String owner) {
+        if (ON_PREM_OWNER.equals(owner)) {
+            return;
+        }
         try {
             if (owner == null || owner.getBytes(StandardCharsets.UTF_8).length > 4096
                     || !(JsonReader.parse(owner) instanceof List<?> values) || values.size() != 3

@@ -1,5 +1,6 @@
 # Sharded tests and their merge-blocking aggregate build gate.
-#   mvn verify — compile + unit tests + enforcer rules + ArchUnit ring rules + specifications
+# PRs and pushes to main run all unit tests and selected integration tests.
+# Manual runs and version tags verify the full reactor.
 # Docs frontmatter validation (gen-index --check) lives with the docs in the
 # separate private repo and is not run here. The zero-agent-footprint gate is a
 # separate workflow (no-agent-footprint.yml).
@@ -61,10 +62,14 @@ jobs:
           python3 -m unittest discover -s tools/error-contract -p 'test_*.py'
       - name: Record the original event and actual checkout identities
         run: .github/scripts/ci-receipt.sh event-inputs --root . --output "$RUNNER_TEMP/ci-event-inputs.json"
-      - name: Derive every test from the current reactor
+      - name: Derive the test selection from the current reactor
         id: plan
         run: |
-          .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
+          selection=()
+          if [[ "$GITHUB_EVENT_NAME" == pull_request || ( "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ) ]]; then
+            selection+=(--fast)
+          fi
+          .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json "${selection[@]}" --output "$RUNNER_TEMP/shards.json"
           matrix_json="$(.github/scripts/ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json")"
           echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
@@ -100,6 +105,8 @@ jobs:
           cache: maven
       - name: Verify exact Java build
         run: java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
       - name: Resolve the reactor's snapshot inputs
         run: |
           .github/scripts/ci-maven-cache.sh seed-stable "$HOME/.m2/repository" "$RUNNER_TEMP/snapshot-m2"
@@ -148,6 +155,8 @@ jobs:
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
       - uses: actions/download-artifact@v4
         with:
           name: ci-shard-plan
@@ -226,7 +235,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/test-tmp"
           export MAVEN_ARGS="$MAVEN_ARGS -nsu"
           case "$SHARD" in
-            app-1|app-2|rest)
+            app-1|app-2|rest|rest-2)
               export MAVEN_ARGS="$MAVEN_ARGS -DforkCount=2"
               ;;
           esac
@@ -346,6 +355,8 @@ jobs:
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
       - name: Check secret availability
         id: guard
         env:
@@ -854,7 +865,7 @@ jobs:
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
         run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-read.sh .github/scripts/_pr-read-smoke.sh .github/scripts/release-notes-read-failure-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/hundred-table-diagnostic.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh .github/scripts/ci-pr-work.sh .github/scripts/connector-witnesses.sh .github/scripts/connector-witnesses-smoke.sh .github/scripts/connector-cache.sh .github/scripts/connector-cache-smoke.sh .github/scripts/connector-workflow-smoke.sh .github/scripts/one-verify.sh .github/scripts/one-verify-smoke.sh .github/scripts/sonar-cache-key.sh .github/scripts/sonar-cache-smoke.sh .github/scripts/nightly-upgrade-expiry-smoke.sh
-      - name: One automatic full test suite
+      - name: One automatic reactor test suite
         run: bash .github/scripts/one-verify.sh
       - name: Full test invocation cases
         run: bash .github/scripts/one-verify-smoke.sh
@@ -1016,6 +1027,8 @@ jobs:
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
       - name: image smoke (builds the boot jar + image, then runs the black-box checks)
         env:
           TAPSTATE_TEST_CLOUD_RELEASE_DIR: ${{ runner.temp }}/image-test-release

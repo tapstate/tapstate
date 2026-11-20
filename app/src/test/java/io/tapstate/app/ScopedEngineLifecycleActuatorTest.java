@@ -149,6 +149,29 @@ class ScopedEngineLifecycleActuatorTest {
         verify(fixedCapture,never()).stopCapture(anyString(),anyBoolean());
     }
 
+    @Test void aSuccessfulBoundedJobStillCarriesThePipelineWhileItsReceiptsArrive() {
+        boundedCapture();
+        var actor = actuator();
+        assertThat(actor.completion("p")).isEmpty();
+
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(fixedCapture.loadDelivered("p")).thenReturn(false);
+        assertThat(actor.isCarryingAJob("p")).isTrue();
+        assertThat(actor.completion("p")).isEmpty();
+
+        when(fixedCapture.loadDelivered("p")).thenReturn(true);
+        assertThat(actor.completion("p")).contains(new LifecycleActuator.Completion("71", claim(1)));
+    }
+
+    @Test void aTerminalJobWithNoBoundedCaptureDoesNotCarryThePipeline() {
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(fixedCapture.isCapturing("p")).thenReturn(true);
+
+        assertThat(actuator().isCarryingAJob("p")).isFalse();
+    }
+
     private void boundedCapture() {
         when(fixedCapture.isCapturing("p")).thenReturn(true);
         when(fixedCapture.captureBindings()).thenReturn(new PipelineCaptureBindings(new ExecutionFence(SCOPE,claim(1)),

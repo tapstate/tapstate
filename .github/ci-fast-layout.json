@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "e2e_shards": 2,
+  "app_shards": 2,
+  "rest_modules": {
+    "rest-2": [
+      "adapters/adapter-mongo-store",
+      "adapters/adapter-pdk",
+      "adapters/adapter-alerting",
+      "control/control-core",
+      "control/control-client",
+      "control/rest-api",
+      "control/mcp-server",
+      "runtime/srs",
+      "runtime/runtime-probe",
+      "runtime/scheduler",
+      "tools/catalog-assembler"
+    ]
+  },
+  "new_test_seconds": 30
+}
