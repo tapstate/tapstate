@@ -17,6 +17,7 @@ import io.tapstate.spi.store.PipelineDraftSummary;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -110,6 +111,7 @@ public final class PipelineDraftService {
         if (!Objects.equals(draft.baseArtifactHash(), baseArtifactHash)) {
             return PipelineDraftMutation.ARTIFACT_CONFLICT;
         }
+        validateSourceNodeConfigs(draft);
         return store.create(new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), 1, draft.mode(),
                 draft.name(), draft.description(), draft.graph(), draft.wizard(), baseArtifactHash, null, null,
                 now, now, draft.updatedBy()));
@@ -141,12 +143,31 @@ public final class PipelineDraftService {
         if (current.mode() != replacement.mode()) {
             return PipelineDraftMutation.MODE_CONFLICT;
         }
+        validateSourceNodeConfigs(replacement);
         PipelineDraft serverOwned = new PipelineDraft(pipelineId, replacement.schemaVersion(),
                 expectedRevision + 1, current.mode(), replacement.name(), replacement.description(),
                 replacement.graph(), replacement.wizard(), current.baseArtifactHash(),
                 current.publishedDraftRevision(), current.publishedArtifactHash(), current.createdAt(),
                 Instant.now(clock), requirePrincipal(principal));
         return store.replace(pipelineId, expectedRevision, serverOwned);
+    }
+
+    private void validateSourceNodeConfigs(PipelineDraft draft) {
+        if (validation != null) {
+            Map<String, String> inputs = new java.util.LinkedHashMap<>();
+            Map<String, Map<String, Object>> configs;
+            if (draft.graph() != null) {
+                draft.graph().nodes().stream().filter(node -> "source".equals(node.type()))
+                        .forEach(node -> inputs.put(node.id(), node.sourceId()));
+                configs = draft.graph().sourceNodeConfigs();
+            } else {
+                var wizard = draft.wizard();
+                if (wizard.root() != null) inputs.put(wizard.root().id(), wizard.root().sourceId());
+                wizard.related().forEach(node -> inputs.put(node.id(), node.sourceId()));
+                configs = wizard.sourceNodeConfigs();
+            }
+            validation.validateDraftSourceNodeConfigs(inputs, configs);
+        }
     }
 
     public PipelineDraftMutation discard(String principal, String pipelineId, long expectedRevision) {

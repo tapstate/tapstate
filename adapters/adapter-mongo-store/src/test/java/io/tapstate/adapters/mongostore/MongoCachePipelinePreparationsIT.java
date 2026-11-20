@@ -111,7 +111,8 @@ class MongoCachePipelinePreparationsIT {
 
             SystemCollections.CONFIGURATION_VERSION.on(f.configDatabase).updateOne(new Document("_id", ConfigurationVersion.ID),
                     new Document("$inc", new Document("revision", 1L)));
-            var after = f.configuration.observationConfiguration(reading, "views", Map.of("input", "capture-a"));
+            var after = f.configuration.observationConfiguration(reading, "views", Map.of("input",
+                    new MongoConfigurationDomain.ObservationCapture("input", "capture-a")));
             assertThat(after.changed()).isTrue();
             assertThat(after.configuration()).isEmpty();
             assertThat(f.configuration.intents().readForActuation("flow").orElseThrow().configurationRevision()).hasValue(revision + 1);

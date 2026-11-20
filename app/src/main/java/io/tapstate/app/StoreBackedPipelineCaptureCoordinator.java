@@ -396,7 +396,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // use would pay for a second read per source on every start.
                 SourceModel discovered = modelInputs.apply(source);
                 Optional<SourceCaptureResolution> selected =
-                        SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+                        SourceCaptureResolution.forPipeline(pipeline, ref, source, discovered);
                 if (selected.isEmpty()) {
                     continue;
                 }
@@ -408,7 +408,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
                     permits.put(captureId, permitOrNotYet(pipelineId, captureId, spec));
                 }
-                plans.add(new SourcePlan(sourceId, discovered, resolution, spec, captureId));
+                plans.add(new SourcePlan(ref.binding(), discovered, resolution, spec, captureId));
             }
             requestSharedSelections(plans);
             requireRemoteSelections(pipelineId, plans, permits);
@@ -1517,7 +1517,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 for (SourceRef ref : pipeline.sources()) {
                     SourceResource source = StoredArtifacts.requireSource(captured, ref.id());
                     Optional<SourceCaptureResolution> selected = SourceCaptureResolution.forPipeline(
-                            pipeline, source, SourceDiscovery.model(storePort, source));
+                            pipeline, ref, source, SourceDiscovery.model(storePort, source));
                     if (selected.isEmpty()) {
                         continue;
                     }
@@ -1585,7 +1585,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 StartFrom.parse(startFromRaw),
                 retention,
                 MOCK_SCHEMA_VER,
-                snapshotEpoch).withConsumerId(SrsConsumerId.of(pipelineId, source.id()).value());
+                snapshotEpoch).withConsumerId(SrsConsumerId.of(pipelineId, resolution.sourceId()).value());
     }
 
     private static ReadMode readModeOf(Settings settings) {

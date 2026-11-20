@@ -52,6 +52,31 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.*;
 
 class PipelineAssistantControllerTest {
+    @Test
+    void assistantCandidatesKeepNodeSettingsOnTheSameInputAndHideThemFromProviderContext() {
+        var config = Map.of("custom-root", Map.of("preImage", false), "child", Map.of("preImage", true));
+        var wire = Map.<String, Object>of(
+                "root", Map.of("id", "custom-root", "sourceId", "src", "table", "orders", "key", List.of("id")),
+                "related", List.of(Map.of("id", "child", "parentId", "custom-root", "sourceId", "src", "table", "items")),
+                "sourceNodeConfigs", config);
+
+        var providerView = AssistantWizardJson.view(wire);
+        assertThat(providerView).doesNotContainKey("sourceNodeConfigs");
+        assertThat(AssistantWizardJson.list(providerView.get("relations"))).hasSize(1);
+        providerView.put("destinationTable", "archived_orders");
+        var candidate = AssistantWizardJson.wire(providerView, wire);
+        assertThat(candidate).containsEntry("sourceNodeConfigs", config);
+        assertThat(AssistantWizardJson.object(AssistantWizardJson.candidateView(candidate).get("root")))
+                .containsEntry("nodeId", "custom-root");
+
+        var root = new java.util.LinkedHashMap<>(AssistantWizardJson.object(providerView.get("root")));
+        root.put("source", "replacement");
+        providerView.put("root", root);
+        providerView.put("sourceNodeConfigs", Map.of("custom-root", Map.of("preImage", true)));
+        assertThat(AssistantWizardJson.wire(providerView, wire))
+                .containsEntry("sourceNodeConfigs", Map.of("child", Map.of("preImage", true)));
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void onPremStreamPublishesOnlyWhileTheOriginalAuthenticationIsActive(boolean retire) throws Exception {

@@ -142,7 +142,7 @@ public final class DslParser {
     private static final Set<String> COLD_KEYS = Set.of("partition_by");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
-    static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
+    static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs", "nodeConfig", "as");
     static final Set<String> SYNC_KEYS = Set.of(
             "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD, EXECUTION_FIELD);
     static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
@@ -444,31 +444,31 @@ public final class DslParser {
 
     private static List<SourceRef> sources(YamlMap m) {
         Node n = m.node(SOURCE_TOKEN);
-        if (n instanceof ScalarNode sc) {
-            return List.of(SourceRef.bare(sc.getValue()));
+        if (n instanceof ScalarNode || n instanceof MappingNode) {
+            return List.of(sourceRef(n, SOURCE_TOKEN));
         }
         List<SourceRef> refs = new ArrayList<>();
         if (n instanceof SequenceNode seq) {
             for (Node item : seq.getValue()) {
-                refs.add(sourceRef(item));
+                refs.add(sourceRef(item, SOURCE_TOKEN + "[" + refs.size() + "]"));
             }
         }
         return refs;
     }
 
-    private static SourceRef sourceRef(Node item) {
+    private static SourceRef sourceRef(Node item, String path) {
         if (item instanceof ScalarNode sc) {
             return SourceRef.bare(sc.getValue());
         }
-        YamlMap ref = YamlMap.requireMapping(item, SOURCE_TOKEN);
+        YamlMap ref = YamlMap.requireMapping(item, path);
         ref.requireOnly(SOURCE_REF_KEYS);
         Boolean srs = boolValue(ref, "srs");
-        // An object written without the switch says exactly what a bare id says, so it normalizes
-        // to one: keeping both spellings of one state would let the same pipeline canonicalize two
-        // ways, and the materialization rule reads "has a switch" off this distinction.
-        return srs == null
-                ? SourceRef.bare(ref.requireString("id"))
-                : SourceRef.spec(ref.requireString("id"), srs);
+        String alias = ref.string("as");
+        if (alias != null && (alias.isBlank() || alias.contains("."))) {
+            throw ref.errorAt("as", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, alias, EXPECTED_TOKEN, "a non-blank alias without dots"));
+        }
+        return SourceRef.of(ref.requireString("id"), srs, ref.freeMap("nodeConfig"), alias);
     }
 
     // ---- transforms ---------------------------------------------------------------

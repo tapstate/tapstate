@@ -73,15 +73,16 @@ final class StoreBackedPipelineChains implements PipelineChains {
         Objects.requireNonNull(pipelineId, "pipelineId");
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts, pipelineId);
         List<SourceCaptureResolution> resolutions = new ArrayList<>();
-        for (String sourceId : pipeline.sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
+        for (String binding : pipeline.sourceBindings()) {
+            var ref = pipeline.sourceReference(binding);
+            SourceResource source = StoredArtifacts.requireSource(artifacts, ref.id());
             var model = models.apply(source);
             if (stores != null && storePort instanceof ThreeLayerStorePort nativeStore) {
-                SourceCaptureResolution.forPipeline(pipeline, source, model)
+                SourceCaptureResolution.forPipeline(pipeline, ref, source, model)
                         .flatMap(resolution -> nativeStore.sharedReadingForStart(pipeline, source, resolution, stores))
                         .ifPresent(resolutions::add);
             } else {
-                SourceCaptureResolution.forStoredPipeline(storePort,pipeline, source, model,requireAttachment)
+                SourceCaptureResolution.forStoredPipeline(storePort,pipeline,ref,source,model,requireAttachment)
                         .ifPresent(resolutions::add);
             }
         }

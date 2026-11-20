@@ -33,11 +33,12 @@ final class MongoPipelineObservationConfig {
     }
 
     MongoConfigurationDomain.ObservationCheck read(PipelineIntentStore.ActuationReading before,
-            String defaultSource, Map<String, String> sourceCaptures) {
+            String defaultSource, Map<String, MongoConfigurationDomain.ObservationCapture> sourceCaptures) {
         var scope = before.intent().scope();
         var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
         String pipeline = scope.pipelineId();
-        var ids = new HashSet<>(sourceCaptures.keySet());
+        var ids = new HashSet<String>();
+        sourceCaptures.values().forEach(capture -> ids.add(capture.sourceId()));
         ids.add(pipeline);
         ids.add(defaultSource);
         var query = new ArrayList<Document>();
@@ -49,7 +50,8 @@ final class MongoPipelineObservationConfig {
         query.add(one(PIPELINE_INTENTS, "intent", pipeline));
         query.add(one(PDK_NOTE_SCOPES, "global", new Document("bindingVersion", scope.bindingVersion()).append("namespace", "pdk.global-state")));
         query.add(lookup(STORAGE_RECOVERY, "recovery", List.of(new Document("$limit", 2), boundedRow())));
-        var captureIds = sourceCaptures.values().stream().distinct().map(id -> MongoCapturePreparationFacts.id(business, id)).toList();
+        var captureIds = sourceCaptures.values().stream().map(MongoConfigurationDomain.ObservationCapture::captureId)
+                .distinct().map(id -> MongoCapturePreparationFacts.id(business, id)).toList();
         query.add(lookup(CAPTURE_PREPARATIONS, "capture", bounded(match(in("_id", captureIds)), captureIds.size())));
         for (var kind : ARTIFACTS) query.add(lookup(kind, kind.collectionName(), bounded(match(in("_id", ids)), ids.size())));
 
@@ -89,18 +91,28 @@ final class MongoPipelineObservationConfig {
                 if (!business.equals(audited.businessScope())) return MongoConfigurationDomain.ObservationCheck.fallback();
 
                 if (!(artifacts.decode(definitions.get(pipeline)) instanceof PipelineResource definition)
-                        || !Set.copyOf(definition.sourceIds()).equals(sourceCaptures.keySet())) return MongoConfigurationDomain.ObservationCheck.fallback();
+                        || !Set.copyOf(definition.sourceBindings()).equals(sourceCaptures.keySet())) return MongoConfigurationDomain.ObservationCheck.fallback();
                 var sources = new HashMap<String, SourceResource>();
-                for (var id : sourceCaptures.keySet()) {
-                    if (!(artifacts.decode(definitions.get(id)) instanceof SourceResource source)) return MongoConfigurationDomain.ObservationCheck.fallback();
-                    sources.put(id, source);
+                var bySourceId = new HashMap<String, SourceResource>();
+                for (var entry : sourceCaptures.entrySet()) {
+                    String binding = entry.getKey();
+                    String id = entry.getValue().sourceId();
+                    if (!definition.sourceReference(binding).id().equals(id)) return MongoConfigurationDomain.ObservationCheck.fallback();
+                    if (!bySourceId.containsKey(id)) {
+                        if (!(artifacts.decode(definitions.get(id)) instanceof SourceResource source))
+                            return MongoConfigurationDomain.ObservationCheck.fallback();
+                        bySourceId.put(id, source);
+                    }
+                    sources.put(binding, bySourceId.get(id));
                 }
                 var captures = new HashMap<String, CapturePreparation>();
                 for (var row : rows(root, "capture")) {
                     var capture = MongoCapturePreparationFacts.available(row);
                     if (!business.equals(capture.scope()) || captures.put(capture.captureId(), capture) != null) return MongoConfigurationDomain.ObservationCheck.fallback();
                 }
-                if (!captures.keySet().equals(Set.copyOf(sourceCaptures.values()))) return MongoConfigurationDomain.ObservationCheck.fallback();
+                if (!captures.keySet().equals(sourceCaptures.values().stream()
+                        .map(MongoConfigurationDomain.ObservationCapture::captureId)
+                        .collect(java.util.stream.Collectors.toSet()))) return MongoConfigurationDomain.ObservationCheck.fallback();
                 return new MongoConfigurationDomain.ObservationCheck(false,
                         Optional.of(new MongoConfigurationDomain.ObservationConfiguration(definition, sources, captures)));
             }
