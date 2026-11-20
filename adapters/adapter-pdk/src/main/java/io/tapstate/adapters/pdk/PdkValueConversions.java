@@ -118,7 +118,7 @@ final class PdkValueConversions {
             type = field.getTapType();
         }
         String declared = declaredType(tap, matches ? field : null, original, path, context);
-        return new ConvertedValue(portable, declared, kind,
+        return new ConvertedValue(portable, TapEventCodec.portableOriginType(originalPayload, portable, declared), kind,
                 context.schema().description(type), temporal);
     }
 

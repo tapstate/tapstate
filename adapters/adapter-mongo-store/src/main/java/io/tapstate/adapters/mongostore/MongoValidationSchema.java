@@ -191,6 +191,10 @@ final class MongoValidationSchema {
     }
 
     static void requireReady(MongoDatabase database, boolean configuration) {
+        requireReady(database, configuration, null);
+    }
+
+    static void requireReady(MongoDatabase database, boolean configuration, MongoStructureProof absenceProof) {
         var table = configuration ? SystemCollections.SCHEMA_MIGRATIONS : SystemCollections.CACHE_SCHEMA_MIGRATIONS;
         var schema = table.on(database).find(new Document("_id", configuration ? "config" : "business")).first();
         var startup = STARTUP.get();
@@ -199,6 +203,14 @@ final class MongoValidationSchema {
             startup.remove(database);
             throw refused();
         }
+        if (configuration && previous == null && absenceProof != null && schema != null
+                && Integer.valueOf(VERSION).equals(schema.get("installedVersion")) && !schema.containsKey("validation")) {
+            // Every poll still observes the current marker. Reuse only the absence of optional physical resources.
+            absenceProof.require(MongoStructureProof.Kind.UNPREPARED_VALIDATION,
+                    () -> configurationHasValidation(database, schema));
+            throw unreadable("version");
+        }
+        if (absenceProof != null) absenceProof.clear();
         if (configuration && previous == null && !configurationHasValidation(database, schema)) throw unreadable("version");
         var marker = configuration ? requireConfiguration(schema, "READY") : requireVersionTwo(schema, "READY");
         if (configuration && Integer.valueOf(2).equals(marker.get("formatVersion")) && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw refused();

@@ -246,6 +246,15 @@ public final class ApplyService {
                 }
             }
         }
+        if (scope == ValidationScope.ONLINE_SOURCE && resources.size() == 1
+                && resources.getFirst() instanceof PipelineResource pipeline) {
+            // A standalone Pipeline preview can use the same persisted dependencies as draft compilation.
+            var inventory = store.draftPublicationInventory(pipeline);
+            if (inventory.isPresent()) {
+                return planResourcesAndWorkspace(resources, preconditions, scope,
+                        publicationReads(pipeline, inventory.orElseThrow(), true));
+            }
+        }
         return planResourcesAndWorkspace(resources, preconditions, scope);
     }
 
@@ -692,7 +701,12 @@ public final class ApplyService {
         var dependencySlice = resource instanceof PipelineResource pipeline
                 ? store.draftPublicationInventory(pipeline) : Optional.<ArtifactStore.ReadableInventory>empty();
         var inventory = dependencySlice.orElseGet(store::readableInventory);
-        var previous = dependencySlice.isPresent() || inventory.exactLookupIds().contains(resource.id())
+        return publicationReads(resource, inventory, dependencySlice.isPresent());
+    }
+
+    private PublicationReads publicationReads(
+            Resource resource, ArtifactStore.ReadableInventory inventory, boolean includesPrevious) {
+        var previous = includesPrevious || inventory.exactLookupIds().contains(resource.id())
                 ? inventory.resources().stream().filter(value -> value.id().equals(resource.id())).findFirst()
                 : store.get(resource.id());
         return new PublicationReads(inventory, previous.orElse(null), store.managedDefaultSourceId(),

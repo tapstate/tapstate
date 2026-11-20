@@ -16,6 +16,7 @@ import io.tapstate.core.lifecycle.StateJson;
 /** Executes only the original explicit Pipeline full and observes actual sink completion under its run fence. */
 final class NativePipelineRecovery {
     private final MongoConfigurationDomain configuration;
+    private final CachePreparation original;
     private final CacheAuthScope auth;
     private final PipelineRecoveryInspector inspector;
     private final PipelineFirstStatePreparer preparer;
@@ -28,10 +29,10 @@ final class NativePipelineRecovery {
     private final StorePort store;
     private final PipelineStoreViews views;
 
-    NativePipelineRecovery(MongoConfigurationDomain configuration,CacheAuthScope auth,StorePort store,
+    NativePipelineRecovery(MongoConfigurationDomain configuration,CachePreparation original,StorePort store,
             PipelineFirstStatePreparer preparer,ConnectorProvisioner connectors,Engine engine,PipelineCaptureCoordinator captures,
             ExecutionAuthorization authorization,Runnable active,BooleanSupplier available,PipelineStoreViews views) {
-        this.configuration=Objects.requireNonNull(configuration);this.auth=Objects.requireNonNull(auth);
+        this.configuration=Objects.requireNonNull(configuration);this.original=Objects.requireNonNull(original);this.auth=original.authScope();
         this.preparer=Objects.requireNonNull(preparer);this.engine=Objects.requireNonNull(engine);this.captures=Objects.requireNonNull(captures);
         this.authorization=Objects.requireNonNull(authorization);this.active=Objects.requireNonNull(active);this.available=Objects.requireNonNull(available);
         this.store=Objects.requireNonNull(store);this.views=Objects.requireNonNull(views);
@@ -179,7 +180,7 @@ final class NativePipelineRecovery {
     void observeCompletion() {
         if(!available.getAsBoolean())return;
         try {
-            active.run();var commands=configuration.recoveryCommands();var pending=commands.current(auth);
+            active.run();var commands=configuration.recoveryCommands();var pending=commands.currentForCompletion(original);
             if(pending.isEmpty())return;var plan=pending.orElseThrow();
             if(!plan.originalScope().equals(auth) || plan.phase()!=StorageRecoveryCommands.Phase.RUNNING
                     || plan.manifest().selection().extent()!=StorageRecoveryCommands.Extent.PIPELINE || plan.manifest().selection().pipelineIds().size()!=1)return;
