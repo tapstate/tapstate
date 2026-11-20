@@ -21,6 +21,12 @@ public interface AiProviderClient {
         return propose(settings, messages, context, (Consumer<String>) output);
     }
 
+    /** Checks the provider's local request budget without signing or sending a request. */
+    default boolean proposalRequestFits(AiProviderSettings settings, List<Map<String, String>> messages,
+            Map<String, Object> context) {
+        return true;
+    }
+
     interface Output extends Consumer<String> {
         default void reasoning(Reasoning part) { }
     }
