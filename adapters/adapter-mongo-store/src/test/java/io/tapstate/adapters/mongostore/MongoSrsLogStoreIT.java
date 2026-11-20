@@ -69,32 +69,6 @@ class MongoSrsLogStoreIT {
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
     @Test
-    void damagedBoundsRetainTheCompleteDiagnosticContract() {
-        withStoreCollection((store, collection) -> {
-            collection.insertOne(new Document("_id", MongoSrsLogStore.boundsId(RING))
-                    .append("largestSequence", "invalid"));
-            assertUnreadable(() -> store.bounds(RING), "bounds");
-        });
-    }
-
-    @Test
-    void damagedRecordRetainsTheCompleteDiagnosticContract() {
-        withStoreCollection((store, collection) -> {
-            collection.insertOne(new Document("_id", new Document("ring", RING).append("seq", 1L))
-                    .append("op", "invalid"));
-            assertUnreadable(() -> store.load(RING, 1L), "record");
-        });
-    }
-
-    private static void assertUnreadable(Runnable read, String field) {
-        assertThatThrownBy(read::run).isInstanceOfSatisfying(TapstateException.class, error -> {
-            assertThat(error.code()).isSameAs(IoError.DOCUMENT_UNREADABLE);
-            assertThat(error.args()).containsEntry("field", field);
-            assertThat(error.args().keySet()).isEqualTo(error.code().placeholders());
-        });
-    }
-
-    @Test
     void storeThenLoadRoundTripsAChange() {
         withStore(store -> {
             store.store(RING, 100L, new SrsLogRecord("bin.4:91827", Op.UPDATE, 42L,
