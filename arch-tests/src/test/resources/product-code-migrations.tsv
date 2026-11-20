@@ -489,6 +489,3 @@ nest.rollup-type-unknown	TS0490032
 nest.rollup-value-type-mismatch	TS0490034
 control.ai-managed-provider-auth-failed	TS0210032
 control.ai-managed-provider-input-limit	TS0210033
-dsl.reserved-field-declared	TS0010037
-schema.reserved-field-rename-conflict	TS0270003
-schema.reserved-field-renamed	TS0270002
