@@ -23,6 +23,46 @@ class PipelineBuilderAssistantProviderSettingsIT {
     private static final String TEST_KEY = "sk-e2e-provider-key-sentinel";
 
     @Test
+    void aCloudWorkspaceDefaultsToManagedKimiAndCanSwitchToItsSavedProvider() throws Exception {
+        try (PreparedNativeStore storage = PreparedNativeStore.createCloud();
+                AtlasRuntime runtime = new AtlasRuntime(storage);
+                ServerHandle server = runtime.launch(Tiers.IN_PROCESS, java.util.List.of(
+                    "--tapstate.ai.bedrock.enabled=true", "--tapstate.ai.bedrock.provider-managers=" + AtlasRuntime.USER));
+                HttpClient client = HttpClient.newHttpClient()) {
+            ControlPlane control = runtime.control(server, true);
+            var initial = providerSettings(client, server, control, "GET", null);
+            assertThat(initial.statusCode()).isEqualTo(200);
+            assertThat(object(initial.body())).containsEntry("mode", "managed")
+                    .containsEntry("managedModel", "global.moonshotai.kimi-k3")
+                    .containsEntry("canManage", true).containsEntry("byokConfigured", false);
+
+            var saved = providerSettings(client, server, control, "PUT", JsonWriter.write(Map.of(
+                    "providerId", "openai-compatible", "model", "e2e-model", "apiKey", TEST_KEY)));
+            assertThat(saved.statusCode()).isEqualTo(204);
+            assertThat(object(providerSettings(client, server, control, "GET", null).body()))
+                    .containsEntry("mode", "byok");
+
+            selectProvider(client, server, control, "managed");
+            assertThat(object(providerSettings(client, server, control, "GET", null).body()))
+                    .containsEntry("mode", "managed").containsEntry("byokConfigured", true);
+
+            selectProvider(client, server, control, "byok");
+            var restored = providerSettings(client, server, control, "GET", null);
+            assertThat(object(restored.body())).containsEntry("mode", "byok").containsEntry("model", "e2e-model");
+            assertThat(restored.body()).doesNotContain(TEST_KEY);
+        }
+    }
+
+    private static void selectProvider(HttpClient client, ServerHandle server, ControlPlane control,
+            String mode) throws Exception {
+        var request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/ai-provider-settings:select"))
+                .header("Cookie", control.credential()).header("Origin", server.baseUrl().toString())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(Map.of("mode", mode)))).build();
+        assertThat(client.send(request, HttpResponse.BodyHandlers.discarding()).statusCode()).isEqualTo(204);
+    }
+
+    @Test
     void anAssistantStreamsBeforeCompletionAndCoalescesTextBehindItsRealAuthorization() throws Exception {
         assertAssistantStreams(false);
     }

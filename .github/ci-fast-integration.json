@@ -10,6 +10,8 @@
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoAlertStorageSchemaIT", "method": "ordinaryLegacyOpenIsLoadOnlyAndExplicitPreparationPreservesOtherFeatureFactsAndKeys"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoAlertStorageSchemaIT", "method": "supportedVersionOneIsLoadOnlyUntilExplicitAuthorityPreparation"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoKeyedStateStoreIT"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoAiProviderSettingsStoreIT", "method": "encryptedCredentialsSurviveRotationAndCannotCrossWorkspaceOrEndpoint"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoConfigurationAiProviderSettingsIT", "method": "encryptedConfigurationSurvivesReopenAndExplicitDeletionWithoutAnyCache"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoPipelineIntentStoreIT"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoSrsLogStoreIT"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoSrsConsumerStoreIT", "method": "nodeBackedWriterUsesTheNodeLeaseAndRejectsBothOldExecutionsAndOldBoots"},
