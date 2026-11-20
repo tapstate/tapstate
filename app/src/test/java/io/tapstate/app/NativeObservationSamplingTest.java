@@ -102,8 +102,9 @@ class NativeObservationSamplingTest {
         void cacheHas(CheckpointDoc checkpoint) {
             when(captures.observationSelection(EXECUTION)).thenReturn(Optional.of(
                     new ScopedPipelineCaptureCoordinator.ObservationSelection(EXECUTION, Map.of(), Map.of())));
-            when(cache.readObservation(eq(SCOPE), eq(CLAIM), eq(Map.of()), any())).thenReturn(Optional.of(
-                    new MongoCacheDomain.ObservationFacts(checkpoint, Map.of(), Map.of(), Map.of())));
+            var reading = mock(MongoCacheDomain.ObservationRead.class);
+            when(reading.facts()).thenReturn(new MongoCacheDomain.ObservationFacts(checkpoint, Map.of(), Map.of(), Map.of()));
+            when(cache.readObservation(eq(SCOPE), eq(CLAIM), eq(Map.of()), any())).thenReturn(Optional.of(reading));
         }
 
         Optional<Observation> publish(PipelineIntentStore.ActuationReading config) {

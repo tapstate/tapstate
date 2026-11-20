@@ -788,9 +788,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (own == null || own.member().detached()) return Optional.empty();
             var held = own.cursor();
             var pin=held.snapshot();
-            var checkpoint=MongoSrsChainStore.controlState(own.root(),scope,new MongoSrsModelContexts(database,scope)).checkpoint();
-            var proved=checkpoint==null?Set.<SrsModelKey>of():checkpoint.tables().values().stream().map(io.tapstate.spi.store.SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
-            if(pin!=null&&!proved.containsAll(pin.models().values()))validateSnapshot(session,context,pin);
+            if(pin!=null)validateSnapshot(session,context,pin);
             return Optional.of(new SrsConsumerProgress(context,own.member().revision(),held.revision(),held.value(),held.snapshot(),held.writerRun(),held.ringDoneThrough()));
         });
     }

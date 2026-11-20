@@ -160,12 +160,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 if(includeNode&&operations.budget()==null)operations.requireAdmission();
                 requireActive.run();requireValidationAuthority();
                 if(!MongoReadBudget.supportsSnapshotReads(client))return legacy.get();
-                if (!includeNode) {
-                    operations.structures.require(MongoStructureProof.Kind.CHECKPOINT_READ, () ->
-                            operations.checkpointSimpleCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
-                                    SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS,
-                                    SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_WORKLOAD_CLAIMS)));
-                    if (!operations.checkpointSimpleCollations) return legacy.get();
+                if (!includeNode && !operations.structures.permits(MongoStructureProof.Kind.CHECKPOINT_READ, () ->
+                        MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                                SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS,
+                                SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_WORKLOAD_CLAIMS)))) {
+                    return legacy.get();
                 }
                 var budget=operations.budget();if(budget!=null)operations.check();
                 var db=budget==null?database:budget.database(database);
@@ -182,14 +181,19 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                             .append("let",new Document("owner",new Document("$arrayElemAt",List.of("$claim.ownerNodeId",0))))
                             .append("pipeline",List.of(new Document("$match",new Document("$expr",new Document("$eq",List.of("$_id",nodeId)))),MongoWorkloadClaimStore.leaseRemaining(true)))
                             .append("as","node")));
-                    var observed=SystemCollections.CACHE_IDENTITY.on(db).aggregate(session,stages).first();
+                    var observed=StoreIo.call(() -> SystemCollections.CACHE_IDENTITY.on(db).aggregate(session,stages).first());
                     MongoCacheBusinessIdentity.requireObservedAdmission(observed,observedRow(observed,"schema"),scope);
                     if(!includeNode)requirePipelineReadingStructure(db, access, budget);
                     var state=observedRow(observed,"state");
                     access.validateState(state);var claim=observedRow(observed,"claim");access.requirePreparedClaim(session,claim);
                     T result=read.apply(new PipelineReading(state,claim,includeNode?observedRow(observed,"node"):null));
                     requireActive.run();requireValidationAuthority();if(budget!=null)operations.check();return result;
+                } catch (TapstateException failure) {
+                    if (includeNode || failure.code() != IoError.DOCUMENT_TOO_LARGE) throw failure;
                 }
+                requireActive.run();
+                requireValidationAuthority();
+                return legacy.get();
             }catch(RuntimeException failure){operations.structures.clear();requireActive.run();throw failure;}
         });
         return includeNode?operations.pipelineRenewal(key,operation):operation.get();

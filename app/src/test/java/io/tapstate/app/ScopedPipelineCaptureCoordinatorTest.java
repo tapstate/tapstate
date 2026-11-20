@@ -510,17 +510,72 @@ class ScopedPipelineCaptureCoordinatorTest {
                     new SrsConsumerStore.RetentionConsumer(peer, Map.of()));
             var oldSnapshot = new SrsConsumerStore.RetentionSnapshot(old, members);
             var newSnapshot = new SrsConsumerStore.RetentionSnapshot(opened, members);
-            when(stores.consumers().retentionSnapshot(held.chain()))
-                    .thenAnswer(call -> Optional.of(chain.get() == old ? oldSnapshot : newSnapshot));
             var refreshed = new CountDownLatch(1);
             doAnswer(call -> {
                 if (chain.get() == opened) refreshed.countDown();
                 return null;
             }).when(f.runtime).retain(eq(BUSINESS), eq(held.chain()), eq(fence), any());
+            when(stores.consumers().retentionSnapshot(held.chain()))
+                    .thenAnswer(call -> Optional.of(chain.get() == old ? oldSnapshot : newSnapshot));
 
             assertThat(refreshed.await(5, TimeUnit.SECONDS)).isTrue();
             verify(f.runtime).startTail(eq(BUSINESS), eq(opened), eq(fence), any(), any(), any(), any(), anyBoolean());
             verify(f.runtime, never()).retain(eq(BUSINESS), eq(held.chain()), eq(fence), any(), same(oldSnapshot));
+        }
+    }
+
+    @Test void unavailableRetentionSnapshotKeepsTheHealthyTailAndRetriesCleanup() throws InterruptedException {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var failures = new AtomicInteger();
+            var retained = new CountDownLatch(2);
+            doAnswer(call -> {
+                if (failures.get() > 0) retained.countDown();
+                return null;
+            }).when(f.runtime).retain(eq(BUSINESS), eq(held.chain()),
+                    eq(WorkloadClaimFence.from(held.claim())), any());
+            when(stores.consumers().retentionSnapshot(held.chain())).thenAnswer(call -> {
+                failures.incrementAndGet();
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "snapshot unavailable"), null);
+            });
+
+            assertThat(retained.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(failures).hasValueGreaterThanOrEqualTo(2);
+            assertThat(held.run().captureFailure("flow")).isEmpty();
+            verify(f.ownership, never()).release(held.claim());
+            verify(held.tail(), never()).close();
+            verify(f.runtime, times(1)).startTail(any(), any(), any(), any(), any(), any(), any(), anyBoolean());
+        }
+    }
+
+    @Test void unavailableRetentionSnapshotStillRejectsALostCaptureOwner() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var fenced = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            when(stores.consumers().retentionSnapshot(held.chain())).thenAnswer(call -> {
+                when(f.authorization.requireCapture(any(), any())).thenThrow(fenced);
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "snapshot unavailable"), null);
+            });
+
+            verify(f.ownership, timeout(3000)).release(held.claim());
+            assertThat(held.run().captureFailure("flow")).contains(fenced);
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = IoError.class,
+            names = {"WORKLOAD_CLAIM_FENCED", "CACHE_BUSINESS_FENCED", "DOCUMENT_UNREADABLE"})
+    void retentionSnapshotFencesAndDamagedFactsStillEndTheCapture(IoError code) {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var failure = new TapstateException(code, Map.of(), null);
+            when(stores.consumers().retentionSnapshot(held.chain())).thenThrow(failure);
+
+            verify(f.ownership, timeout(3000)).release(held.claim());
+            assertThat(held.run().captureFailure("flow")).contains(failure);
         }
     }
 
@@ -719,7 +774,9 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(f.authorization.requireLocal(ORIGINAL)).thenThrow(new TapstateException(
                     io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "flow"), null));
             assertThat(f.authorization.require(ORIGINAL)).isEqualTo(PIPELINE);
+            clearInvocations(f.authorization);
             assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            verify(f.authorization).requireLocal(ORIGINAL);
             verify(publisher, times(2)).publishScoped(SCOPE, state, observations, null);
             verifyNoInteractions(cache);
             assertThat(f.coordinator.observationSelection(ORIGINAL)).isEmpty();

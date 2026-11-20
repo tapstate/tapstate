@@ -1552,7 +1552,13 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private void maintainTail(Owner owner) {
         var current = tailStores(owner);
         String chainId = owner.prepared.chainId();
-        var snapshot = current.consumers().retentionSnapshot(chainId).orElse(null);
+        SrsConsumerStore.RetentionSnapshot snapshot = null;
+        try {
+            snapshot = current.consumers().retentionSnapshot(chainId).orElse(null);
+        } catch (TapstateException unavailable) {
+            if (unavailable.code() != IoError.STORE_UNAVAILABLE) throw unavailable;
+            owner.require();
+        }
         var original = owner.physical;
         ensureTail(owner, current, false, snapshot);
         try {

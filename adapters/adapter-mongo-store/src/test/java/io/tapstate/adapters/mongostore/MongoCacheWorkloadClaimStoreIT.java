@@ -1088,6 +1088,27 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
+    @Test void anOversizedCheckpointSnapshotFallsBackToTheOrdinaryTransaction() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(
+                    new Document("_id", PIPELINE.pipelineId()), new Document("$set",
+                            new Document("padding", "x".repeat(16 * 1024 * 1024 - 400))));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(
+                    new Document("_id", MongoWorkloadClaimStore.id(KEY)), new Document("$set",
+                            new Document("padding", "x".repeat(64 * 1024))));
+            var access = new MongoCachePipelineAccess(f.admin(), f.database(), PIPELINE, null, ACTIVE);
+            var expected = access.transaction(session -> MongoStateStore.toCheckpoint(access.state(session)));
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(f.domain().pipelineStates(PIPELINE).read(PIPELINE.pipelineId())).contains(expected);
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+            }
+            assertThat(commands).containsSubsequence("aggregate:cache_identity", "find:pipeline_state");
+        });
+    }
+
     private static PipelineIntentScope nextScope() { return new PipelineIntentScope("cluster-a", 1, "incarnation-a", "orders", 2); }
     private static void replacePreparedScope(Fixture f, PipelineIntentScope next) {
         String preparationId = UUID.randomUUID().toString();
