@@ -10,6 +10,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
 
 /**
@@ -48,7 +49,7 @@ public final class JobFailureRegistry {
         failures.compute(pipelineId, (id, before) -> {
             if (before != null && before.legacy() == null) return before;
             Slot slot = before == null ? new Slot(pipelineId, 0, null) : before.legacy();
-            slot.record(cause);
+            slot.capture(cause);
             return before == null ? new Slots(slot, null) : before;
         });
     }
@@ -73,9 +74,11 @@ public final class JobFailureRegistry {
         return forJob(jobId, config, 0, null);
     }
 
-    /** Registers from the member's execution context without waiting on the cluster. */
-    public Recorder forProcessor(Processor.Context context) {
-        return forJob(context.jobId(), context.jobConfig(), context.executionId(), JetLiveExecution.StartupPhase.PROCESSOR);
+    /** Registers without waiting on the cluster. A directly driven processor may have no member. */
+    public static Recorder forProcessor(HazelcastInstance member, Processor.Context context) {
+        if (member == null) return null;
+        return of(member).forJob(context.jobId(), context.jobConfig(), context.executionId(),
+                JetLiveExecution.StartupPhase.PROCESSOR);
     }
 
     /** Registers a planning failure on the coordinator before any worker context exists. */
@@ -94,36 +97,42 @@ public final class JobFailureRegistry {
     }
 
     private Recorder attachLocal(JetLiveExecution.Startup startup) {
-        var answer = new java.util.concurrent.atomic.AtomicReference<>(Recorder.NONE);
-        String pipelineId = startup.pipelineId();
-        failures.compute(pipelineId, (id, before) -> {
-            if (!startup.isLocalTo(member)) return before;
-            Slot known = before == null ? null : before.named;
-            if (known != null && known.jobId == startup.jobId()) {
-                answer.set(recorder(known, startup.jobId(), startup.identity()));
-                return before;
-            }
-            var local = before == null ? null : before.local;
-            Slot slot;
-            if (local != null && local.slot.jobId == startup.jobId()) {
-                slot = local.slot;
-                if (!slot.matches(startup.jobId(), startup.identity())) return before;
-                answer.set(recorder(slot, startup.jobId(), startup.identity()));
-                if (local.proof.equals(startup)) return before;
-            } else {
-                // Local execution evidence must not displace another locally executing job.
-                if (local != null && local.proof.isLocalTo(member)) return before;
-                if (local != null) local.slot.retire();
-                slot = new Slot(pipelineId, startup.jobId(), startup.identity());
-                answer.set(recorder(slot, startup.jobId(), startup.identity()));
-            }
-            if (known != null && known.identity == null) {
-                known.retire();
-                known = null;
-            }
-            return new Slots(known, new Local(slot, startup));
-        });
+        var answer = new AtomicReference<>(Recorder.NONE);
+        failures.compute(startup.pipelineId(), (id, before) -> observeLocalStartup(before, startup, answer));
         return answer.get();
+    }
+
+    private Slots observeLocalStartup(Slots before, JetLiveExecution.Startup startup,
+            AtomicReference<Recorder> answer) {
+        if (!startup.isLocalTo(member)) return before;
+        Slot named = before == null ? null : before.named;
+        if (named != null && named.jobId == startup.jobId()) {
+            answer.set(recorder(named, startup.jobId(), startup.identity()));
+            return before;
+        }
+
+        Local local = before == null ? null : before.local;
+        if (local != null && local.slot.jobId == startup.jobId()) {
+            Slot slot = local.slot;
+            if (!slot.matches(startup.jobId(), startup.identity())) return before;
+            answer.set(recorder(slot, startup.jobId(), startup.identity()));
+            return local.proof.equals(startup) ? before : withLocal(named, new Local(slot, startup));
+        }
+
+        // Local execution evidence must not displace another locally executing job.
+        if (local != null && local.proof.isLocalTo(member)) return before;
+        if (local != null) local.slot.retire();
+        Slot slot = new Slot(startup.pipelineId(), startup.jobId(), startup.identity());
+        answer.set(recorder(slot, startup.jobId(), startup.identity()));
+        return withLocal(named, new Local(slot, startup));
+    }
+
+    private static Slots withLocal(Slot named, Local local) {
+        if (named != null && named.identity == null) {
+            named.retire();
+            named = null;
+        }
+        return new Slots(named, local);
     }
 
     /** Only a named lookup can promote a local observation over a different named job. */
@@ -159,25 +168,29 @@ public final class JobFailureRegistry {
         Objects.requireNonNull(identity, "identity");
         while (true) {
             Slots before = failures.get(pipelineId);
-            Slot named = before == null ? null : before.named;
-            Slot known = before == null ? null : before.withJobId(jobId);
-            boolean exact = known != null && identity.equals(known.identity);
-            if (exact && (known == named || named == null)) {
-                if (updateIfCurrent(pipelineId, before, current -> {
-                    known.retire();
-                    return new Slots(current.named, current.local);
-                })) return;
-                continue;
-            }
-            // A different named slot can be displaced only by authority over this cancellation's pair.
-            boolean canPromote = before == null || currentJobMatches(pipelineId, jobId, identity);
-            if (!canPromote && !exact) return;
-            Slot retired = exact ? known : new Slot(pipelineId, jobId, identity);
-            if (updateIfCurrent(pipelineId, before, current -> {
-                retired.retire();
-                return canPromote ? promote(current, retired) : new Slots(current.named, current.local);
-            })) return;
+            if (retireRunAttempt(pipelineId, jobId, identity, before)) return;
         }
+    }
+
+    /** Returns false when a concurrent slot update requires another attempt. */
+    private boolean retireRunAttempt(String pipelineId, long jobId, Serializable identity, Slots before) {
+        Slot named = before == null ? null : before.named;
+        Slot known = before == null ? null : before.withJobId(jobId);
+        boolean exact = known != null && identity.equals(known.identity);
+        if (exact && (known == named || named == null)) {
+            return updateIfCurrent(pipelineId, before, current -> {
+                known.retire();
+                return new Slots(current.named, current.local);
+            });
+        }
+        // A different named slot can be displaced only by authority over this cancellation's pair.
+        boolean canPromote = before == null || currentJobMatches(pipelineId, jobId, identity);
+        if (!canPromote && !exact) return true;
+        Slot retired = exact ? known : new Slot(pipelineId, jobId, identity);
+        return updateIfCurrent(pipelineId, before, current -> {
+            retired.retire();
+            return canPromote ? promote(current, retired) : new Slots(current.named, current.local);
+        });
     }
 
     private Recorder recorder(Slot slot, long jobId, Serializable identity) {
@@ -232,7 +245,7 @@ public final class JobFailureRegistry {
             this.registry = registry; this.pipelineId = pipelineId; this.slot = slot;
         }
         public void record(Throwable failure) {
-            if (slot != null) slot.record(failure);
+            if (slot != null) slot.capture(failure);
             else if (registry != null) registry.record(pipelineId, failure);
         }
         Optional<Throwable> get() {
@@ -282,7 +295,7 @@ public final class JobFailureRegistry {
             return !retired && jobId != 0 && identity != null && identity.equals(expectedIdentity)
                     ? Optional.of(new RetainedFailure(cause)) : Optional.empty();
         }
-        synchronized void record(Throwable failure) { if (!retired) cause = Objects.requireNonNull(failure, "failure"); }
+        synchronized void capture(Throwable failure) { if (!retired) cause = Objects.requireNonNull(failure, "failure"); }
         synchronized Optional<Throwable> get() { return retired ? Optional.empty() : Optional.ofNullable(cause); }
         synchronized void retire() { retired = true; cause = null; }
     }

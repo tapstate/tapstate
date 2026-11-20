@@ -1,6 +1,5 @@
 package io.tapstate.runtime.engine;
 
-import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Traversers;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -99,8 +98,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
     protected void init(Processor.Context context) {
         this.timer = StageTimer.of(stage(), context);
         this.pipelineId = context.jobConfig().getName();
-        HazelcastInstance instance = context.hazelcastInstance();
-        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forProcessor(context) : null;
+        this.failureRegistry = JobFailureRegistry.forProcessor(context.hazelcastInstance(), context);
     }
 
     @Override

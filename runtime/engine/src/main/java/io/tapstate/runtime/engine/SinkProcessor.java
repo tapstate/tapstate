@@ -396,19 +396,23 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             ack = sinkAck.forWriter(writerId(writerOf, totalOne ? 0 : context.globalProcessorIndex()));
         }
         HazelcastInstance instance = context.hazelcastInstance();
-        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forProcessor(context) : null;
+        this.failureRegistry = JobFailureRegistry.forProcessor(instance, context);
+        configureJobGauges(instance);
+        if (ack != null) ack.started(context.jobId(), context.executionId());
+    }
+
+    private void configureJobGauges(HazelcastInstance member) {
         // A gauge that writes into a job's statistics can only do so from that job's own threads, and a
         // sink is also driven by hand - which is how its behaviour is pinned at all. Outside a job there
         // is nothing to write into and asking for a handle fails outright, taking the sink down with it,
-        // so the readings go nowhere instead. The same absence already decides the failure registry
-        // above, and for the same reason: neither exists until there is a job to hold it.
-        if (instance == null && supplied.readableOnlyOnAJobThread()) {
+        // so the readings go nowhere instead.
+        if (member != null) return;
+        if (supplied.readableOnlyOnAJobThread()) {
             this.delivery = DeliveryGauge.none();
         }
-        if (instance == null && suppliedGauge.readableOnlyOnAJobThread()) {
+        if (suppliedGauge.readableOnlyOnAJobThread()) {
             this.gauge = FrontierGauge.none();
         }
-        if (ack != null) ack.started(context.jobId(), context.executionId());
     }
 
     /** What this stage has timed so far, for a witness driving it by hand. */

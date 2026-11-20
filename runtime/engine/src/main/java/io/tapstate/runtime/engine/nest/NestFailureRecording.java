@@ -39,8 +39,7 @@ final class NestFailureRecording {
         String pipelineId = context == null || context.jobConfig() == null
                 ? null
                 : context.jobConfig().getName();
-        return new NestFailureRecording(
-                instance == null ? null : JobFailureRegistry.of(instance).forProcessor(context), pipelineId);
+        return new NestFailureRecording(JobFailureRegistry.forProcessor(instance, context), pipelineId);
     }
 
     /**
