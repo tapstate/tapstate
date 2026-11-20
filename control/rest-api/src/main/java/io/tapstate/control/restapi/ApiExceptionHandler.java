@@ -66,8 +66,7 @@ class ApiExceptionHandler {
             e = new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
         markCloudError(e.code());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
-        var diagnostic = e instanceof io.tapstate.control.core.ConnectionDiagnosticRefusal refusal ? refusal.diagnostic() : Map.<String, Object>of();
-        ApiError body = ApiError.render(e.code(), e.args(), diagnostic, catalog, requestLocale());
+        ApiError body = ApiError.from(e, catalog, requestLocale());
         HttpStatus status=statusFor(e.code());
         if(e.code()==io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED
                 &&java.util.Set.of("validation.metadataFrames","validation.processEnvelope","validation.cooperativeHeadroom").contains(e.args().get("limit")))status=HttpStatus.TOO_MANY_REQUESTS;

@@ -4,8 +4,10 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 
 import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.messages.MessageCatalog;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
@@ -73,6 +75,22 @@ public record ApiError(String code, Map<String, Object> params, String message,
         Map<String, Object> params = new TreeMap<>(parameters);
         var rendered = catalog.render(code, params, locale);
         return new ApiError(code, params, rendered.message(), rendered.solution(), localizeDiagnostic(diagnostic, catalog, locale));
+    }
+
+    static ApiError from(TapstateException failure, MessageCatalog catalog, Locale locale) {
+        var diagnostic = failure instanceof io.tapstate.control.core.ConnectionDiagnosticRefusal refusal
+                ? refusal.diagnostic() : Map.<String, Object>of();
+        return render(failure.code(), failure.args(), diagnostic, catalog, locale);
+    }
+
+    Map<String, Object> fields() {
+        Map<String, Object> fields = new LinkedHashMap<>();
+        fields.put("code", code);
+        fields.put("params", params);
+        fields.put("message", message);
+        if (solution != null && !solution.isEmpty()) fields.put("solution", solution);
+        if (!diagnostic.isEmpty()) fields.put("diagnostic", diagnostic);
+        return fields;
     }
 
     static ApiError from(ObservationFailure failure, MessageCatalog catalog, Locale locale) {

@@ -48,18 +48,7 @@ final class StreamFrames {
         if (failure == null) {
             return null;
         }
-        var rendered = ApiError.from(failure, catalog, Locale.ENGLISH);
-        Map<String, Object> encoded = new LinkedHashMap<>();
-        encoded.put("code", rendered.code());
-        encoded.put("params", rendered.params());
-        encoded.put("message", rendered.message());
-        if (rendered.solution() != null && !rendered.solution().isEmpty()) {
-            encoded.put("solution", rendered.solution());
-        }
-        if (!rendered.diagnostic().isEmpty()) {
-            encoded.put("diagnostic", rendered.diagnostic());
-        }
-        return encoded;
+        return ApiError.from(failure, catalog, Locale.ENGLISH).fields();
     }
 
     /** A logs frame: {@code {"pipelineId":..,"lines":[{timestampMillis,level,message},..]}}. */
