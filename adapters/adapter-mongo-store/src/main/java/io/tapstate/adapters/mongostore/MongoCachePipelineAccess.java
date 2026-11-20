@@ -7,6 +7,7 @@ import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
@@ -88,6 +89,22 @@ final class MongoCachePipelineAccess {
     }
 
     private <T> T transaction(boolean observation, TransactionOptions options, Function<ClientSession, T> action) {
+        return transaction(options, observation ? this::verifyStructures : this::verifyStateStructure, action);
+    }
+
+    CheckpointDoc readCheckpoint(MongoStructureProof structures) {
+        try {
+            return transaction(TRANSACTION, () -> {
+                structures.require(MongoStructureProof.Kind.PIPELINE_STATE, this::verifyStateStructure);
+                structures.require(MongoStructureProof.Kind.CLAIMS, () -> MongoCacheWorkloadClaimStore.requireCollection(database));
+            }, session -> MongoStateStore.toCheckpoint(state(session, true)));
+        } catch (RuntimeException failure) {
+            structures.clear();
+            throw failure;
+        }
+    }
+
+    private <T> T transaction(TransactionOptions options, Runnable verifyStructure, Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -96,7 +113,7 @@ final class MongoCachePipelineAccess {
                         requireActive.run();
                         new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
                                 .requireAdmissionState(session);
-                        if (observation) verifyStructures(); else verifyStateStructure();
+                        verifyStructure.run();
                         T result = action.apply(session);
                         requireActive.run();
                         return result;

@@ -66,6 +66,8 @@ class IdlePipelineObservationIT {
                         .anyMatch(command -> "pipeline_state".equals(command.get("find"))
                                 && Boolean.FALSE.equals(command.get("autocommit"))
                                 && command.get("filter") instanceof Document filter && PIPELINE.equals(filter.get("_id")));
+                assertThat(cacheCommands).as("pipeline startup avoids the old checkpoint snapshot")
+                        .noneMatch(IdlePipelineObservationIT::isLegacyCheckpointRead);
                 assertThat(cacheCommands).as("pipeline startup avoids the unsupported CACHE metadata filter")
                         .noneMatch(command -> command.containsKey("listCollections")
                                 && command.get("filter") instanceof Document filter
@@ -99,6 +101,17 @@ class IdlePipelineObservationIT {
                         () -> control.durablePosition(PIPELINE, TABLE).isPresent(), () -> "position is absent");
             }
         }
+    }
+
+    private static boolean isLegacyCheckpointRead(Document command) {
+        if (!"cache_identity".equals(command.get("aggregate"))) return false;
+        var stages = command.getList("pipeline", Document.class);
+        return stages != null && stages.size() == 4 && stages.stream()
+                .map(stage -> stage.get("$lookup"))
+                .filter(Document.class::isInstance)
+                .map(Document.class::cast)
+                .map(lookup -> lookup.getString("as"))
+                .toList().equals(List.of("schema", "state", "claim"));
     }
 
     private static Date awaitObservation(MongoCollection<Document> observations, Date after) {
