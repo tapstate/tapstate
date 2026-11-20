@@ -85,7 +85,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             HttpRequest request = HttpRequest.newBuilder(endpoint(settings, "/models"))
                     .timeout(timeout).header("Authorization", "Bearer " + settings.apiKey()).GET().build();
             var response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
-            Map<String, Object> json = readResponseObject(response, deadline);
+            Map<String, Object> json = readResponseObject(response, deadline, false);
             if (!(json.get("data") instanceof List<?> data) || data.size() > 2000) throw failed();
             java.util.SortedSet<String> models = new java.util.TreeSet<>();
             for (Object raw : data) {
@@ -161,16 +161,16 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         long deadline = System.nanoTime() + responseTimeout.toNanos();
         try {
             var response = send(settings, body);
-            return readResponseObject(response, deadline);
+            return readResponseObject(response, deadline, signer != null);
         } catch (java.io.IOException | InterruptedException | IllegalArgumentException error) {
             if (error instanceof InterruptedException) Thread.currentThread().interrupt();
             throw failed();
         }
     }
-    private static Map<String, Object> readResponseObject(HttpResponse<InputStream> response, long deadline)
+    private static Map<String, Object> readResponseObject(HttpResponse<InputStream> response, long deadline, boolean signed)
             throws java.io.IOException {
         try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
-            requireSuccessfulResponse(response.statusCode());
+            requireSuccessfulResponse(response.statusCode(), signed);
             byte[] bytes = input.readNBytes(MAX_BYTES + 1);
             if (bytes.length > MAX_BYTES || System.nanoTime() >= deadline) throw failed();
             Object value = JsonReader.parse(new String(bytes, StandardCharsets.UTF_8));
@@ -185,29 +185,17 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
 
     @Override public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
             Map<String, Object> context, AiProviderClient.Output output) {
-        if (signer == null) return proposeOnce(settings, messages, context, output, null);
+        if (signer == null) return proposeOnce(settings, messages, context, output);
         if (!managedConcurrency.tryAcquire()) throw AiProviderService.error(ControlError.AI_OVERLOADED);
-        long started = System.nanoTime();
-        var usage = new TokenUsage();
-        String outcome = "stream-completed";
         try {
-            return proposeOnce(settings, messages, context, output, usage);
-        } catch (TapstateException error) {
-            outcome = error.code().code();
-            throw error;
-        } catch (RuntimeException error) {
-            outcome = "interrupted";
-            throw error;
+            return proposeOnce(settings, messages, context, output);
         } finally {
             managedConcurrency.release();
-            LOG.log(System.Logger.Level.INFO, "Managed AI model={0} outcome={1} elapsedMs={2} inputTokens={3} outputTokens={4}",
-                    settings.model(), outcome, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
-                    usage.input, usage.output);
         }
     }
 
     private Optional<Map<String, Object>> proposeOnce(AiProviderSettings settings, List<Map<String, String>> messages,
-            Map<String, Object> context, AiProviderClient.Output output, TokenUsage usage) {
+            Map<String, Object> context, AiProviderClient.Output output) {
         boolean proposalEnabled = !Boolean.FALSE.equals(context.get("proposalEnabled"));
         List<Map<String, String>> prompt = new ArrayList<>();
         String guidance = guidance(proposalEnabled, context);
@@ -236,9 +224,9 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                     JSON_FUNCTION, Map.of("name", "propose_pipeline")));
         }
         Map<String, Object> body = Map.copyOf(requestBody);
-        if (signer != null) return read(settings, body, output, proposalEnabled, usage);
+        if (signer != null) return read(settings, body, output, proposalEnabled);
         var safeOutput = new RedactedOutput(settings.apiKey(), output);
-        Optional<Map<String, Object>> candidate = read(settings, body, safeOutput, proposalEnabled, null);
+        Optional<Map<String, Object>> candidate = read(settings, body, safeOutput, proposalEnabled);
         if (candidate.stream().anyMatch(value -> containsSecret(value, settings.apiKey()))) throw invalid();
         safeOutput.finish();
         return candidate;
@@ -459,17 +447,17 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
 
     private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, AiProviderClient.Output text,
-            boolean proposalEnabled, TokenUsage usage) {
+            boolean proposalEnabled) {
         try {
-            for (int attempt = 0; attempt < STREAM_ATTEMPTS; attempt++) {
-                boolean canRetry = attempt < STREAM_ATTEMPTS - 1;
+            for (int attempt = 1; attempt <= STREAM_ATTEMPTS; attempt++) {
                 var output = new StreamingOutput(text);
                 try {
-                    return readStreamAttempt(settings, body, output, proposalEnabled, usage, canRetry);
+                    return readStreamAttempt(settings, body, output, proposalEnabled, attempt);
                 } catch (RetryableStreamException error) {
                     if (output.emitted) throw failed();
-                    if (!canRetry) return readAfterStreamRetries(settings, body, text, proposalEnabled);
+                    if (attempt == STREAM_ATTEMPTS) return readAfterStreamRetries(settings, body, text, proposalEnabled);
                     LOG.log(System.Logger.Level.WARNING, "Retrying AI provider before any output was returned");
+                    error.backoff();
                 }
             }
         } catch (java.io.IOException | InterruptedException error) {
@@ -489,21 +477,65 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
 
     private Optional<Map<String, Object>> readStreamAttempt(AiProviderSettings settings, Map<String, Object> body,
-            AiProviderClient.Output output, boolean proposalEnabled, TokenUsage usage, boolean canRetry)
+            AiProviderClient.Output output, boolean proposalEnabled, int attempt)
             throws java.io.IOException, InterruptedException {
         long deadline = System.nanoTime() + responseTimeout.toNanos();
-        var response = send(settings, body);
+        if (signer == null) {
+            return readStreamResponse(send(settings, body), output, proposalEnabled, responses(settings), null, false, deadline);
+        }
+
+        // Local admission or signing failures have not invoked the model.
+        HttpRequest signedRequest = request(settings, body);
+        var usage = new TokenUsage();
+        long started = System.nanoTime();
+        String outcome = "stream-failed";
+        int httpStatus = 0;
+        try {
+            var response = http.send(signedRequest, HttpResponse.BodyHandlers.ofInputStream());
+            httpStatus = response.statusCode();
+            var candidate = readStreamResponse(response, output, proposalEnabled, responses(settings), usage,
+                    attempt < STREAM_ATTEMPTS, deadline);
+            outcome = "stream-completed";
+            return candidate;
+        } catch (RuntimeException failure) {
+            outcome = managedStreamFailure(failure);
+            throw failure;
+        } catch (InterruptedException failure) {
+            outcome = "interrupted";
+            throw failure;
+        } catch (java.io.IOException failure) {
+            outcome = "transport-failed";
+            throw failure;
+        } finally {
+            LOG.log(System.Logger.Level.INFO,
+                    "Managed AI model={0} outcome={1} elapsedMs={2} inputTokens={3} outputTokens={4} attempt={5} httpStatus={6}",
+                    settings.model(), outcome, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+                    usage.input, usage.output, attempt, httpStatus);
+        }
+    }
+
+    private static String managedStreamFailure(RuntimeException failure) {
+        return switch (failure) {
+            case RetryableStreamException retry -> retry.outcome();
+            case TapstateException error -> error.code().code();
+            case IllegalArgumentException ignored -> ControlError.AI_INVALID_PROPOSAL.code();
+            case ClassCastException ignored -> ControlError.AI_INVALID_PROPOSAL.code();
+            case java.io.UncheckedIOException ignored -> "transport-failed";
+            default -> "stream-failed";
+        };
+    }
+
+    private Optional<Map<String, Object>> readStreamResponse(HttpResponse<InputStream> response, AiProviderClient.Output output,
+            boolean proposalEnabled, boolean useResponses, TokenUsage usage, boolean retryHttp, long deadline)
+            throws java.io.IOException {
         try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
             int status = response.statusCode();
             if (status < 200 || status >= 300) {
                 LOG.log(System.Logger.Level.WARNING, "AI provider stream returned HTTP {0}", status);
             }
-            if (signer != null && canRetry && (status == 429 || status == 503)) {
-                Thread.sleep(250);
-                throw new RetryableStreamException();
-            }
-            requireSuccessfulResponse(status);
-            return responses(settings) ? readResponses(input, output, proposalEnabled)
+            if (retryHttp && (status == 429 || status == 503)) throw new RetryableStreamException(status);
+            requireSuccessfulResponse(status, signer != null);
+            return useResponses ? readResponses(input, output, proposalEnabled)
                     : readEvents(input, output, proposalEnabled, usage);
         }
     }
@@ -535,7 +567,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         try {
             var response = send(settings, fallback);
             try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
-                requireSuccessfulResponse(response.statusCode());
+                requireSuccessfulResponse(response.statusCode(), false);
                 byte[] bytes = input.readNBytes(MAX_BYTES + 1);
                 if (System.nanoTime() >= deadline) throw failed();
                 if (bytes.length > MAX_BYTES) throw failed();
@@ -653,8 +685,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         if (!(parsed instanceof Map<?, ?> map) || !(map.get("candidateWizard") instanceof Map<?, ?> result)) throw invalid();
         return object(result);
     }
-    private static void requireSuccessfulResponse(int status) {
-        if (status == 401 || status == 403) throw AiProviderService.error(ControlError.AI_PROVIDER_AUTH_FAILED);
+    private static void requireSuccessfulResponse(int status, boolean signed) {
+        if (status == 401 || status == 403) {
+            throw AiProviderService.error(signed ? ControlError.AI_MANAGED_PROVIDER_AUTH_FAILED : ControlError.AI_PROVIDER_AUTH_FAILED);
+        }
         if (status == 400 || status == 404 || status == 422) throw AiProviderService.error(ControlError.AI_PROVIDER_REQUEST_REJECTED);
         if (status == 429) throw AiProviderService.error(ControlError.AI_PROVIDER_RATE_LIMITED);
         if (status < 200 || status >= 300) throw failed();
@@ -675,7 +709,19 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
 
     private enum TextChannel { CONTENT, TOOL }
-    private static final class RetryableStreamException extends RuntimeException { }
+    private static final class RetryableStreamException extends RuntimeException {
+        private final int httpStatus;
+
+        private RetryableStreamException() { this(0); }
+
+        private RetryableStreamException(int httpStatus) { this.httpStatus = httpStatus; }
+
+        private String outcome() { return httpStatus == 0 ? "upstream-error" : "http-" + httpStatus; }
+
+        private void backoff() throws InterruptedException {
+            if (httpStatus != 0) Thread.sleep(250);
+        }
+    }
     private static Map<String, Object> object(Object value) {
         if (!(value instanceof Map<?, ?> source)) throw invalid();
         Map<String, Object> result = new java.util.LinkedHashMap<>();
@@ -821,9 +867,16 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         byte[] json = JsonWriter.write(body).getBytes(StandardCharsets.UTF_8);
         if (signer == null) request.header("Authorization", "Bearer " + settings.apiKey());
         else {
-            if (json.length > 128 * 1024) throw AiProviderService.error(ControlError.AI_PROVIDER_REQUEST_REJECTED);
+            if (json.length > 128 * 1024) throw AiProviderService.error(ControlError.AI_MANAGED_PROVIDER_INPUT_LIMIT);
             reserveManagedAttempt();
-            signer.sign(request, uri, json);
+            try {
+                signer.sign(request, uri, json);
+            } catch (TapstateException failure) {
+                if (failure.code() == ControlError.AI_PROVIDER_AUTH_FAILED) {
+                    throw AiProviderService.error(ControlError.AI_MANAGED_PROVIDER_AUTH_FAILED);
+                }
+                throw failure;
+            }
         }
         return request.POST(HttpRequest.BodyPublishers.ofByteArray(json)).build();
     }

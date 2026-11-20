@@ -155,6 +155,7 @@ class AiProviderController {
     ResponseEntity<Map<String, Object>> check(HttpServletRequest request, @RequestBody AiProviderSettings settings) {
         var workspace = workspace(request);
         String scope = workspace.owner();
+        authorizeSavedCredential(scope, settings, "ai-provider.check");
         if (!CHECK_CAPACITY.tryAcquire()) throw AiProviderService.error(ControlError.AI_OVERLOADED);
         try {
             client.check(service().resolve(scope, settings));
@@ -167,6 +168,7 @@ class AiProviderController {
     @Verb("ai-provider.models") @PostMapping("/ai-provider-settings:models")
     ResponseEntity<Map<String, Object>> models(HttpServletRequest request, @RequestBody AiProviderSettings settings) {
         var workspace = workspace(request);
+        authorizeSavedCredential(workspace.owner(), settings, "ai-provider.models");
         if (!CHECK_CAPACITY.tryAcquire()) throw AiProviderService.error(ControlError.AI_OVERLOADED);
         try {
             var models = client.models(service().resolveModels(workspace.owner(), settings));
@@ -176,6 +178,12 @@ class AiProviderController {
             CHECK_CAPACITY.release();
         }
     }
+    private void authorizeSavedCredential(String owner, AiProviderSettings settings, String operation) {
+        if ((settings.apiKey() == null || settings.apiKey().isBlank()) && requiresManager(owner)) {
+            requireManager(operation);
+        }
+    }
+
     record Workspace(String owner, Runnable requireActive) { }
     String owner(HttpServletRequest request) { return workspace(request).owner(); }
     Workspace workspace(HttpServletRequest request) {

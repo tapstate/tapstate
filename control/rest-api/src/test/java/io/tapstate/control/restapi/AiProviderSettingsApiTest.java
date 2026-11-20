@@ -206,6 +206,24 @@ class AiProviderSettingsApiTest {
             assertThat(controller.assistantRoute("workspace-a", byok).settings().apiKey()).isEqualTo("sk-workspace-a");
             controller.select(request, managedSelection);
             assertThat(controller.assistantRoute("workspace-a", byok).settings().apiKey()).isNull();
+            var probe = new AiProviderSettings("openai-compatible", null, "saved-model", null);
+            SecurityContextHolder.getContext().setAuthentication(new TapstateAuthentication(
+                    TapstatePrincipal.cloudSession(new VerifiedToken("member", Scope.WRITE))));
+            org.assertj.core.api.SoftAssertions.assertSoftly(softly -> {
+                softly.assertThatThrownBy(() -> controller.check(request, probe))
+                        .isInstanceOfSatisfying(TapstateException.class, error ->
+                                assertThat(error.code()).isEqualTo(ControlError.FORBIDDEN));
+                softly.assertThatThrownBy(() -> controller.models(request, probe))
+                        .isInstanceOfSatisfying(TapstateException.class, error ->
+                                assertThat(error.code()).isEqualTo(ControlError.FORBIDDEN));
+            });
+            assertThat(controller.check(request,
+                    new AiProviderSettings("openai-compatible", null, "probe-model", "ephemeral-test-key")))
+                    .isNotNull();
+            SecurityContextHolder.getContext().setAuthentication(new TapstateAuthentication(
+                    TapstatePrincipal.cloudSession(new VerifiedToken("manager", Scope.WRITE))));
+            assertThat(controller.check(request, probe)).isNotNull();
+            assertThat(controller.models(request, probe)).isNotNull();
             assertThat(controller.get(request).getBody()).containsEntry("byokConfigured", true)
                     .containsEntry("mode", "managed").doesNotContainKey("apiKey");
             assertThat(controller.get(request).getBody().toString()).doesNotContain("sk-workspace-a");

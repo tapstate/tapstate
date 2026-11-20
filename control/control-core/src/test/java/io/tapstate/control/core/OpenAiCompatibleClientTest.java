@@ -156,6 +156,51 @@ class OpenAiCompatibleClientTest {
         }
     }
 
+    @Test void managedLogsEachModelAttemptAndDoesNotCarryUsageAcrossRetries() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            String transientError = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3}}\n\n"
+                    + "data: {\"error\":{\"type\":\"upstream_error\"}}\n\n";
+            String success = chunk(Map.of("content", "Recovered."), "stop") + "data: [DONE]\n\n";
+            byte[] response = (requests.incrementAndGet() == 1 ? transientError : success)
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            try (var output = exchange.getResponseBody()) { output.write(response); }
+        });
+        String model = "test-kimi-attempt-telemetry";
+        var attempts = new java.util.concurrent.CopyOnWriteArrayList<List<Object>>();
+        Logger logger = Logger.getLogger(OpenAiCompatibleClient.class.getName());
+        var handler = new java.util.logging.Handler() {
+            @Override public void publish(LogRecord record) {
+                Object[] values = record.getParameters();
+                if (record.getMessage().startsWith("Managed AI model=") && values != null && model.equals(values[0])) {
+                    attempts.add(List.of(values[1], values[3], values[4], values[5], values[6]));
+                }
+            }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        logger.addHandler(handler);
+        server.start();
+        try {
+            var endpoint = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            var provider = new OpenAiCompatibleClient(ignored -> endpoint, Duration.ofSeconds(5),
+                    (request, uri, body) -> { }, 5);
+            var settings = new AiProviderSettings("bedrock-managed", endpoint.toString(), model, null);
+            var text = new StringBuilder();
+            assertThat(provider.propose(settings, List.of(), Map.of("proposalEnabled", false), text::append)).isEmpty();
+            assertThat(text).hasToString("Recovered.");
+            assertThat(requests).hasValue(2);
+            assertThat(attempts).containsExactly(List.of("upstream-error", 17L, 3L, 1, 200),
+                    List.of("stream-completed", -1L, -1L, 2, 200));
+        } finally {
+            logger.removeHandler(handler);
+            server.stop(0);
+        }
+    }
+
     @Test void managedRefusesIncompleteResponsesAndRejectsOversizedRequestsBeforeSigning() throws Exception {
         String limited = chunk(Map.of("content", "Partial"), "length") + "data: [DONE]\n\n";
         withServer(200, limited, settings -> {
@@ -167,11 +212,28 @@ class OpenAiCompatibleClientTest {
             assertThatThrownBy(() -> client.propose(settings, List.of(), context, discard))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL));
-            var tooLong = List.of(Map.of("role", "user", "content", "x".repeat(128 * 1024)));
+            var tooLong = List.of(Map.of("role", "user", "content", "中".repeat(48 * 1024)));
             assertThatThrownBy(() -> client.propose(settings, tooLong, context, discard))
                     .isInstanceOfSatisfying(TapstateException.class,
-                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_REQUEST_REJECTED));
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_MANAGED_PROVIDER_INPUT_LIMIT));
             assertThat(signed).hasValue(1);
+        });
+    }
+
+    @Test void managedReportsBedrockAuthorizationFailuresAndReleasesAdmissionWhenSigningFails() throws Exception {
+        withServer(403, "AWS rejected the request", settings -> {
+            AtomicInteger signed = new AtomicInteger();
+            var client = new OpenAiCompatibleClient(URI::create, Duration.ofSeconds(5), (request, uri, body) -> {
+                if (signed.incrementAndGet() <= 4) throw AiProviderService.error(ControlError.AI_PROVIDER_AUTH_FAILED);
+            }, 5);
+            Map<String, Object> context = Map.of("proposalEnabled", false);
+            java.util.function.Consumer<String> discard = ignored -> {};
+            for (int attempt = 1; attempt <= 5; attempt++) {
+                assertThatThrownBy(() -> client.propose(settings, List.of(), context, discard))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_MANAGED_PROVIDER_AUTH_FAILED));
+            }
+            assertThat(signed).hasValue(5);
         });
     }
 
