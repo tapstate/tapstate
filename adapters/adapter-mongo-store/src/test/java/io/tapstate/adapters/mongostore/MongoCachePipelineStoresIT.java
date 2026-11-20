@@ -2,8 +2,6 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
-import com.mongodb.MongoCommandException;
-import com.mongodb.ServerAddress;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
@@ -12,7 +10,6 @@ import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandFailedEvent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CasOutcome;
-import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.CacheAuthScope;
@@ -25,7 +22,6 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
-import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -47,12 +43,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.AdditionalAnswers.delegatesTo;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.spy;
 
 /** Explicit business and checkpoint fixtures witness load/write views, not controlled preparation. */
 @RequiresDocker
@@ -133,33 +123,6 @@ class MongoCachePipelineStoresIT {
             assertThat(states.compareAndSwap("orders", 1, "PAUSED", AT)).isInstanceOf(CasOutcome.Applied.class);
             observations.save(observation(PipelineState.PAUSED), 2);
             assertThat(observations.read("orders").orElseThrow().state()).isEqualTo(PipelineState.PAUSED);
-        });
-    }
-
-    @Test void readsExistingCheckpointWhenHostedCacheRejectsCollectionNameInFilter() {
-        withFixture(f -> {
-            var expected = CheckpointDoc.initial(SCOPE.pipelineId(), "NEW", AT);
-            assertThat(f.domain().pipelineStates(SCOPE).read(SCOPE.pipelineId())).contains(expected);
-            assertThat(MongoReadBudget.supportsSnapshotReads(f.admin())).isTrue();
-
-            var listing = spy(f.database().listCollections());
-            doAnswer(call -> {
-                var filter = call.<org.bson.conversions.Bson>getArgument(0)
-                        .toBsonDocument(Document.class, f.database().getCodecRegistry());
-                if (filter.get("name") instanceof BsonDocument operators && operators.containsKey("$in")) {
-                    throw new MongoCommandException(BsonDocument.parse("""
-                            {"ok": 0, "code": 8000, "codeName": "AtlasError", "errmsg": "unsupported type in filter"}
-                            """), new ServerAddress("localhost"));
-                }
-                return call.callRealMethod();
-            }).when(listing).filter(any());
-            var restricted = mock(MongoDatabase.class, delegatesTo(f.database()));
-            doReturn(listing).when(restricted).listCollections();
-
-            var reader = new MongoCacheWorkloadClaimStore(f.admin(), restricted, BUSINESS, ACTIVE);
-            var access = new MongoCachePipelineAccess(f.admin(), restricted, SCOPE, null, ACTIVE);
-            var states = new MongoCachePipelineStateStore(access, () -> reader.readCheckpoint(SCOPE));
-            assertThat(states.read(SCOPE.pipelineId())).contains(expected);
         });
     }
 

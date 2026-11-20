@@ -62,10 +62,10 @@ class IdlePipelineObservationIT {
                         .map(Document::parse)
                         .map(line -> line.getEmbedded(List.of("attr", "commandArgs"), Document.class))
                         .toList();
-                assertThat(cacheCommands).as("pipeline startup reads the CACHE checkpoint")
-                        .anyMatch(command -> "cache_identity".equals(command.get("aggregate"))
-                                && command.getList("pipeline", Document.class).stream().anyMatch(stage ->
-                                        stage.get("$lookup") instanceof Document lookup && "pipeline_state".equals(lookup.get("from"))));
+                assertThat(cacheCommands).as("pipeline startup reads the CACHE checkpoint in a transaction")
+                        .anyMatch(command -> "pipeline_state".equals(command.get("find"))
+                                && Boolean.FALSE.equals(command.get("autocommit"))
+                                && command.get("filter") instanceof Document filter && PIPELINE.equals(filter.get("_id")));
                 assertThat(cacheCommands).as("pipeline startup avoids the unsupported CACHE metadata filter")
                         .noneMatch(command -> command.containsKey("listCollections")
                                 && command.get("filter") instanceof Document filter

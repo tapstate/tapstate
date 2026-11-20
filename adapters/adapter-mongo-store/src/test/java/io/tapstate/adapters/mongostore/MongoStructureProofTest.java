@@ -48,13 +48,13 @@ class MongoStructureProofTest {
         assertThat(leases.stands(lease)).as("new proof must not revive the old lease").isFalse();
     }
 
-    @Test void aBlockedCheckpointAuditMustNotBlockWarmClaimProof() throws Exception {
+    @Test void aBlockedPipelineStateAuditMustNotBlockWarmClaimProof() throws Exception {
         var proof = new MongoStructureProof();
         var claims = proof.check(MongoStructureProof.Kind.CLAIMS, () -> {});
         claims.run();
         var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
-        var cold = proof.check(MongoStructureProof.Kind.CHECKPOINT_READ, () -> {
+        var cold = proof.check(MongoStructureProof.Kind.PIPELINE_STATE, () -> {
             entered.countDown();
             try {
                 if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("probe not released");
