@@ -421,9 +421,11 @@ final class ConvergenceDriver {
                 }
                 // The dispatcher may have removed the worker's slot before another thread evaluates this input.
                 // The original checkpoint still distinguishes completion from a RUNNING frame of the same claim.
-                BooleanSupplier alertCurrent = () -> admitted.getAsBoolean()
-                        && pass.state().read(pipelineId).filter(checkpoint::equals).isPresent()
-                        && admitted.getAsBoolean();
+                BooleanSupplier alertCurrent = () -> {
+                    if (!admitted.getAsBoolean()) return false;
+                    return pass.state().read(pipelineId).filter(checkpoint::equals).isPresent()
+                            && admitted.getAsBoolean();
+                };
                 alert(() -> scoped.alerts().publishedPeriodic(pass, published, alertCurrent));
                 sample(published, pass);
                 if (current.getAsBoolean()) {

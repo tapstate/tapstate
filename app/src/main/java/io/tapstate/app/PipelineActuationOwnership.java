@@ -1230,9 +1230,10 @@ final class PipelineActuationOwnership {
         Held state = held.get(expected.key().resourceId());
         WorkloadClaim local = state == null ? null : state.claim;
         WorkloadClaim claim = reading.get().claim();
-        return !closing && bound > 0 && checkedAt - askedAt < bound
-                && state != null && Objects.equals(state.scope, scope) && local != null && !state.executionAdvancing
-                && sameClaim(WorkloadClaimFence.from(local), expected, compareTopology)
+        if (closing || bound <= 0 || checkedAt - askedAt >= bound || state == null
+                || !Objects.equals(state.scope, scope) || local == null || state.executionAdvancing) return false;
+        // Recheck the mutable ownership facts after comparing the store and local claims.
+        return sameClaim(WorkloadClaimFence.from(local), expected, compareTopology)
                 && sameClaim(WorkloadClaimFence.from(claim), expected, compareTopology)
                 && held.get(expected.key().resourceId()) == state && state.claim == local && !state.executionAdvancing
                 && !closing && membership.businessEligible();
