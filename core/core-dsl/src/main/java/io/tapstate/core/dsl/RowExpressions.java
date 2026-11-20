@@ -254,6 +254,17 @@ public final class RowExpressions {
         return movedColumn(checked(result).getExpr());
     }
 
+    /** A pure read of the current image, suitable for tracking row identity. */
+    public static String movedAfterColumn(String expr) {
+        CelValidationResult result = VALUE.compile(expr);
+        if (result.hasError()) {
+            return null;
+        }
+        CelExpr root = checked(result).getExpr();
+        String column = movedColumn(root);
+        return column != null && root.select().operand().ident().name().equals(AFTER) ? column : null;
+    }
+
     private static String movedColumn(CelExpr root) {
         if (root.getKind() != CelExpr.ExprKind.Kind.SELECT || root.select().testOnly()) {
             return null;

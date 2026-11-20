@@ -113,6 +113,9 @@ actuation.parallelism-needs-a-key:
 actuation.stream-lands-two-ways:
   message: "Pipeline {pipeline} cannot start: rows of {stream} reach one sink both through nest {nest} and through {other}, and the two land them in different tables or on different keys."
   solution: "Send {stream} to that sink one way only, or give nest {nest} the same root key the other way lands {stream} on."
+actuation.sync-output-identity-unresolved:
+  message: "Pipeline {pipeline} cannot start: stream {stream} publishes no key, and this sync matches writes on one."
+  solution: "Publish every column of the source's key under any name - as the column itself, or as a pure read of it. A projection that drops or replaces any component leaves nothing for a later change to match, so the rows are written where nothing can find them again."
 actuation.connector-unavailable-on-member:
   message: "Pipeline {pipeline} was not started: member {member} cannot load connector {connector} ({reason})."
   solution: "Every member loads the connectors a pipeline writes through from the shared connector registry into its own plugins directory. Check that member's access to the store and that its plugins directory is writable, then start the pipeline again."
