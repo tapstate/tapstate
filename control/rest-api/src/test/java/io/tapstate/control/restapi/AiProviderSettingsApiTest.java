@@ -7,6 +7,7 @@ import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.CredentialAuthentication;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TapstatePrincipal;
@@ -156,6 +157,34 @@ class AiProviderSettingsApiTest {
         } finally {
             SecurityContextHolder.clearContext();
         }
+    }
+
+    @Test void onPremUsesAuthenticatedSharedProviderSettings() {
+        var values = new HashMap<String, AiProviderSettingsStore.Settings>();
+        AiProviderSettingsStore store = new AiProviderSettingsStore() {
+            public Optional<Settings> get(String owner) { return Optional.ofNullable(values.get(owner)); }
+            public void put(String owner, Settings settings) { values.put(owner, settings); }
+            public void delete(String owner) { values.remove(owner); }
+        };
+        var service = new AiProviderService(store, new AuditGate(record -> {}, Clock.fixed(NOW, ZoneOffset.UTC)));
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("mode", AuthenticationMode.ON_PREM);
+        beans.registerSingleton("service", service);
+        var controller = new AiProviderController(beans.getBeanProvider(AiProviderService.class),
+                beans.getBeanProvider(CloudAuthenticationService.class), beans.getBeanProvider(AuthenticationMode.class), null);
+        var request = new MockHttpServletRequest();
+        assertThatThrownBy(() -> controller.get(request)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+        var token = new VerifiedToken("local-user", Scope.WRITE);
+        SecurityContextHolder.getContext().setAuthentication(new TapstateAuthentication(
+                TapstatePrincipal.humanJwt(token), new CredentialAuthentication(token, Optional.empty(), Optional.empty(), () -> {})));
+        try {
+            controller.put(request, new AiProviderSettings("openai-compatible", null, "model", "private-key"));
+            assertThat(controller.get(request).getBody()).containsEntry("configured", true).doesNotContainKey("apiKey");
+            assertThat(values).containsKey("[\"on-prem\"]");
+            controller.delete(request);
+            assertThat(controller.get(request).getBody()).containsEntry("configured", false);
+        } finally { SecurityContextHolder.clearContext(); }
     }
 
     private static MockHttpServletRequest request(String jwtId, String secret) {
