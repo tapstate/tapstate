@@ -160,8 +160,16 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     @Override
     protected void init(Context context) {
-        var recorder = io.tapstate.runtime.engine.JobFailureRegistry.forProcessor(context.hazelcastInstance(), context);
-        failures = recorder == null ? null : recorder::record;
+        failures = null;
+        var member = context.hazelcastInstance();
+        if (member != null) {
+            Object recorder = member.getUserContext().get(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY);
+            if (recorder instanceof io.tapstate.core.lifecycle.ExecutionFailureRecorder bound) {
+                var jobConfig = context.jobConfig();
+                if (jobConfig != null) failures = bound.forProcessor(jobConfig.getName(), context.jobId(), context.executionId(),
+                        jobConfig.getArgument(io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT));
+            }
+        }
         try {
             initialize(context);
         } catch (RuntimeException | Error failure) {
@@ -229,7 +237,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         Object observer = context.hazelcastInstance().getUserContext().get(SourceInitialLoadObserver.USER_CONTEXT_KEY);
         if (observer instanceof SourceInitialLoadObserver receipt) {
             try {
-                receipt.started(context.hazelcastInstance(), context.jobConfig().getArgument(io.tapstate.runtime.engine.Engine.RUN_IDENTITY_ARGUMENT),
+                receipt.started(context.hazelcastInstance(), context.jobConfig().getArgument(io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT),
                         context.jobId(), context.executionId(), src, context.globalProcessorIndex(), initialMode, epoch);
                 initialObserver = receipt; observedJob = context.jobId(); observedExecution = context.executionId(); observedIndex = context.globalProcessorIndex();
             } catch (RuntimeException failedObservation) {

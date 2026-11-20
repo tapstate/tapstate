@@ -41,6 +41,27 @@ class ScopedJobFailureRegistryTest {
         assertThat(registry.existing("p", 1, "run-a").get()).containsSame(scoped);
     }
 
+    @Test void aLocalProviderNeverConsultsTheNamedFacadeWhenNoExecutionCanBeProved() {
+        var context = new java.util.concurrent.ConcurrentHashMap<String, Object>();
+        var member = (com.hazelcast.core.HazelcastInstance) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{com.hazelcast.core.HazelcastInstance.class},
+                (proxy, method, arguments) -> {
+                    if (method.getName().equals("getUserContext")) return context;
+                    throw new AssertionError("local startup must not call the named member facade: " + method.getName());
+                });
+        new Engine(member);
+        var bridge = (io.tapstate.core.lifecycle.ExecutionFailureRecorder) context
+                .get(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY);
+        var typed = new io.tapstate.core.common.TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
+                java.util.Map.of("pipeline", "p"), null);
+        bridge.forProcessor("p", 1, 2, "run-a").accept(typed);
+        bridge.forProcessor(null, 0, 0, null).accept(typed);
+        assertThat(JobFailureRegistry.of(member).fact("p")).isEmpty();
+        bridge.forExecution("legacy", 1, null).accept(typed);
+        assertThat(JobFailureRegistry.of(member).fact("legacy"))
+                .hasValueSatisfying(fact -> assertThat(fact.cause()).isSameAs(typed));
+    }
+
     @Test void anOldRecorderAndClearCannotOverwriteOrRemoveTheNewRunFailure() {
         var first = job(1, "run-a"); var next = job(2, "run-b"); var f = new EngineRunHandleTest.Fixture(first);
         var registry = JobFailureRegistry.of(f.member); var a = registry.attach("p", 1, "run-a");

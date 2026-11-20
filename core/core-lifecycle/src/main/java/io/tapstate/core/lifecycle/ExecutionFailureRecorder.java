@@ -11,4 +11,9 @@ public interface ExecutionFailureRecorder {
 
     /** Binds once to the submitted job and immutable execution identity; callbacks retain that binding. */
     Consumer<Throwable> forExecution(String pipelineId, long jobId, Serializable identity);
+
+    /** Existing providers keep their original binding; the engine can prove a local startup directly. */
+    default Consumer<Throwable> forProcessor(String pipelineId, long jobId, long executionId, Serializable identity) {
+        return forExecution(pipelineId, jobId, identity);
+    }
 }

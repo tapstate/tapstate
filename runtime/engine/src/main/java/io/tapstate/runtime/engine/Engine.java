@@ -94,8 +94,16 @@ public final class Engine {
         this.member = Objects.requireNonNull(member, "member");
         this.operatorStateStores = operatorStateStores;
         member.getUserContext().putIfAbsent(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY,
-                (io.tapstate.core.lifecycle.ExecutionFailureRecorder) (pipelineId, jobId, identity) ->
-                        JobFailureRegistry.of(member).forExecution(pipelineId, jobId, identity)::record);
+                new io.tapstate.core.lifecycle.ExecutionFailureRecorder() {
+                    @Override public java.util.function.Consumer<Throwable> forExecution(
+                            String pipelineId, long jobId, java.io.Serializable identity) {
+                        return JobFailureRegistry.of(member).forExecution(pipelineId, jobId, identity)::record;
+                    }
+                    @Override public java.util.function.Consumer<Throwable> forProcessor(
+                            String pipelineId, long jobId, long executionId, java.io.Serializable identity) {
+                        return JobFailureRegistry.of(member).forProcessor(pipelineId, jobId, executionId, identity)::record;
+                    }
+                });
     }
 
     /**

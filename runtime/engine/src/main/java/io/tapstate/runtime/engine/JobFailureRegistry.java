@@ -106,6 +106,13 @@ public final class JobFailureRegistry {
         return identity == null ? new Recorder(this, pipelineId, null) : attach(pipelineId, jobId, identity);
     }
 
+    Recorder forProcessor(String pipelineId, long jobId, long executionId, Serializable identity) {
+        if (pipelineId == null) return Recorder.NONE;
+        return identity == null ? new Recorder(this, pipelineId, null)
+                : attachLocal(new JetLiveExecution.Startup(pipelineId, jobId, executionId, identity,
+                        JetLiveExecution.StartupPhase.PROCESSOR));
+    }
+
     private Recorder attachLocal(JetLiveExecution.Startup startup) {
         var answer = new AtomicReference<>(Recorder.NONE);
         failures.compute(startup.pipelineId(), (id, before) -> observeLocalStartup(before, startup, answer));

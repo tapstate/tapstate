@@ -39,8 +39,9 @@ class PipelineListTest {
                 .containsExactly("orders", "Orders", "description", "cdc", 7L, "hash", true);
         assertThat(item.status().failure().code()).isEqualTo("TS0060027");
         assertThat(item.status().failure().params()).containsEntry("detail", "write refused");
-        assertThat(item.status().failure().message()).contains("\u8fde\u63a5\u5668", "write refused");
-        assertThat(item.status().failure().solution()).contains("\u68c0\u67e5\u76ee\u6807\u53ef\u8fbe\u6027");
+        assertThat(item.status().failure().message()).contains("\u8fde\u63a5\u5668", "mysql", "\u5411\u76ee\u6807\u7aef\u5199\u5165\u6570\u636e")
+                .doesNotContain("write refused");
+        assertThat(item.status().failure().solution()).contains("\u76ee\u6807\u7aef\u8fde\u63a5", "\u5199\u5165\u6743\u9650", "\u6280\u672f\u8be6\u60c5");
         assertThat(item.status().failure().diagnostic()).containsEntry("message", "captured runtime detail");
         assertThat(item.status().intentReadFailure().code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
         assertThat(item.status().intentReadFailure().message())
