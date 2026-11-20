@@ -110,7 +110,7 @@ class CloudConfigurationInitializationDiagnosticsTest {
             verifyNoInteractions(fixture.bridge());
             if (unbound) {
                 assertThat(logs.events.list).singleElement().satisfies(event ->
-                        assertThat(event.getFormattedMessage()).contains("io.store-unavailable", "MongoCommandException code=8000"));
+                        assertThat(event.getFormattedMessage()).contains("TS0480001", "MongoCommandException code=8000"));
             } else {
                 assertThat(logs.events.list).isEmpty();
             }
