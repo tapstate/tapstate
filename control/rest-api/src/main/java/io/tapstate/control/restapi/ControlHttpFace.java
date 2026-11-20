@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.AuthenticationMode;
+import io.tapstate.control.core.ConnectionTestReport;
 import io.tapstate.control.core.CurrentUserQueryService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.SourceDraft;
@@ -10,6 +11,7 @@ import io.tapstate.control.core.SourceTableView;
 import io.tapstate.control.core.SourceView;
 import io.tapstate.control.core.TokenAdminService;
 import io.tapstate.control.core.TokenService;
+import io.tapstate.control.core.ViewCatalogItem;
 import org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.beans.factory.ObjectProvider;
@@ -18,6 +20,7 @@ import org.springframework.context.annotation.Import;
 import tools.jackson.databind.DeserializationFeature;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * The public assembly entry point for the whole HTTP control face: the path-prefix configuration, Spring
@@ -79,7 +82,19 @@ public class ControlHttpFace {
                 .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
                 .addMixIn(SourceView.class, SourceScopeJson.class)
                 .addMixIn(SourceTableView.class, NonNullSourceJson.class)
-                .addMixIn(SourceDraft.SourceSrs.class, NonNullSourceJson.class);
+                .addMixIn(SourceDraft.SourceSrs.class, NonNullSourceJson.class)
+                .addMixIn(ConnectionTestReport.Check.class, ConnectionTestCheckJson.class)
+                .addMixIn(ViewCatalogItem.Freshness.class, ViewFreshnessJson.class);
+    }
+
+    private abstract static class ViewFreshnessJson {
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        abstract String aggregation();
+    }
+
+    private abstract static class ConnectionTestCheckJson {
+        @JsonInclude(JsonInclude.Include.NON_EMPTY)
+        abstract Map<String, Object> diagnostic();
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)

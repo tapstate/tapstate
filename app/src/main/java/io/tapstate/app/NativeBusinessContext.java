@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.control.core.*;
+import io.tapstate.control.restapi.OperationRequestMappingHandlerMapping;
 import io.tapstate.control.restapi.RuntimeHttpHandlers;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.model.*;
@@ -68,13 +69,19 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::preparePipeline, true);
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
+        var diagnosticCandidate = parent.getBeanProvider(IsolatedConnectionDiagnostics.class).getIfAvailable();
+        var resultStore = diagnosticCandidate == null ? port.connectionTestResults()
+                : isolatedConnectionTestResults(diagnosticCandidate);
+        if (diagnosticCandidate != null) {
+            beans.registerSingleton("activeConnectionDiagnostics", IsolatedConnectionDiagnostics.Active.INSTANCE);
+        }
         beans.registerSingleton("defaultSourceVerification", new DefaultSourceVerification(() -> {
             original.requireBusiness();
             var binding = configuration.bindings().load().orElseThrow(StorageRuntime::unavailable);
             if (!binding.equals(original.binding())) return Optional.empty();
             return configuration.artifacts().get(binding.defaultSourceId())
                     .filter(SourceResource.class::isInstance).map(SourceResource.class::cast);
-        }, port.connectionTestResults(), parent.getBean(Clock.class), original.binding().defaultSourceId(), () -> {
+        }, resultStore, parent.getBean(Clock.class), original.binding().defaultSourceId(), () -> {
             var fence = context.getBean(NodeSessionLease.class).currentFence().orElseThrow(StorageRuntime::unavailable);
             return new DefaultSourceVerification.Execution(fence.owner(), fence.claimGeneration());
         }, execution -> port.workloadClaims().read(new WorkloadClaimKey(original.preparation().businessScope().clusterId(),
@@ -84,6 +91,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         result -> result.items().stream().anyMatch(item -> io.tapstate.adapters.pdk.ConnectorError.TEST_TIMEOUT.code().equals(item.connectorErrorCode())),
         Duration.ofSeconds(60)));
         var overrides = new LinkedHashMap<String,Object>();
+        if (diagnosticCandidate != null) overrides.put("connectionTestResultStore", resultStore);
         overrides.put("tokenStore", configuration.tokens());
         overrides.put("aiProviderSettingsStore", configuration.aiProviderSettings());
         var providerClient = parent.getBeanProvider(AiProviderClient.class).getIfAvailable();
@@ -119,6 +127,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         original.requireBusiness(); active.set(true);
         context.getBean(NativeValidationScheduler.class).start();
 
+    }
+
+    private io.tapstate.spi.store.ConnectionTestResultStore isolatedConnectionTestResults(IsolatedConnectionDiagnostics candidate) {
+        if (!candidate.matches(original.binding())) throw StorageRuntime.unavailable();
+        return original.cache().isolatedDiagnosticResults(original.preparation().businessScope(), original::requireBusiness);
     }
 
     @Override public void afterInitialReady() {
@@ -739,7 +752,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return owner.payloadCleanup;
         }
         @Bean RequestMappingHandlerMapping runtimeRequestMappingHandlerMapping() {
-            var mapping = new RequestMappingHandlerMapping(); mapping.setOrder(0);
+            var mapping = new OperationRequestMappingHandlerMapping(); mapping.setOrder(0);
             mapping.setPathPrefixes(Map.of("/api", HandlerTypePredicate.forAnnotation(org.springframework.web.bind.annotation.RestController.class)));
             return mapping;
         }

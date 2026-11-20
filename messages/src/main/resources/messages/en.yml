@@ -113,6 +113,9 @@ actuation.parallelism-needs-a-key:
 actuation.stream-lands-two-ways:
   message: "Pipeline {pipeline} cannot start: rows of {stream} reach one sink both through nest {nest} and through {other}, and the two land them in different tables or on different keys."
   solution: "Send {stream} to that sink one way only, or give nest {nest} the same root key the other way lands {stream} on."
+actuation.sync-output-identity-unresolved:
+  message: "Pipeline {pipeline} cannot start: stream {stream} publishes no key, and this sync matches writes on one."
+  solution: "Publish every column of the source's key under any name - as the column itself, or as a pure read of it. A projection that drops or replaces any component leaves nothing for a later change to match, so the rows are written where nothing can find them again."
 actuation.connector-unavailable-on-member:
   message: "Pipeline {pipeline} was not started: member {member} cannot load connector {connector} ({reason})."
   solution: "Every member loads the connectors a pipeline writes through from the shared connector registry into its own plugins directory. Check that member's access to the store and that its plugins directory is writable, then start the pipeline again."
@@ -1366,6 +1369,8 @@ control.ai-not-configured:
   message: "Configure an AI provider in the Pipeline Builder before requesting a proposal."
 control.ai-provider-failed:
   message: "The AI provider request failed. Check the provider settings and try again."
+control.ai-provider-output-limit:
+  message: "The AI provider reached the output token limit before completing the request."
 control.ai-invalid-proposal:
   message: "The AI response did not contain a complete valid Pipeline proposal."
 control.ai-overloaded:
@@ -1436,3 +1441,10 @@ io.store-quota-exceeded:
   solution: "Ask the storage administrator to restore capacity, then query the original operation. Do not delete initialized storage or repeat setup."
 control.storage-quota-exceeded:
   message: "Initialization cannot complete because the storage endpoint has reached its space quota. Restore capacity and check the original operation; do not submit setup again."
+
+control.ai-provider-request-rejected:
+  message: "The AI provider rejected the model or request protocol."
+  solution: "Check the model ID and API protocol. For current OpenAI models, select Responses API."
+control.ai-provider-rate-limited:
+  message: "The AI provider rate or quota limit was reached."
+  solution: "Check the provider quota and billing, or retry later."

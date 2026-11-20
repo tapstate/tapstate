@@ -22,6 +22,16 @@ import org.junit.jupiter.api.Test;
  */
 class RowExpressionTypedCheckTest {
 
+    @Test
+    void orderingRejectsStaticallyNullOperandsButEqualityStillAcceptsThem() {
+        for (String expression : List.of("null > 25", "25 < null", "after.amount <= null")) {
+            assertThat(RowExpressions.predicateError(expression)).as(expression).isNotNull();
+            assertThat(RowExpressions.typedPredicateError(expression, columns())).as(expression).isNotNull();
+        }
+        assertThat(RowExpressions.typedPredicateError("after.amount > 25", columns())).isNull();
+        assertThat(RowExpressions.typedPredicateError("after.amount == null", columns())).isNull();
+    }
+
     private static Map<String, TapstateType> columns() {
         Map<String, TapstateType> types = new LinkedHashMap<>();
         types.put("id", TapstateType.INT64);
@@ -95,9 +105,42 @@ class RowExpressionTypedCheckTest {
     }
 
     @Test
-    @DisplayName("comparing an exact fixed-point column is refused too, not only arithmetic")
-    void decimalComparisonIsRefused() {
-        assertThat(RowExpressions.typedPredicateError("after.amount > 0", columns())).isNotNull();
+    @DisplayName("an exact fixed-point column supports comparison operations with integers, doubles, and decimals")
+    void decimalComparisonIsAccepted() {
+        Map<String, TapstateType> columns = Map.of(
+                "amount", TapstateType.DECIMAL,
+                "target", TapstateType.DECIMAL,
+                "limit", TapstateType.INT64,
+                "ratio", TapstateType.DOUBLE);
+
+        for (String op : List.of(">", ">=", "<", "<=", "==", "!=")) {
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " 0", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " 25", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("25 " + op + " after.amount", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " 25.5", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("25.5 " + op + " after.amount", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.target", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.limit", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.limit " + op + " after.amount", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.ratio", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.ratio " + op + " after.amount", columns)).isNull();
+        }
+    }
+
+    @Test
+    void theExactLiteralRangeIsCheckedOnlyForTypedDecimalOperands() {
+        String predicate = "after.amount < 1e999999999999999999999";
+        assertThat(RowExpressions.predicateError(predicate)).isNull();
+        assertThat(RowExpressions.typedPredicateError(predicate, Map.of("amount", TapstateType.DOUBLE))).isNull();
+        assertThat(RowExpressions.typedPredicateError(predicate, columns()))
+                .isEqualTo(DecimalComparisonFunctions.EXACT_LITERAL_RANGE);
+    }
+
+    @Test
+    @DisplayName("temporal opaque types refuse numerical comparisons")
+    void temporalComparisonIsRefused() {
+        Map<String, TapstateType> temporal = Map.of("d", TapstateType.DATE);
+        assertThat(RowExpressions.typedPredicateError("after.d > 0", temporal)).isNotNull();
     }
 
     @Test

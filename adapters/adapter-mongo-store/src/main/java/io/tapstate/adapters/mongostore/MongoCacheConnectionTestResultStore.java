@@ -15,8 +15,48 @@ import java.util.Optional;
 /** Latest diagnostics in one original CACHE scope; diagnostic presence never grants setup authority. */
 final class MongoCacheConnectionTestResultStore implements ConnectionTestResultStore {
     private final MongoCacheMetadataAccess access;
-    MongoCacheConnectionTestResultStore(MongoCacheMetadataAccess access) { this.access = access; }
+    private final boolean extendedWrites;
+
+    MongoCacheConnectionTestResultStore(MongoCacheMetadataAccess access) { this(access, false); }
+
+    MongoCacheConnectionTestResultStore(MongoCacheMetadataAccess access, boolean extendedWrites) {
+        this.access = access;
+        this.extendedWrites = extendedWrites;
+    }
+
+    @Override public Publication beginOrdinaryTest(String connectionId) {
+        if (!extendedWrites) return ConnectionTestResultStore.super.beginOrdinaryTest(connectionId);
+        Document key = new Document("_id", connectionId);
+        Document baseline = access.read(session -> access.collection.find(session, key).first());
+        requireOrdinaryScope(baseline, connectionId);
+        return result -> {
+            if (!connectionId.equals(result.connectionId())) throw new IllegalArgumentException("test result identity changed");
+            var report = MongoConnectionDiagnostic.fit(result, ignored -> true);
+            var captured = access.stamp(MongoConnectionTestResultStore.compatibleCacheDocument(report));
+            return access.write(session -> {
+                var current = access.collection.find(session, key).first();
+                requireOrdinaryScope(current, connectionId);
+                // A completed test still returns its own result; a changed row belongs to another publication.
+                if (Objects.equals(baseline, current)) {
+                    access.collection.replaceOne(session, key, captured, new ReplaceOptions().upsert(true));
+                }
+                return report;
+            });
+        };
+    }
+
+    private void requireOrdinaryScope(Document row, String id) {
+        if (row == null) return;
+        if (!access.inScope(row, id)) throw MongoCacheMetadataAccess.unreadable(id, "cache-scope");
+        if (row.containsKey("formatVersion")) throw MongoCacheMetadataAccess.unreadable(id, "attempt");
+        try {
+            MongoConnectionTestResultStore.strictCacheResult(access.payload(row));
+        } catch (TapstateException | NullPointerException | ClassCastException | IllegalArgumentException invalid) {
+            throw MongoCacheMetadataAccess.unreadable(id, "result");
+        }
+    }
     @Override public void save(ConnectionTestResult result) {
+        if (extendedWrites) throw new IllegalStateException("extended connection results require a captured baseline");
         Document captured = access.stamp(MongoConnectionTestResultStore.toDocument(Objects.requireNonNull(result, "result")));
         access.write(session -> {
             Document previous = access.collection.find(session, new Document("_id", result.connectionId())).first();
@@ -35,9 +75,7 @@ final class MongoCacheConnectionTestResultStore implements ConnectionTestResultS
                 return Optional.ofNullable(attempt.report());
             }
             try {
-                Document payload = access.payload(row); var result = MongoConnectionTestResultStore.toResult(payload);
-                if (!payload.equals(MongoConnectionTestResultStore.toDocument(result))) throw MongoCacheMetadataAccess.unreadable(connectionId, "result");
-                return Optional.of(result);
+                return Optional.of(MongoConnectionTestResultStore.strictCacheResult(access.payload(row)));
             } catch (TapstateException | NullPointerException | ClassCastException | IllegalArgumentException invalid) {
                 throw MongoCacheMetadataAccess.unreadable(connectionId, "result");
             }
@@ -56,7 +94,28 @@ final class MongoCacheConnectionTestResultStore implements ConnectionTestResultS
     @Override public boolean finishDefaultAttempt(DefaultSourceTestAttempt value, boolean controlledTimeout) {
         if (value.state() == DefaultSourceTestAttempt.State.CHECKING) throw new IllegalArgumentException("terminal attempt required");
         if (controlledTimeout && value.state() != DefaultSourceTestAttempt.State.FAILED) throw new IllegalArgumentException("invalid timeout terminal");
-        Document captured = bounded(value);
+        Document captured = bounded(value, false);
+        return finish(value, controlledTimeout, captured);
+    }
+
+    @Override public Optional<ConnectionTestResult> publishDefaultReport(DefaultSourceTestAttempt value, boolean controlledTimeout) {
+        if (!extendedWrites) return ConnectionTestResultStore.super.publishDefaultReport(value, controlledTimeout);
+        if (value.report() == null || value.state() == DefaultSourceTestAttempt.State.CHECKING
+                || (controlledTimeout && value.state() != DefaultSourceTestAttempt.State.FAILED)) {
+            throw new IllegalArgumentException("invalid report terminal");
+        }
+        ConnectionTestResult report = MongoConnectionDiagnostic.fit(value.report(), candidate ->
+                MongoConnectionDiagnostic.bsonSize(access.stamp(document(withReport(value, candidate), true))) <= 1024 * 1024);
+        var terminal = withReport(value, report);
+        return finish(terminal, controlledTimeout, bounded(terminal, true)) ? Optional.of(report) : Optional.empty();
+    }
+
+    private static DefaultSourceTestAttempt withReport(DefaultSourceTestAttempt source, ConnectionTestResult report) {
+        return new DefaultSourceTestAttempt(source.connectionId(), source.connectorId(), source.sourceHash(), source.attemptId(),
+                source.owner(), source.sessionGeneration(), source.acceptedAt(), source.deadlineAt(), source.state(), source.finishedAt(), report);
+    }
+
+    private boolean finish(DefaultSourceTestAttempt value, boolean controlledTimeout, Document captured) {
         return access.write(session -> {
             Document filter = new Document("_id", value.connectionId()).append("formatVersion", 2)
                     .append("sourceHash", value.sourceHash()).append("attemptId", value.attemptId()).append("state", "CHECKING")
@@ -77,24 +136,30 @@ final class MongoCacheConnectionTestResultStore implements ConnectionTestResultS
         });
     }
     private Document bounded(DefaultSourceTestAttempt value) {
-        Document captured = access.stamp(document(value));
+        return bounded(value, false);
+    }
+    private Document bounded(DefaultSourceTestAttempt value, boolean includeDiagnostics) {
+        Document captured = access.stamp(document(value, includeDiagnostics));
         requireBounded(captured, value.connectionId());
         return captured;
     }
     static void requireBounded(Document row, String id) {
-        try (var output = new org.bson.io.BasicOutputBuffer(); var writer = new org.bson.BsonBinaryWriter(output)) {
-            new org.bson.codecs.DocumentCodec().encode(writer, row, org.bson.codecs.EncoderContext.builder().build());
-            if (output.getSize() > 1024 * 1024)
-                throw new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
-        }
+        if (MongoConnectionDiagnostic.bsonSize(row) > 1024 * 1024)
+            throw new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
     }
     static Document document(DefaultSourceTestAttempt value) {
+        return document(value, false);
+    }
+    private static Document document(DefaultSourceTestAttempt value, boolean includeDiagnostics) {
+        var report = value.report();
         return new Document("_id", value.connectionId()).append("formatVersion", 2).append("connectorId", value.connectorId())
                 .append("sourceHash", value.sourceHash()).append("attemptId", value.attemptId())
                 .append("nodeId", value.owner().nodeId()).append("bootId", value.owner().bootId())
                 .append("sessionGeneration", value.sessionGeneration()).append("acceptedAt", value.acceptedAt())
                 .append("deadlineAt", value.deadlineAt()).append("state", value.state().name()).append("finishedAt", value.finishedAt())
-                .append("report", value.report() == null ? null : MongoConnectionTestResultStore.toDocument(value.report()));
+                .append("report", report == null ? null : includeDiagnostics
+                        ? MongoConnectionTestResultStore.compatibleCacheDocument(report)
+                        : MongoConnectionTestResultStore.toDocument(report));
     }
     static DefaultSourceTestAttempt attempt(Document row) {
         String id = String.valueOf(row.get("_id"));
@@ -104,8 +169,8 @@ final class MongoCacheConnectionTestResultStore implements ConnectionTestResultS
                     row.getString("attemptId"), new WorkloadOwner(row.getString("nodeId"), row.getString("bootId")),
                     row.getLong("sessionGeneration"), row.getLong("acceptedAt"), row.getLong("deadlineAt"),
                     DefaultSourceTestAttempt.State.valueOf(row.getString("state")), row.getLong("finishedAt"),
-                    row.get("report") == null ? null : MongoConnectionTestResultStore.toResult(row.get("report", Document.class)));
-            if (!row.equals(document(value))) throw new IllegalArgumentException("noncanonical attempt");
+                    row.get("report") == null ? null : MongoConnectionTestResultStore.strictCacheResult(row.get("report", Document.class)));
+            if (!row.equals(document(value, true))) throw new IllegalArgumentException("noncanonical attempt");
             return value;
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) {
             throw MongoCacheMetadataAccess.unreadable(id, "attempt");
