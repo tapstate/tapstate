@@ -93,12 +93,12 @@ class AlertManagementStartupTest {
 
         Startup() throws Exception {
             var store = mock(AlertStore.class);
-            when(store.evaluationRules(any(), anyInt())).thenAnswer(call -> {
+            when(store.evaluationSnapshot(any(), anyInt())).thenAnswer(call -> {
                 entered.countDown();
                 if (!release.await(10, TimeUnit.SECONDS)) throw new AssertionError("initial read was not released");
-                return new AlertStore.DefinitionPage(List.of(), null);
+                return new AlertStore.EvaluationSnapshot(
+                        new AlertStore.DefinitionPage(List.of(), null), new AlertStore.EvaluationPage(List.of(), null));
             });
-            when(store.evaluationStates(any(), anyInt())).thenReturn(new AlertStore.EvaluationPage(List.of(), null));
             services = new PipelineAlertRuntime.Services(store, mock(AlertEvaluationHost.class));
             runtime = new PipelineAlertRuntime(() -> { opens.incrementAndGet(); return services; },
                     mock(PipelineIntentStore.class), (scope, claim) -> Optional.empty(), () -> {

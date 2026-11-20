@@ -28,13 +28,23 @@ final class MongoAlertNodeLifecycleStore implements AlertNodeLifecycleStore {
         this.domain=domain;this.db=db;this.keys=keys;this.bindings=bindings;this.scope=scope;this.setup=setup;this.active=active;
         if(!scope.clusterId().equals(setup.clusterId()))throw invalid("scope");
     }
-    private <T>T tx(Function<ClientSession,T> action) {
+    private <T>T tx(Function<ClientSession,T> action){return tx(true,action);}
+    private <T>T tx(boolean write,Function<ClientSession,T> action) {
         active.run();
         var verifiedSchema=domain.currentAlertSchema();
         return domain.alertTransaction(new MongoReadBudget(Duration.ofSeconds(10)),session->{
-            active.run();currentHost(session,true);T result=action.apply(session);
+            active.run();if(write)currentHost(session,true);else admittedHost(session);T result=action.apply(session);
             domain.requireVerifiedAlertSchema(verifiedSchema);active.run();return result;
         });
+    }
+    private void admittedHost(ClientSession session){
+        var facts=bindings.admittedAlertHost(session);
+        if(facts==null){domain.alertReadKeyId(session);currentHost(session,true);return;}
+        var binding=facts.binding();
+        if(!MongoAlertHostIdentity.current(facts.setup(),setup,binding))throw unreadable("host-installation");
+        if(!setup.equals(binding.setup())||binding.mode()==StorageBinding.Mode.OP&&!scope.authorityId().equals(setup.installationId()))throw unreadable("host-binding");
+        if(facts.schema()==null)throw unreadable("schema-capability");
+        domain.requireVerifiedAlertSchema(MongoAlertStorageSchema.verifyAuthorityState(facts.schema(),facts.version(),scope.clusterId(),domain.alertReadKeyId(facts.key())));
     }
     private CacheAuthScope currentHost(ClientSession session) {
         return currentHost(session,false);
@@ -47,6 +57,7 @@ final class MongoAlertNodeLifecycleStore implements AlertNodeLifecycleStore {
         var prepared=bindings.cachePreparationForTransaction(session).orElseThrow(()->unreadable("cache-preparation"));
         var schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
         var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first();
+        if(schema==null)throw unreadable("schema-capability");
         var marker=MongoAlertStorageSchema.verifyAuthorityState(schema,version,scope.clusterId(),keys.currentForWrite().activeKeyId());
         if(verifySchema)domain.requireVerifiedAlertSchema(marker);
         return prepared.authScope();
@@ -100,8 +111,8 @@ final class MongoAlertNodeLifecycleStore implements AlertNodeLifecycleStore {
             local.run();return after;
         });
     }
-    @Override public Optional<Row> read(Key key){requireScope(key);return tx(session->load(session,key));}
-    @Override public List<Row> list(){return tx(session->list(session));}
+    @Override public Optional<Row> read(Key key){requireScope(key);return tx(false,session->load(session,key));}
+    @Override public List<Row> list(){return tx(false,session->list(session));}
     List<Row> list(ClientSession session) {
         var values=new ArrayList<Row>();
         try(var cursor=SystemCollections.ALERT_NODE_LIFECYCLES.on(db).find(session,scopeFilter()).batchSize(1).limit(MAX_ROWS+1).iterator()) {
