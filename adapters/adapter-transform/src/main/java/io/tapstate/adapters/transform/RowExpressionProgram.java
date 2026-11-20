@@ -9,6 +9,7 @@ import dev.cel.runtime.CelFunctionBinding;
 import dev.cel.runtime.CelLateFunctionBindings;
 import dev.cel.runtime.CelRuntime;
 import dev.cel.runtime.CelRuntimeFactory;
+import io.tapstate.core.dsl.DecimalComparisonFunctions;
 import io.tapstate.core.dsl.RowClock;
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.event.ConvertedValue;
@@ -22,6 +23,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.IntPredicate;
 import java.util.function.UnaryOperator;
@@ -41,9 +43,11 @@ import java.util.function.UnaryOperator;
  */
 final class RowExpressionProgram {
 
-    // A standard runtime plus the same-type temporal orderings the compiler declares. It is immutable and
-    // shared: building the per-expression program is the only per-instance cost.
-    private static final CelRuntime RUNTIME = CelRuntimeFactory.standardCelRuntimeBuilder()
+    // A runtime with exact decimal comparisons, the same-type temporal orderings and the calendar functions
+    // the compiler declares. It is immutable and shared: building the per-expression program is the only
+    // per-instance cost.
+    private static final CelRuntime RUNTIME = DecimalComparisonFunctions.configureRuntime(
+                    CelRuntimeFactory.standardCelRuntimeBuilder())
             .addFunctionBindings(sameTypeOrderings())
             .addFunctionBindings(calendarArithmetic())
             .build();
@@ -67,17 +71,19 @@ final class RowExpressionProgram {
 
     /**
      * The functions that read the clock, bound for one evaluation at the instant it was read, so every clock
-     * call in one expression sees the same moment.
+     * call in one expression sees the same moment, beside the expression's own late-bound decimal
+     * comparisons.
      */
-    private static CelLateFunctionBindings clockAt(Instant now) {
+    private static CelLateFunctionBindings clockAt(Instant now, List<CelFunctionBinding> others) {
         Timestamp timestamp = Timestamp.newBuilder()
                 .setSeconds(now.getEpochSecond())
                 .setNanos(now.getNano())
                 .build();
-        return CelLateFunctionBindings.from(
-                CelFunctionBinding.from(RowClock.NOW_OVERLOAD, List.of(), args -> timestamp),
-                CelFunctionBinding.from(RowClock.TODAY_OVERLOAD, String.class,
-                        zone -> calendar(() -> RowClock.today(now, zone))));
+        List<CelFunctionBinding> bindings = new ArrayList<>(others);
+        bindings.add(CelFunctionBinding.from(RowClock.NOW_OVERLOAD, List.of(), args -> timestamp));
+        bindings.add(CelFunctionBinding.from(RowClock.TODAY_OVERLOAD, String.class,
+                zone -> calendar(() -> RowClock.today(now, zone))));
+        return CelLateFunctionBindings.from(bindings);
     }
 
     private static Object calendar(java.util.function.Supplier<Object> computation) throws CelEvaluationException {
@@ -133,13 +139,17 @@ final class RowExpressionProgram {
     }
 
     private final CelRuntime.Program program;
+    // The expression's own late-bound decimal comparisons, resolved beside the clock on each evaluation.
+    private final List<CelFunctionBinding> functions;
     // The source expression, kept so an evaluation failure can name the expression that failed.
     private final String expr;
     // What now() reads: the processing host's clock, replaced only by a test that has to hold time still.
     private final Clock clock;
 
-    private RowExpressionProgram(CelRuntime.Program program, String expr, Clock clock) {
+    private RowExpressionProgram(CelRuntime.Program program, List<CelFunctionBinding> functions, String expr,
+            Clock clock) {
         this.program = program;
+        this.functions = functions;
         this.expr = expr;
         this.clock = clock;
     }
@@ -166,7 +176,8 @@ final class RowExpressionProgram {
 
     private static RowExpressionProgram of(CelAbstractSyntaxTree ast, String expr, Clock clock) {
         try {
-            return new RowExpressionProgram(RUNTIME.createProgram(ast), expr, clock);
+            var prepared = DecimalComparisonFunctions.forRuntime(ast);
+            return new RowExpressionProgram(RUNTIME.createProgram(prepared.ast()), prepared.bindings(), expr, clock);
         } catch (CelEvaluationException e) {
             // A checked AST builds into a program; a failure here is an invariant violation, not a
             // user condition.
@@ -189,7 +200,8 @@ final class RowExpressionProgram {
         vars.put("after", bind(after));
         vars.put("schema", bind(event.schema()));
         try {
-            return unbound(program.eval(vars, clockAt(clock.instant())));
+            return unbound(program.eval(name -> Optional.ofNullable(vars.get(name)),
+                    clockAt(clock.instant(), functions)));
         } catch (CelEvaluationException e) {
             // A row-level evaluation failure (a missing field, a type clash on a dyn value, a function
             // that type-checks but is unbound at runtime) is a user-diagnosable condition: surface it
@@ -224,6 +236,9 @@ final class RowExpressionProgram {
         // fails nor warns. The carrier is not restored on the way out - what an expression produces is
         // a new value, and it is only the row's own untouched values that keep travelling as they came.
         if (value instanceof ConvertedValue carried) {
+            if ("DECIMAL128".equalsIgnoreCase(carried.originType()) && carried.value() instanceof Double number) {
+                return DecimalComparisonFunctions.DecimalSpecialValue.bind(number);
+            }
             return bound(carried.value());
         }
         if (value == null) {
@@ -239,6 +254,9 @@ final class RowExpressionProgram {
     // language's own wrappers; a sink is owed the row's values, so a value that merely travelled
     // through an expression leaves as the kind of value it arrived as.
     private static Object unbound(Object value) {
+        if (value instanceof DecimalComparisonFunctions.DecimalSpecialValue number) {
+            return number.doubleValue();
+        }
         if (value == NullValue.NULL_VALUE) {
             return null;
         }

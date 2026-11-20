@@ -65,6 +65,19 @@ class ClockFunctionsTest {
     }
 
     @Test
+    @DisplayName("an exact decimal comparison and a clock call answer together in one expression")
+    void anExactDecimalComparisonAndTheClockShareOneEvaluation() {
+        RowExpressionProgram recent = RowExpressionProgram.predicate(
+                "after.amount > 0.1 && after.IssueDate > today('America/Los_Angeles').addYears(-5)",
+                at(JUST_AFTER_MIDNIGHT_IN_VEGAS));
+
+        assertThat(recent.eval(row(Map.of("amount", new java.math.BigDecimal("0.10000000000000001"),
+                "IssueDate", LocalDate.of(2021, 11, 19))))).isEqualTo(true);
+        assertThat(recent.eval(row(Map.of("amount", new java.math.BigDecimal("0.1"),
+                "IssueDate", LocalDate.of(2021, 11, 19))))).isEqualTo(false);
+    }
+
+    @Test
     @DisplayName("a five-year cutoff keeps a row issued after the day five years ago and drops one on or before it")
     void aFiveYearCutoffFiltersOnArrival() {
         RowExpressionProgram cutoff = RowExpressionProgram.predicate(

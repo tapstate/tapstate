@@ -13,9 +13,11 @@ import java.util.Set;
 
 /** A bounded independent current-row predicate. It contains no expression-runtime or event-envelope API. */
 public final class ValidationPredicate {
-    public sealed interface Expr permits Constant, Field, Present, Compare, And, Or, Not, ArraySize, Exists {}
+    public sealed interface Expr permits Constant, FloatingLiteral, Field, Present, Compare, And, Or, Not, ArraySize, Exists {}
     /** Only immutable scalar constants are admitted by compile. */
     public record Constant(Object value) implements Expr {}
+    /** A direct CEL floating literal retains its binary value and exact decimal when representable. */
+    public record FloatingLiteral(double binary, BigDecimal decimal) implements Expr {}
     /** Binding -1 names the current row; nonnegative slots name explicitly scoped array members. */
     public record Field(int binding, List<String> path) implements Expr {
         public Field(List<String> path) { this(-1, path); }
@@ -74,7 +76,11 @@ public final class ValidationPredicate {
     private record Frame(Expr expression, int depth, Scope scope) {}
     private record Binding(int slot, Object value, List<Object> path, Binding parent) {}
     private record Value(Object value, List<Object> path, Problem problem) {}
-    private record Scalar(Object value, String domain, List<Object> path, Problem problem) {}
+    private record Scalar(Object value, String domain, List<Object> path, Problem problem, boolean exactLiteral) {
+        Scalar(Object value, String domain, List<Object> path, Problem problem) {
+            this(value, domain, path, problem, false);
+        }
+    }
     private static final int MAX_NODES = 256;
     private static final int MAX_DEPTH = 32;
     private final String node;
@@ -103,6 +109,8 @@ public final class ValidationPredicate {
                     if (constant.value() != null && domain(constant.value()) == null) throw ValidationError.invalid("predicate.literal");
                     constants.put(Integer.toString(nodes), constant.value());
                 }
+                case FloatingLiteral literal -> constants.put(Integer.toString(nodes),
+                        literal.decimal() == null ? literal.binary() : literal.decimal());
                 case Field field -> { requireScope(field.binding(), frame.scope()); metadata += pathBytes(field.path()); }
                 case Present present -> { requireScope(present.binding(), frame.scope()); metadata += pathBytes(present.path()); }
                 case ArraySize size -> pending.push(new Frame(size.array(), frame.depth() + 1, frame.scope()));
@@ -180,6 +188,7 @@ public final class ValidationPredicate {
         budget.spend(1);
         return switch (expression) {
             case Constant constant -> value(constant.value());
+            case FloatingLiteral literal -> value(literal.binary());
             case Field field -> field(row, bindings, field.binding(), field.path(), false, budget);
             case Present present -> field(row, bindings, present.binding(), present.path(), true, budget);
             case ArraySize size -> {
@@ -193,7 +202,7 @@ public final class ValidationPredicate {
             }
             case And and -> logical(and.left(), and.right(), false, row, budget, bindings);
             case Or or -> logical(or.left(), or.right(), true, row, budget, bindings);
-            case Compare compare -> compare(compare.operator(), evaluate(compare.left(), row, budget, bindings), evaluate(compare.right(), row, budget, bindings), budget);
+            case Compare compare -> compare(compare, evaluate(compare.left(), row, budget, bindings), evaluate(compare.right(), row, budget, bindings), budget);
         };
     }
 
@@ -207,36 +216,69 @@ public final class ValidationPredicate {
         return value(!decisive);
     }
 
-    private Value compare(Operator operator, Value left, Value right, Budget budget) {
+    private Value compare(Compare comparison, Value left, Value right, Budget budget) {
         var a = scalar(left, budget); var b = scalar(right, budget);
+        a = decimalLiteral(comparison.left(), a, comparison.right(), b);
+        b = decimalLiteral(comparison.right(), b, comparison.left(), a);
         if (a.problem() != null) return problem(a.problem());
         if (b.problem() != null) return problem(b.problem());
+        Operator operator = comparison.operator();
         boolean equality = operator == Operator.EQ || operator == Operator.NE;
         if (a.value() == null || b.value() == null) {
-            if (!equality) return problem(ProblemKind.INCOMPATIBLE_TYPE, a.value() == null ? a.path() : b.path());
-            boolean same = a.value() == null && b.value() == null;
-            return value(operator == Operator.EQ ? same : !same);
+            return compareNulls(a, b, operator, equality);
         }
         boolean numeric = number(a.domain()) && number(b.domain());
         if (!a.domain().equals(b.domain()) && !(numeric && limits.compatibleNumericDomains()))
             return problem(ProblemKind.INCOMPATIBLE_TYPE, a.path().isEmpty() ? b.path() : a.path());
-        int order;
-        if (numeric) {
-            if (nan(a.value()) || nan(b.value())) {
-                if (!equality) return problem(ProblemKind.UNSUPPORTED_VALUE, nan(a.value()) ? a.path() : b.path());
-                boolean same = nan(a.value()) && nan(b.value());
-                return value(operator == Operator.EQ ? same : !same);
-            }
-            order = numericOrder((Number)a.value(), (Number)b.value(), budget);
-        } else if (a.value() instanceof String x && b.value() instanceof String y) {
-            order = textOrder(x, y, budget);
-        } else if (a.value() instanceof Boolean x && b.value() instanceof Boolean y && equality) {
-            order = Boolean.compare(x, y);
-        } else return problem(ProblemKind.INCOMPATIBLE_TYPE, a.path());
+        return numeric ? compareNumbers(a, b, operator, equality, budget) : compareNonNumbers(a, b, operator, equality, budget);
+    }
+
+    private static Value compareNulls(Scalar left, Scalar right, Operator operator, boolean equality) {
+        if (!equality) return problem(ProblemKind.INCOMPATIBLE_TYPE, left.value() == null ? left.path() : right.path());
+        boolean same = left.value() == null && right.value() == null;
+        return value(operator == Operator.EQ ? same : !same);
+    }
+
+    private static Value compareNumbers(Scalar left, Scalar right, Operator operator, boolean equality, Budget budget) {
+        boolean leftNan = nan(left.value());
+        boolean rightNan = nan(right.value());
+        if (leftNan || rightNan) {
+            if (!equality) return problem(ProblemKind.UNSUPPORTED_VALUE, leftNan ? left.path() : right.path());
+            boolean same = leftNan && rightNan;
+            return value(operator == Operator.EQ ? same : !same);
+        }
+        return compareOrder(numericOrder(left, right, budget), operator);
+    }
+
+    private static Value compareNonNumbers(Scalar left, Scalar right, Operator operator, boolean equality, Budget budget) {
+        if (left.value() instanceof String x && right.value() instanceof String y) {
+            return compareOrder(textOrder(x, y, budget), operator);
+        }
+        if (left.value() instanceof Boolean x && right.value() instanceof Boolean y && equality) {
+            return compareOrder(Boolean.compare(x, y), operator);
+        }
+        return problem(ProblemKind.INCOMPATIBLE_TYPE, left.path());
+    }
+
+    private static Value compareOrder(int order, Operator operator) {
         return value(switch (operator) {
             case EQ -> order == 0; case NE -> order != 0; case LT -> order < 0;
             case LE -> order <= 0; case GT -> order > 0; case GE -> order >= 0;
         });
+    }
+
+    private static Scalar decimalLiteral(Expr expression, Scalar value, Expr otherExpression, Scalar other) {
+        // The portable row distinguishes decimal fields from CEL int/uint constants and binary floats.
+        // Only a direct literal paired with a decimal field uses the original source magnitude.
+        if (expression instanceof FloatingLiteral literal && otherExpression instanceof Field
+                && (other.value() instanceof BigDecimal || other.value() instanceof BigInteger)) {
+            BigDecimal exact = literal.decimal();
+            if (exact == null) {
+                return new Scalar(null, null, other.path(), new Problem(ProblemKind.UNSUPPORTED_VALUE, other.path()));
+            }
+            return new Scalar(exact, domain(exact), value.path(), null, true);
+        }
+        return value;
     }
 
     private Value exists(Exists exists, Map<String, Object> row, Budget budget, Binding bindings) {
@@ -337,17 +379,24 @@ public final class ValidationPredicate {
     private static boolean number(String domain) { return domain.equals("exact-number") || domain.equals("float32") || domain.equals("float64"); }
     private static boolean nan(Object value) { return value instanceof Double d && d.isNaN() || value instanceof Float f && f.isNaN(); }
     private static boolean infinite(Number value) { return (value instanceof Float || value instanceof Double) && Double.isInfinite(value.doubleValue()); }
-    private static int numericOrder(Number left, Number right, Budget budget) {
+    private static int numericOrder(Scalar a, Scalar b, Budget budget) {
+        Number left = (Number)a.value();
+        Number right = (Number)b.value();
         if (infinite(left) || infinite(right)) {
             if (infinite(left) && infinite(right)) return Double.compare(left.doubleValue(), right.doubleValue());
             return infinite(left) ? (left.doubleValue() < 0 ? -1 : 1) : (right.doubleValue() < 0 ? 1 : -1);
         }
-        chargeNumber(left, budget); chargeNumber(right, budget);
+        chargeNumber(left, a.exactLiteral(), budget);
+        chargeNumber(right, b.exactLiteral(), budget);
         return exact(left).compareTo(exact(right));
     }
-    private static void chargeNumber(Number value, Budget budget) {
-        if (value instanceof BigDecimal d) budget.spend(1L + d.unscaledValue().bitLength() / 32L + Math.abs((long)d.scale()));
-        else if (value instanceof BigInteger i) budget.spend(1L + i.bitLength() / 32L);
+    private static void chargeNumber(Number value, boolean exactLiteral, Budget budget) {
+        // BigDecimal.compareTo compares adjusted exponents first. When they match, the scale
+        // alignment is bounded by the significand sizes, so the literal's exponent adds no work.
+        if (value instanceof BigDecimal d) {
+            long scaleCost = exactLiteral ? 0 : Math.abs((long)d.scale());
+            budget.spend(1L + d.unscaledValue().bitLength() / 32L + scaleCost);
+        } else if (value instanceof BigInteger i) budget.spend(1L + i.bitLength() / 32L);
         else budget.spend(1);
     }
     // Decimal string conversion would change the value of finite binary operands.
