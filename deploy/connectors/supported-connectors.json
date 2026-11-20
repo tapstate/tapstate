@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "version": 3,
+  "version": 4,
   "connectors": [
     {
       "id": "mysql",
@@ -24,7 +24,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "aliyun-rds-mysql-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "aws-rds-mysql",
@@ -48,7 +48,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "polar-db-mysql-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "mysql-pxc",
@@ -60,7 +60,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "mysql-pxc-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "postgres",
@@ -84,7 +84,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "aliyun-rds-postgres-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "aliyun-adb-postgres",
@@ -96,7 +96,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "aliyun-adb-postgres-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "polar-db-postgres",
@@ -108,7 +108,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "polar-db-postgres-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "tencent-db-postgres",
@@ -120,7 +120,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "tencent-db-postgres-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "mongodb",
@@ -156,7 +156,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "aliyun-mongodb-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "tencent-db-mongodb",
@@ -168,7 +168,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "tencent-db-mongodb-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "oracle",
@@ -180,7 +180,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "enterprise",
       "artifactId": "oracle-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "sqlserver",
@@ -192,7 +192,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "enterprise",
       "artifactId": "mssql-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     },
     {
       "id": "db2",
@@ -226,7 +226,7 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "dummy-connector",
-      "loaderRetirementEligible": false
+      "loaderRetirementEligible": true
     }
   ]
 }
