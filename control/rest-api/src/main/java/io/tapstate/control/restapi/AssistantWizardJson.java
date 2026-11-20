@@ -148,9 +148,13 @@ final class AssistantWizardJson {
         var nextRoot = Map.<String, Object>of("id", rootId, SOURCE_ID, text(root.get(SOURCE)),
                 TABLE, text(root.get(TABLE)), "key", list(root.get("keys")),
                 PRE_TRANSFORMS, writeTransforms(root.get(TRANSFORMS)));
-        return Map.of("root", nextRoot, "related", related, TRANSFORMS, writeTransforms(view.get(TRANSFORMS)),
-                OUTPUT, Map.of("kind", oldOutput.getOrDefault("kind", "atlas"), CONFIG, output),
-                SOURCE_NODE_CONFIGS, retainedConfigs(original, nextRoot, related));
+        var candidate = new LinkedHashMap<>(Map.<String, Object>of("root", nextRoot, "related", related,
+                TRANSFORMS, writeTransforms(view.get(TRANSFORMS)),
+                OUTPUT, Map.of("kind", oldOutput.getOrDefault("kind", "atlas"), CONFIG, output)));
+        if (original.containsKey(SOURCE_NODE_CONFIGS)) {
+            candidate.put(SOURCE_NODE_CONFIGS, retainedConfigs(original, nextRoot, related));
+        }
+        return candidate;
     }
     private static Map<String, Object> retainedConfigs(Map<String, Object> original,
             Map<String, Object> root, List<Map<String, Object>> related) {
