@@ -1,0 +1,48 @@
+# A nest root fed through a map names its source by id, and that source's one table is not named like
+# the id: source sd_rooms reads table sd_archived_rooms, while another source of the same pipeline reads
+# a table that is named sd_rooms. The DAG reads the map's reference as the source, so the documents are
+# the archived rooms and must land in their table, keyed by its key.
+#
+# What the assertions have to discriminate:
+#
+# - Resolving the reference as a table name first picks the other source's sd_rooms table, and the
+#   documents are written to a collection of that name. Here sd_archived_rooms holds both documents,
+#   and sd_rooms holds none.
+#
+# - Each document carries its own column from the archived table and the other source's row embedded
+#   under decoy, so the root is the archived room and not the same-named table's row.
+#
+# - A root delete keeps the document, marked deleted, and the count holds at two: the target is keyed
+#   on the root key and upserts rather than appending a document per change.
+#
+# Every name here is this example's own, so no other example's rows can surface in this run.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: a-root-read-by-its-source-id-lands-in-that-sources-table
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [sd_rooms.tap.yml, src_sd_decoy.tap.yml, tgt_sd_rooms_mongo.tap.yml, pipeline.tap.yml]
+  discover: [sd_rooms, src_sd_decoy]
+pipeline: pipeline.tap.yml
+seed:
+  sd_rooms.sd_archived_rooms:
+    values:
+      - { id: 1, title: harbour }
+      - { id: 2, title: garden }
+  src_sd_decoy.sd_rooms:
+    values:
+      - { id: 1, label: decoy-one }
+      - { id: 2, label: decoy-two }
+steps:
+  - start
+  - await: { count: { tgt_sd_rooms_mongo.sd_archived_rooms: 2 } }
+  - await: { doc: { tgt_sd_rooms_mongo.sd_archived_rooms: { where: { id: 1 }, expect: { title: harbour, is_deleted: false, "decoy.label": decoy-one } } } }
+  - assert: { count: { tgt_sd_rooms_mongo.sd_rooms: 0 } }
+  - cdc: { sd_rooms.sd_archived_rooms: { delete: { where: { id: 2 } } } }
+  - await: { doc: { tgt_sd_rooms_mongo.sd_archived_rooms: { where: { id: 2 }, expect: { title: garden, is_deleted: true, "decoy.label": decoy-two } } } }
+  - assert: { count: { tgt_sd_rooms_mongo.sd_archived_rooms: 2 } }
+  - assert: { count: { tgt_sd_rooms_mongo.sd_rooms: 0 } }
