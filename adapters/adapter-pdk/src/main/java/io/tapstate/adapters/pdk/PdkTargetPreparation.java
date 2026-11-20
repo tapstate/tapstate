@@ -215,10 +215,11 @@ final class PdkTargetPreparation {
                 if (observed.revision() == 0) throw refusal;
             }
         }
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
         while (observed.phase() != SinkPreparationStore.Phase.READY) {
             requireActive.run();
-            if (System.nanoTime() >= deadline || Thread.currentThread().isInterrupted()) {
+            // Only a writer in this execution can publish an outstanding receipt. An older
+            // attempt may already have altered the target, so leave it for explicit recovery.
+            if (Thread.currentThread().isInterrupted() || !receipts.canAwait(observed)) {
                 PdkSinkPreparations.host(() -> { receipts.requireReady(target); return null; });
                 return null;
             }

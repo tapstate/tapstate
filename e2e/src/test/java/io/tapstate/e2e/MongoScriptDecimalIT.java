@@ -15,12 +15,16 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.IntStream;
 import org.bson.BsonDecimal128;
 import org.bson.BsonDocument;
 import org.bson.BsonInt32;
 import org.bson.BsonInt64;
 import org.bson.BsonString;
 import org.bson.BsonType;
+import org.bson.Document;
 import org.bson.types.Decimal128;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -124,6 +128,68 @@ class MongoScriptDecimalIT {
         }
     }
 
+    @Test
+    void parallelWritersWaitForDeferredClearPastTenSeconds() throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String sourceName = "script_slow_src_" + suffix;
+        String targetName = "script_slow_tgt_" + suffix;
+        String targetApp = "script-deferred-clear";
+        String pipe = "script_deferred_clear";
+        int rows = 32;
+        try (var replica = BenchmarkTargetLimit.newReplicaSet()) {
+            replica.start();
+            String sourceUri = replica.getReplicaSetUrl(sourceName);
+            String uri = replica.getReplicaSetUrl(targetName);
+            String targetUri = uri + (uri.contains("?") ? "&" : "?") + "appName=" + targetApp;
+            try (var mongo = MongoClients.create(sourceUri);
+                    var storage = PreparedNativeStore.create();
+                    var server = RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1",
+                            ignored -> List.of())) {
+                mongo.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY)
+                        .getCollection(TABLE, BsonDocument.class).insertMany(IntStream.rangeClosed(1, rows)
+                                .mapToObj(key -> row(key, "source-" + key, EXACT)).toList());
+                var target = mongo.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY)
+                        .getCollection(TABLE, BsonDocument.class);
+                target.insertOne(row(99, "pre-existing", EXACT));
+                var control = new ControlPlane(server.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                String source = connection("src_script", sourceUri, sourceName, true);
+                control.apply(Map.of("source.tap.yml", source));
+                control.discoverSchema("src_script", "mongodb", Map.of("uri", sourceUri, "database", sourceName));
+                control.apply(Map.of("source.tap.yml", source,
+                        "target.tap.yml", connection("tgt_script", targetUri, targetName, false),
+                        "pipeline.tap.yml", pipeline(pipe, "tgt_script", "return record;", false,
+                                ", execution: {parallelism: 2, batch: {max_records: 1}}")));
+                var admin = mongo.getDatabase("admin").withTimeout(20, TimeUnit.SECONDS);
+                var hold = new Document("failCommands", List.of("delete")).append("appName", targetApp)
+                        .append("namespace", targetName + "." + TABLE)
+                        .append("blockConnection", true).append("blockTimeMS", 13_000);
+                long before = admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", "alwaysOn").append("data", hold)).get("count", Number.class).longValue();
+                var after = new AtomicLong();
+                try (AutoCloseable disarm = () -> after.set(admin.runCommand(
+                        new Document("configureFailPoint", "failCommand").append("mode", "off"))
+                        .get("count", Number.class).longValue())) {
+                    control.lifecycle(pipe, LifecycleVerb.START);
+                    admin.withTimeout(LIMIT.toSeconds(), TimeUnit.SECONDS).runCommand(new Document(
+                            "waitForFailPoint", "failCommand").append("timesEntered", before + 1));
+                    Await.until("terminal state after the deferred target clear", LIMIT,
+                            () -> control.state(pipe).filter(state -> state == PipelineState.COMPLETED
+                                    || state == PipelineState.FAILED).isPresent(), () -> control.logs(pipe));
+                    assertEquals(PipelineState.COMPLETED, control.state(pipe).orElseThrow(), () -> control.logs(pipe));
+                    var landed = target.find().sort(Sorts.ascending("_id")).into(new ArrayList<>());
+                    assertEquals(rows, landed.size());
+                    for (int i = 0; i < rows; i++) {
+                        assertEquals(i + 1L, landed.get(i).getNumber("_id").longValue());
+                        assertEquals(EXACT, landed.get(i).get("d0"));
+                    }
+                }
+                assertEquals(1, after.get() - before, "one target clear");
+            }
+        }
+    }
+
     private static BsonDocument row(long key, String label, BsonDecimal128 amount) {
         return new BsonDocument("_id", new BsonInt64(key)).append("value", new BsonInt32(7))
                 .append("label", new BsonString(label)).append("d0", amount);
@@ -141,6 +207,10 @@ class MongoScriptDecimalIT {
     }
 
     private static String pipeline(String id, String target, String body, boolean empty) {
+        return pipeline(id, target, body, empty, "");
+    }
+
+    private static String pipeline(String id, String target, String body, boolean empty, String sinkOptions) {
         String script = body.isEmpty() ? "" : """
                 transforms:
                   - id: script
@@ -160,10 +230,10 @@ class MongoScriptDecimalIT {
                 settings: {read_mode: snapshot_only}
                 %s%sserve:
                   from: %s
-                  sync: [{id: output, source: %s, write_mode: upsert, on_full_load: clear}]
+                  sync: [{id: output, source: %s, write_mode: upsert, on_full_load: clear%s}]
                 """.formatted(id, script,
                         empty ? "  - {id: no_rows, from: [script], type: filter, expr: \"false\"}\n" : "",
-                        empty ? "no_rows" : body.isEmpty() ? "/.*/" : "script", target);
+                        empty ? "no_rows" : body.isEmpty() ? "/.*/" : "script", target, sinkOptions);
     }
 
     private record Variant(String name, String body, PipelineState terminal) {

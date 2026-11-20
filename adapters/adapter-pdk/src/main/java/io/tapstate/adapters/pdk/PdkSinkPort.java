@@ -104,9 +104,8 @@ public final class PdkSinkPort implements SinkPort {
     private PdkSinkPort(ConnectorProvisioner provisioner,KeyedStateStore stateStore,SharedSinkConnectors sharing,
             PipelineNode.Purpose purpose,ConnectorNoteScopes noteScopes,WorkloadClaimFence execution,
             PdkSinkPreparations preparations,Map<String,TargetIdentityPlan> plannedIdentities) {
-        if(preparations!=null)preparations.requireClaim(execution);
         this.plannedIdentities=plannedIdentities==null?null:Map.copyOf(plannedIdentities);
-        this.preparations=preparations;
+        this.preparations = preparations == null ? null : preparations.forExecution(execution);
         if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
             throw new IllegalArgumentException("sink purpose must be view or sync");
         }

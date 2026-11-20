@@ -301,14 +301,59 @@ class ScopedTargetPreparationTest {
         assertThat(calls).containsExactly("ready", "index");
     }
 
+    @Test
+    void aNewExecutionRefusesAnUnconfirmedClearFromItsPredecessor() {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        store.begin(store.held.input());
+        calls.clear();
+        var next = new WorkloadClaimFence(CLAIM.key(), CLAIM.owner(), CLAIM.claimGeneration() + 1,
+                CLAIM.executionGeneration() + 1, CLAIM.topologyRevision());
+        var checks = new java.util.concurrent.atomic.AtomicInteger();
+        var preparation = deferredPreparation(functions(calls), store, () -> {
+            if (checks.incrementAndGet() > 2) throw new AssertionError("waiting on a former execution");
+        }, next);
+
+        assertThatThrownBy(() -> preparation.prepareForWrite(DEFERRED, TargetTapTable.build(DEFERRED)))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_STATE_REBUILD_REQUIRED));
+        assertThat(store.held.revision()).isEqualTo(1);
+        assertThat(calls).isEmpty();
+    }
+
+    @Test
+    void aWaitingWriterStopsWhenItsExecutionIsFenced() {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        store.begin(store.held.input());
+        calls.clear();
+        var fenced = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        var checks = new java.util.concurrent.atomic.AtomicInteger();
+        var preparation = deferredPreparation(functions(calls), store, () -> {
+            if (checks.incrementAndGet() == 3) throw fenced;
+        });
+
+        assertThatThrownBy(() -> preparation.prepareForWrite(DEFERRED, TargetTapTable.build(DEFERRED)))
+                .isSameAs(fenced);
+        assertThat(store.held.revision()).isEqualTo(1);
+        assertThat(calls).isEmpty();
+    }
+
     private static NumericType decimalType() {
         return new NumericType(null, true, null, null, new BigDecimal("-99999999.99"),
                 new BigDecimal("99999999.99"), 10, 2);
     }
 
     private static PdkTargetPreparation deferredPreparation(ConnectorFunctions functions, Receipts store, Runnable active) {
+        return deferredPreparation(functions, store, active, CLAIM);
+    }
+
+    private static PdkTargetPreparation deferredPreparation(ConnectorFunctions functions, Receipts store, Runnable active,
+            WorkloadClaimFence execution) {
+        var bound = new PdkSinkPreparations(store, SCOPE, NODE, PipelineNode.Purpose.SYNC, OnFullLoad.CLEAR, true)
+                .forExecution(execution);
         return new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true,
-                NODE, null, true, PipelineNode.Purpose.SYNC, active, binding(store));
+                NODE, null, true, PipelineNode.Purpose.SYNC, active, bound);
     }
     @Test void knownPreparationIsPublishedBeforeIndexAndRestartNeverClearsOrCreatesAgain()throws Throwable {
         var calls=new ArrayList<String>();var store=new Receipts(calls);var functions=functions(calls);
