@@ -46,7 +46,7 @@ final class NativeValidationReportHistory implements AutoCloseable {
     /** One saved task per pass, including after a refused original; no failed Pipeline can starve later Pipelines. */
     synchronized void scan(){
         requireActive();try(var frame=resources.admitMaintenanceMetadata()){
-            var tasks=configuration.validationTasks(this::requireActive);
+            var tasks=configuration.pollingValidationTasks(this::requireActive);
             if(pipeline==null){
                 var next=tasks.pipelines(afterPipeline,1);if(next.isEmpty()){afterPipeline=null;return;}
                 pipeline=next.getFirst();afterTask=null;

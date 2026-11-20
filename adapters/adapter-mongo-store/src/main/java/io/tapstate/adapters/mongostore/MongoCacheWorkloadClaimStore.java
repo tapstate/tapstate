@@ -137,14 +137,75 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
         });
     }
-    @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
-        requireScope(original);
-        var key = pipelineKey(original);
-        return operations.pipelineRenewal(key, () -> transaction(false, original, (store, session) -> {
-            var retained = storedScope(session, key);
-            if (retained != null && !retained.equals(original)) throw claimFenced();
-            return store.read(key);
+    private record PipelineReading(Document state,Document claim,Document node) { }
+    @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original){
+        var key=pipelineKey(original);
+        return pipelineReading(original,true,observed->{
+            if(!original.equals(decodeScope(observed.claim(),key)))throw claimFenced();
+            return Optional.of(MongoWorkloadClaimStore.observedPipelineReading(observed.claim(),observed.node()));
+        },()->transaction(false,original,(store,session)->{
+            var retained=storedScope(session,key);if(retained!=null&&!retained.equals(original))throw claimFenced();return store.read(key);
         }));
+    }
+    io.tapstate.core.lifecycle.CheckpointDoc readCheckpoint(PipelineIntentScope original){
+        return pipelineReading(original,false,observed->MongoStateStore.toCheckpoint(observed.state()),()->{
+            var access=new MongoCachePipelineAccess(client,database,original,null,requireActive);
+            return access.transaction(session->MongoStateStore.toCheckpoint(access.state(session)));
+        });
+    }
+    private <T> T pipelineReading(PipelineIntentScope original,boolean includeNode,java.util.function.Function<PipelineReading,T> read,java.util.function.Supplier<T> legacy){
+        requireScope(original);var key=pipelineKey(original);
+        java.util.function.Supplier<T> operation=()->StoreIo.call(()->{
+            try{
+                if(includeNode&&operations.budget()==null)operations.requireAdmission();
+                requireActive.run();requireValidationAuthority();
+                if(!MongoReadBudget.supportsSnapshotReads(client))return legacy.get();
+                if (!includeNode) {
+                    operations.structures.require(MongoStructureProof.Kind.CHECKPOINT_READ, () ->
+                            operations.checkpointSimpleCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                                    SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS,
+                                    SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_WORKLOAD_CLAIMS)));
+                    if (!operations.checkpointSimpleCollations) return legacy.get();
+                }
+                var budget=operations.budget();if(budget!=null)operations.check();
+                var db=budget==null?database:budget.database(database);
+                var access=new MongoCachePipelineAccess(client,database,original,null,requireActive);
+                try(var session=client.startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())){
+                    if(includeNode)requirePipelineReadingStructure(db, access, budget);
+                    var stages=new java.util.ArrayList<Document>();
+                    stages.add(new Document("$match",new Document("_id","cluster")));
+                    stages.add(observedLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS,"schema","business",false));
+                    stages.add(observedLookup(SystemCollections.CACHE_PIPELINE_STATE,"state",original.pipelineId(),false));
+                    stages.add(observedLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS,"claim",MongoWorkloadClaimStore.id(key),includeNode));
+                    var nodeId=new Document("clusterId",scope.clusterId()).append("resourceType",WorkloadClaimType.NODE_SESSION.name()).append("resourceId","$$owner");
+                    if(includeNode)stages.add(new Document("$lookup",new Document("from",SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())
+                            .append("let",new Document("owner",new Document("$arrayElemAt",List.of("$claim.ownerNodeId",0))))
+                            .append("pipeline",List.of(new Document("$match",new Document("$expr",new Document("$eq",List.of("$_id",nodeId)))),MongoWorkloadClaimStore.leaseRemaining(true)))
+                            .append("as","node")));
+                    var observed=SystemCollections.CACHE_IDENTITY.on(db).aggregate(session,stages).first();
+                    MongoCacheBusinessIdentity.requireObservedAdmission(observed,observedRow(observed,"schema"),scope);
+                    if(!includeNode)requirePipelineReadingStructure(db, access, budget);
+                    var state=observedRow(observed,"state");
+                    access.validateState(state);var claim=observedRow(observed,"claim");access.requirePreparedClaim(session,claim);
+                    T result=read.apply(new PipelineReading(state,claim,includeNode?observedRow(observed,"node"):null));
+                    requireActive.run();requireValidationAuthority();if(budget!=null)operations.check();return result;
+                }
+            }catch(RuntimeException failure){operations.structures.clear();requireActive.run();throw failure;}
+        });
+        return includeNode?operations.pipelineRenewal(key,operation):operation.get();
+    }
+    private void requirePipelineReadingStructure(MongoDatabase db, MongoCachePipelineAccess access, MongoReadBudget budget) {
+        operations.structures.require(MongoStructureProof.Kind.CLAIMS, () -> requireCollection(db));
+        operations.structures.require(MongoStructureProof.Kind.PIPELINE_STATE, () -> access.verifyStateStructure(budget));
+    }
+
+    private static Document observedLookup(SystemCollections table,String name,Object id,boolean lease){
+        var stages=new java.util.ArrayList<Document>();stages.add(new Document("$match",new Document("_id",id)));
+        if(lease)stages.add(MongoWorkloadClaimStore.leaseRemaining(true));
+        return new Document("$lookup",new Document("from",table.collectionName()).append("pipeline",stages).append("as",name));
+    }
+    private static Document observedRow(Document observed,String name){
+        if(observed==null)return null;var rows=observed.getList(name,Document.class);return rows.isEmpty()?null:rows.getFirst();
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
@@ -376,6 +437,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     return committed;
                 }
             } catch (RuntimeException failed) {
+                operations.structures.clear();
                 // A known closed/revoked owner is diagnosed before a driver's closed-client failure.
                 requireActive.run();
                 throw failed;
@@ -391,12 +453,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         if (!renewalFirst) {
             if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
         }
-        requireCollection(budget==null?database:budget.database(database));
+        // Admission may insert the first row, so a missing namespace must never be recreated implicitly.
+        if(admission)requireCollection(budget==null?database:budget.database(database));
+        else operations.structures.require(MongoStructureProof.Kind.CLAIMS,
+                ()->requireCollection(budget==null?database:budget.database(database)));
         var store = raw.inStrictSession(session);
         if (pipeline != null) {
             var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
-            access.verifyStateStructure(budget);
-            var current = access.state(session);
+            operations.structures.require(MongoStructureProof.Kind.PIPELINE_STATE,()->access.verifyStateStructure(budget));
+            var current = access.state(session,true);
             // A real per-Pipeline write serializes admission with controlled state replacement.
             if (admission) access.updateState(session, current, new Document(), false);
         }

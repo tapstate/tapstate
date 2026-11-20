@@ -23,6 +23,7 @@ final class AlertNotificationPlanner {
     private final AlertMailLinks links;
     private final Runnable active;
     private int offset;
+    private Long noDestinationRevision;
     record Destination(AlertIntent.Route route, AlertIntent.Target target, String channel, String receiver,
             String targetId, MessageSettings messages, long settingsRevision, AlertGroupingClock.Policy grouping,
             Set<AlertConfiguration.GroupBy> groupBy, AlertConfiguration.Subscription subscription) { }
@@ -53,11 +54,13 @@ final class AlertNotificationPlanner {
         return store.commit(new AlertStore.Commit(state.kind(),state.state(),changes.intents(),changes.schedules(),view.version()));
     }
     void tick() {
-        active.run();
-        // Discovery starts from durable state and schedules on every process; no process-local known set is authoritative.
-        var initial=store.planning();boolean isolated=initial.isolatedRecords(),unavailable=!initial.unavailableRules().isEmpty();var seed=isolated?new Changes(List.of(),List.of()):seed(initial,null);
+        var known=noDestinationRevision;noDestinationRevision=null;active.run();
+        var observed=known==null?Optional.of(store.planning()):store.planningIfConfigurationChanged(known);
+        if(observed.isEmpty()){noDestinationRevision=known;offset=0;return;}
+        var initial=observed.orElseThrow();boolean isolated=initial.isolatedRecords(),unavailable=!initial.unavailableRules().isEmpty();var seed=isolated?new Changes(List.of(),List.of()):seed(initial,null);
         if(!seed.schedules().isEmpty())require(store.commit(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,List.of(),seed.schedules(),initial.version())));
-        var keys=store.planning().schedules().stream().map(v->v.value()).filter(v->v.batch()==null&&v.retiredAt()==null).map(AlertSchedule.Record::key).toList();
+        var discovered=seed.schedules().isEmpty()?initial:store.planning();
+        var keys=discovered.schedules().stream().map(v->v.value()).filter(v->v.batch()==null&&v.retiredAt()==null).map(AlertSchedule.Record::key).toList();
         int count=Math.min(32,keys.size());
         for(int index=0;index<count;index++){var key=keys.get(Math.floorMod(offset+index,keys.size()));active.run();
             boolean done=false;for(int retry=0;retry<3;retry++){
@@ -69,6 +72,10 @@ final class AlertNotificationPlanner {
         offset=keys.isEmpty()?0:Math.floorMod(offset+count,keys.size());
         if(isolated)throw isolated();
         if(unavailable)throw unavailableRule();
+        if(seed.schedules().isEmpty()&&initial.schedules().isEmpty()&&initial.intents().isEmpty()
+                &&initial.host().deployment()==AlertChannelPolicy.Deployment.ON_PREM
+                &&initial.definitions().stream().noneMatch(value->value instanceof AlertConfiguration.Subscription route&&route.header().active()&&route.enabled()))
+            noDestinationRevision=initial.version().configurationRevision();
     }
     private Changes seed(AlertStore.Planning view,AlertStateRecord.Head replacement) {
         var heads=new LinkedHashMap<AlarmKey,AlertStateRecord.Head>();
