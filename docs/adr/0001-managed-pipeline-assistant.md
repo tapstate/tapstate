@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/pipeline-builder/managed-ai
+---
+
 # ADR 0001: Tapstate-managed AI for Pipeline Builder
 
 Status: Accepted for implementation on 2026-11-20

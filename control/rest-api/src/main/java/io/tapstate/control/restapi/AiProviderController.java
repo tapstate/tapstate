@@ -72,12 +72,13 @@ class AiProviderController {
         result.put("providerId", settings == null ? null : settings.providerId());
         result.put("baseUrl", settings == null ? null : settings.baseUrl());
         result.put("model", settings == null ? null : settings.model());
-        result.put("mode", useManaged ? "managed" : settings != null ? "byok" : null);
-        result.put("byokConfigured", settings != null);
-        result.put("managedAvailable", managed != null);
-        result.put("managedModel", managed == null ? null : managed.settings().model());
-        if (mode == AuthenticationMode.CLOUD && (managed != null || useManaged || !providerManagers.isEmpty()))
+        if (mode == AuthenticationMode.CLOUD && (managed != null || useManaged || !providerManagers.isEmpty())) {
+            result.put("mode", useManaged ? "managed" : settings != null ? "byok" : null);
+            result.put("byokConfigured", settings != null);
+            result.put("managedAvailable", managed != null);
+            result.put("managedModel", managed == null ? null : managed.settings().model());
             result.put("canManage", canManage());
+        }
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(result);
     }
     @Verb("ai-provider.replace") @PutMapping("/ai-provider-settings")

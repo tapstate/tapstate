@@ -35,7 +35,7 @@ final class AtlasRuntime implements AutoCloseable {
 
     enum Mode { ON_PREM, CLOUD }
 
-    private static final String USER = "atlas-data-user";
+    static final String USER = "atlas-data-user";
     private static final String CLUSTER = "atlas-data-cluster";
     private static final String TOKEN = "controlled-atlas-sdk-token";
     private static final String KID = "atlas-data-key";
