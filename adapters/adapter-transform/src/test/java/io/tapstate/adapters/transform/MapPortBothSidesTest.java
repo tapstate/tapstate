@@ -124,6 +124,15 @@ class MapPortBothSidesTest {
         assertThat(out.after()).containsEntry("loud", "us");
     }
 
+    @Test
+    void anUpdateKeepsBeforeAndAfterReadsDistinctOnTheAfterImage() {
+        TransformPort port = map(fields("old_id", FieldRule.computed("before.id"),
+                "new_id", FieldRule.computed("after.id")));
+        Envelope out = port.transform(new Envelope(Op.UPDATE, 1L, "orders",
+                row(1, "eu"), row(2, "eu"), null)).getFirst();
+        assertThat(out.after()).containsEntry("old_id", 1).containsEntry("new_id", 2);
+    }
+
     // ---- the half that must not have changed --------------------------------------------
 
     @Test
