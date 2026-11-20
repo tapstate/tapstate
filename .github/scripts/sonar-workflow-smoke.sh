@@ -107,6 +107,12 @@ comment=step(build,'Comment quality gate on PR')
 assert "steps.analyze.outcome != 'skipped'" in comment and 'always()' in comment
 assert 'types=BUG' not in comment, 'PR comment must not hide non-BUG findings'
 assert 'resolved=false&ps=100' in comment
+upload=step(build,'Upload SonarQube PR findings report')
+assert "if: always() && steps.sonar-comment.outputs.findings_path != ''" in upload
+assert 'continue-on-error: true' in upload and 'uses: actions/upload-artifact@v4' in upload
+assert 'name: ${{ steps.sonar-comment.outputs.findings_name }}' in upload
+assert 'path: ${{ steps.sonar-comment.outputs.findings_path }}' in upload
+assert 'retention-days: 7' in upload
 with tempfile.TemporaryDirectory() as tmp:
     tmp=Path(tmp)
     first_page={
@@ -129,47 +135,74 @@ with tempfile.TemporaryDirectory() as tmp:
              'message': 'Validate this query.'},
         ],
     }
+    page_one=tmp/'page-1.json'
+    page_two=tmp/'page-2.json'
+    page_one.write_text(json.dumps(first_page))
+    page_two.write_text(json.dumps(second_page))
     curl=tmp/'curl'
-    curl.write_text("""#!/usr/bin/env bash
+    curl.write_text(r"""#!/usr/bin/env bash
 url="${*: -1}"
 printf '%s\n' "$url" >> "$CAPTURED_CURL_URLS"
 case "$url" in
   *project_status*)
     printf '%s' '{"projectStatus":{"status":"ERROR","conditions":[{"status":"ERROR","metricKey":"new_maintainability_rating","actualValue":"3","comparator":"GT","errorThreshold":"1"}]}}'
     ;;
-  *issues/search*p=1)
-    printf '%s' '"""+json.dumps(first_page,separators=(',',':'))+"""'
-    ;;
-  *issues/search*p=2)
-    printf '%s' '"""+json.dumps(second_page,separators=(',',':'))+"""'
+  *issues/search*p=*)
+    cat "page-${url##*&p=}.json"
     ;;
   *) exit 2 ;;
 esac
 """)
     curl.chmod(0o755)
     gh=tmp/'gh'
-    gh.write_text('''#!/usr/bin/env bash
-if [[ "$*" == *"/pulls/"* ]]; then
-  [[ "${LIVE_HEAD_FAIL:-false}" != true ]] || exit 1
-  printf '%s\n' "${LIVE_HEAD_SHA:-$EXPECTED_HEAD_SHA}"
-  exit 0
-fi
-for arg in "$@"; do
-  case "$arg" in
-    body=*) printf '%s' "${arg#body=}" > "$CAPTURED_COMMENT" ;;
-  esac
-done
+    gh.write_text(r'''#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  "api --method GET repos/tapstate/tapstate/pulls/540 --jq .head.sha")
+    [[ "${LIVE_HEAD_FAIL:-false}" != true ]] || exit 1
+    if [ -f comments-listed ]; then
+      printf '%s\n' "${CHANGED_HEAD_SHA:-$EXPECTED_HEAD_SHA}"
+    else
+      printf '%s\n' "${LIVE_HEAD_SHA:-$EXPECTED_HEAD_SHA}"
+    fi
+    ;;
+  "api --paginate repos/tapstate/tapstate/issues/540/comments --jq "*)
+    touch comments-listed
+    printf '%s\n' "${EXISTING_COMMENT_ID:-}"
+    ;;
+  "api -X POST repos/tapstate/tapstate/issues/540/comments "* | \
+  "api -X PATCH repos/tapstate/tapstate/issues/comments/42 "*)
+    [[ "$#" -eq 6 && "$5" == --input && -f "$6" ]]
+    [[ "${REJECT_COMMENT:-false}" != true ]] || exit 1
+    jq -je '.body | strings' "$6" > "$CAPTURED_COMMENT"
+    (( $(wc -c < "$CAPTURED_COMMENT") <= 61440 ))
+    printf '%s\n' "$3" > comment-method
+    ;;
+  *) exit 2 ;;
+esac
 ''')
     gh.chmod(0o755)
     captured=tmp/'captured-comment'
     curl_urls=tmp/'curl-urls'
+    outputs=tmp/'outputs'
+    report=tmp/'sonar-pr-findings.md'
     env=dict(os.environ,PATH=str(tmp)+os.pathsep+os.environ['PATH'],SONAR_TOKEN='token',
              SONAR_HOST_URL='https://sonar.example.invalid',GH_TOKEN='token',PR_NUMBER='540',
              GITHUB_REPOSITORY='tapstate/tapstate',EXPECTED_HEAD_SHA='a'*40,GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',CAPTURED_COMMENT=str(captured),
-             CAPTURED_CURL_URLS=str(curl_urls))
-    run=subprocess.run(['bash','-e','-c',script(comment)],env=env,cwd=tmp,capture_output=True,text=True)
+             CAPTURED_CURL_URLS=str(curl_urls),GITHUB_OUTPUT=str(outputs),RUNNER_TEMP=str(tmp))
+
+    def run_comment(**extra):
+        for path in (captured, curl_urls, report, tmp/'comments-listed', tmp/'comment-method'):
+            path.unlink(missing_ok=True)
+        outputs.write_text('')
+        return subprocess.run(['bash','-e','-c',script(comment)],env={**env,**extra},
+                              cwd=tmp,capture_output=True,text=True,timeout=15)
+
+    run=run_comment()
     assert run.returncode==0,run.stdout+run.stderr
     body=captured.read_text()
+    assert (tmp/'comment-method').read_text().strip()=='POST'
+    assert not outputs.read_text() and not report.exists()
     assert 'Analyzed PR head `'+('a'*40)+'`' in body and '/actions/runs/123/attempts/1' in body
     assert 'Open unresolved issues:' in body
     for finding in ['java:S1000','java:S1099','java:S2095','java:S3649']:
@@ -179,9 +212,78 @@ done
     assert issue_requests[0].endswith('&p=1'), issue_requests
     assert issue_requests[1].endswith('&p=2'), issue_requests
     for extra in ({'LIVE_HEAD_SHA': 'b'*40}, {'LIVE_HEAD_FAIL': 'true'}):
-        captured.unlink(missing_ok=True)
-        run=subprocess.run(['bash','-e','-c',script(comment)],env={**env,**extra},cwd=tmp,capture_output=True,text=True)
+        run=run_comment(**extra)
         assert run.returncode==0 and not captured.exists(), 'old or unknown head must not replace the current PR decoration'
+
+    # The UTF-8 report exceeds the budget even though its character count fits.
+    message='\U0001F642'*180
+    for finding in first_page['issues']:
+        finding['message']=message
+    page_one.write_text(json.dumps(first_page))
+    run=run_comment(EXISTING_COMMENT_ID='42')
+    assert run.returncode==0,run.stdout+run.stderr
+    assert (tmp/'comment-method').read_text().strip()=='PATCH'
+    body=captured.read_text(encoding='utf-8')
+    full=report.read_text(encoding='utf-8')
+    assert len(full) < 61440 < len(full.encode('utf-8'))
+    preview_findings=[line for line in body.splitlines() if line.startswith('- `java:')]
+    assert 0 < len(preview_findings) < 100
+    assert all(line.endswith(message) for line in preview_findings)
+    assert f'Showing {len(preview_findings)} of 102 retrieved unresolved issues ({102-len(preview_findings)} omitted' in body
+    assert 'new_maintainability_rating' in body
+    assert 'sonar-pr-findings-attempt-1' in body and 'https://github.com/tapstate/tapstate/actions/runs/123' in body
+    assert outputs.read_text().splitlines()==[f'findings_path={report}', 'findings_name=sonar-pr-findings-attempt-1']
+    assert 'Analyzed PR head `'+('a'*40)+'`' in full
+    assert len(re.findall(r'^- `java:', full, re.M))==102
+    for finding in ['java:S1000','java:S1099','java:S2095','java:S3649']:
+        assert finding in full
+    assert 'java:S3649' not in body
+
+    run=run_comment(CHANGED_HEAD_SHA='b'*40)
+    assert run.returncode==0 and not captured.exists() and not outputs.read_text()
+    run=run_comment(REJECT_COMMENT='true')
+    assert run.returncode!=0 and 'Posted quality gate comment' not in run.stdout
+    assert report.exists() and 'findings_path=' in outputs.read_text()
+
+    first_page['issues'][0]['message']='Review the related findings.\n'+'\U0001F642'*16000
+    page_one.write_text(json.dumps(first_page))
+    run=run_comment()
+    assert run.returncode==0,run.stdout+run.stderr
+    body=captured.read_text()
+    assert 'Showing 0 of 102 retrieved unresolved issues (102 omitted' in body
+    assert 'java:S1000' not in body
+    assert first_page['issues'][0]['message'] in report.read_text(encoding='utf-8')
+
+    page_two.unlink()
+    for finding in first_page['issues']:
+        finding['message']='Page-one maintainability finding.'
+    page_one.write_text(json.dumps(first_page))
+    run=run_comment()
+    assert run.returncode==0,run.stdout+run.stderr
+    body=captured.read_text()
+    incomplete='SonarQube results are incomplete. Retrieved 100 unresolved issues before pagination stopped.'
+    assert incomplete in body
+    assert len(re.findall(r'^- `java:', body, re.M))==100
+    assert 'Open the pull-request dashboard' in body and 'workflow run artifacts' not in body
+    assert not outputs.read_text() and not report.exists()
+
+    for finding in first_page['issues']:
+        finding['message']='Check the related validation. '*18+'Review the issue.'
+    page_one.write_text(json.dumps(first_page))
+    run=run_comment()
+    assert run.returncode==0,run.stdout+run.stderr
+    body=captured.read_text()
+    shown=len(re.findall(r'^- `java:', body, re.M))
+    assert 0 < shown < 100, shown
+    assert incomplete in body and 'Open the pull-request dashboard' in body
+    assert f'Showing {shown} of 100 retrieved unresolved issues ({100-shown} omitted' in body
+    assert report.exists(), f'Comment showed {shown} of 100 retrieved findings without a report'
+    assert '[workflow run artifacts](https://github.com/tapstate/tapstate/actions/runs/123)' in body
+    assert 'sonar-pr-findings-attempt-1' in body
+    assert outputs.read_text().splitlines()==[f'findings_path={report}', 'findings_name=sonar-pr-findings-attempt-1']
+    full=report.read_text(encoding='utf-8')
+    assert incomplete in full
+    assert re.findall(r'^- `(java:\w+)`', full, re.M)==[finding['rule'] for finding in first_page['issues']]
 command=script(step(reporter,'Report analysis outcome'))
 with tempfile.TemporaryDirectory() as tmp:
     for build_result, enabled, outcome, expect in [
@@ -295,5 +397,5 @@ printf '%s' "${GH_TOKEN+present}${GITHUB_TOKEN+present}" > "$SCANNER_AUTH"
     revision_controls+=1
     calls=[json.loads(line) for line in api_log.read_text().splitlines()]
     assert calls and all(row==['api','--method','GET','repos/tapstate/tapstate/git/ref/heads/main','--jq','.object.sha'] for row in calls)
-print(f'sonar-workflow smoke: 7 event/ref cases, 20 runtime cases, {revision_controls} revision-order controls and {lock_mutations} lock mutations passed, including 102 paginated issues')
+print(f'sonar-workflow smoke: 7 event/ref cases, 26 runtime cases, {revision_controls} revision-order controls and {lock_mutations} lock mutations passed, including bounded comments and reports for complete and interrupted pagination')
 PY
