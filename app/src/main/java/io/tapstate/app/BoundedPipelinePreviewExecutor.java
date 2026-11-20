@@ -62,6 +62,8 @@ import java.util.concurrent.atomic.AtomicReference;
 /** Runs candidate Pipelines over exact bounded reads and request-private Jet state. */
 final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, AutoCloseable {
 
+    private static final String DEADLINE_REASON = "the preview exceeded its 45 second execution deadline";
+
     static final String LEASE_MAP = "__preview.leases";
     private static final Logger LOG = LoggerFactory.getLogger(BoundedPipelinePreviewExecutor.class);
     private static final int MAX_WORKERS = 8;
@@ -118,9 +120,30 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
     @Override
     public PipelinePreviewStream preview(PipelinePreviewRequest request) {
         Objects.requireNonNull(request, "request");
+        if (!clock.instant().isBefore(request.deadline())) {
+            PipelinePreviewEvent failure = deadlineFailure(request);
+            return new PipelinePreviewStream() {
+                private final AtomicReference<PipelinePreviewEvent> pending = new AtomicReference<>(failure);
+
+                @Override
+                public PipelinePreviewEvent next() {
+                    return pending.getAndSet(null);
+                }
+
+                @Override
+                public void cancel() {
+                    pending.set(null);
+                }
+            };
+        }
         PreviewStream stream = new PreviewStream(request);
         stream.start();
         return stream;
+    }
+
+    private PipelinePreviewEvent deadlineFailure(PipelinePreviewRequest request) {
+        return new PipelinePreviewEvent(request.runId(), request.candidateHash(), 0, "run.failed", clock.instant(),
+                Map.of("code", ActuationError.PREVIEW_REFUSED.code(), "reason", DEADLINE_REASON));
     }
 
     @Override
@@ -179,8 +202,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             long remaining = Duration.between(clock.instant(), request.deadline()).toNanos();
             if (remaining <= 0) {
                 cancel();
-                return event("run.failed", failure(ActuationError.PREVIEW_REFUSED.code(),
-                        "the preview exceeded its 45 second execution deadline"));
+                return deadlineFailure(request);
             }
             PipelinePreviewEvent next = events.poll(remaining, TimeUnit.NANOSECONDS);
             if (next != null) {
@@ -190,8 +212,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 return null;
             }
             cancel();
-            return event("run.failed", failure(ActuationError.PREVIEW_REFUSED.code(),
-                    "the preview exceeded its 45 second execution deadline"));
+            return deadlineFailure(request);
         }
 
         @Override
@@ -511,7 +532,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 submitted.getFuture().get(remaining, TimeUnit.NANOSECONDS);
             } catch (TimeoutException timeout) {
                 submitted.cancel();
-                throw refused("the preview exceeded its 45 second execution deadline");
+                throw refused(DEADLINE_REASON);
             } catch (java.util.concurrent.ExecutionException failed) {
                 TapstateException coded = BoundedPipelinePreviewExecutor.codedCause(failed);
                 if (coded != null) {
@@ -674,7 +695,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             }
             long remaining = Duration.between(clock.instant(), request.deadline()).toNanos();
             if (remaining <= 0) {
-                throw refused("the preview exceeded its 45 second execution deadline");
+                throw refused(DEADLINE_REASON);
             }
             try {
                 if (!events.offer(new PipelinePreviewEvent(request.runId(), request.candidateHash(), 0,
@@ -693,7 +714,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 throw new java.util.concurrent.CancellationException("preview was cancelled");
             }
             if (!clock.instant().isBefore(request.deadline())) {
-                throw refused("the preview exceeded its 45 second execution deadline");
+                throw refused(DEADLINE_REASON);
             }
         }
 
