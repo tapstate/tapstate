@@ -614,8 +614,13 @@ class NativeValidationFullJobIT {
         var entered=new java.util.concurrent.CountDownLatch(1);var returnPlan=new java.util.concurrent.CountDownLatch(1);
         var cleanupEntered=new java.util.concurrent.CountDownLatch(4);var releases=List.of(new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1));
         var closes=new AtomicInteger();
+        // Release the test barriers before fixture shutdown waits for these workers.
+        var releaseWorkers = (AutoCloseable) () -> {
+            returnPlan.countDown();
+            releases.forEach(java.util.concurrent.CountDownLatch::countDown);
+        };
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
-            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var registry=new ValidationProcessorRegistry(f.member,()->{});releaseWorkers) {
             var start=prepare(f);var reservation=f.owners.take(start);
             runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->{
                 assertThat(Thread.currentThread().getName()).startsWith("validation-check");
@@ -637,7 +642,7 @@ class NativeValidationFullJobIT {
             var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
             var failure=reservation.access().reports().find(reference).orElseThrow().failure();
             assertThat(failure).isNotNull().satisfies(value->assertThat(value.params()).containsEntry("field","fixture.firstCleanupUnknown"));
-        }finally{returnPlan.countDown();releases.forEach(java.util.concurrent.CountDownLatch::countDown);}
+        }
     }
     static void waitFor(java.util.concurrent.CountDownLatch latch){try{assertThat(latch.await(12,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}}
     static ValidationReportAdmission.Start prepare(NativeValidationOwnerReservationsIT.Fixture f){

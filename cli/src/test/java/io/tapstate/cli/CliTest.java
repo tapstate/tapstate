@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import picocli.CommandLine;
 
 import java.io.PrintWriter;
@@ -78,6 +79,69 @@ class CliTest {
         assertThat(Cli.newCommandLine().getSubcommands().keySet())
                 .contains("apply", "up")
                 .doesNotContain("connect");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"apply -h", "status --help", "up --help", "aggregate --help"})
+    void usageHelpRunsBeforeOpeningTheSession(String command) {
+        LaunchOptions launch = LaunchOptions.parse(("-c http://127.0.0.1:1 -u admin " + command).split(" "));
+
+        assertThat(Cli.runSession(launch, () -> {
+            throw new AssertionError("Usage help requested a control-plane client");
+        })).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "status", "status -- --help", "position pipeline -f --help", "up -o invalid --help"})
+    void otherInvocationsReachTheSession(String command) {
+        LaunchOptions launch = LaunchOptions.parse(command.isEmpty() ? new String[0] : command.split(" "));
+        IllegalStateException clientRequested = new IllegalStateException("Control-plane client requested");
+
+        assertThatThrownBy(() -> Cli.runSession(launch, () -> {
+            throw clientRequested;
+        })).isSameAs(clientRequested);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-h", "--help", "-V", "--version"})
+    void dataBrowserHelpAndVersionRunBeforeOpeningTheSession(String option) {
+        LaunchOptions launch = LaunchOptions.parse("--context", "missing", "data-browser", option);
+
+        assertThat(Cli.runSession(launch, () -> {
+            throw new AssertionError("Data-browser help or version requested a control-plane client");
+        })).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"views.orders.find({note:\"example\"})",
+            "views.orders.find({note:\"before --help after\"})"})
+    void dataBrowserQueriesReachTheSession(String query) {
+        LaunchOptions launch = LaunchOptions.parse(("--context missing data-browser " + query).split(" "));
+        IllegalStateException clientRequested = new IllegalStateException("Control-plane client requested");
+
+        assertThat(Cli.bypassesSessionResolution(launch)).isFalse();
+        assertThatThrownBy(() -> Cli.runSession(launch, () -> {
+            throw clientRequested;
+        })).isSameAs(clientRequested);
+    }
+
+    @Test
+    void explainHelpBypassesTheSessionWithAnExplicitContext() {
+        assertThat(Cli.bypassesSessionResolution(
+                LaunchOptions.parse("--context", "missing", "explain", "--help"))).isTrue();
+        assertThat(Cli.bypassesSessionResolution(
+                LaunchOptions.parse("--context", "missing", "explain", "orders"))).isFalse();
+    }
+
+    @Test
+    void literalHelpArgumentStillChecksConflictingLaunchTargets() {
+        LaunchOptions launch = LaunchOptions.parse(
+                "--connect", "http://127.0.0.1:1", "--context", "dev", "status", "--", "--help");
+        var controlPlane = new FakeHealthProbe(false);
+
+        assertThat(Cli.runSession(launch, () -> controlPlane)).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(controlPlane.probed).isEmpty();
+        assertThat(controlPlane.logins).isEmpty();
     }
 
     @Test
