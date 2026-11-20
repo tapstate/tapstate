@@ -55,6 +55,40 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"renewed","missing","expired","replaced","malformed"})
+    void oneSnapshotRechecksTheOriginalNodeBackedTenure(String mode){
+        withBusiness(f->{
+            var claims=f.domain().workloadClaims(SCOPE);var table=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+            var owner=new WorkloadOwner(SCOPE.clusterId(),"original-boot");
+            var nodeKey=new WorkloadClaimKey(SCOPE.clusterId(),WorkloadClaimType.NODE_SESSION,SCOPE.clusterId());
+            var node=claims.acquire(nodeKey,owner,1,TTL).claim();
+            var original=claims.acquireNodeBackedPipeline(PIPELINE,WorkloadClaimFence.from(node),1).claim();
+            var running=claims.advanceExecution(original,1,Set.of(owner.nodeId())).orElseThrow();
+            assertThat(claims.readPipeline(PIPELINE).orElseThrow().leased()).isTrue();
+            var filter=new Document("_id",MongoWorkloadClaimStore.id(nodeKey));
+            io.tapstate.spi.store.WorkloadClaim renewed=null;
+            switch(mode){
+                case "renewed"->renewed=claims.renew(node,Duration.ofSeconds(60)).orElseThrow();
+                case "missing"->table.deleteOne(filter);
+                case "expired"->table.updateOne(filter,new Document("$set",new Document("leaseUntil",new java.util.Date(0))));
+                case "replaced"->table.updateOne(filter,new Document("$set",new Document("ownerBootId","replacement-boot").append("claimGeneration",node.claimGeneration()+1)));
+                case "malformed"->table.updateOne(filter,new Document("$set",new Document("claimGeneration","invalid-generation")));
+            }
+            var commands=new java.util.ArrayList<String>();MongoCommandObservation.CURRENT.set(commands::add);
+            try{
+                if(mode.equals("malformed"))assertThatThrownBy(()->claims.readPipeline(PIPELINE)).isInstanceOfSatisfying(TapstateException.class,e->assertThat(e.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                else{
+                    var observed=claims.readPipeline(PIPELINE).orElseThrow();
+                    assertThat(WorkloadClaimFence.from(observed.claim())).isEqualTo(WorkloadClaimFence.from(running));
+                    assertThat(observed.leased()).isEqualTo(mode.equals("renewed"));
+                    if(renewed!=null)assertThat(observed.claim().leaseUntil()).isEqualTo(renewed.leaseUntil());
+                }
+            }finally{MongoCommandObservation.CURRENT.remove();}
+            assertThat(commands).containsExactly("aggregate");
+        });
+    }
+
     @Test void validationTenureUsesIndependentNativeClientsWithoutReleasingThePipeline() {
         withBusiness(f -> {
             var claims = f.domain().workloadClaims(SCOPE);

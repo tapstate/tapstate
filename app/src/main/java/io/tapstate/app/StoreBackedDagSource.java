@@ -12,6 +12,7 @@ import io.tapstate.adapters.transform.UnwindSpec;
 import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.control.core.PipelineOutputNames;
 import io.tapstate.core.dsl.PipelineInputs;
+import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.RowExpressions;
@@ -37,7 +38,9 @@ import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.AggregateBinding;
 import io.tapstate.runtime.engine.DagBindings;
+import io.tapstate.runtime.engine.aggregate.AggregateStores;
 import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.DagTraceBinding;
 import io.tapstate.runtime.engine.FrontierBinding;
@@ -565,6 +568,11 @@ final class StoreBackedDagSource implements DagSource {
     /** Builds the official topology with finite sources and run-scoped, no-external-write sinks. */
     DAG previewDag(PipelineResource pipeline, String sampleMap,
             String materializerMap, DagTraceBinding trace, String previewExecutionId) {
+        if (pipeline.transforms() != null
+                && pipeline.transforms().stream().anyMatch(step -> AggregateSteps.of(step) != null)) {
+            // A preview keeps no state behind it, and an aggregate step has nowhere else to keep its groups.
+            throw previewRefused("a pipeline with an aggregate step cannot be previewed");
+        }
         Map<String, SourceVertex> vertices = sourceVertices(pipeline);
         Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
         Map<String, List<String>> sourceKeysById = sourceKeysById(vertices);
@@ -1423,7 +1431,60 @@ final class StoreBackedDagSource implements DagSource {
                     ? TargetModelResolver.keyedOn(model, nest.root().key())
                     : new TargetTable(root.name(), List.of()));
         }
+        // An aggregate step publishes a table of its own, named by the step and keyed by its group names.
+        // One whose input cannot be described yet still contributes the name, for the reason a nest does.
+        Map<String, AggregateStepSpec> aggregates =
+                compiledAggregates(pipeline, bySourceTable, sourceVertices, compiledJoins);
+        for (Step step : pipeline.transforms()) {
+            if (AggregateSteps.of(step) != null) {
+                AggregateStepSpec spec = aggregates.get(step.id());
+                assembled.put(step.id(), spec != null ? AggregateSteps.target(spec)
+                        : new TargetTable(step.id(), List.of()));
+            }
+        }
         return assembled;
+    }
+
+    /**
+     * Each aggregate step as a run executes it, compiled against the discovered columns that reach it. A
+     * step whose input cannot be described is left out; a step that can be described and does not hold
+     * is refused here with its own code.
+     */
+    private Map<String, AggregateStepSpec> compiledAggregates(
+            PipelineResource pipeline, Map<String, TargetTable> bySourceTable,
+            Map<String, SourceVertex> sourceVertices, Map<String, CompiledJoin> compiledJoins) {
+        Map<String, AggregateStepSpec> byStep = new LinkedHashMap<>();
+        if (pipeline.transforms() == null
+                || pipeline.transforms().stream().noneMatch(step -> AggregateSteps.of(step) != null)) {
+            return byStep;
+        }
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Map<String, NodeColumns> derived = deriveSteps(pipeline, sourceVertices, sourceKeyByTable,
+                sourceKeysById, stepIds, compiledJoins, this::discoveredColumns).columns();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Aggregate aggregate = AggregateSteps.of(step);
+            if (aggregate == null) {
+                continue;
+            }
+            Map<String, NodeColumns> inputs = inputsOf(refsOf(step.from()), sourceVertices, sourceKeyByTable,
+                    sourceKeysById, stepIds, derived, this::discoveredColumns, false);
+            NodeColumns input = inputs == null ? null : NodeColumns.merged(inputs.values());
+            if (input == null || !input.known()) {
+                continue;
+            }
+            // The rows of one table carry that table's key; rows of several have no key in common.
+            Set<String> streams = streamsReaching(pipeline, step.from(), sourceKeyByTable, sourceKeysById,
+                    sourceVertices, stepIds);
+            TargetTable table = streams.size() == 1 ? bySourceTable.get(streams.iterator().next()) : null;
+            List<String> tableKey = table == null ? List.of() : table.fields().stream()
+                    .filter(TargetField::primaryKey).map(TargetField::name).toList();
+            byStep.put(step.id(), AggregateSteps.compile(step, aggregate, input, tableKey,
+                    refsOf(step.from()).stream().map(StoreBackedDagSource::referenceOf)
+                            .collect(java.util.stream.Collectors.joining(", "))));
+        }
+        return byStep;
     }
 
     /**
@@ -1535,6 +1596,7 @@ final class StoreBackedDagSource implements DagSource {
             if (!(stepOf(pipeline, key) instanceof Step.Inline inline)
                     || inline.body() instanceof TransformBody.Nest
                     || inline.body() instanceof TransformBody.Join
+                    || inline.body() instanceof TransformBody.Aggregate
                     || !visiting.add(key)) {
                 continue;
             }
@@ -1549,7 +1611,7 @@ final class StoreBackedDagSource implements DagSource {
                     }
                 }
                 if (!inputs.isEmpty()) {
-                    reached.add(NodeColumns.of(inline.body(), inputs, null));
+                    reached.add(NodeColumns.of(inline.id(), inline.body(), inputs, null));
                 }
             } finally {
                 // A shared ancestor must be visited again from another fork. Only cycles on the
@@ -1624,7 +1686,7 @@ final class StoreBackedDagSource implements DagSource {
                                 && !inputs.containsKey(nest.root().from()))) {
                     continue;
                 }
-                NodeColumns columns = NodeColumns.of(step.body(), inputs, null);
+                NodeColumns columns = NodeColumns.of(step.id(), step.body(), inputs, null);
                 // A node that cannot say what it emits carries what reached it, so the chain of models
                 // does not stop here and take everything below it with it. Only where the answer is
                 // unknown: a node that did work its columns out keeps them.
@@ -2288,6 +2350,26 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
+        Map<String, AggregateStepSpec> aggregates = compiledAggregates(
+                pipeline, sourceTargets(sourceVertices), sourceVertices, compiledJoins);
+        // Aggregate state is committed under the execution's claim; a run bound to no execution has none.
+        AggregateStores aggregateStores = manifest != null ? AggregateStores.bound(manifest)
+                : (member, step, kind) -> {
+                    throw new IllegalStateException("aggregate step '" + step
+                            + "' needs operator state bound to an execution, and this run has none");
+                };
+        AggregateBinding aggregateBinding = new AggregateBinding(step -> {
+            AggregateStepSpec spec = aggregates.get(step.id());
+            if (spec == null) {
+                throw new IllegalStateException("aggregate step '" + step.id()
+                        + "' was not compiled: the columns reaching it are not known");
+            }
+            return spec;
+        }, aggregateStores,
+                // What a step keeps to answer a second delivery is forgotten below the position the sinks
+                // have durably acknowledged, which only a run bound to an execution can read.
+                operators == null ? ReplayFloorFactory.NONE : new ScopedSrsReplayFloorFactory(scopedSources, scopedDirect),
+                io.tapstate.runtime.engine.aggregate.AggregateProcessor.Sweep.DEFAULT);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
                         progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),
@@ -2305,7 +2387,8 @@ final class StoreBackedDagSource implements DagSource {
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)
                                 .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests())).withSnapshotEpochs(snapshotEpochs),
-                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)));
+                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)))
+                .withAggregate(aggregateBinding);
     }
 
     private Map<String, Long> sourceEpochs(
@@ -2850,7 +2933,8 @@ final class StoreBackedDagSource implements DagSource {
             // shape the product's own valid corpus writes, so the validator accepted a pipeline the
             // builder then would not build. Its identity is the target model registered for the step,
             // which the branch below reads like any other single stream's.
-            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
+            if (step instanceof Step.Inline inline && (inline.body() instanceof TransformBody.Join
+                    || inline.body() instanceof TransformBody.Aggregate)) {
                 streams.add(step.id());
                 return;
             }
@@ -3184,7 +3268,8 @@ final class StoreBackedDagSource implements DagSource {
             // Assemblies replace terminal streams, but every source feeding them contributes freshness.
             if (!sourceInputs && step instanceof Step.Inline inline
                     && (inline.body() instanceof TransformBody.Nest
-                            || inline.body() instanceof TransformBody.Join)) {
+                            || inline.body() instanceof TransformBody.Join
+                            || inline.body() instanceof TransformBody.Aggregate)) {
                 streams.add(step.id());
                 continue;
             }
@@ -3415,10 +3500,14 @@ final class StoreBackedDagSource implements DagSource {
         Set<String> declaredAliases = step.from() instanceof FromClause.Aliases declared
                 ? declared.aliases().keySet()
                 : Set.of();
+        // A source the front end added for an OR alternative answers to the alias it stands in for.
         for (io.tapstate.core.sql.JoinTree.Source source : plan.from().sources()) {
-            if (!declaredAliases.contains(source.name())) {
+            if (!declaredAliases.contains(source.declared())) {
                 throw new TapstateException(ActuationError.JOIN_SOURCE_NOT_DECLARED,
-                        Map.of("step", step.id(), "name", source.name()), null);
+                        Map.of("step", step.id(), "name", source.declared()), null);
+            }
+            if (!source.declared().equals(source.name())) {
+                tableByName.put(source.name(), tableByName.getOrDefault(source.declared(), source.table()));
             }
         }
         String driving = plan.factSource().table();
@@ -3432,7 +3521,7 @@ final class StoreBackedDagSource implements DagSource {
             if (source.name().equals(plan.factSource().name())) {
                 continue;
             }
-            List<String> sourceKey = keyByTable.getOrDefault(source.name(), List.of());
+            List<String> sourceKey = keyByTable.getOrDefault(source.declared(), List.of());
             if (!sourceKey.isEmpty()) {
                 dimensionRowKeyColumns.put(source.name(), List.copyOf(sourceKey));
             }
@@ -3563,6 +3652,7 @@ final class StoreBackedDagSource implements DagSource {
         if (pipeline.transforms() == null) {
             return byAlias;
         }
+        Map<String, NodeColumns>[] stepColumns = new Map[1];
         for (Step step : pipeline.transforms()) {
             if (!(step instanceof Step.Inline inline) || !(inline.body() instanceof TransformBody.Nest)) {
                 continue;
@@ -3571,7 +3661,9 @@ final class StoreBackedDagSource implements DagSource {
                 continue;
             }
             aliases.aliases().forEach((alias, ref) -> {
-                NestTable resolved = keyedThroughSteps(pipeline, ref, nestTable(ref, sourceTables), sourceTables);
+                NestTable resolved = withStepColumns(
+                        keyedThroughSteps(pipeline, ref, nestTable(ref, sourceTables), sourceTables),
+                        ref, stepColumns, pipeline);
                 NestTable existing = byAlias.putIfAbsent(alias, resolved);
                 if (existing != null && !existing.name().equals(resolved.name())) {
                     throw new IllegalStateException("alias '" + alias + "' names table '" + existing.name()
@@ -3581,6 +3673,48 @@ final class StoreBackedDagSource implements DagSource {
             });
         }
         return byAlias;
+    }
+
+    /**
+     * An alias that names another step - a {@code map}, a {@code union} - reads that step's output, which has
+     * no table behind it and so no key; but its columns and their types are worked out like any other node's.
+     * They are what a rollup over the level computes in: without them a {@code sum} over a mapped or merged
+     * level would have no type to be exact in and could not be declared at all. The key stays the author's
+     * to declare. A step whose columns nobody can work out stays untyped, as before.
+     */
+    @SuppressWarnings("unchecked")
+    private NestTable withStepColumns(NestTable table, FromRef ref, Map<String, NodeColumns>[] stepColumns,
+            PipelineResource pipeline) {
+        if (!table.fields().isEmpty() || !(ref instanceof FromRef.Literal literal)
+                || !(stepOf(pipeline, literal.ref()) instanceof Step.Inline)) {
+            return table;
+        }
+        if (stepColumns[0] == null) {
+            try {
+                Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+                stepColumns[0] = deriveSteps(pipeline, vertices, sourceKeyByTable(vertices), sourceKeysById(vertices),
+                        stepIds(pipeline), compiledJoins(pipeline, sourceTablesByName(vertices)),
+                        this::discoveredColumns).columns();
+            } catch (RuntimeException underivable) {
+                stepColumns[0] = Map.of();
+            }
+        }
+        NodeColumns columns = stepColumns[0].get(literal.ref());
+        if (columns == null || !columns.known()) {
+            return table;
+        }
+        Map<String, io.tapstate.core.dsl.aggregate.ValueType> types = new LinkedHashMap<>();
+        columns.columns().forEach((name, declared) -> {
+            // A column whose type nothing declared stays untyped, rather than failing the whole level.
+            io.tapstate.core.common.TapstateType type = declared == null
+                    ? io.tapstate.core.common.TapstateType.UNKNOWN : JoinSchemaDrift.typeOf(declared);
+            var numeric = columns.numericTypes().get(name);
+            Integer scale = type == io.tapstate.core.common.TapstateType.DECIMAL && numeric != null
+                    ? numeric.scale() : null;
+            types.put(name, new io.tapstate.core.dsl.aggregate.ValueType(type, scale));
+        });
+        return new NestTable(table.name(), table.primaryKey(), table.uniqueIndexes(),
+                List.copyOf(columns.columns().keySet()), types);
     }
 
     /**
@@ -3605,7 +3739,7 @@ final class StoreBackedDagSource implements DagSource {
                 behind.uniqueIndexes().stream()
                         .map(index -> carriedKey(index, walked.projections()))
                         .flatMap(Optional::stream).toList(),
-                resolved.fields());
+                resolved.fields(), resolved.types());
     }
 
     /**
@@ -3617,7 +3751,7 @@ final class StoreBackedDagSource implements DagSource {
     private static Optional<List<String>> carriedKey(List<String> key, List<Map<String, FieldRule>> projections) {
         List<String> current = key;
         for (Map<String, FieldRule> rules : projections) {
-            List<String> renamed = renamedKey(current, rules);
+            List<String> renamed = KeyProjection.renamed(current, rules);
             if (renamed.size() != current.size()) {
                 return Optional.empty();
             }
@@ -3629,17 +3763,6 @@ final class StoreBackedDagSource implements DagSource {
             current = renamed;
         }
         return Optional.of(current);
-    }
-
-    /** Key columns under the names a map's renames give them; a column no rename reads keeps its name. */
-    private static List<String> renamedKey(List<String> key, Map<String, FieldRule> rules) {
-        Map<String, String> renamedTo = new LinkedHashMap<>();
-        rules.forEach((output, rule) -> {
-            if (rule instanceof FieldRule.Rename rename) {
-                renamedTo.put(rename.sourceField(), output);
-            }
-        });
-        return List.copyOf(new LinkedHashSet<>(key.stream().map(column -> renamedTo.getOrDefault(column, column)).toList()));
     }
 
     /** Whether a map's rule for a column writes something other than that column's own value. */
@@ -3678,7 +3801,8 @@ final class StoreBackedDagSource implements DagSource {
                         resolvedTable,
                         discovered.primaryKey(),
                         uniqueIndexesOf(discovered),
-                        discovered.fields().stream().map(field -> field.name()).toList()))
+                        discovered.fields().stream().map(field -> field.name()).toList(),
+                        rollupTypesOf(discovered)))
                 .orElseGet(() -> new NestTable(resolvedTable, List.of()));
     }
 
@@ -3688,6 +3812,18 @@ final class StoreBackedDagSource implements DagSource {
      * non-unique indexes are dropped here rather than downstream: an index that does not identify a row
      * is not a candidate, and carrying it further would only give the compiler more to reject.
      */
+    private static Map<String, io.tapstate.core.dsl.aggregate.ValueType> rollupTypesOf(SourceTable table) {
+        Map<String, io.tapstate.core.dsl.aggregate.ValueType> types = new LinkedHashMap<>();
+        for (var field : table.fields()) {
+            // A decimal keeps the scale it was declared with, which is the scale its sums are exact at. The
+            // precision is not carried: a sum widens to 38 digits whatever the column held.
+            Integer scale = field.type() == io.tapstate.core.common.TapstateType.DECIMAL
+                    && field.numericType() != null ? field.numericType().scale() : null;
+            types.put(field.name(), new io.tapstate.core.dsl.aggregate.ValueType(field.type(), scale));
+        }
+        return types;
+    }
+
     private static List<List<String>> uniqueIndexesOf(SourceTable table) {
         List<List<String>> unique = new ArrayList<>();
         for (SourceIndex index : table.indexes()) {
@@ -4510,6 +4646,10 @@ final class StoreBackedDagSource implements DagSource {
                 table = nestTable(assemblyRoot(step), tables).name();
                 names.put(stream, new TargetTable(table, List.of()));
                 continue;
+            } else if (AggregateSteps.of(step) != null) {
+                // An aggregate's rows land in a table named by the step, whatever its input is called.
+                names.put(stream, new TargetTable(stream, List.of()));
+                continue;
             }
             if (table != null) {
                 names.put(stream, names.getOrDefault(table, new TargetTable(table, List.of())));
@@ -4721,6 +4861,11 @@ final class StoreBackedDagSource implements DagSource {
 
     /** The source reference that determines an assembly's physical output name and source ownership. */
     private static FromRef assemblyRoot(Step step) {
+        if (AggregateSteps.of(step) != null) {
+            // An aggregate reads one input; what it publishes belongs to the source of that input.
+            List<FromRef> refs = refsOf(step.from());
+            return refs.size() == 1 ? refs.getFirst() : null;
+        }
         if (!(step instanceof Step.Inline inline) || !(step.from() instanceof FromClause.Aliases aliases)) {
             return null;
         }

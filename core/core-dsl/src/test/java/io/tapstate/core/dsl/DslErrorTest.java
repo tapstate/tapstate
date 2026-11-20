@@ -68,7 +68,8 @@ class DslErrorTest {
                 // a join reading another step or a pattern: the wiring is written in the document, so
                 // an ordinary corpus case witnesses each
                 "dsl.join-input-not-a-table",
-                "dsl.join-input-is-a-pattern");
+                "dsl.join-input-is-a-pattern", "dsl.rollup-function-unknown",
+                "dsl.rollup-on-single-row-embed", "dsl.rollup-level-without-fields");
     }
 
     @Test

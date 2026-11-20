@@ -48,6 +48,9 @@ final class AlertDeliveryRuntime implements AutoCloseable {
             active.run();
             for(var result:List.copyOf(pending.values())) persist(result);
             renew();
+            if(pending.isEmpty()&&running.isEmpty()&&store.deliveryIntentsEmpty()){
+                active.run();cursor=null;failure.set(null);return;
+            }
             var page=store.dueIntents(clock.instant(),cursor,32);cursor=page.next();
             boolean paused=page.isolatedRecords();
             for(var row:page.rows()){

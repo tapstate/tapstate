@@ -34,6 +34,7 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 
 | Features | |
 |---|---|
+| [Aggregate](aggregate/) | Keep one row per group current, with counts, sums and extremes over the group's rows. |
 | [Filter](filter/) | Keep matching rows in a live view, including removals and source before-image requirements. |
 | [Join](join/) | SQL subset, dimension-key uniqueness, output keys, and usage requirements. |
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |

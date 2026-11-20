@@ -18,12 +18,32 @@ sealed interface ExplainOutcome {
             Next next,
             Pending pending,
             Plan plan,
-            List<String> awaitingRebalance) implements ExplainOutcome {
+            List<String> awaitingRebalance,
+            List<Rollup> rollups,
+            List<Aggregate> aggregates) implements ExplainOutcome {
 
         public Found {
             evidence = List.copyOf(evidence);
             cannotSay = List.copyOf(cannotSay);
             awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
+            rollups = rollups == null ? List.of() : List.copyOf(rollups);
+            aggregates = aggregates == null ? List.of() : List.copyOf(aggregates);
+        }
+
+        /** An explanation of a pipeline with no aggregate step. */
+        Found(String pipelineId, String state, String kind, String message, String observedAt,
+                Long observedAgeMillis, String freshness, List<Evidence> evidence, List<String> cannotSay, Next next,
+                Pending pending, Plan plan, List<String> awaitingRebalance, List<Rollup> rollups) {
+            this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay,
+                    next, pending, plan, awaitingRebalance, rollups, List.of());
+        }
+
+        /** An explanation of a pipeline that declares no rollup fields. */
+        Found(String pipelineId, String state, String kind, String message, String observedAt,
+                Long observedAgeMillis, String freshness, List<Evidence> evidence, List<String> cannotSay, Next next,
+                Pending pending, Plan plan, List<String> awaitingRebalance) {
+            this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay,
+                    next, pending, plan, awaitingRebalance, List.of());
         }
 
         /** An explanation beside {@code plan}, which every member of the cluster was planned for. */
@@ -122,5 +142,24 @@ sealed interface ExplainOutcome {
     }
 
     record Unreachable() implements ExplainOutcome {
+    }
+
+    /**
+     * What one aggregate step keeps in state, as the server listed it. The row count, the estimate and the
+     * count are each null when the server did not know them.
+     */
+    record Aggregate(String step, int entriesPerRow, List<String> keptInputFields, Long inputRows,
+            Long estimatedEntries, Long storedEntries) {
+        public Aggregate {
+            keptInputFields = keptInputFields == null ? List.of() : List.copyOf(keptInputFields);
+        }
+    }
+
+    /** One rollup field the pipeline declares, as the server listed it. */
+    record Rollup(String step, String level, String embed, String field, String function, String argument,
+            String filter, List<String> references) {
+        public Rollup {
+            references = references == null ? List.of() : List.copyOf(references);
+        }
     }
 }
