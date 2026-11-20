@@ -233,7 +233,7 @@ public final class PdkSinkPort implements SinkPort {
                     connector.resolveTargetTypes(table);
                     preparation.prepare(target, table);
                 }
-                PdkTargetIdentityPlanner.verifyPrepared(connector, config, targets, identities,operationObserver);
+                PdkTargetIdentityPlanner.verifyEagerTargets(connector, config, targets, identities, operationObserver);
                 return null;
             });
         } catch (TapstateException e) {

@@ -24,6 +24,46 @@ class ScopedTargetPreparationTest {
             List.of(new TargetIndex(List.of("id"), true)));
 
     @Test
+    void aNewDeferredUnwindTargetVerifiesItsLogicalIndexAfterPreparation(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
+        var calls = new ArrayList<String>();
+        var indexes = new ArrayList<io.tapdata.entity.schema.TapIndex>();
+        var deferredUnwind = new TargetTable("orders", List.of(
+                new TargetField("_id", "string", true, io.tapstate.core.common.TapstateType.STRING),
+                new TargetField("position", "long", true, io.tapstate.core.common.TapstateType.INT64),
+                TargetField.deferredDecimal("amount", decimalType())),
+                List.of(new TargetIndex(List.of("_id", "position"), true)),
+                new UnwindIdentity(List.of("_id"), "_unwind_source_id"));
+        var targets = Map.of("expanded", deferredUnwind);
+        var config = new SinkConfig("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null,
+                NODE, OnFullLoad.CLEAR, true);
+        var connector = PdkConnector.open("mongodb", IdentityConnectorFixture.ref(directory), Map.of());
+        connector.functions().supportGetTableNamesFunction((context, size, out) ->
+                out.accept(indexes.isEmpty() ? List.of() : List.of("orders")));
+        connector.functions().supportClearTable((context, event) -> calls.add("clear"));
+        connector.functions().supportCreateIndex((context, model, event) -> indexes.addAll(event.getIndexList()));
+        connector.functions().supportQueryIndexes((context, table, out) -> out.accept(List.copyOf(indexes)));
+        var frozen = PdkTargetIdentityPlanner.assess(connector, config, targets);
+        var store = new Receipts(calls, frozen.get("expanded").target());
+        try (var writer = new PdkSinkWriter(connector, (context, events, table, result) -> {
+            throw new AssertionError("the empty snapshot cannot write rows");
+        }, config, targets, null, true, null, PipelineNode.Purpose.SYNC, binding(store), frozen)) {
+            writer.prepareTargets();
+            assertThat(indexes).isEmpty();
+            assertThat(calls).isEmpty();
+
+            writer.snapshotDelivered("expanded");
+
+            assertThat(indexes).anySatisfy(index -> {
+                assertThat(index.getUnique()).isTrue();
+                assertThat(index.getIndexFields()).extracting(io.tapdata.entity.schema.TapIndexField::getName)
+                        .containsExactly("_unwind_source_id", "position");
+            });
+            assertThat(store.held.phase()).isEqualTo(SinkPreparationStore.Phase.READY);
+        }
+    }
+
+    @Test
     void emptyDeferredSnapshotPreparesAtTheDeliveredBoundaryWithoutWritingRows(
             @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
         var calls = new ArrayList<String>();

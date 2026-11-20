@@ -459,6 +459,71 @@ class SinkProcessorTest {
     }
 
     @Test
+    void a_later_cdc_bound_does_not_displace_a_held_empty_snapshot_notification() throws Exception {
+        var calls = new ArrayList<String>();
+        var pending = new CompletableFuture<WriteResult>();
+        var writer = new RecordingSnapshotWriter(calls) {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return pending;
+            }
+        };
+        var ack = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                calls.add("bounded=" + chain);
+            }
+        };
+        var processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1));
+        var inbox = new TestInbox();
+        inbox.add(snapshotRow("lines"));
+        processor.process(0, inbox);
+
+        processor.tryProcessWatermark(snapshotBoundOn("orders"));
+        processor.tryProcessWatermark(boundAt("orders", 2));
+        assertThat(calls).isEmpty();
+
+        pending.complete(new WriteResult(1));
+        drain(processor);
+
+        assertThat(calls).containsExactly("prepared=orders", "bounded=orders");
+    }
+
+    @Test
+    void an_empty_assembled_output_is_prepared_after_all_of_its_input_snapshots_and_before_final_ack()
+            throws Exception {
+        var calls = new ArrayList<String>();
+        var chains = new PipelineChains();
+        chains.source("source-orders", "orders");
+        chains.source("source-lines", "lines");
+        chains.assembled("nested", List.of("source-orders", "source-lines"));
+        chains.derived("filtered", List.of("nested"));
+        var ack = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                throw new AssertionError("the empty output has no position to advance");
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                calls.add("bounded=" + chain);
+            }
+        };
+        var processor = init(new SinkProcessor(new RecordingSnapshotWriter(calls), ack,
+                new ContiguousPrefix(AXES), 1, 1).withAssembledOutputs(chains.assembledOutputs(List.of("filtered"))));
+
+        processor.tryProcessWatermark(snapshotBoundOn("orders"));
+        assertThat(calls).containsExactly("prepared=orders", "bounded=orders");
+        processor.tryProcessWatermark(snapshotBoundOn("lines"));
+        assertThat(calls).containsExactly("prepared=orders", "bounded=orders",
+                "prepared=lines", "prepared=nested", "bounded=lines");
+    }
+
+    @Test
     void failed_snapshot_preparation_keeps_the_empty_snapshot_unacknowledged() throws Exception {
         var calls = new ArrayList<String>();
         var failure = new IllegalStateException("target schema could not be prepared");

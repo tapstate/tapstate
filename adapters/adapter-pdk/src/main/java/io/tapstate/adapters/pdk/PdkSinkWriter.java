@@ -58,6 +58,7 @@ final class PdkSinkWriter implements SinkWriter {
     private Map<String, TargetIdentityPlan> identities = Map.of();
     private SinkConfig identityConfig;
     private boolean identityPrepared;
+    private final Set<String> verifiedDeferredIdentities = new HashSet<>();
     // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
@@ -177,7 +178,7 @@ final class PdkSinkWriter implements SinkWriter {
                 preparation.prepare(target, tableModel(entry.getKey(), target));
             }
             if (identityConfig != null) {
-                PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities,operationObserver);
+                PdkTargetIdentityPlanner.verifyEagerTargets(connector, identityConfig, targets, identities, operationObserver);
                 identityPrepared = true;
             }
             return null;
@@ -235,13 +236,22 @@ final class PdkSinkWriter implements SinkWriter {
         if (target == null || !target.hasDeferredDecimal()) return;
         try {
             connector.underLoader(() -> {
-                preparation.prepareForWrite(target, tableModel(stream, target));
+                prepareDeferredTarget(stream, target, tableModel(stream, target));
                 return null;
             });
         } catch (TapstateException failure) {
             throw failure;
         } catch (Throwable failure) {
             throw writeFailed(connector.connectorId(), failure);
+        }
+    }
+
+    private void prepareDeferredTarget(String stream, TargetTable target, TapTable table) throws Throwable {
+        preparation.prepareForWrite(target, table);
+        TargetIdentityPlan identity = identities.get(stream);
+        if (identity != null && !verifiedDeferredIdentities.contains(stream)) {
+            PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets.get(stream), identity, operationObserver);
+            verifiedDeferredIdentities.add(stream);
         }
     }
 
@@ -260,6 +270,10 @@ final class PdkSinkWriter implements SinkWriter {
                 }
                 if (!batch.keys().isEmpty()) {
                     if (!identityPrepared) prepareTargets();
+                    for (String stream : batch.keys().keySet()) {
+                        TargetTable target = projectedTarget(stream, targets.get(stream));
+                        if (target.hasDeferredDecimal()) prepareDeferredTarget(stream, target, tableModel(stream, target));
+                    }
                     batch.keys().forEach((stream, keys) -> PdkMongoIdentityGuard.verify(connector, identities.get(stream), keys));
                 }
                 return writeRows(rowsByTable);
