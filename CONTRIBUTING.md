@@ -269,6 +269,9 @@ its own private channel — see [SECURITY.md](SECURITY.md) — and never a publi
 A CI check enforces this on every pull request. It is not a coverage target: one
 smoke-level case is the floor — a case that fails if your change is reverted.
 
+See [Test placement](.github/workflows/README.md#test-placement) to choose which
+jobs run your case and record the execution evidence for review.
+
 **Write it declaratively first.** A case is a directory under `e2e/examples/`:
 
 ```

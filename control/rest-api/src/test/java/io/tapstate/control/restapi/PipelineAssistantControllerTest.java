@@ -7,6 +7,10 @@ import io.tapstate.control.core.AiProviderService;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.CredentialAuthentication;
+import io.tapstate.control.core.Scope;
+import io.tapstate.control.core.TapstatePrincipal;
+import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.ApplyService;
@@ -28,6 +32,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.security.core.context.SecurityContextHolder;
 import tools.jackson.databind.json.JsonMapper;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -46,6 +52,82 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.*;
 
 class PipelineAssistantControllerTest {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void onPremStreamPublishesOnlyWhileTheOriginalAuthenticationIsActive(boolean retire) throws Exception {
+        var drafts = new PipelineApiTest.FakePipelineDraftStore();
+        var base = draft();
+        drafts.create(base);
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
+        var schema = new DiscoveredSourceModel("src", "mysql", 1,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()))));
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) {
+                return "src".equals(id) ? Optional.of(schema) : Optional.empty();
+            }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var mapper = JsonMapper.builder().build();
+        var candidate = AssistantWizardJson.view(
+                AssistantWizardJson.object(PipelineDraftJson.write(mapper, base).get("wizard")));
+        candidate.put("destinationTable", "customer_orders");
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(drafts,
+                new PipelineApiTest.TestApp().artifactQueryService(artifacts), audit, apply));
+        beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
+        beans.registerSingleton("mode", AuthenticationMode.ON_PREM);
+        var providerService = org.mockito.Mockito.mock(AiProviderService.class);
+        org.mockito.Mockito.when(providerService.require("[\"on-prem\"]"))
+                .thenReturn(new AiProviderSettings("openai-compatible", "https://api.openai.com/v1", "model", "test-key"));
+        beans.registerSingleton("providerService", providerService);
+
+        var active = new AtomicBoolean(true);
+        AiProviderClient client = new AiProviderClient() {
+            public void check(AiProviderSettings settings) { }
+
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                if (retire) active.set(false);
+                text.accept("Provider output");
+                return Optional.of(candidate);
+            }
+        };
+        var providers = new AiProviderController(beans.getBeanProvider(AiProviderService.class), null,
+                beans.getBeanProvider(AuthenticationMode.class), client);
+        var assistant = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), providers, client,
+                mapper);
+        var token = new VerifiedToken("operator", Scope.WRITE);
+        var original = new CredentialAuthentication(token, Optional.empty(), Optional.empty(), () -> {
+            if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
+        });
+        SecurityContextHolder.getContext().setAuthentication(new TapstateAuthentication(TapstatePrincipal.humanJwt(token), original));
+        org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody stream;
+        try {
+            stream = assistant.assistant("orders", Map.of("revision", 1,
+                    "messages", List.of(Map.of("role", "user", "text", "Suggest a pipeline"))),
+                    new MockHttpServletRequest(), new MockHttpServletResponse()).getBody();
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+        var output = new ByteArrayOutputStream();
+        stream.writeTo(output);
+        String events = output.toString(StandardCharsets.UTF_8);
+        if (retire) {
+            assertThat(events).contains(ControlError.UNAUTHENTICATED.code(), "[DONE]")
+                    .doesNotContain("Provider output", "data-proposal");
+        } else {
+            assertThat(events).contains("Provider output", "data-proposal", "customer_orders", "[DONE]");
+        }
+    }
+
     @Test void malformedMessageEntryIsRejectedWithCodedRequestErrorBeforeStreaming() {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         store.create(draft());

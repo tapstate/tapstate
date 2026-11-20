@@ -4,6 +4,7 @@ import io.tapstate.control.core.PipelinePreviewService;
 import io.tapstate.control.core.AiProviderClient;
 import io.tapstate.control.core.OpenAiCompatibleClient;
 import io.tapstate.messages.MessageCatalog;
+import org.springframework.boot.webmvc.autoconfigure.WebMvcRegistrations;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.bind.annotation.RestController;
@@ -11,6 +12,7 @@ import org.springframework.web.method.HandlerTypePredicate;
 import org.springframework.web.servlet.config.annotation.AsyncSupportConfigurer;
 import org.springframework.web.servlet.config.annotation.PathMatchConfigurer;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 import java.time.Duration;
 
@@ -38,6 +40,16 @@ public class RestApiConfiguration {
         long previewBudget = PipelinePreviewService.DEADLINE.plus(ASYNC_RESPONSE_BUFFER).toMillis();
         long assistantBudget = OpenAiCompatibleClient.maximumProposalDuration().plus(ASYNC_RESPONSE_BUFFER).toMillis();
         return Math.max(Math.max(previewBudget, assistantBudget), 105000L);
+    }
+
+    @Bean
+    WebMvcRegistrations operationWebMvcRegistrations() {
+        return new WebMvcRegistrations() {
+            @Override
+            public RequestMappingHandlerMapping getRequestMappingHandlerMapping() {
+                return new OperationRequestMappingHandlerMapping();
+            }
+        };
     }
 
     @Bean

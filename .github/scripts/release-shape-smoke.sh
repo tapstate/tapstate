@@ -339,6 +339,8 @@ has "and a red smoke blocks the gate" gates 'needs:.*cli-native'
 
 # --- the gate is upstream of the draft -------------------------------------------------------------
 has "the draft waits on the gate"             draft  'needs:.*gates'
+has "the gate waits on the full reactor"       gates  'needs:.*reactor-regression'
+has "the reactor verifies the release commit" reactor-regression 'source-sha:.*needs[.]version[.]outputs[.]sha'
 has "the gate waits on the connector lane"    gates  'needs:.*connectors'
 has "the gate waits on the performance lane" gates  'needs:.*join-perf'
 # The slow lane starts alongside the build, not after it, which is the only reason its ~38 minutes
@@ -453,6 +455,10 @@ else
 fi
 release_workflow="$workflow"
 workflow="$nightly"
+has "Nightly verifies the run commit" reactor-regression 'source-sha:.*github[.]sha'
+hasnt "Nightly reactor execution is independent" reactor-regression '^    needs:'
+has "the failure alert observes reactor regression" notify-feishu 'needs:.*reactor-regression'
+has "the failure alert names reactor regression" notify-feishu 'failed[+]=[(]reactor-regression[)]'
 for j in real-connectors join-perf cli-native release-images; do
   has "Nightly calls the shared $j workflow" "$j" "uses: .*${j}[.]yml"
   has "Nightly pins $j to the event commit" "$j" 'source-sha:.*github[.]sha'

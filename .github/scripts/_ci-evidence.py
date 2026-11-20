@@ -1454,7 +1454,7 @@ def ledger_selector(args, root, inv, files):
         require(args.shard and re.fullmatch(r'[A-Za-z0-9_-]+', args.shard), 'published shard identity is invalid')
         path = Path(args.shard_plan); plan = load(path)
         require(type(plan.get('schema')) is int and plan['schema'] == 1, 'published shard plan schema differs')
-        identities = [tuple(test[field] for field in ('module', 'kind', 'class')) + ((test['example'],) if 'example' in test else ()) for test in plan['expected']]
+        identities = [tuple(test[field] for field in ('module', 'kind', 'class')) + tuple(test[field] for field in ('example', 'method') if field in test) for test in plan['expected']]
         require(plan['cohort_hash'] == digest(json.dumps(sorted(identities)).encode()), 'published plan cohort differs')
         matches = [entry for entry in plan['shards'] if entry['id'] == args.shard]
         require(len(matches) == 1, 'published shard selector is missing or duplicate')
