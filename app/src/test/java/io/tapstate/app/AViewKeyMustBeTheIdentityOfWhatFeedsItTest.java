@@ -61,7 +61,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         assertThatThrownBy(() -> dagFor(artifacts))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-key-not-feed-identity"));
+                .satisfies(code("TS0360024"));
     }
 
     @Test
@@ -72,7 +72,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         assertThatThrownBy(() -> dagFor(artifacts))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-key-not-feed-identity"));
+                .satisfies(code("TS0360024"));
     }
 
     @Test
@@ -89,7 +89,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         assertThatThrownBy(() -> dagFor(artifacts))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-fed-by-many-tables"));
+                .satisfies(code("TS0360025"));
     }
 
     @Test
@@ -110,7 +110,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         assertThatThrownBy(() -> dagFor(artifacts))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-store-is-a-capture-source"));
+                .satisfies(code("TS0360026"));
     }
 
     @Test
@@ -120,7 +120,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         // NullPointerException. The missing key is the earlier and simpler fact; it must speak first.
         assertThatThrownBy(() -> dagFor(nestWorkspace(List.of("id"), null)))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-key-missing"));
+                .satisfies(code("TS0360020"));
     }
 
     @Test
@@ -142,7 +142,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-key-not-feed-identity"));
+                .satisfies(code("TS0360024"));
     }
 
     @Test
@@ -162,7 +162,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-key-not-feed-identity"))
+                .satisfies(code("TS0360024"))
                 .satisfies(error -> Assertions.assertThat(((TapstateException) error).args())
                         .containsEntry("identity", "email"));
     }
@@ -242,7 +242,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
             assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                     .as(descriptor)
                     .isInstanceOf(TapstateException.class)
-                    .satisfies(code("actuation.view-key-not-feed-identity"));
+                    .satisfies(code("TS0360024"));
         }
     }
 
@@ -267,7 +267,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-key-not-feed-identity"))
+                .satisfies(code("TS0360024"))
                 .satisfies(error -> Assertions.assertThat(((TapstateException) error).args())
                         .containsEntry("identity", "id"));
     }
@@ -278,7 +278,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                 .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-key-not-feed-identity"));
+                .satisfies(code("TS0360024"));
     }
 
     @Test

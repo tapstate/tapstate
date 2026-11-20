@@ -43,7 +43,7 @@ class ARollupDocumentPastItsWidthIsReportedOnceTest {
         List<String> warnings = run(nest("customer", List.of("customer_id"), policies));
 
         assertThat(warnings).hasSize(1);
-        assertThat(warnings.getFirst()).startsWith("nest.rollup-level-wide: document")
+        assertThat(warnings.getFirst()).startsWith("TS0460003: document")
                 .contains("C-wide").contains(String.valueOf(RollupGuidance.elementsPerDocument(0)));
     }
 

@@ -53,7 +53,7 @@ public class StorageHttpFace {
     record UnavailableHandler(ApiSecurityErrorWriter errors) implements HttpRequestHandler {
         @Override
         public void handleRequest(HttpServletRequest request, HttpServletResponse response) throws IOException {
-            errors.write(response, ControlError.STORAGE_UNAVAILABLE, Map.of());
+            errors.write(request, response, ControlError.STORAGE_UNAVAILABLE, Map.of());
         }
     }
 }

@@ -1,6 +1,8 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.AggregateErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 import java.util.Set;
 
@@ -25,33 +27,16 @@ public enum AggregateSizingError implements TapstateErrorCode {
      * is two and one more for each field that keeps its inputs; {@code estimatedEntries} is that times
      * {@code inputRows}, an upper estimate since a row failing the step's condition keeps one entry.
      */
-    STATE_ESTIMATE("aggregate.state-estimate",
-            Set.of("pipeline", "step", "entriesPerRow", "inputRows", "estimatedEntries")),
+    STATE_ESTIMATE(AggregateErrorDefinitions.STATE_ESTIMATE),
 
     /** What the step keeps per input row, where an input reports no row count to size the whole on. */
-    STATE_ESTIMATE_UNSIZED("aggregate.state-estimate-unsized", Set.of("pipeline", "step", "entriesPerRow"));
+    STATE_ESTIMATE_UNSIZED(AggregateErrorDefinitions.STATE_ESTIMATE_UNSIZED);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    AggregateSizingError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    AggregateSizingError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    /** A cost is told, never refused: the step is correct at any size. */
-    @Override
-    public Severity severity() {
-        return Severity.WARNING;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

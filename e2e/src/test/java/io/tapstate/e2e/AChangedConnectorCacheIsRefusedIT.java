@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.spi.store.ContentHash;
@@ -59,16 +60,31 @@ class AChangedConnectorCacheIsRefusedIT {
                     .timeout(Duration.ofSeconds(30))
                     .header("Authorization", "Bearer " + control.credential())
                     .header("Content-Type", "application/json")
+                    .header("Accept-Language", "en")
                     .POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(Map.of(
                             "id", "orders", "connectorId", E2eConnectorJar.CONNECTOR_ID, "settings", settings))))
                     .build();
             try (HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
                 HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
                 assertThat(response.statusCode()).isEqualTo(500);
-                assertThat(JsonReader.parse(response.body())).isEqualTo(Map.of(
-                        "code", "connector.load-failed",
-                        "params", Map.of("connector", E2eConnectorJar.CONNECTOR_ID),
-                        "message", "Connector 'e2e_file' could not be loaded."));
+                assertThat(JsonReader.parse(response.body())).isInstanceOf(Map.class);
+                var failure = (Map<?, ?>) JsonReader.parse(response.body());
+                assertThat(failure.get("code")).isEqualTo(ConnectorError.LOAD_FAILED.code());
+                assertThat(failure.get("params")).isEqualTo(Map.of("connector", E2eConnectorJar.CONNECTOR_ID));
+                assertThat(failure.get("message")).isEqualTo("Connector 'e2e_file' could not be loaded.");
+                assertThat(failure.get("solution"))
+                        .isEqualTo("Check the connector jar and its dependencies are present and readable.");
+                assertThat(failure.get("diagnostic")).isInstanceOf(Map.class);
+                var diagnostic = (Map<?, ?>) failure.get("diagnostic");
+                assertThat(diagnostic.get("codeSource")).isEqualTo("tapstate-standard");
+                for (String field : List.of("code", "params", "message", "solution")) {
+                    assertThat(diagnostic.get(field)).as("shared diagnostic field %s", field)
+                            .isEqualTo(failure.get(field));
+                }
+                if (diagnostic.containsKey("rawMessage")) {
+                    assertThat(diagnostic.get("rawMessage")).isInstanceOf(String.class);
+                    assertThat((String) diagnostic.get("rawMessage")).isNotBlank();
+                }
                 assertThat(response.body()).doesNotContain(directory.toString(), hash, "cause", "stackTrace");
             }
             assertThat(Files.readAllBytes(seed)).isEqualTo(artifact);

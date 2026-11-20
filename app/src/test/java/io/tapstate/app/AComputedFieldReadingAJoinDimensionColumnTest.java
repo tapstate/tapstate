@@ -63,7 +63,7 @@ class AComputedFieldReadingAJoinDimensionColumnTest {
             fail("expected transform.expression-failed, but the computed row carried %s as %s",
                     leaked, leaked == null ? "null" : leaked.getClass().getName());
         } catch (TapstateException failure) {
-            assertThat(failure.code().code()).isEqualTo("transform.expression-failed");
+            assertThat(failure.code().code()).isEqualTo("TS0450001");
             assertThat(failure.args()).containsEntry("expr", "after.customer + '!'");
         }
     }

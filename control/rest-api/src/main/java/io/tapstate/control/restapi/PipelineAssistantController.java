@@ -78,11 +78,19 @@ class PipelineAssistantController {
     private final AiProviderController providers;
     private final ObjectMapper json;
     private final AiProviderClient client;
+    private final io.tapstate.messages.MessageCatalog catalog;
     PipelineAssistantController(ObjectProvider<PipelineDraftService> drafts,
             ObjectProvider<SourceProjectionService> sources, ObjectProvider<SourceSchemaQueryService> schemas,
             AiProviderController providers, AiProviderClient client, ObjectMapper json) {
+        this(drafts, sources, schemas, providers, client, json, io.tapstate.messages.MessageCatalog.bundled());
+    }
+    @org.springframework.beans.factory.annotation.Autowired
+    PipelineAssistantController(ObjectProvider<PipelineDraftService> drafts,
+            ObjectProvider<SourceProjectionService> sources, ObjectProvider<SourceSchemaQueryService> schemas,
+            AiProviderController providers, AiProviderClient client, ObjectMapper json,
+            io.tapstate.messages.MessageCatalog catalog) {
         this.drafts = drafts; this.sources = sources; this.schemas = schemas; this.providers = providers;
-        this.client = client; this.json = json;
+        this.client = client; this.json = json; this.catalog = catalog;
     }
     @Verb("pipeline-draft.assistant")
     @PostMapping(value = "/pipelines/{id}/draft:assistant", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -95,14 +103,11 @@ class PipelineAssistantController {
         long revision = revision(body.get("revision"));
         PipelineDraft base = current(id, revision);
         List<Map<String, String>> messages = messages(body.get("messages"));
+        var locale = ApiExceptionHandler.localeFor(request);
         StreamingResponseBody stream = output -> {
             AssistantStream streamEvents = new AssistantStream(output, response::flushBuffer);
             if (!CAPACITY.tryAcquire()) {
-                streamEvents.event(Map.of("type", ERROR, ERROR_TEXT, ControlError.AI_OVERLOADED.code()));
-                streamEvents.event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, ERROR, STATUS, ERROR,
-                        "code", ControlError.AI_OVERLOADED.code())));
-                streamEvents.event(Map.of("type", FINISH, FINISH_REASON, ERROR));
-                streamEvents.done();
+                streamEvents.failure(ApiError.render(ControlError.AI_OVERLOADED, Map.of(), Map.of(), catalog, locale));
                 return;
             }
             String textId = UUID.randomUUID().toString();
@@ -129,7 +134,7 @@ class PipelineAssistantController {
                 // A cancelled request consumes its interrupt before returning the pooled thread.
                 if (disconnected.getCause() instanceof java.io.InterruptedIOException) Thread.interrupted();
             } catch (TapstateException failure) {
-                streamEvents.failure(failure.code().code());
+                streamEvents.failure(ApiError.from(failure, catalog, locale));
             } finally { heartbeat.shutdownNow(); CAPACITY.release(); }
         };
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
@@ -644,11 +649,14 @@ class PipelineAssistantController {
             done();
         }
 
-        void failure(String code) {
+        void failure(ApiError failure) {
             synchronized (lock) {
             try {
-                event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, ERROR, STATUS, ERROR, "code", code)));
-                event(Map.of("type", ERROR, ERROR_TEXT, code));
+                var status = new LinkedHashMap<>(failure.fields());
+                status.put(STATE, ERROR);
+                status.put(STATUS, ERROR);
+                event(Map.of("type", DATA_STATUS, "data", status));
+                event(Map.of("type", ERROR, ERROR_TEXT, failure.code()));
                 event(Map.of("type", FINISH, FINISH_REASON, ERROR));
                 done();
             } catch (UncheckedIOException disconnected) {

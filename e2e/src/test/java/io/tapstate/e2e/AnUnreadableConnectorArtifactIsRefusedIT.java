@@ -26,7 +26,7 @@ class AnUnreadableConnectorArtifactIsRefusedIT {
             ControlPlane.Refusal refusal = control.registerConnectorExpectingRefusal(artifact);
 
             assertThat(refusal.status()).isEqualTo(400);
-            assertThat(refusal.code()).isEqualTo("connector.artifact-unreadable");
+            assertThat(refusal.code()).isEqualTo("TS0060013");
             assertThat(refusal.params()).containsKey("artifact");
             assertThat(refusal.params().get("artifact")).asString()
                     .contains("tapstate-connector-").endsWith(".jar");

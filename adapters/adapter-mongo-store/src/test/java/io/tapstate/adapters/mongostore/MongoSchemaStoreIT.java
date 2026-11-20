@@ -215,7 +215,7 @@ class MongoSchemaStoreIT {
 
             assertThatThrownBy(() -> store.get("torn"))
                     .isInstanceOfSatisfying(TapstateException.class, error ->
-                            assertThat(error.code().code()).isEqualTo("io.document-unreadable"));
+                            assertThat(error.code().code()).isEqualTo("TS0480004"));
         });
     }
 
@@ -305,7 +305,7 @@ class MongoSchemaStoreIT {
 
             assertThat(failure).isInstanceOf(TapstateException.class);
             TapstateException coded = (TapstateException) failure;
-            assertThat(coded.code().code()).isEqualTo("io.schema-read-contention");
+            assertThat(coded.code().code()).isEqualTo("TS0480007");
             assertThat(coded.args()).containsExactlyEntriesOf(Map.of("connectionId", "orders-db"));
             assertThat(reads.get()).isEqualTo(8);
             assertThat(publications.get()).isEqualTo(8);

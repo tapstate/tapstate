@@ -8,7 +8,7 @@ import java.util.Map;
 /**
  * Boundary validation for request bodies. A structurally malformed request — a missing required field left
  * null or blank — is a client-attributable, diagnosable error, so it is refused right at the HTTP boundary
- * with a coded {@code control.malformed-request} (a 400) carrying a human {@code reason}, rather than being
+ * with a coded {@link ControlError#MALFORMED_REQUEST} (a 400) carrying a human {@code reason}, rather than being
  * left to trip a bare invariant crash (a 500) deeper inside a control-core service. The service layer keeps
  * its own bare invariant guards for genuine programmer errors; this layer catches the client's malformed
  * input first, before the service call is made.

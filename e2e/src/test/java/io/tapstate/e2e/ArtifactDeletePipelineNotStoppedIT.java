@@ -46,7 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ArtifactDeletePipelineNotStoppedIT {
 
-    private static final String NOT_STOPPED = "artifact.pipeline-not-stopped";
+    private static final String NOT_STOPPED = "TS0240005";
 
     @BeforeAll
     static void requireDocker() {

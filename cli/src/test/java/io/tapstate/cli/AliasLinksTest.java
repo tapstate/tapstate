@@ -67,7 +67,7 @@ class AliasLinksTest {
         assertThatThrownBy(() -> AliasLinks.install(binDir))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("cli.alias-name-taken"));
+                        .isEqualTo("TS0330006"));
 
         assertThat(Files.isSymbolicLink(foreign)).isFalse();
         assertThat(Files.readString(foreign)).contains("not tapstate");
@@ -84,7 +84,7 @@ class AliasLinksTest {
         assertThatThrownBy(() -> AliasLinks.uninstall(binDir))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("cli.alias-name-taken"));
+                        .isEqualTo("TS0330006"));
 
         assertThat(Files.readString(foreign)).contains("not tapstate");
     }
@@ -113,7 +113,7 @@ class AliasLinksTest {
 
         assertThatThrownBy(() -> AliasLinks.install(binDir))
                 .isInstanceOfSatisfying(TapstateException.class, e ->
-                        assertThat(e.code().code()).isEqualTo("cli.alias-name-taken"));
+                        assertThat(e.code().code()).isEqualTo("TS0330006"));
         assertThatThrownBy(() -> AliasLinks.uninstall(binDir))
                 .isInstanceOf(TapstateException.class);
         // Untouched, which is the point: refusing has to leave the other thing exactly as it was.
@@ -147,7 +147,7 @@ class AliasLinksTest {
 
         assertThatThrownBy(() -> AliasLinks.install(absent))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("cli.alias-link-failed");
+                    assertThat(e.code().code()).isEqualTo("TS0330008");
                     assertThat(e.args()).containsEntry("path", absent.resolve("tap").toString());
                     assertThat((String) e.args().get("reason")).isNotBlank();
                 });
@@ -164,7 +164,7 @@ class AliasLinksTest {
         try {
             assertThatThrownBy(() -> AliasLinks.uninstall(binDir))
                     .isInstanceOfSatisfying(TapstateException.class, e -> {
-                        assertThat(e.code().code()).isEqualTo("cli.alias-link-failed");
+                        assertThat(e.code().code()).isEqualTo("TS0330008");
                         assertThat(e.args()).containsEntry("path", alias.toString());
                     });
         } finally {

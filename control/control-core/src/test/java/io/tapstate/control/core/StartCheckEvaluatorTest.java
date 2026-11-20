@@ -75,7 +75,7 @@ class StartCheckEvaluatorTest {
         assertThat(refused.behavior()).isEqualTo(StartFinding.Behavior.WARN);
         assertThat(refused.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
         assertThat(refused.params()).containsEntry("check", "refused")
-                .containsEntry("reasonCode", "lifecycle.unknown-pipeline");
+                .containsEntry("reasonCode", "TS0280005");
         StartFinding slow = evaluation.finding("slow/pl").orElseThrow();
         assertThat(slow.behavior()).isEqualTo(StartFinding.Behavior.WARN);
         assertThat(slow.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
@@ -178,7 +178,7 @@ class StartCheckEvaluatorTest {
             assertThat(finding.key()).isEqualTo("target-not-empty/pl");
             assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.WARN);
             assertThat(finding.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
-            assertThat(finding.params()).containsEntry("reasonCode", "lifecycle.pipeline-not-runnable");
+            assertThat(finding.params()).containsEntry("reasonCode", "TS0280004");
         });
         assertThat(evaluator.report(evaluation, Set.of()).plan()).isEmpty();
     }
@@ -247,11 +247,11 @@ class StartCheckEvaluatorTest {
             assertThat(entry.onFullLoad()).isEqualTo("append");
         });
         StartCheckReport.Finding finding = report.findings().getFirst();
-        assertThat(finding.code()).isEqualTo("start-check.target-not-empty");
+        assertThat(finding.code()).isEqualTo("TS0290006");
         assertThat(finding.params()).containsEntry("rows", 1465L);
-        assertThat(finding.message()).startsWith("start-check.target-not-empty ");
+        assertThat(finding.message()).startsWith("TS0290006 ");
         assertThat(finding.actions()).extracting(StartCheckReport.Action::message)
-                .allSatisfy(message -> assertThat(message).startsWith("start-check."));
+                .allSatisfy(message -> assertThat(message).startsWith("TS029"));
     }
 
     @Test

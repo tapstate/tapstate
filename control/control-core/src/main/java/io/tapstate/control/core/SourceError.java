@@ -2,40 +2,40 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.SourceErrorDefinitions;
 
 import java.util.Set;
 
 /** Stable coded failures for Source-specific CRUD operations. */
 public enum SourceError implements TapstateErrorCode {
 
-    NOT_FOUND("source.not-found", Set.of("id")),
-    ALREADY_EXISTS("source.already-exists", Set.of("id")),
-    ID_MISMATCH("source.id-mismatch", Set.of("pathId", "bodyId")),
-    PRECONDITION_REQUIRED("source.precondition-required", Set.of("id")),
-    VERSION_CONFLICT("source.version-conflict", Set.of("id")),
-    IN_USE("source.in-use", Set.of("id", "referrers")),
-    SRS_CHANGE_WHILE_RUNNING("source.srs-change-while-running", Set.of("id", "pipelines"));
+    NOT_FOUND(SourceErrorDefinitions.NOT_FOUND),
+    ALREADY_EXISTS(SourceErrorDefinitions.ALREADY_EXISTS),
+    ID_MISMATCH(SourceErrorDefinitions.ID_MISMATCH),
+    PRECONDITION_REQUIRED(SourceErrorDefinitions.PRECONDITION_REQUIRED),
+    VERSION_CONFLICT(SourceErrorDefinitions.VERSION_CONFLICT),
+    IN_USE(SourceErrorDefinitions.IN_USE),
+    SRS_CHANGE_WHILE_RUNNING(SourceErrorDefinitions.SRS_CHANGE_WHILE_RUNNING);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    SourceError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
+    SourceError(ProductErrorDefinition definition) {
+        this.definition = definition;
     }
 
     @Override
     public String code() {
-        return code;
+        return definition.code();
     }
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return definition.severity();
     }
 
     @Override
     public Set<String> placeholders() {
-        return placeholders;
+        return definition.parameters();
     }
 }

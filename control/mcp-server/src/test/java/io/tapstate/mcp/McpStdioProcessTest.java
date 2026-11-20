@@ -83,7 +83,7 @@ class McpStdioProcessTest {
             Map<?, ?> callResult = (Map<?, ?>) called.get("result");
             assertThat(callResult.get("isError")).isEqualTo(true);
             assertThat(((Map<?, ?>) callResult.get("structuredContent")).get("code"))
-                    .isEqualTo("control.unreachable");
+                    .isEqualTo("TS0210005");
         } finally {
             process.getOutputStream().close();
             if (!process.waitFor(5, TimeUnit.SECONDS)) {

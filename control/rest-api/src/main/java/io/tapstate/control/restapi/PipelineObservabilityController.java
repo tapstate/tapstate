@@ -6,6 +6,8 @@ import io.tapstate.control.core.PipelineExplainService;
 import io.tapstate.control.core.PipelineHistoryQuery;
 import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.messages.MessageCatalog;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -25,10 +27,13 @@ class PipelineObservabilityController {
 
     private final PipelineHistoryQueryService history;
     private final PipelineExplainService explanations;
+    private final MessageCatalog catalog;
 
-    PipelineObservabilityController(PipelineHistoryQueryService history, PipelineExplainService explanations) {
+    PipelineObservabilityController(PipelineHistoryQueryService history, PipelineExplainService explanations,
+            MessageCatalog catalog) {
         this.history = history;
         this.explanations = explanations;
+        this.catalog = catalog;
     }
 
     @Verb("pipeline.metrics.history")
@@ -56,10 +61,12 @@ class PipelineObservabilityController {
 
     @Verb("pipeline.explain")
     @GetMapping("/pipelines/{id}/explain")
-    ResponseEntity<PipelineExplanationResponse> explain(@PathVariable("id") String id) {
+    ResponseEntity<PipelineExplanationResponse> explain(
+            @PathVariable("id") String id, HttpServletRequest request) {
         return ResponseEntity.ok()
                 .cacheControl(CacheControl.noStore())
-                .body(PipelineExplanationResponse.of(explanations.explain(id)));
+                .body(PipelineExplanationResponse.of(explanations.explain(id), catalog,
+                        ApiExceptionHandler.localeFor(request)));
     }
 
     private static java.time.Instant instant(String value, String name) {

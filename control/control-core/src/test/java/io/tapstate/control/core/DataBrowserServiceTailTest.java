@@ -82,7 +82,7 @@ class DataBrowserServiceTailTest {
                         + "road too. Enforced on one of two roads it is not enforced")
                 .isInstanceOf(TapstateException.class)
                 .satisfies(refused -> assertThat(((TapstateException) refused).code().code())
-                        .isEqualTo("data-browser.unknown-collection"));
+                        .isEqualTo("TS0390001"));
         assertThat(opened.get())
                 .as("and refused before the stream opens, not after it is already running")
                 .isNull();

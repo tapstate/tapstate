@@ -51,7 +51,7 @@ class TokenAdminServiceTest {
 
         assertThatThrownBy(() -> service.create("alice", Scope.WRITE))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("control.audit-blocked"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0210015"));
         assertThat(tokens.list()).isEmpty();
     }
 

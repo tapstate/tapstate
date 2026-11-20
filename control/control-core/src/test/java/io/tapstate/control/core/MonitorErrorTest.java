@@ -10,7 +10,7 @@ class MonitorErrorTest {
     @Test
     void everyCodeIsInTheMonitorDomainAndErrorSeverity() {
         for (MonitorError e : MonitorError.values()) {
-            assertThat(e.code()).startsWith("monitor.");
+            assertThat(e.code()).startsWith("TS040");
             assertThat(e.severity()).isEqualTo(Severity.ERROR);
         }
     }
@@ -19,10 +19,10 @@ class MonitorErrorTest {
     void carriesTheMonitorVocabularyCodes() {
         assertThat(MonitorError.values()).extracting(MonitorError::code).containsExactlyInAnyOrder(
                 // a status/metrics/snapshot read of a pipeline that has published no observation
-                "monitor.no-observation",
-                "monitor.invalid-cursor",
-                "monitor.cursor-expired",
-                "monitor.query-budget-exceeded");
+                "TS0400001",
+                "TS0400002",
+                "TS0400003",
+                "TS0400004");
     }
 
     @Test

@@ -726,7 +726,7 @@ class IndependentCdcRecoveryIT {
                             boolean ready = output.contains("Tapstate application is ready");
                             boolean occupiedPort = output.contains("Web server failed to start. Port "
                                     + server.baseUrl().getPort() + " was already in use.");
-                            if (!ready && (output.contains("boot.node-id-in-use") || occupiedPort)) {
+                            if (!ready && (output.contains("TS0310028") || output.contains("boot.node-id-in-use") || occupiedPort)) {
                                 refused.set(true); return true;
                             }
                             if (!server.isAlive()) throw new AssertionError("the prepared boot exited: " + output);

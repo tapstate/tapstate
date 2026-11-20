@@ -27,7 +27,6 @@ import org.bson.Document;
 /** Actual task and session ownership survives a bounded claim caller. */
 final class MongoClaimOperations {
     private final MongoClient client;
-    volatile boolean checkpointSimpleCollations;
     final MongoStructureProof structures = new MongoStructureProof();
     private final ThreadPoolExecutor workers = new ThreadPoolExecutor(4, 4, 100, TimeUnit.MILLISECONDS,
             new LinkedBlockingQueue<>(), action -> {

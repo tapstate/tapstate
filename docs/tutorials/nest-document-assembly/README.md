@@ -140,7 +140,7 @@ tapstate -w work                       # then, in the session:
 
 > **Discover before the second apply.** A nest sizes its levels from the row counts of the tables
 > feeding them. Applied before discovery, those counts are unknown and you get
-> `nest.capacity-estimate-incomplete` telling you the estimate is a floor. Discover both sources, apply
+> `TS0460002` telling you the estimate is a floor. Discover both sources, apply
 > once more, and the warning goes away.
 
 > **`start` returning `running` is not proof it runs.** A pipeline whose configuration is wrong can
@@ -285,7 +285,7 @@ count disagree. An order with no lines has `item_count: 0` and, from its `defaul
 A money total - `qty` times `unit_price` - is not here, and the reason is worth knowing: `unit_price` is a
 `DECIMAL(10,2)`, and arithmetic on decimals inside an expression is not available yet. Writing
 `total: { sum: "=after.qty * after.unit_price" }` is refused when you apply, with
-`nest.rollup-expression-invalid`, rather than computed through floating point. Summing one decimal column,
+`TS0490031`, rather than computed through floating point. Summing one decimal column,
 such as `$unit_price`, is exact. [Rollup fields](../../nest/rollup-fields.md) has the whole set of
 functions and rules.
 
@@ -318,10 +318,10 @@ claim the order's own field names, then drop the internal names after assembly. 
 including two flat child tables and the many-to-one direction, is in
 [Flat embeds](../../nest/flat-embeds.md).
 
-If two live invoice rows name one order, the run stops with `nest.flat-cardinality-violation`. If a flat
+If two live invoice rows name one order, the run stops with `TS0490014`. If a flat
 field overlaps the order, another flat child, or a nested path, model discovery rejects it before start
 when possible; an actual row catches anything the model could not see and stops with
-`nest.flat-field-conflict`.
+`TS0490005`.
 
 ## 4. The rule that decides relationship direction
 
@@ -362,7 +362,7 @@ key:
 Starting the pipeline fails with a diagnostic such as:
 
 ```
-nest.embed-target-not-parent-key {embedPath=lines.product, fields=product_id, parentKey=id}
+TS0490002 {embedPath=lines.product, fields=product_id, parentKey=id}
 ```
 
 Declare the actual row identity with `key` when discovery cannot provide it. Do not change `on` merely to

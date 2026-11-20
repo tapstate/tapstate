@@ -108,6 +108,21 @@ class PdkSnapshotPreparationTest {
         assertThat(counter("streams")).hasValue(0);assertThat(deliveries).hasValue(0);assertThat(counter("stops")).hasValue(1);
     }
 
+    @Test void aCdcPreflightRefusalReachesItsOpeningOwnerExactlyOnce() throws Exception {
+        var refused = new TapstateException(ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "prepared", "detail", "opening-secret"), null);
+        var facts = new java.util.ArrayList<io.tapstate.core.common.FailureFact>();
+        var port = port().withOpeningFailure(facts::add).withStreamPreparation(tables -> { throw refused; });
+        assertThatThrownBy(() -> port.cdc(config("t1"), io.tapstate.spi.capture.CaptureStart.present(),
+                (events, position) -> { throw new AssertionError("no rows after refusal"); })).isSameAs(refused);
+        assertThat(facts).singleElement().satisfies(fact -> {
+            assertThat(fact.cause()).isSameAs(refused);
+            assertThat(fact.publicFailure().params().toString()).doesNotContain("opening-secret");
+        });
+        assertThat(counter("streams")).hasValue(0);
+        assertThat(counter("stops")).hasValue(1);
+    }
+
     @Test void missingCdcSelectionUsesACaptureDiagnosticBeforeCallingTheModelOwner() throws Exception {
         var calls=new AtomicInteger();var port=port().withStreamPreparation(tables -> calls.incrementAndGet());
         assertThatThrownBy(() -> port.cdc(config("absent"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> {}))
@@ -250,6 +265,22 @@ class PdkSnapshotPreparationTest {
         }
         assertThat(calls).hasValue(1); assertThat(counter("reads")).hasValue(2); assertThat(counter("earlyReads")).hasValue(0);
         assertThat(counter("inits")).hasValue(1); assertThat(counter("discoveries")).hasValue(1); assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void anOpeningRefusalReachesItsOwnerWithSafeParametersBeforeTheHandleIsLost() throws Exception {
+        var refused = new TapstateException(ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "prepared", "detail", "opening-secret"), null);
+        var captured = new AtomicReference<io.tapstate.core.common.FailureFact>();
+        var port = port().withOpeningFailure(captured::set)
+                .withSnapshotPreparation((request, seam, tables) -> { throw refused; });
+        try (var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            assertThatThrownBy(() -> session.read("t1")).isSameAs(refused);
+        }
+        assertThat(captured.get()).isNotNull();
+        assertThat(captured.get().cause()).isSameAs(refused);
+        assertThat(captured.get().publicFailure().params().toString()).doesNotContain("opening-secret");
+        assertThat(counter("reads")).hasValue(0);
+        assertThat(counter("stops")).hasValue(1);
     }
 
     @Test void pinRefusalPreservesItsCodeAndStopsTheSessionWithoutReadingRows() throws Exception {

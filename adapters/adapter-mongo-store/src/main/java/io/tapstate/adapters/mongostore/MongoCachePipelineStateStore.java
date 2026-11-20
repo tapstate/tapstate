@@ -56,9 +56,12 @@ final class MongoCachePipelineStateStore implements StateStore {
     }
 
     private final MongoCachePipelineAccess access;
-    private final java.util.function.Supplier<CheckpointDoc> reading;
-    MongoCachePipelineStateStore(MongoCachePipelineAccess access){this(access,null);}
-    MongoCachePipelineStateStore(MongoCachePipelineAccess access,java.util.function.Supplier<CheckpointDoc> reading){this.access=access;this.reading=reading;}
+    private final MongoStructureProof structures;
+
+    MongoCachePipelineStateStore(MongoCachePipelineAccess access, MongoStructureProof structures) {
+        this.access = access;
+        this.structures = structures;
+    }
 
     static void advanceFence(MongoDatabase database, ClientSession session, Document current,
             Document values, boolean advanceEpoch) {
@@ -95,8 +98,7 @@ final class MongoCachePipelineStateStore implements StateStore {
 
     @Override public Optional<CheckpointDoc> read(String pipelineId) {
         access.requirePipeline(pipelineId);
-        if(reading!=null)return Optional.of(reading.get());
-        return access.transaction(session -> Optional.of(MongoStateStore.toCheckpoint(access.state(session))));
+        return Optional.of(access.readCheckpoint(structures));
     }
 
     @Override public void create(String pipelineId, String stateJson, Instant touchTime) {

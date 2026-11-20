@@ -72,7 +72,7 @@ class AggregateOutputTargetTest {
     void aStepNamingNoKeyOverATableWithoutOneIsRefusedWithItsCode() {
         assertThatThrownBy(() -> bind(pipeline("", "region: $region"), List.of()))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        refused -> assertThat(refused.code().code()).isEqualTo("aggregate.key-required"));
+                        refused -> assertThat(refused.code().code()).isEqualTo("TS0500003"));
     }
 
     @Test

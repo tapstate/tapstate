@@ -27,7 +27,7 @@ class CodedFailureAnalyzerTest {
         FailureAnalysis analysis = new CodedFailureAnalyzer().analyze(coded);
 
         assertThat(analysis).as("a coded startup failure produces an analysis").isNotNull();
-        assertThat(analysis.getDescription()).isEqualTo("[store.unreachable] Cannot reach the store at localhost:27017.");
+        assertThat(analysis.getDescription()).isEqualTo("[TS0470001] Cannot reach the store at localhost:27017.");
         assertThat(analysis.getAction())
                 .isEqualTo("Check the store is running and the connection settings are correct, then restart.");
         assertThat(analysis.getCause()).isSameAs(coded);
@@ -39,9 +39,12 @@ class CodedFailureAnalyzerTest {
         TapstateException coded = new TapstateException(BootError.CLOUD_CONFIG_INCOMPLETE,
                 Map.of("unrendered", sentinel), new IllegalArgumentException(sentinel));
         FailureAnalysis analysis = new CodedFailureAnalyzer().analyze(coded);
-        assertThat(analysis.getDescription()).startsWith("[boot.cloud-config-incomplete] ")
+        assertThat(analysis.getDescription()).isEqualTo("[TS0310002] The managed Cloud startup configuration is incomplete.")
                 .doesNotContain(sentinel, "unrendered");
-        assertThat(analysis.getAction()).doesNotContain(sentinel);
+        assertThat(analysis.getAction()).contains("tapstate.cloud.base-url").doesNotContain(sentinel);
+        assertThat(analysis.getCause()).isSameAs(coded);
+        assertThat(coded.args()).containsEntry("unrendered", sentinel);
+        assertThat(coded.getCause()).hasMessage(sentinel);
     }
 
     @Test

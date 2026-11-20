@@ -199,7 +199,7 @@ class PipelineObservabilityLiveIT {
                             "--resolution", "raw", "--limit", "1000", "--table", TABLE);
 
                     assertThat(cliExplain.exitCode()).isZero();
-                    assertThat(cliExplain.stdout()).contains("kind       CODED_FAILURE", "engine.job-failed");
+                    assertThat(cliExplain.stdout()).contains("kind       CODED_FAILURE", "TS0440008");
                     assertThat(cliHistory.exitCode()).isZero();
                     assertThat(cliHistory.stdout()).contains(
                             "counter_reset", "gap", "consistency eventual", "lag.orders=");
