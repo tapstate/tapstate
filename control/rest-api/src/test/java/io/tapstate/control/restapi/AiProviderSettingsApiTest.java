@@ -160,6 +160,21 @@ class AiProviderSettingsApiTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"", " , , "})
+    void rejectsManagedCloudStartupWithoutProviderManagers(String managers) {
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("mode", AuthenticationMode.CLOUD);
+        var client = org.mockito.Mockito.mock(AiProviderClient.class);
+        beans.registerSingleton("managed", new ManagedAiProvider(new AiProviderSettings("bedrock-managed",
+                "https://bedrock-runtime.ap-southeast-1.amazonaws.com/openai/v1", "global.moonshotai.kimi-k3", null),
+                client));
+        assertThatThrownBy(() -> new AiProviderController(null, null,
+                beans.getBeanProvider(AuthenticationMode.class), client, null,
+                beans.getBeanProvider(ManagedAiProvider.class), managers))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("TAPSTATE_AI_BEDROCK_PROVIDER_MANAGERS");
+    }
+
     @Test void managedDefaultAndExplicitSwitchKeepTheWorkspaceKeyAndRejectUnauthorizedChanges() {
         var values = new HashMap<String, AiProviderSettingsStore.Settings>();
         AiProviderSettingsStore store = new AiProviderSettingsStore() {

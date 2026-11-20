@@ -319,6 +319,28 @@ class OpenAiCompatibleClientTest {
                     .hasValueSatisfying(value -> assertThat(value).containsKey("root")));
         }
     }
+    @Test void managedAcceptsACompleteToolCallWithoutFinishReason() throws Exception {
+        String arguments = JsonWriter.write(Map.of("explanation", "Preserve the root.",
+                "candidateWizard", Map.of("root", Map.of("table", "orders"))));
+        String complete = chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function",
+                Map.of("name", "propose_pipeline", "arguments", arguments)))), null);
+        withServer(200, complete + "data: [DONE]\n\n", settings -> {
+            var client = new OpenAiCompatibleClient(URI::create, Duration.ofSeconds(5),
+                    (request, uri, body) -> { }, 5);
+            var text = new StringBuilder();
+            assertThat(client.propose(settings, List.of(), Map.of(), text::append))
+                    .hasValueSatisfying(value -> assertThat(value).containsKey("root"));
+            assertThat(text).hasToString("Preserve the root.");
+        });
+        withServer(200, complete, settings -> {
+            var client = new OpenAiCompatibleClient(URI::create, Duration.ofSeconds(5),
+                    (request, uri, body) -> { }, 5);
+            assertThatThrownBy(() -> client.propose(settings, List.of(), Map.of(), ignored -> { }))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL));
+        });
+    }
+
     @Test void describesUnionAndMapRulesForBuilderProposals() throws Exception {
         String arguments = JsonWriter.write(Map.of("candidateWizard", Map.of("root", Map.of("transforms", List.of(
                 Map.of("id", "copy-name", "name", "map", "type", "map", "enabled", true,

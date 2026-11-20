@@ -72,13 +72,17 @@ workload identity. Defaults for `TAPSTATE_AI_BEDROCK_REGION` and
 `TAPSTATE_AI_BEDROCK_MODEL` are the Singapore endpoint and K3 Global profile
 above. `TAPSTATE_AI_BEDROCK_REQUESTS_PER_MINUTE` defaults to 30 upstream
 attempts per server process. Each process allows four concurrent managed
-streams. A managed request sends up to 128 KiB of JSON and requests at most
-4,096 completion tokens. The workload's AWS policy must permit the Bedrock
+streams. A managed request sends up to 128 KiB of JSON, including conversation,
+schema, guidance and tool definitions, and requests at most 4,096 completion
+tokens. For large schemas, the assistant first tries the selected tables and
+then offers guidance without a proposal if their schema still exceeds the
+request budget. The workload's AWS policy must permit the Bedrock
 streaming action for the selected profile and its routing destinations.
 
 Set `TAPSTATE_AI_BEDROCK_PROVIDER_MANAGERS` to the comma-separated verified Cloud
 user IDs allowed to edit and activate the workspace route on that deployment.
-Keep this list during operator rollback so a manager can reactivate saved BYOK.
+Managed Cloud deployments require at least one ID at startup. Keep this list
+during operator rollback so a manager can reactivate saved BYOK.
 Upgrade every serving process before enabling the managed feature. Before a
 binary downgrade, managers must reactivate saved BYOK wherever it was parked,
 so old binaries can read the existing credential record format.

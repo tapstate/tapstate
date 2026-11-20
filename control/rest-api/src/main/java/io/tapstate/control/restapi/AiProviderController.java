@@ -60,6 +60,10 @@ class AiProviderController {
         this.managed = mode == AuthenticationMode.CLOUD && managed != null ? managed.getIfAvailable() : null;
         this.providerManagers = java.util.Arrays.stream(providerManagers.split(",")).map(String::strip)
                 .filter(value -> !value.isEmpty()).collect(Collectors.toUnmodifiableSet());
+        if (this.managed != null && this.providerManagers.isEmpty()) {
+            throw new IllegalStateException("Set TAPSTATE_AI_BEDROCK_PROVIDER_MANAGERS (tapstate.ai.bedrock.provider-managers) "
+                    + "to at least one Cloud user ID when managed Bedrock is enabled.");
+        }
     }
 
     @Verb("ai-provider.get") @GetMapping("/ai-provider-settings")

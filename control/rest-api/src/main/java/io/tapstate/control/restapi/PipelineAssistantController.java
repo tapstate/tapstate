@@ -42,6 +42,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
+import java.util.function.Predicate;
 
 /** Produces transient proposals only; existing draft CAS remains the sole Apply write. */
 @RestController
@@ -115,9 +116,8 @@ class PipelineAssistantController {
                 workspace.requireActive().run();
                 streamEvents.event(Map.of("type", "start", "messageId", UUID.randomUUID().toString()));
                 streamEvents.status("connecting");
-                Map<String, Object> context = context(base);
-                Map<String, Object> focus = focus(base, body.get("focus"));
-                if (!focus.isEmpty()) context.put("focus", focus);
+                Map<String, Object> context = context(base, focus(base, body.get("focus")),
+                        value -> route.client().proposalRequestFits(route.settings(), messages, value));
                 streamEvents.event(Map.of("type", "text-start", "id", textId));
                 streamEvents.status("streaming");
                 Optional<Map<String, Object>> candidate = propose(route, messages, context,
@@ -252,15 +252,21 @@ class PipelineAssistantController {
         return Map.of("kind", kind);
     }
     private Map<String, Object> context(PipelineDraft base) {
+        return context(base, Map.of(), ignored -> true);
+    }
+
+    private Map<String, Object> context(PipelineDraft base, Map<String, Object> focus,
+            Predicate<Map<String, Object>> fitsRequest) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("currentWizard", AssistantWizardJson.view(wizard(base)));
+        if (!focus.isEmpty()) result.put("focus", focus);
         SelectedInputScope selection = selectedInputScope(base);
         boolean inputSelectionPending = !selection.rootTableSelected();
         result.put("inputSelectionPending", inputSelectionPending);
         Set<String> sourceIds = inputSources(selection);
         if (selection.sourceIds().isEmpty() && sourceIds.size() > MAX_AUTO_SOURCES) {
             requireSourceSelection(result, sourceIds);
-            omitOversizedSchema(result, List.of());
+            if (!fitsContext(result, fitsRequest)) omitOversizedSchema(result, List.of(), fitsRequest);
             return result;
         }
         List<SourceSchemaInventory> discovered = discoverSchemas(sourceIds);
@@ -269,19 +275,21 @@ class PipelineAssistantController {
         if (selectedTableCount > MAX_AUTO_TABLES
                 || (inputSelectionPending && tableCount > MAX_AUTO_TABLES)) {
             requireSourceSelection(result, discovered);
-            omitOversizedSchema(result, discovered);
+            if (!fitsContext(result, fitsRequest)) omitOversizedSchema(result, discovered, fitsRequest);
             return result;
         }
         boolean selectedOnly = tableCount > MAX_AUTO_TABLES;
         List<Map<String, Object>> inventory = sourceInventory(discovered, selection.tables(), selectedOnly);
         result.put(SOURCES, inventory);
         result.put(PROPOSAL_ENABLED, !inventory.isEmpty());
-        if (JsonWriter.write(result).length() > MAX_CONTEXT_LENGTH && !selection.tables().isEmpty()) {
+        if (fitsContext(result, fitsRequest)) return result;
+        if (!selectedOnly && !selection.tables().isEmpty()) {
             inventory = sourceInventory(discovered, selection.tables(), true);
             result.put(SOURCES, inventory);
             result.put(PROPOSAL_ENABLED, !inventory.isEmpty());
+            if (fitsContext(result, fitsRequest)) return result;
         }
-        omitOversizedSchema(result, discovered);
+        omitOversizedSchema(result, discovered, fitsRequest);
         return result;
     }
 
@@ -341,14 +349,21 @@ class PipelineAssistantController {
         context.put("scopeSelectionRequired", true);
     }
 
-    private static void omitOversizedSchema(Map<String, Object> context, List<SourceSchemaInventory> discovered) {
-        if (JsonWriter.write(context).length() <= MAX_CONTEXT_LENGTH) return;
+    private static boolean fitsContext(Map<String, Object> context, Predicate<Map<String, Object>> fitsRequest) {
+        return JsonWriter.write(context).length() <= MAX_CONTEXT_LENGTH && fitsRequest.test(context);
+    }
+
+    private static void omitOversizedSchema(Map<String, Object> context, List<SourceSchemaInventory> discovered,
+            Predicate<Map<String, Object>> fitsRequest) {
         context.put(SOURCES, List.of());
         context.put(PROPOSAL_ENABLED, false);
         context.put("schemaUnavailable", "selected schema is too large to include");
         if (!context.containsKey("availableSources")) requireSourceSelection(context, discovered);
         if (JsonWriter.write(context).length() > MAX_CONTEXT_LENGTH) {
             throw malformed("pipeline context is too large for the assistant");
+        }
+        if (!fitsRequest.test(context)) {
+            throw AiProviderService.error(ControlError.AI_MANAGED_PROVIDER_INPUT_LIMIT);
         }
     }
     private void enforceScope(PipelineDraft base, Map<String, Object> candidate, Map<String, Object> scopeContext) {

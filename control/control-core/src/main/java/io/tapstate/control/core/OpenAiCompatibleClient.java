@@ -26,6 +26,7 @@ import java.util.function.Function;
 /** Bounded provider protocol adapter. Only text and complete tool arguments leave this boundary. */
 public final class OpenAiCompatibleClient implements AiProviderClient {
     private static final int MAX_BYTES = 524288;
+    private static final int MANAGED_REQUEST_MAX_BYTES = 128 * 1024;
     private static final int STREAM_ATTEMPTS = 2;
     private static final int CHECK_RETRY_MAX_TOKENS = 8192;
     private static final String MAX_TOKENS = "max_tokens";
@@ -200,6 +201,25 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private Optional<Map<String, Object>> proposeOnce(AiProviderSettings settings, List<Map<String, String>> messages,
             Map<String, Object> context, AiProviderClient.Output output) {
         boolean proposalEnabled = !Boolean.FALSE.equals(context.get("proposalEnabled"));
+        Map<String, Object> body = proposalBody(settings, messages, context, proposalEnabled);
+        if (signer != null) return read(settings, body, output, proposalEnabled);
+        var safeOutput = new RedactedOutput(settings.apiKey(), output);
+        Optional<Map<String, Object>> candidate = read(settings, body, safeOutput, proposalEnabled);
+        if (candidate.stream().anyMatch(value -> containsSecret(value, settings.apiKey()))) throw invalid();
+        safeOutput.finish();
+        return candidate;
+    }
+
+    @Override public boolean proposalRequestFits(AiProviderSettings settings, List<Map<String, String>> messages,
+            Map<String, Object> context) {
+        if (signer == null) return true;
+        boolean proposalEnabled = !Boolean.FALSE.equals(context.get("proposalEnabled"));
+        return requestBytes(settings, proposalBody(settings, messages, context, proposalEnabled)).length
+                <= MANAGED_REQUEST_MAX_BYTES;
+    }
+
+    private Map<String, Object> proposalBody(AiProviderSettings settings, List<Map<String, String>> messages,
+            Map<String, Object> context, boolean proposalEnabled) {
         List<Map<String, String>> prompt = new ArrayList<>();
         String guidance = guidance(proposalEnabled, context);
         prompt.add(Map.of("role", "system", "content", guidance + " Current context: " + JsonWriter.write(context)));
@@ -227,13 +247,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             if (isConcreteEditRequest(messages) && !Boolean.TRUE.equals(context.get("inputSelectionPending"))) requestBody.put("tool_choice", Map.of(JSON_TYPE, JSON_FUNCTION,
                     JSON_FUNCTION, Map.of("name", "propose_pipeline")));
         }
-        Map<String, Object> body = Map.copyOf(requestBody);
-        if (signer != null) return read(settings, body, output, proposalEnabled);
-        var safeOutput = new RedactedOutput(settings.apiKey(), output);
-        Optional<Map<String, Object>> candidate = read(settings, body, safeOutput, proposalEnabled);
-        if (candidate.stream().anyMatch(value -> containsSecret(value, settings.apiKey()))) throw invalid();
-        safeOutput.finish();
-        return candidate;
+        return Map.copyOf(requestBody);
     }
 
     private static final class RedactedOutput implements AiProviderClient.Output {
@@ -623,14 +637,19 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
 
     private static Optional<Map<String, Object>> streamCandidate(StreamState state, boolean proposalEnabled, boolean managed) {
-        if (!state.done || managed && !("stop".equals(state.finish) || TOOL_CALLS.equals(state.finish))) throw invalid();
+        if (!state.done) throw invalid();
         if (!state.toolCallStarted) {
+            if (managed && !completedFinish(state.finish)) throw invalid();
             return Optional.empty();
         }
         if (!proposalEnabled
-                || (state.finish != null && !List.of(TOOL_CALLS, "stop").contains(state.finish))
+                || (state.finish != null && !completedFinish(state.finish))
                 || !"propose_pipeline".equals(state.function)) throw invalid();
         return Optional.of(candidate(state.arguments.toString()));
+    }
+
+    private static boolean completedFinish(String reason) {
+        return "stop".equals(reason) || TOOL_CALLS.equals(reason);
     }
     private static void readChunk(String data, StreamState state, Consumer<String> text, TokenUsage usage) {
         Map<String, Object> chunk = object(JsonReader.parse(data));
@@ -865,14 +884,18 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
         throw invalid();
     }
+    private static byte[] requestBytes(AiProviderSettings settings, Map<String, Object> body) {
+        if (responses(settings)) body = OpenAiResponsesProtocol.request(body);
+        return JsonWriter.write(body).getBytes(StandardCharsets.UTF_8);
+    }
+
     private HttpRequest request(AiProviderSettings settings, Map<String, Object> body) {
         URI uri = endpoint(settings, responses(settings) ? "/responses" : "/chat/completions");
-        if (responses(settings)) body = OpenAiResponsesProtocol.request(body);
         var request = HttpRequest.newBuilder(uri).timeout(responseTimeout).header("Content-Type", "application/json");
-        byte[] json = JsonWriter.write(body).getBytes(StandardCharsets.UTF_8);
+        byte[] json = requestBytes(settings, body);
         if (signer == null) request.header("Authorization", "Bearer " + settings.apiKey());
         else {
-            if (json.length > 128 * 1024) throw AiProviderService.error(ControlError.AI_MANAGED_PROVIDER_INPUT_LIMIT);
+            if (json.length > MANAGED_REQUEST_MAX_BYTES) throw AiProviderService.error(ControlError.AI_MANAGED_PROVIDER_INPUT_LIMIT);
             reserveManagedAttempt();
             try {
                 signer.sign(request, uri, json);
