@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: wallet_db
+connector: mysql
+config: { host: ${WALLET_HOST}, port: ${WALLET_PORT}, database: ${WALLET_DATABASE}, username: ${WALLET_USERNAME}, password: ${WALLET_PASSWORD} }
+mode: cdc
+tables: [ wallet_tran, location ]

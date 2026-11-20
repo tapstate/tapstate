@@ -24,7 +24,9 @@ public final class OperatorMapConfigurations {
     public static void install(HazelcastInstance member,OperatorRunManifest original,Collection<OperatorMapCapacity> capacities) {
         Objects.requireNonNull(member,"member"); Objects.requireNonNull(original,"original");
         List<OperatorMapCapacity> captured = List.copyOf(capacities);
-        var wantedPositions = new HashSet<>(original.bindings().stream().map(OperatorMapBinding::placement).toList());
+        // State that is not kept in a map has a binding and no map configuration to hold it to.
+        var wantedPositions = new HashSet<>(original.bindings().stream().map(OperatorMapBinding::placement)
+                .filter(placement -> placement.resource().keptInAMap()).toList());
         var actualPositions = new HashSet<io.tapstate.spi.store.OperatorPlacement>();
         for (var capacity : captured) if (!actualPositions.add(capacity.placement())) throw fenced();
         if (!wantedPositions.equals(actualPositions)) throw fenced();

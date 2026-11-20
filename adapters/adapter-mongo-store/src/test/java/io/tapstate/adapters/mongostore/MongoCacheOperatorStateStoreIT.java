@@ -274,7 +274,15 @@ class MongoCacheOperatorStateStoreIT {
             code(() -> shape.read("step"),IoError.DOCUMENT_UNREADABLE);
             code(() -> shape.recordIfAbsent("step",Set.of("root")),IoError.DOCUMENT_UNREADABLE);
             for (var kind : OperatorPlacement.Resource.values()) {
-                var at = f.at(kind); code(() -> f.writer(at).load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
+                var at = f.at(kind);
+                if (kind == OperatorPlacement.Resource.AGGREGATE_STATE) {
+                    // The ordered resource is read and written by its own operations, under the same checks.
+                    var ordered = (io.tapstate.spi.store.OrderedStateStore) f.writer(at);
+                    code(() -> ordered.loadAll(List.of(new byte[]{1})),IoError.DOCUMENT_UNREADABLE);
+                    code(() -> ordered.commit(List.of(new io.tapstate.spi.store.OrderedStateStore.Entry(new byte[]{1},new byte[]{1})),List.of()),IoError.DOCUMENT_UNREADABLE);
+                    continue;
+                }
+                code(() -> f.writer(at).load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
                 code(() -> f.writer(at).save(at.mapName(),"key",new byte[]{1}),IoError.DOCUMENT_UNREADABLE);
             }
             assertThat(f.snapshot()).isEqualTo(before);
@@ -409,6 +417,15 @@ class MongoCacheOperatorStateStoreIT {
         withFixture(f -> {
             for (var kind : OperatorPlacement.Resource.values()) {
                 var placement = f.at(kind); var store = f.writer(placement);
+                if (kind == OperatorPlacement.Resource.AGGREGATE_STATE) {
+                    // The ordered resource has its own collection too, written by whole commits and not by the keyed operations.
+                    var ordered = (io.tapstate.spi.store.OrderedStateStore) store;
+                    ordered.commit(List.of(new io.tapstate.spi.store.OrderedStateStore.Entry(new byte[]{1}, new byte[]{(byte)kind.ordinal()})), List.of());
+                    var read = ordered.loadAll(List.of(new byte[]{1}, new byte[]{2}));
+                    assertThat(read.get(0)).isEqualTo(new byte[]{(byte)kind.ordinal()}); assertThat(read.get(1)).isNull();
+                    assertThat(MongoCacheOperatorStateStore.table(kind).on(f.database).countDocuments()).isOne();
+                    continue;
+                }
                 store.save(placement.mapName(), "key", new byte[]{(byte)kind.ordinal()});
                 assertThat(store.saveIfAbsent(placement.mapName(), "key", new byte[]{99})).hasValue(new byte[]{(byte)kind.ordinal()});
                 assertThat(store.saveIfAbsent(placement.mapName(), "other", new byte[]{42})).isEmpty();

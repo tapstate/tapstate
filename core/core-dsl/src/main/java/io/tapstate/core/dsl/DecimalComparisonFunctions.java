@@ -177,8 +177,15 @@ public final class DecimalComparisonFunctions {
         );
     }
 
-    /** A runtime AST and the decimal overloads it can dispatch after standard CEL dispatch. */
-    public record RuntimeExpression(CelAbstractSyntaxTree ast, CelFunctionResolver functions) {
+    /**
+     * A runtime AST and the decimal overloads it can dispatch after standard CEL dispatch: as a resolver,
+     * and as the bindings that make it, for a caller that resolves other late functions beside them.
+     */
+    public record RuntimeExpression(CelAbstractSyntaxTree ast, CelFunctionResolver functions,
+            List<CelFunctionBinding> bindings) {
+        public RuntimeExpression {
+            bindings = List.copyOf(bindings);
+        }
     }
 
     /** CEL-only value for a Decimal128 special carried as a Double. */
@@ -230,7 +237,7 @@ public final class DecimalComparisonFunctions {
         }
         CelAbstractSyntaxTree runtimeAst = overloads.isEmpty() ? ast
                 : CelAbstractSyntaxTree.newCheckedAst(ast.getExpr(), ast.getSource(), references, ast.getTypeMap());
-        return new RuntimeExpression(runtimeAst, CelLateFunctionBindings.from(overloads));
+        return new RuntimeExpression(runtimeAst, CelLateFunctionBindings.from(overloads), overloads);
     }
 
     static String validationError(CelAbstractSyntaxTree ast) {
