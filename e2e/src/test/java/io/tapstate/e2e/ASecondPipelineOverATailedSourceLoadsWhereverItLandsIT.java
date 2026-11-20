@@ -35,8 +35,9 @@ import org.junit.jupiter.api.Test;
  * real one's tail carries only what changed after it began.
  *
  * <p>START is sent through the member away from the capture. Either member can prepare the intent.
- * The first candidate is driven by the capture holder and skipped. The same loop retries until a
- * candidate's live claim and reported controller agree that it is driven away from the original holder.
+ * The first candidate is driven by the capture holder. It stays running through the other member's
+ * restart while the loop looks for a candidate driven away from the holder. Both candidates must
+ * receive the change made after the restart.
  */
 class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
 
@@ -96,6 +97,7 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
                 remote.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
 
                 List<String> placements = new ArrayList<>();
+                Optional<LocalCandidate> localCandidate = Optional.empty();
                 for (int n = 2; n <= MOST_PIPELINES; n++) {
                     String pipeline = "shared_pipe_" + n;
                     EndpointAddress target = startPipelineInto(remote, n, sourceUri, run);
@@ -111,6 +113,7 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
                         assertThat(placement.preparation().orElseThrow().issuerNode().owner())
                                 .as("the first preparation issued the observed claim, %s", trace).isEqualTo(claim.owner());
                         assertThat(remoteCandidate).as("the local candidate is excluded, %s", trace).isFalse();
+                        localCandidate = Optional.of(new LocalCandidate(pipeline, target));
                     }
                     if (!remoteCandidate) {
                         System.out.println("Excluded local snapshot candidate: " + trace);
@@ -128,6 +131,12 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
                     assertThat(control.captureOwnersOf(pipeline)).as("the remote pipeline uses the original capture")
                             .isEqualTo(capture);
 
+                    LocalCandidate recovered = localCandidate.orElseThrow();
+                    // A snapshot can also deliver an inserted row if it reads the table after the write.
+                    Await.until(recovered.pipeline() + " to report STREAMING for its current run",
+                            () -> control.initialLoad(recovered.pipeline())
+                                    .filter(load -> "STREAMING".equals(load.get("phase"))).isPresent(),
+                            () -> "initial load = " + control.initialLoad(recovered.pipeline()));
                     long firstTargetBefore = mongo.count(firstTarget, TABLE);
                     mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
                     Await.until("a change made after " + pipeline + " started to reach its target through "
@@ -145,6 +154,12 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
                             .as("the remote member still drives the pipeline after the change, %s", afterChange)
                             .isEqualTo(placement.claim().orElseThrow().claim().owner());
                     System.out.println("Verified remote snapshot and CDC on both targets: " + trace);
+
+                    Map<String, Object> insertedRow = Map.of(SeedRows.ID, SEEDED_ROWS + 1);
+                    Await.until("the candidate running before the member restart to deliver the inserted row",
+                            () -> mongo.fetch(recovered.target(), TABLE, insertedRow).isPresent(),
+                            () -> "row " + insertedRow + " is missing; rows at its target = "
+                                    + mongo.count(recovered.target(), TABLE));
                     return;
                 }
                 throw new AssertionError("no remote driver among " + MOST_PIPELINES + " pipelines, placements=" + placements);
@@ -156,6 +171,8 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
         assertThat(driver).as("the controller belongs to one of the two members, %s", trace).isIn(holder, remoteMember);
         return !holder.equals(driver);
     }
+
+    private record LocalCandidate(String pipeline, EndpointAddress target) {}
 
     private record Placement(Optional<String> controller, Optional<PipelinePreparation> preparation,
             Optional<WorkloadClaimReading> claim) {
