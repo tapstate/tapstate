@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -24,6 +25,61 @@ class BoundedPipelinePreviewIT {
     @BeforeAll
     static void requireDocker() {
         DockerGate.require();
+    }
+
+    @Test
+    void aPlainMapKeyRenameCompletesADefaultSyncPreview(@TempDir Path directory) throws Exception {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectory(directory.resolve("source"));
+            Files.writeString(source.resolve("orders.csv"), "id,company_name\norder-1,Northwind\norder-2,Contoso\n");
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: preview_pipeline
+                    source: preview_source
+                    settings: { read_mode: snapshot_and_cdc }
+                    transforms:
+                      - id: renamed_orders
+                        from: [ orders ]
+                        type: map
+                        fields:
+                          ORDER_ID: $id
+                          company: $company_name
+                    serve:
+                      from: renamed_orders
+                      sync:
+                        - { id: preview_sync, source: preview_target }
+                    """;
+            List<Map<String, Object>> events = control.preview(PIPELINE_ID, "preview_sync", 1,
+                    SAMPLE_ID + "-plain-rename", List.of(
+                            new ControlPlane.PreviewDraft("source.tap.yml", """
+                                    version: tapstate/v1
+                                    kind: source
+                                    id: preview_source
+                                    connector: e2e_file
+                                    config: { uri: "%s" }
+                                    mode: cdc
+                                    tables: [ orders ]
+                                    """.formatted(source)),
+                            new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline),
+                            new ControlPlane.PreviewDraft("target.tap.yml",
+                                    targetYaml(source.resolve("preview-target")))));
+
+            assertThat(events).extracting(event -> event.get("kind"))
+                    .as("default sync preview events: %s", events)
+                    .startsWith("run.accepted", "compile.completed", "sample.completed")
+                    .endsWith("result.completed", "run.completed");
+            assertThat(((Number) payload(events, "sample.completed").get("rootRows")).intValue()).isEqualTo(1);
+            assertThat(documents(payload(events, "result.completed")))
+                    .isEqualTo(List.of(Map.of("ORDER_ID", "order-1", "company", "Northwind")));
+            assertThat(control.artifactIds()).doesNotContain(SOURCE_ID, PIPELINE_ID, "preview_target");
+            assertThat(source.resolve("preview-target")).doesNotExist();
+        }
     }
 
     @ParameterizedTest
