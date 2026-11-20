@@ -487,3 +487,5 @@ nest.rollup-overflow	TS0490033
 nest.rollup-result-not-convertible	TS0490035
 nest.rollup-type-unknown	TS0490032
 nest.rollup-value-type-mismatch	TS0490034
+control.ai-managed-provider-auth-failed	TS0210032
+control.ai-managed-provider-input-limit	TS0210033

@@ -1418,6 +1418,11 @@ control.ai-overloaded:
 control.ai-provider-auth-failed:
   message: "The AI provider rejected this credential. Update the API key or its model permissions."
 
+control.ai-managed-provider-auth-failed:
+  message: "Tapstate-managed AI authentication failed. Contact your Tapstate administrator."
+control.ai-managed-provider-input-limit:
+  message: "The request exceeds the managed AI input limit. Start a new conversation or select fewer tables."
+
 start-check.target-empty:
   message: "{target} on {connection} is empty, so the full load starts from nothing."
 start-check.target-set-to-clear:

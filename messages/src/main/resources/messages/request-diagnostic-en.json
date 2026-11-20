@@ -122,5 +122,13 @@
   "TS0210031": {
     "message": "Initialization cannot complete because the storage endpoint has reached its space quota. Restore capacity and check the original operation; do not submit setup again.",
     "solution": "Restore storage capacity and inspect the original operation; do not submit setup again."
+  },
+  "TS0210032": {
+    "message": "The managed AI service could not authenticate the request.",
+    "solution": "Contact your Tapstate administrator to check the managed service credentials and permissions."
+  },
+  "TS0210033": {
+    "message": "The request exceeds the input limit for the managed AI service.",
+    "solution": "Start a new conversation or select fewer tables, then try again."
   }
 }

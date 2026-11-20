@@ -72,6 +72,11 @@ public final class RequestErrorDefinitions {
     public static final ProductErrorDefinition STORAGE_QUOTA_EXCEEDED =
             DEFINITIONS.define(31, Severity.ERROR, Set.of());
 
+    public static final ProductErrorDefinition AI_MANAGED_PROVIDER_AUTH_FAILED =
+            DEFINITIONS.define(32, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_MANAGED_PROVIDER_INPUT_LIMIT =
+            DEFINITIONS.define(33, Severity.ERROR, Set.of());
+
     private RequestErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {
