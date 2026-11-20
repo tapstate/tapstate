@@ -132,6 +132,9 @@ class PipelineSourceNodeSettingsIT {
                     .isEqualTo(List.of(Map.of("fail_cdc", false), Map.of("fail_cdc", true)));
             control.lifecycle(pipeline, LifecycleVerb.START);
             awaitState(control, pipeline, PipelineState.FAILED);
+            Await.until("the failure to come from the configured connector", TIMEOUT,
+                    () -> control.logs(pipeline).contains("the change stream stopped and will not resume"),
+                    () -> control.logs(pipeline));
             control.stop(pipeline, false);
             awaitState(control, pipeline, PipelineState.STOPPED);
 

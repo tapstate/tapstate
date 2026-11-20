@@ -146,7 +146,7 @@ public final class LivePipelines {
             Collections.sort(moved);
             throw new TapstateException(
                     SourceError.SRS_CHANGE_WHILE_RUNNING,
-                    Map.of("id", moved.get(0), "pipelines", List.of(replacement.id())),
+                    Map.of("id", replacement.sourceReference(moved.get(0)).id(), "pipelines", List.of(replacement.id())),
                     null);
         }
     }
@@ -161,12 +161,12 @@ public final class LivePipelines {
         return configs;
     }
 
-    /** The switches this pipeline has recorded, by source id; references carrying none are absent. */
+    /** The switches this pipeline has recorded for each input binding. */
     private static Map<String, Boolean> recordedSwitches(PipelineResource pipeline) {
         Map<String, Boolean> switches = new LinkedHashMap<>();
         for (SourceRef ref : pipeline.sources()) {
             if (ref instanceof SourceRef.Spec spec) {
-                switches.put(spec.id(), spec.srs());
+                switches.put(spec.binding(), spec.srs());
             }
         }
         return switches;

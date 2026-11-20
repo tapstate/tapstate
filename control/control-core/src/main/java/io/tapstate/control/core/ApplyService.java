@@ -458,12 +458,13 @@ public final class ApplyService {
      */
     private PipelineResource withOwnSrsSwitches(
             PipelineResource pipeline, Map<String, SourceResource> batchSources, Resource existing) {
-        Map<String, Boolean> alreadyRecorded = new LinkedHashMap<>();
+        Map<String, SourceRef.Spec> previousBindings = new LinkedHashMap<>();
+        Map<String, Boolean> previousSources = new LinkedHashMap<>();
         if (existing instanceof PipelineResource stored) {
             for (SourceRef ref : stored.sources()) {
                 if (ref instanceof SourceRef.Spec spec) {
-                    alreadyRecorded.put(spec.binding(), spec.srs());
-                    alreadyRecorded.putIfAbsent(spec.id(), spec.srs());
+                    previousBindings.put(spec.binding(), spec);
+                    previousSources.putIfAbsent(spec.id(), spec.srs());
                 }
             }
         }
@@ -475,7 +476,9 @@ public final class ApplyService {
                 anyRecorded = true;
                 continue;
             }
-            Boolean own = alreadyRecorded.getOrDefault(ref.binding(), alreadyRecorded.get(ref.id()));
+            SourceRef.Spec previous = previousBindings.get(ref.binding());
+            Boolean own = previous != null && previous.id().equals(ref.id())
+                    ? previous.srs() : previousSources.get(ref.id());
             if (own == null) {
                 // The source is read from the batch alone, because the batch is the closure: a pipeline
                 // referencing a source that is not in it is refused before this runs. A reference left

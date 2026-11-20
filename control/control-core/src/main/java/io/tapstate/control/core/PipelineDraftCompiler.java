@@ -23,6 +23,7 @@ import io.tapstate.core.sql.SqlFrontEnd;
 import io.tapstate.spi.store.PipelineDraft;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -724,27 +725,49 @@ public final class PipelineDraftCompiler {
                 ? node.id() : optionalText(node.metadata(), "stepId");
     }
 
-    private static Map<String, String> graphInputRenames(List<String> inputIds,
+    private static Map<String, List<String>> graphInputRenames(List<String> inputIds,
             Map<String, PipelineDraft.Node> nodes, Map<String, SourceRef> bindings) {
-        Map<String, String> renamed = new LinkedHashMap<>();
-        Set<String> ambiguous = new HashSet<>();
+        if (inputIds.stream().map(bindings::get).noneMatch(ref -> ref != null && ref.alias() != null)) {
+            return Map.of();
+        }
+        Map<String, List<String>> renamed = new LinkedHashMap<>();
         for (String inputId : inputIds) {
             SourceRef ref = bindings.get(inputId);
-            if (ref == null || ref.alias() == null) continue;
+            if (ref == null) continue;
             for (var selection : sourceTableSelections(nodes.get(inputId))) {
-                String original = selection.reference(ref.id());
-                if (renamed.putIfAbsent(original, selection.reference(ref.binding())) != null) ambiguous.add(original);
+                String reference = selection.reference(ref.binding());
+                renamed.computeIfAbsent(selection.reference(ref.id()), ignored -> new ArrayList<>()).add(reference);
+                renamed.computeIfAbsent(selection.unqualifiedReference(), ignored -> new ArrayList<>()).add(reference);
             }
         }
-        ambiguous.forEach(renamed::remove);
         return renamed;
     }
 
+    private static FromRef graphInputRef(String value, Map<String, List<String>> inputRenames,
+            Map<String, Integer> occurrences, Map<String, Integer> used) {
+        var candidates = inputRenames.get(value);
+        if (candidates == null || candidates.isEmpty()) return graphFromRef(value);
+        if (candidates.size() == 1) return graphFromRef(candidates.getFirst());
+        var remaining = candidates.stream().filter(candidate -> candidate.equals(value)
+                || !occurrences.containsKey(candidate)).toList();
+        if (occurrences.getOrDefault(value, 1) != remaining.size()) {
+            throw new IllegalArgumentException("graph transform reference matches multiple input nodes: " + value);
+        }
+        return graphFromRef(remaining.get(used.merge(value, 1, Integer::sum) - 1));
+    }
+
     private static FromClause graphTransformFrom(PipelineDraft.Node node, List<String> graphRefs,
-            Map<String, String> inputRenames) {
+            Map<String, List<String>> inputRenames) {
         Object configured = node.config().get("from");
         boolean aliasMap = "join".equals(node.type()) || "nest".equals(node.type());
         if (configured != null) {
+            Map<String, Integer> occurrences = new HashMap<>();
+            Map<String, Integer> used = new HashMap<>();
+            if (configured instanceof Map<?, ?> map) {
+                map.values().forEach(value -> { if (value instanceof String ref) occurrences.merge(ref, 1, Integer::sum); });
+            } else if (configured instanceof List<?> list) {
+                list.forEach(value -> { if (value instanceof String ref) occurrences.merge(ref, 1, Integer::sum); });
+            }
             if (aliasMap) {
                 if (!(configured instanceof Map<?, ?> aliases)) {
                     throw new IllegalArgumentException("graph " + node.type()
@@ -757,12 +780,12 @@ public final class PipelineDraftCompiler {
                         throw new IllegalArgumentException("graph transform from aliases must map names to refs: "
                                 + node.id());
                     }
-                    refs.put(alias, graphFromRef(inputRenames.getOrDefault(ref, ref)));
+                    refs.put(alias, graphInputRef(ref, inputRenames, occurrences, used));
                 }
                 return FromClause.aliases(refs);
             }
             if (configured instanceof String ref && !ref.isBlank()) {
-                return FromClause.list(graphFromRef(inputRenames.getOrDefault(ref, ref)));
+                return FromClause.list(graphInputRef(ref, inputRenames, occurrences, used));
             }
             if (configured instanceof List<?> values) {
                 List<FromRef> refs = new ArrayList<>();
@@ -771,7 +794,7 @@ public final class PipelineDraftCompiler {
                         throw new IllegalArgumentException("graph transform from must contain non-blank refs: "
                                 + node.id());
                     }
-                    refs.add(graphFromRef(inputRenames.getOrDefault(ref, ref)));
+                    refs.add(graphInputRef(ref, inputRenames, occurrences, used));
                 }
                 if (!refs.isEmpty()) {
                     return new FromClause.Flow(refs);
@@ -869,6 +892,10 @@ public final class PipelineDraftCompiler {
     }
 
     private record SourceTableSelection(String table, boolean regex) {
+        private String unqualifiedReference() {
+            return regex && !isRegexReference(table) ? "/" + table + "/" : table;
+        }
+
         private String reference(String sourceId) {
             if (!regex) {
                 return sourceId + "." + table;

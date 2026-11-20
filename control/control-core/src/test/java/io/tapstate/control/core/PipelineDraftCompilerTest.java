@@ -325,6 +325,29 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void scopesGraphSelectorsToSeparatelyConfiguredSameSourceNodes() {
+        var graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("input-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("input-items", "source", "crm", "/items_.*/", Map.of(), Map.of()),
+                new PipelineDraft.Node("combined", "union", null, null,
+                        Map.of("from", List.of("orders", "/items_.*/")), Map.of())),
+                List.of(new PipelineDraft.Edge("root-edge", "input-orders", "combined"),
+                        new PipelineDraft.Edge("items-edge", "input-items", "combined")),
+                new PipelineDraft.Viewport(0, 0, 1),
+                Map.of("input-orders", Map.of("preImage", true), "input-items", Map.of("preImage", false)));
+
+        var pipeline = compiler.compile(dagDraft(graph));
+        var orders = pipeline.sources().get(0);
+        var items = pipeline.sources().get(1);
+        assertThat(orders.binding()).isNotEqualTo(items.binding());
+        assertThat(orders.nodeConfig()).containsEntry("preImage", true);
+        assertThat(items.nodeConfig()).containsEntry("preImage", false);
+        assertThat(((FromClause.Flow) pipeline.transforms().getFirst().from()).refs())
+                .containsExactly(FromRef.literal(orders.binding() + ".orders"),
+                        FromRef.regex(java.util.regex.Pattern.quote(items.binding()) + "\\.items_.*"));
+    }
+
+    @Test
     void compilesCanvasGraphIntoViewAndTargetPublication() {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
                 new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
