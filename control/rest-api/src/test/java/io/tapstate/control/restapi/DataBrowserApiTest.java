@@ -232,7 +232,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
         // Refused before the read, not mapped out of its outcome.
         assertThat(context.getBean(FakeFindProbe.class).lastQuery()).isNull();
@@ -261,7 +261,7 @@ class DataBrowserApiTest {
         // What refuses it is the strict mapper this surface is configured with, not the vocabulary check
         // below: none of `{"status": "paid"}`'s keys are ours, so binding fails before any of them is
         // read. Said plainly because the two are different guards and only one of them is exercised here.
-        assertThat(refusedFilter(Map.of("status", "paid")).code()).isEqualTo("control.malformed-request");
+        assertThat(refusedFilter(Map.of("status", "paid")).code()).isEqualTo("TS0210001");
     }
 
     @Test
@@ -270,7 +270,7 @@ class DataBrowserApiTest {
         // anything: an empty object binds cleanly and every field comes out null. It is neither shape,
         // and read as either it is a request to match nothing or a request to match everything — the
         // difference between an empty answer and a whole collection, guessed at.
-        assertThat(refusedFilter(Map.of()).code()).isEqualTo("control.malformed-request");
+        assertThat(refusedFilter(Map.of()).code()).isEqualTo("TS0210001");
     }
 
     @Test
@@ -309,7 +309,7 @@ class DataBrowserApiTest {
         // than crashing the bind.
         assertThat(refusedFilter(Map.of("any", List.of(
                 Map.of("all", List.of(Map.of("field", "a", "op", "eq", "value", 1))))))
-                .code()).isEqualTo("control.malformed-request");
+                .code()).isEqualTo("TS0210001");
     }
 
     @Test
@@ -318,7 +318,7 @@ class DataBrowserApiTest {
         assertThat(refusedFilter(Map.of(
                 "field", "status", "op", "eq", "value", "Paid",
                 "all", List.of(Map.of("field", "total", "op", "gt", "value", 100))))
-                .code()).isEqualTo("control.malformed-request");
+                .code()).isEqualTo("TS0210001");
     }
 
     @Test
@@ -326,7 +326,7 @@ class DataBrowserApiTest {
         // The vocabulary's own rule reaching the wire: over JSON the value's type is whatever was typed,
         // and this mistake reads back as an empty collection rather than as a mistake.
         assertThat(refusedFilter(Map.of("field", "status", "op", "in", "value", "Paid"))
-                .code()).isEqualTo("control.malformed-request");
+                .code()).isEqualTo("TS0210001");
     }
 
     /** The coded refusal a malformed {@code filter} produces, asserting it never reached the probe. */
@@ -470,7 +470,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("data-browser.unknown-collection");
+        assertThat(body.code()).isEqualTo("TS0390001");
         assertThat(body.params()).containsEntry("source", "views").containsEntry("collection", "absent");
     }
 
@@ -490,7 +490,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("data-browser.unorderable-field");
+        assertThat(body.code()).isEqualTo("TS0390003");
         // Named as the caller wrote it: parsed, they would go looking for a different field.
         assertThat(body.params()).containsEntry("field", "price\\.usd");
     }
@@ -516,7 +516,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("connector.capability-missing");
+        assertThat(body.code()).isEqualTo("TS0060031");
         assertThat(body.params()).containsEntry("capability", "executeQuery");
     }
 
@@ -533,7 +533,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("data-browser.invalid-limit");
+        assertThat(body.code()).isEqualTo("TS0390002");
         assertThat(body.params()).containsEntry("max", "200");
     }
 
@@ -546,7 +546,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("source.not-found");
+        assertThat(body.code()).isEqualTo("TS0220001");
     }
 
     // ---- the three verbs are guarded like every other ----
@@ -909,7 +909,7 @@ class DataBrowserApiTest {
     private record StubConnectorCode() implements TapstateErrorCode {
         @Override
         public String code() {
-            return "connector.capability-missing";
+            return "TS0060031";
         }
 
         @Override

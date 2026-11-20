@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -20,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -176,6 +178,7 @@ public final class SnapshotPhase {
             var opened = owner.apply(SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
                     new TapstateException(io.tapstate.spi.store.IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",run.miningChainId()),null)));
             session = new SnapshotSession() {
+                @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) { return opened.failureFact(failure); }
                 @Override public CaptureBatch read(String table) {
                     preparation.requireReading();
                     var batch = opened.read(table);
@@ -215,6 +218,7 @@ public final class SnapshotPhase {
             var opened=owner.apply(SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
                     new TapstateException(io.tapstate.spi.store.IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",preparation.channel()),null)));
             session=new SnapshotSession() {
+                @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) { return opened.failureFact(failure); }
                 @Override public CaptureBatch read(String table) {
                     preparation.requireReading();var batch=opened.read(table);
                     try {preparation.requireReading();return guardedBatch(batch,preparation::requireReading);}
@@ -234,6 +238,7 @@ public final class SnapshotPhase {
     }
     private static CaptureBatch guardedBatch(CaptureBatch original,Runnable requireReading) {
         return new CaptureBatch() {
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) { return original.failureFact(failure); }
             private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
             @Override public Optional<SourcePosition> seam() { requireReading.run(); return original.seam(); }
             @Override public boolean hasNext() { requireReading.run(); return original.hasNext(); }
@@ -311,7 +316,7 @@ public final class SnapshotPhase {
      * narrows each bounded read to one table when that read opens.
      */
     private static CaptureConfig readOf(CaptureConfig config, List<String> tables) {
-        return new CaptureConfig(config.connectorId(), config.settings(), tables, config.node(), config.sharedNotes());
+        return new CaptureConfig(config.connectorId(), config.settings(), tables, config.node(), config.sharedNotes(), config.nodeConfig());
     }
 
     /**
@@ -415,6 +420,12 @@ public final class SnapshotPhase {
         private final String tailSeam;
         private final boolean oneBatch;
         private CaptureBatch open;
+        private final AtomicReference<FailureFact> capturedFailure = new AtomicReference<>();
+
+        public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+            var captured = capturedFailure.get();
+            return captured != null && captured.cause() == failure ? captured : new io.tapstate.core.common.FailureFact(failure);
+        }
         private boolean closed;
         private boolean disposed;
 
@@ -502,13 +513,42 @@ public final class SnapshotPhase {
                     sink.accept(batch.next().withOrder(order));
                     count++;
                 }
-            } finally {
-                batch.close();
-                synchronized (this) {
-                    if (open == batch) open = null;
+            } catch (RuntimeException | Error failure) {
+                try {
+                    recordReadFailure(batch, failure);
+                } finally {
+                    closeReadBatch(batch, failure);
                 }
+                throw failure;
             }
+            closeReadBatch(batch, null);
             return count;
+        }
+
+        private void recordReadFailure(CaptureBatch batch, Throwable failure) {
+            try {
+                capturedFailure.set(batch.failureFact(failure));
+            } catch (RuntimeException | LinkageError unavailable) {
+                capturedFailure.set(FailureFact.unavailable(failure));
+            }
+        }
+
+        private void closeReadBatch(CaptureBatch batch, Throwable primary) {
+            try {
+                batch.close();
+            } catch (RuntimeException | Error cleanup) {
+                if (primary == null) throw cleanup;
+                if (!(primary instanceof VirtualMachineError)
+                        && (cleanup instanceof Error || primary instanceof CancellationException)) {
+                    if (cleanup != primary) cleanup.addSuppressed(primary);
+                    throw cleanup;
+                }
+                if (cleanup != primary) primary.addSuppressed(cleanup);
+                return;
+            }
+            synchronized (this) {
+                if (open == batch) open = null;
+            }
         }
 
         /**
@@ -521,7 +561,13 @@ public final class SnapshotPhase {
          */
         private void openBatchOf(String table) {
             requireOpen();
-            CaptureBatch batch = session.read(table);
+            CaptureBatch batch;
+            try { batch = session.read(table); }
+            catch (RuntimeException | Error failure) {
+                try { capturedFailure.set(session.failureFact(failure)); }
+                catch (RuntimeException | LinkageError unavailable) { capturedFailure.set(FailureFact.unavailable(failure)); }
+                throw failure;
+            }
             try {
                 seamOf(batch, miningChainId);
             } catch (RuntimeException | Error failure) {

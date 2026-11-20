@@ -171,9 +171,33 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
         } catch (TapstateException e) {
             throw e;
         } catch (Throwable t) {
+            if (PdkConnectionTester.authenticationRejected(t)) {
+                throw new TapstateException(ConnectorError.DISCOVERY_AUTHENTICATION_REJECTED,
+                        Map.of("connector", connector.connectorId()), t);
+            }
+            if (connectionSelectionTimedOut(t)) {
+                throw new TapstateException(ConnectorError.DISCOVERY_CONNECTION_TIMEOUT,
+                        Map.of("connector", connector.connectorId()), t);
+            }
             throw new TapstateException(ConnectorError.DISCOVER_FAILED,
                     Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
         }
+    }
+
+    private static boolean connectionSelectionTimedOut(Throwable failure) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable cause = failure; cause != null && seen.size() < 32 && seen.add(cause); cause = cause.getCause()) {
+            Class<?> actual = cause.getClass();
+            ClassLoader loader = actual.getClassLoader();
+            if (loader == null) continue;
+            try {
+                // A connector can carry its own driver. Resolve its exact timeout type without initialization.
+                if (actual == Class.forName("com.mongodb.MongoTimeoutException", false, loader)) return true;
+            } catch (ClassNotFoundException | LinkageError | SecurityException unavailable) {
+                // A different driver or a partially available connector cannot identify this cause.
+            }
+        }
+        return false;
     }
 
     /** Normalizes the actual open session's metadata without launching a separate discovery or count. */

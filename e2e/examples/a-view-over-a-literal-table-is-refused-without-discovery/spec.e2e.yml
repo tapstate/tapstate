@@ -17,6 +17,6 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
-  - await: { failure_code: actuation.source-schema-not-discovered }
-  - assert: { failure_code: actuation.source-schema-not-discovered }
+  - await: { failure_code: TS0360004 }
+  - assert: { failure_code: TS0360004 }
   - assert: { count: { views.order_state: 0 } }

@@ -53,7 +53,7 @@ from twice a join step's resident budget for every join map a member runs.
 The bootstrap-members column is a second setting, not a description of the profile:
 `tapstate.cluster.bootstrap-min-members` must be **exactly 2** under `process-failure-only` and **3
 or more** under `production-ha`. Its default is 3, so a `process-failure-only` member started without
-it is refused at boot with `boot.cluster-profile-invalid` rather than quietly running with the wrong
+it is refused at boot with `TS0310018` rather than quietly running with the wrong
 threshold.
 
 Before the production threshold is reached, members may discover each other but cannot acquire or

@@ -17,6 +17,11 @@ import io.tapstate.core.common.TapstateException;
 @FunctionalInterface
 public interface SnapshotSession extends AutoCloseable {
 
+    /** A process-local failure captured by this reader; unrelated failures retain their own attribution. */
+    default io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
+    }
+
     /** A bounded close returned while its original attempt still runs; completion permits retrying only that close. */
     final class PendingClose extends TapstateException {
         private final transient CompletionStage<Void> completion;
@@ -59,7 +64,7 @@ public interface SnapshotSession extends AutoCloseable {
             return provider.snapshotSession(config);
         }
         return table -> port.snapshot(new CaptureConfig(
-                config.connectorId(), config.settings(), List.of(table), config.node(), config.sharedNotes()));
+                config.connectorId(), config.settings(), List.of(table), config.node(), config.sharedNotes(), config.nodeConfig()));
     }
 
     /** Opens the next selected table's bounded read. The caller closes the batch after draining it. */

@@ -199,7 +199,7 @@ final class BackgroundLoad {
             // short is a failure, a cancellation among them: a hand-off released under a load nobody closed
             // throws one, and so can a connector, and neither is a stop.
             if (!isCancelled()) {
-                health.fail(failure);
+                health.fail(load.failureFact(failure));
             }
         } finally {
             boolean deferred = false;

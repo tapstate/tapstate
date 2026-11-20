@@ -52,7 +52,8 @@ class MongoPipelineLayoutStoreTest {
         assertThatThrownBy(() -> MongoPipelineLayoutStore.toLayout(stored))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
-                    assertThat(error.args()).containsEntry("id", "orders_sync");
+                    assertThat(error.args()).containsEntry("id", "orders_sync").containsEntry("field", "layout");
+                    assertThat(error.args().keySet()).isEqualTo(error.code().placeholders());
                 });
     }
 }

@@ -2,6 +2,8 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.ArtifactErrorDefinitions;
 
 import java.util.Set;
 
@@ -15,11 +17,11 @@ import java.util.Set;
  */
 public enum ArtifactError implements TapstateErrorCode {
 
-    NOT_FOUND("artifact.not-found", Set.of("id")),
-    PRECONDITION_REQUIRED("artifact.precondition-required", Set.of("id")),
-    VERSION_CONFLICT("artifact.version-conflict", Set.of("id")),
-    IN_USE("artifact.in-use", Set.of("id", "referrers")),
-    PIPELINE_NOT_STOPPED("artifact.pipeline-not-stopped", Set.of("id", "actual", "desired")),
+    NOT_FOUND(ArtifactErrorDefinitions.NOT_FOUND),
+    PRECONDITION_REQUIRED(ArtifactErrorDefinitions.PRECONDITION_REQUIRED),
+    VERSION_CONFLICT(ArtifactErrorDefinitions.VERSION_CONFLICT),
+    IN_USE(ArtifactErrorDefinitions.IN_USE),
+    PIPELINE_NOT_STOPPED(ArtifactErrorDefinitions.PIPELINE_NOT_STOPPED),
     /**
      * The artifact was removed and some of its dependent bookkeeping was not. Distinct from the four
      * above because it is not a refusal: those mean nothing happened and the caller may retry, this one
@@ -27,14 +29,14 @@ public enum ArtifactError implements TapstateErrorCode {
      * a code with a refusal would make a partly-executed removal indistinguishable from one that never
      * started, on every face.
      */
-    RECLAIM_INCOMPLETE("artifact.reclaim-incomplete", Set.of("id", "reason", "residue"));
+    RECLAIM_INCOMPLETE(ArtifactErrorDefinitions.RECLAIM_INCOMPLETE);
 
     private final String code;
     private final Set<String> placeholders;
 
-    ArtifactError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
+    ArtifactError(ProductErrorDefinition definition) {
+        this.code = definition.code();
+        this.placeholders = definition.parameters();
     }
 
     @Override

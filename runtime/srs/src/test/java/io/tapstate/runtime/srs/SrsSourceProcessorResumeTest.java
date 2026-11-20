@@ -78,7 +78,7 @@ class SrsSourceProcessorResumeTest {
         }
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
-                pipeline, ringName, "orders", StartFrom.earliest(), assemblyConfirmation, 1L,
+                pipeline + ".capture-buffer", ringName, "orders", StartFrom.earliest(), assemblyConfirmation, 1L,
                 new CursorFactory(ringName), null, SourcePlacement.anyMember()));
         Vertex project = dag.newVertex("project", Processors.mapP(
                 (Envelope change) -> change.position().order().seq())).localParallelism(1);
@@ -112,6 +112,9 @@ class SrsSourceProcessorResumeTest {
                         .containsExactly(4L, 5L, 6L, 7L, 8L, 9L, 10L, 11L);
             } else {
                 assertThat(engine.failureOf(pipeline)).isPresent();
+                assertThat(engine.failureOf(pipeline).orElseThrow()).isInstanceOfSatisfying(
+                        io.tapstate.core.common.TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(CaptureError.RECOVERY_LOG_GAP));
                 assertThat(engine.failureOf(pipeline).orElseThrow().getMessage())
                         .contains(CaptureError.RECOVERY_LOG_GAP.code(), "ring=" + ringName, "sequence=3");
                 assertThat(target).hasSize(initialCount);

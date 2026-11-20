@@ -127,7 +127,7 @@ class TargetNotEmptyCheckTest {
         assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.WARN);
         assertThat(finding.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
         assertThat(finding.code()).isEqualTo(StartCheckCode.TARGET_ROWS_UNKNOWN);
-        assertThat(finding.params()).containsEntry("reasonCode", "data-browser.connector-not-browsable");
+        assertThat(finding.params()).containsEntry("reasonCode", "TS0390004");
     }
 
     @Test

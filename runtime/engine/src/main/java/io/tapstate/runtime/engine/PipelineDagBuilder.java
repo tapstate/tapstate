@@ -384,7 +384,7 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
         PipelineChains chains = frontier == null ? null : new PipelineChains();
 
-        for (String sourceId : pipeline.sourceIds()) {
+        for (String sourceId : pipeline.sourceBindings()) {
             List<String> sourceKeys = bindings.sourceKeys().apply(sourceId);
             if (sourceKeys == null || sourceKeys.isEmpty()) {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
@@ -567,7 +567,7 @@ public final class PipelineDagBuilder {
         boolean readsSnapshot = pipeline.settings() == null || pipeline.settings().readMode() != ReadMode.CDC_ONLY;
         if (sinkAck != null && chains != null && readsSnapshot) {
             Map<String, List<AwaitedLoad>> gates = loadGates(sinks, chains, shape);
-            for (String sourceId : pipeline.sourceIds()) {
+            for (String sourceId : pipeline.sourceBindings()) {
                 for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {
                     List<AwaitedLoad> awaited = gates.get(frontier.chainOf(sourceKey));
                     if (awaited != null) {

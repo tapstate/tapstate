@@ -55,7 +55,7 @@ class LoggingDimensionRowDisplacedAlertTest {
         ILoggingEvent event = written.list.get(0);
         assertThat(event.getLevel()).isEqualTo(Level.WARN);
         assertThat(event.getFormattedMessage())
-                .contains("engine.join-dimension-row-displaced")
+                .contains("TS0440011")
                 .contains("customers")
                 // The key as the reader's own table spells it. Filed under, it is an encoding - and
                 // somebody told that "AAAAATE" lost a row cannot say which of their rows that is.
@@ -105,7 +105,7 @@ class LoggingDimensionRowDisplacedAlertTest {
                 .as("the warning is visible through the affected pipeline's logs read face")
                 .singleElement()
                 .asString()
-                .contains("engine.join-dimension-row-displaced")
+                .contains("TS0440011")
                 .contains("customers")
                 .contains("join_customers");
         assertThat(sink.tail("outer_pipeline")).isEmpty();

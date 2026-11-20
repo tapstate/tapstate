@@ -511,6 +511,62 @@ class ApplyServiceTest {
     }
 
     @Test
+    void refusesAConnectorReplacementThatInvalidatesAnExistingPipelineOverride() {
+        ApplyService configured = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null, ResourceAttributionPolicy.onPrem(),
+                StateDatabasePolicy.ON_PREM, DeploymentProfile.ON_PREM,
+                id -> new ConnectorDetail(id, id, "", "database", List.of(), "", true, false, "",
+                        List.of(), SpecSource.of("hash", id.equals("postgres")
+                                ? "{}" : """
+                                        {"configOptions":{"node":{"properties":{"preImage":{"type":"boolean"}}}}}
+                                        """), true));
+        String reader = READER_PIPELINE.replace("source: orders_src",
+                "source: { id: orders_src, nodeConfig: { preImage: false } }");
+        configured.apply("author", List.of(draft(BUFFERED_SRC), draft(reader)));
+        Resource original = store.get("orders_src").orElseThrow();
+        SourceResource source = (SourceResource) original;
+        Map<String, Object> postgres = new LinkedHashMap<>(source.config());
+        postgres.put("schema", "public");
+        SourceResource replacement = new SourceResource(source.id(), source.metadata(), "postgres", postgres,
+                source.mode(), source.tables(), source.srs(), source.execution(), source.experimental());
+
+        assertThat(stored("p1")).contains("preImage: false");
+        assertThatThrownBy(() -> configured.replace("author", replacement, CanonicalHash.of(original)))
+                .isInstanceOf(TapstateException.class).hasMessageContaining("undeclared field");
+        assertThat(store.get("orders_src")).contains(original);
+    }
+
+    @Test
+    void dslConnectorReplacementFencesTheStoredPipelineItValidated() {
+        ApplyService configured = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null, ResourceAttributionPolicy.onPrem(),
+                StateDatabasePolicy.ON_PREM, DeploymentProfile.ON_PREM,
+                id -> new ConnectorDetail(id, id, "", "database", List.of(), "", true, false, "",
+                        List.of(), SpecSource.of("hash", """
+                                {"configOptions":{"node":{"properties":{%s"preImage":{"type":"boolean"}}}}}
+                                """.formatted(id.equals("postgres") ? "" : "\"legacyFlag\":{}, ")), true));
+        String reader = READER_PIPELINE.replace("source: orders_src",
+                "source: { id: orders_src, nodeConfig: { preImage: false } }");
+        configured.apply("author", List.of(draft(BUFFERED_SRC), draft(reader)));
+        SourceResource original = (SourceResource) store.get("orders_src").orElseThrow();
+        Map<String, Object> postgres = new LinkedHashMap<>(original.config());
+        postgres.put("schema", "public");
+        SourceResource replacement = new SourceResource(original.id(), original.metadata(), "postgres", postgres,
+                original.mode(), original.tables(), original.srs(), original.execution(), original.experimental());
+
+        store.concurrentWriter = () -> store.landDirectly(new DslParser().parse(
+                reader.replace("preImage: false", "legacyFlag: true")));
+        assertThatThrownBy(() -> configured.apply("author", List.of(draft(new CanonicalWriter().write(replacement)))))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ArtifactError.VERSION_CONFLICT);
+                    assertThat(refused.args()).containsEntry("id", "p1");
+                });
+        assertThat(store.get("orders_src")).contains(original);
+    }
+
+    @Test
     void draftPublicationPlanningAlsoRefusesToChangeTheLivePipelinesBufferingSwitch() {
         service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
         ApplyService guarded = guardedWith(PipelineState.RUNNING);
@@ -732,7 +788,7 @@ class ApplyServiceTest {
         assertThat(result.valid()).isFalse();
         assertThat(result.outcomes()).isEmpty();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic -> {
-            assertThat(diagnostic.code()).isEqualTo("dsl.unknown-field");
+            assertThat(diagnostic.code()).isEqualTo("TS0010002");
             assertThat(diagnostic.params()).containsEntry("field", "bogus_field");
         });
         assertThat(store.saveCount).isZero();
@@ -992,7 +1048,7 @@ class ApplyServiceTest {
         List<String> attempted = new ArrayList<>();
         List<String> refreshed = new ArrayList<>();
         boolean[] fail = {true};
-        ValidationDiagnostic advisory = new ValidationDiagnostic("control.unreachable", Map.of());
+        ValidationDiagnostic advisory = new ValidationDiagnostic("TS0210005", Map.of());
         ApplyService deriving = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
                 (resources, discovered) -> List.of(advisory), pipeline -> {
@@ -1014,7 +1070,7 @@ class ApplyServiceTest {
         assertThat(refreshed).containsExactly("second_pipeline");
         assertThat(first.warnings()).hasSize(2).contains(advisory);
         assertThat(first.warnings().get(1)).satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "ora2my_ods")
                     .containsEntry("causeCode", ArtifactError.NOT_FOUND.code())
                     .containsEntry("causeParams", Map.of("id", "missing_model"));
@@ -1349,7 +1405,7 @@ class ApplyServiceTest {
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).extracting(ValidationDiagnostic::code)
-                .containsExactly("dsl.unknown-field");
+                .containsExactly("TS0010002");
         assertThat(result.warnings()).as("a batch that was refused carries no advisory findings").isEmpty();
         assertThat(reviewed).as("the advisory pass is not reached at all").isEmpty();
     }
@@ -1554,7 +1610,7 @@ class ApplyServiceTest {
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic ->
-                assertThat(diagnostic.code()).isEqualTo("artifact.version-conflict"));
+                assertThat(diagnostic.code()).isEqualTo("TS0240003"));
     }
 
     // ---- fixtures ----

@@ -94,7 +94,7 @@ class ASlowConnectionTestFinishesBeforeTheCliExitsIT {
             assertThat(tests.get()).as("the CLI must issue the operation exactly once").isEqualTo(1);
             assertThat(run.exitCode()).as("stdout:%n%s%nstderr:%n%s", run.stdout(), run.stderr()).isZero();
             assertThat(run.stdout()).contains("PASSED").contains("slow-db2");
-            assertThat(run.stderr()).doesNotContain("cli.request-timed-out");
+            assertThat(run.stderr()).doesNotContain("TS0330019");
         } finally {
             connectorCompletion.shutdownNow();
             server.stop(0);

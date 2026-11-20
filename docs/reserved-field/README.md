@@ -57,10 +57,10 @@ every target sees one name:
 
 | Situation | What happens |
 |---|---|
-| a source table has a column `__tap` | it is read as `__tap_src`; applying the pipeline reports the warning `schema.reserved-field-renamed`, naming the source, the table, the column and the new name |
+| a source table has a column `__tap` | it is read as `__tap_src`; applying the pipeline reports the warning `TS0270002`, naming the source, the table, the column and the new name |
 | the column is part of the table's key | values are unchanged; the key is known by the new name, and the pipeline refers to it by that name |
-| the table also has a column `__tap_src` | refused with `schema.reserved-field-rename-conflict`: two columns cannot be read under one name |
-| a `map` or `format` step declares an output field `__tap` | refused with `dsl.reserved-field-declared`; choose another name |
+| the table also has a column `__tap_src` | refused with `TS0270003`: two columns cannot be read under one name |
+| a `map` or `format` step declares an output field `__tap` | refused with `TS0010037`; choose another name |
 
 Only the top-level column name is reserved. A field called `__tap` inside a nested value or a
 sub-document is ordinary data and is delivered as it is.

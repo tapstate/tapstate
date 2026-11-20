@@ -23,7 +23,7 @@ public final class PipelineConnectorNodes {
         Objects.requireNonNull(definitions, "definitions");
         Set<Identity> result = new LinkedHashSet<>();
         pipeline.sources().forEach(source -> result.add(new Identity(
-                new PipelineNode(pipeline.id(), source.id()), PipelineNode.Purpose.CAPTURE)));
+                new PipelineNode(pipeline.id(), source.binding()), PipelineNode.Purpose.CAPTURE)));
         String viewId = switch (pipeline.view()) {
             case ViewBlock.Inline view -> view.id();
             case ViewBlock.Use view -> view.id();

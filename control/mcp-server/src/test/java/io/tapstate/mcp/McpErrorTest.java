@@ -9,7 +9,7 @@ class McpErrorTest {
 
     @Test
     void errorsExposeStableSeverityCodesAndPlaceholders() {
-        assertThat(McpError.SERVER_REJECTED.code()).isEqualTo("mcp.server-rejected");
+        assertThat(McpError.SERVER_REJECTED.code()).isEqualTo("TS0260004");
         assertThat(McpError.SERVER_REJECTED.severity()).isEqualTo(Severity.ERROR);
         assertThat(McpError.CONNECTOR_SPEC_UNAVAILABLE.placeholders())
                 .containsExactly("connector");

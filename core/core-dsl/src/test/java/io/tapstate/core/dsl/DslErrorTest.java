@@ -13,7 +13,7 @@ class DslErrorTest {
     @Test
     void everyCodeIsInTheDslDomainAndErrorSeverity() {
         for (DslError e : DslError.values()) {
-            assertThat(e.code()).startsWith("dsl.");
+            assertThat(e.code()).matches("TS001(?!0000)[0-9]{4}");
             assertThat(e.severity()).isEqualTo(Severity.ERROR);
         }
     }
@@ -21,57 +21,58 @@ class DslErrorTest {
     @Test
     void carriesTheCorpusVocabularyCodes() {
         assertThat(DslError.values()).extracting(DslError::code).containsExactlyInAnyOrder(
-                "dsl.unsupported-version",
-                "dsl.unknown-field",
-                "dsl.forbidden-field",
-                "dsl.missing-field",
-                "dsl.missing-reference",
-                "dsl.ambiguous-reference",
-                "dsl.mode-mismatch",
-                "dsl.mode-required-for-read",
-                "dsl.illegal-value",
-                "dsl.illegal-expression",
-                "dsl.composition",
-                "dsl.duplicate-id",
-                "dsl.unsupported-mode",
-                "dsl.config-type-mismatch",
-                "dsl.config-required",
-                "dsl.invalid-config-value",
+                "TS0010001",
+                "TS0010002",
+                "TS0010003",
+                "TS0010004",
+                "TS0010005",
+                "TS0010006",
+                "TS0010007",
+                "TS0010008",
+                "TS0010009",
+                "TS0010010",
+                "TS0010011",
+                "TS0010012",
+                "TS0010013",
+                "TS0010014",
+                "TS0010015",
+                "TS0010016",
                 // pre-semantic syntax error — no corpus witness (a syntax error cannot be well-formed)
-                "dsl.malformed-yaml",
+                "TS0010017",
                 // pre-semantic interpolation errors — no corpus witness either, since they are raised on
                 // raw text before the parse and turn on the environment, not on the document
-                "dsl.undefined-variable",
-                "dsl.malformed-interpolation",
+                "TS0010018",
+                "TS0010019",
                 // post-semantic row-expression type errors — the artifact is well-formed and complete,
                 // but the verdict turns on a source's discovered column types, which it does not carry
-                "dsl.row-expression-needs-discovery",
-                "dsl.row-expression-type-unsupported",
-                "dsl.row-expression-type-unknown",
+                "TS0010020",
+                "TS0010021",
+                "TS0010022",
                 // post-semantic too - whether a table declares a key is a property of the table,
                 // carried only by a discovered model and never by the document naming it
-                "dsl.upsert-needs-key",
+                "TS0010023",
                 // the unwind gate, and the other way round from the one above: what an expansion
                 // says about its own rows, and which sync those rows reach, are both written in the
                 // document, so both are witnessed by an ordinary corpus case
-                "dsl.unwind-needs-an-element-key",
-                "dsl.unwind-needs-an-upsert-target",
+                "TS0010024",
+                "TS0010025",
                 // a step output field taking the name kept for product-added row data
-                "dsl.reserved-field-declared",
+                "TS0010037",
                 // Source columns are available during assembly, not offline corpus validation.
-                "dsl.unwind-column-already-exists",
+                "TS0010027",
                 // the write-target gate: which connectors may be written to is a property of the
                 // deployment applied to, not of the document, so it is raised on the apply path
-                "dsl.unsupported-target-connector",
+                "TS0010026",
                 // the join SQL gate: both are raised while reading the artifact, so both are
                 // witnessed by an ordinary corpus case
-                "dsl.join-sql-not-parsable",
-                "dsl.join-sql-unsupported",
+                "TS0010028",
+                "TS0010029",
                 // a join reading another step or a pattern: the wiring is written in the document, so
                 // an ordinary corpus case witnesses each
-                "dsl.join-input-not-a-table",
-                "dsl.join-input-is-a-pattern", "dsl.rollup-function-unknown",
-                "dsl.rollup-on-single-row-embed", "dsl.rollup-level-without-fields");
+                "TS0010030",
+                "TS0010031", "TS0010034",
+                "TS0010035", "TS0010036");
+
     }
 
     @Test
@@ -131,6 +132,10 @@ class DslErrorTest {
 
     @Test
     void resolvesByCorpusVocabularySymbol() {
+        for (DslError code : DslError.values()) {
+            assertThat(code.symbol()).matches("[a-z]+(-[a-z]+)*");
+            assertThat(DslError.ofSymbol(code.symbol())).isSameAs(code);
+        }
         assertThat(DslError.ofSymbol("unknown-field")).isSameAs(DslError.UNKNOWN_FIELD);
         assertThat(DslError.ofSymbol("mode-mismatch")).isSameAs(DslError.MODE_MISMATCH);
     }

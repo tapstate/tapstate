@@ -150,7 +150,7 @@ class AJoinThatCannotResolveItsInputsIsRefusedWithACodeTest {
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         TapstateException refused = (TapstateException) thrown;
-        assertThat(refused.code().code()).isEqualTo("actuation.join-input-not-a-table");
+        assertThat(refused.code().code()).isEqualTo("TS0360013");
         assertThat(refused.args())
                 .containsEntry("step", "widen")
                 .containsEntry("alias", "o")
@@ -170,7 +170,7 @@ class AJoinThatCannotResolveItsInputsIsRefusedWithACodeTest {
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         TapstateException refused = (TapstateException) thrown;
-        assertThat(refused.code().code()).isEqualTo("actuation.join-sql-invalid");
+        assertThat(refused.code().code()).isEqualTo("TS0360014");
         assertThat(refused.args()).containsEntry("step", "widen");
         assertThat(String.valueOf(refused.args().get("detail")))
                 .containsIgnoringCase("no_such_column")

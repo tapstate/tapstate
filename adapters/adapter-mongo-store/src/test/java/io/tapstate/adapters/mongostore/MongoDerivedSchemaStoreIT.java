@@ -197,7 +197,7 @@ class MongoDerivedSchemaStoreIT {
 
             assertThatThrownBy(() -> store.latest("wide", "widen"))
                     .isInstanceOfSatisfying(TapstateException.class, error -> {
-                        assertThat(error.code().code()).isEqualTo("io.document-unreadable");
+                        assertThat(error.code().code()).isEqualTo("TS0480004");
                         assertThat(error.args()).containsEntry("id", "wide").containsEntry("field", "versions");
                     });
         });

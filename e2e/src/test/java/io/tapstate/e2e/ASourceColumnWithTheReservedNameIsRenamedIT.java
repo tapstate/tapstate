@@ -43,7 +43,7 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
 
     private static final String RESERVED = "__tap";
     private static final String RENAMED = "__tap_src";
-    private static final String RENAMED_CODE = "schema.reserved-field-renamed";
+    private static final String RENAMED_CODE = "TS0270002";
 
     private static Map<String, Object> mysql;
 

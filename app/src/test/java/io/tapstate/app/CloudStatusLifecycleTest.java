@@ -145,7 +145,7 @@ class CloudStatusLifecycleTest {
             scheduled.getFirst().run();
             assertThat(calls.get()).isEqualTo(2);
             assertThat(logs.list).singleElement().satisfies(event -> {
-                assertThat(event.getFormattedMessage()).isEqualTo("Cloud status report failed [control.malformed-request]");
+                assertThat(event.getFormattedMessage()).isEqualTo("Cloud status report failed [TS0210001]");
                 assertThat(event.getThrowableProxy()).isNull();
             });
         } finally {

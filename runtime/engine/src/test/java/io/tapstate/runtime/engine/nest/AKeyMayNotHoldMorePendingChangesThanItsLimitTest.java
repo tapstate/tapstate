@@ -128,7 +128,7 @@ class AKeyMayNotHoldMorePendingChangesThanItsLimitTest {
                 policyOf("c1", "p1", 1), policyOf("c1", "p2", 2), policyOf("c1", "p3", 3)))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.pending-limit-exceeded");
+                .isEqualTo("TS0490021");
     }
 
     /**
@@ -144,7 +144,7 @@ class AKeyMayNotHoldMorePendingChangesThanItsLimitTest {
                 claimOf("c1", "p1", "k1", 2), claimOf("c1", "p1", "k2", 3), claimOf("c1", "p1", "k3", 4)))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.pending-limit-exceeded");
+                .isEqualTo("TS0490021");
     }
 
     @Test

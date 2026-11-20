@@ -147,7 +147,8 @@ final class ClusterHealthProbe {
                             || candidate.startsWith("connector.") && candidate.indexOf('.', "connector.".length()) >= 0)) {
                         // Connector-specific code namespaces remain an explicit projection gap.
                         complete = false; code = "unsupported-namespace";
-                    } else if (candidate.length() <= 1024 && dot > 0
+                    } else if (candidate.matches("TS(?!000)[0-9]{3}(?!0000)[0-9]{4}")) code = candidate;
+                    else if (candidate.length() <= 1024 && dot > 0
                             && candidate.substring(0, dot).matches(segment)
                             && candidate.substring(dot + 1).matches(segment)
                             && Domain.isRegistered(candidate.substring(0, dot))) code = candidate;

@@ -144,16 +144,17 @@ class HttpControlClientTest {
         }
     }
 
-    @Test
-    void aRefusalKeepsWhatItCarriedBesidesItsCodeMessageAndParams() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0280006", "lifecycle.start-needs-confirmation"})
+    void aRefusalKeepsWhatItCarriedBesidesItsCodeMessageAndParams(String code) throws Exception {
         HttpServer server = server(exchange -> answer(exchange, 409,
-                "{\"code\":\"lifecycle.start-needs-confirmation\",\"message\":\"Answer first.\","
+                "{\"code\":\"" + code + "\",\"message\":\"Answer first.\","
                         + "\"params\":{\"pipeline\":\"orders\"},\"startChecks\":{\"outcome\":\"NEEDS_CONFIRMATION\"}}"));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
             ControlResponse response = client.post(baseOf(server), "token", "/api/pipelines/orders:start", null,
                     RequestBudget.HEAVY);
 
-            assertThat(response).isEqualTo(new ControlResponse.Rejected(409, "lifecycle.start-needs-confirmation",
+            assertThat(response).isEqualTo(new ControlResponse.Rejected(409, code,
                     "Answer first.", Map.of("pipeline", "orders"),
                     Map.of("startChecks", Map.of("outcome", "NEEDS_CONFIRMATION"))));
         } finally {

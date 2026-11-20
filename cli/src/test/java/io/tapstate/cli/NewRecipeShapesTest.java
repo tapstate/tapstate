@@ -500,7 +500,7 @@ class NewRecipeShapesTest {
                 "-w", ws.toString());
 
         assertThat(r.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("cli.connector-not-official");
+        assertThat(r.err()).contains("TS0330014");
         assertThat(ws.resolve("source")).doesNotExist();
     }
 
@@ -678,7 +678,7 @@ class NewRecipeShapesTest {
         NewRecipeTest.Run r = consolidated(home, ws);
 
         assertThat(r.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("cli.artifact-exists");
+        assertThat(r.err()).contains("TS0330001");
         assertThat(ws.resolve("source/orders_1_src.tap.yml")).doesNotExist();
         assertThat(ws.resolve("pipeline")).doesNotExist();
         assertThat(ws.resolve(".env")).doesNotExist();

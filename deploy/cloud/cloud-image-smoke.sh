@@ -270,9 +270,9 @@ refuses() {
   esac
   echo "PASS: real image refuses $scenario before Ready"
 }
-refuses cloud-without-config "$CLOUD" boot.web-profile-mode-mismatch || FAILED=1
-refuses cloud-partial-config "$CLOUD" boot.cloud-config-incomplete "${CLOUD_ENV[@]}" || FAILED=1
-refuses onprem-with-cloud-config "$ONPREM" boot.web-profile-mode-mismatch "${CLOUD_ENV[@]}" \
+refuses cloud-without-config "$CLOUD" TS0310006 || FAILED=1
+refuses cloud-partial-config "$CLOUD" TS0310002 "${CLOUD_ENV[@]}" || FAILED=1
+refuses onprem-with-cloud-config "$ONPREM" TS0310006 "${CLOUD_ENV[@]}" \
   -e 'TAPSTATE_CLOUD_ATLAS_URI=mongodb://mongo:27017/image_crossed?replicaSet=rs0' || FAILED=1
 mkdir "$WORK/missing" "$WORK/damaged"
 docker cp "$SERVER:/opt/tapstate/connectors/." "$WORK/damaged/"
@@ -292,7 +292,7 @@ seed_refuses() {
     "$CLOUD" "${BASE_ARGS[@]}" >/dev/null || return 1
   ready "$CURRENT" || return 1
   logs "$CURRENT" "cloud-$scenario-seed" || return 1
-  grep -qF 'boot.cloud-connectors-invalid' "$WORK/cloud-$scenario-seed.log" || return 1
+  grep -qF 'TS0310013' "$WORK/cloud-$scenario-seed.log" || return 1
   python3 - "$WORK/cloud-$scenario-seed.log" <<'PY_MEMBER' || return 1
 import pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()

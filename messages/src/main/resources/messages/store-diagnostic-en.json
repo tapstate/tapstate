@@ -1,0 +1,74 @@
+{
+  "TS0470001": {
+    "message": "Cannot reach the store at {target}.",
+    "solution": "Check the store is running and the connection settings are correct, then restart."
+  },
+  "TS0470002": {
+    "message": "Cannot verify read/write access to the deployment database {database}.",
+    "solution": "Check MongoDB connectivity and grant the Cluster user read/write access to its metadata, operator-state, and views databases."
+  },
+  "TS0470003": {
+    "message": "Cannot inspect collections in cache database {database}.",
+    "solution": "Grant the cache user the MongoDB listCollections privilege on this database, then test again."
+  },
+  "TS0470004": {
+    "message": "The store at {target} is not a transaction-capable replica set or sharded cluster.",
+    "solution": "Use a replica set or sharded cluster; standalone MongoDB cannot host checkpoint transactions."
+  },
+  "TS0470005": {
+    "message": "The operator-state database name is not valid for this deployment.",
+    "solution": "Set tapstate.store.mongo.operator-state-database to a non-blank name of at most 63 UTF-8 bytes, without a null character, slash, backslash, space, double quote, dot, or dollar sign. Do not use local, config, or the control database named by tapstate.store.mongo.uri."
+  },
+  "TS0470006": {
+    "message": "The store connection string is not a valid MongoDB URI.",
+    "solution": "Check the store URI setting; it must start with mongodb:// or mongodb+srv://."
+  },
+  "TS0470007": {
+    "message": "AI provider settings require configuration schema version {required}.",
+    "solution": "Keep using the existing non-AI configuration, or explicitly initialize a supported configuration database. No automatic upgrade is performed."
+  },
+  "TS0470008": {
+    "message": "The metadata store's Source config encryption keyring is missing or invalid.",
+    "solution": "Restore a complete metadata backup that includes the original keyring. Do not generate a replacement for existing encrypted Source configs."
+  },
+  "TS0470009": {
+    "message": "This node could not join the current Source config keyring epoch.",
+    "solution": "Check metadata-store availability and confirm this node still owns its current node session, then restart it."
+  },
+  "TS0470010": {
+    "message": "The prepared Source config key cannot become active because a live node has not loaded it.",
+    "solution": "Wait for every current node session to renew, or remove the failed node and wait for its lease to expire, then retry rotation."
+  },
+  "TS0470011": {
+    "message": "Configuration initialization cannot proceed for this installation operation.",
+    "solution": "Verify the original installation identity, operation and generation. Inspect the existing configuration; do not reset its identity or encryption key."
+  },
+  "TS0470012": {
+    "message": "The system default target Source cannot be changed through ordinary authoring.",
+    "solution": "Inspect the Cluster storage binding in Settings. Do not remove or replace its default target Source."
+  },
+  "TS0470013": {
+    "message": "Pipeline {pipeline} must complete its recorded state retirement before removal or identity reuse.",
+    "solution": "Continue the original deletion operation and verify its private resource release and notes cleanup. Keep retained identities while the result is unknown."
+  },
+  "TS0470014": {
+    "message": "The store TLS CA certificate file at {path} could not be read.",
+    "solution": "Check the path points at a readable PEM certificate for the store's TLS chain."
+  },
+  "TS0470015": {
+    "message": "The storage connection uses unsupported database, authentication or TLS settings.",
+    "solution": "Use an explicit valid database, verified server TLS and a separate CA bundle. Atlas requires a username and password with authSource=admin. Omit the mechanism to negotiate SCRAM, or specify supported SCRAM-SHA-256 or SCRAM-SHA-1 credentials. Client keys and disabled certificate verification are not supported."
+  },
+  "TS0470016": {
+    "message": "Cache history retention must be a positive whole number of seconds.",
+    "solution": "Configure an exact positive duration in tapstate.metrics.history.retention before initializing or opening the cache. Fractional seconds are not truncated."
+  },
+  "TS0470017": {
+    "message": "Configured history retention is {configuredSeconds} seconds, but the cache TTL is {storedSeconds} seconds.",
+    "solution": "Stop all Cluster instances, adjust the TTL through database tools, then restart every instance with the same retention. Startup never changes this index."
+  },
+  "TS0470018": {
+    "message": "The storage TLS trust bundle is invalid.",
+    "solution": "Provide a PEM certificate bundle of at most 64 KiB without private keys. Check the server chain and hostname; do not disable verification."
+  }
+}

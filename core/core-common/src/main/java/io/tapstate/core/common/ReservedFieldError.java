@@ -17,38 +17,32 @@ public enum ReservedFieldError implements TapstateErrorCode {
      * A source column named like the reserved field is read under {@code renamed}. {@code source} and
      * {@code table} say where it is, {@code column} the name the source gives it.
      */
-    RENAMED("schema.reserved-field-renamed", Severity.WARNING,
-            Set.of("source", "table", "column", "renamed")),
+    RENAMED(SchemaErrorDefinitions.RESERVED_FIELD_RENAMED),
 
     /**
      * The name such a column would be read under already exists in the same table. {@code source} is
      * the connection it was found on, {@code table} the table, {@code renamed} the name in conflict.
      */
-    RENAME_CONFLICT("schema.reserved-field-rename-conflict", Severity.ERROR,
-            Set.of("source", "table", "renamed"));
+    RENAME_CONFLICT(SchemaErrorDefinitions.RESERVED_FIELD_RENAME_CONFLICT);
 
-    private final String code;
-    private final Severity severity;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    ReservedFieldError(String code, Severity severity, Set<String> placeholders) {
-        this.code = code;
-        this.severity = severity;
-        this.placeholders = placeholders;
+    ReservedFieldError(ProductErrorDefinition definition) {
+        this.definition = definition;
     }
 
     @Override
     public String code() {
-        return code;
+        return definition.code();
     }
 
     @Override
     public Severity severity() {
-        return severity;
+        return definition.severity();
     }
 
     @Override
     public Set<String> placeholders() {
-        return placeholders;
+        return definition.parameters();
     }
 }

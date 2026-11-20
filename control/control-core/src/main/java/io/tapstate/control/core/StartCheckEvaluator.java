@@ -201,10 +201,10 @@ public final class StartCheckEvaluator {
         return new StartCheckReport.Finding(finding.key(), finding.check(),
                 new StartCheckReport.Subject(subject.kind(), subject.id(), subject.element(), subject.label()),
                 finding.behavior(), finding.evaluation(), finding.code().code(), finding.params(),
-                messages.render(finding.code(), finding.params()),
+                messages.renderText(finding.code(), finding.params()),
                 finding.actions().stream()
                         .map(action -> new StartCheckReport.Action(action.id(), action.kind(), action.destructive(),
-                                action.code().code(), messages.render(action.code(), action.params()),
+                                action.code().code(), messages.renderText(action.code(), action.params()),
                                 action.changes()))
                         .toList());
     }

@@ -138,6 +138,16 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
             }
         }
 
+        @Override
+        public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+            return closing ? io.tapstate.core.common.FailureFact.unavailable(failure) : delegate.failureFact(failure);
+        }
+
+        @Override
+        public java.util.Map<String, Object> diagnostic(Throwable failure) {
+            return closing ? java.util.Map.of() : delegate.diagnostic(failure);
+        }
+
         private void fileIfTheSinks(Throwable failure) {
             if (!closing && PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
                 authorization.recordSinkWriteFailure(fence);

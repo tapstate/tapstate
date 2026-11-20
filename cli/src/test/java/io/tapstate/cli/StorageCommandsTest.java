@@ -47,7 +47,7 @@ class StorageCommandsTest {
             assertThat(bodies.getLast()).isEqualTo(Map.of("operationId", "original", "generation", 1L, "bindingVersion", 1L));
             repl.dispatch("storage status"); assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_OK);
             repl.dispatch("storage test mongodb://sentinel-secret"); assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
-            assertThat(calls).hasValue(4); assertThat(output.toString()).contains("cli.storage-usage").doesNotContain("sentinel-secret");
+            assertThat(calls).hasValue(4); assertThat(output.toString()).contains("TS0330047").doesNotContain("sentinel-secret");
         } finally { server.stop(0); }
     }
     @Test void anUnknownWriteResultIsNotRetriedAgainstTheSameOrAnotherMember(@TempDir Path work) throws Exception {

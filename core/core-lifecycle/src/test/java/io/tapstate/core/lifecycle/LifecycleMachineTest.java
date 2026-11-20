@@ -76,13 +76,13 @@ class LifecycleMachineTest {
     }
 
     @Test
-    @DisplayName("an illegal transition carries the lifecycle.illegal-transition code and {from, verb} args")
+    @DisplayName("an illegal transition carries the TS0280001 code and {from, verb} args")
     void illegalTransitionIsCoded() {
         TapstateException ex = catchThrowableOfType(
                 () -> LifecycleMachine.transition(RUNNING, START), TapstateException.class);
 
         assertThat(ex.code()).isSameAs(LifecycleError.ILLEGAL_TRANSITION);
-        assertThat(ex.code().code()).isEqualTo("lifecycle.illegal-transition");
+        assertThat(ex.code().code()).isEqualTo("TS0280001");
         assertThat(ex.args()).containsEntry("from", RUNNING).containsEntry("verb", "start");
         assertThat(ex.args().keySet()).containsExactlyInAnyOrder("from", "verb");
     }

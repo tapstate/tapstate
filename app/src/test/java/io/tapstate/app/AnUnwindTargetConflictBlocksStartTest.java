@@ -54,7 +54,7 @@ class AnUnwindTargetConflictBlocksStartTest {
                     () -> service.start("alice", pipeline.id(), List.of(), null));
             assertThat(refusal.report().outcome()).isEqualTo(StartCheckReport.Outcome.BLOCKED);
             assertThat(refusal.report().findings()).hasSize(2).allSatisfy(finding -> {
-                assertThat(finding.code()).isEqualTo("start-check.target-identity-refused");
+                assertThat(finding.code()).isEqualTo("TS0290003");
                 assertThat(finding.params()).containsEntry("reason", "target-key-conflict");
             });
             assertThat(refusal.report().findings()).extracting(StartCheckReport.Finding::key).doesNotHaveDuplicates();
@@ -76,7 +76,7 @@ class AnUnwindTargetConflictBlocksStartTest {
                     () -> service.start("alice", pipeline.id(), List.of(), null));
             assertThat(refusal.report().outcome()).isEqualTo(StartCheckReport.Outcome.BLOCKED);
             assertThat(refusal.report().findings()).hasSize(4).allSatisfy(finding -> {
-                assertThat(finding.code()).isEqualTo("start-check.target-identity-refused");
+                assertThat(finding.code()).isEqualTo("TS0290003");
                 assertThat(finding.params()).containsEntry("reason", "target-key-conflict");
             });
             assertThat(refusal.report().findings()).extracting(StartCheckReport.Finding::key).doesNotHaveDuplicates();

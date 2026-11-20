@@ -228,6 +228,16 @@ final class PdkSinkWriter implements SinkWriter {
         }
     }
 
+    @Override
+    public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        return connector.failureFact(failure);
+    }
+
+    @Override
+    public Map<String, Object> diagnostic(Throwable failure) {
+        return connector.diagnostic(failure);
+    }
+
     private synchronized WriteResult deliver(List<Envelope> records) {
         try {
             return connector.underLoader(() -> {

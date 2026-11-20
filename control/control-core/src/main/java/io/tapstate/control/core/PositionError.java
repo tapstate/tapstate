@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.PositionErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 
 import java.util.Set;
@@ -19,48 +21,33 @@ public enum PositionError implements TapstateErrorCode {
      * A chain the write-back would move is still being read: {@code chain} is the chain, {@code pipelines}
      * the ones on it that are not at rest.
      */
-    WRITE_BACK_WHILE_LIVE("position.write-back-while-live", Set.of("chain", "pipelines")),
+    WRITE_BACK_WHILE_LIVE(PositionErrorDefinitions.WRITE_BACK_WHILE_LIVE),
 
     /**
      * The request named a chain this pipeline does not read: {@code chain} is the id it named,
      * {@code pipeline} the pipeline, {@code known} the chains it does read.
      */
-    CHAIN_NOT_READ("position.chain-not-read", Set.of("chain", "pipeline", "known")),
+    CHAIN_NOT_READ(PositionErrorDefinitions.CHAIN_NOT_READ),
 
     /**
      * The request changed something other than where a chain resumes from: {@code field} is what it
      * changed, {@code chain} the chain it changed it on. Everything else in the document is a reading,
      * not a setting, and the only thing that could be done with a changed one is ignore it.
      */
-    FIELD_NOT_EDITABLE("position.field-not-editable", Set.of("field", "chain")),
+    FIELD_NOT_EDITABLE(PositionErrorDefinitions.FIELD_NOT_EDITABLE),
 
     /**
      * The request asked for no move at all — no chain named, or every named chain already sitting where
      * the request puts it: {@code pipeline} is the pipeline. Accepting it would report a write-back that
      * did not happen.
      */
-    NOTHING_TO_WRITE("position.nothing-to-write", Set.of("pipeline"));
+    NOTHING_TO_WRITE(PositionErrorDefinitions.NOTHING_TO_WRITE);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    PositionError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    PositionError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }
