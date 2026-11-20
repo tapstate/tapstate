@@ -105,27 +105,24 @@ class PeriodicObservationIsolationIT {
             control.discoverSchema(B + "_source", "mysql", sb);
             MongoDatabase dbA = ca.getDatabase(new ConnectionString(ta).getDatabase());
             MongoDatabase dbB = cb.getDatabase(new ConnectionString(tb).getDatabase());
-            var startupVm = attach(server.output());
-            try (var held = hold(startupVm, Mode.EXECUTION_ADVANCE, () -> control.lifecycle(A, LifecycleVerb.START))) {
-                control.lifecycle(B, LifecycleVerb.START);
-                Await.until("B delivers its snapshot while A's execution advance is held", DELIVERY,
-                        () -> amount(dbB) == 0, () -> "B=" + amount(dbB) + "; A held at " + held.stack);
-            } finally {
-                startupVm.dispose();
-            }
-            Await.until("both snapshot rows and published status", START,
-                    () -> amount(dbA) == 0 && amount(dbB) == 0
-                            && control.observedAt(A).isPresent() && control.observedAt(B).isPresent(),
-                    () -> "A=" + amount(dbA) + ", B=" + amount(dbB));
-            update(sa);
-            Await.until("A CDC target arrives", START, () -> amount(dbA) == 1, () -> "A=" + amount(dbA));
-            update(sb);
-            Await.until("B delivers one real CDC row and publishes outbound facts before arming", START,
-                    () -> amount(dbB) == 1 && outbound(control).isPresent(),
-                    () -> "B=" + amount(dbB) + " outbound=" + outbound(control));
-            Supplier<Reading> read = () -> read(control, dbB);
             var vm = attach(server.output());
             try {
+                try (var held = hold(vm, Mode.EXECUTION_ADVANCE, () -> control.lifecycle(A, LifecycleVerb.START))) {
+                    control.lifecycle(B, LifecycleVerb.START);
+                    Await.until("B delivers its snapshot while A's execution advance is held", DELIVERY,
+                            () -> amount(dbB) == 0, () -> "B=" + amount(dbB) + "; A held at " + held.stack);
+                }
+                Await.until("both snapshot rows and published status", START,
+                        () -> amount(dbA) == 0 && amount(dbB) == 0
+                                && control.observedAt(A).isPresent() && control.observedAt(B).isPresent(),
+                        () -> "A=" + amount(dbA) + ", B=" + amount(dbB));
+                update(sa);
+                Await.until("A CDC target arrives", START, () -> amount(dbA) == 1, () -> "A=" + amount(dbA));
+                update(sb);
+                Await.until("B delivers one real CDC row and publishes outbound facts before arming", START,
+                        () -> amount(dbB) == 1 && outbound(control).isPresent(),
+                        () -> "B=" + amount(dbB) + " outbound=" + outbound(control));
+                Supplier<Reading> read = () -> read(control, dbB);
                 for (var mode : List.of(Mode.NATIVE_METRICS, Mode.OBSERVATION_WRITE, Mode.NATIVE_METRICS, Mode.OBSERVATION_WRITE)) {
                     Reading beforeControl = read.get();
                     update(sb);
