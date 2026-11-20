@@ -172,7 +172,11 @@ public final class Cli implements Runnable {
             // the accept would be a second word for the same subject; a flag on the start would not be
             // anybody looking at all.
             Map.entry("pipeline.derived-schema", "derived-schema"),
-            Map.entry("pipeline.accept-derived-schema", "derived-schema"));
+            Map.entry("pipeline.accept-derived-schema", "derived-schema"),
+            // One verb for both, as with the derived schema: a repair is the same look followed by a
+            // decision about what it showed.
+            Map.entry("pipeline.aggregate-check", "aggregate"),
+            Map.entry("pipeline.aggregate-repair", "aggregate"));
 
     /**
      * Verbs that chain several registered operations rather than projecting one, and are not
@@ -285,6 +289,10 @@ public final class Cli implements Runnable {
                     "Show a pipeline's per-table snapshot progress.")),
             Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
                     "Compare a join's recorded and current columns; --accept re-reads the sources.")),
+            // "the rows the step holds" is the load-bearing part. A check that came back clean and was
+            // read as "the view matches the source" would be believed for something it never looked at.
+            Map.entry("aggregate", new VerbHelp("<pipeline-id> <step> [--group <name=value,...>] [--repair]",
+                    "Check an aggregate step's totals against the rows the step holds; --repair rewrites them.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
             // "per chain" is the load-bearing half of this line. A pipeline's position is one value per

@@ -1,0 +1,19 @@
+version: tapstate/v1
+kind: pipeline
+id: wallet_pipeline
+source: wallet_db
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: widen
+    type: join
+    from: { t: wallet_tran, l: location }
+    engine: builtin
+    sql: |
+      SELECT t.id AS tran_id, t.amount AS amount, l.name AS location_name
+      FROM t LEFT JOIN l
+        ON t.locn_code = l.locn_code
+        OR t.hub_locn_id = l.hub_locn_id
+view:
+  id: wallet_state
+  from: widen
+  primary_key: tran_id

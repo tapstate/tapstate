@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.lifecycle.HistogramBounds;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAccumulator;
@@ -103,6 +104,110 @@ public final class NestStateStats {
             counters.keys.observe(keys, keys);
             counters.roundTrips.observe(roundTrips, roundTrips);
             counters.commitDuration.observe(nanos / 1_000_000_000.0, nanos);
+        }
+    }
+
+    /**
+     * Counts what one acknowledged commit group of {@code namespace} wrote: each key's state as stored - at a
+     * nest's root level, each document's weight - and the group's total. The largest key is kept apart, since a
+     * distribution's last bucket says only that a document passed its top bound, not how far.
+     */
+    public void wrote(String namespace, java.util.Collection<byte[]> written) {
+        Counters counters = counters(namespace);
+        long total = 0L;
+        synchronized (counters) {
+            for (byte[] state : written) {
+                if (state == null) {
+                    continue;
+                }
+                counters.documentBytes.observe(state.length, state.length);
+                counters.largestDocumentBytes.accumulate(state.length);
+                total += state.length;
+            }
+            counters.commitBytes.observe(total, total);
+        }
+    }
+
+    /** Counts one fold of a document's rollup fields at {@code namespace}'s level, and how long it took. */
+    public void folded(String namespace, long nanos) {
+        Counters counters = counters(namespace);
+        synchronized (counters) {
+            counters.foldDuration.observe(nanos / 1_000_000_000.0, nanos);
+        }
+    }
+
+    /** How much {@code namespace}'s weight readings have seen, so a publisher can tell whether they moved. */
+    long weightObservations(String namespace) {
+        Counters counters = byNamespace.get(namespace);
+        return counters == null ? 0L : counters.commitBytes.count() + counters.foldDuration.count();
+    }
+
+    /** How heavy {@code namespace}'s state has been to keep, or null while nothing has been written. */
+    public Weight weight(String namespace) {
+        Counters counters = byNamespace.get(namespace);
+        if (counters == null) return null;
+        synchronized (counters) {
+            if (counters.commitBytes.count() == 0) return null;
+            return new Weight(counters.documentBytes.count(), counters.documentBytes.read(),
+                    counters.documentBytes.sum(), counters.largestDocumentBytes.get(), counters.commitBytes.count(),
+                    counters.commitBytes.read(), counters.commitBytes.sum(), counters.foldDuration.count(),
+                    counters.foldDuration.read(), counters.foldDuration.sum(), counters.countingSinceMillis);
+        }
+    }
+
+    /**
+     * One namespace's weight as read together: bytes per written key, the largest key, bytes per commit group,
+     * and rollup folds with their nanoseconds - each a count, the bucket counts and the sum observed.
+     */
+    public record Weight(long documents, long[] documentBuckets, long documentBytes, long largestDocument,
+            long groups, long[] groupBuckets, long groupBytes, long folds, long[] foldBuckets, long foldNanos,
+            long countingSinceMillis) {
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Weight that
+                    && documents == that.documents
+                    && Arrays.equals(documentBuckets, that.documentBuckets)
+                    && documentBytes == that.documentBytes
+                    && largestDocument == that.largestDocument
+                    && groups == that.groups
+                    && Arrays.equals(groupBuckets, that.groupBuckets)
+                    && groupBytes == that.groupBytes
+                    && folds == that.folds
+                    && Arrays.equals(foldBuckets, that.foldBuckets)
+                    && foldNanos == that.foldNanos
+                    && countingSinceMillis == that.countingSinceMillis;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Long.hashCode(documents);
+            result = 31 * result + Arrays.hashCode(documentBuckets);
+            result = 31 * result + Long.hashCode(documentBytes);
+            result = 31 * result + Long.hashCode(largestDocument);
+            result = 31 * result + Long.hashCode(groups);
+            result = 31 * result + Arrays.hashCode(groupBuckets);
+            result = 31 * result + Long.hashCode(groupBytes);
+            result = 31 * result + Long.hashCode(folds);
+            result = 31 * result + Arrays.hashCode(foldBuckets);
+            result = 31 * result + Long.hashCode(foldNanos);
+            result = 31 * result + Long.hashCode(countingSinceMillis);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Weight["
+                    + "documents=" + documents
+                    + ", documentBuckets=" + Arrays.toString(documentBuckets)
+                    + ", documentBytes=" + documentBytes
+                    + ", largestDocument=" + largestDocument
+                    + ", groups=" + groups
+                    + ", groupBuckets=" + Arrays.toString(groupBuckets)
+                    + ", groupBytes=" + groupBytes
+                    + ", folds=" + folds
+                    + ", foldBuckets=" + Arrays.toString(foldBuckets)
+                    + ", foldNanos=" + foldNanos
+                    + ", countingSinceMillis=" + countingSinceMillis + "]";
         }
     }
 
@@ -222,6 +327,10 @@ public final class NestStateStats {
         private final Distribution keys = new Distribution(HistogramBounds.STATE_COMMIT_KEYS);
         private final Distribution roundTrips = new Distribution(HistogramBounds.STATE_COMMIT_ROUND_TRIPS);
         private final Distribution commitDuration = new Distribution(HistogramBounds.STATE_COMMIT_DURATION);
+        private final Distribution documentBytes = new Distribution(HistogramBounds.STATE_DOCUMENT_BYTES);
+        private final Distribution commitBytes = new Distribution(HistogramBounds.STATE_COMMIT_BYTES);
+        private final Distribution foldDuration = new Distribution(HistogramBounds.ROLLUP_FOLD_DURATION);
+        private final LongAccumulator largestDocumentBytes = new LongAccumulator(Math::max, 0L);
 
         /**
          * When these counts began, in epoch milliseconds: what a count of work done accumulates from, so a

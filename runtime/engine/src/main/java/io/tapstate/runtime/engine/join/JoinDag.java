@@ -81,8 +81,13 @@ public final class JoinDag {
         String factSource = plan.factSource().name();
         keyColumns.put(factSource, factKeyColumns);
         sourceByOrdinal.put(0, factSource);
+        // A source the front end added for one alternative of an OR condition reads the rows of the source
+        // it stands in for, so it is fed by that source's producers - on an edge of its own, keyed by its
+        // own columns, into state of its own.
+        Map<String, String> declared = new LinkedHashMap<>();
         int ordinal = 1;
         for (JoinTree.Source source : plan.from().sources()) {
+            declared.put(source.name(), source.declared());
             if (source.name().equals(factSource)) {
                 continue;
             }
@@ -92,14 +97,14 @@ public final class JoinDag {
 
         Map<Integer, List<String>> chainsByOrdinal = new LinkedHashMap<>();
         if (axes != null) {
-            sourceByOrdinal.forEach((edge, source) -> chainsByOrdinal.put(edge, chainsOfSource.apply(source)));
+            sourceByOrdinal.forEach((edge, source) -> chainsByOrdinal.put(edge, chainsOfSource.apply(declared.get(source))));
         }
         Vertex vertex = width.sized(dag.newVertex(nodeId, width.metaSupplier(nodeId, new JoinVertexSupplier(
                 plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
                 Map.copyOf(sourceByOrdinal), stores, displaced, false, axes, chainsByOrdinal),
                 axes, chainsByOrdinal)));
         sourceByOrdinal.forEach((edge, source) -> {
-            List<Vertex> producers = sourceUpstream.apply(source);
+            List<Vertex> producers = sourceUpstream.apply(declared.get(source));
             if (producers == null || producers.isEmpty()) {
                 throw new IllegalStateException("join source '" + source + "' resolved to no vertex");
             }

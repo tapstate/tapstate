@@ -128,6 +128,33 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void anAggregateReportKeepsANullGroupValueApartFromAnEmptyOne() {
+        AggregateCheckOutcome.Found found = HttpControlPlaneClient.aggregateReport("""
+                {"pipeline":"pl1","step":"by_region","repaired":false,"groups":2,"next":"c1","conflicts":3,"withheld":1,
+                 "findings":[{"group":{"region":null,"kind":""},"verdict":"mismatch","fields":["revenue","(rows)"],
+                              "code":"aggregate.sum-out-of-range","field":"revenue"}]}""");
+
+        assertThat(found.groups()).isEqualTo(2);
+        assertThat(found.next()).isEqualTo("c1");
+        assertThat(found.conflicts()).isEqualTo(3);
+        assertThat(found.withheld()).isEqualTo(1);
+        AggregateCheckOutcome.Finding finding = found.findings().get(0);
+        assertThat(finding.group()).containsEntry("region", null).containsEntry("kind", "");
+        assertThat(finding.verdict()).isEqualTo("mismatch");
+        assertThat(finding.fields()).containsExactly("revenue", "(rows)");
+        assertThat(finding.code()).isEqualTo("aggregate.sum-out-of-range");
+        assertThat(finding.field()).isEqualTo("revenue");
+    }
+
+    @Test
+    void anAggregateAnswerThatIsNotAReportIsNotReadAsAnEmptyOne() {
+        // An empty report says every group matched; a body nobody could read must not say that.
+        assertThat(HttpControlPlaneClient.aggregateReport("{\"findings\":[]}")).isNull();
+        assertThat(HttpControlPlaneClient.aggregateReport(
+                "{\"groups\":1,\"findings\":[{\"group\":{},\"fields\":[]}]}")).isNull();
+    }
+
+    @Test
     void healthyWhenHealthzReturns200() throws Exception {
         HttpServer server = serverReplying(200, "ok");
         try {
@@ -1927,6 +1954,28 @@ class HttpControlPlaneClientTest {
     void statusReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
         assertThat(new HttpControlPlaneClient().status(unreachableBase(), "tok", "pl1"))
                 .isInstanceOf(StatusOutcome.Unreachable.class);
+    }
+
+    @Test
+    void explainDecodesWhatAnAggregateStepKeepsAndLeavesTheUnknownNull() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1/explain", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"RUNNING\",\"kind\":\"NO_MATCH\","
+                        + "\"message\":\"No diagnostic rule matched.\",\"freshness\":\"UNKNOWN\","
+                        + "\"evidence\":[],\"cannotSay\":[\"The observation has no time.\"],\"next\":null,"
+                        + "\"aggregates\":[{\"step\":\"by_region\",\"entriesPerRow\":3,"
+                        + "\"keptInputFields\":[\"most\"],\"inputRows\":1000,\"estimatedEntries\":3000},"
+                        + "{\"step\":\"by_day\",\"entriesPerRow\":2,\"storedEntries\":12}]}", seen);
+        try {
+            ExplainOutcome outcome = new HttpControlPlaneClient().explain(baseOf(server), "tok-abc", "pl1");
+
+            assertThat(outcome).isInstanceOf(ExplainOutcome.Found.class);
+            assertThat(((ExplainOutcome.Found) outcome).aggregates()).containsExactly(
+                    new ExplainOutcome.Aggregate("by_region", 3, List.of("most"), 1_000L, 3_000L, null),
+                    new ExplainOutcome.Aggregate("by_day", 2, List.of(), null, null, 12L));
+        } finally {
+            server.stop(0);
+        }
     }
 
     @Test

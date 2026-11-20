@@ -22,6 +22,7 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.StateCommitReading;
+import io.tapstate.core.lifecycle.StateWeightReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StageReading;
@@ -37,6 +38,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -45,6 +47,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -195,6 +198,10 @@ public final class ObservationPublisher {
     static final String STATE_COMMIT_KEYS_METRIC = "tapstate.pipeline.state.commit.keys";
     static final String STATE_COMMIT_ROUND_TRIPS_METRIC = "tapstate.pipeline.state.commit.round_trips";
     static final String STATE_COMMIT_DURATION_METRIC = "tapstate.pipeline.state.commit.duration";
+    static final String STATE_DOCUMENT_BYTES_METRIC = "tapstate.pipeline.state.document.bytes";
+    static final String STATE_DOCUMENT_BYTES_MAX_METRIC = "tapstate.pipeline.state.document.bytes.max";
+    static final String STATE_COMMIT_BYTES_METRIC = "tapstate.pipeline.state.commit.bytes";
+    static final String ROLLUP_FOLD_DURATION_METRIC = "tapstate.pipeline.nest.rollup.fold.duration";
     static final String STATE_EVICTIONS_METRIC = "tapstate.pipeline.state.evictions";
     /**
      * Where each namespace comes from in the pipeline's definition, as one reading of 1 per namespace whose
@@ -299,6 +306,30 @@ public final class ObservationPublisher {
     private static final String CHAIN_ID_ATTRIBUTE = MetricAttributes.CHAIN_ID;
     private static final String NEST_NAMESPACE_ATTRIBUTE = MetricAttributes.NEST_NAMESPACE;
     private static final String JOIN_NAMESPACE_ATTRIBUTE = MetricAttributes.JOIN_NAMESPACE;
+    private static final String AGGREGATE_STEP_ATTRIBUTE = MetricAttributes.AGGREGATE_STEP;
+
+    /** One family of what an aggregate step reports: its flat prefix, its canonical name and its unit. */
+    private record AggregateFamily(String prefix, String metric, String unit) {
+    }
+
+    /**
+     * What an aggregate step reports about itself, by the prefix its reading arrives under, which is also
+     * its flat key with the step appended. The sizes are as of the last pass the step finished over its
+     * state and are absent until one has, so an absence is "not measured yet". The count of inputs not
+     * applied is absent until there is one, for the reason the discarded changes of a nest are.
+     */
+    private static final List<AggregateFamily> AGGREGATE_FAMILIES = List.of(
+            new AggregateFamily("aggregateRows.", "tapstate.pipeline.aggregate.rows", "{row}"),
+            new AggregateFamily("aggregateGroups.", "tapstate.pipeline.aggregate.groups", "{group}"),
+            new AggregateFamily("aggregateStateEntries.", "tapstate.pipeline.aggregate.state.entries", "{entry}"),
+            new AggregateFamily("aggregateTombstones.", "tapstate.pipeline.aggregate.tombstones", "{entry}"),
+            new AggregateFamily("aggregateLargestGroupRows.", "tapstate.pipeline.aggregate.group.rows.largest",
+                    "{row}"),
+            new AggregateFamily("aggregateFailedGroups.", "tapstate.pipeline.aggregate.groups.failed", "{group}"),
+            new AggregateFamily("aggregateInputs.", "tapstate.pipeline.aggregate.inputs", "{event}"),
+            new AggregateFamily("aggregateStateWrites.", "tapstate.pipeline.aggregate.state.writes", "{commit}"),
+            new AggregateFamily("aggregateOrderConflicts.", "tapstate.pipeline.aggregate.order_conflicts",
+                    "{event}"));
     private static final String DIRECTION_ATTRIBUTE = MetricAttributes.DIRECTION;
     private static final String OP_ATTRIBUTE = MetricAttributes.OP;
     private static final String INBOUND = "in";
@@ -316,7 +347,7 @@ public final class ObservationPublisher {
      * <p>Collapsing is not the same as dropping and is recorded separately by the projection, so what a
      * reader of this face is actually looking at stays answerable.
      */
-    static final Map<String, FlatReduction> FLAT_REDUCTIONS = Map.ofEntries(
+    private static final Map<String, FlatReduction> NAMED_REDUCTIONS = Map.ofEntries(
             Map.entry(RECORDS_METRIC, keyed("records.", DIRECTION_ATTRIBUTE)),
             Map.entry(BYTES_METRIC, keyed("bytes.", DIRECTION_ATTRIBUTE)),
             Map.entry(LAG_METRIC, keyed("lag.", TABLE_ID_ATTRIBUTE)),
@@ -355,6 +386,16 @@ public final class ObservationPublisher {
             // canonical fact does, and the flat face keeps their bare keys.
             Map.entry(RECORDS_DRIVEN_METRIC, attributes -> RECORDS_DRIVEN_FLAT),
             Map.entry(RECONCILE_STREAK_METRIC, attributes -> RECONCILE_STREAK_FLAT));
+
+    /** Every rule above, and one per family an aggregate step reports: its prefix and then the step. */
+    static final Map<String, FlatReduction> FLAT_REDUCTIONS = flatReductions();
+
+    private static Map<String, FlatReduction> flatReductions() {
+        Map<String, FlatReduction> reductions = new HashMap<>(NAMED_REDUCTIONS);
+        AGGREGATE_FAMILIES.forEach(family ->
+                reductions.put(family.metric(), keyed(family.prefix(), AGGREGATE_STEP_ATTRIBUTE)));
+        return Map.copyOf(reductions);
+    }
 
     /**
      * A rule spelling a point's flat key as {@code prefix} and the value of {@code dimension}, and
@@ -414,6 +455,8 @@ public final class ObservationPublisher {
     private final Function<String, SnapshotReading> snapshots;
     private final Function<String, SnapshotReading> runSnapshots;
     private final Function<String, InitialLoad> initialLoads;
+    private final AtomicReference<Function<String, Map<String, Long>>> aggregateReadings =
+            new AtomicReference<>(id -> Map.of());
     private final Function<String, Map<String, Long>> frontierGaps;
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
@@ -770,6 +813,32 @@ public final class ObservationPublisher {
     }
 
     /**
+     * This publisher, also reporting what the aggregate steps of a pipeline's live run say about
+     * themselves. {@code readings} yields them keyed by a kind's prefix and then the step; a pipeline
+     * with no aggregate step yields none.
+     */
+    public ObservationPublisher withAggregateReadings(Function<String, Map<String, Long>> readings) {
+        this.aggregateReadings.set(Objects.requireNonNull(readings, "readings"));
+        return this;
+    }
+
+    /** One fact per family that reported, one point per step. */
+    static List<MetricFact> aggregateFacts(String pipelineId, Instant at, Map<String, Long> readings) {
+        List<MetricFact> facts = new ArrayList<>();
+        for (AggregateFamily family : AGGREGATE_FAMILIES) {
+            Map<String, Long> bySteps = new java.util.TreeMap<>();
+            readings.forEach((name, value) -> {
+                if (name.startsWith(family.prefix())) {
+                    bySteps.put(name.substring(family.prefix().length()), value);
+                }
+            });
+            readingsAt(pipelineId, family.metric(), family.unit(), at, AGGREGATE_STEP_ATTRIBUTE, bySteps)
+                    .ifPresent(facts::add);
+        }
+        return facts;
+    }
+
+    /**
      * Publishes the pipeline's latest observation from its actual state; a no-op, answering empty, if it
      * has no checkpoint.
      */
@@ -866,9 +935,10 @@ public final class ObservationPublisher {
                 pinned = frontierStalls.apply(pipelineId);
                 SnapshotReading loaded = capture == null ? snapshots.apply(pipelineId) : capture.loaded();
                 SnapshotReading readThisRun = capture == null ? runSnapshots.apply(pipelineId) : capture.run();
-                List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
+                List<MetricFact> measured = new ArrayList<>(facts(pipelineId, actual, at, readings, gaps, pinned,
                         nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                        joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
+                        joinRecomputeExpected.apply(pipelineId), loaded, readThisRun));
+                measured.addAll(aggregateFacts(pipelineId, at, aggregateReadings.get().apply(pipelineId)));
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                         loaded.byTable(), capture == null ? positions.apply(pipelineId) : capture.positions(), carried, at, measured,
@@ -1117,6 +1187,7 @@ public final class ObservationPublisher {
                 .ifPresent(facts::add);
         rootsRendered(pipelineId, at, nestReadings).ifPresent(facts::add);
         facts.addAll(stateCommits(pipelineId, at, nestReadings));
+        facts.addAll(stateWeights(pipelineId, at, nestReadings));
         nestOrigins(pipelineId, at, nestReadings).ifPresent(facts::add);
         // One point per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
@@ -1189,6 +1260,48 @@ public final class ObservationPublisher {
                 new MetricFact(STATE_COMMIT_DURATION_METRIC, MetricType.HISTOGRAM,
                         HistogramBounds.STATE_COMMIT_DURATION.unit(), took),
                 new MetricFact(STATE_EVICTIONS_METRIC, MetricType.COUNTER, "{entry}", evicted));
+    }
+
+    /**
+     * How heavy each namespace's state is to keep, one point per namespace that has written any: bytes per
+     * written key (at a root level, per document), the largest of them, bytes per commit group, and where a level
+     * renders rollup fields, how long folding them took. Nothing at all for a pipeline that has written nothing.
+     */
+    private static List<MetricFact> stateWeights(String pipelineId, Instant at,
+            Map<String, NestStateReading> nestReadings) {
+        List<MetricPoint> documents = new ArrayList<>();
+        List<MetricPoint> largest = new ArrayList<>();
+        List<MetricPoint> groups = new ArrayList<>();
+        List<MetricPoint> folds = new ArrayList<>();
+        nestReadings.forEach((namespace, reading) -> {
+            StateWeightReading weight = reading.weight();
+            if (weight == null) {
+                return;
+            }
+            Map<String, String> attributes =
+                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, NEST_NAMESPACE_ATTRIBUTE, namespace);
+            Instant since = weight.countingSince();
+            documents.add(MetricPoint.distribution(attributes, since, at, weight.documentBytes()));
+            largest.add(MetricPoint.reading(attributes, at, weight.largestDocumentBytes()));
+            groups.add(MetricPoint.distribution(attributes, since, at, weight.commitBytes()));
+            if (weight.foldDuration() != null) {
+                folds.add(MetricPoint.distribution(attributes, since, at, weight.foldDuration()));
+            }
+        });
+        if (documents.isEmpty()) {
+            return List.of();
+        }
+        List<MetricFact> facts = new ArrayList<>(List.of(
+                new MetricFact(STATE_DOCUMENT_BYTES_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_DOCUMENT_BYTES.unit(), documents),
+                new MetricFact(STATE_DOCUMENT_BYTES_MAX_METRIC, MetricType.GAUGE, "By", largest),
+                new MetricFact(STATE_COMMIT_BYTES_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_BYTES.unit(), groups)));
+        if (!folds.isEmpty()) {
+            facts.add(new MetricFact(ROLLUP_FOLD_DURATION_METRIC, MetricType.HISTOGRAM,
+                    HistogramBounds.ROLLUP_FOLD_DURATION.unit(), folds));
+        }
+        return facts;
     }
 
     private static Optional<MetricFact> nestOrigins(String pipelineId, Instant at,
