@@ -16,4 +16,9 @@ public final class IoDiagnosticCatalog {
     }
 
     public static DiagnosticDefinitionLookup bundled() { return Bundled.INSTANCE; }
+
+    static java.util.Optional<MessageCatalog.Rendered> renderHistoricalWithoutParameters(String code,
+            java.util.Map<String, Object> named, java.util.Locale locale) {
+        return Bundled.INSTANCE.renderHistoricalWithoutParameters(code, named, locale);
+    }
 }

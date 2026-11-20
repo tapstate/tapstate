@@ -62,6 +62,28 @@ class ProductDiagnosticCatalogTest {
     }
 
     @Test
+    void historicalNoParameterTextIsExplicitAndNeverCompletesTheDefinition() {
+        String fallback = "\"historicalWithoutParameters\":{\"message\":\"Old failure without recorded facts.\",\"solution\":\"Inspect the original operation.\"}";
+        String resource = RESOURCE.replace("\"solution\":\"Correct the request.\"", "\"solution\":\"Correct the request.\"," + fallback);
+        var catalog = ProductDiagnosticCatalog.load("021", List.of(DEFINITION), language -> resource);
+        assertThat(catalog.renderHistoricalWithoutParameters(CODE, Map.of(), Locale.ENGLISH)
+                .orElseThrow().message()).isEqualTo("Old failure without recorded facts.");
+        assertThat(catalog.resolve(CODE, Map.of(), List.of(), Locale.ENGLISH)).isEmpty();
+        assertThat(catalog.renderHistoricalWithoutParameters(CODE, Map.of("reason", "partial"), Locale.ENGLISH)).isEmpty();
+        assertThat(catalog.renderHistoricalWithoutParameters("TS0219999", Map.of(), Locale.ENGLISH)).isEmpty();
+        assertThat(catalog.resolve(CODE, Map.of("reason", "original"), List.of(), Locale.ENGLISH)
+                .orElseThrow().message()).isEqualTo("Invalid request: original");
+        assertThatThrownBy(() -> ProductDiagnosticCatalog.load("021", List.of(DEFINITION),
+                language -> resource.replace("Old failure without recorded facts.", "Missing {reason}")))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("requires parameters");
+        assertThatThrownBy(() -> ProductDiagnosticCatalog.load("021", List.of(DEFINITION),
+                language -> language.equals("en") ? resource : RESOURCE))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("translations");
+        assertThat(ProductDiagnosticCatalog.load("021", List.of(DEFINITION), language -> RESOURCE)
+                .renderHistoricalWithoutParameters(CODE, Map.of(), Locale.ENGLISH)).isEmpty();
+    }
+
+    @Test
     void unknownLegacyAndPositionalInputsAreLeftToTheirOwningAdapter() {
         var catalog = ProductDiagnosticCatalog.load("021", List.of(DEFINITION), language -> RESOURCE);
         var args = Map.<String, Object>of("reason", "missing id");

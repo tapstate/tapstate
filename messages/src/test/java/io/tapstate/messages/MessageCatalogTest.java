@@ -41,6 +41,25 @@ class MessageCatalogTest {
     }
 
     @Test
+    void emptyHistoricalCorruptDocumentFactsHaveLocalizedTextWithoutInventingParameters() {
+        var messages = new java.util.HashSet<String>();
+        var params = Map.<String, Object>of();
+        for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+            var rendered = EN.render("TS0480004", params, locale);
+            assertThat(rendered.message()).isNotEqualTo("TS0480004").doesNotContain("{id}", "{field}");
+            assertThat(rendered.solution()).isNotBlank();
+            messages.add(rendered.message());
+            var complete = EN.render("TS0480004", Map.of("id", "original-id", "field", "original-field"), locale);
+            assertThat(complete.message()).contains("original-id", "original-field");
+        }
+        assertThat(messages).hasSize(3);
+        assertThat(params).isEmpty();
+        assertThat(EN.renderComplete("TS0480004", params)).isEmpty();
+        assertThat(EN.render("TS0480004", Map.of("id", "only-id")).message()).isEqualTo("TS0480004");
+        assertThat(EN.render("TS0060027", Map.of()).message()).isEqualTo("TS0060027");
+    }
+
+    @Test
     void currentConnectionIdentityRetainsTheSourceBoundProjection() {
         var definition = io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED;
         var current = new TapstateErrorCode() {

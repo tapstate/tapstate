@@ -13,7 +13,11 @@
   },
   "TS0480004": {
     "message": "A stored document with id '{id}' could not be read back; the fault is in '{field}'.",
-    "solution": "The stored document is corrupt or was written by a newer version; inspect or restore it."
+    "solution": "The stored document is corrupt or was written by a newer version; inspect or restore it.",
+    "historicalWithoutParameters": {
+      "message": "A stored document could not be read. This failure did not record the affected document or field.",
+      "solution": "Preserve the existing data and inspect the original operation and service logs. Restore the document from a verified compatible backup if needed; do not delete retained state or repeat setup."
+    }
   },
   "TS0480005": {
     "message": "Cleanup of artifact {hash} upload {upload} could not be confirmed.",

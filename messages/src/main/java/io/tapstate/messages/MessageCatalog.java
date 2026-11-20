@@ -82,6 +82,8 @@ public final class MessageCatalog {
     public Rendered render(String code, Map<String, Object> args, Locale locale) {
         var current = registered(code, args, locale);
         if (current.isPresent()) return current.orElseThrow();
+        var historical = IoDiagnosticCatalog.renderHistoricalWithoutParameters(code, args, locale);
+        if (historical.isPresent()) return historical.orElseThrow();
         Entry entry = entries.get(code);
         if (entry == null) {
             return new Rendered(code, null);
@@ -100,6 +102,12 @@ public final class MessageCatalog {
         collectLegacyParameters(entry.message(), required);
         collectLegacyParameters(entry.solution(), required);
         return required.equals(args.keySet()) ? Optional.of(render(code, args)) : Optional.empty();
+    }
+
+    /** Presentation text may describe an explicitly supported old record without completing its facts. */
+    public Optional<Rendered> renderAvailable(String code, Map<String, Object> args, Locale locale) {
+        if (renderComplete(code, args).isPresent()) return Optional.of(render(code, args, locale));
+        return IoDiagnosticCatalog.renderHistoricalWithoutParameters(code, args, locale);
     }
 
     private static Optional<Rendered> registered(String code, Map<String, Object> args, Locale locale) {

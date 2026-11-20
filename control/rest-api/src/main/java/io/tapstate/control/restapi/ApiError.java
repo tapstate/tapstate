@@ -42,8 +42,9 @@ public record ApiError(String code, Map<String, Object> params, String message,
                 params.put(key, entry.getValue());
             }
         }
-        if (catalog.renderComplete(code, params).isEmpty()) return result;
-        var rendered = catalog.render(code, params, locale);
+        var available = catalog.renderAvailable(code, params, locale);
+        if (available.isEmpty()) return result;
+        var rendered = available.orElseThrow();
         if (diagnostic.get("message") instanceof String original && !original.equals(rendered.message())) {
             result.putIfAbsent("rawMessage", original);
         }

@@ -36,11 +36,14 @@ public final class ProductDiagnosticCatalog implements DiagnosticDefinitionLooku
 
     private final Map<String, Definition> definitions;
     private final Map<String, Map<String, MessageCatalog.Rendered>> text;
+    private final Map<String, Map<String, MessageCatalog.Rendered>> historicalWithoutParameters;
 
     private ProductDiagnosticCatalog(Map<String, Definition> definitions,
-            Map<String, Map<String, MessageCatalog.Rendered>> text) {
+            Map<String, Map<String, MessageCatalog.Rendered>> text,
+            Map<String, Map<String, MessageCatalog.Rendered>> historicalWithoutParameters) {
         this.definitions = Map.copyOf(definitions);
         this.text = Map.copyOf(text);
+        this.historicalWithoutParameters = Map.copyOf(historicalWithoutParameters);
     }
 
     /**
@@ -59,15 +62,16 @@ public final class ProductDiagnosticCatalog implements DiagnosticDefinitionLooku
                 throw new IllegalStateException("invalid or repeated diagnostic definition " + definition.code());
         }
         Map<String, Map<String, MessageCatalog.Rendered>> languages = new LinkedHashMap<>();
+        Map<String, Map<String, MessageCatalog.Rendered>> historical = new LinkedHashMap<>();
         for (String language : LANGUAGES) {
             Object parsed = JsonReader.parseUnique(readLocale.apply(language));
             if (!(parsed instanceof Map<?, ?> entries) || !entries.keySet().equals(definitions.keySet()))
                 throw new IllegalStateException("incomplete diagnostic catalog " + language);
             Map<String, MessageCatalog.Rendered> templates = new LinkedHashMap<>();
+            Map<String, MessageCatalog.Rendered> historicalTemplates = new LinkedHashMap<>();
             definitions.forEach((code, definition) -> {
                 if (!(entries.get(code) instanceof Map<?, ?> entry)
-                        || !entry.keySet().equals(entry.containsKey("technicalParams")
-                                ? Set.of("message", "solution", "technicalParams") : Set.of("message", "solution"))
+                        || !validFields(entry)
                         || !(entry.get("message") instanceof String message) || message.isBlank()
                         || !(entry.get("solution") instanceof String solution) || solution.isBlank())
                     throw new IllegalStateException("invalid language entry " + language + "/" + code);
@@ -90,10 +94,42 @@ public final class ProductDiagnosticCatalog implements DiagnosticDefinitionLooku
                 if (!used.equals(definition.parameters()))
                     throw new IllegalStateException("incorrect diagnostic parameters " + language + "/" + code);
                 templates.put(code, new MessageCatalog.Rendered(message, solution));
+                if (entry.containsKey("historicalWithoutParameters")) {
+                    if (definition.parameters().isEmpty()
+                            || !(entry.get("historicalWithoutParameters") instanceof Map<?, ?> fallback)
+                            || !fallback.keySet().equals(Set.of("message", "solution"))
+                            || !(fallback.get("message") instanceof String fallbackMessage) || fallbackMessage.isBlank()
+                            || !(fallback.get("solution") instanceof String fallbackSolution) || fallbackSolution.isBlank())
+                        throw new IllegalStateException("invalid historical diagnostic text " + language + "/" + code);
+                    Set<String> missing = new HashSet<>();
+                    collectParameters(fallbackMessage, missing);
+                    collectParameters(fallbackSolution, missing);
+                    if (!missing.isEmpty())
+                        throw new IllegalStateException("historical diagnostic text requires parameters " + language + "/" + code);
+                    historicalTemplates.put(code, new MessageCatalog.Rendered(fallbackMessage, fallbackSolution));
+                }
             });
             languages.put(language, Map.copyOf(templates));
+            historical.put(language, Map.copyOf(historicalTemplates));
         }
-        return new ProductDiagnosticCatalog(definitions, languages);
+        var historicalCodes = historical.get("en").keySet();
+        if (historical.values().stream().anyMatch(values -> !values.keySet().equals(historicalCodes)))
+            throw new IllegalStateException("incomplete historical diagnostic translations");
+        return new ProductDiagnosticCatalog(definitions, languages, historical);
+    }
+
+    private static boolean validFields(Map<?, ?> entry) {
+        Set<String> fields = new HashSet<>(Set.of("message", "solution"));
+        if (entry.containsKey("technicalParams")) fields.add("technicalParams");
+        if (entry.containsKey("historicalWithoutParameters")) fields.add("historicalWithoutParameters");
+        return entry.keySet().equals(fields);
+    }
+
+    /** Explicit code-level text for old records with no arguments; this never completes their facts. */
+    public Optional<MessageCatalog.Rendered> renderHistoricalWithoutParameters(String code,
+            Map<String, Object> named, Locale locale) {
+        if (!named.isEmpty()) return Optional.empty();
+        return Optional.ofNullable(historicalWithoutParameters.get(language(locale)).get(code));
     }
 
     private static void collectParameters(String template, Set<String> used) {
