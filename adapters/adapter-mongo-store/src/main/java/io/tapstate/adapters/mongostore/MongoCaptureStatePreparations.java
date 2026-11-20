@@ -20,6 +20,12 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
         this.client=Objects.requireNonNull(client,"client");this.database=Objects.requireNonNull(database,"database");this.cluster=Objects.requireNonNull(cluster,"cluster");this.bindings=Objects.requireNonNull(bindings,"bindings");this.artifacts=Objects.requireNonNull(artifacts,"artifacts");this.active=Objects.requireNonNull(active,"active");
         if(!bindings.belongsTo(client,database.getName()) || !artifacts.belongsTo(client,database.getName()))throw new IllegalArgumentException("capture preparation requires one original CONFIG client");
     }
+    static void addRetainedArtifactHashes(ClientSession session, MongoDatabase database, java.util.Set<String> retained) {
+        var preparations = SystemCollections.CAPTURE_PREPARATIONS.on(database);
+        preparations.find(session, new Document("artifactHash", new Document("$exists", true)))
+                .forEach(row -> retained.add(MongoCapturePreparationFacts.artifactHash(row)));
+    }
+
     @Override public CaptureStatePreparations guardedBy(Runnable guard){Objects.requireNonNull(guard,"guard");return new MongoCaptureStatePreparations(client,database,cluster,bindings,artifacts,() -> {active.run();guard.run();});}
     @Override public Optional<CapturePreparation> read(CacheBusinessScope scope,String capture) {
         Objects.requireNonNull(scope,"scope");if(capture==null || capture.isBlank())throw new IllegalArgumentException("blank capture identity");

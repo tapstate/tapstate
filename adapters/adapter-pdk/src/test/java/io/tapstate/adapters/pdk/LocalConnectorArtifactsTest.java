@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarFile;
@@ -98,6 +99,87 @@ class LocalConnectorArtifactsTest {
                     assertThat(failure.args()).containsEntry("hash", hash);
                 });
         assertThat(copies).hasValue(1);
+    }
+
+    @Test
+    void reclaimsOnlyAnEligibleUnreferencedOldInstallationAndReopensIdenticalBytes() throws Exception {
+        var cache = new Cache();
+        var runtime = installer(cache, (hash, output) -> { throw new AssertionError("Unexpected GridFS"); });
+        Path original = artifact("2.9.3");
+        String old = install(runtime, original);
+        String latest = install(runtime, artifact("2.9.12"));
+        var oldRef = runtime.resolve("orders", old);
+        Path oldJar = work.resolve("plugins").resolve(old + ".jar");
+        Path oldRecord = work.resolve("plugins").resolve(old + ".json");
+        var eligible = Set.of("orders");
+
+        ConnectorClassLoader originalLoader;
+        try (var first = oldRef.acquireLoader(); var second = oldRef.acquireLoader()) {
+            originalLoader = first.loader();
+            first.close();
+            runtime.reclaim(eligible, () -> Set.of());
+            assertThat(oldJar).exists();
+            assertThat(oldRecord).exists();
+            assertThat(second.loader()).isSameAs(originalLoader);
+        }
+
+        runtime.reclaim(Set.of(), Set::of);
+        assertThat(oldJar).exists();
+        try (var check = oldRef.acquireLoader()) {
+            assertThat(check.loader()).isSameAs(originalLoader);
+        }
+
+        runtime.reclaim(eligible, () -> Set.of(old));
+        assertThat(oldJar).exists();
+        assertThat(oldRecord).exists();
+        try (var check = oldRef.acquireLoader()) {
+            assertThat(check.loader()).isNotSameAs(originalLoader);
+        }
+
+        runtime.reclaim(eligible, Set::of);
+        assertThat(oldJar).doesNotExist();
+        assertThat(oldRecord).doesNotExist();
+        assertThat(cache.forNode("node")).extracting(ConnectorArtifactHoldings.Held::sha256).containsExactly(latest);
+        assertThat(runtime.resolve("orders").contentHash()).isEqualTo(latest);
+        assertThatThrownBy(oldRef::acquireLoader).isInstanceOf(TapstateException.class);
+
+        assertThat(install(runtime, original)).isEqualTo(old);
+        try (var reopened = runtime.resolve("orders", old).acquireLoader()) {
+            assertThat(reopened.loader()).isNotSameAs(originalLoader);
+        }
+    }
+
+    @Test
+    void sweepWaitsForDurableReferencePublication() throws Exception {
+        var runtime = installer(new Cache(), (hash, output) -> { throw new AssertionError("Unexpected GridFS"); });
+        String old = install(runtime, artifact("2.9.3"));
+        install(runtime, artifact("2.9.12"));
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var scanning = new java.util.concurrent.CountDownLatch(1);
+        var retained = new AtomicBoolean();
+        try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var writer = executor.submit(() -> runtime.withArtifactRetention(() -> {
+                runtime.retain(runtime.resolve("orders", old));
+                entered.countDown();
+                try {
+                    assertThat(scanning.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+                retained.set(true);
+                return null;
+            }));
+            assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            var sweep = executor.submit(() -> {
+                scanning.countDown();
+                runtime.reclaim(Set.of("orders"), () -> retained.get() ? Set.of(old) : Set.of());
+                return null;
+            });
+            writer.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            sweep.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        assertThat(runtime.resolve("orders", old).contentHash()).isEqualTo(old);
     }
 
     private LocalConnectorArtifacts installer(Cache cache, LocalConnectorArtifacts.LegacyArtifact legacy) {

@@ -1037,8 +1037,24 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         }
         if (stored == null || !Long.valueOf(scope.generation()).equals(stored.get("generation"))
                 || !(stored.get("value") instanceof String value)) throw unreadable("origin");
+        return decodeOrigin(originContext(scope), value);
+    }
+
+    /** Reads every retained origin, including old generations held for recovery or note carry. */
+    void addRetainedArtifactHashes(ClientSession session, java.util.Set<String> retained) {
+        origins.find(session).forEach(row -> {
+            if (!(row.get("_id") instanceof Document id)
+                    || !(id.get("bindingVersion") instanceof Long bindingVersion)
+                    || !(id.get("namespace") instanceof String namespace)
+                    || !(row.get("generation") instanceof Long generation)
+                    || !(row.get("value") instanceof String value)) throw unreadable("origin");
+            retained.add(decodeOrigin(originContext(bindingVersion, namespace, generation), value).artifactHash());
+        });
+    }
+
+    private RequiredNoteOrigin decodeOrigin(String context, String value) {
         try {
-            Object parsed = JsonReader.parse(ciphers.current().decrypt(originContext(scope), "pdk-note-origin", value));
+            Object parsed = JsonReader.parse(ciphers.current().decrypt(context, "pdk-note-origin", value));
             if (!(parsed instanceof Map<?, ?> tree) || !Long.valueOf(1).equals(tree.get("version"))) throw unreadable("origin");
             return new RequiredNoteOrigin((String) tree.get("connectorId"), (String) tree.get("artifactHash"),
                     Base64.getUrlDecoder().decode((String) tree.get("settings")));
@@ -1079,7 +1095,11 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     private static String originContext(RequiredNoteScope scope) {
-        return JsonWriter.write(List.of(scope.owner().bindingVersion(), scope.owner().namespace(), scope.generation()));
+        return originContext(scope.owner().bindingVersion(), scope.owner().namespace(), scope.generation());
+    }
+
+    private static String originContext(long bindingVersion, String namespace, long generation) {
+        return JsonWriter.write(List.of(bindingVersion, namespace, generation));
     }
 
     private static void requireOriginScope(RequiredNoteScope scope) {

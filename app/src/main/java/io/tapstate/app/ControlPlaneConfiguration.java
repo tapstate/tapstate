@@ -523,7 +523,8 @@ class ControlPlaneConfiguration {
                 backed::copyLegacyConnectorArtifact, () -> java.util.stream.Stream.concat(
                         support.admittedIds().stream(), properties.getAlsoAcceptIds().stream()).distinct().toList(),
                 ConnectorCatalogBackground.hostApiVersion());
-        return new LocalConnectorRuntime(local, properties.getSeedDir(), cloud.cloud() ? null : properties.getDropDir());
+        return new LocalConnectorRuntime(local, properties.getSeedDir(), cloud.cloud() ? null : properties.getDropDir(),
+                () -> local.reclaim(support.loaderRetirementEligibleIds(), backed::retainedConnectorArtifacts));
     }
 
     @Bean

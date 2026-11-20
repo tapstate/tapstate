@@ -224,6 +224,13 @@ final class ThreeLayerStorePort implements StorePort {
         active();
         return bound.cache().connectorArtifactHoldings(business(), this::active);
     }
+    Set<String> retainedConnectorArtifacts() {
+        active();
+        var retained = configuration.retainedConnectorArtifacts();
+        active();
+        return retained;
+    }
+
     boolean copyLegacyConnectorArtifact(String hash, java.io.OutputStream output) throws java.io.IOException {
         active();
         return bound.cache().copyLegacyConnectorArtifact(business(), this::active, hash, output);

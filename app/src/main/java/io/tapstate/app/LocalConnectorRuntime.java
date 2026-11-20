@@ -11,6 +11,7 @@ import io.tapstate.spi.store.ContentHash;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -24,12 +25,19 @@ final class LocalConnectorRuntime implements AutoCloseable {
     private final LocalConnectorArtifacts local;
     private final Path seed;
     private final Path drop;
+    private final Maintenance maintenance;
     private Thread worker;
 
-    LocalConnectorRuntime(LocalConnectorArtifacts local, Path seed, Path drop) {
+    @FunctionalInterface
+    interface Maintenance {
+        void run() throws IOException;
+    }
+
+    LocalConnectorRuntime(LocalConnectorArtifacts local, Path seed, Path drop, Maintenance maintenance) {
         this.local = local;
         this.seed = seed;
         this.drop = drop;
+        this.maintenance = maintenance;
     }
 
     LocalConnectorArtifacts artifacts() {
@@ -68,10 +76,8 @@ final class LocalConnectorRuntime implements AutoCloseable {
                 }
             }
             local.restore();
-            if (drop != null) {
-                pollDrops();
-                worker = Thread.ofVirtual().name("connector-drop-directory").start(this::watchDrops);
-            }
+            if (drop != null) pollDrops();
+            worker = Thread.ofVirtual().name("connector-artifact-maintenance").start(this::maintain);
             return List.copyOf(results);
         } catch (IOException unavailable) {
             if (readiness != null) throw CloudConnectorSeedReadiness.sweepUnavailable();
@@ -99,16 +105,20 @@ final class LocalConnectorRuntime implements AutoCloseable {
 
     private volatile boolean closed;
 
-    private void watchDrops() {
+    private void maintain() {
         while (!closed) {
             try {
                 Thread.sleep(10_000);
-                if (!closed) pollDrops();
+                if (closed) return;
+                if (drop != null) pollDrops();
+                maintenance.run();
             } catch (InterruptedException stopped) {
                 Thread.currentThread().interrupt();
                 return;
-            } catch (IOException unavailable) {
-                LOG.warn("Could not read the connector drop directory");
+            } catch (IOException | UncheckedIOException unavailable) {
+                LOG.warn("Could not complete local connector artifact maintenance", unavailable);
+            } catch (io.tapstate.core.common.TapstateException refused) {
+                LOG.warn("Local connector artifact maintenance deferred ({})", refused.code().code());
             }
         }
     }

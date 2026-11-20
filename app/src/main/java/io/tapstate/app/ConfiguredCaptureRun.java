@@ -51,6 +51,13 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
 
     private static ConfiguredCaptureRun prepare(ExecutionFence original, CaptureConfig config, RequiredNoteStore notes,
             ConnectorProvisioner provisioner, Runnable requireOriginalStart, boolean recoveryPinned, boolean startup) {
+        return provisioner.withArtifactRetention(() -> prepareRetainingArtifact(
+                original, config, notes, provisioner, requireOriginalStart, recoveryPinned, startup));
+    }
+
+    private static ConfiguredCaptureRun prepareRetainingArtifact(ExecutionFence original, CaptureConfig config,
+            RequiredNoteStore notes, ConnectorProvisioner provisioner, Runnable requireOriginalStart,
+            boolean recoveryPinned, boolean startup) {
         Objects.requireNonNull(requireOriginalStart,"requireOriginalStart"); requireOriginalStart.run();
         if (original.scope()==null || config.node()==null || !original.pipelineId().equals(config.node().pipelineId())) throw unavailable();
         var fixed=notes.guardedBy(requireOriginalStart); var scope=original.scope();
@@ -88,6 +95,13 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
     static ConfiguredCaptureRun prepareBound(ExecutionFence original, CaptureConfig config, RequiredNoteStore notes,
             ConnectorProvisioner provisioner, Runnable guard, ConnectorRunBindings.Binding binding,
             ConnectorRunBindings.Binding previous) {
+        return provisioner.withArtifactRetention(() -> prepareBoundRetainingArtifact(
+                original, config, notes, provisioner, guard, binding, previous));
+    }
+
+    private static ConfiguredCaptureRun prepareBoundRetainingArtifact(ExecutionFence original, CaptureConfig config,
+            RequiredNoteStore notes, ConnectorProvisioner provisioner, Runnable guard,
+            ConnectorRunBindings.Binding binding, ConnectorRunBindings.Binding previous) {
         var fixed = notes.guardedBy(guard);
         var origin = ConnectorNoteOrigin.capture(config.connectorId(), binding.sha256(), config.settings());
         var owner = binding.notes().owner();

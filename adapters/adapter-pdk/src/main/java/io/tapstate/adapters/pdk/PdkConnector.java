@@ -33,12 +33,9 @@ import java.util.Map;
  * per-operation drive (init / read / write / stop) and its own coded failures belong to the ports.
  *
  * <p>The connector is driven with its own class loader installed as the thread context loader, the way
- * a real connector reaches its isolated runtime. That loader is the one every open of the same artifact
- * shares for the life of the process ({@link ConnectorClassLoader#shared}), so {@link #close()} releases
- * this handle and leaves the loader to the others: a connector that loads a JNI library can load it only
- * through the first loader that does, and each test, discovery and pipeline open of it must find that
- * loader again. Constructing a
- * real connector bootstraps the PDK runtime through the host loader, so the host must carry it: the
+ * a real connector reaches its isolated runtime. This handle leases the shared loader while in use.
+ * For connectors with process-wide native state, the loader can stay open after its last handle closes.
+ * Constructing a real connector bootstraps the PDK runtime through the host loader, so the host must carry it: the
  * assembly root does, so a real connector constructs here. A build whose host omits the runtime drives
  * only synthetic connectors that bind to the frozen contract alone.
  */
@@ -56,7 +53,7 @@ final class PdkConnector implements AutoCloseable {
     }
 
     private final String connectorId;
-    private final ConnectorClassLoader loader;
+    private final ConnectorClassLoader.SharedUse loaderUse;
     private final TapConnector connector;
     private final ConnectorFunctions functions;
     private final TapConnectorContext context;
@@ -72,14 +69,14 @@ final class PdkConnector implements AutoCloseable {
     private final Runnable driveGuard;
     private final String specification;
 
-    private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
+    private PdkConnector(String connectorId, ConnectorClassLoader.SharedUse loaderUse, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
                          TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes, Runnable driveGuard, ConnectorTrustMaterial trust,
                          String specification) {
         this.specification=specification;
         this.trust = trust;
         this.connectorId = connectorId;
-        this.loader = loader;
+        this.loaderUse = loaderUse;
         this.connector = connector;
         this.functions = functions;
         this.context = context;
@@ -214,10 +211,10 @@ final class PdkConnector implements AutoCloseable {
             configuredGlobal = new ScopedDurableStateMap(captured.store(), global, List.of(), false, captured::requireActive);
         }
 
-        ConnectorClassLoader loader;
+        ConnectorClassLoader.SharedUse loaderUse;
         try {
             PdkJsonProvider.prepareRuntime();
-            loader = ConnectorClassLoader.shared(ref.classpath());
+            loaderUse = ref.acquireLoader();
         } catch (RuntimeException | LinkageError e) {
             if (strictDefaultTest) {
                 if (e instanceof RuntimeException runtime) throw runtime;
@@ -231,7 +228,7 @@ final class PdkConnector implements AutoCloseable {
             material = ConnectorTrustMaterial.open(connectorId, effectiveSettings);
             effectiveSettings = material.settings();
             driveGuard.run();
-            Class<? extends TapConnector> connectorClass = loadConnectorClass(connectorId, loader, ref.className(), strictDefaultTest);
+            Class<? extends TapConnector> connectorClass = loadConnectorClass(connectorId, loaderUse.loader(), ref.className(), strictDefaultTest);
             ClassLoader restore = Thread.currentThread().getContextClassLoader();
             TapConnector connector;
             ConnectorFunctions functions = new ConnectorFunctions();
@@ -294,7 +291,7 @@ final class PdkConnector implements AutoCloseable {
             // on the actual drive thread; other operations retain the connector's defaults.
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
-                    connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId,
+                    connectorId, loaderUse, connector, functions, context, codecs, stateNamespace, pipelineId,
                     () -> notesActive.set(false), driveGuard, material, ref.spec());
             try {
                 result.requireActive();
@@ -307,10 +304,10 @@ final class PdkConnector implements AutoCloseable {
             return result;
         } finally {
             // Release the loader on every failure path — a coded load/class error, an escaping VM error,
-            // anything. A shared loader stays open for the artifact's other opens; this is a no-op on it.
+            // anything. Other handles keep their own leases.
             if (!opened) {
                 notesActive.set(false);
-                closeQuietly(loader);
+                loaderUse.close();
                 if (material != null) material.close();
             }
         }
@@ -557,7 +554,12 @@ final class PdkConnector implements AutoCloseable {
     /** Recovery cannot treat a plugin stop failure as proof that its original source resources ended. */
     void stopForCleanup() throws Throwable {
         stopped = true;
-        underLoaderForCleanup(() -> { connector.stop(context); return null; });
+        try {
+            underLoaderForCleanup(() -> { connector.stop(context); return null; });
+        } catch (Throwable failure) {
+            loaderUse.keep();
+            throw failure;
+        }
     }
 
     /**
@@ -578,22 +580,15 @@ final class PdkConnector implements AutoCloseable {
 
     @Override
     public void close() {
-        closeNotes.run();
-        closeQuietly(loader);
-        trust.close();
+        try {
+            closeNotes.run();
+            trust.close();
+        } finally {
+            loaderUse.close();
+        }
     }
 
     void closeDefaultTest() {
-        closeNotes.run();
-        try { loader.close(); }
-        finally { trust.close(); }
-    }
-
-    private static void closeQuietly(ConnectorClassLoader loader) {
-        try {
-            loader.close();
-        } catch (RuntimeException ignore) {
-            // best-effort: the loader is being discarded; a close failure must not mask the real error
-        }
+        close();
     }
 }

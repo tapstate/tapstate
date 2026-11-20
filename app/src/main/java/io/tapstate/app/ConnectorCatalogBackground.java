@@ -51,6 +51,13 @@ final class ConnectorCatalogBackground implements AutoCloseable {
                 .toList();
     }
 
+    java.util.Set<String> loaderRetirementEligibleIds() {
+        return catalog.current().support().entries().values().stream()
+                .filter(ConnectorSupportManifest.Entry::loaderRetirementEligible)
+                .map(ConnectorSupportManifest.Entry::id)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
     boolean permitsRole(String id, String role) {
         var entry = catalog.current().support().entries().get(id);
         return entry == null || entry.supportsRole(role);

@@ -168,6 +168,18 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         return change(scope, expected, desired, null, null, true);
     }
 
+    static void addRetainedArtifactHashes(ClientSession session, MongoDatabase database, java.util.Set<String> retained) {
+        var mappings = SystemCollections.OPERATOR_GENERATIONS.on(database);
+        mappings.find(session, new Document("connectorBindings", new Document("$exists", true))).forEach(row -> {
+            var binding = MongoPipelineStateMappings.connectorBindings(row).orElseThrow(MongoPipelineIntentStore::fenced);
+            binding.effective().forEach(value -> retained.add(value.sha256()));
+            if (binding.handoff() != null) {
+                binding.handoff().previous().forEach(value -> retained.add(value.sha256()));
+                binding.handoff().candidates().forEach(value -> retained.add(value.sha256()));
+            }
+        });
+    }
+
     @Override public ConnectorBindingStore connectorBindings() {
         return new ConnectorBindingStore() {
             @Override public Optional<ConnectorRunBindings> load(PipelineIntentScope scope) {

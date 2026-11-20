@@ -11,10 +11,10 @@ import java.net.URLClassLoader;
 import java.net.URLConnection;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A live, isolated class loader for one connector.
@@ -29,12 +29,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * bundle its own API; a bundled Log4j stays entirely isolated. Everything else on the host —
  * the tapstate application classes and the service framework libraries — is hidden from the connector.
  *
- * <p>Two lifetimes. {@link #open} gives a loader of its own, which its caller closes. {@link #shared} gives
- * the one loader every open of the same connector artifact uses for the life of the process, the way the
- * connectors were built to be hosted: a connector that loads a JNI library binds it to the first class loader
- * that loads it, and the JVM refuses the same library to every other loader for as long as that one is
- * reachable - which, once a bundled JDBC driver has registered itself with {@code DriverManager}, is forever.
- * Opened afresh per use, such a connector could load its library once per process and never again.
+ * <p>Introspection opens a private loader. Connector handles lease a shared loader. Loaders for
+ * connectors with process-wide native state stay available for the life of the process.
  */
 public final class ConnectorClassLoader implements AutoCloseable {
 
@@ -51,11 +47,13 @@ public final class ConnectorClassLoader implements AutoCloseable {
     private static final List<String> SHARED_HOST_PREFIXES =
             List.of("io.tapdata.", "net.sf.cglib.", "org.slf4j.");
 
-    /** The process-wide loaders, one per connector artifact; never closed, as nothing could reopen them. */
-    private static final Map<ArtifactKey, ConnectorClassLoader> SHARED = new ConcurrentHashMap<>();
+    /** Shared loaders and their use counts are guarded by this map. */
+    private static final Map<ArtifactKey, ConnectorClassLoader> SHARED = new HashMap<>();
 
     private final URLClassLoader loader;
     private final boolean shared;
+    private int users;
+    private boolean pinned;
 
     private ConnectorClassLoader(URLClassLoader loader, boolean shared) {
         this.loader = loader;
@@ -67,20 +65,69 @@ public final class ConnectorClassLoader implements AutoCloseable {
         return new ConnectorClassLoader(newLoader(classpath), false);
     }
 
-    /**
-     * The isolated loader every caller over this {@code classpath} shares for the life of the process. Its
-     * {@link #close()} does nothing: other opens of the same artifact are using it, and a library a
-     * connector loaded through it could not be loaded through a replacement anyway.
-     *
-     * <p>Keyed by each file's path, size and modification time, so a jar replaced in place gets a loader of
-     * its own instead of the classes of the jar that used to be there. That cuts both ways: a file replaced
-     * by identical bytes is another key too, and its callers would split across two loaders. Registered
-     * artifacts are staged under their content hash and never replaced once staged, which is what keeps
-     * every open of one of them on one loader.
-     */
+    /** A shared loader borrowed without a release handle stays pinned for this JVM. */
     public static ConnectorClassLoader shared(List<Path> classpath) {
+        synchronized (SHARED) {
+            var loader = sharedLoader(classpath);
+            loader.pinned = true;
+            return loader;
+        }
+    }
+
+    static SharedUse acquire(List<Path> classpath) {
+        synchronized (SHARED) {
+            var loader = sharedLoader(classpath);
+            loader.users++;
+            return new SharedUse(loader);
+        }
+    }
+
+    private static ConnectorClassLoader sharedLoader(List<Path> classpath) {
         return SHARED.computeIfAbsent(ArtifactKey.of(classpath),
                 key -> new ConnectorClassLoader(newLoader(classpath), true));
+    }
+
+    /** Retires idle matching loaders before the owner makes a local artifact reclaimable. */
+    static boolean retireUnused(Path jar) {
+        var path = jar.toAbsolutePath().normalize();
+        synchronized (SHARED) {
+            var keys = SHARED.keySet().stream()
+                    .filter(key -> key.entries().stream().anyMatch(entry -> entry.path().equals(path)))
+                    .toList();
+            if (keys.stream().map(SHARED::get).anyMatch(loader -> loader.pinned || loader.users != 0)) return false;
+            for (var key : keys) {
+                var loader = SHARED.get(key);
+                try {
+                    loader.closeLoader();
+                } catch (RuntimeException | Error failure) {
+                    loader.pinned = true;
+                    throw failure;
+                }
+                SHARED.remove(key);
+            }
+            return true;
+        }
+    }
+
+    static final class SharedUse implements AutoCloseable {
+        private final ConnectorClassLoader loader;
+        private boolean closed;
+
+        private SharedUse(ConnectorClassLoader loader) { this.loader = loader; }
+
+        ConnectorClassLoader loader() { return loader; }
+
+        void keep() {
+            synchronized (SHARED) { loader.pinned = true; }
+        }
+
+        @Override public void close() {
+            synchronized (SHARED) {
+                if (closed) return;
+                closed = true;
+                loader.users--;
+            }
+        }
     }
 
     private static URLClassLoader newLoader(List<Path> classpath) {
@@ -111,9 +158,10 @@ public final class ConnectorClassLoader implements AutoCloseable {
 
     @Override
     public void close() {
-        if (shared) {
-            return;
-        }
+        if (!shared) closeLoader();
+    }
+
+    private void closeLoader() {
         try {
             loader.close();
         } catch (IOException e) {

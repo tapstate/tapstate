@@ -30,6 +30,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import java.util.jar.Attributes;
@@ -66,6 +67,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
     private final Supplier<List<String>> admission;
     private final String hostApi;
     private final Map<String, Installed> installed = new ConcurrentHashMap<>();
+    private final Map<String, Path> bundled = new java.util.HashMap<>();
 
     public LocalConnectorArtifacts(Path directory, ConnectorIntrospector introspector, ConnectorCatalogStore catalog,
                                    ConnectorSpecStore specs, ConnectorArtifactHoldings holdings, String nodeId,
@@ -172,6 +174,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             }
             Installed selected = new Installed(current.orElseThrow(), file);
             Installed previous = installed.putIfAbsent(sha256, selected);
+            bundled.put(sha256, file);
             return new RegistrationOutcome(selected.registration(), previous == null && newlyRegistered);
         } catch (IOException error) {
             throw loadFailure(id);
@@ -308,19 +311,19 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
     }
 
     @Override
-    public ConnectorRef resolve(String connectorId) {
+    public synchronized ConnectorRef resolve(String connectorId) {
         return load(selected(connectorId).orElseThrow(() -> notRegistered(connectorId)));
     }
 
     @Override
-    public ConnectorRef resolve(String connectorId, String hash) {
+    public synchronized ConnectorRef resolve(String connectorId, String hash) {
         Installed value = installed.get(hash);
         if (value == null || !value.registration().connectorId().equals(connectorId)) throw localUnavailable(connectorId, hash);
         return load(value);
     }
 
     @Override
-    public ConnectorRef resolveRetained(RequiredNoteStore notes, RequiredNoteScope scope, RequiredNoteOrigin origin) {
+    public synchronized ConnectorRef resolveRetained(RequiredNoteStore notes, RequiredNoteScope scope, RequiredNoteOrigin origin) {
         boolean ready = notes.localArtifactReady(scope, origin);
         String id = origin.connectorId();
         String hash = origin.artifactHash();
@@ -366,6 +369,61 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
     }
 
     @Override
+    public synchronized <T> T withArtifactRetention(Supplier<T> publication) {
+        return publication.get();
+    }
+
+    /**
+     * Retires idle loaders independently of disk retention. Old bytes remain protected by exact durable
+     * references. The same monitor covers local opens, installation and the publication of new references.
+     */
+    public synchronized void reclaim(Set<String> eligibleIds, Supplier<Set<String>> retainedArtifacts) throws IOException {
+        for (var entry : installed.values()) {
+            if (eligibleIds.contains(entry.registration().connectorId())) {
+                ConnectorClassLoader.retireUnused(entry.file());
+            }
+        }
+
+        Set<String> retained = null;
+        for (String hash : records.hashes()) {
+            var record = readRecord(hash).orElse(null);
+            if (record == null || record.state() != ConnectorInstallRecords.State.COMPLETE
+                    || !eligibleIds.contains(record.connectorId())) continue;
+            var latest = selected(record.connectorId()).orElse(null);
+            if (latest == null || latest.metadata().sha256().equals(hash)) continue;
+
+            Path file = localFile(hash);
+            Path bundle = bundled.get(hash);
+            if (!ConnectorClassLoader.retireUnused(file)
+                    || bundle != null && !ConnectorClassLoader.retireUnused(bundle)) continue;
+            if (retained == null) retained = retainedArtifacts.get();
+            if (retained.contains(hash)) continue;
+            reclaim(hash, record, file, bundle);
+        }
+    }
+
+    private void reclaim(String hash, ConnectorInstallRecords.Installation record, Path file, Path bundle)
+            throws IOException {
+        boolean bundledCopy = bundle != null && Files.isRegularFile(bundle);
+        if (!bundledCopy) holdings.withdraw(nodeId, hash);
+        try {
+            Files.deleteIfExists(file);
+        } catch (IOException failure) {
+            if (!bundledCopy && Files.isRegularFile(file)) {
+                try {
+                    holdings.publish(nodeId, new ConnectorArtifactHoldings.Held(hash, record.connectorId(), record.version()));
+                } catch (RuntimeException restore) {
+                    failure.addSuppressed(restore);
+                }
+            }
+            throw failure;
+        }
+        if (bundledCopy) installed.computeIfPresent(hash, (key, old) -> new Installed(old.metadata(), bundle));
+        else installed.remove(hash);
+        records.remove(hash);
+    }
+
+    @Override
     public synchronized void retain(ConnectorRef ref) {
         String hash = ref.contentHash();
         var value = installed.get(hash);
@@ -393,7 +451,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
                 .map(value -> value.metadata().version());
     }
 
-    public List<ConnectorArtifactMetadata> catalog() {
+    public synchronized List<ConnectorArtifactMetadata> catalog() {
         return list().stream().map(row -> installed.get(row.contentHash()).metadata()).toList();
     }
 
@@ -408,7 +466,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         return new Inventory(versions(), catalog());
     }
 
-    public String manifestAuthentication(String sha256) throws IOException {
+    public synchronized String manifestAuthentication(String sha256) throws IOException {
         var artifact = installed.get(sha256);
         if (artifact == null) return null;
         try (var jar = new JarFile(artifact.file().toFile())) {
@@ -467,8 +525,14 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         return reference(value.file(), hash, introspector.introspect(List.of(value.file())));
     }
 
-    private static ConnectorRef reference(Path file, String hash, IntrospectedConnector details) {
-        return new ConnectorRef(List.of(file), details.className(), details.pdkApiVersion(), null, details.spec(), hash, false);
+    private ConnectorRef reference(Path file, String hash, IntrospectedConnector details) {
+        return new ConnectorRef(List.of(file), details.className(), details.pdkApiVersion(), null, details.spec(), hash,
+                false, this::acquireLoader);
+    }
+
+    private synchronized ConnectorClassLoader.SharedUse acquireLoader(List<Path> classpath) {
+        if (!Files.isRegularFile(classpath.getFirst())) throw loadFailure(classpath.getFirst().getFileName().toString());
+        return ConnectorClassLoader.acquire(classpath);
     }
 
     private static void verifyHash(Path file, String id, String sha256) {

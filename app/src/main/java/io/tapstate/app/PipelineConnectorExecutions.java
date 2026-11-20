@@ -132,6 +132,14 @@ final class PipelineConnectorExecutions {
     }
 
     void prepare(PipelineIntentSnapshot intent, List<Node> nodes, WorkloadClaimFence claim, Runnable guard) {
+        connectors.withArtifactRetention(() -> {
+            prepareRetainingArtifacts(intent, nodes, claim, guard);
+            return null;
+        });
+    }
+
+    private void prepareRetainingArtifacts(PipelineIntentSnapshot intent, List<Node> nodes, WorkloadClaimFence claim,
+            Runnable guard) {
         var bindings = store(guard);
         var scope = intent.scope();
         var state = bindings.load(scope).orElse(null);

@@ -58,6 +58,13 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
     static ConfiguredSinkRun prepare(ExecutionFence original,SinkConfig config,PipelineNode.Purpose purpose,
             RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable requireActive,boolean recoveryPinned,
             ConnectorRunBindings.Binding binding) {
+        return provisioner.withArtifactRetention(() -> prepareRetainingArtifact(
+                original, config, purpose, notes, provisioner, requireActive, recoveryPinned, binding));
+    }
+
+    private static ConfiguredSinkRun prepareRetainingArtifact(ExecutionFence original, SinkConfig config,
+            PipelineNode.Purpose purpose, RequiredNoteStore notes, ConnectorProvisioner provisioner,
+            Runnable requireActive, boolean recoveryPinned, ConnectorRunBindings.Binding binding) {
         Objects.requireNonNull(requireActive,"requireActive");requireActive.run();
         if(original.scope()==null || config.node()==null || !config.node().pipelineId().equals(original.pipelineId()))throw unavailable();
         var fixed=notes.guardedBy(requireActive);var scope=original.scope();

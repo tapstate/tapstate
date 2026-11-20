@@ -13,6 +13,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -42,6 +43,19 @@ final class ConnectorInstallRecords {
         Installation complete() {
             return new Installation(connectorId, version, origin, sizeBytes, State.COMPLETE);
         }
+    }
+
+    List<String> hashes() throws IOException {
+        if (!Files.isDirectory(directory)) return List.of();
+        try (var files = Files.list(directory)) {
+            return files.map(file -> file.getFileName().toString())
+                    .filter(name -> name.matches("[0-9a-f]{64}\\.json"))
+                    .map(name -> name.substring(0, 64)).sorted().toList();
+        }
+    }
+
+    void remove(String hash) throws IOException {
+        Files.deleteIfExists(path(hash));
     }
 
     Optional<Installation> read(String hash) throws IOException {

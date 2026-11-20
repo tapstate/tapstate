@@ -42,6 +42,11 @@ public interface ConnectorProvisioner {
         return java.util.Optional.empty();
     }
 
+    /** Serializes retaining exact local bytes and publishing a durable reference against reclamation. */
+    default <T> T withArtifactRetention(java.util.function.Supplier<T> publication) {
+        return publication.get();
+    }
+
     /** Keeps a persistent copy before publishing a new durable binding. */
     default void retain(ConnectorRef ref) {}
 
