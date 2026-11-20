@@ -226,6 +226,15 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
     }
 
+    /** Cloud bootstrap may finish alert preparation from its matching retained setup operation. */
+    public void resumeInitialAlertStorage(String operationId) {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(30));
+        requireOpen();
+        new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen)
+                .resumeInitialPreparation(operationId, budget);
+    }
+
     <T> T alertMaintenanceTransaction(MongoReadBudget budget,java.util.function.Function<com.mongodb.client.ClientSession,T> action) {
         requireOpen();return budget.maintenanceTransaction(connection.client(),session->{requireOpen();T result=action.apply(session);requireOpen();return result;});
     }
