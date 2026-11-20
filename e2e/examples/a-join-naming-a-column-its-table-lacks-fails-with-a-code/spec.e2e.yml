@@ -30,5 +30,6 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
+  - await: { failure_code: TS0360014 }
   - assert: { failure_code: TS0360014 }
   - assert: { count: { views.order_state: 0 } }
