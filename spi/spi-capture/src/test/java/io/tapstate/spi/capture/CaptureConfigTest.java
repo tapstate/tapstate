@@ -85,6 +85,17 @@ class CaptureConfigTest {
     }
 
     @Test
+    void nodeOverrideIdentityMetadataSurvivesNodeAndNoteScoping() {
+        var overrides = new HashMap<String, Object>(Map.of("preImage", false));
+        var config = new CaptureConfig("mongo", overrides, List.of("orders"), null, null, overrides);
+        overrides.put("preImage", true);
+        var scoped = config.at(new PipelineNode("p1", "source")).sharing(new SharedNotes("chain", List.of()));
+        assertThat(scoped.nodeConfig()).containsEntry("preImage", false);
+        assertThat(scoped.settings()).containsEntry("preImage", false);
+        assertThatThrownBy(() -> scoped.nodeConfig().put("preImage", true)).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
     void streamsAreADefensiveCopyAndUnmodifiable() {
         List<String> source = new ArrayList<>(List.of("orders"));
         CaptureConfig config = new CaptureConfig("mysql", Map.of(), source);

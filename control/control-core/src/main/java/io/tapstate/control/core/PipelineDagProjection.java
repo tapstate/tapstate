@@ -156,10 +156,10 @@ final class PipelineDagProjection {
         }
         String label = referenceLabel(reference);
         SourceTable sourceTable = resolveSourceTable(reference, sourceSummaries);
-        String id = sourceTable == null ? sourceNodeId(label) : sourceNodeId(sourceTable.sourceId(), sourceTable.table());
+        String id = sourceTable == null ? sourceNodeId(label) : sourceNodeId(sourceTable.source().binding(), sourceTable.table());
         sourceNodes.putIfAbsent(id, sourceTable == null
                 ? new PipelineDagNode(id, "source", label, null)
-                : new PipelineDagNode(id, "source", sourceTable.table(), sourceTable.sourceId()));
+                : new PipelineDagNode(id, "source", sourceTable.table(), sourceTable.source().id()));
         return id;
     }
 
@@ -287,22 +287,27 @@ final class PipelineDagProjection {
             int separator = value.indexOf('.');
             if (separator >= 0) {
                 String sourceId = value.substring(0, separator);
-                if (sourceSummaries.stream().anyMatch(source -> source.id().equals(sourceId))) {
-                    return new SourceTable(sourceId, value.substring(separator + 1));
-                }
-                return null;
+                return sourceSummaries.stream().filter(source -> source.binding().equals(sourceId)).findFirst()
+                        .map(source -> new SourceTable(source, value.substring(separator + 1))).orElse(null);
             }
             if (sourceSummaries.size() == 1) {
-                return new SourceTable(sourceSummaries.getFirst().id(), value);
+                return new SourceTable(sourceSummaries.getFirst(), value);
             }
             return null;
         }
+        var regex = (FromRef.Regex) reference;
+        for (var source : sourceSummaries) {
+            String prefix = java.util.regex.Pattern.quote(source.binding()) + "\\.";
+            if (regex.pattern().startsWith(prefix)) {
+                return new SourceTable(source, "/" + regex.pattern().substring(prefix.length()) + "/");
+            }
+        }
         if (sourceSummaries.size() == 1) {
-            return new SourceTable(sourceSummaries.getFirst().id(), referenceLabel(reference));
+            return new SourceTable(sourceSummaries.getFirst(), referenceLabel(reference));
         }
         return null;
     }
 
-    private record SourceTable(String sourceId, String table) {
+    private record SourceTable(PipelineSourceSummary source, String table) {
     }
 }

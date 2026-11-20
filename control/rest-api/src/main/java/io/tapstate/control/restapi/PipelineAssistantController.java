@@ -220,7 +220,7 @@ class PipelineAssistantController {
             List<Map<String, Object>> changes = new ArrayList<>();
             diff(WIZARD, before, wizard(candidate), changes);
             current(id, revision);
-            return Map.of(VALID, true, "candidateWizard", AssistantWizardJson.view(wizard(candidate)),
+            return Map.of(VALID, true, "candidateWizard", AssistantWizardJson.candidateView(wizard(candidate)),
                     VALIDATION, Map.of(VALID, true, DIAGNOSTICS, List.of()),
                     "diff", Map.of("before", beforeDsl, "after", afterDsl, "changes", changes));
         } catch (IllegalArgumentException malformed) {

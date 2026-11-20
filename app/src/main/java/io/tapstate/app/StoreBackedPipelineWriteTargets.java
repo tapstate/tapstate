@@ -94,10 +94,9 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
                     var expanded = PipelineInlining.inline(pipeline, captured);
                     var sources = new LinkedHashMap<String, SourceResource>();
                     var tables = new LinkedHashMap<String, Set<String>>();
-                    for (String id : pipeline.sourceIds()) {
-                        var sourceDefinition = StoredArtifacts.requireSource(captured, id);
-                        sources.put(id, sourceDefinition);
-                        tables.put(id, Set.copyOf(PipelineTableSelection.resolve(expanded, sourceDefinition,
+                    for (var ref : pipeline.sources()) {
+                        var sourceDefinition = sources.computeIfAbsent(ref.id(), id -> StoredArtifacts.requireSource(captured, id));
+                        tables.put(ref.binding(), Set.copyOf(PipelineTableSelection.resolve(expanded, ref, sourceDefinition,
                                 discovery.apply(sourceDefinition))));
                     }
                     return Optional.of(new DesiredStore.StartPreparation(scope.scope(),
