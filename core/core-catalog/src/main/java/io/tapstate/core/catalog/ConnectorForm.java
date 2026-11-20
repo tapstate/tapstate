@@ -2,6 +2,7 @@ package io.tapstate.core.catalog;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.BiPredicate;
 
 /**
  * One of the two config forms a connector's own spec declares, and the reader for what it declares.
@@ -39,11 +40,16 @@ public enum ConnectorForm {
      * connectors carry no spec at all.
      */
     public Map<String, Map<?, ?>> itemsIn(Map<?, ?> specRoot) {
+        return itemsIn(specRoot, (name, item) -> true);
+    }
+
+    /** Collects leaves while excluding any rejected group and all of its descendants. */
+    public Map<String, Map<?, ?>> itemsIn(Map<?, ?> specRoot, BiPredicate<String, Map<?, ?>> include) {
         Map<String, Map<?, ?>> items = new LinkedHashMap<>();
         if (specRoot.get("configOptions") instanceof Map<?, ?> configOptions
                 && configOptions.get(key) instanceof Map<?, ?> form
                 && form.get("properties") instanceof Map<?, ?> properties) {
-            collect(properties, items);
+            collect(properties, items, include);
         }
         return items;
     }
@@ -53,13 +59,15 @@ public enum ConnectorForm {
      * own (a titled section, an optional-fields block), while the connector still reads them by their
      * leaf name.
      */
-    private static void collect(Map<?, ?> properties, Map<String, Map<?, ?>> out) {
+    private static void collect(Map<?, ?> properties, Map<String, Map<?, ?>> out,
+            BiPredicate<String, Map<?, ?>> include) {
         for (Map.Entry<?, ?> entry : properties.entrySet()) {
             if (!(entry.getKey() instanceof String name) || !(entry.getValue() instanceof Map<?, ?> item)) {
                 continue; // a non-object property value is a malformed form item — skip it, don't guess
             }
-            if (item.get("properties") instanceof Map<?, ?> nested) {
-                collect(nested, out);
+            if (!include.test(name, item)) continue;
+            if (!"array".equals(item.get("type")) && item.get("properties") instanceof Map<?, ?> nested) {
+                collect(nested, out, include);
             } else {
                 out.put(name, item);
             }

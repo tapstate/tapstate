@@ -79,7 +79,9 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                         confirmed = offset.sinkAcked();
                     }
                     if (confirmed != null && confirmed.token() != null) {
-                        positions.put(table, confirmed.token());
+                        String label = PipelineTableSelection.label(sourceId, table,
+                                resolutions.values().stream().map(SourceCaptureResolution::tables));
+                        positions.put(label, confirmed.token());
                     }
                 }
             });

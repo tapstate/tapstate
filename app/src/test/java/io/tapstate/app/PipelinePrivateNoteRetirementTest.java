@@ -92,7 +92,7 @@ class PipelinePrivateNoteRetirementTest {
             var token=new RequiredNoteScope(RequiredNoteOwner.forNode(1,new PipelineNode(ownerId,id),purpose,1),7);
             Map<String,Object> config=id.equals("retained")?Map.of("autoClearSlot",false):Map.of();
             String connector=id.equals("mongo")?"mongodb":"postgres";
-            var source=new io.tapstate.core.model.SourceResource(id,null,connector,config,null,null,null,null);
+            var source=new io.tapstate.core.model.SourceResource(id.equals("pg") ? "physical_pg" : id,null,connector,config,null,null,null,null);
             var origin=io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture(connector,"a".repeat(64),config);
             contexts.add(new RequiredNoteContext(token,Optional.of(origin),false));selected.put(token.owner().namespace(),source);
             var retirement=mock(RequiredNoteRetirement.class);when(retirement.scope()).thenReturn(token);

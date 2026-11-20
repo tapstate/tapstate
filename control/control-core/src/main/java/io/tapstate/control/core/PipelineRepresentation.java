@@ -121,9 +121,9 @@ public final class PipelineRepresentation {
     }
 
     private static List<SourceRef> sourceRefs(List<Object> values, PipelineResource existing) {
-        Map<String, Map<String, Object>> previous = new LinkedHashMap<>();
+        Map<String, SourceRef> previous = new LinkedHashMap<>();
         if (existing != null) {
-            existing.sources().forEach(ref -> previous.put(ref.binding(), ref.nodeConfig()));
+            existing.sources().forEach(ref -> previous.putIfAbsent(ref.binding(), ref));
         }
         List<SourceRef> sources = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
@@ -137,14 +137,19 @@ public final class PipelineRepresentation {
                 String alias = fields.get("alias") == null ? null : requiredText(fields, "alias", path);
                 Map<String, Object> nodeConfig = fields.containsKey("nodeConfig")
                         ? copyJson(object(fields.get("nodeConfig"), path + ".nodeConfig"))
-                        : previous.get(alias == null ? id : alias);
+                        : previousNodeConfig(previous, id, alias);
                 sources.add(SourceRef.of(id, null, nodeConfig, alias));
             } else {
                 String id = requiredString(value, path);
-                sources.add(SourceRef.of(id, null, previous.get(id)));
+                sources.add(SourceRef.of(id, null, previousNodeConfig(previous, id, null)));
             }
         }
         return List.copyOf(sources);
+    }
+
+    private static Map<String, Object> previousNodeConfig(Map<String, SourceRef> previous, String id, String alias) {
+        SourceRef held = previous.get(alias == null ? id : alias);
+        return held != null && held.id().equals(id) ? held.nodeConfig() : Map.of();
     }
 
     private static List<Step> transforms(List<Map<String, Object>> values) {

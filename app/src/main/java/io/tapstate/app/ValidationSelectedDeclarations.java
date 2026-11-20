@@ -58,7 +58,7 @@ final class ValidationSelectedDeclarations {
             var source = mapping.source();
             var table = mapping.mapping().source().table();
             if (pipeline.sources().stream().filter(ref -> ref.id().equals(source.id())).noneMatch(ref ->
-                    PipelineTableSelection.selectsName(mapping.from(), source, ref.binding(), table, ref.alias() != null))) {
+                    PipelineTableSelection.selectsName(mapping.from(), source, ref.binding(), table))) {
                 throw invalid("sourceTableScope");
             }
         }

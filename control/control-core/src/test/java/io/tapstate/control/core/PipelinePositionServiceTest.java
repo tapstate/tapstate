@@ -208,6 +208,37 @@ class PipelinePositionServiceTest {
         assertThat(audit.records).extracting(AuditRecord::operationId).containsExactly("pipeline.set-position");
     }
 
+    @Test
+    void writesBackAFullDocumentWithTwoBindingsOnOneChain() {
+        String pipeline = "orders_sync";
+        chains.put(pipeline, List.of(
+                new PipelineChains.Chain(CHAIN, "left", List.of("orders")),
+                new PipelineChains.Chain(CHAIN, "right", List.of("items"))));
+        atRest(pipeline);
+        meta.put(seeded("original"));
+
+        var current = service.read(pipeline);
+        var first = current.chains().getFirst();
+        var second = current.chains().getLast();
+        var conflicting = new PipelinePosition(pipeline,
+                List.of(withResumeToken(first, "one"), withResumeToken(second, "two")));
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.writeBack("alice", pipeline, conflicting));
+        assertThat(refused.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+        assertThat(meta.rewinds).isEmpty();
+
+        var after = service.writeBack("alice", pipeline,
+                new PipelinePosition(pipeline, List.of(first, withResumeToken(second, "earlier"))));
+
+        assertThat(meta.rewinds).containsExactly(Map.entry(CHAIN, "earlier"));
+        assertThat(after.chains()).allSatisfy(chain -> assertThat(chain.resumeFrom().token()).isEqualTo("earlier"));
+    }
+
+    private static PipelinePosition.Chain withResumeToken(PipelinePosition.Chain row, String token) {
+        return new PipelinePosition.Chain(row.chainId(), row.sourceId(), row.tables(), PipelinePosition.Point.at(token),
+                row.recordedAt(), row.targetAcked(), row.sharedWith());
+    }
+
     /**
      * A write-back that the next advance undoes is not one. The clamp on a source-read advance takes the
      * lowest position across the chain's consumers, and an ack recorded in an earlier generation ranks

@@ -208,7 +208,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if (progress.membershipRevision() != membership.orElseThrow().revision()) throw refused();
         if (progress.snapshot() == null) return result;
         return result.withRetainedTables(
-                source, retainedTables(srs, progress.snapshot(), original, scope));
+                reference.binding(), source, retainedTables(srs, progress.snapshot(), original, scope));
     }
 
     private void requirePlanningPreparation(
@@ -449,7 +449,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             SourceResource definition,
             SourceModelSnapshot models,
             WorkloadClaimFence node) {
-        var frozenModel = models.model(definition);
+        var frozenModel = models.modelForBinding(reference.binding(), definition);
         var selected = SourceCaptureResolution.forPipeline(pipeline, reference, definition, frozenModel);
         if (selected.isEmpty()) return;
         boolean shared = !session.bounded && reference instanceof SourceRef.Spec spec && Boolean.TRUE.equals(spec.srs());
@@ -479,7 +479,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                         prepared.preparation().canonicalChainId(),
                                         prepared.preparation().chainId())
                         : selected.orElseThrow();
-        var source = new Source(reference.binding(), resolution, shared, frozenModel);
+        var source = new Source(reference.binding(), resolution, shared, frozenModel, reference.id());
         session.sources.put(source.id, source);
         source.identity=sourceIdentities.apply(definition.id()).filter(identity->identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
         source.prepared = prepared.preparation();
@@ -1139,14 +1139,16 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     private static final class Source {
         Runnable guard;boolean sampled;SourceBindingSnapshot identity;
-        final String id; final SourceCaptureResolution selected;final boolean shared;boolean positionEditsRestricted; final Map<String,Long> rows=new ConcurrentHashMap<>();
+        final String id;
+        final String sourceId;
+        final SourceCaptureResolution selected;final boolean shared;boolean positionEditsRestricted; final Map<String,Long> rows=new ConcurrentHashMap<>();
         final Set<String> completed=ConcurrentHashMap.newKeySet();
         final Map<String,SourceTable> expectedModels;
         final Map<String,Long> estimates = new LinkedHashMap<>();
         Owner owner;CapturePreparation prepared;WorkloadClaimFence foreign;SrsStores srs;SrsConsumerRun consumer;SrsFreshFullPreparation freshFull; CaptureRun run; DirectChannelStore channels; DirectChannelProgress direct; CaptureStart start; long snapshotEpoch; Set<String> readTables=Set.of();
         ConfiguredCaptureRun tailOpening;
-        Source(String id,SourceCaptureResolution selected,boolean shared,SourceModel frozen) {
-            this.id=id;this.selected=selected;this.shared=shared;
+        Source(String id,SourceCaptureResolution selected,boolean shared,SourceModel frozen,String sourceId) {
+            this.id=id;this.sourceId=sourceId;this.selected=selected;this.shared=shared;
             if(frozen==null)expectedModels=null;
             else {
                 var fixed=new LinkedHashMap<String,SourceTable>();
@@ -1177,7 +1179,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         PipelineCaptureBindings bindings;
         Session(ExecutionFence original,PipelinePreparationInputs inputs,Instant began,ReadMode mode) { this.original=original;this.inputs=inputs;this.began=began;this.mode=mode;this.bounded=mode==ReadMode.SNAPSHOT_ONLY;this.snapshot=mode!=ReadMode.CDC_ONLY; }
         String label(String source,String table) {
-            return sources.values().stream().filter(item -> item.selected.tables().contains(table)).count()>1?source+"."+table:table;
+            return PipelineTableSelection.label(source, table, sources.values().stream().map(item -> item.selected.tables()));
         }
     }
     record ObservationSelection(ExecutionFence execution, Map<SrsConsumerRun, io.tapstate.adapters.mongostore.MongoCacheDomain.ObservationSource> sources,
@@ -1193,7 +1195,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var preparations = new LinkedHashMap<String, CapturePreparation>();
         for (var source : held.sources.values()) {
             tables.put(source.consumer, new io.tapstate.adapters.mongostore.MongoCacheDomain.ObservationSource(
-                    source.snapshotEpoch, Set.copyOf(source.selected.tables())));
+                    source.sourceId, source.snapshotEpoch, Set.copyOf(source.selected.tables())));
             preparations.put(source.id, source.prepared);
         }
         return Optional.of(new ObservationSelection(original, Map.copyOf(tables), Map.copyOf(preparations)));
@@ -1226,7 +1228,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 if (rows == null && source.readTables.contains(table)) rows = 0L;
                 stages.put(label, new InitialLoad.Table(InitialLoad.Stage.LANDED, rows, source.estimates.get(table)));
                 var ack = cursor.sinkAckedByTable().get(table);
-                if (ack != null && ack.token() != null) positions.put(table, ack.token());
+                if (ack != null && ack.token() != null) positions.put(label, ack.token());
             }
         }
         if (!observationSessionCurrent(held)) return Optional.empty();

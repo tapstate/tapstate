@@ -9,6 +9,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TableRename;
 import io.tapstate.core.model.TransformBody;
@@ -762,13 +763,14 @@ class PipelineDraftCompilerTest {
         assertThat(map.experimental()).containsEntry("field-mode", "permissive");
     }
 
-    @Test
-    void targetRenameAfterANestUsesTheConfiguredRootTable() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void targetRenameAfterANestUsesTheConfiguredRootTable(boolean reopened) {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
-                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of("sourceAlias", "input_orders")),
                 new PipelineDraft.Node("items", "source", "mysql", "order_items", Map.of(), Map.of()),
                 new PipelineDraft.Node("nest", "nest", null, null, Map.of(
-                        "from", Map.of("orders", "mysql.orders", "items", "mysql.order_items"),
+                        "from", Map.of("orders", reopened ? "input_orders.orders" : "mysql.orders", "items", "mysql.order_items"),
                         "root", Map.of("from", "orders", "key", List.of("id"), "embed", List.of())),
                         Map.of("stepId", "assembled")),
                 new PipelineDraft.Node("target", "target", "mongo", "orders_archive", Map.of(), Map.of())),
@@ -783,13 +785,14 @@ class PipelineDraftCompilerTest {
                 .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
     }
 
-    @Test
-    void targetRenameAfterAJoinUsesTheSqlFactTable() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void targetRenameAfterAJoinUsesTheSqlFactTable(boolean reopened) {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
-                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of("sourceAlias", "input_orders")),
                 new PipelineDraft.Node("customers", "source", "mysql", "customers", Map.of(), Map.of()),
                 new PipelineDraft.Node("join", "join", null, null, Map.of(
-                        "from", Map.of("o", "mysql.orders", "c", "mysql.customers"),
+                        "from", Map.of("o", reopened ? "input_orders.orders" : "mysql.orders", "c", "mysql.customers"),
                         "engine", "builtin",
                         "sql", "SELECT o.id FROM o LEFT JOIN c ON o.customer_id = c.id"),
                         Map.of("stepId", "joined-orders")),
@@ -803,6 +806,22 @@ class PipelineDraftCompilerTest {
 
         assertThat(serve.sync().getFirst().rename())
                 .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void acceptsAnExplicitBindingEqualToThePhysicalSourceIdAfterAReplacement() {
+        var graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "input_orders", "orders", Map.of(),
+                        Map.of("sourceAlias", "input_orders")),
+                new PipelineDraft.Node("view", "view", null, null, Map.of("primaryKey", "id"), Map.of())),
+                List.of(new PipelineDraft.Edge("input-view", "source", "view")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        var compiled = compiler.compile(dagDraft(graph));
+
+        assertThat(compiled.sources())
+                .containsExactly(SourceRef.of("input_orders", null, Map.of(), "input_orders"));
+        assertThat(((ViewBlock.Inline) compiled.view()).from()).isEqualTo(FromRef.literal("input_orders.orders"));
     }
 
     @Test

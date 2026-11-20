@@ -21,7 +21,15 @@ class SourceNodeConfigRulesTest {
                         "connection": {"properties": {"uri": {"type": "string"}}},
                         "node": {"properties": {"advanced": {"properties": {
                           "preImage": {"type": "boolean"},
-                          "callbackToken": {"type": "string", "writeOnly": true}
+                          "callbackToken": {"type": "string", "writeOnly": true},
+                          "protectedGroup": {"secret": true, "properties": {
+                            "protectedChild": {"type": "string"}
+                          }},
+                          "routes": {"type": "array", "items": {"properties": {
+                            "name": {"type": "string"},
+                            "key": {"type": "string", "format": "password"}
+                          }}},
+                          "topics": {"type": "array", "items": {"type": "string"}}
                         }}}}
                       }
                     }
@@ -31,6 +39,19 @@ class SourceNodeConfigRulesTest {
     void admitsAnExplicitFalseForANestedNodeField() {
         assertThatCode(() -> SourceNodeConfigRules.validate(SOURCE, Map.of("preImage", false), id -> CONNECTOR))
                 .doesNotThrowAnyException();
+    }
+
+    @Test
+    void excludesCredentialBearingArraysAndGroupsButAllowsOrdinaryArrays() {
+        for (var override : List.<Map<String, Object>>of(
+                Map.of("routes", List.of(Map.of("name", "demo", "key", "fake-key"))),
+                Map.of("protectedChild", "fake-value"))) {
+            assertThatThrownBy(() -> SourceNodeConfigRules.validate(SOURCE, override, id -> CONNECTOR))
+                    .isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("cannot include connector credentials");
+        }
+        assertThatCode(() -> SourceNodeConfigRules.validate(SOURCE,
+                Map.of("topics", List.of("orders")), id -> CONNECTOR)).doesNotThrowAnyException();
     }
 
     @Test

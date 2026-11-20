@@ -344,6 +344,8 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
     }
     private void verifyDependencies(ClientSession session, String pipelineId, PipelinePreparationInputs inputs, Map<String, String> dependencies) {
         var root = artifacts.getInTransaction(session, pipelineId).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        if (!(root instanceof io.tapstate.core.model.PipelineResource pipeline)) throw fenced();
+        var captureArtifacts = inputs.sourceArtifactHashes(pipeline);
         var known = new java.util.HashMap<String, io.tapstate.core.model.Resource>(); known.put(root.id(), root);
         var queue = new java.util.ArrayDeque<io.tapstate.core.model.Resource>(); queue.add(root);
         var visited = new java.util.HashSet<String>(); var confirmed = new java.util.HashSet<String>();
@@ -357,11 +359,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                 }
                 if (!edge.kind().equals(target.kind())) throw fenced();
                 String actual = CanonicalHash.of(target);
-                String capture = resource == root && root instanceof io.tapstate.core.model.PipelineResource pipeline
-                        ? pipeline.sources().stream().filter(ref -> ref.id().equals(edge.id()))
-                                .map(ref -> inputs.sourceHashes().get(ref.binding()))
-                                .filter(java.util.Objects::nonNull).findFirst().orElse(null)
-                        : inputs.sourceHashes().get(edge.id());
+                String capture = captureArtifacts.get(edge.id());
                 String dependency = dependencies.get(edge.id());
                 if (capture == null ? !actual.equals(dependency) : !actual.equals(capture)) throw fenced();
                 if (dependency != null) {

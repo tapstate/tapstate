@@ -85,9 +85,11 @@ final class NativeObservationSampling {
         var facts = cache.readObservation(pass.scope(), pass.claim(), selection.sources(), current);
         if (facts.isEmpty() || !checkpoint.equals(facts.get().checkpoint())) return Attempt.fallback();
 
-        var capturesBySource = new HashMap<String, String>();
-        selection.preparations().forEach((source, preparation) -> capturesBySource.put(source, preparation.captureId()));
-        var checked = configuration.observationConfiguration(config, defaultSource, capturesBySource);
+        var capturesByBinding = new HashMap<String, MongoConfigurationDomain.ObservationCapture>();
+        selection.sources().forEach((run, source) -> capturesByBinding.put(run.sourceId(),
+                new MongoConfigurationDomain.ObservationCapture(source.sourceId(),
+                        selection.preparations().get(run.sourceId()).captureId())));
+        var checked = configuration.observationConfiguration(config, defaultSource, capturesByBinding);
         if (checked.changed()) return new Attempt(true, Optional.empty());
         var currentConfig = checked.configuration();
         if (currentConfig.isEmpty() || !matches(currentConfig.get(), facts.get(), selection)) return Attempt.fallback();

@@ -155,6 +155,61 @@ class PipelineSourceNodeSettingsIT {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"snapshot_only", "snapshot_and_cdc"})
+    void aliasedNodesCanOpenTheirPrivateCaptureScopes(String mode, @TempDir Path directory) throws Exception {
+        Path input = Files.createDirectory(directory.resolve("input"));
+        Path output = Files.createDirectory(directory.resolve("output"));
+        FileEndpoints.replaceTable(input.resolve("orders.csv"), "id,seq\n1,10\n");
+        FileEndpoints.replaceTable(input.resolve("items.csv"), "id,seq\n2,20\n");
+
+        try (var storage = PreparedNativeStore.create(); var server = Tiers.IN_PROCESS.launch(storage);
+                var files = new FileEndpoints()) {
+            var control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            String pipeline = "private_aliases";
+            control.apply(Map.of("input.tap.yml", """
+                    version: tapstate/v1
+                    kind: source
+                    id: shared_orders
+                    connector: e2e_file
+                    config: { uri: "%s", fail_cdc: true }
+                    mode: cdc
+                    tables: [orders, items]
+                    """.formatted(input), "output.tap.yml", Workspaces.targetYaml("output", output),
+                    "pipeline.tap.yml", """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: private_aliases
+                    source:
+                      - { id: shared_orders, as: parent, srs: false, nodeConfig: { fail_cdc: false } }
+                      - { id: shared_orders, as: child, srs: false, nodeConfig: { fail_cdc: false } }
+                    settings: { read_mode: %s }
+                    serve:
+                      from: [parent.orders, child.items]
+                      sync: [{ id: sink, source: output }]
+                    """.formatted(mode)));
+            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", input.toString()));
+            control.lifecycle(pipeline, LifecycleVerb.START);
+            var target = EndpointAddress.uri(output.toString());
+            Await.until("both aliased node snapshots to reach the sink", TIMEOUT,
+                    () -> files.fetch(target, "orders", Map.of("id", 1L)).isPresent()
+                            && files.fetch(target, "items", Map.of("id", 2L)).isPresent(),
+                    () -> control.pipelineStatus(pipeline) + " " + control.logs(pipeline));
+            if (mode.equals("snapshot_only")) {
+                awaitState(control, pipeline, PipelineState.COMPLETED);
+            } else {
+                awaitState(control, pipeline, PipelineState.RUNNING);
+                FileEndpoints.replaceTable(input.resolve("items.csv"), "id,seq\n2,20\n3,30\n");
+                Await.until("the child node to deliver CDC through its own private capture", TIMEOUT,
+                        () -> files.fetch(target, "items", Map.of("id", 3L)).isPresent(),
+                        () -> control.pipelineStatus(pipeline).toString());
+            }
+        }
+    }
+
     private static void clearForUpdatedSelection(ControlPlane control, PreparedNativeStore storage, String pipeline) {
         // The inherited capture has a different input selection. Prepare the new definition for a full load.
         try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(

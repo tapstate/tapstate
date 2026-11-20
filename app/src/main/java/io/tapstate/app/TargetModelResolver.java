@@ -111,11 +111,11 @@ final class TargetModelResolver {
      * is identical either way, and the difference only appears on a connection with many tables, which
      * is exactly where it is paid. The model is indexed by name here for the second half of it.
      */
-    private Map<String, TargetTable> resolveAll(SourceResource source, SourceModel discovered) {
+    static Map<String, TargetTable> resolveAll(SourceResource source, SourceModel discovered) {
         return resolveAll(SourceCaptureResolution.of(source, discovered).tables(), discovered);
     }
 
-    private Map<String, TargetTable> resolveAll(List<String> selected, SourceModel discovered) {
+    private static Map<String, TargetTable> resolveAll(List<String> selected, SourceModel discovered) {
         Map<String, SourceTable> byName = tablesByName(discovered);
         Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (String table : selected) {

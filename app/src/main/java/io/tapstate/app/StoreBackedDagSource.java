@@ -131,7 +131,7 @@ final class StoreBackedDagSource implements DagSource {
 
     private final StorePort storePort;
     private final ArtifactStore artifactStore;
-    private final Function<SourceResource,SourceModel> modelInputs;
+    private final java.util.function.BiFunction<String, SourceResource, SourceModel> modelInputs;
     private final SinkWriterBinder sinkWriterBinder;
     private final TargetModelResolver targetModelResolver;
     private final NestSettings nestSettings;
@@ -263,7 +263,7 @@ final class StoreBackedDagSource implements DagSource {
         if(pass!=null)models=capturedStartGuard.planningModels(pass,snapshot,models);
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
-                requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads, CapturedStartGuard.NONE, initialReceipts);
+                requireMarkedStore, members, parallelismBudget, records, models::modelForBinding, boundedLoads, CapturedStartGuard.NONE, initialReceipts);
         captured.validateStart(pipelineId);
         PreparedOperators operators = pass == null ? null : captured.prepareOperators(pipeline,defaultDatabase,pass);
         NestCapacity capacity = operators == null ? captured.capacityOf(pipelineId) : NestCapacity.none();
@@ -443,12 +443,14 @@ final class StoreBackedDagSource implements DagSource {
             io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
             java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard) {
         this(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,requireMarkedStore,members,
-                parallelismBudget,modelRecords,modelInputs,boundedLoads,capturedStartGuard,(fence,ack) -> ack);
+                parallelismBudget,modelRecords,(binding, source) -> modelInputs.apply(source),
+                boundedLoads,capturedStartGuard,(fence,ack) -> ack);
     }
     private StoreBackedDagSource(StorePort storePort,SinkWriterBinder sinkWriterBinder,NestSettings nestSettings,
             StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
             boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
-            io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords,
+            java.util.function.BiFunction<String, SourceResource, SourceModel> modelInputs,
             java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard,
             java.util.function.BiFunction<ExecutionFence,SinkAckFactory,SinkAckFactory> initialReceipts) {
         this.initialReceipts=Objects.requireNonNull(initialReceipts);
@@ -458,7 +460,7 @@ final class StoreBackedDagSource implements DagSource {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
-        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore, this.modelInputs);
+        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore, source -> this.modelInputs.apply(null, source));
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
         this.modelRecords = Objects.requireNonNull(modelRecords, "modelRecords");
@@ -517,7 +519,7 @@ final class StoreBackedDagSource implements DagSource {
         for (Map.Entry<String, SourceVertex> entry : vertices.entrySet()) {
             SourceVertex vertex = entry.getValue();
             SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.artifactId());
-            SourceModel discovered = modelInputs.apply(source);
+            SourceModel discovered = modelInputs.apply(vertex.sourceId(), source);
             SourceTable table = discovered == null ? null : discovered.tables().stream()
                     .filter(candidate -> candidate.name().equals(vertex.table())).findFirst().orElse(null);
             if (table == null) {
@@ -1160,8 +1162,8 @@ final class StoreBackedDagSource implements DagSource {
         List<String> copied = new ArrayList<>();
         var discoveredBySource = new LinkedHashMap<String, Map<String, SourceTable>>();
         for (SourceVertex vertex : sourceVertices.values()) {
-            var tables = discoveredBySource.computeIfAbsent(vertex.artifactId(), id -> {
-                SourceModel discovered = modelInputs.apply(StoredArtifacts.requireSource(artifacts(), id));
+            var tables = discoveredBySource.computeIfAbsent(vertex.sourceId(), binding -> {
+                SourceModel discovered = modelForVertex(vertex);
                 var byName = new LinkedHashMap<String, SourceTable>();
                 if (discovered != null) discovered.tables().forEach(table -> byName.putIfAbsent(table.name(), table));
                 return byName;
@@ -1197,7 +1199,7 @@ final class StoreBackedDagSource implements DagSource {
             if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
                 throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceModel discovered = modelInputs.apply(source);
+            SourceModel discovered = modelInputs.apply(ref.binding(), source);
             // Applying an undiscovered source records nothing, including when discovery is needed
             // to expand an omitted or regex table selector. A start still requires capture resolution.
             if (discovered == null) {
@@ -1349,7 +1351,7 @@ final class StoreBackedDagSource implements DagSource {
         if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
             throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
         SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-        SourceModel discovered = modelInputs.apply(source);
+        SourceModel discovered = modelInputs.apply(ref.binding(), source);
         if (skipUndiscovered && discovered == null) return;
         Optional<SourceCaptureResolution> selected;
         if (failures == null) {
@@ -1377,13 +1379,19 @@ final class StoreBackedDagSource implements DagSource {
         return byTable;
     }
 
+    private SourceModel modelForVertex(SourceVertex vertex) {
+        return modelInputs.apply(vertex.sourceId(), StoredArtifacts.requireSource(artifacts(), vertex.artifactId()));
+    }
+
     /** Keeps each discovered model attached to the stream that reads that source's table. */
     private Map<String, TargetTable> sourceTargets(Map<String, SourceVertex> vertices) {
         Map<String, Map<String, TargetTable>> bySource = new LinkedHashMap<>();
         Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (SourceVertex vertex : vertices.values()) {
-            TargetTable target = bySource.computeIfAbsent(vertex.artifactId(), targetModelResolver::resolveAll)
-                    .get(vertex.table());
+            TargetTable target = bySource.computeIfAbsent(vertex.sourceId(), binding -> {
+                SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.artifactId());
+                return TargetModelResolver.resolveAll(source, modelInputs.apply(binding, source));
+            }).get(vertex.table());
             if (target != null) {
                 targets.put(vertex.stream(), target);
             }
@@ -1843,7 +1851,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private NodeColumns discoveredColumns(SourceVertex vertex) {
         SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.artifactId());
-        SourceModel discovered = modelInputs.apply(source);
+        SourceModel discovered = modelInputs.apply(vertex.sourceId(), source);
         SourceTable table = discovered == null ? null : discoveredTable(discovered, vertex.table());
         return table == null ? null : NodeColumns.known(SourceSchemaCopy.columnsOf(table));
     }
@@ -2466,8 +2474,7 @@ final class StoreBackedDagSource implements DagSource {
             for (String key : upstreams(ref, keysByTable, keysBySource, vertices, stepIds)) {
                 SourceVertex vertex = vertices.get(key);
                 if (vertex != null) {
-                    SourceTable table = Optional.ofNullable(modelInputs.apply(
-                                    StoredArtifacts.requireSource(artifacts(), vertex.artifactId())))
+                    SourceTable table = Optional.ofNullable(modelForVertex(vertex))
                             .map(model -> discoveredTable(model, vertex.table())).orElse(null);
                     byStream.put(vertex.stream(), table);
                 }
@@ -3587,7 +3594,7 @@ final class StoreBackedDagSource implements DagSource {
         if (sourceTable == null) {
             return List.of();
         }
-        return Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),sourceTable.artifactId())))
+        return Optional.ofNullable(modelForVertex(sourceTable))
                 .flatMap(model -> model.tables().stream()
                         .filter(t -> t.name().equals(sourceTable.table())).findFirst())
                 .map(t -> t.fields().stream()
@@ -3800,7 +3807,7 @@ final class StoreBackedDagSource implements DagSource {
         }
         String resolvedTable = table;
         String physicalTable = sourceTable.table();
-        return Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),sourceTable.artifactId())))
+        return Optional.ofNullable(modelForVertex(sourceTable))
                 .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(physicalTable)).findFirst())
                 .map(discovered -> new NestTable(
                         resolvedTable,
@@ -4184,7 +4191,7 @@ final class StoreBackedDagSource implements DagSource {
         var models = new HashMap<SourceResource, Optional<SourceModel>>();
         var captured = new StoreBackedDagSource(storePort, sinkWriterBinder, nestSettings, storeReachability,
                 sourcePlacement, catalogArtifacts, requireMarkedStore, members, parallelismBudget, modelRecords,
-                source -> models.computeIfAbsent(source, value -> Optional.ofNullable(modelInputs.apply(value))).orElse(null));
+                source -> models.computeIfAbsent(source, value -> Optional.ofNullable(modelInputs.apply(null, value))).orElse(null));
         return definition -> captured.outputNameDetails(definition, resources);
     }
 

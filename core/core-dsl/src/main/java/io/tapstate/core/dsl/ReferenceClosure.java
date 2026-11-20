@@ -5,6 +5,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TableRef;
@@ -314,11 +315,13 @@ final class ReferenceClosure {
 
     private List<SourceTables> universeOf(PipelineResource p) {
         Map<String, SourceTables> out = new LinkedHashMap<>();
-        Set<String> aliases = new HashSet<>();
-        for (var ref : p.sources()) {
-            if (ref.alias() != null) aliases.add(ref.binding());
-            if (out.putIfAbsent(ref.binding(), tableSetOf(ref.binding(), sources.get(ref.id()))) != null
-                    && aliases.contains(ref.binding())) {
+        Map<String, SourceRef> bindings = new LinkedHashMap<>();
+        for (SourceRef ref : p.sources()) {
+            SourceRef existing = bindings.putIfAbsent(ref.binding(), ref);
+            if (existing == null) {
+                out.put(ref.binding(), tableSetOf(ref.binding(), sources.get(ref.id())));
+            } else if (existing.alias() != null || ref.alias() != null
+                    || !existing.nodeConfig().equals(ref.nodeConfig())) {
                 throw new DslException(DslError.DUPLICATE_ID, "source", 0, 0, null, Map.of("id", ref.binding()));
             }
         }

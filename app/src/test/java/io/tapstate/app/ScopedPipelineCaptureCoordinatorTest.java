@@ -989,7 +989,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var pass=mock(PipelineConvergencePass.class);when(pass.scope()).thenReturn(SCOPE);
             var captured=f.models();
             var planning=f.coordinator.retainedPlanningModels(pass,f.snapshot(),captured);
-            assertThat(planning.model(f.source).tables()).containsExactly(pinned);
+            assertThat(planning.modelForBinding("input", f.source).tables()).containsExactly(pinned);
             assertThat(captured.model(f.source).tables()).containsExactly(observed);
             assertThat(f.models().model(f.source).tables()).containsExactly(observed);
             verify(srs.models(),never()).publishedForNewSnapshot(anyString(),anyMap());

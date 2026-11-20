@@ -243,6 +243,39 @@ class DslReferenceClosureTest {
     }
 
     @Test
+    void invalidSourceAliasReportsItsYamlPath() {
+        String src = source("src_a", "mysql", "orders");
+        String pipe = """
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [{id: src_a, as: invalid.alias}]
+                view: {from: orders, primary_key: id}
+                """;
+
+        DslException failure = (DslException) catchThrowable(() -> batch(src, pipe));
+        assertThat(failure.code()).isEqualTo(DslError.ILLEGAL_VALUE);
+        assertThat(failure.path()).isEqualTo("source[0].as");
+    }
+
+    @Test
+    void conflictingNodeOverridesOnOneBindingAreRejected() {
+        String src = source("src_a", "mysql", "orders");
+        String pipe = """
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [{id: src_a, nodeConfig: {preImage: true}},
+                         {id: src_a, nodeConfig: {preImage: false}}]
+                view: {from: orders, primary_key: id}
+                """;
+
+        DslException failure = (DslException) catchThrowable(() -> batch(src, pipe));
+        assertThat(failure).isNotNull();
+        assertThat(failure.code()).isEqualTo(DslError.DUPLICATE_ID);
+    }
+
+    @Test
     @DisplayName("no-shadowing covers generated step ids too: an anonymous filter_1 over a table filter_1")
     void generatedStepIdShadowingATableIsRejected() {
         // The anonymous filter generates id filter_1 (canonical-form §5); src_a happens to declare a

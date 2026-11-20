@@ -29,12 +29,16 @@ class SourceModelSnapshotTest {
         var current=discovered("src","mongodb","new-sample");store.schemas().save(current);
         var captured=SourceModelSnapshot.capture("p",List.of(source),store.schemas());
         var pinned=discovered("src","mongodb","original-sample").model().tables().getFirst();
-        var planning=captured.withRetainedTables(source,Map.of("orders",pinned));
-        assertThat(planning.model(source).tables()).containsExactly(pinned);
+        var other=discovered("src","mongodb","other-sample").model().tables().getFirst();
+        var planning=captured.withRetainedTables("left",source,Map.of("orders",pinned))
+                .withRetainedTables("right",source,Map.of("orders",other));
+        assertThat(planning.modelForBinding("left",source).tables()).containsExactly(pinned);
+        assertThat(planning.modelForBinding("right",source).tables()).containsExactly(other);
+        assertThat(planning.modelForBinding("untouched",source)).isEqualTo(current.model());
         assertThat(captured.model(source)).isEqualTo(current.model());
         assertThat(store.schemas().get("src")).contains(current);
         var missing=Map.of("missing-table",new SourceTable("missing-table",List.of(),List.of(),List.of()));
-        assertThatThrownBy(() -> captured.withRetainedTables(source,missing)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> captured.withRetainedTables("left",source,missing)).isInstanceOf(TapstateException.class);
     }
 
     @Test void absentMismatchedAndDiscoveredEmptyModelsKeepTheirDistinctMeanings() {

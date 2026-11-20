@@ -14,21 +14,35 @@ import java.util.Optional;
 final class SourceModelSnapshot {
     private final String pipeline;
     private final Map<String,Optional<DiscoveredSourceModel>> models;
-    private SourceModelSnapshot(String pipeline,Map<String,Optional<DiscoveredSourceModel>> models) {
-        this.pipeline = Objects.requireNonNull(pipeline,"pipeline"); this.models = Map.copyOf(models);
+    private final Map<String, DiscoveredSourceModel> retainedByBinding;
+
+    private SourceModelSnapshot(String pipeline, Map<String, Optional<DiscoveredSourceModel>> models,
+            Map<String, DiscoveredSourceModel> retainedByBinding) {
+        this.pipeline = Objects.requireNonNull(pipeline, "pipeline");
+        this.models = Map.copyOf(models);
+        this.retainedByBinding = Map.copyOf(retainedByBinding);
     }
     static SourceModelSnapshot capture(String pipeline,Collection<SourceResource> sources,SchemaStore schemas) {
         var captured = java.util.List.copyOf(sources); var models = new LinkedHashMap<String,Optional<DiscoveredSourceModel>>();
         for (var source : captured) if (!models.containsKey(source.id())) models.put(source.id(),schemas.get(source.id()));
-        return new SourceModelSnapshot(pipeline,models);
+        return new SourceModelSnapshot(pipeline, models, Map.of());
     }
     SourceModel model(SourceResource source) {
         if (!models.containsKey(source.id())) throw fenced();
         return SourceDiscovery.matched(models.get(source.id()),source);
     }
 
-    /** Uses exact retained observations for planning; the public discovery record remains untouched. */
-    SourceModelSnapshot withRetainedTables(SourceResource source,Map<String,SourceTable> retained) {
+    SourceModel modelForBinding(String binding, SourceResource source) {
+        var retained = binding == null ? null : retainedByBinding.get(binding);
+        if (retained == null) return model(source);
+        if (!retained.connectionId().equals(source.id()) || !retained.connectorId().equals(source.connector())) {
+            throw fenced();
+        }
+        return retained.model();
+    }
+
+    /** Uses exact retained observations for one input binding while leaving public discovery intact. */
+    SourceModelSnapshot withRetainedTables(String binding, SourceResource source, Map<String, SourceTable> retained) {
         if (!models.containsKey(source.id())) throw fenced();
         var discovery = models.get(source.id()).orElseThrow(this::fenced);
         if (!discovery.connectorId().equals(source.connector())) throw fenced();
@@ -39,16 +53,10 @@ final class SourceModelSnapshot {
             tables.add(pinned==null?observed:new SourceTable(pinned.name(),pinned.fields(),pinned.primaryKey(),pinned.indexes(),observed.approximateRowCount()));
         }
         if(!remaining.isEmpty())throw fenced();
-        var copy=new LinkedHashMap<>(models);
-        copy.put(
-                source.id(),
-                Optional.of(
-                        new DiscoveredSourceModel(
-                                discovery.connectionId(),
-                                discovery.connectorId(),
-                                discovery.discoveredAt(),
-                                new SourceModel(tables))));
-        return new SourceModelSnapshot(pipeline,copy);
+        var copy = new LinkedHashMap<>(retainedByBinding);
+        copy.put(binding, new DiscoveredSourceModel(discovery.connectionId(), discovery.connectorId(),
+                discovery.discoveredAt(), new SourceModel(tables)));
+        return new SourceModelSnapshot(pipeline, models, copy);
     }
     PipelinePreparationInputs preparationInputs(PipelineIntentScope scope,PipelineResource original,PipelineResource selected,Map<String,SourceResource> sources) {
         requirePipeline(scope.pipelineId());

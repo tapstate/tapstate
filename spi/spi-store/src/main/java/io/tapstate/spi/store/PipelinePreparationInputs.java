@@ -45,6 +45,22 @@ public record PipelinePreparationInputs(String pipelineHash,Map<String,String> s
         }
         return new PipelinePreparationInputs(CanonicalHash.of(pipeline),hashes,selections,direct);
     }
+    /** Source artifact hashes by resource ID, independent of the capture bindings that use them. */
+    public Map<String, String> sourceArtifactHashes(PipelineResource pipeline) {
+        var hashes = new HashMap<String, String>();
+        for (var ref : pipeline.sources()) {
+            String hash = sourceHashes.get(ref.binding());
+            if (hash == null) {
+                throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+            }
+            String prior = hashes.putIfAbsent(ref.id(), hash);
+            if (prior != null && !prior.equals(hash)) {
+                throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+            }
+        }
+        return Map.copyOf(hashes);
+    }
+
     public boolean sameRecovery(PipelinePreparationInputs other) { return directChannels.equals(Objects.requireNonNull(other,"other").directChannels); }
     private static boolean hash(String value) { return value != null && value.matches("[0-9a-f]{64}"); }
 }

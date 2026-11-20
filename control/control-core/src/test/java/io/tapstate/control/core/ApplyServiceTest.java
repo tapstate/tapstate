@@ -538,6 +538,35 @@ class ApplyServiceTest {
     }
 
     @Test
+    void dslConnectorReplacementFencesTheStoredPipelineItValidated() {
+        ApplyService configured = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null, ResourceAttributionPolicy.onPrem(),
+                StateDatabasePolicy.ON_PREM, DeploymentProfile.ON_PREM,
+                id -> new ConnectorDetail(id, id, "", "database", List.of(), "", true, false, "",
+                        List.of(), SpecSource.of("hash", """
+                                {"configOptions":{"node":{"properties":{%s"preImage":{"type":"boolean"}}}}}
+                                """.formatted(id.equals("postgres") ? "" : "\"legacyFlag\":{}, ")), true));
+        String reader = READER_PIPELINE.replace("source: orders_src",
+                "source: { id: orders_src, nodeConfig: { preImage: false } }");
+        configured.apply("author", List.of(draft(BUFFERED_SRC), draft(reader)));
+        SourceResource original = (SourceResource) store.get("orders_src").orElseThrow();
+        Map<String, Object> postgres = new LinkedHashMap<>(original.config());
+        postgres.put("schema", "public");
+        SourceResource replacement = new SourceResource(original.id(), original.metadata(), "postgres", postgres,
+                original.mode(), original.tables(), original.srs(), original.execution(), original.experimental());
+
+        store.concurrentWriter = () -> store.landDirectly(new DslParser().parse(
+                reader.replace("preImage: false", "legacyFlag: true")));
+        assertThatThrownBy(() -> configured.apply("author", List.of(draft(new CanonicalWriter().write(replacement)))))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ArtifactError.VERSION_CONFLICT);
+                    assertThat(refused.args()).containsEntry("id", "p1");
+                });
+        assertThat(store.get("orders_src")).contains(original);
+    }
+
+    @Test
     void draftPublicationPlanningAlsoRefusesToChangeTheLivePipelinesBufferingSwitch() {
         service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
         ApplyService guarded = guardedWith(PipelineState.RUNNING);

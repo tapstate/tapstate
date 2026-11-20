@@ -445,25 +445,30 @@ public final class DslParser {
     private static List<SourceRef> sources(YamlMap m) {
         Node n = m.node(SOURCE_TOKEN);
         if (n instanceof ScalarNode || n instanceof MappingNode) {
-            return List.of(sourceRef(n));
+            return List.of(sourceRef(n, SOURCE_TOKEN));
         }
         List<SourceRef> refs = new ArrayList<>();
         if (n instanceof SequenceNode seq) {
             for (Node item : seq.getValue()) {
-                refs.add(sourceRef(item));
+                refs.add(sourceRef(item, SOURCE_TOKEN + "[" + refs.size() + "]"));
             }
         }
         return refs;
     }
 
-    private static SourceRef sourceRef(Node item) {
+    private static SourceRef sourceRef(Node item, String path) {
         if (item instanceof ScalarNode sc) {
             return SourceRef.bare(sc.getValue());
         }
-        YamlMap ref = YamlMap.requireMapping(item, SOURCE_TOKEN);
+        YamlMap ref = YamlMap.requireMapping(item, path);
         ref.requireOnly(SOURCE_REF_KEYS);
         Boolean srs = boolValue(ref, "srs");
-        return SourceRef.of(ref.requireString("id"), srs, ref.freeMap("nodeConfig"), ref.string("as"));
+        String alias = ref.string("as");
+        if (alias != null && (alias.isBlank() || alias.contains("."))) {
+            throw ref.errorAt("as", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, alias, EXPECTED_TOKEN, "a non-blank alias without dots"));
+        }
+        return SourceRef.of(ref.requireString("id"), srs, ref.freeMap("nodeConfig"), alias);
     }
 
     // ---- transforms ---------------------------------------------------------------

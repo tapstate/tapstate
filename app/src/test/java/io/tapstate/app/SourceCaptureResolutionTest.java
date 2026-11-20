@@ -243,6 +243,19 @@ class SourceCaptureResolutionTest {
         }
     }
 
+    @Test
+    void anAliasedSourceStillSupportsUnqualifiedTableReferences() {
+        var source = cdcSource("orders_src", "orders", null);
+        var ref = new SourceRef.Spec(source.id(), true, Map.of("preImage", false), "input");
+        for (var selector : List.of(io.tapstate.core.model.FromRef.literal("orders"),
+                io.tapstate.core.model.FromRef.regex("^orders$"))) {
+            var view = new io.tapstate.core.model.ViewBlock.Inline("orders_view", selector, null, null);
+            var pipeline = new PipelineResource("flow", null, List.of(ref), null, view, null, null, null);
+            assertThat(SourceCaptureResolution.forPipeline(pipeline, ref, source, null))
+                    .hasValueSatisfying(capture -> assertThat(capture.tables()).containsExactly("orders"));
+        }
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
     void sameSourceBindingsKeepIndependentSettingsAndPreparedReaders(boolean shared) {

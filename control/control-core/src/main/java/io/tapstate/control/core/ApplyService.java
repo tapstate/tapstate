@@ -751,7 +751,7 @@ public final class ApplyService {
         List<ArtifactOutcome> outcomes = new ArrayList<>();
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
-        Map<String, String> enforced = new LinkedHashMap<>();
+        Map<String, String> enforced = new LinkedHashMap<>(plan.workspacePreconditions());
         // Read once for the refusal below, and only when there is a reading to judge against.
         ReadableArtifactInventory.Snapshot inventory = live == null
                 ? null : ReadableArtifactInventory.scan(store);
@@ -797,7 +797,10 @@ public final class ApplyService {
         // survives a concurrent writer.
         ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
             String conflicted;
-            if (attribution.requiresSnapshotFence() && !toWrite.isEmpty()) {
+            if (toWrite.isEmpty()) {
+                return new ApplyResult(outcomes, plan.warnings());
+            }
+            if (attribution.requiresSnapshotFence()) {
                 List<ArtifactWrite> writes = new ArrayList<>(toWrite.stream().map(attributed::write).toList());
                 writes.set(0, writes.getFirst().guardedBy(enforced));
                 conflicted = store.writeAll(writes).refusedId();
