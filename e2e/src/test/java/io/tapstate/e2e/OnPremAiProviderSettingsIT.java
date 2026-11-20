@@ -72,7 +72,7 @@ class OnPremAiProviderSettingsIT {
         var examples = List.of(
                 new ReplyExample(reportedRequest, "I will use the selected schema.",
                         "I will copy id from orders to enriched_orders."),
-                new ReplyExample(reportedRequest + ". Please reply in German.", "Ich verwende das ausgewählte Schema.",
+                new ReplyExample(reportedRequest + ". Please reply in German.", "Ich verwende das ausgew\u00e4hlte Schema.",
                         "Ich kopiere id aus orders nach enriched_orders."));
         var wizard = Map.of("root", Map.of("source", "orders_src", "table", "orders", "keys", List.of("id"),
                         "columns", List.of(), "transforms", List.of()),
