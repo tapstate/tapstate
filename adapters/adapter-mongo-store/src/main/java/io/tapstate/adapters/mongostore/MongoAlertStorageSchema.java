@@ -91,6 +91,20 @@ final class MongoAlertStorageSchema {
     int prepare(String operationId,MongoReadBudget budget) {
         return StoreIo.call(()->prepareAll(operationId,budget));
     }
+
+    /** Resumes only the additive steps left by the original installation. */
+    void resumeInitialPreparation(String operationId, MongoReadBudget budget) {
+        Document retained = budget.transaction(client, session -> marker(session, budget));
+        if (retained == null) return;
+        int version = retained.getInteger("installedVersion");
+        if (version >= OPERATIONAL_VERSION && version < VERSION
+                && operationId.equals(retained.getString("operationId"))
+                && operationId.equals(retained.getString("authorityPreparationOperationId"))
+                && operationId.equals(retained.get(QUERY, Document.class).getString("operationId"))) {
+            prepare(operationId, budget);
+        }
+    }
+
     private int prepareAll(String operationId,MongoReadBudget budget) {
         prepareOperational(operationId,budget);
         prepareNodes(budget);
@@ -352,13 +366,10 @@ final class MongoAlertStorageSchema {
     private Map<String, Document> structures(MongoReadBudget budget) {
         List<String> names = COLLECTIONS.stream().map(SystemCollections::collectionName).toList();
         var found = new HashMap<String, Document>();
-        try (var cursor = budget.database(database).listCollections().filter(new Document("name", new Document("$in", names)))
-                .batchSize(COLLECTIONS.size()).iterator()) {
-            while (cursor.hasNext()) {
-                budget.remainingMillis(); Document row = cursor.next();
-                if (!(row.get("name") instanceof String name) || !names.contains(name) || found.put(name, row) != null) {
-                    throw unreadable("collection-metadata");
-                }
+        for (Document row : MongoCollectionMetadata.matching(budget.database(database), names, true)) {
+            budget.remainingMillis();
+            if (found.put(row.getString("name"), row) != null) {
+                throw unreadable("collection-metadata");
             }
         }
         return found;

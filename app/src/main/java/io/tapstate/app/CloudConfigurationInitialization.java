@@ -35,7 +35,10 @@ final class CloudConfigurationInitialization implements AutoCloseable {
             MongoConfigurationDomain retained;
             try { retained = MongoConfigurationDomain.open(connection, cloud.clusterId()); }
             catch (TapstateException unavailable) { retained = null; }
-            if (retained != null) { stage = "confirm"; return confirm(retained); }
+            if (retained != null) {
+                stage = "resume-retained";
+                return confirm(retained, true);
+            }
             if (authorization == null) { stage = "claim"; authorization = bridge.claimConfiguration(bootId, hash); }
             active();
             MongoConfigurationDomain created;
@@ -51,7 +54,7 @@ final class CloudConfigurationInitialization implements AutoCloseable {
                 created = MongoConfigurationBootstrap.resume(connection, cloud.clusterId(), installationId(), authorization.operationId(), 1);
             }
             stage = "confirm";
-            return confirm(created);
+            return confirm(created, false);
         } catch (TapstateException failure) {
             LOG.warn("Cloud configuration initialization failed [stage={}, code={}, detail={}, creationGranted={}, creationInvoked={}]",
                     stage, failure.code().code(), driverDetail(failure),
@@ -66,11 +69,15 @@ final class CloudConfigurationInitialization implements AutoCloseable {
         return "none";
     }
 
-    private MongoConfigurationDomain confirm(MongoConfigurationDomain original) {
+    private MongoConfigurationDomain confirm(MongoConfigurationDomain original, boolean retained) {
         try {
             active(); var state = original.setupStates().load();
-            if (state.scope().installationId().equals(installationId()) && state.phase() == StorageSetupStateStore.Phase.CONFIG_PREPARED) {
-                bridge.completeConfiguration(state.scope().operationId(), hash);
+            if (state.scope().installationId().equals(installationId())) {
+                String operationId = state.scope().operationId();
+                if (retained) original.resumeInitialAlertStorage(operationId);
+                if (state.phase() == StorageSetupStateStore.Phase.CONFIG_PREPARED) {
+                    bridge.completeConfiguration(operationId, hash);
+                }
             }
             active(); return original;
         } catch (RuntimeException | Error failed) {

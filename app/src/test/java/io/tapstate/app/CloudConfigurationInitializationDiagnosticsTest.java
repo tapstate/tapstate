@@ -10,9 +10,13 @@ import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.StoreError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StorageSetupScope;
+import io.tapstate.spi.store.StorageSetupStateStore;
 import java.time.Duration;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.LoggerFactory;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -22,6 +26,37 @@ import static org.mockito.Mockito.*;
 
 class CloudConfigurationInitializationDiagnosticsTest {
     private static final String OPERATION = "a9c7faf0-c2a4-437a-a698-767c515e37ec";
+
+    @ParameterizedTest
+    @EnumSource(value = StorageSetupStateStore.Phase.class, names = {"CONFIG_PREPARED", "COMPLETE"})
+    void retainedConfigurationResumesOriginalAlertsBeforeItIsPublished(StorageSetupStateStore.Phase phase) {
+        var settings = new MongoConnectionSettings("mongodb://fixture/config", null, Duration.ofSeconds(1));
+        var properties = new CloudProperties();
+        properties.setBaseUrl("https://cloud.example"); properties.setToken("token-secret-sentinel");
+        properties.setClusterId("cluster"); properties.setAtlasUri(settings.uri());
+        var bridge = mock(CloudSdkBridge.class);
+        var domain = mock(MongoConfigurationDomain.class);
+        var setup = mock(StorageSetupStateStore.class);
+        var scope = new StorageSetupScope("cluster", "cloud-cluster", OPERATION, 1);
+        when(domain.setupStates()).thenReturn(setup);
+        when(setup.load()).thenReturn(new StorageSetupStateStore.Status(scope, phase,
+                phase == StorageSetupStateStore.Phase.COMPLETE ? 1 : 0));
+        try (var domains = mockStatic(MongoConfigurationDomain.class);
+             var initialization = new CloudConfigurationInitialization(settings, CloudRuntimeSettings.resolve(properties),
+                     bridge, BootId.fresh())) {
+            domains.when(() -> MongoConfigurationDomain.open(settings, "cluster")).thenReturn(domain);
+
+            assertThat(initialization.open()).isSameAs(domain);
+
+            var order = inOrder(domain, bridge);
+            order.verify(domain).resumeInitialAlertStorage(OPERATION);
+            if (phase == StorageSetupStateStore.Phase.CONFIG_PREPARED)
+                order.verify(bridge).completeConfiguration(eq(OPERATION), anyString());
+            else
+                verifyNoInteractions(bridge);
+            verify(bridge, never()).claimConfiguration(anyString(), anyString());
+        }
+    }
 
     @Test
     void theFirstPreparationFailureRemainsDiagnosableWhenTheNextEntryCanOnlyResume() {

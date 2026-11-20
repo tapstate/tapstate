@@ -1,10 +1,14 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.IndexOptions;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
 import io.tapstate.core.alerting.AlarmKey;
 import io.tapstate.core.alerting.AlertRule;
 import io.tapstate.core.alerting.AlertConfiguration;
@@ -18,6 +22,7 @@ import java.util.ArrayList;
 import java.util.UUID;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.TimeUnit;
@@ -33,6 +38,30 @@ import static org.assertj.core.api.Assertions.*;
 class MongoAlertStorageSchemaIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
+
+    @Test void alertInventoryUsesTheAtlasSupportedNameFilter() {
+        withConfiguration(false, f -> {
+            f.database().createCollection("alert_rules_unrelated");
+            var filters = new CopyOnWriteArrayList<String>();
+            var settings = MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(f.settings().uri()))
+                    .addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            if ("listCollections".equals(event.getCommandName()))
+                                filters.add(event.getCommand().getDocument("filter", new org.bson.BsonDocument()).toJson());
+                        }
+                    }).build();
+            var key = SystemCollections.CLUSTER_KEYS.on(f.database()).find().first();
+            try (var observer = MongoClients.create(settings)) {
+                var schema = new MongoAlertStorageSchema(observer, observer.getDatabase(f.database().getName()),
+                        "cluster-a", key.getString("keyId"), () -> {});
+                assertThat(schema.load(new MongoReadBudget(Duration.ofSeconds(5))))
+                        .isEqualTo(MongoAlertStorageSchema.VERSION);
+            }
+            // Atlas Free rejects listCollections with a document-valued $in name filter.
+            assertThat(filters).singleElement().satisfies(filter -> assertThat(filter).doesNotContain("$in"));
+        });
+    }
 
     @Test void operationalVersionFourNeedsExplicitNodeAndDomainPreparationWithOriginalFactsPreserved() {
         withConfiguration(false,f->{
@@ -50,6 +79,33 @@ class MongoAlertStorageSchemaIT {
             assertThat(after.get("queryPreparation",Document.class)).isEqualTo(new Document(query).append("indexContractVersion",2).append("nextIndex",6));
             assertThat(versions(f).find().first()).isEqualTo(counter);assertThat(schema(f).get(MongoSourceIdentitySchema.FIELD)).isEqualTo(source);
             assertThat(SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).countDocuments()).isZero();assertAllTables(f);
+        });
+    }
+
+    @Test void cloudBootstrapResumesOnlyTheOriginalIncompleteAlertPreparation() {
+        withConfiguration(false, f -> {
+            SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).drop();
+            var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(f.database());
+            schemas.updateOne(new Document("_id", "config"), new Document("$set",
+                    new Document("alerting.installedVersion", 4)
+                            .append("alerting.queryPreparation.indexContractVersion", 1)
+                            .append("alerting.queryPreparation.nextIndex", 5)));
+            var retained = schema(f);
+            var key = SystemCollections.CLUSTER_KEYS.on(f.database()).find().first();
+            var setup = SystemCollections.STORAGE_SETUP.on(f.database()).find().first();
+
+            f.domain().resumeInitialAlertStorage("unrelated-setup");
+            assertThat(schema(f)).isEqualTo(retained);
+            assertThat(names(f)).doesNotContain("alert_node_lifecycles");
+
+            f.domain().resumeInitialAlertStorage("setup-a");
+            assertThat(f.domain().alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION);
+            var completed = schema(f);
+            assertThat(completed.get("alerting", Document.class).getString("operationId")).isEqualTo("setup-a");
+            f.domain().resumeInitialAlertStorage("setup-a");
+            assertThat(schema(f)).isEqualTo(completed);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(f.database()).find().first()).isEqualTo(key);
+            assertThat(SystemCollections.STORAGE_SETUP.on(f.database()).find().first()).isEqualTo(setup);
         });
     }
 
