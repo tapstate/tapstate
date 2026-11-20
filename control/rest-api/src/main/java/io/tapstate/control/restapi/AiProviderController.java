@@ -120,9 +120,8 @@ class AiProviderController {
     }
 
     private boolean canManage() {
-        var principal = AuthenticatedCaller.principal();
-        return AuthenticatedCaller.isCloudSession() && principal.permits(Scope.WRITE)
-                && providerManagers.contains(principal.subject());
+        return AuthenticatedCaller.isCloudSession() && AuthenticatedCaller.permits(Scope.WRITE)
+                && providerManagers.contains(AuthenticatedCaller.subject());
     }
 
     private void requireManager(String operation) {
