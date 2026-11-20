@@ -225,17 +225,21 @@ class ControlOperationsTest {
 
     @Test
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
-        // The cluster context is REST-only. The reveal reservation stays unpublished until its
-        // dedicated authorizer exists.
+        // The cluster context and Cloud-session provider selection are REST-only. The reveal
+        // reservation stays unpublished until its dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(86);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
-                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")).allSatisfy(op ->
+                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())
+                && !"ai-provider.select".equals(op.id())
+                && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
                 assertThat(op.exposure()).containsOnlyKeys(Frontend.REST));
         assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();
         assertThat(registry.resolve("cluster.context").exposure())
                 .containsEntry(Frontend.REST, Maturity.CURRENT).doesNotContainKey(Frontend.CLI);
+        assertThat(registry.resolve("ai-provider.select").exposure())
+                .containsEntry(Frontend.REST, Maturity.CURRENT).containsOnlyKeys(Frontend.REST);
     }
 
     @Test
