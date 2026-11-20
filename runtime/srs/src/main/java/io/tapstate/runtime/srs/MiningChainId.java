@@ -50,7 +50,8 @@ public record MiningChainId(String value) {
 
     /** The explicit key when one is given (config hash skipped), else the derived config hash. */
     public static MiningChainId resolve(CaptureConfig config, String srsKey) {
-        return srsKey != null && !srsKey.isBlank() ? ofKey(srsKey) : of(config);
+        return new MiningChainId(io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(
+                config.connectorId(), config.settings(), srsKey, config.nodeConfig()));
     }
 
     /** The recovery record of one independent channel, isolated from every other reader of its source. */
@@ -62,7 +63,7 @@ public record MiningChainId(String value) {
             throw new IllegalArgumentException("a direct channel names a non-blank pipeline and source");
         }
         return new MiningChainId(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(
-                config.connectorId(),config.settings(),srsKey,pipelineId,sourceId));
+                config.connectorId(),config.settings(),srsKey,pipelineId,sourceId,config.nodeConfig()));
     }
 
 }

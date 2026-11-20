@@ -74,16 +74,23 @@ public final class PipelineRepresentation {
                 .equals(sourceSummaries.stream().map(PipelineSourceSummary::id).toList())) {
             throw new IllegalArgumentException("source summaries must match declared pipeline source references");
         }
+        List<PipelineSourceSummary> summaries = new ArrayList<>(sourceSummaries.size());
+        for (int index = 0; index < sourceSummaries.size(); index++) {
+            var source = sourceSummaries.get(index);
+            var ref = pipeline.sources().get(index);
+            summaries.add(new PipelineSourceSummary(source.id(), source.metadata(), source.connector(),
+                    source.resolved(), ref.nodeConfig(), ref.alias()));
+        }
         return new PipelineView(
                 pipeline.id(),
                 pipeline.metadata(),
-                sourceSummaries,
+                summaries,
                 transformViews(pipeline.transforms()),
                 viewValue(pipeline.view()),
                 serveValue(pipeline.serve()),
                 settingsValue(pipeline.settings()),
                 pipeline.experimental(),
-                dagProjection.project(pipeline, sourceSummaries),
+                dagProjection.project(pipeline, summaries),
                 contentHash,
                 status);
     }
@@ -99,9 +106,7 @@ public final class PipelineRepresentation {
             return new PipelineResource(
                     input.id(),
                     input.metadata(),
-                    sourceIds(input.sources()).stream()
-                            .map(id -> (SourceRef) SourceRef.bare(id))
-                            .toList(),
+                    sourceRefs(input.sources(), existing),
                     transforms(input.transforms()),
                     view(input.view()),
                     serve(input.serve()),
@@ -115,19 +120,36 @@ public final class PipelineRepresentation {
         }
     }
 
-    private static List<String> sourceIds(List<Object> values) {
-        List<String> ids = new ArrayList<>(values.size());
+    private static List<SourceRef> sourceRefs(List<Object> values, PipelineResource existing) {
+        Map<String, SourceRef> previous = new LinkedHashMap<>();
+        if (existing != null) {
+            existing.sources().forEach(ref -> previous.putIfAbsent(ref.binding(), ref));
+        }
+        List<SourceRef> sources = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
             Object value = values.get(index);
+            String path = "sources[" + index + "]";
             if (value instanceof PipelineSourceSummary summary) {
-                ids.add(summary.id());
+                sources.add(SourceRef.of(summary.id(), null, summary.nodeConfig(), summary.alias()));
             } else if (value instanceof Map<?, ?>) {
-                ids.add(requiredText(object(value, "sources[" + index + "]"), "id", "sources[" + index + "]"));
+                Map<String, Object> fields = object(value, path);
+                String id = requiredText(fields, "id", path);
+                String alias = fields.get("alias") == null ? null : requiredText(fields, "alias", path);
+                Map<String, Object> nodeConfig = fields.containsKey("nodeConfig")
+                        ? copyJson(object(fields.get("nodeConfig"), path + ".nodeConfig"))
+                        : previousNodeConfig(previous, id, alias);
+                sources.add(SourceRef.of(id, null, nodeConfig, alias));
             } else {
-                ids.add(requiredString(value, "sources[" + index + "]"));
+                String id = requiredString(value, path);
+                sources.add(SourceRef.of(id, null, previousNodeConfig(previous, id, null)));
             }
         }
-        return List.copyOf(ids);
+        return List.copyOf(sources);
+    }
+
+    private static Map<String, Object> previousNodeConfig(Map<String, SourceRef> previous, String id, String alias) {
+        SourceRef held = previous.get(alias == null ? id : alias);
+        return held != null && held.id().equals(id) ? held.nodeConfig() : Map.of();
     }
 
     private static List<Step> transforms(List<Map<String, Object>> values) {
