@@ -69,20 +69,19 @@ public final class PipelineDraftCompiler {
 
         Map<String, String> inputSources = new LinkedHashMap<>();
         inputSources.put(root.id(), root.sourceId());
-        wizard.related().forEach(related -> inputSources.put(related.id(), related.sourceId()));
-        LinkedHashSet<String> unionSources = new LinkedHashSet<>();
-        addUnionSources(root.preTransforms(), unionSources);
-        wizard.related().forEach(related -> addUnionSources(related.preTransforms(), unionSources));
-        addUnionSources(wizard.transforms(), unionSources);
-        var bindings = sourceBindings(inputSources, unionSources, wizard.sourceNodeConfigs(), Map.of());
-
         Set<String> currentInputs = new LinkedHashSet<>();
         currentInputs.add(root.sourceId() + "." + root.table());
+        LinkedHashSet<String> unionSources = new LinkedHashSet<>();
+        addUnionSources(root.preTransforms(), unionSources);
         for (PipelineDraft.Related related : wizard.related()) {
-            requiredText(related.sourceId(), "related source");
-            requiredText(related.table(), "related table");
-            currentInputs.add(related.sourceId() + "." + related.table());
+            String sourceId = requiredText(related.sourceId(), "related source");
+            String table = requiredText(related.table(), "related table");
+            inputSources.put(related.id(), sourceId);
+            currentInputs.add(sourceId + "." + table);
+            addUnionSources(related.preTransforms(), unionSources);
         }
+        addUnionSources(wizard.transforms(), unionSources);
+        var bindings = sourceBindings(inputSources, unionSources, wizard.sourceNodeConfigs(), Map.of());
 
         LinkedHashMap<String, FromRef> aliases = new LinkedHashMap<>();
         List<Step> steps = new ArrayList<>();

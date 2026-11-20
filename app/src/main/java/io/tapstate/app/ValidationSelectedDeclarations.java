@@ -55,10 +55,7 @@ final class ValidationSelectedDeclarations {
         }
         var mappings=ValidationDirectMappings.declare(artifacts,draft,mapping->inspections.get(mapping.outputId()));
         for (var mapping : mappings) {
-            var source = mapping.source();
-            var table = mapping.mapping().source().table();
-            if (pipeline.sources().stream().filter(ref -> ref.id().equals(source.id())).noneMatch(ref ->
-                    PipelineTableSelection.selectsName(mapping.from(), source, ref.binding(), table))) {
+            if (!mapping.selectsSourceTable(mapping.mapping().source().table())) {
                 throw invalid("sourceTableScope");
             }
         }

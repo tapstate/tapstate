@@ -26,24 +26,6 @@ final class PipelineTableSelection {
 
     private PipelineTableSelection() {}
 
-    /** Test one independently observed table against only the selected output, without widening scope. */
-    static boolean selects(FromClause from, SourceResource source,
-            io.tapstate.spi.store.SourceTable knownTable) {
-        return selectsName(from, source, knownTable.name());
-    }
-
-    /** Rejects names outside the selected declaration without inventing a discovered table model. */
-    static boolean selectsName(FromClause from, SourceResource source, String table) {
-        return selectsName(from, source, source.id(), table);
-    }
-
-    static boolean selectsName(FromClause from, SourceResource source, String binding, String table) {
-        if (!SourceTableSelection.selectsTableName(source, table)) return false;
-        var referenced = new LinkedHashSet<String>();
-        collect(from, binding, List.of(table), referenced, false);
-        return referenced.contains(table);
-    }
-
     static List<String> resolve(PipelineResource pipeline, SourceResource source, SourceModel discovered) {
         return resolve(pipeline, pipeline.sourceReference(source.id()), source, discovered);
     }

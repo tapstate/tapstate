@@ -64,7 +64,7 @@ final class SourceModelSnapshot {
         var selections = new LinkedHashMap<String,java.util.Set<String>>();
         for (var ref : original.sources()) {
             var source = sources.get(ref.id()); if (source == null) throw fenced();
-            selections.put(ref.binding(),java.util.Set.copyOf(PipelineTableSelection.resolve(selected,ref,source,model(source))));
+            selections.put(ref.binding(),java.util.Set.copyOf(PipelineTableSelection.resolve(selected,ref,source,modelForBinding(ref.binding(), source))));
         }
         return PipelinePreparationInputs.of(scope,original,sources,selections);
     }

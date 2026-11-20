@@ -89,6 +89,25 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void reportsAnUnselectedRelatedSourceAtValidationAndPublication() {
+        var template = wizardDraft();
+        var wizard = template.wizard();
+        var relation = wizard.related().getFirst();
+        var missingSource = new PipelineDraft.Related(relation.id(), relation.parentId(), null,
+                relation.table(), relation.relation(), relation.preTransforms());
+        var incomplete = new PipelineDraft(template.pipelineId(), template.schemaVersion(),
+                template.revision(), template.mode(), template.name(), template.description(), null,
+                new PipelineDraft.Wizard(wizard.root(), List.of(missingSource), wizard.transforms(), wizard.output()),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        assertThatThrownBy(() -> compiler.compileCandidate(incomplete))
+                .isInstanceOf(IllegalArgumentException.class).hasMessage("wizard field must be non-blank: related source");
+        assertThatThrownBy(() -> compiler.compile(incomplete))
+                .isInstanceOf(IllegalArgumentException.class).hasMessage("wizard field must be non-blank: related source");
+    }
+
+    @Test
     void compileIsAStableCanonicalFixedPoint() {
         PipelineDraft draft = wizardDraft();
         CanonicalWriter writer = new CanonicalWriter();

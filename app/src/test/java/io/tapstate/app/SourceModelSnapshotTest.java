@@ -41,6 +41,27 @@ class SourceModelSnapshotTest {
         assertThatThrownBy(() -> captured.withRetainedTables("left",source,missing)).isInstanceOf(TapstateException.class);
     }
 
+    @Test
+    void preparationFencesABindingWithARetainedModelFromAnotherSource() {
+        var store = new InMemoryStorePort();
+        var oldSource = source("old", "mongodb");
+        var replacement = source("replacement", "mongodb");
+        var oldModel = discovered(oldSource.id(), oldSource.connector(), "id");
+        store.schemas().save(oldModel);
+        store.schemas().save(discovered(replacement.id(), replacement.connector(), "id"));
+        var models = SourceModelSnapshot.capture("p", List.of(oldSource, replacement), store.schemas())
+                .withRetainedTables("input", oldSource, Map.of("orders", oldModel.model().tables().getFirst()));
+        var pipeline = new io.tapstate.core.model.PipelineResource("p", null,
+                List.of(io.tapstate.core.model.SourceRef.of(replacement.id(), true, Map.of(), "input")),
+                null, null, null, null, null);
+        var scope = new PipelineIntentScope("cluster", 1, "incarnation", "p", 1);
+        var sources = Map.of(replacement.id(), replacement);
+
+        assertThatThrownBy(() -> models.preparationInputs(scope, pipeline, pipeline, sources))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
+    }
+
     @Test void absentMismatchedAndDiscoveredEmptyModelsKeepTheirDistinctMeanings() {
         var store = new InMemoryStorePort(); var absent = source("absent","mysql"); var mismatched = source("mismatched","mysql"); var empty = source("empty","mysql");
         store.schemas().save(discovered("mismatched","other","wrong"));
