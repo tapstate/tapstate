@@ -30,21 +30,12 @@ class CloudConfigurationInitializationDiagnosticsTest {
     @ParameterizedTest
     @EnumSource(value = StorageSetupStateStore.Phase.class, names = {"CONFIG_PREPARED", "COMPLETE"})
     void retainedConfigurationResumesOriginalAlertsBeforeItIsPublished(StorageSetupStateStore.Phase phase) {
-        var settings = new MongoConnectionSettings("mongodb://fixture/config", null, Duration.ofSeconds(1));
-        var properties = new CloudProperties();
-        properties.setBaseUrl("https://cloud.example"); properties.setToken("token-secret-sentinel");
-        properties.setClusterId("cluster"); properties.setAtlasUri(settings.uri());
-        var bridge = mock(CloudSdkBridge.class);
-        var domain = mock(MongoConfigurationDomain.class);
-        var setup = mock(StorageSetupStateStore.class);
-        var scope = new StorageSetupScope("cluster", "cloud-cluster", OPERATION, 1);
-        when(domain.setupStates()).thenReturn(setup);
-        when(setup.load()).thenReturn(new StorageSetupStateStore.Status(scope, phase,
-                phase == StorageSetupStateStore.Phase.COMPLETE ? 1 : 0));
+        var fixture = retainedConfiguration(phase);
+        var domain = fixture.domain();
+        var bridge = fixture.bridge();
         try (var domains = mockStatic(MongoConfigurationDomain.class);
-             var initialization = new CloudConfigurationInitialization(settings, CloudRuntimeSettings.resolve(properties),
-                     bridge, BootId.fresh())) {
-            domains.when(() -> MongoConfigurationDomain.open(settings, "cluster")).thenReturn(domain);
+             var initialization = fixture.initialization()) {
+            domains.when(() -> MongoConfigurationDomain.open(fixture.settings(), "cluster")).thenReturn(domain);
 
             assertThat(initialization.open()).isSameAs(domain);
 
@@ -55,6 +46,55 @@ class CloudConfigurationInitializationDiagnosticsTest {
             else
                 verifyNoInteractions(bridge);
             verify(bridge, never()).claimConfiguration(anyString(), anyString());
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = StorageSetupStateStore.Phase.class, names = {"CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"})
+    void alertPreparationFailureOnlyBlocksAnUnboundConfiguration(StorageSetupStateStore.Phase phase) {
+        boolean unbound = phase == StorageSetupStateStore.Phase.CONFIG_PREPARED;
+        var fixture = retainedConfiguration(phase);
+        var domain = fixture.domain();
+        var failure = new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "MongoCommandException code=8000", "secret", "parameter-secret-sentinel"), null);
+        doThrow(failure).when(domain).resumeInitialAlertStorage(OPERATION);
+        try (var logs = new Logs(); var domains = mockStatic(MongoConfigurationDomain.class);
+             var initialization = fixture.initialization()) {
+            domains.when(() -> MongoConfigurationDomain.open(fixture.settings(), "cluster")).thenReturn(domain);
+
+            if (unbound) {
+                assertThat(catchThrowable(initialization::open)).isSameAs(failure);
+                verify(domain).close();
+            } else {
+                assertThat(initialization.open()).isSameAs(domain);
+                verify(domain, never()).close();
+            }
+            verifyNoInteractions(fixture.bridge());
+            assertThat(logs.events.list).singleElement().satisfies(event ->
+                    assertThat(event.getFormattedMessage()).contains("io.store-unavailable", "MongoCommandException code=8000"));
+            assertSafe(logs);
+        }
+    }
+
+    private static RetainedConfiguration retainedConfiguration(StorageSetupStateStore.Phase phase) {
+        var settings = new MongoConnectionSettings("mongodb://fixture/config", null, Duration.ofSeconds(1));
+        var properties = new CloudProperties();
+        properties.setBaseUrl("https://cloud.example"); properties.setToken("token-secret-sentinel");
+        properties.setClusterId("cluster"); properties.setAtlasUri(settings.uri());
+        var bridge = mock(CloudSdkBridge.class);
+        var domain = mock(MongoConfigurationDomain.class);
+        var setup = mock(StorageSetupStateStore.class);
+        var scope = new StorageSetupScope("cluster", "cloud-cluster", OPERATION, 1);
+        when(domain.setupStates()).thenReturn(setup);
+        when(setup.load()).thenReturn(new StorageSetupStateStore.Status(scope, phase,
+                phase == StorageSetupStateStore.Phase.CONFIG_PREPARED ? 0 : 1));
+        return new RetainedConfiguration(settings, CloudRuntimeSettings.resolve(properties), bridge, domain);
+    }
+
+    private record RetainedConfiguration(MongoConnectionSettings settings, CloudRuntimeSettings cloud,
+            CloudSdkBridge bridge, MongoConfigurationDomain domain) {
+        CloudConfigurationInitialization initialization() {
+            return new CloudConfigurationInitialization(settings, cloud, bridge, BootId.fresh());
         }
     }
 

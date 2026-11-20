@@ -98,6 +98,19 @@ class MongoAlertStorageSchemaIT {
             assertThat(schema(f)).isEqualTo(retained);
             assertThat(names(f)).doesNotContain("alert_node_lifecycles");
 
+            f.client().getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("createIndexes")).append("errorCode", 8)));
+            try {
+                assertThatThrownBy(() -> f.domain().resumeInitialAlertStorage("setup-a"))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+            } finally {
+                clearFailPoint(f);
+            }
+            assertThat(f.domain().alertQueryPreparation().orElseThrow().phase())
+                    .isEqualTo(io.tapstate.spi.store.AlertQueryPreparation.Phase.PREPARING);
+
             f.domain().resumeInitialAlertStorage("setup-a");
             assertThat(f.domain().alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION);
             var completed = schema(f);

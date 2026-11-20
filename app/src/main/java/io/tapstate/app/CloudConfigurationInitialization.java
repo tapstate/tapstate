@@ -74,7 +74,7 @@ final class CloudConfigurationInitialization implements AutoCloseable {
             active(); var state = original.setupStates().load();
             if (state.scope().installationId().equals(installationId())) {
                 String operationId = state.scope().operationId();
-                if (retained) original.resumeInitialAlertStorage(operationId);
+                if (retained) resumeAlerts(original, state);
                 if (state.phase() == StorageSetupStateStore.Phase.CONFIG_PREPARED) {
                     bridge.completeConfiguration(operationId, hash);
                 }
@@ -85,6 +85,18 @@ final class CloudConfigurationInitialization implements AutoCloseable {
             throw failed;
         }
     }
+
+    private void resumeAlerts(MongoConfigurationDomain original, StorageSetupStateStore.Status state) {
+        try {
+            original.resumeInitialAlertStorage(state.scope().operationId());
+        } catch (TapstateException failure) {
+            if (state.bindingVersion() == 0) throw failure;
+            // Alert recovery cannot take a cluster with a committed storage binding offline.
+            LOG.warn("Cloud alert storage preparation failed [code={}, detail={}]",
+                    failure.code().code(), driverDetail(failure));
+        }
+    }
+
     private String installationId() { return "cloud-" + cloud.clusterId(); }
     private void active() { if (closed) throw StorageRuntime.unavailable(); }
     @Override public synchronized void close() { closed = true; }
