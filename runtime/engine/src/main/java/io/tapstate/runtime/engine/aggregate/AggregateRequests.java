@@ -184,6 +184,18 @@ public final class AggregateRequests {
         }
     }
 
+    /**
+     * How a request ends that its step stopped before answering: the step is gone, which is not the same as a
+     * step that runs and failed while answering.
+     */
+    public static final class StepStopped extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+
+        StepStopped() {
+            super("the aggregate step stopped");
+        }
+    }
+
     /** A request waiting for its step, and where its answer goes. */
     public record Waiting(Request request, CompletableFuture<Report> answer) {
     }
@@ -214,7 +226,7 @@ public final class AggregateRequests {
             waiting.add(entry);
             if (closed) {
                 // The step stopped while this was offered; it will not be polled.
-                entry.answer().completeExceptionally(new IllegalStateException("the aggregate step stopped"));
+                entry.answer().completeExceptionally(new StepStopped());
             }
             return Optional.of(entry.answer());
         }
@@ -222,7 +234,7 @@ public final class AggregateRequests {
         private void close() {
             closed = true;
             for (Waiting left = waiting.poll(); left != null; left = waiting.poll()) {
-                left.answer().completeExceptionally(new IllegalStateException("the aggregate step stopped"));
+                left.answer().completeExceptionally(new StepStopped());
             }
         }
     }

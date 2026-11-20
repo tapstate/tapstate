@@ -65,6 +65,9 @@ public enum AggregateError implements TapstateErrorCode {
     /** A running step did not take or answer a check or a repair in the time allowed. */
     STEP_BUSY("aggregate.step-busy", Set.of("pipeline", "step")),
 
+    /** The step runs, but failed while answering a check or a repair. */
+    STEP_FAILED("aggregate.step-failed", Set.of("pipeline", "step", "reason")),
+
     /** The step declares more fields than one of its stored rows can account for. */
     TOO_MANY_FIELDS("aggregate.too-many-fields", Set.of("step", "count", "limit"));
 

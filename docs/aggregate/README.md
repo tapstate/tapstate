@@ -236,7 +236,8 @@ body `{ "group": { "<name>": "<value>" }, "after": "<cursor>" }`.
 - A group too large to recompute in memory is reported as too large to decide, and nothing is claimed or
   changed for it.
 - The step answers between two of its own updates, so the pipeline keeps running. It must be running:
-  otherwise the answer is `aggregate.step-not-running`.
+  otherwise the answer is `aggregate.step-not-running`. A step that runs but fails while answering says
+  so with `aggregate.step-failed`, naming the failure.
 
 **What a check does not prove.** It compares the step's fields with the rows *the step holds*. It reads
 neither the source nor the target. A clean check says the fields are consistent with the stored rows; it

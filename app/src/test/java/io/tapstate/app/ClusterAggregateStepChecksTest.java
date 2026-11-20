@@ -72,7 +72,11 @@ class ClusterAggregateStepChecksTest {
                     continue;
                 }
                 asked.add(waiting.request());
-                waiting.answer().complete(answer.apply(waiting.request()));
+                try {
+                    waiting.answer().complete(answer.apply(waiting.request()));
+                } catch (RuntimeException failed) {
+                    waiting.answer().completeExceptionally(failed);
+                }
             }
         });
         step.setDaemon(true);
@@ -145,6 +149,22 @@ class ClusterAggregateStepChecksTest {
         assertRefused(() -> new ClusterAggregateStepChecks(null, new AuditGate(audited::add, FIXED))
                         .check("sales", "by_region", new AggregateStepChecks.Request(null, null)),
                 AggregateError.STEP_NOT_RUNNING, Map.of("pipeline", "sales", "step", "by_region"));
+    }
+
+    @Test
+    @DisplayName("a running step that fails while answering is reported as failing, with what failed")
+    void aStepThatFailsWhileAnsweringIsNotReportedAsNotRunning() {
+        runStep();
+        answer = request -> {
+            throw new IllegalStateException("the check path broke");
+        };
+
+        assertThatThrownBy(() -> checks().check("sales", "by_region", new AggregateStepChecks.Request(null, null)))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(AggregateError.STEP_FAILED);
+                    assertThat(refused.args()).containsEntry("pipeline", "sales").containsEntry("step", "by_region");
+                    assertThat(String.valueOf(refused.args().get("reason"))).contains("the check path broke");
+                });
     }
 
     @Test

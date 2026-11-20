@@ -78,6 +78,7 @@ final class ClusterAggregateStepChecks implements AggregateStepChecks {
         Map<Member, Future<Answer>> answers = member.getExecutorService(EXECUTOR)
                 .submitToAllMembers(new Ask(pipelineId, step, asked));
         boolean busy = false;
+        String failure = null;
         AggregateRequests.Report report = null;
         for (Future<Answer> pending : answers.values()) {
             Answer answer;
@@ -94,8 +95,15 @@ final class ClusterAggregateStepChecks implements AggregateStepChecks {
                 report = answer.report();
             }
             busy |= answer.busy();
+            if (answer.failure() != null) {
+                failure = answer.failure();
+            }
         }
         if (report == null) {
+            if (failure != null) {
+                throw new TapstateException(AggregateError.STEP_FAILED,
+                        Map.of("pipeline", pipelineId, "step", step, "reason", failure), null);
+            }
             throw busy ? busy(pipelineId, step) : notRunning(pipelineId, step);
         }
         if (report.refusal() != null) {
@@ -145,11 +153,17 @@ final class ClusterAggregateStepChecks implements AggregateStepChecks {
     /**
      * One member's answer.
      *
-     * @param report what the step answered, or null when it does not run here or did not answer
-     * @param busy   whether the step runs here and did not take or answer the request in time
+     * @param report  what the step answered, or null when it does not run here or did not answer
+     * @param busy    whether the step runs here and did not take or answer the request in time
+     * @param failure what went wrong where the step runs here and failed while answering, else null; carried
+     *                as text so that any member can read it
      */
-    record Answer(AggregateRequests.Report report, boolean busy) implements Serializable {
+    record Answer(AggregateRequests.Report report, boolean busy, String failure) implements Serializable {
         private static final long serialVersionUID = 1L;
+
+        Answer(AggregateRequests.Report report, boolean busy) {
+            this(report, busy, null);
+        }
     }
 
     /** Runs on each member: hands the request to the step if it runs there, and waits for its answer. */
@@ -184,9 +198,14 @@ final class ClusterAggregateStepChecks implements AggregateStepChecks {
                 return new Answer(offered.get().get(ANSWER_SECONDS, TimeUnit.SECONDS), false);
             } catch (TimeoutException late) {
                 return new Answer(null, true);
-            } catch (ExecutionException stopped) {
-                // The step stopped, or failed while answering; either way it gave no answer.
-                return new Answer(null, false);
+            } catch (ExecutionException unanswered) {
+                Throwable cause = unanswered.getCause();
+                if (cause instanceof AggregateRequests.StepStopped) {
+                    // The step stopped before it answered: it no longer runs here.
+                    return new Answer(null, false);
+                }
+                // The step runs here and failed while answering: say what failed rather than that it is absent.
+                return new Answer(null, false, cause == null ? unanswered.toString() : cause.toString());
             }
         }
     }
