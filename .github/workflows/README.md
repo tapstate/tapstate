@@ -212,6 +212,27 @@ with its own environment configuration and approval. This lane adds no automatic
 PR/main test suite; its runner cost is incurred on manual dev dispatch and once
 per release attempt after the release gates pass.
 
+## Cluster image from selected branches
+
+`build-cluster-image.yml` is the manual lane for packaging a Cloud cluster image
+from any Tapstate and tapstate-web branch pair. Fill `tapstate_branch` and
+`tapstate_web_branch` (default `main`); the run builds the Cloud Web bundle from
+the Web commit, the Boot JAR from the Tapstate commit, stages the locked
+connector seed, verifies both image platforms, and publishes
+`ghcr.io/tapstate/tapstate-cloud:<next-minor>-dev`. The version calculator counts
+up from the tagged `main` history, so a feature branch needs no release tag of
+its own. The lane runs no test suite: the Boot JAR is packaged with
+`-DskipTests`, so test sources still compile for the modules that publish
+test-jars but no test executes. The Web step only bundles its pinned checkout,
+and the image check before the push is a packaging assertion.
+
+The job summary and the `json` job output carry the branch pair, build version,
+digest reference, tag, Web commit id, and run URL. Unlike the dev lane above,
+this workflow always publishes the plain `-dev` tag for the selected branches and
+does not register the image in the dev release catalog. It uses the same
+`cloud-ghcr-dev` environment and Public `tapstate-cloud` package, so the branch
+policy of that environment must allow the selected Tapstate ref.
+
 ## Test placement
 
 Add new tests to the existing Maven reactor. Choose their placement by the

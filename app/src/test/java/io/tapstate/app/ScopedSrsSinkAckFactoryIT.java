@@ -45,7 +45,7 @@ class ScopedSrsSinkAckFactoryIT {
                 var target = new SourceResource(StorageBinding.defaultSourceId(StorageBinding.Mode.OP),null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null);
                 var committed = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster","installation","setup",1),StorageBinding.Mode.OP,endpoint,target);
                 cache.prepareFirstAuth(committed.firstCreation().orElseThrow()); var business = cache.prepareInitialBusiness(committed.preparation(),() -> {});
-                var claims = cache.workloadClaims(business); var owner = new WorkloadOwner("node","boot");
+                var claims = (DeadlineWorkloadClaimStore) cache.workloadClaims(business); var owner = new WorkloadOwner("node","boot");
                 var node = claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),owner,1,Duration.ofMinutes(2)).claim();
                 var source = new SourceResource("source",null,"fixture",Map.of(),io.tapstate.core.model.SourceMode.CDC,
                         Set.of("orders").stream().sorted().<io.tapstate.core.model.TableRef>map(io.tapstate.core.model.TableRef::literal).toList(),new io.tapstate.core.model.Srs("chain","retention",null,null,true),null);
@@ -77,7 +77,8 @@ class ScopedSrsSinkAckFactoryIT {
                 var run = SrsConsumerRun.of(physical,membership); var readerFactory = new ScopedSrsReadCursorPublisherFactory(run,"orders"); var factory = copied(new ScopedSrsSinkAckFactory(
                         Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(run,"orders")),"original-run"));
                 var member = mock(HazelcastInstance.class); var local = new ConcurrentHashMap<String,Object>(); when(member.getUserContext()).thenReturn(local);
-                try (var authorization = ExecutionAuthorization.scoped(business,claims,Duration.ofSeconds(2),System::nanoTime,() -> true)) {
+                try (var claimDrain = (AutoCloseable) () -> PipelineDirectPreparationIT.closeCacheClaims(cache, claims);
+                     var authorization = ExecutionAuthorization.scoped(business,claims,Duration.ofSeconds(2),System::nanoTime,() -> true)) {
                     local.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization); local.put(SrsStoreViews.USER_CONTEXT_KEY,cache);
                     factory.beginRun(member,Map.of("source.orders",List.of("fast","slow")),original);
                     var reader = readerFactory.resolve(member); reader.accept(99);
