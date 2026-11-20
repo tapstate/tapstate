@@ -102,9 +102,11 @@ final class NativeObservationSampling {
         var facts = cache.readObservation(pass.scope(), pass.claim(), selection.sources(), current);
         if (facts.isEmpty() || !checkpoint.equals(facts.get().checkpoint())) return Attempt.fallback();
 
-        var capturesBySource = new HashMap<String, String>();
-        selection.preparations().forEach((source, preparation) -> capturesBySource.put(source, preparation.captureId()));
-        var checked = configuration.observationConfiguration(config, defaultSource, capturesBySource);
+        var capturesByBinding = new HashMap<String, MongoConfigurationDomain.ObservationCapture>();
+        selection.sources().forEach((run, source) -> capturesByBinding.put(run.sourceId(),
+                new MongoConfigurationDomain.ObservationCapture(source.sourceId(),
+                        selection.preparations().get(run.sourceId()).captureId())));
+        var checked = configuration.observationConfiguration(config, defaultSource, capturesByBinding);
         if (checked.changed()) return new Attempt(true, Optional.empty());
         var currentConfig = checked.configuration();
         if (currentConfig.isEmpty() || !matches(currentConfig.get(), facts.get(), selection)) return Attempt.fallback();
@@ -150,12 +152,14 @@ final class NativeObservationSampling {
             var original = entry.getKey();
             var source = current.sources().get(original.sourceId());
             var prepared = selection.preparations().get(original.sourceId());
+            var ref = current.pipeline().sourceReference(original.sourceId());
+            var settings = io.tapstate.core.model.PipelineSourceConfig.settings(ref, source);
             if (!prepared.equals(current.captures().get(prepared.captureId()))
                     || !prepared.chainId().equals(original.miningChainId())
-                    || !prepared.sourceIdentityHash().equals(SourceCaptureIdentity.physical(source.connector(), source.config()))) return false;
+                    || !prepared.sourceIdentityHash().equals(SourceCaptureIdentity.physical(source.connector(), settings))) return false;
             var model = SourceDiscovery.matched(Optional.ofNullable(facts.schemas().get(source.id())), source);
             if (model == null) return false;
-            var resolved = SourceCaptureResolution.forPipeline(current.pipeline(), source, model);
+            var resolved = SourceCaptureResolution.forPipeline(current.pipeline(), ref, source, model);
             if (resolved.isEmpty() || !resolved.get().chainId().value().equals(prepared.canonicalChainId())
                     || !Set.copyOf(resolved.get().tables()).equals(entry.getValue().tables())) return false;
         }

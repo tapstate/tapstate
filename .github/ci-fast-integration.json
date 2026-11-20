@@ -13,6 +13,7 @@
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoAiProviderSettingsStoreIT", "method": "encryptedCredentialsSurviveRotationAndCannotCrossWorkspaceOrEndpoint"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoConfigurationAiProviderSettingsIT", "method": "encryptedConfigurationSurvivesReopenAndExplicitDeletionWithoutAnyCache"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoPipelineIntentStoreIT"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCapturePreparationsIT", "method": "sharedNoteLookupsRespectPipelineNodeSettingsAndTheCurrentArtifactHash"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineStoresIT", "method": "aBulkObservationPreservesTheSuccessfulEntryAndReportsBothFailuresInOrder"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "completedDeletionReusesTheSameIdWithoutResettingClaimOrCheckpointHistory"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "concurrentIndependentCacheClientsPublishOneSuccessorAndReplayItsOriginalReceipt"},

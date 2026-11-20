@@ -61,11 +61,17 @@ public record PipelineDraft(
         WIZARD
     }
 
-    public record Graph(List<Node> nodes, List<Edge> edges, Viewport viewport) {
+    public record Graph(List<Node> nodes, List<Edge> edges, Viewport viewport,
+            Map<String, Map<String, Object>> sourceNodeConfigs) {
+        public Graph(List<Node> nodes, List<Edge> edges, Viewport viewport) {
+            this(nodes, edges, viewport, Map.of());
+        }
+
         public Graph {
             nodes = List.copyOf(nodes);
             edges = List.copyOf(edges);
             Objects.requireNonNull(viewport, "viewport");
+            sourceNodeConfigs = copySourceNodeConfigs(sourceNodeConfigs);
         }
     }
 
@@ -95,10 +101,16 @@ public record PipelineDraft(
         }
     }
 
-    public record Wizard(Root root, List<Related> related, List<Transform> transforms, Output output) {
+    public record Wizard(Root root, List<Related> related, List<Transform> transforms, Output output,
+            Map<String, Map<String, Object>> sourceNodeConfigs) {
+        public Wizard(Root root, List<Related> related, List<Transform> transforms, Output output) {
+            this(root, related, transforms, output, Map.of());
+        }
+
         public Wizard {
             related = List.copyOf(related);
             transforms = List.copyOf(transforms);
+            sourceNodeConfigs = copySourceNodeConfigs(sourceNodeConfigs);
         }
     }
 
@@ -263,6 +275,21 @@ public record PipelineDraft(
             requireText(updatedBy, "updatedBy");
             workspacePreconditions = workspacePreconditions == null ? Map.of() : Map.copyOf(workspacePreconditions);
         }
+    }
+
+    private static Map<String, Map<String, Object>> copySourceNodeConfigs(
+            Map<String, Map<String, Object>> configs) {
+        if (configs == null || configs.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Map<String, Object>> result = new LinkedHashMap<>();
+        configs.forEach((id, config) -> {
+            requireText(id, "source node config id");
+            if (config != null && !config.isEmpty()) {
+                result.put(id, copy(config));
+            }
+        });
+        return java.util.Collections.unmodifiableMap(result);
     }
 
     private static Map<String, Object> copy(Map<String, Object> values) {

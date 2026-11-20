@@ -5,7 +5,6 @@ import com.mongodb.client.*;
 import com.mongodb.event.*;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.model.*;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -162,6 +161,41 @@ class MongoCapturePreparationsIT {
             assertThat(f.snapshot()).isEqualTo(before);
             assertThat(f.controls().countDocuments()).isEqualTo(2);
             assertThat(history.issueFirstCreate(f.request)).isEqualTo(new CaptureCreationResult.AlreadyIssued(original));
+        });
+    }
+
+    @Test
+    void sharedNoteLookupsRespectPipelineNodeSettingsAndTheCurrentArtifactHash() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var inherited = f.issue(f.request).preparation();
+            var request = f.pipeline("overridden", CapturePreparation.Mode.SHARED_SRS, Set.of("orders"),
+                    Map.of("preImage", false));
+            var isolated = f.issue(request).preparation();
+            var source = (SourceResource) f.configuration.artifacts().get("input").orElseThrow();
+            var pipeline = (PipelineResource) f.configuration.artifacts().get("overridden").orElseThrow();
+            String sourceHash = CanonicalHash.of(source);
+            String pipelineHash = CanonicalHash.of(pipeline);
+            assertThat(isolated.canonicalChainId()).isNotEqualTo(inherited.canonicalChainId());
+
+            var notes = f.configuration.requiredNotes();
+            var owner = new RequiredNoteOwner(f.scope.bindingVersion(), "pdk.chain." + isolated.chainId(),
+                    RequiredNoteOwner.Kind.CHAIN, isolated.chainId(), 0);
+            var origin = new RequiredNoteOrigin(source.connector(), sourceHash, new byte[]{3});
+            notes.prepareOrigin(notes.open(owner), origin);
+            var captures = f.configuration.capturePreparations();
+            assertThat(captures.inspectSharedOrigin(f.scope, source.id(), sourceHash)).isEmpty();
+            assertThat(captures.inspectSharedOrigin(f.scope, source.id(), sourceHash, pipeline.id(), pipelineHash))
+                    .contains(origin);
+            assertThat(captures.inspectSharedHistory(isolated, source.id(), sourceHash, pipeline.id(), pipelineHash))
+                    .isEqualTo(new CaptureSharedHistory(isolated, false));
+            assertCode(() -> captures.inspectSharedHistory(isolated, source.id(), sourceHash),
+                    IoError.PIPELINE_INTENT_FENCED);
+            String stale = "f".repeat(64);
+            assertCode(() -> captures.inspectSharedOrigin(f.scope, source.id(), sourceHash, pipeline.id(), stale),
+                    IoError.PIPELINE_INTENT_FENCED);
+            assertCode(() -> captures.inspectSharedOrigin(f.scope, source.id(), sourceHash, null, pipelineHash),
+                    IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.controls().countDocuments()).isEqualTo(2);
         });
     }
 
@@ -509,8 +543,15 @@ class MongoCapturePreparationsIT {
     private record Fixture(MongoConfigurationDomain configuration,MongoDatabase config,MongoClient cacheAdmin,MongoDatabase cache,MongoCacheDomain domain,MongoConnectionSettings settings,
             StorageBinding.Connection connection,CacheBusinessScope scope,WorkloadClaimFence node,CapturePreparationRequest request) {
         CapturePreparationRequest pipeline(String id,CapturePreparation.Mode mode,Set<String> tables) {
-            String readMode=mode==CapturePreparation.Mode.SNAPSHOT_ONLY?"snapshot_only":"snapshot_and_cdc";
-            var pipeline=(PipelineResource)new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: "+id+"\nsource: [{id: input, srs: "+(mode!=CapturePreparation.Mode.DIRECT)+"}]\nsettings: {read_mode: "+readMode+"}\n");
+            return pipeline(id, mode, tables, Map.of());
+        }
+        CapturePreparationRequest pipeline(String id,CapturePreparation.Mode mode,Set<String> tables,
+                Map<String, Object> nodeConfig) {
+            ReadMode readMode = mode == CapturePreparation.Mode.SNAPSHOT_ONLY
+                    ? ReadMode.SNAPSHOT_ONLY : ReadMode.SNAPSHOT_AND_CDC;
+            var pipeline = new PipelineResource(id, null,
+                    List.of(SourceRef.of("input", mode != CapturePreparation.Mode.DIRECT, nodeConfig)),
+                    null, null, null, new Settings(null, null, null, null, readMode, null), null);
             configuration.artifacts().create(pipeline);var original=new PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),id,1);
             configuration.intents().compareAndSet(original,0,new DesiredState(id,PipelineState.RUNNING,CanonicalHash.of(pipeline),false));
             var source=(SourceResource)configuration.artifacts().get("input").orElseThrow();var inputs=PipelinePreparationInputs.of(original,pipeline,Map.of("input",source),Map.of("input",tables));
