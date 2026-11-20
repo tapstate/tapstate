@@ -472,7 +472,18 @@ public final class TapEventCodec {
         // for bytes declares no equality of its own, so a join key built from a binary column would
         // compare by identity and match nothing, silently. Its tag comes along, because a target of the
         // same kind writes it back, and the way out builds the box again.
-        return new ConvertedValue(portable(value, converted.getValue()), originType);
+        Object result = portable(value, converted.getValue());
+        return new ConvertedValue(result, portableOriginType(value, result, originType));
+    }
+
+    // The portable Double alone cannot distinguish a Decimal128 special value from a binary float.
+    static String portableOriginType(Object original, Object portable, String declared) {
+        if (declared == null && portable instanceof Double number && original != null
+                && BSON_DECIMAL128.equals(original.getClass().getName())
+                && (!Double.isFinite(number) || Double.doubleToRawLongBits(number) == Long.MIN_VALUE)) {
+            return "DECIMAL128";
+        }
+        return declared;
     }
 
     /**
