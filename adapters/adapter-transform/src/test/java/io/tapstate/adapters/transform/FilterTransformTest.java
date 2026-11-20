@@ -360,18 +360,18 @@ class FilterTransformTest {
     @Test
     @DisplayName("a row expression that fails to evaluate surfaces a coded transform.expression-failed")
     void codesRowExpressionEvaluationFailure() {
-        // now() type-checks (it is declared in the compile environment) but is unbound in the runtime,
-        // so the predicate compiles and then fails at eval — the operator must see a coded diagnostic
-        // naming the expression, not a bare crash.
-        TransformPort filter = StatelessTransforms.filter("now() == now()");
-        Envelope row = Envelope.insert(1L, "orders", Map.of("id", 1), null);
+        // A time zone read from the row type-checks as a string but names no zone, so the predicate
+        // compiles and then fails at eval — the operator must see a coded diagnostic naming the
+        // expression, not a bare crash.
+        TransformPort filter = StatelessTransforms.filter("today(after.zone) == today(after.zone)");
+        Envelope row = Envelope.insert(1L, "orders", Map.of("id", 1, "zone", "Nowhere/Here"), null);
 
         assertThatThrownBy(() -> filter.transform(row))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException e = (TapstateException) thrown;
                     assertThat(e.code().code()).isEqualTo("transform.expression-failed");
-                    assertThat(e.args().get("expr")).isEqualTo("now() == now()");
+                    assertThat(e.args().get("expr")).isEqualTo("today(after.zone) == today(after.zone)");
                     assertThat(e.args()).containsKey("detail");
                 });
     }

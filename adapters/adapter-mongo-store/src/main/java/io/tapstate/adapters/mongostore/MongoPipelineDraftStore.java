@@ -502,11 +502,19 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         PipelineDraft.Relation relation = related.relation();
         List<Document> pairs = relation.on().stream().map(pair -> new Document("childField", pair.childField())
                 .append("parentField", pair.parentField())).toList();
+        Document relationDocument = new Document("on", pairs).append("shape", relation.shape().name().toLowerCase())
+                .append("path", relation.path()).append("key", relation.key())
+                .append("arrayKey", relation.arrayKey());
+        // Written only when present, so a relation without rollup fields keeps the stored shape it always had.
+        if (relation.rollup() != null) {
+            relationDocument.append("rollup", new Document(relation.rollup()));
+        }
+        if (relation.trackKeyChanges() != null) {
+            relationDocument.append("trackKeyChanges", relation.trackKeyChanges());
+        }
         return new Document("id", related.id()).append("parentId", related.parentId())
                 .append("sourceId", related.sourceId()).append("table", related.table())
-                .append("relation", new Document("on", pairs).append("shape", relation.shape().name().toLowerCase())
-                        .append("path", relation.path()).append("key", relation.key())
-                        .append("arrayKey", relation.arrayKey()))
+                .append("relation", relationDocument)
                 .append("preTransforms", related.preTransforms().stream().map(MongoPipelineDraftStore::transformDocument).toList());
     }
 
@@ -580,7 +588,10 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 document.getString("sourceId"), document.getString("table"), new PipelineDraft.Relation(on,
                         PipelineDraft.Shape.valueOf(relation.getString("shape").toUpperCase()),
                         relation.getString("path"), strings(relation.get("key")),
-                        strings(relation.get("arrayKey"))),
+                        strings(relation.get("arrayKey")),
+                        relation.get("rollup") instanceof Document rollup
+                                ? MongoCatalogStore.normalizeMap(rollup) : null,
+                        relation.get("trackKeyChanges") instanceof Boolean track ? track : null),
                 transforms(document.get("preTransforms")));
     }
 

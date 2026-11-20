@@ -47,7 +47,16 @@ import java.util.OptionalLong;
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
         long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess,
         OptionalLong rootsRendered, Instant rootsRenderedSince, StateCommitReading commits, NestOrigin origin,
-        OptionalLong keyAccesses, OptionalLong coldKeys) {
+        OptionalLong keyAccesses, OptionalLong coldKeys, StateWeightReading weight) {
+
+    /** A reading with nothing measured about its state's weight. */
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess,
+            OptionalLong rootsRendered, Instant rootsRenderedSince, StateCommitReading commits, NestOrigin origin,
+            OptionalLong keyAccesses, OptionalLong coldKeys) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, keyAccess, rootsRendered,
+                rootsRenderedSince, commits, origin, keyAccesses, coldKeys, null);
+    }
 
     public NestStateReading {
         if (keyAccess != null) {
@@ -74,17 +83,23 @@ public record NestStateReading(long entries, long accesses, long backfills, long
 
     public NestStateReading withRootsRendered(long rendered, Instant since) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                keyAccess, OptionalLong.of(rendered), since, commits, origin, keyAccesses, coldKeys);
+                keyAccess, OptionalLong.of(rendered), since, commits, origin, keyAccesses, coldKeys, weight);
     }
 
     public NestStateReading withCommits(StateCommitReading measured) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                keyAccess, rootsRendered, rootsRenderedSince, measured, origin, keyAccesses, coldKeys);
+                keyAccess, rootsRendered, rootsRenderedSince, measured, origin, keyAccesses, coldKeys, weight);
+    }
+
+    /** The same reading, with how heavy its state has been to keep. */
+    public NestStateReading withWeight(StateWeightReading measured) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, keyAccesses, coldKeys, measured);
     }
 
     public NestStateReading withContext(NestKeyAccess keys, NestOrigin placement) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                keys, rootsRendered, rootsRenderedSince, commits, placement, keyAccesses, coldKeys);
+                keys, rootsRendered, rootsRenderedSince, commits, placement, keyAccesses, coldKeys, weight);
     }
 
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
@@ -106,13 +121,13 @@ public record NestStateReading(long entries, long accesses, long backfills, long
     /** The same reading, placed in the pipeline's definition. */
     public NestStateReading withOrigin(NestOrigin origin) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, keyAccesses, coldKeys);
+                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, keyAccesses, coldKeys, weight);
     }
 
     /** The same reading with independently measured key counters. */
     public NestStateReading withKeyCounts(long keyAccesses, long coldKeys) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys));
+                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys), weight);
     }
 
     /** A decrease in either measured key counter identifies a new counting lifetime. */

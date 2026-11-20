@@ -3,6 +3,8 @@ package io.tapstate.core.model.canonical;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupPick;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
@@ -315,7 +317,14 @@ public final class CanonicalWriter {
     private void body(B b, TransformBody body) {
         switch (body) {
             case TransformBody.Js js -> b.literal("script", js.script());
-            case TransformBody.MapProjection mp -> b.put("fields", fieldRules(mp.fields()));
+            // An omitted fields block stays omitted: only a soft-delete map may leave it out, and writing
+            // an empty one would change the identity of an artifact its author never edited.
+            case TransformBody.MapProjection mp -> {
+                if (!mp.fields().isEmpty() || mp.softDelete() == null) {
+                    b.put("fields", fieldRules(mp.fields()));
+                }
+                b.scalar("soft_delete", mp.softDelete());
+            }
             case TransformBody.Filter f -> b.expression("expr", f.expr());
             // Declared order, which is the order the grammar declares them in: the one required key,
             // then the two an author already knows from a document store's own unwind, then the two
@@ -330,6 +339,18 @@ public final class CanonicalWriter {
                 b.scalar("source_id_field", u.sourceIdField());
             }
             case TransformBody.Union ignored -> {
+            }
+            // The order the step is read in: which rows, then how they are grouped, then what is
+            // computed. Group names and fields keep the order written, which is the output's.
+            case TransformBody.Aggregate a -> {
+                b.scalarSeq("key", a.key());
+                b.scalar("where", a.where());
+                if (!a.groupBy().isEmpty()) {
+                    B g = new B();
+                    a.groupBy().forEach((name, expression) -> g.putRequired(name, scalar(expression)));
+                    b.put("groupBy", g.build());
+                }
+                b.put("fields", rollupFields(a.fields()));
             }
             case TransformBody.Nest n -> {
                 b.scalar("primary_key", n.primaryKey());
@@ -388,8 +409,13 @@ public final class CanonicalWriter {
             B b = new B();
             b.scalar("from", e.from());
             b.freeMap("on", new TreeMap<>(e.on()));
+            if (e.orOn() != null) {
+                // The alternatives keep the order they were written in: it is the order they are tried in, so
+                // it is part of what the embed means. Each one's own pairs are sorted like on's.
+                b.put("orOn", fromValue(e.orOn()));
+            }
             b.scalar("as", e.as().yaml());
-            if (e.as() != EmbedAs.FLAT) {
+            if (e.as() != EmbedAs.FLAT && e.as() != EmbedAs.ROLLUP) {
                 b.scalar("path", e.path());
             }
             b.scalarSeq("key", e.key());
@@ -399,9 +425,44 @@ public final class CanonicalWriter {
             if (e.embed() != null) {
                 b.put("embed", embeds(e.embed()));
             }
+            if (e.rollup() != null) {
+                b.put("rollup", rollupFields(e.rollup()));
+            }
             items.add(b.build());
         }
         return new Node.SeqN(items);
+    }
+
+    /**
+     * Rollup fields in declaration order: the order is where the author put them and is what the document
+     * shows, so sorting would rewrite a source nobody edited.
+     */
+    private Node rollupFields(Map<String, RollupField> fields) {
+        B b = new B();
+        for (Map.Entry<String, RollupField> entry : fields.entrySet()) {
+            RollupField field = entry.getValue();
+            B f = new B();
+            Object argument = field.argument();
+            if (argument instanceof RollupPick pick) {
+                B p = new B();
+                p.scalar("value", pick.value());
+                if (pick.by().size() == 1) {
+                    p.scalar("by", pick.by().getFirst());
+                } else {
+                    p.scalarSeq("by", pick.by());
+                }
+                f.putRequired(field.function().yaml(), p.build());
+            } else {
+                f.putRequired(field.function().yaml(), scalar(argument));
+            }
+            f.scalar("filter", field.filter());
+            f.scalar("type", field.type() == null ? null : field.type().yaml());
+            if (field.defaultValue() != null) {
+                f.put("default", literalValue(field.defaultValue()));
+            }
+            b.putRequired(entry.getKey(), f.build());
+        }
+        return b.build();
     }
 
     private Node fromClause(FromClause from) {

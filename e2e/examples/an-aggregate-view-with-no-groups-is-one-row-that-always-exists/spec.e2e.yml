@@ -1,0 +1,62 @@
+# A step with no `groupBy:` keeps one total over the whole table, in one row that is always there.
+#
+# The row is keyed by the column `aggregate`, holding the id of the step. Every change to the table
+# rewrites that one row; the target never holds a second one, and never holds none.
+#
+# What the assertions have to discriminate:
+#
+# - The target holds exactly one row after every change. A step that wrote a new row per change, or
+#   keyed the row by anything that varies, leaves more than one.
+# - One order is cancelled from the start. A step that ignored `where:` counts five orders and a
+#   revenue of 1300, not four and 400.
+# - Deleting the order that holds the largest amount takes the maximum back down to the one before.
+# - When every order has left the total, the row stays, with a count of zero and the default of the
+#   sum. A step that treated the emptied total as a deleted group leaves the target with no row, and
+#   the count assertion fails.
+# - An order arriving after that is counted from zero, which shows nothing of the earlier orders was
+#   kept behind.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+
+name: an-aggregate-view-with-no-groups-is-one-row-that-always-exists
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mysql]
+pipeline: pipeline.tap.yml
+
+seed:
+  src_mysql.orders:
+    values:
+      - { id: 1, region: EU, amount: 100, status: paid }
+      - { id: 2, region: US, amount: 250, status: paid }
+      - { id: 3, region: EU, amount: 900, status: cancelled }
+      - { id: 4, region: APAC, amount: 40, status: paid }
+      - { id: 5, region: US, amount: 10, status: paid }
+steps:
+  - start
+  - await: { doc: { tgt_mongo.sales_total: { where: { aggregate: sales_total }, expect: { order_count: 4, revenue: 400, max_order: 250 } } } }
+  - assert: { count: { tgt_mongo.sales_total: 1 } }
+  # A new order joins the total, in the same row.
+  - cdc: { src_mysql.orders: { insert: { values: [ { id: 6, region: EU, amount: 600, status: paid } ] } } }
+  - await: { doc: { tgt_mongo.sales_total: { where: { aggregate: sales_total }, expect: { order_count: 5, revenue: 1000, max_order: 600 } } } }
+  - assert: { count: { tgt_mongo.sales_total: 1 } }
+  # The order holding the largest amount is deleted: the maximum goes back down.
+  - cdc: { src_mysql.orders: { delete: { where: { id: 6 } } } }
+  - await: { doc: { tgt_mongo.sales_total: { where: { aggregate: sales_total }, expect: { order_count: 4, revenue: 400, max_order: 250 } } } }
+  - assert: { count: { tgt_mongo.sales_total: 1 } }
+  # Every order leaves the total: the row stays, at zero and at the default of the sum.
+  - cdc: { src_mysql.orders: { update: { where: { id: 1 }, set: { status: cancelled } } } }
+  - cdc: { src_mysql.orders: { update: { where: { id: 2 }, set: { status: cancelled } } } }
+  - cdc: { src_mysql.orders: { update: { where: { id: 4 }, set: { status: cancelled } } } }
+  - cdc: { src_mysql.orders: { delete: { where: { id: 5 } } } }
+  - await: { doc: { tgt_mongo.sales_total: { where: { aggregate: sales_total }, expect: { order_count: 0, revenue: 0 } } } }
+  - assert: { count: { tgt_mongo.sales_total: 1 } }
+  # An order arriving afterwards is counted from zero.
+  - cdc: { src_mysql.orders: { insert: { values: [ { id: 7, region: APAC, amount: 7, status: paid } ] } } }
+  - await: { doc: { tgt_mongo.sales_total: { where: { aggregate: sales_total }, expect: { order_count: 1, revenue: 7, max_order: 7 } } } }
+  - assert: { count: { tgt_mongo.sales_total: 1 } }

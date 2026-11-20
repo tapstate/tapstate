@@ -2,7 +2,11 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.dsl.RollupFold;
+import io.tapstate.core.dsl.aggregate.RollupElement;
+import io.tapstate.core.dsl.aggregate.RollupError;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.runtime.engine.ReplayFloor;
 
@@ -645,14 +649,46 @@ public final class RootAssembly implements Serializable {
      */
     public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
             Map<String, Map<Object, Map<String, Object>>> resolved) {
+        return render(slots, resolved, UNNAMED_ROOT);
+    }
+
+    /**
+     * As above, naming the document {@code root} in a refusal a rollup field raises while it is rendered: an
+     * overflow or a value of the wrong type is a fact about one document, and the author has to find it.
+     */
+    public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
+        return render(slots, resolved, root, null);
+    }
+
+    /** As above, telling {@code foldTimer} how long each level's rollup fields took to fold, in nanoseconds. */
+    public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root,
+            java.util.function.LongConsumer foldTimer) {
         Objects.requireNonNull(slots, "slots");
         Objects.requireNonNull(resolved, "resolved");
         if (!rootPresent) {
             return Optional.empty();
         }
         Map<String, Object> document = new LinkedHashMap<>(rootFields);
-        renderInto(document, children, slots, resolved, true);
+        this.foldTimer = foldTimer;
+        try {
+            renderInto(document, children, slots, resolved, true, root, RollupLevel.ROOT);
+        } finally {
+            this.foldTimer = null;
+        }
         return Optional.of(document);
+    }
+
+    /** Where the render in progress reports its folds; never part of the state. */
+    private transient java.util.function.LongConsumer foldTimer;
+
+    /** How a refusal names a document whose key the caller did not pass. */
+    private static final String UNNAMED_ROOT = "(document)";
+
+    /** The level a rollup field lands on, as a refusal names it. */
+    private record RollupLevel(String name) {
+        static final RollupLevel ROOT = new RollupLevel("$root");
     }
 
     /**
@@ -686,7 +722,8 @@ public final class RootAssembly implements Serializable {
                         absent.add(field);
                     }
                 }
-            } else if (!rendered.containsKey(slot.path())) {
+            } else if (slot.path() != null && !rendered.containsKey(slot.path())) {
+                // A rollup level renders no path of its own, and its fields are written even when null.
                 absent.add(slot.path());
             }
         }
@@ -767,13 +804,22 @@ public final class RootAssembly implements Serializable {
             Map<String, Set<List<Object>>> needed, boolean allowMissingObjects, Set<String> completedObjectLookups) {
         for (EmbedSlot slot : slots) {
             if (slot.isReference()) {
-                if (slot.as() == EmbedAs.OBJECT
-                        && (allowMissingObjects || completedObjectLookups.contains(slot.lookupMap()))) {
-                    continue;
-                }
-                List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields(), slot.lookupMap());
-                if (!key.contains(null)) {
-                    needed.computeIfAbsent(slot.lookupMap(), namespace -> new LinkedHashSet<>()).add(key);
+                // An alternative settles the way an object does, whatever the slot's shape: a document whose
+                // first choice is absent renders its second, and its first choice turning up later redraws it.
+                // Waiting for ever on every alternative instead would hold back each document whose row is
+                // named by only one of them, which is every document an author writes alternatives for.
+                boolean settles = slot.as() == EmbedAs.OBJECT || slot.hasAlternatives();
+                for (EmbedSlot.Reference reference : slot.references()) {
+                    if (settles && (allowMissingObjects
+                            || completedObjectLookups.contains(reference.lookupMap()))) {
+                        continue;
+                    }
+                    List<Object> key = NestKeys.valuesOf(fields, reference.referenceFields(),
+                            reference.lookupMap());
+                    if (!key.contains(null)) {
+                        needed.computeIfAbsent(reference.lookupMap(), namespace -> new LinkedHashSet<>())
+                                .add(key);
+                    }
                 }
                 continue;
             }
@@ -846,11 +892,14 @@ public final class RootAssembly implements Serializable {
             List<String> path = new ArrayList<>(parentPath);
             path.add(slot.stateField());
             if (slot.isReference()) {
-                if (slot.as() == EmbedAs.OBJECT) {
-                    List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields(), slot.lookupMap());
-                    if (!key.contains(null) && (resolved == null
-                            || !resolved.getOrDefault(slot.lookupMap(), Map.of()).containsKey(key))) {
-                        into.add(new MissingObjectReference(path, slot.lookupMap(), key));
+                if (slot.as() == EmbedAs.OBJECT || slot.hasAlternatives()) {
+                    for (EmbedSlot.Reference reference : slot.references()) {
+                        List<Object> key = NestKeys.valuesOf(fields, reference.referenceFields(),
+                                reference.lookupMap());
+                        if (!key.contains(null) && (resolved == null
+                                || !resolved.getOrDefault(reference.lookupMap(), Map.of()).containsKey(key))) {
+                            into.add(new MissingObjectReference(path, reference.lookupMap(), key));
+                        }
                     }
                 }
                 continue;
@@ -1166,7 +1215,8 @@ public final class RootAssembly implements Serializable {
 
     private void renderInto(Map<String, Object> document,
             Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
-            Map<String, Map<Object, Map<String, Object>>> resolved, boolean rememberTopLevelFlatFields) {
+            Map<String, Map<Object, Map<String, Object>>> resolved, boolean rememberTopLevelFlatFields,
+            String root, RollupLevel level) {
         Map<String, String> occupied = new LinkedHashMap<>();
         for (String field : document.keySet()) {
             occupied.put(field, "the parent row");
@@ -1175,16 +1225,17 @@ public final class RootAssembly implements Serializable {
             if (slot.as() == EmbedAs.FLAT) {
                 continue;
             }
-            occupied.putIfAbsent(slot.path(), slot.diagnosticPath());
+            if (slot.path() != null) {
+                occupied.putIfAbsent(slot.path(), slot.diagnosticPath());
+            }
             if (slot.isReference()) {
                 // Read off the row this level already carries. The columns holding the reference are ones
                 // the row has anyway, so pointing at something costs the document no bytes of its own.
-                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields(), slot.lookupMap());
-                Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
                 // A row that is not filed at all has not been fetched; one filed and empty has been
                 // deleted. Neither is something to render, and frozen at its last value is the one thing
                 // it must not be: the source no longer has that row, so neither may the document.
-                boolean live = row != null && !row.isEmpty();
+                Map<String, Object> row = pointedAt(document, slot, resolved);
+                boolean live = row != null;
                 // The shape is whatever `as` says, here exactly as for a gathered embed. Which side of the
                 // join carries the other's identity decides where a row is read from - it does not decide,
                 // and is not decided by, what the row looks like once it is in. An array holds the one row
@@ -1204,14 +1255,29 @@ public final class RootAssembly implements Serializable {
                         }
                     }
                     case FLAT -> throw new IllegalStateException("flat slots are rendered in the flat pass");
+                    case ROLLUP -> throw new IllegalStateException("a rollup level is never a reference");
                 }
                 continue;
             }
             Map<List<Object>, ElementNode> elements = held.get(slot.stateField());
             switch (slot.as()) {
-                case ARRAY -> document.put(slot.path(), liveOf(elements, slot, resolved));
+                case ARRAY -> {
+                    if (slot.rollups().isEmpty()) {
+                        document.put(slot.path(), liveOf(elements, slot, resolved, root));
+                    } else {
+                        List<RollupElement> live = liveElementsOf(elements, slot, resolved, root);
+                        List<Map<String, Object>> rendered = new ArrayList<>(live.size());
+                        for (RollupElement element : live) {
+                            rendered.add(element.rendered());
+                        }
+                        document.put(slot.path(), rendered);
+                        writeRollups(document, slot, live, root, level, occupied);
+                    }
+                }
+                case ROLLUP -> writeRollups(document, slot, liveElementsOf(elements, slot, resolved, root), root,
+                        level, occupied);
                 case OBJECT -> latestOf(elements)
-                        .ifPresent(element -> document.put(slot.path(), renderOne(element, slot, resolved)));
+                        .ifPresent(element -> document.put(slot.path(), renderOne(element, slot, resolved, root)));
                 case FLAT -> throw new IllegalStateException("flat slots are rendered in the flat pass");
             }
         }
@@ -1221,16 +1287,15 @@ public final class RootAssembly implements Serializable {
             }
             Map<String, Object> flat = null;
             if (slot.isReference()) {
-                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields(), slot.lookupMap());
-                Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
-                if (row != null && !row.isEmpty()) {
+                Map<String, Object> row = pointedAt(document, slot, resolved);
+                if (row != null) {
                     flat = new LinkedHashMap<>(row);
                 }
             } else {
                 Map<List<Object>, ElementNode> elements = held.get(slot.stateField());
                 Optional<ElementNode> only = onlyLiveFlat(elements, slot);
                 if (only.isPresent()) {
-                    flat = renderOne(only.get(), slot, resolved);
+                    flat = renderOne(only.get(), slot, resolved, root);
                 }
             }
             if (flat != null) {
@@ -1239,24 +1304,120 @@ public final class RootAssembly implements Serializable {
         }
     }
 
-    private Map<String, Object> renderOne(ElementNode element, EmbedSlot slot,
+    /**
+     * The live row a referenced slot shows, or null where it shows none: the first of its references, in the
+     * order they were declared, whose row is filed and not deleted. A slot with no alternatives has one
+     * reference, so this is exactly the read it always made.
+     */
+    private static Map<String, Object> pointedAt(Map<String, Object> fields, EmbedSlot slot,
             Map<String, Map<Object, Map<String, Object>>> resolved) {
+        for (EmbedSlot.Reference reference : slot.references()) {
+            List<Object> key = NestKeys.valuesOf(fields, reference.referenceFields(), reference.lookupMap());
+            Map<String, Object> row = resolved.getOrDefault(reference.lookupMap(), Map.of()).get(key);
+            if (row != null && !row.isEmpty()) {
+                return row;
+            }
+        }
+        return null;
+    }
+
+    private Map<String, Object> renderOne(ElementNode element, EmbedSlot slot,
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
         Map<String, Object> rendered = new LinkedHashMap<>(element.fields());
-        renderInto(rendered, element.children(), slot.children(), resolved, false);
+        renderInto(rendered, element.children(), slot.children(), resolved, false, root,
+                new RollupLevel(slot.diagnosticPath()));
         return rendered;
     }
 
     private List<Map<String, Object>> liveOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
-            Map<String, Map<Object, Map<String, Object>>> resolved) {
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
         List<Map<String, Object>> live = new ArrayList<>();
         if (elements != null) {
             for (ElementNode element : elements.values()) {
                 if (!element.deleted()) {
-                    live.add(renderOne(element, slot, resolved));
+                    live.add(renderOne(element, slot, resolved, root));
                 }
             }
         }
         return live;
+    }
+
+    /**
+     * The live elements of a level a rollup folds over: each rendered exactly as the array would show it -
+     * references resolved, its own levels' rollups written - with its key and the references it names that
+     * rendered absent. A reference that names nothing (its own key and every alternative's all null) is
+     * not missing; it was never there.
+     */
+    private List<RollupElement> liveElementsOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
+        List<RollupElement> live = new ArrayList<>();
+        if (elements == null) {
+            return live;
+        }
+        for (Map.Entry<List<Object>, ElementNode> entry : elements.entrySet()) {
+            ElementNode element = entry.getValue();
+            if (element.deleted()) {
+                continue;
+            }
+            Map<String, Object> rendered = renderOne(element, slot, resolved, root);
+            Set<String> missing = new LinkedHashSet<>();
+            for (EmbedSlot child : slot.children()) {
+                if (!child.isReference() || child.path() == null) {
+                    continue;
+                }
+                if (namesNothing(element.fields(), child)) {
+                    continue;
+                }
+                Object at = rendered.get(child.path());
+                if (at == null || (at instanceof List<?> list && list.isEmpty())) {
+                    missing.add(child.path());
+                }
+            }
+            // A value a connector converted travels in a carrier, which orders and adds as nothing at all: a
+            // rollup reads the value inside, while the array keeps the carrier the target is owed.
+            @SuppressWarnings("unchecked")
+            Map<String, Object> plain = (Map<String, Object>) ConvertedValue.unwrap(rendered);
+            live.add(new RollupElement(entry.getKey(), rendered, plain, missing));
+        }
+        return live;
+    }
+
+    /**
+     * Whether an element names no row for a referenced slot: every place the slot may be read from - its own
+     * reference and each alternative - is keyed by nulls only. An element that names a row through any one
+     * of them is missing that row when the slot renders absent.
+     */
+    private static boolean namesNothing(Map<String, Object> fields, EmbedSlot child) {
+        for (EmbedSlot.Reference reference : child.references()) {
+            if (!NestKeys.valuesOf(fields, reference.referenceFields()).stream().allMatch(Objects::isNull)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Writes a level's rollup fields on the map that holds the level, refusing a field whose name the map
+     * already carries. A null result is written as a null rather than left out: a field that stops being
+     * written is left standing in a keyed target at its last value, which is the one thing an incomplete
+     * total must not do.
+     */
+    private void writeRollups(Map<String, Object> document, EmbedSlot slot, List<RollupElement> live,
+            String root, RollupLevel level, Map<String, String> occupied) {
+        long began = foldTimer == null ? 0L : System.nanoTime();
+        Map<String, Object> values = RollupFold.apply(slot.rollups(), live, root);
+        if (foldTimer != null) {
+            foldTimer.accept(System.nanoTime() - began);
+        }
+        for (Map.Entry<String, Object> value : values.entrySet()) {
+            String field = value.getKey();
+            if (document.containsKey(field)) {
+                throw new TapstateException(RollupError.FIELD_CONFLICT, Map.of("field", field,
+                        "level", level.name(), "other", occupied.getOrDefault(field, "a field the row carries")), null);
+            }
+            document.put(field, value.getValue());
+            occupied.putIfAbsent(field, slot.diagnosticPath() + " rollup field");
+        }
     }
 
     /** The one live row of a flat embed, refusing a one-to-many relationship at runtime. */

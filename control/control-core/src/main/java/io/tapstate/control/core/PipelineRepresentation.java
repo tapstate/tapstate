@@ -6,6 +6,10 @@ import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupFunction;
+import io.tapstate.core.model.RollupPick;
+import io.tapstate.core.model.RollupResultType;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
@@ -45,6 +49,9 @@ import java.util.function.Function;
 
 /** Projects a canonical Pipeline artifact and its resolved Sources into a structured view. */
 public final class PipelineRepresentation {
+
+    private static final String FIELDS_KEY = "fields";
+    private static final String SOFT_DELETE_KEY = "soft_delete";
 
     private final PipelineDagProjection dagProjection = new PipelineDagProjection();
 
@@ -187,7 +194,12 @@ public final class PipelineRepresentation {
         if (body.containsKey("script")) {
             return "js";
         }
-        if (body.containsKey("fields")) {
+        // Read before map: both carry fields, and only an aggregate says how rows are grouped. One
+        // with neither key has to name its type, as an unqualified fields map is a projection.
+        if (body.containsKey("groupBy") || body.containsKey("where")) {
+            return "aggregate";
+        }
+        if (body.containsKey(FIELDS_KEY) || body.containsKey(SOFT_DELETE_KEY) || body.containsKey("softDelete")) {
             return "map";
         }
         if (body.containsKey("expr")) {
@@ -211,10 +223,14 @@ public final class PipelineRepresentation {
     static TransformBody body(String type, Map<String, Object> payload, String path) {
         return switch (type) {
             case "js" -> new TransformBody.Js(requiredText(payload, "script", path));
-            case "map" -> new TransformBody.MapProjection(
-                    fieldRules(requiredObject(payload, "fields", path), path + ".fields"));
+            case "map" -> mapBody(payload, path);
             case "filter" -> new TransformBody.Filter(requiredText(payload, "expr", path));
             case "union" -> new TransformBody.Union();
+            case "aggregate" -> new TransformBody.Aggregate(
+                    stringsOrNull(payload.get("key"), path + ".key"),
+                    textOrNull(payload.get("where"), path + ".where"),
+                    groupBy(payload.get("groupBy"), path + ".groupBy"),
+                    rollupFields(requiredObject(payload, "fields", path), path + ".fields"));
             // An expansion's four optional keys are read as absent when absent, never defaulted:
             // this face round-trips what it wrote, and answering with a spelled-out false for a
             // key nobody wrote turns reading a pipeline into editing it.
@@ -379,11 +395,31 @@ public final class PipelineRepresentation {
         return number.intValue();
     }
 
+    /** A map's fields may be absent only where soft_delete stands in for them, as in the document form. */
+    private static TransformBody.MapProjection mapBody(Map<String, Object> payload, String path) {
+        String softDelete = textOrNull(value(payload, SOFT_DELETE_KEY, "softDelete"), path + "." + SOFT_DELETE_KEY);
+        if (softDelete != null && softDelete.isBlank()) {
+            throw malformed(path + ".soft_delete must name a column");
+        }
+        Map<String, FieldRule> fields = softDelete != null && payload.get(FIELDS_KEY) == null
+                ? Map.of()
+                : fieldRules(requiredObject(payload, FIELDS_KEY, path), path + "." + FIELDS_KEY);
+        if (softDelete != null && fields.containsKey(softDelete)) {
+            throw malformed(path + ".soft_delete names a column also declared under fields");
+        }
+        return new TransformBody.MapProjection(fields, softDelete);
+    }
+
     private static Map<String, Object> bodyValue(TransformBody body) {
         Map<String, Object> value = new LinkedHashMap<>();
         switch (body) {
             case TransformBody.Js js -> value.put("script", js.script());
-            case TransformBody.MapProjection map -> value.put("fields", fieldRuleValues(map.fields()));
+            case TransformBody.MapProjection map -> {
+                value.put(FIELDS_KEY, fieldRuleValues(map.fields()));
+                if (map.softDelete() != null) {
+                    value.put(SOFT_DELETE_KEY, map.softDelete());
+                }
+            }
             case TransformBody.Filter filter -> value.put("expr", filter.expr());
             // Every key, including the ones the author omitted: this face reports what a pipeline
             // is, and a key left out of the answer is indistinguishable from a key this face does
@@ -397,6 +433,12 @@ public final class PipelineRepresentation {
                 value.put("sourceIdField", unwind.sourceIdField());
             }
             case TransformBody.Union ignored -> {
+            }
+            case TransformBody.Aggregate aggregate -> {
+                value.put("key", aggregate.key());
+                value.put("where", aggregate.where());
+                value.put("groupBy", aggregate.groupBy());
+                value.put("fields", rollupValues(aggregate.fields()));
             }
             case TransformBody.Nest nest -> {
                 value.put("primaryKey", nest.primaryKey());
@@ -431,8 +473,11 @@ public final class PipelineRepresentation {
             Map<String, Object> value = new LinkedHashMap<>();
             value.put("from", embed.from());
             value.put("on", embed.on());
+            if (embed.orOn() != null) {
+                value.put("orOn", embed.orOn());
+            }
             value.put("as", embed.as() == null ? null : embed.as().name());
-            if (embed.as() != EmbedAs.FLAT) {
+            if (embed.as() != EmbedAs.FLAT && embed.as() != EmbedAs.ROLLUP) {
                 value.put("path", embed.path());
             }
             value.put("key", embed.key());
@@ -440,8 +485,39 @@ public final class PipelineRepresentation {
             value.put("ignoreUpdates", embed.ignoreUpdates());
             value.put("trackKeyChanges", embed.trackKeyChanges());
             value.put("embed", embedValues(embed.embed()));
+            value.put("rollup", rollupValues(embed.rollup()));
             return Collections.unmodifiableMap(value);
         }).toList();
+    }
+
+    /** Rollup fields in the shape they are written in: one function key carrying its argument, then options. */
+    private static Map<String, Object> rollupValues(Map<String, RollupField> fields) {
+        if (fields == null) {
+            return null;
+        }
+        Map<String, Object> values = new LinkedHashMap<>();
+        fields.forEach((name, field) -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            Object argument = field.argument();
+            if (argument instanceof RollupPick pick) {
+                Map<String, Object> picked = new LinkedHashMap<>();
+                picked.put("value", pick.value());
+                picked.put("by", pick.by());
+                argument = Collections.unmodifiableMap(picked);
+            }
+            value.put(field.function().yaml(), argument);
+            if (field.filter() != null) {
+                value.put("filter", field.filter());
+            }
+            if (field.type() != null) {
+                value.put("type", field.type().yaml());
+            }
+            if (field.defaultValue() != null) {
+                value.put("default", field.defaultValue());
+            }
+            values.put(name, Collections.unmodifiableMap(value));
+        });
+        return Collections.unmodifiableMap(values);
     }
 
     private static Map<String, Object> fieldRuleValues(Map<String, FieldRule> rules) {
@@ -642,18 +718,106 @@ public final class PipelineRepresentation {
             if (as == EmbedAs.FLAT && arrayKey != null) {
                 throw malformed(entryPath + ".arrayKey is forbidden when as is flat");
             }
+            if (as == EmbedAs.ROLLUP && embedPath != null) {
+                throw malformed(entryPath + ".path is forbidden when as is rollup");
+            }
+            Map<String, RollupField> rollup = rollupFields(value.get("rollup"), entryPath + ".rollup");
+            if ((as == EmbedAs.OBJECT || as == EmbedAs.FLAT) && rollup != null) {
+                throw malformed(entryPath + ".rollup is forbidden when as is " + as.yaml());
+            }
+            if (as == EmbedAs.ROLLUP && (rollup == null || rollup.isEmpty())) {
+                throw malformed(entryPath + ".rollup is required when as is rollup");
+            }
             result.add(new Embed(
                     requiredText(value, "from", entryPath),
                     stringMap(requiredObject(value, "on", entryPath), entryPath + ".on"),
                     as,
-                    as == EmbedAs.FLAT ? null : requiredText(value, "path", entryPath),
+                    as == EmbedAs.FLAT || as == EmbedAs.ROLLUP ? null : requiredText(value, "path", entryPath),
                     key,
                     arrayKey,
                     booleanOrNull(value(value, "ignoreUpdates", "ignore_updates"), entryPath + ".ignoreUpdates"),
                     booleanOrNull(value(value, "trackKeyChanges", "track_key_changes"), entryPath + ".trackKeyChanges"),
-                    embeds(listOrNull(value(value, "embed"), entryPath + ".embed"), entryPath + ".embed")));
+                    embeds(listOrNull(value(value, "embed"), entryPath + ".embed"), entryPath + ".embed"),
+                    rollup,
+                    alternatives(listOrNull(value(value, "orOn", "or_on"), entryPath + ".orOn"), entryPath + ".orOn")));
         }
         return List.copyOf(result);
+    }
+
+    /** An embed's orOn alternatives, each an object of child field to parent field; null when absent. */
+    private static List<Map<String, String>> alternatives(List<?> values, String path) {
+        if (values == null) {
+            return null;
+        }
+        if (values.isEmpty()) {
+            throw malformed(path + " must list at least one alternative");
+        }
+        List<Map<String, String>> result = new ArrayList<>(values.size());
+        for (int index = 0; index < values.size(); index++) {
+            String entryPath = path + "[" + index + "]";
+            Map<String, String> alternative = stringMap(object(values.get(index), entryPath), entryPath);
+            if (alternative.isEmpty()) {
+                throw malformed(entryPath + " must map at least one field");
+            }
+            result.add(alternative);
+        }
+        return List.copyOf(result);
+    }
+
+    /** Group names to the expression each is computed from, in the order written. */
+    private static Map<String, String> groupBy(Object raw, String path) {
+        if (raw == null) {
+            return Map.of();
+        }
+        Map<String, String> result = new LinkedHashMap<>();
+        object(raw, path).forEach((name, expression) -> result.put(name, text(expression, path + "." + name)));
+        return result;
+    }
+
+    /** Rollup fields read back from their written shape; exactly one function key per field. */
+    private static Map<String, RollupField> rollupFields(Object raw, String path) {
+        if (raw == null) {
+            return null;
+        }
+        Map<String, Object> fields = object(raw, path);
+        Map<String, RollupField> result = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : fields.entrySet()) {
+            String fieldPath = path + "." + entry.getKey();
+            Map<String, Object> value = object(entry.getValue(), fieldPath);
+            List<RollupFunction> functions = new ArrayList<>();
+            for (String key : value.keySet()) {
+                if (!List.of("filter", "type", "default").contains(key)) {
+                    functions.add(RollupFunction.byYaml(key).orElseThrow(
+                            () -> malformed(fieldPath + "." + key + " is not a rollup function; one of "
+                                    + RollupFunction.spellings())));
+                }
+            }
+            if (functions.size() != 1) {
+                throw malformed(fieldPath + " must name exactly one rollup function");
+            }
+            RollupFunction function = functions.getFirst();
+            Object argument = value.get(function.yaml());
+            if (function == RollupFunction.FIRST || function == RollupFunction.LAST) {
+                Map<String, Object> pick = object(argument, fieldPath + "." + function.yaml());
+                Object by = pick.get("by");
+                List<String> order = by instanceof String single ? List.of(single)
+                        : stringsOrNull(by, fieldPath + "." + function.yaml() + ".by");
+                if (order == null || order.isEmpty()) {
+                    throw malformed(fieldPath + "." + function.yaml() + ".by is required");
+                }
+                argument = new RollupPick(requiredText(pick, "value", fieldPath + "." + function.yaml()), order);
+            } else if (!(argument instanceof String) && !(function == RollupFunction.COUNT
+                    && Boolean.TRUE.equals(argument))) {
+                throw malformed(fieldPath + "." + function.yaml() + " must be an expression"
+                        + (function == RollupFunction.COUNT ? " or true" : ""));
+            }
+            RollupResultType type = value.get("type") == null ? null
+                    : enumValue(value.get("type"), RollupResultType.values(), RollupResultType::yaml,
+                            fieldPath + ".type");
+            result.put(entry.getKey(), RollupField.of(function, argument,
+                    textOrNull(value.get("filter"), fieldPath + ".filter"), type, value.get("default")));
+        }
+        return result;
     }
 
     private static ViewBlock view(Map<String, Object> value) {
