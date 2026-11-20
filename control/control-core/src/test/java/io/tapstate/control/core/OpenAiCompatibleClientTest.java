@@ -98,13 +98,13 @@ class OpenAiCompatibleClientTest {
             var first = Map.of("role", "user", "content", "Which table did I select?");
             var text = new StringBuilder();
             assertThat(client.propose(settings, List.of(first), Map.of("proposalEnabled", false), text::append)).isEmpty();
-            assertThat(text.toString()).isEqualTo("Orders.");
+            assertThat(text).hasToString("Orders.");
             var history = Map.of("role", "assistant", "content", text.toString());
             var second = Map.of("role", "user", "content", "Add a mapping to the selected table");
             text.setLength(0);
             assertThat(client.propose(settings, List.of(first, history, second), Map.of(), text::append))
                     .hasValueSatisfying(value -> assertThat(value.get("root")).isEqualTo(Map.of("table", "orders")));
-            assertThat(text.toString()).isEqualTo("Map the order fields.");
+            assertThat(text).hasToString("Map the order fields.");
             assertThat(requests.get(1).get("messages").toString()).contains("Orders.", "Add a mapping");
             assertThat(requests.get(1).get("reasoning_effort")).isEqualTo("low");
             assertThat(requests.get(1).get("max_completion_tokens")).isEqualTo(4096L);
@@ -118,6 +118,61 @@ class OpenAiCompatibleClientTest {
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_RATE_LIMITED));
             assertThat(requests).hasSize(3);
         } finally { server.stop(0); }
+    }
+
+    @Test void managedRetriesOnlyOneTransientHttpFailureAndKeepsAllAttemptsStreaming() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        var observedBodies = new java.util.concurrent.ConcurrentLinkedQueue<Map<?, ?>>();
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            observedBodies.add((Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            int attempt = requests.incrementAndGet();
+            if (attempt != 2) {
+                exchange.sendResponseHeaders(attempt == 1 ? 503 : 429, -1);
+                exchange.close();
+                return;
+            }
+            var response = (chunk(Map.of("content", "Recovered."), "stop") + "data: [DONE]\n\n").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            try (var output = exchange.getResponseBody()) { output.write(response); }
+        });
+        server.start();
+        try {
+            var endpoint = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            var client = new OpenAiCompatibleClient(ignored -> endpoint, Duration.ofSeconds(5), (request, uri, body) -> {}, 10);
+            var settings = new AiProviderSettings("bedrock-managed", endpoint.toString(), "test-kimi", null);
+            var text = new StringBuilder();
+            assertThat(client.propose(settings, List.of(), Map.of("proposalEnabled", false), text::append)).isEmpty();
+            assertThat(text).hasToString("Recovered.");
+            Map<String, Object> context = Map.of("proposalEnabled", false);
+            java.util.function.Consumer<String> discard = ignored -> {};
+            assertThatThrownBy(() -> client.propose(settings, List.of(), context, discard))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_RATE_LIMITED));
+            assertThat(requests).hasValue(4);
+            assertThat(observedBodies.stream().map(body -> Boolean.TRUE.equals(body.get("stream"))).toList()).containsOnly(true);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test void managedRefusesIncompleteResponsesAndRejectsOversizedRequestsBeforeSigning() throws Exception {
+        String limited = chunk(Map.of("content", "Partial"), "length") + "data: [DONE]\n\n";
+        withServer(200, limited, settings -> {
+            AtomicInteger signed = new AtomicInteger();
+            var client = new OpenAiCompatibleClient(URI::create, Duration.ofSeconds(5),
+                    (request, uri, body) -> signed.incrementAndGet(), 5);
+            Map<String, Object> context = Map.of("proposalEnabled", false);
+            java.util.function.Consumer<String> discard = ignored -> {};
+            assertThatThrownBy(() -> client.propose(settings, List.of(), context, discard))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL));
+            var tooLong = List.of(Map.of("role", "user", "content", "x".repeat(128 * 1024)));
+            assertThatThrownBy(() -> client.propose(settings, tooLong, context, discard))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_REQUEST_REJECTED));
+            assertThat(signed).hasValue(1);
+        });
     }
 
     @Test void streamsOnlyTheTopLevelExplanationAndDecodesSplitEscapes() throws Exception {

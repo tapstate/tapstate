@@ -30,7 +30,9 @@ class MongoConfigurationAiProviderSettingsIT {
     @Test void encryptedConfigurationSurvivesReopenAndExplicitDeletionWithoutAnyCache() {
         fixture((uri, config, raw) -> {
             var store = config.aiProviderSettings();
-            assertThat(store.get(OWNER)).isEmpty(); store.put(OWNER, setting());
+            assertThat(store.get(OWNER)).isEmpty();
+            assertThat(store.selectManaged(OWNER, true)).isFalse();
+            store.put(OWNER, setting());
             var saved = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).find().first();
             assertThat(saved.toJson()).doesNotContain(SECRET);
             assertThat(saved.getString("secret")).startsWith("tsai:1:");

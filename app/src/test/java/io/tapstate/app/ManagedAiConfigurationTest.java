@@ -5,6 +5,7 @@ import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.http.auth.aws.signer.AwsV4HttpSigner;
 
 import java.net.URI;
@@ -12,9 +13,38 @@ import java.net.http.HttpRequest;
 import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ManagedAiConfigurationTest {
+    @Test void managesTheConfiguredAwsRegionAndModelWithoutAWorkspaceKey() {
+        var configuration = new ManagedAiConfiguration();
+        try (var credentials = configuration.bedrockCredentials()) {
+            var route = configuration.managedAiProvider(credentials, "ap-southeast-1", "global.moonshotai.kimi-k3", 30);
+            assertThat(route.settings().baseUrl()).isEqualTo("https://bedrock-runtime.ap-southeast-1.amazonaws.com/openai/v1");
+            assertThat(route.settings().model()).isEqualTo("global.moonshotai.kimi-k3");
+            assertThat(route.settings().apiKey()).isNull();
+            assertThatIllegalArgumentException().isThrownBy(() ->
+                    configuration.managedAiProvider(credentials, "ap-southeast-1.invalid", "model", 30));
+            assertThatIllegalArgumentException().isThrownBy(() ->
+                    configuration.managedAiProvider(credentials, "ap-southeast-1", "", 30));
+            assertThatIllegalArgumentException().isThrownBy(() ->
+                    configuration.managedAiProvider(credentials, "ap-southeast-1", "model", 0));
+        }
+    }
+
+    @Test void missingWorkloadCredentialsBecomeACodedAuthenticationFailure() {
+        var endpoint = URI.create("https://bedrock-runtime.ap-southeast-1.amazonaws.com/openai/v1/chat/completions");
+        var signer = AwsV4HttpSigner.create();
+        var request = HttpRequest.newBuilder(endpoint);
+        byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+        assertThatThrownBy(() -> ManagedAiConfiguration.sign(() -> {
+            throw SdkClientException.create("test credential source unavailable");
+        }, signer, "ap-southeast-1", request, endpoint, body))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_AUTH_FAILED));
+    }
+
     @Test void bedrockSignsTheRequestWithTheWorkloadSessionAndRejectsLongTermKeys() {
         var endpoint = URI.create("https://bedrock-runtime.ap-southeast-1.amazonaws.com/openai/v1/chat/completions");
         var signer = AwsV4HttpSigner.create();

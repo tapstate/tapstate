@@ -28,6 +28,8 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private static final int MAX_BYTES = 524288;
     private static final int STREAM_ATTEMPTS = 2;
     private static final int CHECK_RETRY_MAX_TOKENS = 8192;
+    private static final String MAX_TOKENS = "max_tokens";
+    private static final String TOOL_CALLS = "tool_calls";
     private static final String JSON_TYPE = "type";
     private static final String JSON_STRING = "string";
     private static final String JSON_OBJECT = "object";
@@ -99,7 +101,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
     }
     @Override public void check(AiProviderSettings settings) {
-        Map<String, Object> body = Map.of("model", settings.model(), "max_tokens", 128,
+        Map<String, Object> body = Map.of("model", settings.model(), MAX_TOKENS, 128,
                 "messages", List.of(Map.of("role", "user", "content", "Reply OK.")));
         Map<String, Object> plain = checkProbe(settings, body);
         if (responses(settings)) {
@@ -118,7 +120,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             calls = OpenAiResponsesProtocol.validateCompleted(checked).stream()
                     .map(OpenAiCompatibleClient::object).filter(item -> "function_call".equals(item.get("type"))).toList();
         } else {
-            Object raw = checkMessage(checked).get("tool_calls");
+            Object raw = checkMessage(checked).get(TOOL_CALLS);
             if (!(raw instanceof List<?> items)) throw AiProviderService.error(ControlError.AI_PROVIDER_REQUEST_REJECTED);
             calls = items;
         }
@@ -138,7 +140,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         Map<String, Object> response = checkResponse(settings, body);
         if (!outputLimitReached(response, responses(settings))) return response;
         Map<String, Object> retry = new java.util.LinkedHashMap<>(body);
-        retry.put("max_tokens", CHECK_RETRY_MAX_TOKENS);
+        retry.put(MAX_TOKENS, CHECK_RETRY_MAX_TOKENS);
         response = checkResponse(settings, retry);
         if (outputLimitReached(response, responses(settings))) throw AiProviderService.error(ControlError.AI_PROVIDER_OUTPUT_LIMIT);
         return response;
@@ -226,7 +228,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             requestBody.put("max_completion_tokens", 4096);
             requestBody.put("reasoning_effort", "low");
             requestBody.put("stream_options", Map.of("include_usage", true));
-        } else requestBody.put("max_tokens", 8192);
+        } else requestBody.put(MAX_TOKENS, 8192);
         if (responses(settings)) requestBody.put("reasoning", Map.of("summary", "concise"));
         if (proposalEnabled) {
             requestBody.put("tools", List.of(tool));
@@ -456,46 +458,75 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         return Map.of("type", "array", "items", items);
     }
 
-    @SuppressWarnings("unchecked")
     private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, AiProviderClient.Output text,
             boolean proposalEnabled, TokenUsage usage) {
-        for (int attempt = 0; attempt < STREAM_ATTEMPTS; attempt++) {
-            long deadline = System.nanoTime() + responseTimeout.toNanos();
-            boolean[] emitted = {false};
-            try {
-                var response = send(settings, body);
-                try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
-                    if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                        LOG.log(System.Logger.Level.WARNING, "AI provider stream returned HTTP {0}", response.statusCode());
-                    }
-                    if (signer != null && (response.statusCode() == 429 || response.statusCode() == 503)
-                            && attempt < STREAM_ATTEMPTS - 1) {
-                        Thread.sleep(250);
-                        continue;
-                    }
-                    requireSuccessfulResponse(response.statusCode());
-                    AiProviderClient.Output emit = new AiProviderClient.Output() {
-                        public void accept(String delta) { emitted[0] = true; text.accept(delta); }
-                        public void reasoning(AiProviderClient.Reasoning part) { emitted[0] = true; text.reasoning(part); }
-                    };
-                    return responses(settings) ? readResponses(input, emit, proposalEnabled)
-                            : readEvents(input, emit, proposalEnabled, usage);
+        try {
+            for (int attempt = 0; attempt < STREAM_ATTEMPTS; attempt++) {
+                boolean canRetry = attempt < STREAM_ATTEMPTS - 1;
+                var output = new StreamingOutput(text);
+                try {
+                    return readStreamAttempt(settings, body, output, proposalEnabled, usage, canRetry);
+                } catch (RetryableStreamException error) {
+                    if (output.emitted) throw failed();
+                    if (!canRetry) return readAfterStreamRetries(settings, body, text, proposalEnabled);
+                    LOG.log(System.Logger.Level.WARNING, "Retrying AI provider before any output was returned");
                 }
-            } catch (RetryableStreamException error) {
-                if (emitted[0]) throw failed();
-                if (attempt >= STREAM_ATTEMPTS - 1) {
-                    if (responses(settings) || signer != null) throw failed();
-                    return readNonStreaming(settings, body, text, proposalEnabled);
-                }
-                LOG.log(System.Logger.Level.WARNING, "Retrying AI provider after an empty upstream error stream");
-            } catch (java.io.IOException | InterruptedException error) {
-                if (error instanceof InterruptedException) Thread.currentThread().interrupt();
-                LOG.log(System.Logger.Level.WARNING, "AI provider stream transport failed: {0}", error.getClass().getSimpleName());
-                throw failed();
-            } catch (IllegalArgumentException | ClassCastException error) { throw invalid(); }
+            }
+        } catch (java.io.IOException | InterruptedException error) {
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            LOG.log(System.Logger.Level.WARNING, "AI provider stream transport failed: {0}", error.getClass().getSimpleName());
+            throw failed();
+        } catch (IllegalArgumentException | ClassCastException error) {
+            throw invalid();
         }
         throw failed();
     }
+
+    private Optional<Map<String, Object>> readAfterStreamRetries(AiProviderSettings settings, Map<String, Object> body,
+            AiProviderClient.Output text, boolean proposalEnabled) {
+        if (responses(settings) || signer != null) throw failed();
+        return readNonStreaming(settings, body, text, proposalEnabled);
+    }
+
+    private Optional<Map<String, Object>> readStreamAttempt(AiProviderSettings settings, Map<String, Object> body,
+            AiProviderClient.Output output, boolean proposalEnabled, TokenUsage usage, boolean canRetry)
+            throws java.io.IOException, InterruptedException {
+        long deadline = System.nanoTime() + responseTimeout.toNanos();
+        var response = send(settings, body);
+        try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
+            int status = response.statusCode();
+            if (status < 200 || status >= 300) {
+                LOG.log(System.Logger.Level.WARNING, "AI provider stream returned HTTP {0}", status);
+            }
+            if (signer != null && canRetry && (status == 429 || status == 503)) {
+                Thread.sleep(250);
+                throw new RetryableStreamException();
+            }
+            requireSuccessfulResponse(status);
+            return responses(settings) ? readResponses(input, output, proposalEnabled)
+                    : readEvents(input, output, proposalEnabled, usage);
+        }
+    }
+
+    private static final class StreamingOutput implements AiProviderClient.Output {
+        private final AiProviderClient.Output delegate;
+        private boolean emitted;
+
+        private StreamingOutput(AiProviderClient.Output delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override public void accept(String delta) {
+            emitted = true;
+            delegate.accept(delta);
+        }
+
+        @Override public void reasoning(AiProviderClient.Reasoning part) {
+            emitted = true;
+            delegate.reasoning(part);
+        }
+    }
+
     private Optional<Map<String, Object>> readNonStreaming(AiProviderSettings settings, Map<String, Object> body,
             Consumer<String> text, boolean proposalEnabled) {
         Map<String, Object> fallback = new java.util.LinkedHashMap<>(body);
@@ -513,7 +544,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 Map<String, Object> message = object(object(choices.getFirst()).get("message"));
                 boolean hasText = message.get("content") instanceof String content && !content.isEmpty();
                 if (hasText) text.accept((String) message.get("content"));
-                if (!(message.get("tool_calls") instanceof List<?> calls) || calls.isEmpty()) {
+                if (!(message.get(TOOL_CALLS) instanceof List<?> calls) || calls.isEmpty()) {
                     if (!hasText) throw invalid();
                     return Optional.empty();
                 }
@@ -551,26 +582,22 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             }
             readChunk(data, state, text, usage);
         }
-        if (usage != null && !("stop".equals(state.finish) || "tool_calls".equals(state.finish))) throw invalid();
-        if (!state.done) throw invalid();
+        return streamCandidate(state, proposalEnabled, usage != null);
+    }
+
+    private static Optional<Map<String, Object>> streamCandidate(StreamState state, boolean proposalEnabled, boolean managed) {
+        if (!state.done || managed && !("stop".equals(state.finish) || TOOL_CALLS.equals(state.finish))) throw invalid();
         if (!state.toolCallStarted) {
             return Optional.empty();
         }
         if (!proposalEnabled
-                || (state.finish != null && !List.of("tool_calls", "stop").contains(state.finish))
+                || (state.finish != null && !List.of(TOOL_CALLS, "stop").contains(state.finish))
                 || !"propose_pipeline".equals(state.function)) throw invalid();
         return Optional.of(candidate(state.arguments.toString()));
     }
     private static void readChunk(String data, StreamState state, Consumer<String> text, TokenUsage usage) {
         Map<String, Object> chunk = object(JsonReader.parse(data));
-        if (chunk.containsKey("error")) {
-            Object error = chunk.get("error");
-            String type = error instanceof Map<?, ?> details && details.get("type") instanceof String value
-                    && value.matches("[A-Za-z0-9_.-]{1,80}") ? value : "unspecified";
-            LOG.log(System.Logger.Level.WARNING, "AI provider stream error payload received");
-            if ("upstream_error".equals(type)) throw new RetryableStreamException();
-            throw failed();
-        }
+        if (chunk.containsKey("error")) rejectStreamError(chunk.get("error"));
         if (usage != null && chunk.get("usage") instanceof Map<?, ?> counts) {
             usage.input = tokenCount(counts.get("prompt_tokens"));
             usage.output = tokenCount(counts.get("completion_tokens"));
@@ -586,10 +613,18 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         Map<String, Object> delta = object(choice.getOrDefault("delta", Map.of()));
         if (delta.get("content") instanceof String content && !content.isEmpty())
             emitText(state, text, content, TextChannel.CONTENT);
-        if (delta.get("tool_calls") instanceof List<?> calls) {
+        if (delta.get(TOOL_CALLS) instanceof List<?> calls) {
             for (Object raw : calls) appendToolCall(raw, state, text);
         }
     }
+    private static void rejectStreamError(Object error) {
+        LOG.log(System.Logger.Level.WARNING, "AI provider stream error payload received");
+        if (error instanceof Map<?, ?> details && "upstream_error".equals(details.get("type"))) {
+            throw new RetryableStreamException();
+        }
+        throw failed();
+    }
+
     private static long tokenCount(Object value) {
         return value instanceof Number count && count.longValue() >= 0 ? count.longValue() : -1;
     }
@@ -718,15 +753,15 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             throws java.io.IOException, InterruptedException {
         var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
         if (signer != null) return response;
-        boolean negotiable = responses(settings) ? body.containsKey("reasoning") : body.containsKey("max_tokens");
+        boolean negotiable = responses(settings) ? body.containsKey("reasoning") : body.containsKey(MAX_TOKENS);
         if (response.statusCode() != 400 || !negotiable) return response;
         String rejected = rejectedParameter(response);
         Map<String, Object> compatible = new java.util.LinkedHashMap<>(body);
         if (responses(settings) && body.containsKey("reasoning")
                 && ("reasoning".equals(rejected) || "reasoning.summary".equals(rejected))) {
             compatible.remove("reasoning");
-        } else if (!responses(settings) && body.containsKey("max_tokens") && "max_tokens".equals(rejected)) {
-            compatible.put("max_completion_tokens", compatible.remove("max_tokens"));
+        } else if (!responses(settings) && body.containsKey(MAX_TOKENS) && MAX_TOKENS.equals(rejected)) {
+            compatible.put("max_completion_tokens", compatible.remove(MAX_TOKENS));
         } else return response;
         // Negotiate only an explicit parameter rejection, before any response content is emitted.
         return http.send(request(settings, compatible), HttpResponse.BodyHandlers.ofInputStream());

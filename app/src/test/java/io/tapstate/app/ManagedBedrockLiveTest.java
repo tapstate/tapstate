@@ -39,7 +39,7 @@ class ManagedBedrockLiveTest {
             assertThat(proposal).containsEntry("destinationTable", "orders_archive_smoke")
                     .containsEntry("destinationSourceId", "dst").containsEntry("destinationWriteMode", "upsert");
             assertThat(proposal.get("root")).isInstanceOfSatisfying(Map.class,
-                    result -> assertThat(result.get("table")).isEqualTo("orders"));
+                    result -> assertThat(result).containsEntry("table", "orders"));
             var edited = new PipelineDraft("orders-smoke", 1, 1, PipelineDraft.Mode.WIZARD, "Orders", null, null,
                     new PipelineDraft.Wizard(new PipelineDraft.Root("root", "src", "orders", List.of("id"), List.of()),
                             List.of(), List.of(), new PipelineDraft.Output("atlas", Map.of(

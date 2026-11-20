@@ -13,6 +13,7 @@ import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.http.SdkHttpMethod;
 import software.amazon.awssdk.http.SdkHttpRequest;
+import software.amazon.awssdk.http.auth.aws.signer.AwsV4FamilyHttpSigner;
 import software.amazon.awssdk.http.auth.aws.signer.AwsV4HttpSigner;
 
 import java.io.ByteArrayInputStream;
@@ -48,7 +49,7 @@ class ManagedAiConfiguration {
                     .putHeader("content-type", "application/json").build();
             var signed = signer.sign(spec -> spec.identity(identity).request(unsigned)
                     .payload(() -> new ByteArrayInputStream(json))
-                    .putProperty(AwsV4HttpSigner.SERVICE_SIGNING_NAME, "bedrock")
+                    .putProperty(AwsV4FamilyHttpSigner.SERVICE_SIGNING_NAME, "bedrock")
                     .putProperty(AwsV4HttpSigner.REGION_NAME, region));
             signed.request().headers().forEach((name, values) -> {
                 if (!"host".equalsIgnoreCase(name) && !"content-type".equalsIgnoreCase(name)

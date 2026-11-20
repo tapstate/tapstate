@@ -7,6 +7,7 @@ import java.util.Optional;
 
 /** Settings use a trusted workspace scope supplied by the authenticated application boundary. */
 public final class AiProviderService {
+    private static final String AUDIT_TARGET = "ai-provider-settings";
     private final AiProviderSettingsStore store;
     private final AuditGate audit;
     public AiProviderService(AiProviderSettingsStore store, AuditGate audit) {
@@ -24,7 +25,7 @@ public final class AiProviderService {
     public Optional<AiProviderSettings> get(String caller) { return saved(caller).map(SavedProvider::settings); }
 
     public void select(String owner, String actor, boolean managed) {
-        audit.dispatch(ControlOperations.AI_PROVIDER_SELECT, new AuditContext(actor, "ai-provider-settings"), () -> {
+        audit.dispatch(ControlOperations.AI_PROVIDER_SELECT, new AuditContext(actor, AUDIT_TARGET), () -> {
             if (!store.selectManaged(owner, managed) && !managed) throw error(ControlError.AI_NOT_CONFIGURED);
             return null;
         });
@@ -51,11 +52,11 @@ public final class AiProviderService {
     }
     public void put(String caller, String actor, AiProviderSettings settings) {
         AiProviderSettings checked = resolve(caller, settings);
-        audit.dispatch(ControlOperations.AI_PROVIDER_REPLACE, new AuditContext(actor, "ai-provider-settings"),
+        audit.dispatch(ControlOperations.AI_PROVIDER_REPLACE, new AuditContext(actor, AUDIT_TARGET),
                 () -> { store.put(caller, new AiProviderSettingsStore.Settings(checked.providerId(), checked.baseUrl(), checked.model(), checked.apiKey())); return null; });
     }
     public void delete(String caller, String actor) {
-        audit.dispatch(ControlOperations.AI_PROVIDER_DELETE, new AuditContext(actor, "ai-provider-settings"),
+        audit.dispatch(ControlOperations.AI_PROVIDER_DELETE, new AuditContext(actor, AUDIT_TARGET),
                 () -> { store.delete(caller); return null; });
     }
     public static AiProviderSettings validated(AiProviderSettings settings) {

@@ -27,6 +27,8 @@ import java.util.concurrent.Semaphore;
 /** Builder credential setup; all reads expose metadata only. */
 @RestController
 class AiProviderController {
+    private static final String MANAGED_MODE = "managed";
+    private static final String BYOK_MODE = "byok";
     private static final Semaphore CHECK_CAPACITY = new Semaphore(2);
     private final ObjectProvider<AiProviderService> services;
     private final ObjectProvider<CloudAuthenticationService> cloud;
@@ -73,7 +75,8 @@ class AiProviderController {
         result.put("baseUrl", settings == null ? null : settings.baseUrl());
         result.put("model", settings == null ? null : settings.model());
         if (mode == AuthenticationMode.CLOUD && (managed != null || useManaged || !providerManagers.isEmpty())) {
-            result.put("mode", useManaged ? "managed" : settings != null ? "byok" : null);
+            String savedMode = settings == null ? null : BYOK_MODE;
+            result.put("mode", useManaged ? MANAGED_MODE : savedMode);
             result.put("byokConfigured", settings != null);
             result.put("managedAvailable", managed != null);
             result.put("managedModel", managed == null ? null : managed.settings().model());
@@ -103,11 +106,11 @@ class AiProviderController {
     ResponseEntity<Void> select(HttpServletRequest request, @RequestBody Selection selection) {
         var workspace = workspace(request);
         if (mode != AuthenticationMode.CLOUD || selection == null
-                || !("managed".equals(selection.mode()) || "byok".equals(selection.mode()))) {
+                || !(MANAGED_MODE.equals(selection.mode()) || BYOK_MODE.equals(selection.mode()))) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "invalid AI provider selection"), null);
         }
         requireManager("ai-provider.select");
-        boolean useManaged = "managed".equals(selection.mode());
+        boolean useManaged = MANAGED_MODE.equals(selection.mode());
         if (useManaged && managed == null) throw AiProviderService.error(ControlError.AI_NOT_CONFIGURED);
         service().select(workspace.owner(), AuthenticatedCaller.subject(), useManaged);
         workspace.requireActive().run();

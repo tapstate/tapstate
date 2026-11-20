@@ -14,7 +14,7 @@ public record ManagedAiProvider(AiProviderSettings settings, AiProviderClient cl
     }
 
     public static ManagedAiProvider bedrock(String region, String model, int requestsPerMinute, Signer signer) {
-        if (!region.matches("[a-z]{2}(?:-[a-z0-9]+)+-[0-9]") || model.isBlank() || model.length() > 200
+        if (!region.matches("[a-z]{2}-[a-z0-9-]{1,60}-\\d") || region.contains("--") || model.isBlank() || model.length() > 200
                 || requestsPerMinute < 1) throw new IllegalArgumentException("Invalid managed AI configuration");
         URI base = URI.create("https://bedrock-runtime." + region + ".amazonaws.com/openai/v1");
         return new ManagedAiProvider(new AiProviderSettings("bedrock-managed", base.toString(), model, null),

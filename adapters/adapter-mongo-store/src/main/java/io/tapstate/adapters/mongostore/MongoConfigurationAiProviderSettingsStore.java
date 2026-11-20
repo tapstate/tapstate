@@ -26,8 +26,9 @@ import java.util.function.Function;
 /** One current owner-bound provider setting over the original CONFIG client and persistent key. */
 final class MongoConfigurationAiProviderSettingsStore implements AiProviderSettingsStore {
     static final String MANAGED = "managedSelected";
+    private static final String FORMAT_VERSION = "formatVersion";
     private static final int MAX_BYTES = 256 * 1024;
-    private static final Set<String> FIELDS = Set.of("_id", "formatVersion", "owner", "providerId", "baseUrl", "model", "secret");
+    private static final Set<String> FIELDS = Set.of("_id", FORMAT_VERSION, "owner", "providerId", "baseUrl", "model", "secret");
     private static final TransactionOptions TX = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
@@ -56,7 +57,7 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         if (settings.apiKey() == null || settings.apiKey().isBlank() || settings.apiKey().length() > 8192
                 || settings.apiKey().chars().anyMatch(value -> value < 32 || value == 127)) throw invalid("apiKey");
         var cipher = keys.currentForWrite();
-        var captured = new Document("_id", MongoAiProviderSettingsStore.id(owner)).append("formatVersion", 1)
+        var captured = new Document("_id", MongoAiProviderSettingsStore.id(owner)).append(FORMAT_VERSION, 1)
                 .append("owner", owner).append("providerId", settings.providerId()).append("baseUrl", settings.baseUrl())
                 .append("model", settings.model()).append("secret", cipher.providerSecrets().encrypt(owner,
                         context(settings.providerId(), settings.baseUrl(), settings.model()), settings.apiKey()));
@@ -146,7 +147,7 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
             var required = new java.util.HashSet<>(row.keySet());
             required.remove(MANAGED);
             if (!required.equals(FIELDS) || row.containsKey(MANAGED) && !Boolean.TRUE.equals(row.get(MANAGED))
-                    || !Integer.valueOf(1).equals(row.get("formatVersion"))
+                    || !Integer.valueOf(1).equals(row.get(FORMAT_VERSION))
                     || !owner.equals(row.get("owner")) || !MongoAiProviderSettingsStore.id(owner).equals(row.get("_id"))) throw invalid("owner");
             size(row);
             String provider = row.getString("providerId"), endpoint = row.getString("baseUrl"), model = row.getString("model");
