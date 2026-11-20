@@ -6,6 +6,7 @@ import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.NestKeyAccess;
 import io.tapstate.core.lifecycle.StateCommitReading;
+import io.tapstate.core.lifecycle.StateWeightReading;
 import java.time.Instant;
 
 import java.util.*;
@@ -46,6 +47,8 @@ public final class NestStateSamples {
             Map<String, Source> commitSources = new HashMap<>();
             Map<String, Source> rootSources = new HashMap<>();
             Map<String, StateCommitReading> commits = new HashMap<>();
+            Map<String, Source> weightSources = new HashMap<>();
+            Map<String, StateWeightReading> weights = new HashMap<>();
             Map<String, Long> roots = new HashMap<>();
             sources.forEach((source, values) -> {
                 if (source.member() == null) return;
@@ -54,6 +57,12 @@ public final class NestStateSamples {
                         commits.containsKey(source.member()) ? commits.get(source.member()).groups() : 0L)) {
                     commitSources.put(source.member(), source);
                     commits.put(source.member(), commit);
+                }
+                var weight = NestStateMetricNames.weightFrom(values);
+                if (weight != null && newer(source, weightSources.get(source.member()), weight.commitBytes().count(),
+                        weights.containsKey(source.member()) ? weights.get(source.member()).commitBytes().count() : 0L)) {
+                    weightSources.put(source.member(), source);
+                    weights.put(source.member(), weight);
                 }
                 Long rendered = values.get(NestStateMetricNames.ROOTS_RENDERED);
                 if (rendered != null && values.containsKey(NestStateMetricNames.ROOTS_RENDERED_SINCE)
@@ -66,8 +75,10 @@ public final class NestStateSamples {
                     .map(values -> Instant.ofEpochMilli(values.get(NestStateMetricNames.ROOTS_RENDERED_SINCE)))
                     .max(Instant::compareTo).orElse(null);
             var commit = commits.values().stream().reduce(NestStateSamples::merge).orElse(null);
-            if (since != null || commit != null) {
-                result.put(namespace, new Diagnostics(roots.values().stream().mapToLong(Long::longValue).sum(), since, commit));
+            var weight = weights.values().stream().reduce(NestStateSamples::merge).orElse(null);
+            if (since != null || commit != null || weight != null) {
+                result.put(namespace, new Diagnostics(roots.values().stream().mapToLong(Long::longValue).sum(), since,
+                        commit, weight));
             }
         });
         return result;
@@ -92,7 +103,17 @@ public final class NestStateSamples {
         return new HistogramValue(a.count() + b.count(), a.sum() + b.sum(), a.bounds(), buckets);
     }
 
-    public record Diagnostics(long rootsRendered, Instant rootsSince, StateCommitReading commits) { }
+    public record Diagnostics(long rootsRendered, Instant rootsSince, StateCommitReading commits,
+            StateWeightReading weight) { }
+
+    /** Two members' weights as one: distributions add, the largest is the larger, folds where either folded. */
+    private static StateWeightReading merge(StateWeightReading a, StateWeightReading b) {
+        HistogramValue folds = a.foldDuration() == null ? b.foldDuration()
+                : b.foldDuration() == null ? a.foldDuration() : merge(a.foldDuration(), b.foldDuration());
+        return new StateWeightReading(merge(a.documentBytes(), b.documentBytes()),
+                Math.max(a.largestDocumentBytes(), b.largestDocumentBytes()), merge(a.commitBytes(), b.commitBytes()),
+                folds, a.countingSince().isAfter(b.countingSince()) ? a.countingSince() : b.countingSince());
+    }
 
     private static NestKeyAccess aggregate(Map<Source, Map<String, Long>> samples, Set<String> dataMembers) {
         Map<String, List<Source>> members = new TreeMap<>();

@@ -61,7 +61,9 @@ class WhichBucketsADurationFallsIntoTest {
         assertThat(Arrays.stream(HistogramBounds.values()).map(HistogramBounds::instrument))
                 .containsExactlyInAnyOrder("tapstate.pipeline.record.delivery.duration",
                         "tapstate.pipeline.process.duration", "tapstate.pipeline.state.commit.duration",
-                        "tapstate.pipeline.state.commit.keys", "tapstate.pipeline.state.commit.round_trips");
+                        "tapstate.pipeline.state.commit.keys", "tapstate.pipeline.state.commit.round_trips",
+                        "tapstate.pipeline.state.document.bytes", "tapstate.pipeline.state.commit.bytes",
+                        "tapstate.pipeline.nest.rollup.fold.duration");
         assertThat(HistogramBounds.STATE_COMMIT_DURATION.unit()).isEqualTo("s");
         assertThat(HistogramBounds.STATE_COMMIT_KEYS.unit()).isEqualTo("{key}");
         assertThat(HistogramBounds.STATE_COMMIT_ROUND_TRIPS.unit()).isEqualTo("{round_trip}");

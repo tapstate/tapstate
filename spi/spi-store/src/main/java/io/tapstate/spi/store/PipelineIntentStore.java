@@ -21,6 +21,13 @@ public interface PipelineIntentStore {
     }
 
 
+    /** The configuration revision belongs to the same snapshot as this runtime intent, when supported. */
+    record ActuationReading(PipelineIntentSnapshot intent, java.util.OptionalLong configurationRevision) {}
+
+    default Optional<ActuationReading> readForActuation(String pipelineId) {
+        return loadForActuation(pipelineId).map(intent -> new ActuationReading(intent, java.util.OptionalLong.empty()));
+    }
+
     /** Expected zero means never written; a refusal leaves the latest value and all versions unchanged. */
     boolean compareAndSet(PipelineIntentScope scope, long expectedIntentRevision, DesiredState desired);
 

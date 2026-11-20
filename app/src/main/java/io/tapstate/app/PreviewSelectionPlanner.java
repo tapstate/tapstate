@@ -106,7 +106,7 @@ final class PreviewSelectionPlanner {
             String factAlias = entry.getValue().plan().factSource().name();
             roots.add(context.lineage(aliases.aliases().get(factAlias)).sourceKey());
             for (String alias : entry.getValue().plan().from().sources().stream()
-                    .map(JoinTree.Source::name).toList()) {
+                    .map(JoinTree.Source::declared).toList()) {
                 if (!alias.equals(factAlias)) {
                     dimensions.add(context.lineage(aliases.aliases().get(alias)).sourceKey());
                 }
@@ -287,7 +287,7 @@ final class PreviewSelectionPlanner {
         private Lineage mapLineage(Lineage upstream, TransformBody.MapProjection projection) {
             Map<String, String> fields = new LinkedHashMap<>(upstream.physicalByLogical());
             Set<String> consumed = new HashSet<>();
-            projection.fields().forEach((output, rule) -> {
+            projection.outputFields().forEach((output, rule) -> {
                 switch (rule) {
                     case FieldRule.Rename rename -> {
                         String physical = upstream.physicalByLogical().get(rename.sourceField());
@@ -321,29 +321,34 @@ final class PreviewSelectionPlanner {
             if (embed.on().isEmpty()) {
                 refuse("Nest relation '" + embed.from() + "' has no exact join keys");
             }
-            TupleSet tuples = new TupleSet();
-            for (Map<String, Object> row : parentRows) {
-                Map<String, Object> tuple = new LinkedHashMap<>();
-                boolean usable = true;
-                for (Map.Entry<String, String> pair : embed.on().entrySet()) {
-                    String physicalChild = child.physicalByLogical().get(pair.getKey());
-                    if (parent.physicalByLogical().get(pair.getValue()) == null || physicalChild == null) {
-                        refuse("Nest relation keys must resolve through source fields and direct Map renames");
+            // One read per way of matching the child: each alternative names different child columns, so
+            // their tuples cannot share one exact-tuple request. The preview renders from what all of them read.
+            List<Envelope> childRows = new ArrayList<>();
+            for (Map<String, String> alternative : embed.alternatives()) {
+                TupleSet tuples = new TupleSet();
+                for (Map<String, Object> row : parentRows) {
+                    Map<String, Object> tuple = new LinkedHashMap<>();
+                    boolean usable = true;
+                    for (Map.Entry<String, String> pair : alternative.entrySet()) {
+                        String physicalChild = child.physicalByLogical().get(pair.getKey());
+                        if (parent.physicalByLogical().get(pair.getValue()) == null || physicalChild == null) {
+                            refuse("Nest relation keys must resolve through source fields and direct Map renames");
+                        }
+                        Object value = row.get(pair.getValue());
+                        if (value == null) {
+                            usable = false;
+                            break;
+                        }
+                        tuple.put(physicalChild, value);
                     }
-                    Object value = row.get(pair.getValue());
-                    if (value == null) {
-                        usable = false;
-                        break;
+                    if (usable) {
+                        tuples.add(tuple);
                     }
-                    tuple.put(physicalChild, value);
                 }
-                if (usable) {
-                    tuples.add(tuple);
-                }
+                childRows.addAll(read(child.sourceKey(),
+                        new BoundedSnapshotQueryRequest.ExactTuples(tuples.values()),
+                        Math.max(1, MAX_INPUT_ROWS - rowsRead), false));
             }
-            List<Envelope> childRows = read(child.sourceKey(),
-                    new BoundedSnapshotQueryRequest.ExactTuples(tuples.values()),
-                    Math.max(1, MAX_INPUT_ROWS - rowsRead), false);
             List<Map<String, Object>> logicalChildren = logicalRows(child, childRows);
             for (Embed nested : embed.embed() == null ? List.<Embed>of() : embed.embed()) {
                 loadEmbed(aliases, nested, child, logicalChildren);
@@ -375,6 +380,12 @@ final class PreviewSelectionPlanner {
             FromClause.Aliases aliases = (FromClause.Aliases) step.from();
             Map<String, Lineage> lineages = new LinkedHashMap<>();
             aliases.aliases().forEach((name, ref) -> lineages.put(name, lineage(ref)));
+            // an OR alternative the front end added samples the rows of the alias it stands in for
+            compiled.plan().from().sources().forEach(source -> {
+                if (!source.declared().equals(source.name()) && lineages.containsKey(source.declared())) {
+                    lineages.put(source.name(), lineages.get(source.declared()));
+                }
+            });
             Map<String, List<Map<String, Object>>> available = new LinkedHashMap<>();
             String fact = compiled.plan().factSource().name();
             available.put(fact, logicalRows(lineages.get(fact)));

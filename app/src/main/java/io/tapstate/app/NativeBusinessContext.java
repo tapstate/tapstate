@@ -520,7 +520,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean NativePipelineRecovery nativePipelineRecovery(NativeBusinessContext owner,PipelineFirstStatePreparer preparer,
                 ConnectorProvisioner connectors,Engine engine,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization) {
-            return new NativePipelineRecovery(owner.configuration,owner.original.preparation().authScope(),owner.port,preparer,
+            return new NativePipelineRecovery(owner.configuration,owner.original.preparation(),owner.port,preparer,
                     connectors,engine,captures,authorization,owner.original::requireActive,owner::available,owner.original.cache());
         }
         @Bean io.tapstate.core.lifecycle.ParallelismBudget parallelismBudget(org.springframework.core.env.Environment environment) {
@@ -653,6 +653,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 active.run();
                 var setup = owner.original.binding().setup();
                 var scope=alertScope(owner,cloud);
+                // An already bound Cloud cluster can retry preparation with the alert worker.
+                CloudConfigurationInitialization.resumeAlertStorage(owner.configuration, setup, cloud);
                 var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
                         : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
                 var catalog=types.catalog();var retention=retentions.resolve(deployment);
@@ -720,6 +722,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     rebuilds::rebuild, (original, command) -> plans.forRun(original, () -> {
                         owner.memberStorage.requireNode(); if (!ownership.proveClaim(original.scope(), command)) throw ThreeLayerStorePort.refused();
                     }));
+            var observationSampling = new NativeObservationSampling(owner.configuration, owner.original.cache(), scopedCaptures,
+                    pipeline -> engine.captureRun(pipeline).map(run -> {
+                        if (!(run.operatorManifest().executionIdentity() instanceof ExecutionFence original)) throw ThreeLayerStorePort.refused();
+                        return original;
+                    }), pipeline -> plans.current(List.of(pipeline)).get(pipeline), owner.original.binding().defaultSourceId(), clock);
             return ConvergenceDriver.scoped(converger, observations, samples, export,
                     () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
@@ -733,7 +740,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                         try (var ignored = ownership.enterPass(intent.scope())) {
                                             rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
                                         }
-                                    })));
+                                    }), observationSampling));
         }
         @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {

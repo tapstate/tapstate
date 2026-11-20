@@ -37,7 +37,18 @@ public enum NestSizingError implements TapstateErrorCode {
      */
     CAPACITY_ESTIMATE_INCOMPLETE(
             "nest.capacity-estimate-incomplete",
-            Set.of("pipeline", "embedPath", "counted", "total"));
+            Set.of("pipeline", "embedPath", "counted", "total")),
+
+    /**
+     * A level carrying rollup fields is estimated to make its documents heavier than a rollup keeps up with:
+     * each change rewrites the document's state and refolds the level, so its cost grows with the level's
+     * elements times their width. {@code estimatedElements} is the level's rows over its parent's, an average a
+     * skewed level exceeds for some documents; {@code estimatedBytes} the state those elements take; {@code
+     * boundary} how many elements of this width a document should hold.
+     */
+    ROLLUP_LEVEL_WIDE(
+            "nest.rollup-level-wide",
+            Set.of("pipeline", "embedPath", "estimatedElements", "estimatedBytes", "boundary"));
 
     private final String code;
     private final Set<String> placeholders;
