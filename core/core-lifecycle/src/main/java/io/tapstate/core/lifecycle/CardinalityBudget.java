@@ -109,9 +109,43 @@ public enum CardinalityBudget {
     STATE_COMMIT_DURATION("tapstate.pipeline.state.commit.duration", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
     STATE_EVICTIONS("tapstate.pipeline.state.evictions", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    /**
+     * How heavy state is to keep, per namespace: bytes per written key and per commit group add when folded;
+     * the largest key is a reading of its own namespace, so a fold keeps the heaviest rather than a sum no
+     * document weighs.
+     */
+    STATE_DOCUMENT_BYTES("tapstate.pipeline.state.document.bytes", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    STATE_DOCUMENT_BYTES_MAX("tapstate.pipeline.state.document.bytes.max", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.HIGHEST),
+    STATE_COMMIT_BYTES("tapstate.pipeline.state.commit.bytes", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    /** How long folding rollup fields took, per nest namespace that renders any. */
+    ROLLUP_FOLD_DURATION("tapstate.pipeline.nest.rollup.fold.duration", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
     JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000,
             Fold.ADDED),
     JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE,
+            1_000, Fold.ADDED),
+    /**
+     * What an aggregate step reports about itself, one series per step. Nothing here is per group: the
+     * number of groups is decided by the data, and a group's own numbers are the answer of a check.
+     */
+    AGGREGATE_ROWS("tapstate.pipeline.aggregate.rows", MetricAttributes.AGGREGATE_STEP, 1_000, Fold.ADDED),
+    AGGREGATE_GROUPS("tapstate.pipeline.aggregate.groups", MetricAttributes.AGGREGATE_STEP, 1_000, Fold.ADDED),
+    AGGREGATE_STATE_ENTRIES("tapstate.pipeline.aggregate.state.entries", MetricAttributes.AGGREGATE_STEP, 1_000,
+            Fold.ADDED),
+    AGGREGATE_TOMBSTONES("tapstate.pipeline.aggregate.tombstones", MetricAttributes.AGGREGATE_STEP, 1_000,
+            Fold.ADDED),
+    /** The largest group of each step: two steps' largest groups are not one group of their sum. */
+    AGGREGATE_LARGEST_GROUP("tapstate.pipeline.aggregate.group.rows.largest", MetricAttributes.AGGREGATE_STEP,
+            1_000, Fold.HIGHEST),
+    AGGREGATE_FAILED_GROUPS("tapstate.pipeline.aggregate.groups.failed", MetricAttributes.AGGREGATE_STEP, 1_000,
+            Fold.ADDED),
+    AGGREGATE_INPUTS("tapstate.pipeline.aggregate.inputs", MetricAttributes.AGGREGATE_STEP, 1_000, Fold.ADDED),
+    AGGREGATE_STATE_WRITES("tapstate.pipeline.aggregate.state.writes", MetricAttributes.AGGREGATE_STEP, 1_000,
+            Fold.ADDED),
+    AGGREGATE_ORDER_CONFLICTS("tapstate.pipeline.aggregate.order_conflicts", MetricAttributes.AGGREGATE_STEP,
             1_000, Fold.ADDED),
     /** Two readings about the pipeline as a whole: the pipeline is their only attribute, so nothing grows and nothing folds. */
     RECORDS_DRIVEN("tapstate.pipeline.records.driven", null, 1, Fold.ADDED),

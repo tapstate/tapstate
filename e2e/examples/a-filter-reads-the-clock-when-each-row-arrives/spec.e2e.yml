@@ -1,0 +1,25 @@
+# A filter that reads the clock runs in the shipped product: now(), today(zone) and the calendar
+# arithmetic are bound where rows are evaluated, not only declared where pipelines are checked.
+#
+# The predicate is true for every row at any moment after 2020, so the counts say whether the clock
+# functions evaluated at all: the two seeded rows arrive through the snapshot, the three inserted ones
+# through the change stream, and the target rests at five. A product that declares a clock function
+# without binding it fails each row's evaluation and the target stays empty; one that does not declare
+# today() refuses the pipeline at apply.
+#
+# The state is asserted after the counts, because a filter whose evaluation fails drives the pipeline to
+# FAILED: a run that delivers and then dies would pass the counts and fail here.
+name: a-filter-reads-the-clock-when-each-row-arrives
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  discover: [src_file]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 2 }
+steps:
+  - start
+  - await: { count: { tgt_file.orders: 2 } }
+  - cdc: { src_file.orders: insert 3 }
+  - await: { count: { tgt_file.orders: 5 } }
+  - assert: { state: RUNNING }
