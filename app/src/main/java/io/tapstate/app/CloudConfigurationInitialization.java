@@ -5,6 +5,7 @@ import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.StorageSetupScope;
 import io.tapstate.spi.store.StorageSetupStateStore;
 import io.tapstate.spi.store.IoError;
 import java.util.Objects;
@@ -35,7 +36,10 @@ final class CloudConfigurationInitialization implements AutoCloseable {
             MongoConfigurationDomain retained;
             try { retained = MongoConfigurationDomain.open(connection, cloud.clusterId()); }
             catch (TapstateException unavailable) { retained = null; }
-            if (retained != null) { stage = "confirm"; return confirm(retained); }
+            if (retained != null) {
+                stage = "resume-retained";
+                return confirm(retained, true);
+            }
             if (authorization == null) { stage = "claim"; authorization = bridge.claimConfiguration(bootId, hash); }
             active();
             MongoConfigurationDomain created;
@@ -44,14 +48,14 @@ final class CloudConfigurationInitialization implements AutoCloseable {
                 var alertScope = bridge.alertScope().orElseThrow(StorageRuntime::unavailable);
                 stage = "prepare";
                 creationInvoked = true;
-                created = MongoConfigurationBootstrap.prepareWithAlerts(connection, cloud.clusterId(), installationId(), authorization.operationId(), 1,
+                created = MongoConfigurationBootstrap.prepareWithAlerts(connection, cloud.clusterId(), installationId(cloud), authorization.operationId(), 1,
                         alertScope, io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED);
             } else {
                 stage = "resume";
-                created = MongoConfigurationBootstrap.resume(connection, cloud.clusterId(), installationId(), authorization.operationId(), 1);
+                created = MongoConfigurationBootstrap.resume(connection, cloud.clusterId(), installationId(cloud), authorization.operationId(), 1);
             }
             stage = "confirm";
-            return confirm(created);
+            return confirm(created, false);
         } catch (TapstateException failure) {
             LOG.warn("Cloud configuration initialization failed [stage={}, code={}, detail={}, creationGranted={}, creationInvoked={}]",
                     stage, failure.code().code(), driverDetail(failure),
@@ -66,11 +70,15 @@ final class CloudConfigurationInitialization implements AutoCloseable {
         return "none";
     }
 
-    private MongoConfigurationDomain confirm(MongoConfigurationDomain original) {
+    private MongoConfigurationDomain confirm(MongoConfigurationDomain original, boolean retained) {
         try {
             active(); var state = original.setupStates().load();
-            if (state.scope().installationId().equals(installationId()) && state.phase() == StorageSetupStateStore.Phase.CONFIG_PREPARED) {
-                bridge.completeConfiguration(state.scope().operationId(), hash);
+            if (state.scope().installationId().equals(installationId(cloud))) {
+                String operationId = state.scope().operationId();
+                if (retained && state.bindingVersion() == 0) resumeAlertStorage(original, state.scope(), cloud);
+                if (state.phase() == StorageSetupStateStore.Phase.CONFIG_PREPARED) {
+                    bridge.completeConfiguration(operationId, hash);
+                }
             }
             active(); return original;
         } catch (RuntimeException | Error failed) {
@@ -78,7 +86,14 @@ final class CloudConfigurationInitialization implements AutoCloseable {
             throw failed;
         }
     }
-    private String installationId() { return "cloud-" + cloud.clusterId(); }
+
+    static void resumeAlertStorage(MongoConfigurationDomain configuration, StorageSetupScope setup, CloudRuntimeSettings cloud) {
+        if (cloud.cloud() && setup.installationId().equals(installationId(cloud))) {
+            configuration.resumeInitialAlertStorage(setup.operationId());
+        }
+    }
+
+    private static String installationId(CloudRuntimeSettings cloud) { return "cloud-" + cloud.clusterId(); }
     private void active() { if (closed) throw StorageRuntime.unavailable(); }
     @Override public synchronized void close() { closed = true; }
 }
