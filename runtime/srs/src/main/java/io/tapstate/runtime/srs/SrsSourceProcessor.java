@@ -160,12 +160,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     @Override
     protected void init(Context context) {
-        Object recorder = context.hazelcastInstance().getUserContext()
-                .get(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY);
-        failures = recorder instanceof io.tapstate.core.lifecycle.ExecutionFailureRecorder bound
-                ? bound.forExecution(context.jobConfig().getName(), context.jobId(), context.jobConfig()
-                        .getArgument(io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT))
-                : null;
+        var recorder = io.tapstate.runtime.engine.JobFailureRegistry.forProcessor(context.hazelcastInstance(), context);
+        failures = recorder == null ? null : recorder::record;
         try {
             initialize(context);
         } catch (RuntimeException | Error failure) {

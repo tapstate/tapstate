@@ -6,7 +6,6 @@ import org.junit.jupiter.api.Test;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -24,6 +23,22 @@ class ScopedJobFailureRegistryTest {
         current.status.set(JobStatus.FAILED);
         assertThat(f.engine.failureFactOf("p")).containsSame(fact);
         assertThat(f.engine.failureOf("p")).containsSame(cause);
+    }
+
+    @Test void aMissingMemberNeedsNoProcessorContextAndTheLegacyBridgeStillRecords() {
+        assertThat(JobFailureRegistry.forProcessor(null, null)).isNull();
+        var fixture = new EngineRunHandleTest.Fixture(job(1, "run-a"));
+        var registry = JobFailureRegistry.of(fixture.member);
+        var bridge = (io.tapstate.core.lifecycle.ExecutionFailureRecorder) fixture.member.getUserContext()
+            .get(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY);
+        var cause = new IllegalStateException("legacy bridge failure");
+        bridge.forExecution("legacy", 1, null).accept(cause);
+        assertThat(registry.fact("legacy")).hasValueSatisfying(fact -> assertThat(fact.cause()).isSameAs(cause));
+        bridge.forExecution(null, 1, null).accept(new IllegalStateException("unnamed"));
+        assertThat(registry.get("legacy")).containsSame(cause);
+        var scoped = new IllegalStateException("scoped bridge failure");
+        bridge.forExecution("p", 1, "run-a").accept(scoped);
+        assertThat(registry.existing("p", 1, "run-a").get()).containsSame(scoped);
     }
 
     @Test void anOldRecorderAndClearCannotOverwriteOrRemoveTheNewRunFailure() {
@@ -86,9 +101,14 @@ class ScopedJobFailureRegistryTest {
             f.named.set(job(2, "run-b")); var nextStarted = new CountDownLatch(1);
             var b = executor.submit(() -> { nextStarted.countDown(); return registry.attach("p", 2, "run-b"); });
             assertThat(nextStarted.await(10, TimeUnit.SECONDS)).isTrue();
-            try { b.get(1, TimeUnit.SECONDS); } catch (TimeoutException serialized) { /* The slow update may still own the original PID slot. */ }
-            finally { resume.countDown(); }
-            var old = a.get(10, TimeUnit.SECONDS); var current = b.get(10, TimeUnit.SECONDS);
+            // The later proof must be able to publish while the old name lookup is still blocked.
+            JobFailureRegistry.Recorder current;
+            try {
+                current = b.get(5, TimeUnit.SECONDS);
+            } finally {
+                resume.countDown();
+            }
+            var old = a.get(10, TimeUnit.SECONDS);
             var expected = new IllegalStateException("current"); current.record(expected); old.record(new IllegalStateException("late")); old.clear();
             assertThat(registry.existing("p", 2, "run-b").get()).containsSame(expected);
             assertThat(registry.existing("p", 1, "run-a").get()).isEmpty();

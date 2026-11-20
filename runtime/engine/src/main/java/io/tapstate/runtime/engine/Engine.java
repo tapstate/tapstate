@@ -174,14 +174,15 @@ public final class Engine {
         }
         configureNestState(stateDatabases, settings);
         Job submitted = submitJob(pipelineId, dag, originalIdentity, manifest);
+        JobConfig config;
         try {
-            JobConfig config = submitted.getConfig();
+            config = submitted.getConfig();
             if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))
                     || !Objects.equals(manifest, config.getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
         } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
             throw runRefused(pipelineId);
         }
-        JobFailureRegistry.of(member).attach(pipelineId, submitted.getId(), originalIdentity);
+        JobFailureRegistry.of(member).forJob(submitted.getId(), config);
         return new Run(pipelineId, originalIdentity, submitted, manifest);
     }
 
