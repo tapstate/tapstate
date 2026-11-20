@@ -120,7 +120,7 @@ class StorageHttpAuthenticationTest {
                 .POST(HttpRequest.BodyPublishers.ofString(body)).build(), HttpResponse.BodyHandlers.ofString());
     }
     private static Map<String,Object> connection(String database) {
-        return Map.of("kind", "ATLAS", "uri", "mongodb://fixture.invalid/" + database, "database", database);
+        return Map.of("kind", "ATLAS", "uri", "mongodb+srv://fixture.invalid/" + database, "database", database);
     }
     private static StorageSetupScope currentScope() {
         return new StorageSetupScope(SETUP.clusterId(), SETUP.installationId(), SETUP.operationId(), GENERATION.get());

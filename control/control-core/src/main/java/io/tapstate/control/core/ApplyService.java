@@ -322,10 +322,10 @@ public final class ApplyService {
                         && "true".equals(source.metadata().labels().get("store"))).toList();
         if (markedStores.size() > 1 || markedStores.stream().anyMatch(source ->
                 deploymentProfile != DeploymentProfile.CLOUD
-                        || !"mongodb-atlas".equals(source.connector())
+                        || !Set.of("mongodb", "mongodb-atlas").contains(source.connector())
                         || source.mode() != null || source.tables() != null)) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                    Map.of("reason", "Cloud allows exactly one MongoDB Atlas state store without capture settings"),
+                    Map.of("reason", "Cloud allows exactly one MongoDB state store without capture settings"),
                     null);
         }
         TapstateCatalog liveCatalog = publication == null ? catalog.get()

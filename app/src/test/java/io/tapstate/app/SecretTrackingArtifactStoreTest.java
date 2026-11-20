@@ -75,6 +75,13 @@ class SecretTrackingArtifactStoreTest {
         assertThat(redactor.redact(io.tapstate.core.common.JsonWriter.write(Map.of("tlsCaPem", ca)))).doesNotContain("sentinel-certificate-body");
     }
 
+    @Test void aCloudDefaultSourceTracksItsUriCredentials() {
+        var redactor = new SecretRedactor(); var store = tracking(new RecordingStore(), redactor);
+        store.save(new SourceResource("atlas-store", null, "mongodb",
+                Map.of("uri", "mongodb://cloud-user:cloud-password@host/views"), null, null, null, null));
+        assertThat(redactor.redact("mongodb://cloud-user:cloud-password@host/views")).doesNotContain("cloud-password");
+    }
+
     @Test
     void registersExistingAndSuccessfullyWrittenSourceSecrets() {
         RecordingStore delegate = new RecordingStore();

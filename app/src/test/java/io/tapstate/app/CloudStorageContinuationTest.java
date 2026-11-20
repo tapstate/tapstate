@@ -27,6 +27,10 @@ class CloudStorageContinuationTest {
             StorageBinding.Mode.CLOUD, "original-cache", 1));
     private static final SourceResource SOURCE = new SourceResource("atlas-store", null, "mongodb-atlas",
             Map.of("uri", "mongodb://target/master?tls=true", "tlsCaPem", "saved-master-ca"), null, null, null, null);
+    private static final StorageBinding HOSTED_CONNECTION = new StorageBinding(SETUP, StorageBinding.Mode.CLOUD, 1, "atlas-store",
+            new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, "mongodb://cache/cache", "cache", null));
+    private static final SourceResource HOSTED_SOURCE = new SourceResource("atlas-store", null, "mongodb",
+            Map.of("uri", "mongodb://target/master"), null, null, null, null);
 
     private static final class Fixture implements AutoCloseable {
         final MongoConfigurationDomain configuration = mock(MongoConfigurationDomain.class);
@@ -36,13 +40,19 @@ class CloudStorageContinuationTest {
         final StorageSetupService.DefaultTarget target = mock(StorageSetupService.DefaultTarget.class);
         final FirstCacheCreation grant = mock(FirstCacheCreation.class);
         final CloudSdkBridge bridge = mock(CloudSdkBridge.class);
-        final StorageBindingCommit committed = new StorageBindingCommit(CONNECTION, PREPARATION, Optional.of(grant));
+        final StorageBinding binding;
+        final SourceResource source;
+        final StorageBindingCommit committed;
         final AtomicReference<StorageSetupStateStore.Phase> phase = new AtomicReference<>(StorageSetupStateStore.Phase.STORAGE_BOUND);
         final MockedStatic<MongoConfigurationDomain> configurations = mockStatic(MongoConfigurationDomain.class);
         final MockedStatic<MongoCacheDomain> caches = mockStatic(MongoCacheDomain.class);
         final StorageRoot root;
-        Fixture() { this(false); }
-        Fixture(boolean configurationUnavailable) {
+        Fixture() { this(false, false); }
+        Fixture(boolean configurationUnavailable) { this(configurationUnavailable, false); }
+        Fixture(boolean configurationUnavailable, boolean hostedMongo) {
+            binding = hostedMongo ? HOSTED_CONNECTION : CONNECTION;
+            source = hostedMongo ? HOSTED_SOURCE : SOURCE;
+            committed = new StorageBindingCommit(binding, PREPARATION, Optional.of(grant));
             when(configuration.bindings()).thenReturn(bindings); when(configuration.setupStates()).thenReturn(states);
             when(configuration.recoveryCommands()).thenReturn(mock(StorageRecoveryCommands.class));
             when(configuration.databaseName()).thenReturn("config");
@@ -51,14 +61,14 @@ class CloudStorageContinuationTest {
                         invocation.<Runnable>getArgument(2).run();
                         return new MongoConfigurationDomain.ValidationSchemaStatus("original-validation", true, 0);
                     });
-            when(bindings.load()).thenReturn(Optional.of(CONNECTION)); when(bindings.cachePreparation()).thenReturn(Optional.of(PREPARATION));
+            when(bindings.load()).thenReturn(Optional.of(binding)); when(bindings.cachePreparation()).thenReturn(Optional.of(PREPARATION));
             when(bindings.guardedBy(any())).thenReturn(bindings);
             when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(SETUP, phase.get(), 1));
             when(states.loadView()).thenAnswer(ignored -> new StorageSetupStateStore.View(
                     states.load(), bindings.load(), bindings.cachePreparation()));
-            when(bindings.complete(SETUP)).thenAnswer(ignored -> { phase.set(StorageSetupStateStore.Phase.COMPLETE); return CONNECTION; });
+            when(bindings.complete(SETUP)).thenAnswer(ignored -> { phase.set(StorageSetupStateStore.Phase.COMPLETE); return binding; });
             var artifacts = mock(ArtifactStore.class); when(configuration.artifacts()).thenReturn(artifacts);
-            when(artifacts.get("atlas-store")).thenReturn(Optional.of(SOURCE));
+            when(artifacts.get("atlas-store")).thenReturn(Optional.of(source));
             when(cache.cloudSessions(PREPARATION.authScope())).thenReturn(mock(CloudSessionStore.class));
             when(target.identity(any())).thenReturn(new StorageSetupService.ConnectorIdentity("a".repeat(64), "b".repeat(64)));
             var open = configurations.when(() -> MongoConfigurationDomain.open(any(MongoConnectionSettings.class), eq("cluster")));
@@ -109,6 +119,16 @@ class CloudStorageContinuationTest {
             assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
             verify(f.target, never()).test(any(), any(), any());
             verify(business).start();
+        }
+    }
+
+    @Test void aPlainMongodbDefaultSourceContinuesCloudSetup() {
+        try (var f = new Fixture(false, true)) {
+            var business = f.business();
+            f.continueWith(business);
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+            verify(business).start();
+            verify(f.cache).prepareFirstAuth(f.grant);
         }
     }
 

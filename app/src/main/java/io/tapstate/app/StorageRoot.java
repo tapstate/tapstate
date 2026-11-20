@@ -490,8 +490,7 @@ final class StorageRoot implements AutoCloseable {
             var source = configuration.artifacts().get(committed.binding().defaultSourceId())
                     .filter(SourceResource.class::isInstance).map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
             if (!(source.config().get("uri") instanceof String uri)
-                    || !Set.of("mongodb", "mongodb-atlas").contains(source.connector())
-                    || cloud.cloud() && !source.connector().equals("mongodb-atlas"))
+                    || !Set.of("mongodb", "mongodb-atlas").contains(source.connector()))
                 throw StorageRuntime.unavailable();
             var master = new StorageBinding.Connection(source.connector().equals("mongodb-atlas")
                     ? StorageBinding.Connection.Kind.ATLAS : StorageBinding.Connection.Kind.MONGODB, uri, MongoDatabaseNames.fromUri(uri),

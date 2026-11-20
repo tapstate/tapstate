@@ -62,8 +62,8 @@ final class MongoInitialCloudRecovery {
         if (scopes.size() != 1 || !scopes.getFirst().equals(pristine)) throw MongoCachePipelineAccess.fenced();
         if (SystemCollections.SOURCES.on(database).countDocuments(session) != 1) throw MongoCachePipelineAccess.fenced();
         var resource = artifacts.getInTransaction(session, binding.defaultSourceId()).orElseThrow(MongoCachePipelineAccess::fenced);
-        if (!(resource instanceof SourceResource source) || (scope.mode() == StorageBinding.Mode.CLOUD
-                ? !"mongodb-atlas".equals(source.connector()) : !Set.of("mongodb", "mongodb-atlas").contains(source.connector()))) throw MongoCachePipelineAccess.fenced();
+        if (!(resource instanceof SourceResource source)
+                || !Set.of("mongodb", "mongodb-atlas").contains(source.connector())) throw MongoCachePipelineAccess.fenced();
         return source;
     }
 
