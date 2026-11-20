@@ -469,18 +469,44 @@ class NativeValidationOwnerReservationsIT {
                     () -> localGuard.run(), ownerTtl,ownerTtl.compareTo(Duration.ofSeconds(15))>=0?Duration.ofSeconds(5):ownerTtl.dividedBy(3), maxPipelines, maxOperations, handoffClock,(saved,spec)->startup.inspect(saved,spec));
         }
         @Override public void close() {
-            owners.close(); resources.close(); nodeLease.stopAndClose(member::shutdown); timers.close();
+            Throwable failure = runCleanup(null, owners::close, resources::close,
+                    () -> nodeLease.stopAndClose(member::shutdown), timers::close);
             // Let transaction callbacks finish on their original clients before dropping the databases.
             long deadline = ShutdownAwait.deadline();
-            ShutdownAwait.executor(timers.renewals, deadline);
-            ShutdownAwait.executor(timers.deadlines, deadline);
-            process.close(); process.awaitStopped(deadline);
-            configuration.close(); cache.close();
+            failure = runCleanup(failure,
+                    () -> ShutdownAwait.executor(timers.renewals, deadline),
+                    () -> ShutdownAwait.executor(timers.deadlines, deadline),
+                    process::close, () -> process.awaitStopped(deadline),
+                    configuration::close, cache::close, this::endOpenTransactions,
+                    () -> raw.getDatabase(configName).drop(), () -> raw.getDatabase(cacheName).drop(), raw::close);
+            if (failure instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (failure instanceof Error error) {
+                throw error;
+            }
+        }
+
+        private void endOpenTransactions() {
             try (var maintenance = new MongoConnection(new MongoConnectionSettings(settings.uri(), null, Duration.ofSeconds(5)))) {
                 maintenance.verifyConnectivity();
                 maintenance.endTransactionsLeftOpenBy(processId, Duration.ofSeconds(5));
             }
-            raw.getDatabase(configName).drop(); raw.getDatabase(cacheName).drop(); raw.close();
+        }
+
+        private static Throwable runCleanup(Throwable first, Runnable... actions) {
+            for (var action : actions) {
+                try {
+                    action.run();
+                } catch (RuntimeException | Error failure) {
+                    if (first == null) {
+                        first = failure;
+                    } else if (first != failure) {
+                        first.addSuppressed(failure);
+                    }
+                }
+            }
+            return first;
         }
     }
 }

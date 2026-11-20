@@ -34,7 +34,8 @@ class CliOfflineHelpIT {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"status", "status -- --help", "position pipeline -f --help"})
+    @ValueSource(strings = {"status", "status -- --help", "position pipeline -f --help",
+            "aggregate pipeline step --group --help"})
     void nonHelpArgumentsStillResolveTheServer(String command, @TempDir Path home) {
         CliOnce.Run run = CliOnce.runWithPassword(null, List.of("-Duser.home=" + home),
                 ("--context missing " + command).split(" "));

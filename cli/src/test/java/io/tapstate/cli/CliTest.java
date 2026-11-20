@@ -82,7 +82,7 @@ class CliTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"apply -h", "status --help", "up --help"})
+    @ValueSource(strings = {"apply -h", "status --help", "up --help", "aggregate --help"})
     void usageHelpRunsBeforeOpeningTheSession(String command) {
         LaunchOptions launch = LaunchOptions.parse(("-c http://127.0.0.1:1 -u admin " + command).split(" "));
 

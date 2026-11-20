@@ -26,7 +26,7 @@ final class ConnectedVerb implements Callable<Integer> {
         // to know where they go, including paths like "--help". The regular command table stays intact.
         verb.getCommandSpec().addOption(OptionSpec.builder(
                         "-f", "--file", "-w", "--workdir", "-o", "--output", "--if-match", "--scope",
-                        "--decide", "--from", "--to", "--resolution", "--limit", "--cursor", "--table")
+                        "--decide", "--from", "--to", "--resolution", "--limit", "--cursor", "--table", "--group")
                 .arity("1").type(String[].class).hidden(true).build());
         verb.setAllowOptionsAsOptionParameters(true);
     }

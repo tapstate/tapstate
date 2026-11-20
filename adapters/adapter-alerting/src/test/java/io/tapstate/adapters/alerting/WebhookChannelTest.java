@@ -63,10 +63,18 @@ class WebhookChannelTest {
             assertThat(channel.activeAttempts()).isZero();
             // A cancelled periodic task can briefly reenter the executor queue.
             long cleanupDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-            while (channel.queuedClientTasks() != 0 && System.nanoTime() - cleanupDeadline < 0) {
+            int emptyReads = 0;
+            int queuedTasks;
+            do {
+                queuedTasks = channel.queuedClientTasks();
+                emptyReads = queuedTasks == 0 ? emptyReads + 1 : 0;
+                if (emptyReads == 2) {
+                    break;
+                }
                 LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
-            }
-            assertThat(channel.queuedClientTasks()).isZero();
+            } while (System.nanoTime() - cleanupDeadline < 0);
+            assertThat(emptyReads).as("consecutive empty timer queue reads (last count: %s)", queuedTasks)
+                    .isEqualTo(2);
             assertThat(body.get()).isEqualTo(new String(request.payload(), StandardCharsets.UTF_8));
             assertThat(headers.get().toLowerCase()).contains("authorization: bearer fixture-token", "x-tapstate-delivery-id: delivery", "x-tapstate-signature: v1=");
             assertThat(fixture.calls).hasValue(1);
