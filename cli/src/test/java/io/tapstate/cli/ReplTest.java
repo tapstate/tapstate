@@ -5971,6 +5971,12 @@ class ReplTest {
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
         String first = h.sink().toString().substring(mark);
 
+        String projectedPosition = "opaque-v1:" + CanonicalHash.ofText(firstPosition);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", projectedPosition));
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+        assertThat(h.sink().toString().substring(mark)).isEqualTo(first);
+
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", nextPosition));
         mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();

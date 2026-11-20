@@ -127,11 +127,15 @@ class PipelineObservationApiTest {
             Map.of("recordCount", 42L, "errorCount", 0L),
             Map.of("orders", new TableSnapshot(10, 100L, 10)));
 
+    // A connector token that shares the Java magic and uses a different version byte.
+    private static final String HEADER_LIKE_POSITION = "rO0ABA==";
+
     /** One running pipeline whose target-acked source positions have advanced, to exercise that field. */
     private static final Observation PL_POS = new Observation("pl2", PipelineState.RUNNING,
             Map.of("recordCount", 6L, "errorCount", 0L),
             Map.of(),
-            Map.of("orders", "w7", "shipments", MYSQL_POSITION, "events", POSTGRES_POSITION));
+            Map.of("orders", "w7", "shipments", MYSQL_POSITION, "events", POSTGRES_POSITION,
+                    "ledger", "binlog.000017:567", "archive", HEADER_LIKE_POSITION));
 
     private static String serializedPosition(String position) {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -399,7 +403,10 @@ class PipelineObservationApiTest {
         // position as a sibling rather than nested inside that map keeps every metrics cell a number,
         // so a reader never has to type-test a cell before using it.
         Map<String, String> positions = (Map<String, String>) body.get("targetAckedPosition");
-        assertThat(positions).containsOnlyKeys("orders", "shipments", "events").containsEntry("orders", "w7");
+        assertThat(positions).containsOnlyKeys("orders", "shipments", "events", "ledger", "archive")
+                .containsEntry("orders", "w7")
+                .containsEntry("ledger", "binlog.000017:567")
+                .containsEntry("archive", HEADER_LIKE_POSITION);
         assertThat(positions.get("shipments")).matches("opaque-v1:[0-9a-f]{64}");
         assertThat(positions.get("events")).matches("opaque-v1:[0-9a-f]{64}").isNotEqualTo(positions.get("shipments"));
         Map<String, Object> metrics = (Map<String, Object>) body.get("metrics");
