@@ -1,0 +1,23 @@
+version: tapstate/v1
+kind: pipeline
+id: sales
+source: src_mysql
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: sales_by_region_day
+    from: [ orders ]
+    type: aggregate
+    key: [ id ]
+    where: "=after.status != 'cancelled'"
+    groupBy:
+      region: $region
+      day: "=after.order_day"
+    fields:
+      order_count: { count: true }
+      revenue: { sum: $amount, default: 0 }
+      big_orders: { count: true, filter: "=after.amount >= 1000" }
+      max_order: { max: $amount }
+serve:
+  from: sales_by_region_day
+  sync:
+    - { source: tgt_mongo, write_mode: upsert, on_full_load: clear }

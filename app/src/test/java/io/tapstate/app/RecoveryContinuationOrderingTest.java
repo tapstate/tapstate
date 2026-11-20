@@ -91,7 +91,7 @@ class RecoveryContinuationOrderingTest {
         when(intents.load("p")).thenReturn(Optional.of(accepted));
         var recoveryScope=permission.recovery();when(recoveries.read("p")).thenReturn(Optional.of(recoveryScope));
         var executor=new ManualExecutor();var runtime=mock(StorageRuntime.class);var bound=mock(StorageRuntime.Bound.class);var business=mock(NativeBusinessContext.class);
-        var recovery=new NativePipelineRecovery(configuration,auth,mock(StorePort.class),preparer,mock(ConnectorProvisioner.class),mock(Engine.class),
+        var recovery=new NativePipelineRecovery(configuration,new CachePreparation("operation",auth),mock(StorePort.class),preparer,mock(ConnectorProvisioner.class),mock(Engine.class),
                 mock(PipelineCaptureCoordinator.class),mock(ExecutionAuthorization.class),() -> {},() -> true,mock(PipelineStoreViews.class));
         ReflectionTestUtils.setField(recovery,"inspector",inspector);
         var root=mock(StorageRoot.class,CALLS_REAL_METHODS);
@@ -110,6 +110,51 @@ class RecoveryContinuationOrderingTest {
         verify(preparer,never()).prepareRecovered(any(),any(),any());
         assertThat(root.recoveryFailure().orElse(null)).isInstanceOf(io.tapstate.core.common.TapstateException.class);
     }
+    @Test void completionPollProcessesTheRecoveryThatAppearsAfterAnIdleTick() {
+        var auth = new CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, "cache", 1);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "p", 2);
+        var manifest = new StorageRecoveryCommands.Manifest(
+                new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.PIPELINE, Set.of("p")),
+                Set.of("p"), Map.of("p", "c".repeat(64)), "a".repeat(64), 0);
+        var running = new StorageRecoveryCommands.Plan(UUID.randomUUID().toString(), null, auth, manifest,
+                "b".repeat(64), 1, StorageRecoveryCommands.Phase.RUNNING);
+        var configuration = mock(MongoConfigurationDomain.class);
+        var commands = mock(StorageRecoveryCommands.class);
+        var recoveries = mock(CacheRecoveryStore.class);
+        var preparation = mock(CacheRecoveryStore.FullPreparation.class);
+        var intents = mock(PipelineIntentStore.class);
+        var views = mock(PipelineStoreViews.class);
+        var state = mock(StateStore.class);
+        when(configuration.recoveryCommands()).thenReturn(commands);
+        var original = new CachePreparation("operation", auth);
+        when(commands.currentForCompletion(original)).thenReturn(Optional.empty()).thenReturn(Optional.of(running));
+        when(commands.guardedBy(any())).thenReturn(commands);
+        when(configuration.cacheRecoveries()).thenReturn(recoveries);
+        var recovery = new PipelineCacheRecovery(running.operationId(), null, scope);
+        when(recoveries.read("p")).thenReturn(Optional.of(recovery));
+        when(recoveries.authorizeFull(running, "p")).thenReturn(preparation);
+        when(configuration.intents()).thenReturn(intents);
+        when(intents.load("p")).thenReturn(Optional.of(new PipelineIntentSnapshot(scope, 1,
+                new DesiredState("p", PipelineState.RUNNING, "hash"))));
+        when(views.pipelineStates(scope)).thenReturn(state);
+        when(state.read("p")).thenReturn(Optional.of(new CheckpointDoc("p", StateJson.of(PipelineState.COMPLETED),
+                1, java.time.Instant.EPOCH)));
+        var poller = new NativePipelineRecovery(configuration, original, mock(StorePort.class),
+                mock(PipelineFirstStatePreparer.class), mock(ConnectorProvisioner.class), mock(Engine.class),
+                mock(PipelineCaptureCoordinator.class), mock(ExecutionAuthorization.class), () -> {}, () -> true, views);
+
+        poller.observeCompletion();
+        verify(commands, never()).complete(any());
+        verifyNoInteractions(recoveries);
+
+        poller.observeCompletion();
+        var order = inOrder(recoveries, preparation, state, commands);
+        order.verify(recoveries).authorizeFull(running, "p");
+        order.verify(preparation).requireActive();
+        order.verify(state).read("p");
+        order.verify(commands).complete(running);
+    }
+
     private static final class ManualExecutor extends AbstractExecutorService {
         final AtomicReference<Runnable> queued=new AtomicReference<>();
         public void execute(Runnable task){if(!queued.compareAndSet(null,task))throw new AssertionError("already queued");}

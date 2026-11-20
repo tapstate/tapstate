@@ -34,9 +34,11 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 
 | Features | |
 |---|---|
+| [Aggregate](aggregate/) | Keep one row per group current, with counts, sums and extremes over the group's rows. |
 | [Filter](filter/) | Keep matching rows in a live view, including removals and source before-image requirements. |
 | [Join](join/) | SQL subset, dimension-key uniqueness, output keys, and usage requirements. |
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |
+| [Soft delete](soft-delete/) | Keep a deleted row in the target, or a deleted child in its document, marked deleted instead of removed. |
 | [Unwind](unwind/) | Expand array elements into individually keyed rows and keep them current. |
 | [Reserved row field](reserved-field/) | The one field Tapstate adds to rows, what a target receives under it, how to strip it, and how a source column of the same name is renamed. |
 | [Observability](observability/) | Read current state, bounded output-rate and lag history, and one shared evidence-backed explanation. |

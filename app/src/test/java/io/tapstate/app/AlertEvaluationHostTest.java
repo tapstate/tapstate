@@ -51,6 +51,15 @@ class AlertEvaluationHostTest {
         assertThat(host.accept(binding, sequence, new AlertInput.Conditions(now.get(), condition, null)))
                 .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
     }
+    @Test void aLoadedFreshnessHeadKeepsTheProducersIndependentSequence(){
+        var rule=definition("pipeline.observation-stale");var binding=binding(rule,"producer");
+        var input=new AlertInput.Freshness(T,true,T,T,Duration.ofSeconds(120),Duration.ofSeconds(120));
+        assertThat(host.accept(binding,1,input)).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        var retained=Optional.of(rows.get(binding.key()));now.set(T.plusSeconds(1));
+        assertThat(host.accept(binding,123,new AlertInput.Freshness(now.get(),true,T,T,Duration.ofSeconds(120),Duration.ofSeconds(120)),true,retained))
+                .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        assertThat(rows.get(binding.key()).value().snapshot().lastSequence()).isEqualTo(123);
+    }
     @Test void operationalFailuresRequireEachOriginalCapabilityEvenAfterHostRestart() {
         var header=definition("pipeline.failed").header();
         var rule=new AlertConfiguration.Rule(header,"Source failure","source.connection-failed",1,

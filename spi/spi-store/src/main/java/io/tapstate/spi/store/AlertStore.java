@@ -80,6 +80,10 @@ public interface AlertStore {
             intents=Map.copyOf(intents);episodes=Map.copyOf(episodes);limits=Map.copyOf(limits);dependencies=Set.copyOf(dependencies);unavailableRules=Map.copyOf(unavailableRules); }
     }
     Planning planning();
+    /** Empty only when live authoring metadata still matches the caller's complete no-destination proof. */
+    default Optional<Planning> planningIfConfigurationChanged(long revision){return Optional.of(planning());}
+    /** Conservative fallback for stores without a scoped all-purpose existence probe. */
+    default boolean deliveryIntentsEmpty(){return false;}
     default Optional<AlertMaintenance> maintenance() { return Optional.empty(); }
     record Commit(CommitKind kind,StateChange state,List<IntentChange> intents,List<ScheduleChange> schedules,PlanVersion version) {
         public Commit(CommitKind kind,StateChange state,List<IntentChange> intents,List<ScheduleChange> schedules){this(kind,state,intents,schedules,null);}
@@ -134,6 +138,9 @@ public interface AlertStore {
     /** Background evaluation only, scoped by the original Host; unknown records fail the whole page. */
     DefinitionPage evaluationRules(String after,int limit);
     EvaluationPage evaluationStates(AlarmKey after,int limit);
+    /** All current rules and one retained-state page. Cluster-node rows require evaluationStates after observer refresh. */
+    record EvaluationSnapshot(DefinitionPage rules,EvaluationPage states) { }
+    EvaluationSnapshot evaluationSnapshot(AlarmKey after,int limit);
     Outcome saveDefinition(AlertConfiguration.Definition before,AlertConfiguration.Definition after,Access access);
     Outcome saveReceiver(AlertReceiver before,AlertReceiver after,PrivateMaterial replacement,boolean retainOriginalMaterial,Access access);
     enum PrivateField { AUTHENTICATION,PRIVATE_CA,ENDPOINT }

@@ -103,6 +103,18 @@ final class NestStateIo {
         Committed NONE = (keys, roundTrips, nanos) -> { };
 
         void group(long keys, long roundTrips, long nanos);
+
+        /** What one acknowledged commit group wrote: each key's state as it was stored. */
+        default void sizes(Collection<byte[]> written) {
+        }
+    }
+
+    /** Runs one store write as one commit group, reporting it and what it wrote once it succeeded. */
+    static void commit(Committed committed, Collection<byte[]> written, Runnable write) {
+        commit(committed, written.size(), write);
+        if (committed != Committed.NONE) {
+            committed.sizes(written);
+        }
     }
 
     /** Runs one store write as one commit group, reporting it once it succeeded. */
@@ -373,7 +385,7 @@ final class NestStateIo {
         }
 
         private void write(Map<String, byte[]> combined) {
-            commit(committed, combined.size(), () -> {
+            commit(committed, combined.values(), () -> {
                 if (combined.size() == 1) {
                     Map.Entry<String, byte[]> only = combined.entrySet().iterator().next();
                     store.save(namespace, only.getKey(), only.getValue());

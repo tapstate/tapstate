@@ -1,6 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
@@ -13,6 +14,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.CacheAuthScope;
+import io.tapstate.spi.store.CachePreparation;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StorageRecoveryCommands;
 import java.util.ArrayList;
@@ -109,6 +111,19 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
     @Override public Optional<Plan> current(CacheAuthScope current) {
         return transaction(session -> pending(root(session, current)));
     }
+    @Override public Optional<Plan> currentForCompletion(CachePreparation current) {
+        var rows = StoreIo.call(() -> {
+            active.run();
+            var observed = SystemCollections.STORAGE_RECOVERY.on(database)
+                    .withReadPreference(ReadPreference.primary()).withReadConcern(ReadConcern.MAJORITY)
+                    .find().limit(2).into(new ArrayList<>());
+            active.run();
+            return observed;
+        });
+        return rows.size() == 1 && MongoStorageRecoveryStore.idleCompletionRecord(rows.getFirst(), current)
+                ? Optional.empty() : current(current.authScope());
+    }
+
     @Override public Optional<Plan> find(CacheAuthScope current, String originalId) {
         Objects.requireNonNull(originalId, "originalId");
         return transaction(session -> pending(root(session, current)).filter(plan -> plan.operationId().equals(originalId)));

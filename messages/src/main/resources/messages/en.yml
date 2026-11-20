@@ -562,6 +562,15 @@ dsl.join-input-not-a-table:
 dsl.join-input-is-a-pattern:
   message: "Join `{step}` at {path} binds alias `{alias}` to the pattern `/{pattern}/`, but a join input must name one source table."
   solution: "Write the table's name instead of a pattern, for example `{alias}: orders`. A join reads one table per alias: its SQL names that table's columns and its rows are keyed on that table's primary key. A pattern names a set that can change, so it is refused even where it matches a single table today."
+dsl.rollup-function-unknown:
+  message: "Rollup field `{field}` at {path} names `{function}` as its function; a rollup field names exactly one of {known}."
+  solution: "Write one function key with its argument, for example `{field}: { sum: $amount }`. The qualifiers `filter`, `type` and `default` go beside it."
+dsl.rollup-on-single-row-embed:
+  message: "The embed at {path} is `as: {as}` and holds at most one row, so it cannot carry rollup fields."
+  solution: "Read the row's columns directly, or declare the embed `as: array` (or `as: rollup` when the rows should not be shown) if it gathers many rows."
+dsl.rollup-level-without-fields:
+  message: "The embed at {path} is `as: rollup` but declares no `rollup:` fields, so it would be held and never shown."
+  solution: "Add the fields to compute over it under `rollup:`, or declare it `as: array` to render its rows."
 dsl.malformed-yaml:
   message: "Malformed YAML: {detail}."
   solution: "Fix the YAML syntax; the line and column point at the problem."
@@ -1082,6 +1091,9 @@ nest.key-ambiguous:
 nest.referenced-level-carries-embeds:
   message: "{embedPath} is a row this document points at rather than one grouped under it, and it carries embeds of its own: {children}."
   solution: "Move those embeds to a level the document holds, or join {table} the other way round so its rows hang under this document instead of being pointed at."
+nest.or-on-not-a-reference:
+  message: "Embed {embedPath} lists orOn alternatives, and one of them matches on {fields}, which identifies its parent ({parentKey})."
+  solution: "Use orOn only where the parent points at one shared row, such as a location looked up by code or by hub id. An embed that gathers several rows under its parent matches on one condition; give it a single on."
 nest.resolver-vertex-limit-exceeded:
   message: "This nest compiles to {vertices} resolver vertices, past the limit of {limit}."
   solution: "Flatten the tree or split the pipeline: every vertex takes a thread of its own."
@@ -1130,6 +1142,30 @@ nest.parent-absent:
 nest.state-served-from-cold-layer:
   message: "Nest namespace {namespace} completed {backfills} cold loader callbacks for {accesses} logical state accesses; cold key share {share}, {millis} per callback; {entries} of {stored} entries are in memory ({resident})."
   solution: "Inspect cold-key traffic, backend latency and batching. Increase the in-memory entry budget only when the measured working set and available memory justify it."
+nest.rollup-on-reference-embed:
+  message: "The embed at {embedPath} is one its parent points at, so it holds at most one row and cannot carry rollup fields."
+  solution: "Read the referenced row's columns directly, for example in a rollup field one level up: `=after.<path>.<column>`."
+nest.rollup-field-conflict:
+  message: "Rollup field `{field}` on {level} is already taken by {other}."
+  solution: "Rename the rollup field. Columns, embed paths, flat fields and rollup fields share one namespace per level, and none overwrites another by declaration order."
+nest.rollup-expression-invalid:
+  message: "Rollup field `{field}`: its {part} does not check: {reason}"
+  solution: "Arguments, orderings and filters read the element as `after`: its own columns, its references' columns (`after.<path>.<column>`) and its child levels' rollup fields. Check the names against the discovered model with `tapstate desc`."
+nest.rollup-type-unknown:
+  message: "Rollup field `{field}` sums or averages `{expression}`, whose numeric type nothing resolved."
+  solution: "Discover the source so the column has a type, or compute over a column whose type is known. A sum's type is fixed when the pipeline is applied, so it is never guessed from the values."
+nest.rollup-overflow:
+  message: "Rollup field `{field}` of document {root} does not fit in {type}."
+  solution: "The value is not rounded or wrapped. Check the source rows for an outlier; a total that truly needs more digits than a decimal(38) holds cannot be a rollup field."
+nest.rollup-value-type-mismatch:
+  message: "Rollup field `{field}` of document {root} met a {actual} value where its column was declared {declared}."
+  solution: "The value is not coerced. Fix the row, or rediscover the source if the column's declared type has changed."
+nest.rollup-result-not-convertible:
+  message: "Rollup field `{field}` of document {root} is the {from} value that `type: {to}` cannot hold exactly."
+  solution: "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal)."
+nest.rollup-evaluation-failed:
+  message: "Rollup field `{field}` of document {root} could not evaluate `{expression}`: {reason}"
+  solution: "Check the element's values against what the expression expects; a field the element does not carry reads as null, any other failure stops the document rather than guessing."
 nest.key-change-tracking-requires-before-image:
   message: "Stream {alias} tracks structural key changes, but the row an update of source table {table} replaces does not carry {columns}."
   solution: "Configure that source to send whole row images rather than minimal ones - on MySQL that is binlog_row_image=FULL, on PostgreSQL a full replica identity on the table - or turn key tracking off for that stream. A minimal image sends the columns identifying the row and nothing else, so the earlier row arrives without the one this compares and reads as a row that used to hang under nothing."
@@ -1139,6 +1175,9 @@ nest.state-far-exceeds-memory-budget:
 nest.capacity-estimate-incomplete:
   message: "Nest level {embedPath} of pipeline {pipeline} could be sized from {counted} of the {total} inputs feeding it; the rest report no row count, so what was estimated is a floor."
   solution: "Discover the sources feeding that level so their tables report row counts, then apply again to have it sized on all of them."
+nest.rollup-level-wide:
+  message: "Nest level {embedPath} of pipeline {pipeline} carries rollup fields over an estimated {estimatedElements} elements per document, about {estimatedBytes} bytes of state, past the {boundary} elements of this width a rollup keeps up with: every change rewrites the document and refolds the whole level."
+  solution: "Compute this value outside the document's render - in the target, or with a cross-row computation keyed by the parent - or narrow the level with a filter upstream. An average this high also means some documents are far wider."
 schema.column-name-reads-as-a-path:
   message: "Pipeline {pipeline} writes column {column} of table {table} to {target}, which reads a dot in a key as a step into a nested document rather than as part of a name."
   solution: "The rows cross correctly and the key is really written, but a read for {column} on {target} answers nothing unless the dot is escaped, and no index can be declared over it at all, because an index key is written in that same path syntax. If it is a column you will query or index, rename it in {source}, or give it a name without a dot in a map step before it is written."
@@ -1450,6 +1489,66 @@ io.store-quota-exceeded:
   solution: "Ask the storage administrator to restore capacity, then query the original operation. Do not delete initialized storage or repeat setup."
 control.storage-quota-exceeded:
   message: "Initialization cannot complete because the storage endpoint has reached its space quota. Restore capacity and check the original operation; do not submit setup again."
+aggregate.input-not-supported:
+  message: "Aggregate step `{step}` reads `{from}`, which is {kind}."
+  solution: "An aggregate step reads one source table, or a `filter`, `map` or `union` step over source tables. To put totals into an assembled document, aggregate the table first and embed the result with a nest."
+aggregate.upstream-filter-unsafe:
+  message: "Aggregate step `{step}` reads the filter step `{filter}`, and source `{source}` does not guarantee to send a row as it was before an update, so a row that stops matching would stay in its group."
+  solution: "Move the condition into the aggregate step's `where:`. The step remembers each row, so it removes a row that stops matching whether or not the source says what the row was."
+aggregate.key-required:
+  message: "Aggregate step `{step}` reads `{from}`, which has no primary key, and names no `key:`."
+  solution: "Add `key: [<columns>]` naming the columns that identify one input row. After a `union` of tables whose keys overlap, include the column that tells the tables apart."
+aggregate.name-conflict:
+  message: "Aggregate step `{step}` uses the name `{name}` for both a key column and a field."
+  solution: "The output row holds the group names and the fields side by side, and a step with no `groupBy` keys its one row by a column named `aggregate`. Rename the field."
+aggregate.expression-invalid:
+  message: "Aggregate step `{step}`, `{field}`: its {part} does not check: {reason}"
+  solution: "Expressions read the input row as `after`, and `$column` names one of its columns. Check the names against the discovered model with `tapstate desc`."
+aggregate.type-unknown:
+  message: "Aggregate step `{step}`, field `{field}` sums or averages `{expression}`, whose numeric type nothing resolved."
+  solution: "Discover the source so the column has a type, or compute over a column whose type is known. A sum's type is fixed when the pipeline is applied, so it is never guessed from the values."
+aggregate.evaluation-failed:
+  message: "Aggregate step `{step}` could not evaluate its {part} `{expression}` on a row: {reason}"
+  solution: "The expression passed its checks and then failed on the values of one row, for example a division by zero or a conversion of text that is not a number. Guard the expression against such values, or exclude the rows with `where:`."
+aggregate.overflow:
+  message: "Aggregate step `{step}`, field `{field}` of group {group} does not fit in {type}."
+  solution: "The value is not rounded or wrapped, and the group keeps its last good values until its rows bring the total back in range. Check the group's rows for an outlier."
+aggregate.value-type-mismatch:
+  message: "Aggregate step `{step}`, field `{field}` of group {group} met a {actual} value where its column was declared {declared}."
+  solution: "The value is not coerced and the row is not left out: the group keeps its last good values until the row is fixed or removed. Rediscover the source if the column's declared type has changed."
+aggregate.result-not-convertible:
+  message: "Aggregate step `{step}`, field `{field}` of group {group} is the {from} value that `type: {to}` cannot hold exactly."
+  solution: "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal). The group keeps its last good values meanwhile."
+aggregate.state-estimate:
+  message: "Aggregate step `{step}` of pipeline {pipeline} keeps up to {entriesPerRow} state entries per input row: at most about {estimatedEntries} for the {inputRows} rows its inputs hold."
+  solution: "Nothing to fix. This is what the step stores to keep its totals exact through restarts and replays, and it holds the input's values. A field that keeps its inputs (min, max, first, last) adds one entry per row, and a distinct count one per distinct value in a group; `explain` shows the estimate beside what the running step counted."
+aggregate.state-estimate-unsized:
+  message: "Aggregate step `{step}` of pipeline {pipeline} keeps up to {entriesPerRow} state entries per input row; an input reports no row count, so the total is not estimated."
+  solution: "Discover the source the step reads so its tables report row counts, then apply again to have the total estimated."
+aggregate.definition-changed:
+  message: "Aggregate step `{step}` holds state built by a different definition: its {changed} changed."
+  solution: "The stored rows and totals are valid only for the definition that built them, so the step does not start on them. Rebuild the pipeline from a full load, which clears the step's state and its target, or restore the previous definition."
+aggregate.rebuild-needs-clear:
+  message: "Target `{target}` reads the aggregate step `{step}` and is set to `on_full_load: {policy}`, which keeps the rows it already holds."
+  solution: "A full load rebuilds every group, and a group that no longer exists would stay in the target. Set `on_full_load: clear` on the target, or `fail` to refuse a full load while it holds rows."
+aggregate.total-mismatch:
+  message: "Aggregate step `{step}`, group {group}: the stored `{field}` is not what the group's stored rows give."
+  solution: "Run the repair for this group: it writes the group's totals again from its stored rows and sends the group on. This compares the step's totals with the rows the step holds; it says nothing about whether those rows match the source."
+aggregate.step-not-running:
+  message: "No member is running an aggregate step `{step}` of pipeline `{pipeline}`."
+  solution: "A check or a repair is answered by the running step itself. Check the step id with `tapstate explain`, and start the pipeline if it is stopped."
+aggregate.group-invalid:
+  message: "That does not name a group of aggregate step `{step}`: {reason}."
+  solution: "Name the group by every name under the step's `groupBy:`, as `name=value` pairs; a name with no value means null. Copy a group as a check printed it."
+aggregate.step-busy:
+  message: "Aggregate step `{step}` of pipeline `{pipeline}` did not answer in time."
+  solution: "The step answers a check or a repair between its own updates, a few at a time. Nothing was left half done: ask again, and narrow the request to one group if the step is under heavy load."
+aggregate.step-failed:
+  message: "Aggregate step `{step}` of pipeline `{pipeline}` is running but failed while answering: {reason}"
+  solution: "The step's own updates are not affected by this answer. Look in the node's log for the failure at this time; asking again after a fix, or narrowing the request to one group, tells whether it recurs."
+aggregate.too-many-fields:
+  message: "Aggregate step `{step}` declares {count} fields; a step may declare at most {limit}."
+  solution: "Split the fields across two aggregate steps that read the same input and group the same way."
 
 control.ai-provider-request-rejected:
   message: "The AI provider rejected the model or request protocol."

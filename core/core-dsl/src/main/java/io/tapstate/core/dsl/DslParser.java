@@ -5,6 +5,10 @@ import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupFunction;
+import io.tapstate.core.model.RollupPick;
+import io.tapstate.core.model.RollupResultType;
 import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
@@ -126,7 +130,11 @@ public final class DslParser {
     static final Set<String> NEST_STATE_KEYS = Set.of("database");
     static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
-            "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
+            "from", "on", "orOn", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed",
+            "rollup");
+    /** The keys that qualify a rollup field's one function rather than naming it. */
+    static final Set<String> ROLLUP_OPTION_KEYS = Set.of("filter", "type", "default");
+    static final Set<String> ROLLUP_PICK_KEYS = Set.of("value", "by");
     private static final Set<String> VIEW_INLINE_KEYS = Set.of(
             "id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD, "write_mode", "on_full_load", EXECUTION_FIELD);
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
@@ -142,6 +150,8 @@ public final class DslParser {
             EXECUTION_FIELD);
     static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
     static final Set<String> BATCH_KEYS = Set.of("max_records", "max_wait");
+    private static final String SOFT_DELETE_TOKEN = "soft_delete";
+    private static final String FIELDS_TOKEN = "fields";
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
     static final Set<String> PUSH_KEYS = Set.of("id", SOURCE_TOKEN, "topic", FORMAT_FIELD, OPTIONS_FIELD);
@@ -519,11 +529,12 @@ public final class DslParser {
     private static Set<String> payloadKeys(String type) {
         return switch (type) {
             case "js" -> Set.of("script");
-            case "map" -> Set.of("fields");
+            case "map" -> Set.of(FIELDS_TOKEN, SOFT_DELETE_TOKEN);
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path", "include_array_index",
                     "preserve_null_and_empty_arrays", "element_key", "element_type", SOURCE_ID_FIELD_TOKEN);
             case "union" -> Set.of();
+            case "aggregate" -> Set.of("key", "where", "groupBy", "fields");
             case "nest" -> Set.of(
                     PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document",
                     "state", "root");
@@ -540,9 +551,11 @@ public final class DslParser {
     static Set<String> requiredPayloadKeys(String type) {
         return switch (type) {
             case "js" -> Set.of("script");
-            case "map" -> Set.of("fields");
+            // fields, unless soft_delete stands in for it; body() refuses a map carrying neither
+            case "map" -> Set.of();
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path");
+            case "aggregate" -> Set.of("fields");
             case "nest" -> Set.of("root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
@@ -552,8 +565,7 @@ public final class DslParser {
     private TransformBody body(String type, YamlMap s) {
         return switch (type) {
             case "js" -> new TransformBody.Js(s.requireString("script"));
-            case "map" -> new TransformBody.MapProjection(
-                    fieldRules(s.require("fields", s.mapping("fields")), stepName(type, s)));
+            case "map" -> mapProjection(type, s);
             case FILTER_TOKEN -> {
                 String expr = s.requireString("expr");
                 checkPredicate(s, "expr", expr);
@@ -567,6 +579,7 @@ public final class DslParser {
                     elementType(s),
                     sourceIdField(s));
             case "union" -> new TransformBody.Union();
+            case "aggregate" -> aggregate(s);
             case "nest" -> new TransformBody.Nest(
                     s.string(PRIMARY_KEY_FIELD),
                     enumByYaml(NestOrder.values(), NestOrder::yaml, s, "order"),
@@ -582,7 +595,7 @@ public final class DslParser {
                 yield new TransformBody.Join(engine, sql);
             }
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
-                    Map.of(VALUE_TOKEN, type, EXPECTED_TOKEN, "a known transform type (js, map, filter, unwind, union, nest, join)"));
+                    Map.of(VALUE_TOKEN, type, EXPECTED_TOKEN, "a known transform type (js, map, filter, unwind, union, aggregate, nest, join)"));
         };
     }
 
@@ -590,6 +603,33 @@ public final class DslParser {
     private static String stepName(String type, YamlMap step) {
         String id = step.string("id");
         return id == null ? type : id;
+    }
+
+    /**
+     * A map's body. {@code fields} may be left out only where {@code soft_delete} is given, since a
+     * step adding the deleted-row column is a whole step on its own. The column may not also be a
+     * declared field: two values for one column, one of them silently losing on every row, is a
+     * mistake the author should hear about where they wrote it.
+     */
+    private TransformBody.MapProjection mapProjection(String type, YamlMap s) {
+        String softDelete = s.string(SOFT_DELETE_TOKEN);
+        YamlMap fields = s.mapping(FIELDS_TOKEN);
+        if (softDelete == null) {
+            s.require(FIELDS_TOKEN, fields);
+        } else if (softDelete.isBlank()) {
+            throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, softDelete, EXPECTED_TOKEN, "a column name"));
+        } else if (ReservedField.is(softDelete)) {
+            throw s.errorAt(SOFT_DELETE_TOKEN, DslError.RESERVED_FIELD_DECLARED,
+                    Map.of("step", stepName(type, s), "field", softDelete));
+        }
+        Map<String, FieldRule> rules = fields == null ? Map.of() : fieldRules(fields, stepName(type, s));
+        if (softDelete != null && rules.containsKey(softDelete)) {
+            throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, softDelete,
+                            EXPECTED_TOKEN, "a column not also declared under fields"));
+        }
+        return new TransformBody.MapProjection(rules, softDelete);
     }
 
     private Map<String, FieldRule> fieldRules(YamlMap fields, String step) {
@@ -666,18 +706,221 @@ public final class DslParser {
             if (as == EmbedAs.FLAT && e.has("arrayKey")) {
                 throw e.errorAt("arrayKey", DslError.FORBIDDEN_FIELD, Map.of("field", "arrayKey"));
             }
+            if (as == EmbedAs.ROLLUP && e.has("path")) {
+                throw e.errorAt("path", DslError.FORBIDDEN_FIELD, Map.of("field", "path"));
+            }
+            if ((as == EmbedAs.OBJECT || as == EmbedAs.FLAT) && e.has("rollup")) {
+                throw e.errorAt("rollup", DslError.ROLLUP_ON_SINGLE_ROW_EMBED, Map.of("as", as.yaml()));
+            }
+            Map<String, RollupField> rollup = rollupFields(e);
+            if (as == EmbedAs.ROLLUP && (rollup == null || rollup.isEmpty())) {
+                throw e.errorAt("as", DslError.ROLLUP_LEVEL_WITHOUT_FIELDS, Map.of());
+            }
             out.add(new Embed(
                     e.requireString("from"),
                     e.require("on", stringMap(e, "on")),
                     as,
-                    as == EmbedAs.FLAT ? null : e.requireString("path"),
+                    as == EmbedAs.FLAT || as == EmbedAs.ROLLUP ? null : e.requireString("path"),
                     scalarList(e.seq("key"), "key"),
                     scalarList(e.seq("arrayKey"), "arrayKey"),
                     boolValue(e, "ignoreUpdates"),
                     boolValue(e, "trackKeyChanges"),
-                    embeds(e.seq("embed"), e.childPath("embed"))));
+                    embeds(e.seq("embed"), e.childPath("embed")),
+                    rollup,
+                    alternatives(e, "orOn")));
         }
         return out;
+    }
+
+    /**
+     * An embed's further ways of matching its child, each a mapping of child field to parent field like
+     * {@code on}. An empty list, or an alternative that maps nothing, is refused rather than read as absent:
+     * either is an author who meant to write an alternative and did not, and dropping it silently would
+     * leave the embed matching on fewer conditions than written.
+     */
+    private static List<Map<String, String>> alternatives(YamlMap owner, String key) {
+        List<Node> items = owner.seq(key);
+        if (items == null) {
+            return null;
+        }
+        String expected = "a list of non-empty mappings from child field to parent field";
+        if (items.isEmpty()) {
+            throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, "[]", EXPECTED_TOKEN, expected));
+        }
+        List<Map<String, String>> out = new ArrayList<>(items.size());
+        for (Node item : items) {
+            Object raw = YamlMap.nodeValue(item);
+            if (!(raw instanceof Map<?, ?> pairs) || pairs.isEmpty()) {
+                throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
+                        Map.of(VALUE_TOKEN, String.valueOf(raw), EXPECTED_TOKEN, expected));
+            }
+            Map<String, String> alternative = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> pair : pairs.entrySet()) {
+                if (!(pair.getValue() instanceof String parentField)) {
+                    throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
+                            Map.of(VALUE_TOKEN, String.valueOf(pair.getValue()), EXPECTED_TOKEN, "a string"));
+                }
+                alternative.put(String.valueOf(pair.getKey()), parentField);
+            }
+            out.add(alternative);
+        }
+        return out;
+    }
+
+    /**
+     * An embed's {@code rollup:} map, in the order written. Shape is all that is judged here: each field
+     * names exactly one known function, its argument is a {@code $column}, an {@code =expression} or (for a
+     * count) {@code true}, and every expression compiles over a row. Whether the expressions type-check
+     * against the level's columns and references is judged where the tree and its models are known.
+     */
+    /**
+     * Reads a {@code rollup:} map that arrives already structured, as plain maps, lists and scalars, under
+     * exactly the rules of a written embed's. {@code path} names where it sits, for diagnostics.
+     */
+    public Map<String, RollupField> rollupFieldsFromTree(Map<String, Object> rollup, String path) {
+        Objects.requireNonNull(rollup, "rollup");
+        Map<String, Object> owner = new LinkedHashMap<>();
+        owner.put("rollup", rollup);
+        return rollupFields(YamlMap.of(TreeNodes.mapping(owner, path), path));
+    }
+
+    private Map<String, RollupField> rollupFields(YamlMap embed) {
+        return rollupFields(embed, "rollup");
+    }
+
+    /**
+     * An aggregate step's payload. Shape only, as for a rollup: every expression compiles over a row,
+     * and whether it type-checks against the input's columns is judged where the input model is known.
+     */
+    private TransformBody.Aggregate aggregate(YamlMap s) {
+        List<String> key = s.has("key") ? scalarList(s.seq("key"), "key") : null;
+        if (key != null && key.isEmpty()) {
+            throw s.errorAt("key", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, "[]", EXPECTED_TOKEN, "at least one column identifying an input row"));
+        }
+        String where = s.string("where");
+        if (where != null) {
+            checkRollupExpression(s, "where", where, true);
+        }
+        Map<String, String> groupBy = new LinkedHashMap<>();
+        YamlMap groups = s.mapping("groupBy");
+        if (groups != null) {
+            for (String name : groups.keys()) {
+                if (ReservedField.is(name)) {
+                    throw groups.errorAt(name, DslError.RESERVED_FIELD_DECLARED,
+                            Map.of("step", stepName("aggregate", s), "field", name));
+                }
+                groupBy.put(name, rollupExpression(groups, name));
+            }
+        }
+        Map<String, RollupField> fields = rollupFields(s, "fields");
+        if (fields.isEmpty()) {
+            throw s.errorAt("fields", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, "{}", EXPECTED_TOKEN, "at least one output field"));
+        }
+        return new TransformBody.Aggregate(key, where, groupBy, fields);
+    }
+
+    private Map<String, RollupField> rollupFields(YamlMap owner, String fieldsKey) {
+        YamlMap fields = owner.mapping(fieldsKey);
+        if (fields == null) {
+            return null;
+        }
+        Map<String, RollupField> out = new LinkedHashMap<>();
+        for (String name : fields.keys()) {
+            if (ReservedField.is(name)) {
+                // A computed field is a column of the row it is written to, and that name is the product's.
+                throw fields.errorAt(name, DslError.RESERVED_FIELD_DECLARED,
+                        Map.of("step", stepName(fieldsKey, owner), "field", name));
+            }
+            YamlMap f = YamlMap.requireMapping(fields.node(name), fields.childPath(name));
+            List<String> functions = new ArrayList<>();
+            for (String key : f.keys()) {
+                if (!ROLLUP_OPTION_KEYS.contains(key)) {
+                    functions.add(key);
+                }
+            }
+            if (functions.size() != 1 || RollupFunction.byYaml(functions.getFirst()).isEmpty()) {
+                throw fields.errorAt(name, DslError.ROLLUP_FUNCTION_UNKNOWN, Map.of(
+                        "field", name,
+                        "function", functions.isEmpty() ? "(none)" : String.join(", ", functions),
+                        "known", String.join(", ", RollupFunction.spellings())));
+            }
+            RollupFunction function = RollupFunction.byYaml(functions.getFirst()).orElseThrow();
+            String key = function.yaml();
+            Object argument = switch (function) {
+                case FIRST, LAST -> rollupPick(f.mapping(key));
+                case COUNT -> {
+                    Object value = YamlMap.nodeValue(f.node(key));
+                    if (Boolean.TRUE.equals(value)) {
+                        yield Boolean.TRUE;
+                    }
+                    yield rollupExpression(f, key);
+                }
+                default -> rollupExpression(f, key);
+            };
+            String filter = f.string("filter");
+            if (filter != null) {
+                checkRollupExpression(f, "filter", filter);
+            }
+            out.put(name, RollupField.of(function, argument, filter,
+                    enumByYaml(RollupResultType.values(), RollupResultType::yaml, f, "type"),
+                    f.has("default") ? YamlMap.nodeValue(f.node("default")) : null));
+        }
+        return out;
+    }
+
+    private RollupPick rollupPick(YamlMap pick) {
+        pick.requireOnly(ROLLUP_PICK_KEYS);
+        pick.requirePresent(ROLLUP_PICK_KEYS);
+        String value = rollupExpression(pick, "value");
+        List<String> by = new ArrayList<>();
+        Node byNode = pick.node("by");
+        if (byNode instanceof SequenceNode byList) {
+            for (Node item : byList.getValue()) {
+                String written = YamlMap.requireScalar(item, "by");
+                checkRollupExpression(pick, "by", written);
+                by.add(written);
+            }
+        } else {
+            by.add(rollupExpression(pick, "by"));
+        }
+        if (by.isEmpty()) {
+            throw pick.errorAt("by", DslError.ILLEGAL_VALUE,
+                    Map.of("value", "[]", "expected", "at least one ordering expression"));
+        }
+        return new RollupPick(value, by);
+    }
+
+    /** A rollup argument as written, after checking it is a {@code $column} or an {@code =expression}. */
+    private static String rollupExpression(YamlMap owner, String key) {
+        String written = owner.requireString(key);
+        checkRollupExpression(owner, key, written);
+        return written;
+    }
+
+    private static void checkRollupExpression(YamlMap owner, String key, String written) {
+        checkRollupExpression(owner, key, written, "filter".equals(key));
+    }
+
+    private static void checkRollupExpression(YamlMap owner, String key, String written, boolean predicate) {
+        if (written.startsWith("$")) {
+            String column = written.substring(1);
+            if (!RollupExpressions.isColumnName(column)) {
+                throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", written,
+                        "expected", "$<column> naming one field of the element, or =<expression>"));
+            }
+            return;
+        }
+        if (!written.startsWith("=")) {
+            throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", written,
+                    "expected", "$<column> naming one field of the element, or =<expression>"));
+        }
+        String expr = written.substring(1);
+        String detail = predicate
+                ? RollupExpressions.untypedPredicateError(expr)
+                : RollupExpressions.untypedValueError(expr);
+        failExpression(owner, key, expr, detail);
     }
 
     // ---- view / serve -------------------------------------------------------------

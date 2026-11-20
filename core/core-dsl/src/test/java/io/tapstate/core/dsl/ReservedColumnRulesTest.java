@@ -86,4 +86,43 @@ class ReservedColumnRulesTest {
                 .isInstanceOfSatisfying(DslException.class, error ->
                         assertThat(error.code()).isEqualTo(DslError.ILLEGAL_EXPRESSION));
     }
+
+    private static void declaringIsRefused(String body, String path) {
+        String step = """
+                version: tapstate/v1
+                kind: transform
+                id: totals
+                %s
+                """.formatted(body.formatted(ReservedField.NAME).strip());
+
+        assertThatThrownBy(() -> new DslParser().parse(step))
+                .isInstanceOfSatisfying(DslException.class, error -> {
+                    assertThat(error.code()).isEqualTo(DslError.RESERVED_FIELD_DECLARED);
+                    assertThat(error.path()).isEqualTo(path.formatted(ReservedField.NAME));
+                });
+    }
+
+    @Test
+    @DisplayName("a map cannot name the reserved field as its deleted-row column")
+    void aSoftDeleteColumnWithTheReservedNameIsRefused() {
+        declaringIsRefused("""
+                type: map
+                soft_delete: %s
+                """, "soft_delete");
+    }
+
+    @Test
+    @DisplayName("an aggregate step cannot name a group or a field as the reserved field")
+    void anAggregateOutputWithTheReservedNameIsRefused() {
+        declaringIsRefused("""
+                type: aggregate
+                groupBy: { %s: $region }
+                fields: { orders: { count: true } }
+                """, "groupBy.%s");
+        declaringIsRefused("""
+                type: aggregate
+                groupBy: { region: $region }
+                fields: { %s: { count: true } }
+                """, "fields.%s");
+    }
 }
