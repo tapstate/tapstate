@@ -183,11 +183,15 @@ An element whose reference columns are all null names no row, so it is not "miss
 null and is skipped, like any null argument.
 
 **Do not read this null as 0.** It means "incomplete": a total that would have left out an element. A
-field that should tolerate the gap says so in its own expression:
+field that should tolerate the gap says so in its own expression, by testing the reference with `has()`:
 
 ```yaml
 amount: { sum: "=has(after.prize_definition) ? after.amount * after.prize_definition.prize_value : 0" }
 ```
+
+A reference the field's argument or filter tests with `has()` no longer makes that field null: an element
+whose row is missing is folded with whatever the expression gives for it (here `0`). The test has to name
+the reference itself, `has(after.prize_definition)`; testing one of its columns does not count.
 
 `explain <pipeline>` in a connected session (`rollups` in `GET /api/pipelines/{id}/explain`) lists every
 rollup field with the level it lands on, its function, its filter, and the references that make it null

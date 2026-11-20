@@ -66,6 +66,22 @@ class RollupFieldsAreRenderedWithTheRowsTheySummarizeTest {
     }
 
     @Test
+    void aTotalThatTestsItsReferenceWithHasCountsAMissingRowAsItsExpressionSays() {
+        Map<String, RollupField> rollups = new LinkedHashMap<>();
+        rollups.put("amount", RollupField.of(RollupFunction.SUM,
+                "=has(after.prize_definition) ? after.amount * after.prize_definition.prize_value : 0",
+                null, null, null));
+        NestTopology tree = compile(items(rollups));
+        Map<String, Map<Object, Map<String, Object>>> onlyOne = new HashMap<>();
+        onlyOne.put(tree.slots().getFirst().children().getFirst().lookupMap(),
+                Map.of(List.of(1L), row("id", 1L, "prize_code", "reward-points", "prize_value", 5L)));
+
+        Map<String, Object> document = transaction().render(tree.slots(), onlyOne, "t1").orElseThrow();
+
+        assertThat(document).as("item 2's prize is missing and contributes 0").containsEntry("amount", 10L);
+    }
+
+    @Test
     void anItemThatNamesNoReferenceAtAllIsNotMissingOne() {
         RootAssembly t1 = new RootAssembly();
         t1.applyRoot(row("id", 1L, "player_id", 9L), at(1));

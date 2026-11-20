@@ -144,11 +144,13 @@ public final class RollupExpressions {
 
     /**
      * The element fields {@code expr} reads that are where a reference renders: the references the field
-     * cannot be computed without. A presence test counts, since it reads the reference as much as a value
-     * access does.
+     * cannot be computed without. A reference the expression tests for presence ({@code has(after.ref)})
+     * is left out: the expression itself says what an element whose reference is missing contributes, so
+     * that element is folded like any other rather than making the field incomplete.
      */
     static Set<String> referencesRead(String expr, RollupScope scope) {
         Set<String> read = new LinkedHashSet<>();
+        Set<String> tested = new LinkedHashSet<>();
         CelNavigableAst.fromAst(evaluableAst(expr, false)).getRoot().allNodes()
                 .filter(node -> node.getKind() == CelExpr.ExprKind.Kind.SELECT)
                 .forEach(node -> {
@@ -156,9 +158,10 @@ public final class RollupExpressions {
                     CelExpr operand = select.operand();
                     if (operand.getKind() == CelExpr.ExprKind.Kind.IDENT
                             && operand.ident().name().equals(ROW) && scope.isReference(select.field())) {
-                        read.add(select.field());
+                        (select.testOnly() ? tested : read).add(select.field());
                     }
                 });
+        read.removeAll(tested);
         return read;
     }
 

@@ -318,6 +318,24 @@ class RollupFieldsFoldExactlyTest {
     }
 
     @Test
+    void aFieldThatTestsAReferenceWithHasFoldsAnElementMissingItAsItsExpressionSays() {
+        RollupScope scope = new RollupScope(Map.of("amount", ValueType.INT64), true,
+                Map.of("prize", RollupScope.ofColumns(Map.of("value", ValueType.INT64), true)), Map.of(), Map.of());
+        RollupSpec tolerant = RollupCompiler.compile("amount_total", RollupField.of(RollupFunction.SUM,
+                "=has(after.prize) ? after.amount * after.prize.value : 0", null, null, null), scope);
+        assertThat(tolerant.references()).as("the expression says what a missing prize contributes").isEmpty();
+        List<RollupElement> missing = List.of(
+                new RollupElement(List.of(1), row("amount", 2L, "prize", Map.of("value", 5L)), Set.of()),
+                new RollupElement(List.of(2), row("amount", 1L), Set.of("prize")));
+        assertThat(RollupFold.apply(List.of(tolerant), missing, "t1")).containsEntry("amount_total", 10L);
+
+        RollupSpec columnTested = RollupCompiler.compile("x", RollupField.of(RollupFunction.SUM,
+                "=has(after.prize.value) ? after.amount : 0", null, null, null), scope);
+        assertThat(columnTested.references()).as("testing a column of the reference reads the reference")
+                .containsExactly("prize");
+    }
+
+    @Test
     void aMisspeltReferenceColumnIsRefusedWhenThePipelineIsApplied() {
         RollupScope scope = new RollupScope(Map.of("amount", ValueType.INT64), true,
                 Map.of("prize", RollupScope.ofColumns(Map.of("value", ValueType.INT64), true)), Map.of(), Map.of());
