@@ -117,8 +117,9 @@ class AStoredValueReadsBackAsWhatWentInTest {
     @Test
     void aValueOfAKindNotListedIsRefusedAndNotStoredAsItsText() {
         DataOutputStream out = new DataOutputStream(new ByteArrayOutputStream());
+        Object unlisted = new Object();
 
-        assertThatThrownBy(() -> StoredValues.write(out, new Object()))
+        assertThatThrownBy(() -> StoredValues.write(out, unlisted))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("java.lang.Object")
                 .hasMessageContaining("cannot be kept in aggregate state");

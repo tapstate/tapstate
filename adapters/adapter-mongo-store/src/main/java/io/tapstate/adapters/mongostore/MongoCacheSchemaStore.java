@@ -116,24 +116,34 @@ final class MongoCacheSchemaStore implements SchemaStore {
             Document envelope = current(session, id);
             if (envelope == null || !envelope.containsKey(GENERATION)) return Optional.empty();
             String generation = envelope.getString(GENERATION);
-            var tables = new ArrayList<Document>();
             try (var cursor = rows.find(session, scoped(new Document("_id", ownedKeys(id)).append(GENERATION, generation)))
                     .sort(new Document("order", 1)).iterator()) {
-                while (cursor.hasNext()) {
-                    Document row = cursor.next(); int order = tables.size();
-                    if (!access.inScope(row, id) || !Integer.valueOf(order).equals(row.get("order"))
-                            || !tableKey(id, generation, order).equals(row.get("_id"))) throw unreadable(id);
-                    Document payload = access.payload(row); payload.remove("_id"); payload.remove(GENERATION); payload.remove("order");
-                    try {
-                        if (!payload.equals(MongoSchemaStore.tableDocument(MongoSchemaStore.toTable(payload, id)))) throw unreadable(id);
-                    } catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
-                    tables.add(row);
-                }
+                return decodeDiscovered(id, envelope, cursor);
             }
-            if (tables.size() != envelope.getInteger("tableCount")) throw unreadable(id);
-            try { return Optional.of(MongoSchemaStore.toDiscovered(envelope, tables)); }
-            catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
         });
+    }
+
+    Optional<DiscoveredSourceModel> decodeDiscovered(String id, Document envelope, java.util.Iterator<Document> rows) {
+        if (!access.inScope(envelope, id)) return Optional.empty();
+        validate(envelope, id);
+        if (!envelope.containsKey(GENERATION)) return Optional.empty();
+        String generation = envelope.getString(GENERATION);
+        var tables = new ArrayList<Document>();
+        while (rows.hasNext()) {
+            Document row = rows.next();
+            int order = tables.size();
+            if (!access.inScope(row, id) || !Integer.valueOf(order).equals(row.get("order"))
+                    || !tableKey(id, generation, order).equals(row.get("_id"))) throw unreadable(id);
+            Document payload = access.payload(row);
+            payload.remove("_id"); payload.remove(GENERATION); payload.remove("order");
+            try {
+                if (!payload.equals(MongoSchemaStore.tableDocument(MongoSchemaStore.toTable(payload, id)))) throw unreadable(id);
+            } catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
+            tables.add(row);
+        }
+        if (tables.size() != envelope.getInteger("tableCount")) throw unreadable(id);
+        try { return Optional.of(MongoSchemaStore.toDiscovered(envelope, tables)); }
+        catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
     }
 
     private void reclaim(String id) {
@@ -210,7 +220,7 @@ final class MongoCacheSchemaStore implements SchemaStore {
     }
     private static boolean canonicalUuid(String value) { try { return UUID.fromString(value).toString().equals(value); }
         catch (IllegalArgumentException invalid) { return false; } }
-    private static Document ownedKeys(String id) {
+    static Document ownedKeys(String id) {
         if (id.indexOf('.') >= 0) throw new IllegalArgumentException("connectionId must not contain '.'");
         return new Document("$gte", id + '.').append("$lt", id + '/');
     }

@@ -47,6 +47,12 @@ class AlertSiblingQuiescenceIT {
                             java.net.URI.create("https://example.invalid"),active));
                     start=worker::start;stop=worker::close;drain=worker::awaitStopped;
                 }else if(kind.equals("delivery")){
+                    AlertNotificationPlannerIT.route(f, Duration.ZERO);
+                    var planner = AlertNotificationPlannerIT.planner(f, "delivery-fixture");
+                    f.evaluator().withPlanner(planner);
+                    AlertNotificationPlannerIT.bad(f);
+                    planner.tick();
+                    assertThat(AlertNotificationPlannerIT.intents(f)).isNotEmpty();
                     var worker=new AlertDeliveryRuntime(store,f.clock(),"delivery",active,
                             mock(AlertDeliveryRuntime.Channels.class),ignored->null);
                     start=worker::start;stop=worker::close;drain=worker::awaitStopped;

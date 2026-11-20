@@ -41,7 +41,14 @@ public class Bootstrap {
     /** Exit code when a coded diagnostic was reported (matches the CLI's convention). */
     private static final int EXIT_CODED_DIAGNOSTIC = 1;
 
+    static void configureWorkerParallelism() {
+        String property = "java.util.concurrent.ForkJoinPool.common.parallelism";
+        if (Runtime.getRuntime().availableProcessors() <= 2 && System.getProperty(property) == null)
+            System.setProperty(property, "2");
+    }
+
     public static void main(String[] args) {
+        configureWorkerParallelism();
         ServerTimeZone timeZone = ServerTimeZone.initialize();
         Logger log = LoggerFactory.getLogger(Bootstrap.class);
         try {
