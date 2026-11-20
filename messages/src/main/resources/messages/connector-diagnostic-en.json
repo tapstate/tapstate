@@ -105,8 +105,9 @@
     "technicalParams": ["detail"]
   },
   "TS0060027": {
-    "message": "Connector '{connector}' failed while writing: {detail}.",
-    "solution": "Check the target is reachable and the connection settings are correct."
+    "message": "Connector '{connector}' could not write data to the target.",
+    "solution": "Check the target connection, permissions and write settings. Review the original error in technical details before retrying.",
+    "technicalParams": ["detail"]
   },
   "TS0060028": {
     "message": "Connector '{connector}' failed while reading the store: {detail}.",

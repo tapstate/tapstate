@@ -254,6 +254,23 @@ class MessageCatalogTest {
     }
 
     @Test
+    void writeFailureSummariesKeepRawDriverTextOnlyInTheStableTechnicalArgument() {
+        var definition = io.tapstate.core.common.ConnectorErrorDefinitions.WRITE_FAILED;
+        var params = Map.<String, Object>of("connector", "fixture", "detail", "fail_writes raw-driver-marker");
+        assertThat(definition.parameters()).containsExactlyInAnyOrder("connector", "detail");
+        var messages = new java.util.HashSet<String>();
+        for (var language : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+            var rendered = EN.render(definition.code(), params, language);
+            assertThat(rendered.message()).contains("fixture").doesNotContain("fail_writes", "raw-driver-marker");
+            assertThat(rendered.solution()).isNotBlank().doesNotContain("fail_writes", "raw-driver-marker");
+            messages.add(rendered.message());
+        }
+        assertThat(messages).hasSize(3);
+        assertThat(params).containsEntry("detail", "fail_writes raw-driver-marker");
+        assertThat(EN.render("connector.write-failed", params).message()).contains("fail_writes raw-driver-marker");
+    }
+
+    @Test
     void everyDslCodeRendersFullyWithNoLeftoverPlaceholders() {
         for (DslError code : DslError.values()) {
             Map<String, Object> args = new HashMap<>();

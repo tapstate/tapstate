@@ -27,6 +27,10 @@ class ConnectorDiagnosticContractTest {
                 assertThat(catalog.render(code.code(), params).message()).doesNotContain("value-detail");
                 assertThat(catalog.render(code.code(), params).solution())
                         .isEqualTo("Check that the source database is reachable and the connection settings are correct, then refresh the schema.");
+            } else if (code == ConnectorError.WRITE_FAILED) {
+                assertThat(catalog.render(legacy, params).message()).contains("value-detail");
+                assertThat(catalog.render(code.code(), params).message()).doesNotContain("value-detail");
+                assertThat(catalog.render(code.code(), params).solution()).contains("technical details");
             } else if (code != ConnectorError.TEST_FAILED)
                 assertThat(catalog.render(code.code(), params)).isEqualTo(catalog.render(legacy, params));
             else assertThat(code.code()).isEqualTo("TS0060001");
@@ -36,7 +40,7 @@ class ConnectorDiagnosticContractTest {
                 assertThat(text.message()).isNotBlank().doesNotContain(code.code());
                 assertThat(text.solution()).isNotBlank();
                 messages.add(text.message());
-                code.placeholders().stream().filter(name -> code != ConnectorError.DISCOVER_FAILED || !name.equals("detail"))
+                code.placeholders().stream().filter(name -> (code != ConnectorError.DISCOVER_FAILED && code != ConnectorError.WRITE_FAILED) || !name.equals("detail"))
                         .forEach(name -> assertThat(text.message() + text.solution()).contains("value-" + name));
             }
             assertThat(messages).hasSize(3);
