@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoDestination;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
@@ -3024,15 +3025,18 @@ final class StoreBackedDagSource implements DagSource {
             Set<String> stepIds) {
         Map<String, Set<String>> passedOn = new LinkedHashMap<>();
         for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
-            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
-                    && (nest.root().embed() == null || nest.root().embed().isEmpty())
-                    && inline.from() instanceof FromClause.Aliases aliases
-                    && aliases.aliases().get(nest.root().from()) != null) {
-                passedOn.put(step.id(), streamsReaching(pipeline, aliases.aliases().get(nest.root().from()),
+            FromRef root = passthroughNestRoot(step);
+            if (root != null) {
+                passedOn.put(step.id(), streamsReaching(pipeline, root,
                         sourceKeyByTable, sourceKeysById, sourceVertices, stepIds));
             }
         }
         return passedOn;
+    }
+
+    private static FromRef passthroughNestRoot(Step step) {
+        return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
+                && (nest.root().embed() == null || nest.root().embed().isEmpty()) ? assemblyRoot(step) : null;
     }
 
     /**
@@ -3992,6 +3996,8 @@ final class StoreBackedDagSource implements DagSource {
         List<PipelineOutputNames.Output> outputs = new ArrayList<>();
         List<PipelineOutputNames.Unresolved> unresolved = new ArrayList<>();
         Map<String, Set<PipelineInputs.Input>> inputs = new LinkedHashMap<>();
+        Map<String, Set<String>> outputStreams = new LinkedHashMap<>();
+        Map<String, PipelineOutputNames.NestMeasurement> nestMeasurements = Map.of();
         Set<String> qualifiedTables = Set.of();
         try {
             if (pipeline.view() instanceof ViewBlock.Inline view) {
@@ -4008,16 +4014,70 @@ final class StoreBackedDagSource implements DagSource {
                 if (resources != null && pipeline.view() instanceof ViewBlock.Inline view) {
                     Set<String> terminal = new LinkedHashSet<>();
                     partial.collect(view.from(), terminal, new HashSet<>());
+                    outputStreams.put(view.id(), terminal);
                     if (view.from() instanceof FromRef.Literal && terminal.size() == 1)
                         inputs.put(view.id(), inputLineage(pipeline, partial, FromClause.list(view.from())));
                 }
-                if (sync) outputs.addAll(syncOutputNames(pipeline, partial, resources != null, inputs));
-                if (resources != null) qualifiedTables = qualifiedTables(pipeline, partial);
+                if (sync) outputs.addAll(syncOutputNames(pipeline, partial, resources != null, inputs, outputStreams));
+                if (resources != null) {
+                    qualifiedTables = qualifiedTables(pipeline, partial);
+                    nestMeasurements = nestMeasurements(pipeline, partial, inputs, outputs, outputStreams);
+                }
             } catch (TapstateException unavailable) {
                 unresolved.add(outputProblem(pipeline, unavailable));
             }
         }
-        return new PipelineOutputNames.Description(new PipelineOutputNames.Result(outputs, unresolved), inputs, qualifiedTables);
+        return new PipelineOutputNames.Description(
+                new PipelineOutputNames.Result(outputs, unresolved), inputs, qualifiedTables, nestMeasurements);
+    }
+
+    private Map<String, PipelineOutputNames.NestMeasurement> nestMeasurements(PipelineResource pipeline, PartialOutputStreams partial,
+            Map<String, Set<PipelineInputs.Input>> inputs, List<PipelineOutputNames.Output> outputs,
+            Map<String, Set<String>> outputStreams) {
+        Set<String> nestSteps = partial.assemblies.stream()
+                .filter(stream -> stepOf(pipeline, stream) instanceof Step.Inline step
+                        && step.body() instanceof TransformBody.Nest)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        if (nestSteps.isEmpty()) return Map.of();
+
+        Map<String, Integer> consumers = new HashMap<>();
+        outputStreams.values().forEach(streams -> streams.stream().flatMap(stream -> partial.arrivingStreams(stream).stream()).distinct()
+                .forEach(stream -> consumers.merge(stream, 1, Integer::sum)));
+        Set<PipelineOutputNames.Output> sharedTargets = sharedOutputTargets(outputs);
+        Map<String, PipelineOutputNames.NestMeasurement> result = new LinkedHashMap<>();
+        for (var output : outputs) {
+            String identity = output.identity();
+            Set<String> streams = outputStreams.getOrDefault(identity, Set.of());
+            if (java.util.Collections.disjoint(streams, nestSteps)) continue;
+            // A stream-keyed sample cannot separate sinks or cover another stream in the same collection.
+            Set<String> arriving = streams.size() == 1 ? partial.arrivingStreams(streams.iterator().next()) : Set.of();
+            String key = null;
+            if (!sharedTargets.contains(output) && arriving.size() == 1
+                    && !inputs.getOrDefault(identity, Set.of()).isEmpty()) {
+                String stream = arriving.iterator().next();
+                if (consumers.get(stream) == 1
+                        && !(partial.sourceStreams.contains(stream) && partial.assemblies.contains(stream))) key = stream;
+            }
+            result.put(identity, new PipelineOutputNames.NestMeasurement(key));
+        }
+        return result;
+    }
+
+    private Set<PipelineOutputNames.Output> sharedOutputTargets(List<PipelineOutputNames.Output> outputs) {
+        record Target(String collection, String connection, String database, String srvService, String host) { }
+        Map<String, Optional<MongoDestination>> mongoDestinations = new HashMap<>();
+        Map<Target, List<PipelineOutputNames.Output>> writers = new HashMap<>();
+        for (var output : outputs) {
+            var mongo = mongoDestinations.computeIfAbsent(output.connection(), id -> artifacts().get(id)
+                    .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)
+                    .map(MongoDestination::from));
+            var targets = mongo.map(destination -> destination.hosts().stream()
+                            .map(host -> new Target(output.table(), null, destination.database(), destination.srvService(), host)).toList())
+                    .orElseGet(() -> List.of(new Target(output.table(), output.connection(), null, null, null)));
+            targets.forEach(target -> writers.computeIfAbsent(target, ignored -> new ArrayList<>()).add(output));
+        }
+        return writers.values().stream().filter(owners -> owners.size() > 1).flatMap(List::stream)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
     }
 
     private static Set<String> qualifiedTables(PipelineResource pipeline, PartialOutputStreams partial) {
@@ -4049,7 +4109,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private List<PipelineOutputNames.Output> syncOutputNames(PipelineResource pipeline, PartialOutputStreams partial,
-            boolean includeInputs, Map<String, Set<PipelineInputs.Input>> inputs) {
+            boolean includeInputs, Map<String, Set<PipelineInputs.Input>> inputs, Map<String, Set<String>> outputStreams) {
         ServeBlock.Inline serve = (ServeBlock.Inline) pipeline.serve();
         Map<String, SourceVertex> vertices = partial.vertices;
         Set<String> streams = new LinkedHashSet<>();
@@ -4068,6 +4128,7 @@ final class StoreBackedDagSource implements DagSource {
                     outputs.add(new PipelineOutputNames.Output(syncNodeId(sync), kind, sync.source(), entry.getValue().name(), identity));
                 }
                 if (includeInputs) {
+                    outputStreams.computeIfAbsent(identity, ignored -> new LinkedHashSet<>()).add(entry.getKey());
                     SourceVertex direct = vertices.values().stream().filter(vertex -> vertex.stream().equals(entry.getKey())).findFirst().orElse(null);
                     Set<PipelineInputs.Input> reached = partial.unresolvedTargetPossible(sync, entry.getValue().name()) ? Set.of() : direct == null
                             ? inputLineage(pipeline, partial, FromClause.list(FromRef.literal(entry.getKey())))
@@ -4094,13 +4155,17 @@ final class StoreBackedDagSource implements DagSource {
         private final Map<String, String> keys;
         private final Map<String, List<String>> sources;
         private final Set<String> steps;
+        private final Set<String> sourceStreams;
         private final Set<String> assemblies = new HashSet<>();
+        private final Map<String, Set<String>> forwardedStreams = new HashMap<>();
         private final Map<String, List<String>> resolvedSteps = new LinkedHashMap<>();
 
         private PartialOutputStreams(PipelineResource pipeline, List<PipelineOutputNames.Unresolved> unresolved) {
             this.pipeline = pipeline;
             this.unresolved = unresolved;
             vertices = sourceVertices(pipeline, false, failures);
+            sourceStreams = vertices.values().stream().map(SourceVertex::stream)
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
             keys = sourceKeyByTable(vertices);
             sources = sourceKeysById(vertices);
             pipeline.sourceIds().forEach(id -> sources.putIfAbsent(id, List.of()));
@@ -4156,13 +4221,23 @@ final class StoreBackedDagSource implements DagSource {
             if (root != null) {
                 Set<String> roots = new LinkedHashSet<>();
                 collect(root, roots, visiting);
-                if (roots.size() != 1) return;
+                boolean passthrough = passthroughNestRoot(step) != null;
+                if (roots.isEmpty() || !passthrough && roots.size() != 1) return;
                 requireStableAssemblyName(step, roots);
                 assemblies.add(step.id());
+                if (passthrough) {
+                    Set<String> arriving = new LinkedHashSet<>();
+                    roots.forEach(stream -> arriving.addAll(arrivingStreams(stream)));
+                    forwardedStreams.put(step.id(), Set.copyOf(arriving));
+                }
                 streams.add(step.id());
             } else {
                 for (FromRef upstream : refsOf(step.from())) collect(upstream, streams, visiting);
             }
+        }
+
+        private Set<String> arrivingStreams(String stream) {
+            return sourceStreams.contains(stream) ? Set.of(stream) : forwardedStreams.getOrDefault(stream, Set.of(stream));
         }
 
         private void requireStableAssemblyName(Step step, Set<String> roots) {
