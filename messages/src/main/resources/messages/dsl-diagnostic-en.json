@@ -17,7 +17,7 @@
   },
   "TS0010005": {
     "message": "Reference '{ref}' at {path} points to nothing in this workspace.",
-    "solution": "Define the referenced resource, or fix the name to match an existing one."
+    "solution": "Define the referenced resource '{ref}', or select an existing resource at {path}."
   },
   "TS0010006": {
     "message": "Reference '{ref}' at {path} is ambiguous across more than one source.",

@@ -20,6 +20,19 @@ class AlarmTypeTextTest {
         var storage = catalog.types().stream().filter(type -> type.id().equals("cluster.storage-unavailable")).findFirst().orElseThrow();
         assertThat(text.describe(storage).guidance()).contains("stop new durable acceptance or send permits", "do not bypass the ledger");
     }
+    @Test void eachBuiltinDescriptionUsesTheRequestedLanguageWithoutChangingItsKeys() {
+        var text = AlarmTypeText.english();
+        for (var type : BuiltinAlarmTypes.catalog().types()) {
+            var english = text.describe(type, java.util.Locale.ENGLISH);
+            var simplified = text.describe(type, java.util.Locale.SIMPLIFIED_CHINESE);
+            var traditional = text.describe(type, java.util.Locale.TRADITIONAL_CHINESE);
+            assertThat(Set.of(english.condition(), simplified.condition(), traditional.condition())).hasSize(3);
+            assertThat(Set.of(english.recovery(), simplified.recovery(), traditional.recovery())).hasSize(3);
+            assertThat(Set.of(english.guidance(), simplified.guidance(), traditional.guidance())).hasSize(3);
+            assertThat(text.describe(type, java.util.Locale.forLanguageTag("zh-Hant-HK"))).isEqualTo(traditional);
+            assertThat(text.describe(type, java.util.Locale.FRENCH)).isEqualTo(english);
+        }
+    }
     @Test void eventDescriptionsExtendTheSameCatalogWithoutInventingRecoveryOrFallingBackToAnotherType() {
         var type = new AlarmTypeCatalog.Type("test.event", 1, AlarmTypeCatalog.Kind.EVENT, Set.of("pipeline"), "test-provider", "event", List.of(),
                 AlarmSeverity.MINOR, false, "test.event.condition", null, "test.event.guidance");

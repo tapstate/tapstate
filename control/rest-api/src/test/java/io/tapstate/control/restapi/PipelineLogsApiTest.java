@@ -120,6 +120,22 @@ class PipelineLogsApiTest {
     }
 
     @Test
+    void localizesTheSameCapturedLineOnEachRead() {
+        var fields = Map.<String, Object>of("code", "TS0360004", "codeSource", "tapstate-standard",
+                "params", Map.of("source", "orders"), "message", "Captured English cause");
+        context.getBean(FakeLogSink.class).append("pl1", new LogLine(2L, "WARN", "original log", fields));
+        for (var locale : List.of(java.util.Locale.SIMPLIFIED_CHINESE, java.util.Locale.ENGLISH)) {
+            var line = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                    .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                    .header("Accept-Language", locale.toLanguageTag()).retrieve().body(PipelineLogs.class).lines().getFirst();
+            var expected = io.tapstate.messages.MessageCatalog.bundled().render("TS0360004", Map.of("source", "orders"), locale);
+            assertThat(line.message()).isEqualTo("original log");
+            assertThat(line.diagnostic()).containsEntry("message", expected.message())
+                    .containsEntry("solution", expected.solution()).containsEntry("rawMessage", "Captured English cause");
+        }
+    }
+
+    @Test
     void logsHonorsTheRequestedLineLimit() {
         PipelineLogs body = client().get().uri("/api/pipelines/pl1/logs?limit=1")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))

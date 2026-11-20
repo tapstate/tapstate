@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Locale;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -40,8 +41,24 @@ class PipelineStatusResponseTest {
         var mapper = tools.jackson.databind.json.JsonMapper.builder().build();
         assertThat(mapper.readTree(mapper.writeValueAsString(response.failure())).path("diagnostic").path("cause")
                 .path("rawMessage").asText()).isEqualTo("captured cause");
-        assertThat(mapper.readTree(mapper.writeValueAsString(new PipelineStatusResponse.Failure("legacy", java.util.Map.of(), "old")))
+        assertThat(mapper.readTree(mapper.writeValueAsString(new ApiError("legacy", java.util.Map.of(), "old")))
                 .has("diagnostic")).isFalse();
+    }
+
+    @Test
+    void statusFailureRendersMessageAndSolutionInTheRequestedLanguage() {
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0060027",
+                java.util.Map.of("connector", "mysql", "detail", "write refused"));
+        var status = new PipelineStatus("orders", PipelineState.FAILED, null, OBSERVED_AT).diagnosed(failure);
+
+        PipelineStatusResponse response = PipelineStatusResponse.of(status, catalog,
+                Clock.fixed(OBSERVED_AT, ZoneOffset.UTC), Locale.forLanguageTag("zh-CN"));
+
+        assertThat(response.failure().code()).isEqualTo("TS0060027");
+        assertThat(response.failure().params()).containsEntry("detail", "write refused");
+        assertThat(response.failure().message()).contains("\u8fde\u63a5\u5668", "write refused");
+        assertThat(response.failure().solution()).contains("\u68c0\u67e5\u76ee\u6807\u53ef\u8fbe\u6027");
+        assertThat(response.failure().diagnostic()).isEmpty();
     }
 
     @Test

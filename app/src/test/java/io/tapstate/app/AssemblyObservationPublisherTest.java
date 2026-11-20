@@ -54,6 +54,7 @@ class AssemblyObservationPublisherTest {
 
         // An engine whose member reports no live job, so recordCount resolves absent.
         HazelcastInstance member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
         JetService jet = mock(JetService.class);
         when(member.getJet()).thenReturn(jet);
         when(jet.getJob(anyString())).thenReturn(null);

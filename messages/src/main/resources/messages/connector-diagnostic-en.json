@@ -100,8 +100,9 @@
     "solution": "Check the target and retry explicitly when the original test resources have ended."
   },
   "TS0060026": {
-    "message": "Connector '{connector}' could not discover its schema: {detail}.",
-    "solution": "The connector failed while discovering the source model; check the source is reachable and the connection settings are correct."
+    "message": "Connector '{connector}' could not discover its schema.",
+    "solution": "Check that the source database is reachable and the connection settings are correct, then refresh the schema.",
+    "technicalParams": ["detail"]
   },
   "TS0060027": {
     "message": "Connector '{connector}' failed while writing: {detail}.",
@@ -158,5 +159,13 @@
   "TS0060040": {
     "message": "Connector '{connector}' could not let go of what it set up on its source to read changes ({resources}): {detail}.",
     "solution": "The pipeline's state was cleared anyway. Remove what is named here on the source by hand; for a PostgreSQL replication slot, run pg_drop_replication_slot with its name once no session is using it. Until then the source keeps change log for it."
+  },
+  "TS0060041": {
+    "message": "Schema discovery for {connector} timed out while waiting for the database.",
+    "solution": "Check that the database is running and that the connector can reach its host and port, then refresh the schema."
+  },
+  "TS0060042": {
+    "message": "Schema discovery for {connector} was rejected by the database's authentication checks.",
+    "solution": "Check the data source username, password and authentication settings, then refresh its schema. If the credentials are correct, ask the database administrator to check the account."
   }
 }

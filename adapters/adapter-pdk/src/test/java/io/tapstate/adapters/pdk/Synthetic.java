@@ -1557,6 +1557,16 @@ final class Synthetic {
     }
 
     /** A connector whose discoverSchema throws — discovery could not complete, a coded drive failure. */
+    static Path declaredAuthenticationRejectedDiscoverSource(Path dir) {
+        String body = "throw new RuntimeException(new io.tapdata.exception.TapPdkUserPwdInvalidEx(\"demo\", \"fixture\", new java.sql.SQLException(\"password rejected marker\", \"72000\")));";
+        return SyntheticJar.compileToJar(dir, "synthetic.DeclaredAuthenticationDiscover", discoverSource("DeclaredAuthenticationDiscover", body));
+    }
+
+    static Path authenticationRejectedDiscoverSource(Path dir, String sqlState) {
+        String body = "throw new RuntimeException(new java.sql.SQLException(\"password rejected marker\", \"" + sqlState + "\"));";
+        return SyntheticJar.compileToJar(dir, "synthetic.AuthenticationDiscover", discoverSource("AuthenticationDiscover", body));
+    }
+
     static Path throwingDiscoverSource(Path dir) {
         String body = "throw new RuntimeException(\"discover boom\");";
         return SyntheticJar.compileToJar(dir, "synthetic.ThrowingDiscover", discoverSource("ThrowingDiscover", body));

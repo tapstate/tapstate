@@ -762,14 +762,14 @@ pagination, REST and MCP forms, and the difference between an empty retained win
 
 - The read faces lag the write verbs: they report observed state, which converges to
   what you asked for rather than changing with the command. Immediately after `start`,
-  CLI `status` and `metrics` may report `monitor.no-observation` until the first runtime
+  CLI `status` and `metrics` may report `TS0400001` until the first runtime
   observation. During startup, REST `GET /api/pipelines/{id}/status` can show
   `desiredState: "RUNNING"` and `displayState: "STARTING"` while omitting `state` and
   `observedState` until runtime state is available. After
   `stop`, the observed state can still be `RUNNING` until another observation arrives,
   even though the intent is `STOPPED`. `status --watch` streams observed state changes
   only; a known unobserved pipeline or saved draft keeps the watch open without frames,
-  while an unknown id closes with `lifecycle.unknown-pipeline`. Use `--watch`, or retry
+  while an unknown id closes with `TS0280005`. Use `--watch`, or retry
   after another observation arrives.
 - Under the answer, `status` prints two more lines. `moving` is how fast the pipeline moves, in rows
   per second per direction, measured between two readings of the pipeline's own observation time —
@@ -1111,10 +1111,10 @@ is no blanket guarantee of recovery after that history expires.
 | Read mode | Recovery of a running pipeline after a single-member restart |
 | --- | --- |
 | `snapshot_and_cdc` (default) | Skip tables whose initial load this pipeline's sinks already confirmed. Read each unconfirmed table again from the beginning, keeping its recorded snapshot generation and original pre-snapshot CDC position, then resume changes from the recorded position. There is no durable cursor within an unfinished table's snapshot. |
-| `cdc_only` | Take no initial snapshot. Reopen CDC at a saved source checkpoint or proven start anchor. The configured initial `start_from` applies only to fresh initialization. If a previously started channel has neither anchor, restart is refused with `capture.recovery-progress-unproven` and the pipeline becomes `FAILED`. |
+| `cdc_only` | Take no initial snapshot. Reopen CDC at a saved source checkpoint or proven start anchor. The configured initial `start_from` applies only to fresh initialization. If a previously started channel has neither anchor, restart is refused with `TS0350005` and the pipeline becomes `FAILED`. |
 | `snapshot_only` | Read the selected data again for an interrupted active load. There is no CDC recovery chain or durable snapshot row cursor. |
 
-For `capture.recovery-progress-unproven`, keep the retained state for diagnosis.
+For `TS0350005`, keep the retained state for diagnosis.
 Perform a full reload, or explicitly accept a new CDC-only baseline and the missing
 interval. The runtime does not clear retained state automatically.
 

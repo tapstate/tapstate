@@ -36,7 +36,7 @@ If both locator options are present, `element_key` supplies identity and
 `element_key` and use `include_array_index`; the key becomes `(id, item_no)`.
 At least one locator is required. Generated column names must differ from parent
 column names, the array path, and each other. Assembly refuses a known collision with
-`dsl.unwind-column-already-exists` before the job runs. If an extra field absent from
+`TS0010027` before the job runs. If an extra field absent from
 the discovered model appears in a row, the same check stops expansion before that
 row can overwrite it. Choose another generated name or rename the parent field in
 an earlier `map`.
@@ -211,8 +211,8 @@ only the last row for that key. The warning is not an `error_count` increment.
 Choose element keys unique within each parent.
 
 A declaration with neither locator fails validation with
-`dsl.unwind-needs-an-element-key`. An append target fails validation with
-`dsl.unwind-needs-an-upsert-target`: appending a delete would add a row instead of
+`TS0010024`. An append target fails validation with
+`TS0010025`: appending a delete would add a row instead of
 removing the old one. One-time expansion into an append target is also unsupported.
 
 A `map` before or after `unwind` can rename parent key columns; their identity follows

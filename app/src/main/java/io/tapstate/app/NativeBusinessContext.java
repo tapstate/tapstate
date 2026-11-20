@@ -671,21 +671,26 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,
                 PipelineAlertRuntime runtime, CloudRuntimeSettings cloud, Clock clock, AuditGate audit) {
-            return (operation, caller, input) -> {
-                owner.original.requireBusiness();
-                var setup = owner.original.binding().setup();
-                var scope=alertScope(owner,cloud);
-                var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
-                        : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
-                return new AlertManagement(runtime::managementServices, originalCaller -> {
-                    originalCaller.requireActive().run();
-                    if (!owner.active.get() || originalCaller.storageScope().filter(owner.original.preparation().authScope()::equals).isEmpty())
-                        throw ThreeLayerStorePort.refused();
-                    if (!cloud.cloud()) return owner.root.authentication().alertAccess(originalCaller, setup);
-                    return CloudAlertAccess.bind(originalCaller, scope, owner.original.preparation().authScope(), () -> {
-                        owner.original.requireBusiness(); if (!owner.active.get()) throw ThreeLayerStorePort.refused();
-                    });
-                }, runtime::health, scope, deployment, clock, audit).dispatch(operation, caller, input);
+            return new io.tapstate.control.core.AlertControlDispatcher() {
+                @Override public Map<String, Object> dispatch(String operation, io.tapstate.control.core.CredentialAuthentication caller, Map<String, Object> input) {
+                    return dispatch(operation, caller, input, java.util.Locale.ENGLISH);
+                }
+                @Override public Map<String, Object> dispatch(String operation, io.tapstate.control.core.CredentialAuthentication caller, Map<String, Object> input, java.util.Locale locale) {
+                    owner.original.requireBusiness();
+                    var setup = owner.original.binding().setup();
+                    var scope=alertScope(owner,cloud);
+                    var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
+                            : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
+                    return new AlertManagement(runtime::managementServices, originalCaller -> {
+                        originalCaller.requireActive().run();
+                        if (!owner.active.get() || originalCaller.storageScope().filter(owner.original.preparation().authScope()::equals).isEmpty())
+                            throw ThreeLayerStorePort.refused();
+                        if (!cloud.cloud()) return owner.root.authentication().alertAccess(originalCaller, setup);
+                        return CloudAlertAccess.bind(originalCaller, scope, owner.original.preparation().authScope(), () -> {
+                            owner.original.requireBusiness(); if (!owner.active.get()) throw ThreeLayerStorePort.refused();
+                        });
+                    }, runtime::health, scope, deployment, clock, audit).dispatch(operation, caller, input, locale);
+                }
             };
         }
         @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,

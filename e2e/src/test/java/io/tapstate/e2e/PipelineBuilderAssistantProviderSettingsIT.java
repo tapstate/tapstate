@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.control.core.ControlError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.testsupport.RequiresDocker;
@@ -251,7 +252,7 @@ class PipelineBuilderAssistantProviderSettingsIT {
             assertThat(client.send(settingsRequest, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(204);
             var first = assistant(client, server, control, java.util.List.of(Map.of("role", "user", "text", "Choose tables")));
             assertThat(first.statusCode()).isEqualTo(200);
-            assertThat(first.body()).contains("Which source?", "needs-input", "control.ai-invalid-proposal", "\"finishReason\":\"stop\"")
+            assertThat(first.body()).contains("Which source?", "needs-input", ControlError.AI_INVALID_PROPOSAL.code(), "\"finishReason\":\"stop\"")
                     .doesNotContain("data-proposal", "\"type\":\"error\"");
             assertThat(configuration.drafts().get("blank_auto")).contains(originalDraft);
             var second = assistant(client, server, control, java.util.List.of(

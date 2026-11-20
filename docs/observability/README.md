@@ -50,12 +50,12 @@ of claiming that the job is running.
 When runtime state is available but desired intent cannot be read, the response preserves the runtime
 state and includes an `intentReadFailure` object with `code`, `params`, and `message`. If an applied
 Pipeline has no usable runtime state or known transition, the endpoint returns HTTP 500 with
-`io.document-unreadable` and `params.field: "checkpoint"`. A status read for a leftover runtime
+`TS0480004` and `params.field: "checkpoint"`. A status read for a leftover runtime
 observation without a current draft or artifact reports `hasArtifact: false` and omits `displayState`.
 
 The status watch sends observed state changes only. It stays open without frames while a known pipeline or
-saved draft has no observation, and closes an id that is not known with `lifecycle.unknown-pipeline`. Reads
-that need runtime data, such as metrics, snapshot, and explain, continue to return `monitor.no-observation`
+saved draft has no observation, and closes an id that is not known with `TS0280005`. Reads
+that need runtime data, such as metrics, snapshot, and explain, continue to return `TS0400001`
 until the first observation is published.
 
 The snapshot read shows progress for the pipeline's initial load. A replacement run keeps a table's
@@ -72,7 +72,7 @@ changes wait for it until then; each table crosses on its own, so one table can 
 still landing.
 
 `pipeline.explain` requires a current observation. A newly started pipeline may return
-`monitor.no-observation` until its first observation is published. History is independent of the
+`TS0400001` until its first observation is published. History is independent of the
 latest observation and can still return retained samples for a stopped pipeline.
 
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
@@ -256,15 +256,15 @@ The server enforces independent bounds:
 - up to 25,000 scanned raw documents in one request;
 - two output-rate series plus at most 20 selected lag series.
 
-Crossing a runtime bound returns `monitor.query-budget-exceeded`; narrow the time range or select fewer
+Crossing a runtime bound returns `TS0400004`; narrow the time range or select fewer
 tables. Lowering the output limit creates more response pages but does not raise the raw scan budget.
 
 `nextCursor` is always present and is `null` on the last page. When it is non-null, repeat the pipeline
 id, `from`, `to`, `resolution`, `limit`, and every table selector unchanged, and add that cursor. A
 token is opaque, query-bound, and valid for 10 minutes. It
 does not hold a Mongo cursor, transaction, or other server-side session. Changing the query, modifying the
-token, or using a token from another pipeline returns `monitor.invalid-cursor`; an expired token returns
-`monitor.cursor-expired` with HTTP 410. Start a new first-page query in either case.
+token, or using a token from another pipeline returns `TS0400002`; an expired token returns
+`TS0400003` with HTTP 410. Start a new first-page query in either case.
 
 History declares `consistency: "EVENTUAL"`. Keyset pagination does not repeat or skip records visible in
 the ordered walk at each page boundary, but the complete walk is not a database snapshot. A late sample
@@ -425,17 +425,19 @@ given as the most any run saw: how many an instance holds at a given moment vari
 
 ## Coded errors and operator response
 
-Every coded REST error is `{code, params, message}` and carries `Cache-Control: no-store`.
+Every coded REST error contains `{code, params, message}` and carries `Cache-Control: no-store`.
+A localized `solution` is included when available; optional `diagnostic` can include technical
+details, nested causes, and a separately retained original message.
 
 | HTTP | Code | Response |
 |---|---|---|
-| 400 | `TS0210001` (migration candidate; legacy releases use `control.malformed-request`) | Correct timestamps, range, resolution, limit, or selectors. |
-| 400 | `monitor.invalid-cursor` | Repeat the exact query or start a new first page. |
-| 400 | `monitor.query-budget-exceeded` | Narrow the range or select fewer table series. |
+| 400 | `TS0210001` (legacy releases use `control.malformed-request`) | Correct timestamps, range, resolution, limit, or selectors. |
+| 400 | `TS0400002` | Repeat the exact query or start a new first page. |
+| 400 | `TS0400004` | Narrow the range or select fewer table series. |
 | 401/403 | `TS0210003` / `TS0210004` | Supply a valid read-scoped credential. |
-| 404 | `lifecycle.unknown-pipeline` | Check the id and apply the pipeline first. |
-| 404 | `monitor.no-observation` | The pipeline exists; wait for its first observation before retrying reads that require runtime data. |
-| 410 | `monitor.cursor-expired` | Start a new history query; do not resume the old walk. |
+| 404 | `TS0280005` | Check the id and apply the pipeline first. |
+| 404 | `TS0400001` | The pipeline exists; wait for its first observation before retrying reads that require runtime data. |
+| 410 | `TS0400003` | Start a new history query; do not resume the old walk. |
 
 A 200 `NO_RETAINED_SAMPLES` history response is different from every error above. So is an absent
 metric in an otherwise valid page. Keep those states distinct in dashboards and automation.

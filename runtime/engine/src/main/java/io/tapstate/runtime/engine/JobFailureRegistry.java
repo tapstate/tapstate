@@ -69,7 +69,12 @@ public final class JobFailureRegistry {
         if (identity == null) return new Recorder(this, config.getName(), null);
         if (!(identity instanceof java.io.Serializable immutable)) throw new io.tapstate.core.common.TapstateException(
                 EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", config.getName()), null);
-        return attach(config.getName(), jobId, immutable);
+        return forExecution(config.getName(), jobId, immutable);
+    }
+
+    Recorder forExecution(String pipelineId, long jobId, java.io.Serializable identity) {
+        if (pipelineId == null) return Recorder.NONE;
+        return identity == null ? new Recorder(this, pipelineId, null) : attach(pipelineId, jobId, identity);
     }
 
     /** Only initialization/submission may attach; reads of an old handle must never recreate a slot. */

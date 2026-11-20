@@ -880,7 +880,7 @@ class ManagedMongoStoreIsolationIT {
                 });
                 String logged = events.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
                         .collect(java.util.stream.Collectors.joining("\n"));
-                assertThat(logged).contains("code=io.store-unauthorized", "driver_type=MongoSecurityException", "cause_code=18")
+                assertThat(logged).contains("code=TS0480003", "driver_type=MongoSecurityException", "cause_code=18")
                         .doesNotContain(user, PASSWORD, rejectedPassword, "mongodb://");
                 assertThat(events.list).allSatisfy(event -> assertThat(event.getThrowableProxy()).isNull());
             } finally { logger.detachAppender(events); events.stop(); logger.setLevel(previousLevel); }
@@ -1618,7 +1618,7 @@ class ManagedMongoStoreIsolationIT {
                 if (failAfterCompletion) {
                     assertThatThrownBy(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request))
                             .isInstanceOfSatisfying(org.springframework.web.client.HttpServerErrorException.ServiceUnavailable.class,
-                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("\"code\":\"control.storage-unavailable\""));
+                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("\"code\":\"TS0210030\""));
                     org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> injected.get() != null && !root.initialActivationPending());
                 }
                 else try (var callers = java.util.concurrent.Executors.newFixedThreadPool(2)) {

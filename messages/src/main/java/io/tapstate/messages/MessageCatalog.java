@@ -60,7 +60,12 @@ public final class MessageCatalog {
 
     /** Renders the code's message and solution, substituting named placeholders from the args. */
     public Rendered render(TapstateErrorCode code, Map<String, Object> args) {
-        return registered(code.code(), args, Locale.ENGLISH).orElseGet(() -> new Rendered(code.code(), null));
+        return render(code, args, Locale.ENGLISH);
+    }
+
+    /** Localizes a typed product error without consulting historical string-only entries. */
+    public Rendered render(TapstateErrorCode code, Map<String, Object> args, Locale locale) {
+        return registered(code.code(), args, locale).orElseGet(() -> new Rendered(code.code(), null));
     }
 
     /**

@@ -466,6 +466,15 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void aRetiredSharedTailKeepsItsOriginalSafeFailureFact() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report = pendingTailFailure(f, null, true);
+            var fact = report.held().tail().health().failureFact().orElseThrow();
+            assertThat(fact.publicFailure()).isNotNull();
+            assertThat(report.held().run().captureFailureFact("flow")).get().isSameAs(fact);
+        }
+    }
+
     @Test void unavailableRetentionRetriesWithoutEndingTheOriginalCapture() {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var held = ownedShared(f);
@@ -514,6 +523,9 @@ class ScopedPipelineCaptureCoordinatorTest {
         return pendingTailFailure(f,null);
     }
     private static PendingReport pendingTailFailure(Fixture f,CountDownLatch allowClose) {
+        return pendingTailFailure(f, allowClose, false);
+    }
+    private static PendingReport pendingTailFailure(Fixture f,CountDownLatch allowClose,boolean typedFact) {
     var port=mock(PdkCapturePort.class,RETURNS_SELF);f.portOverride.set(port);
     var runtime=mock(PipelineAlertRuntime.class);var storage=mock(StorageBinding.class);
     when(storage.defaultSourceId()).thenReturn("other");
@@ -537,7 +549,12 @@ class ScopedPipelineCaptureCoordinatorTest {
     var ioClosed=new CountDownLatch(1);
     doAnswer(call->{observer.close();drive.close();ioClosed.countDown();if(allowClose!=null)allowClose.await();return null;}).when(held.tail()).close();
     var failure=new TapstateException(ConnectorError.CAPTURE_FAILED,Map.of("connector","fixture","detail","connection failed"),null);
-    var health=held.tail().health();health.recording(mock(CaptureListener.class)).onError(failure);
+    var health=held.tail().health();
+    if (typedFact) health.recording(mock(CaptureListener.class)).onFailure(new io.tapstate.core.common.FailureFact(
+            failure, Map.of("code", failure.code().code(), "rawMessage", "redacted original"),
+            new io.tapstate.core.common.FailureFact.PublicFailure(failure.code().code(),
+                    Map.of("connector", "fixture", "detail", "connection failed"))));
+    else health.recording(mock(CaptureListener.class)).onError(failure);
     assertThat(health.failure()).contains(failure);
     try {assertThat(ioClosed.await(3,TimeUnit.SECONDS)).isTrue();}
     catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}

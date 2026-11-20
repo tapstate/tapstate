@@ -32,6 +32,7 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.TreeMap;
+import java.util.Locale;
 
 /**
  * Projects a coded first-party error onto a structured HTTP response. A {@link TapstateException} — a
@@ -64,10 +65,9 @@ class ApiExceptionHandler {
         if (StorageQuota.isQuotaCode(e.code()))
             e = new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
         markCloudError(e.code());
-        MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
-        var diagnostic = e instanceof io.tapstate.control.core.ConnectionTestRefusal refusal ? refusal.diagnostic() : Map.<String, Object>of();
-        ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message(), diagnostic);
+        var diagnostic = e instanceof io.tapstate.control.core.ConnectionDiagnosticRefusal refusal ? refusal.diagnostic() : Map.<String, Object>of();
+        ApiError body = ApiError.render(e.code(), e.args(), diagnostic, catalog, requestLocale());
         HttpStatus status=statusFor(e.code());
         if(e.code()==io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED
                 &&java.util.Set.of("validation.metadataFrames","validation.processEnvelope","validation.cooperativeHeadroom").contains(e.args().get("limit")))status=HttpStatus.TOO_MANY_REQUESTS;
@@ -76,9 +76,8 @@ class ApiExceptionHandler {
 
     @ExceptionHandler(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition.class)
     ResponseEntity<ApiError> handleValidationConflict(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition failure){
-        MessageCatalog.Rendered rendered=catalog.render(failure.code(),failure.args());
         return ResponseEntity.status(HttpStatus.CONFLICT).cacheControl(CacheControl.noStore())
-                .body(new ApiError(failure.code().code(),new TreeMap<>(failure.args()),rendered.message()));
+                .body(ApiError.render(failure.code(), failure.args(), Map.of(), catalog, requestLocale()));
     }
 
     @ExceptionHandler(UnavailableCodedException.class)
@@ -93,9 +92,7 @@ class ApiExceptionHandler {
      */
     @ExceptionHandler(StartRefusal.class)
     ResponseEntity<StartRefusalError> handle(StartRefusal e) {
-        MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
-        StartRefusalError body = new StartRefusalError(e.code().code(), new TreeMap<>(e.args()),
-                rendered.message(), e.report(), e.decisionsApplied().isEmpty() ? null : e.decisionsApplied());
+        StartRefusalError body = new StartRefusalError(ApiError.render(e.code(), e.args(), Map.of(), catalog, requestLocale()), e.report(), e.decisionsApplied().isEmpty() ? null : e.decisionsApplied());
         return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
     }
 
@@ -116,8 +113,7 @@ class ApiExceptionHandler {
     @ExceptionHandler(BadRequestCodedException.class)
     ResponseEntity<ApiError> handle(BadRequestCodedException e) {
         markCloudError(e.code());
-        MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
-        ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
+        ApiError body = ApiError.render(e.code(), e.args(), Map.of(), catalog, requestLocale());
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).cacheControl(CacheControl.noStore()).body(body);
     }
 
@@ -131,6 +127,28 @@ class ApiExceptionHandler {
         if (request != null && request.getAttribute(CloudAuthenticationObserver.REQUEST_ID_CONTEXT_KEY) != null) {
             request.setAttribute(CloudAuthenticationObserver.ERROR_CODE_CONTEXT_KEY, code.code());
         }
+    }
+
+    static Locale localeFor(HttpServletRequest request) {
+        if (request == null) return Locale.ENGLISH;
+        String accepted = request.getHeader("Accept-Language");
+        if (accepted == null || accepted.isBlank()) return Locale.ENGLISH;
+        try {
+            for (Locale.LanguageRange range : Locale.LanguageRange.parse(accepted)) {
+                Locale locale = Locale.forLanguageTag(range.getRange());
+                if ("en".equals(locale.getLanguage())) return Locale.ENGLISH;
+                if ("zh".equals(locale.getLanguage())) return locale;
+            }
+        } catch (IllegalArgumentException malformed) {
+            return Locale.ENGLISH;
+        }
+        return Locale.ENGLISH;
+    }
+
+    static Locale requestLocale() {
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes)
+            return localeFor(attributes.getRequest());
+        return Locale.ENGLISH;
     }
 
     /**

@@ -68,7 +68,7 @@ public final class Engine {
     private static final Duration PREVIOUS_RUN_BUDGET = Duration.ofSeconds(30);
 
     /** Reserved job metadata carrying the submitting caller's immutable complete execution identity. */
-    public static final String RUN_IDENTITY_ARGUMENT = "tapstate.execution-identity";
+    public static final String RUN_IDENTITY_ARGUMENT = io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT;
     public static final String OPERATOR_MANIFEST_ARGUMENT = "tapstate.operator-manifest";
 
     private final HazelcastInstance member;
@@ -92,6 +92,9 @@ public final class Engine {
     public Engine(HazelcastInstance member, OperatorStateStores operatorStateStores) {
         this.member = Objects.requireNonNull(member, "member");
         this.operatorStateStores = operatorStateStores;
+        member.getUserContext().putIfAbsent(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY,
+                (io.tapstate.core.lifecycle.ExecutionFailureRecorder) (pipelineId, jobId, identity) ->
+                        JobFailureRegistry.of(member).forExecution(pipelineId, jobId, identity)::record);
     }
 
     /**

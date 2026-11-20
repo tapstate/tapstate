@@ -20,7 +20,12 @@ class StoreDiagnosticContractTest {
             code.placeholders().forEach(name -> params.put(name, "value-" + name));
             assertThat(code.severity()).isEqualTo(Severity.ERROR);
             assertThat(code.code()).matches("TS047(?!0000)[0-9]{4}");
-            assertThat(catalog.render(code.code(), params)).isEqualTo(catalog.render(legacy, params));
+            if (code == StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED) {
+                assertThat(catalog.render(legacy, params).message())
+                        .isEqualTo("AI provider settings require configuration schema value-required.");
+                assertThat(catalog.render(code.code(), params).message())
+                        .isEqualTo("AI provider settings require configuration schema version value-required.");
+            } else assertThat(catalog.render(code.code(), params)).isEqualTo(catalog.render(legacy, params));
             var messages = new HashSet<String>();
             for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
                 var text = catalog.render(code.code(), params, locale);

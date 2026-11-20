@@ -291,7 +291,11 @@ public enum ConnectorError implements TapstateErrorCode {
      * there by hand. Reported, never fatal: the clearing completes, because a source that cannot be reached
      * must not leave a pipeline that can neither keep its state nor let go of it.
      */
-    RELEASE_FAILED(ConnectorErrorDefinitions.RELEASE_FAILED);
+    RELEASE_FAILED(ConnectorErrorDefinitions.RELEASE_FAILED),
+
+    DISCOVERY_CONNECTION_TIMEOUT(ConnectorErrorDefinitions.DISCOVERY_CONNECTION_TIMEOUT),
+
+    DISCOVERY_AUTHENTICATION_REJECTED(ConnectorErrorDefinitions.DISCOVERY_AUTHENTICATION_REJECTED);
 
     static final class Parameters {
         static final String TIMEOUT = "timeout";

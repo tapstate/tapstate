@@ -86,6 +86,29 @@ class ControlPlaneTest {
     }
 
     @Test
+    void onlyStartupStorageUnavailabilityIsPending() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            AtomicInteger reads = new AtomicInteger();
+            fixture.server.createContext("/api/storage/status", exchange -> {
+                int read = reads.incrementAndGet();
+                Map<String, String> reply = switch (read) {
+                    case 1 -> Map.of("code", "TS0210030");
+                    case 2 -> Map.of("code", io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE.code());
+                    default -> Map.of("businessPhase", "READY");
+                };
+                byte[] bytes = JsonWriter.write(reply).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(read < 3 ? 503 : 200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            assertThat(fixture.control.storageStatusDuringStartup()).isEmpty();
+            assertThatThrownBy(fixture.control::storageStatusDuringStartup)
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("503");
+            assertThat(fixture.control.storageStatusDuringStartup().orElseThrow().get("businessPhase"))
+                    .isEqualTo("READY");
+        }
+    }
+
+    @Test
     void readsThePublishedState() {
         assertThat(ControlPlane.interpretState(200, status("RUNNING"), PIPELINE)).contains(PipelineState.RUNNING);
     }

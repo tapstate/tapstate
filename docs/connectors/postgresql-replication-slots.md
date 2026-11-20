@@ -61,7 +61,7 @@ pipeline has not landed yet is in Tapstate's change log. So while pipelines are 
   since the backup, and the source no longer has them.
 
 If the log no longer has a change a pipeline still needs, the pipeline does not skip it: it stops with
-`capture.recovery-log-gap`. Rerun it with `restart <pipeline> --rerun`, which reads the source again.
+`TS0350004`. Rerun it with `restart <pipeline> --rerun`, which reads the source again.
 
 ## Pipelines that read the source directly
 
@@ -145,5 +145,5 @@ With every pipeline on that database running, an inactive one is not in use, and
 the slot is inactive, which is why every pipeline is started first.
 
 A pipeline whose recorded position an earlier version wrote without enough to resume from safely stops at
-its first start with `capture.recovery-progress-unproven`, and keeps its state for you to look at. Rerun it
+its first start with `TS0350005`, and keeps its state for you to look at. Rerun it
 with `restart <pipeline> --rerun`.

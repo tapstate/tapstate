@@ -201,6 +201,19 @@ final class ControlPlane {
     /** Reads admission through the same native snapshot used by the application. */
     Map<?, ?> storageStatus() {
         var response = send(authed("/api/storage/status", "{}"));
+        return readStorageStatus(response);
+    }
+
+    Optional<Map<?, ?>> storageStatusDuringStartup() {
+        var response = send(authed("/api/storage/status", "{}"));
+        if (response.statusCode() == 503
+                && io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        return Optional.of(readStorageStatus(response));
+    }
+
+    private static Map<?, ?> readStorageStatus(HttpResponse<String> response) {
         expect(response, 200, "read native storage admission");
         return (Map<?, ?>) JsonReader.parse(response.body());
     }

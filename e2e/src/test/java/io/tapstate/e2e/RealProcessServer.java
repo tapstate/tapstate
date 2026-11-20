@@ -47,6 +47,13 @@ final class RealProcessServer implements ServerHandle {
     // Keep closed reservations too: a delayed launch or cleanup must never refer to a port handed
     // to a later launch in this JVM. Open reservations protect members not yet launched from reuse.
     private static final Map<Integer, Socket> PORT_RESERVATIONS = new LinkedHashMap<>();
+    private static final int FIRST_FIXTURE_PORT = 10_000;
+    private static final int FIXTURE_PORT_LIMIT = 20_000;
+    private static final int PORTS_PER_BLOCK = 100;
+    private static final Map<Integer, java.nio.channels.FileLock> PORT_BLOCKS = new LinkedHashMap<>();
+    private static java.nio.channels.FileChannel portBlockFile;
+    private static int nextFixturePort = java.util.concurrent.ThreadLocalRandom.current()
+            .nextInt(FIRST_FIXTURE_PORT, FIXTURE_PORT_LIMIT);
 
     private final Process process;
     private Runnable beforeClose = () -> { };
@@ -844,28 +851,47 @@ final class RealProcessServer implements ServerHandle {
 
     private static synchronized int freePort() {
         try {
-            while (true) {
+            for (int tried = 0; tried < FIXTURE_PORT_LIMIT - FIRST_FIXTURE_PORT; tried++) {
+                int port = nextFixturePort++;
+                if (nextFixturePort == FIXTURE_PORT_LIMIT) nextFixturePort = FIRST_FIXTURE_PORT;
+                if (PORT_RESERVATIONS.containsKey(port) || !claimPortBlock(port)) continue;
                 Socket socket = new Socket();
                 try {
-                    // Members bind a routable address, links bind loopback, and HTTP can bind both.
-                    // Disallow address reuse so the reservation owns the port on every local address.
-                    // A bound client socket reserves without listening to a member's discovery dials.
+                    // Keep listener handoff ports outside OS client-ephemeral ranges and the
+                    // fixture's 20000-29999 member-outbound range. Startup may take several seconds
+                    // after release, during which bind(0) client connections could steal the port.
                     socket.setReuseAddress(false);
-                    socket.bind(new InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0));
-                    int port = socket.getLocalPort();
-                    if (!PORT_RESERVATIONS.containsKey(port)) {
-                        PORT_RESERVATIONS.put(port, socket);
-                        return port;
-                    }
+                    socket.bind(new InetSocketAddress(InetAddress.getByName("0.0.0.0"), port));
+                    PORT_RESERVATIONS.put(port, socket);
+                    return port;
+                } catch (java.net.BindException occupied) {
+                    socket.close();
                 } catch (IOException failure) {
                     socket.close();
                     throw failure;
                 }
-                socket.close();
             }
+            throw new IOException("all fixture listener ports are reserved or occupied");
         } catch (IOException e) {
             throw new UncheckedIOException("could not reserve a port for the server", e);
         }
+    }
+
+    /** One file channel retains disjoint port blocks for this fixture JVM's entire lifetime. */
+    private static boolean claimPortBlock(int port) throws IOException {
+        int block = (port - FIRST_FIXTURE_PORT) / PORTS_PER_BLOCK;
+        if (PORT_BLOCKS.containsKey(block)) return true;
+        if (portBlockFile == null) {
+            Path file = Path.of(System.getProperty("java.io.tmpdir"),
+                    "tapstate-e2e-listener-port-blocks-" + System.getProperty("user.name"));
+            portBlockFile = java.nio.channels.FileChannel.open(file,
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.READ,
+                    java.nio.file.StandardOpenOption.WRITE);
+        }
+        var lock = portBlockFile.tryLock(block, 1, false);
+        if (lock == null) return false;
+        PORT_BLOCKS.put(block, lock);
+        return true;
     }
 
     /** Releases only a reservation made here, immediately before its listener takes the port. */

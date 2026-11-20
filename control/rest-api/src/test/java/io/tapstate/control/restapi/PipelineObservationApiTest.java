@@ -454,6 +454,23 @@ class PipelineObservationApiTest {
     }
 
     @Test
+    void explanationLocalizesTheTypedRuntimeFailureAndKeepsCapturedEvidence() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl3/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .header("Accept-Language", "zh-CN, en;q=0.8")
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        List<Map<String, Object>> evidence = (List<Map<String, Object>>) body.get("evidence");
+        Map<?, ?> failure = (Map<?, ?>) evidence.stream().filter(item -> item.get("field").equals("failure"))
+                .findFirst().orElseThrow().get("value");
+
+        assertThat(failure.get("code")).isEqualTo("TS0440008");
+        assertThat(failure.get("params")).isEqualTo(Map.of("pipeline", "pl3", "cause", "the sink rejected the batch"));
+        assertThat((String) failure.get("message")).contains("\u56e0\u4f5c\u4e1a\u5931\u8d25", "the sink rejected the batch");
+        assertThat((String) failure.get("solution")).contains("\u67e5\u770b Pipeline \u65e5\u5fd7");
+        assertThat(failure.get("diagnostic")).isEqualTo(Map.of("rawMessage", "safe captured cause"));
+    }
+
+    @Test
     void explainReturnsTheSharedTypedShapeWithoutCachingIt() {
         ResponseEntity<Map<String, Object>> response = client().get().uri("/api/pipelines/pl1/explain")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))

@@ -14,7 +14,8 @@ class StreamLivenessTest {
         var closed = new CountDownLatch(1);
         var socket = new Socket();
         var live = new StreamLiveness(Duration.ofNanos(1), Duration.ofSeconds(10), closed);
-        long now = System.nanoTime();
+        // Advance the test clock past the constructor deadline even on a coarse monotonic clock.
+        long now = System.nanoTime() + Duration.ofSeconds(1).toNanos();
         live.tick(socket, now);
         live.pong(ByteBuffer.wrap(new byte[] {1}), now);
         live.pong(ByteBuffer.allocate(8).putLong(99).flip(), now);
@@ -28,9 +29,10 @@ class StreamLivenessTest {
         var closed = new CountDownLatch(1);
         var socket = new Socket();
         var live = new StreamLiveness(Duration.ofNanos(1), Duration.ofSeconds(10), closed);
-        live.tick(socket, System.nanoTime());
-        live.pong(socket.payload, System.nanoTime());
-        live.tick(socket, System.nanoTime());
+        long now = System.nanoTime() + Duration.ofSeconds(1).toNanos();
+        live.tick(socket, now);
+        live.pong(socket.payload, now);
+        live.tick(socket, now + 1);
         assertThat(closed.getCount()).isEqualTo(1);
         assertThat(socket.pings).isEqualTo(2);
     }
@@ -40,7 +42,7 @@ class StreamLivenessTest {
         var closed = new CountDownLatch(1);
         var socket = new Socket();
         var live = new StreamLiveness(Duration.ofNanos(1), Duration.ofNanos(1), closed);
-        long now = System.nanoTime();
+        long now = System.nanoTime() + Duration.ofSeconds(1).toNanos();
         live.tick(socket, now);
         live.pong(socket.payload, now + 1);
         assertThat(closed.getCount()).isZero();
@@ -52,8 +54,9 @@ class StreamLivenessTest {
         var socket = new Socket();
         socket.write = CompletableFuture.failedFuture(new java.io.IOException("peer closed"));
         var live = new StreamLiveness(Duration.ofNanos(1), Duration.ofSeconds(10), closed);
-        live.tick(socket, System.nanoTime());
-        live.tick(socket, System.nanoTime());
+        long now = System.nanoTime() + Duration.ofSeconds(1).toNanos();
+        live.tick(socket, now);
+        live.tick(socket, now + 1);
         assertThat(closed.getCount()).isZero();
         assertThat(socket.pings).isEqualTo(1);
     }
@@ -64,7 +67,8 @@ class StreamLivenessTest {
         var socket = new Socket();
         socket.throwOnWrite = true;
         var live = new StreamLiveness(Duration.ofNanos(1), Duration.ofSeconds(10), closed);
-        live.tick(socket, System.nanoTime());
+        long now = System.nanoTime() + Duration.ofSeconds(1).toNanos();
+        live.tick(socket, now);
         assertThat(closed.getCount()).isZero();
     }
 

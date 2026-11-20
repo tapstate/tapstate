@@ -235,6 +235,32 @@ class ApiExceptionHandlerTest {
     }
 
     @Test
+    void aDslRefusalUsesTheRequestedLanguageAndIncludesItsNextStep() {
+        RequestAttributes previous = RequestContextHolder.getRequestAttributes();
+        try {
+            var request = new MockHttpServletRequest();
+            request.addHeader("Accept-Language", "zh-CN, en;q=0.8");
+            RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+
+            var failure = new TapstateException(DslError.MISSING_REFERENCE,
+                    Map.of("path", "transforms[0].from", "ref", "missing-table"), null);
+            ResponseEntity<ApiError> response = handler.handle(failure);
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(response.getBody().code()).isEqualTo("TS0010005");
+            assertThat(response.getBody().params()).containsEntry("ref", "missing-table")
+                    .containsEntry("path", "transforms[0].from");
+            assertThat(response.getBody().message()).contains("missing-table", "transforms[0].from")
+                    .doesNotContain("Reference '");
+            assertThat(response.getBody().solution()).contains("\u8bf7\u521b\u5efa\u8d44\u6e90", "missing-table", "transforms[0].from")
+                    .doesNotContain("Define the referenced resource");
+        } finally {
+            if (previous == null) RequestContextHolder.resetRequestAttributes();
+            else RequestContextHolder.setRequestAttributes(previous);
+        }
+    }
+
+    @Test
     void aMalformedRequestIsABadRequestWithACodedRenderedBody() {
         // A request refused at the boundary as structurally malformed is a client input error like dsl.*: a 400
         // with a coded body whose reason is substituted into the catalog template, not left as the bare code.

@@ -150,6 +150,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     // Times each read of the ring that produced something, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.SOURCE);
     private SourceArrivals arrivals = SourceArrivals.of(null);
+    private java.util.function.Consumer<Throwable> failures;
 
     @Override
     public void holdChangesUntil(List<AwaitedLoad> awaited, LoadLandings landings) {
@@ -159,6 +160,21 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     @Override
     protected void init(Context context) {
+        Object recorder = context.hazelcastInstance().getUserContext()
+                .get(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY);
+        failures = recorder instanceof io.tapstate.core.lifecycle.ExecutionFailureRecorder bound
+                ? bound.forExecution(context.jobConfig().getName(), context.jobId(), context.jobConfig()
+                        .getArgument(io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT))
+                : null;
+        try {
+            initialize(context);
+        } catch (RuntimeException | Error failure) {
+            if (failures != null) failures.accept(failure);
+            throw failure;
+        }
+    }
+
+    private void initialize(Context context) {
         this.timer = StageTimer.of(stage(), context);
         this.arrivals = SourceArrivals.of(context);
         // Take what the capture side has already buffered for this ring before opening the ring reader, so
@@ -234,6 +250,15 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     @Override
     public boolean complete() {
+        try {
+            return drain();
+        } catch (RuntimeException | Error failure) {
+            if (failures != null) failures.accept(failure);
+            throw failure;
+        }
+    }
+
+    private boolean drain() {
         // Emit anything held back by earlier backpressure before reading more: the cursor only advances as
         // fill reads, so a change the outbox refused stays buffered until it is taken, never re-read nor lost.
         // A bound the outbox refused is offered again the same way, before anything more is read: it was

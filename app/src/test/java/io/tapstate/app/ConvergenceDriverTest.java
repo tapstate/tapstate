@@ -311,6 +311,8 @@ class ConvergenceDriverTest {
     void aFirstPartyFailureWithoutConnectorContextKeepsItsStructuredLogCode() {
         var logger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
         var captured = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         captured.start(); logger.addAppender(captured);
         var actuator = new FailingActuator();
         var current = new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
@@ -321,7 +323,7 @@ class ConvergenceDriverTest {
             actuator.fact = new io.tapstate.core.common.FailureFact(new io.tapstate.core.common.TapstateException(
                     code, Map.of("source", "original_source"), null));
             driver.reconcile();
-        } finally { logger.detachAppender(captured); captured.stop(); }
+        } finally { logger.detachAppender(captured); captured.stop(); logger.setLevel(previousLevel); }
         assertThat(captured.list).singleElement().satisfies(event -> {
             var diagnostic = PipelineLogAppender.diagnostic(event, new io.tapstate.core.logging.SecretRedactor());
             assertThat(diagnostic).containsEntry("code", code.code()).containsEntry("codeSource", "tapstate-standard")
@@ -336,6 +338,8 @@ class ConvergenceDriverTest {
     void aCapturedConnectorFailureDoesNotSendRawSecretsToAnyLogAppender() {
         var logger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
         var captured = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         captured.start(); logger.addAppender(captured);
         var actuator = new FailingActuator();
         var current = new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
@@ -350,7 +354,7 @@ class ConvergenceDriverTest {
             actuator.fact = new io.tapstate.core.common.FailureFact(raw, diagnostic,
                     new io.tapstate.core.common.FailureFact.PublicFailure(code.code(), safe));
             driver.reconcile();
-        } finally { logger.detachAppender(captured); captured.stop(); }
+        } finally { logger.detachAppender(captured); captured.stop(); logger.setLevel(previousLevel); }
         assertThat(captured.list).singleElement().satisfies(event -> {
             assertThat(PipelineLogAppender.diagnostic(event, new io.tapstate.core.logging.SecretRedactor()))
                     .containsAllEntriesOf(diagnostic);

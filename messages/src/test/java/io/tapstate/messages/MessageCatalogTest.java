@@ -207,6 +207,53 @@ class MessageCatalogTest {
     }
 
     @Test
+    void localizedTypedDslErrorsCarryTheirRegisteredMessageAndSolution() {
+        var args = Map.<String, Object>of("path", "transforms[0].from", "ref", "missing-table");
+        var english = EN.render(DslError.MISSING_REFERENCE, args, Locale.ENGLISH);
+        var simplified = EN.render(DslError.MISSING_REFERENCE, args, Locale.SIMPLIFIED_CHINESE);
+        var traditional = EN.render(DslError.MISSING_REFERENCE, args, Locale.TRADITIONAL_CHINESE);
+
+        assertThat(english.message()).contains("missing-table", "transforms[0].from");
+        assertThat(english.solution()).contains("Define the referenced resource", "missing-table");
+        assertThat(simplified.message()).contains("missing-table", "transforms[0].from");
+        assertThat(simplified.solution()).contains("missing-table");
+        assertThat(traditional.message()).contains("missing-table", "transforms[0].from");
+        assertThat(traditional.solution()).contains("missing-table");
+        assertThat(simplified.message()).isNotEqualTo(english.message()).isNotEqualTo(traditional.message());
+        assertThat(simplified.solution()).isNotEqualTo(english.solution()).isNotEqualTo(traditional.solution());
+    }
+
+    @Test
+    void validationOutputUsesAReadableLabelWithoutChangingTheDiagnosticPath() {
+        var args = new HashMap<String, Object>(Map.of("path", "validation.output", "ref", "orders_view"));
+        for (var language : Map.of(Locale.ENGLISH, "data validation output resource",
+                Locale.SIMPLIFIED_CHINESE, "\u6570\u636e\u6821\u9a8c\u7684\u8f93\u51fa\u8d44\u6e90",
+                Locale.TRADITIONAL_CHINESE, "\u8cc7\u6599\u6821\u9a57\u7684\u8f38\u51fa\u8cc7\u6e90").entrySet()) {
+            var rendered = EN.render(DslError.MISSING_REFERENCE, args, language.getKey());
+            assertThat(rendered.message()).contains(language.getValue(), "orders_view").doesNotContain("validation.output");
+            assertThat(rendered.solution()).contains(language.getValue(), "orders_view");
+            assertThat(args).containsEntry("path", "validation.output");
+        }
+        var other = EN.render(DslError.MISSING_REFERENCE,
+                Map.of("path", "transforms[0].from", "ref", "validation.output"));
+        assertThat(other.message()).contains("transforms[0].from", "validation.output");
+    }
+
+    @Test
+    void discoverySummariesKeepNativeDetailsInParametersAndDescribeAnAuthenticationRefusal() {
+        var original = Map.<String, Object>of("connector", "postgres", "detail", "raw-driver-error-marker");
+        for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+            var generic = EN.render("TS0060026", original, locale);
+            assertThat(generic.message()).contains("postgres").doesNotContain("raw-driver-error-marker");
+            assertThat(generic.solution()).doesNotContain("raw-driver-error-marker");
+            var authentication = EN.render("TS0060042", Map.of("connector", "postgres"), locale);
+            assertThat(authentication.message()).contains("postgres").doesNotContain("TS0060042");
+            assertThat(authentication.solution()).isNotBlank();
+        }
+        assertThat(original).containsEntry("detail", "raw-driver-error-marker");
+    }
+
+    @Test
     void everyDslCodeRendersFullyWithNoLeftoverPlaceholders() {
         for (DslError code : DslError.values()) {
             Map<String, Object> args = new HashMap<>();

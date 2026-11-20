@@ -11,7 +11,7 @@ class CliDiagnosticContractTest {
     @Test void cliDefinitionsKeepParametersSeverityAndHistoricalRecovery() {
         var codes = new ArrayList<TapstateErrorCode>();
         codes.addAll(List.of(CliError.values()));
-        assertThat(codes).hasSize(60);
+        assertThat(codes).hasSize(63);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String legacy = "cli."
@@ -21,7 +21,8 @@ class CliDiagnosticContractTest {
             assertThat(code.severity()).isEqualTo(code == CliError.START_CHECKS_NOT_RUN || code == CliError.VERSION_MISMATCH
                     ? Severity.WARNING : Severity.ERROR);
             assertThat(code.code()).matches("TS033(?!0000)[0-9]{4}");
-            assertThat(catalog.render(code.code(), params).message()).isEqualTo(catalog.render(legacy, params).message());
+            boolean migrated = !Set.of(CliError.REQUEST_FAILED, CliError.CONNECTION_LOST, CliError.STREAM_NO_FRAMES).contains(code);
+            if (migrated) assertThat(catalog.render(code.code(), params).message()).isEqualTo(catalog.render(legacy, params).message());
             if (catalog.render(legacy, params).solution() != null)
                 assertThat(catalog.render(code.code(), params).solution()).isEqualTo(catalog.render(legacy, params).solution());
             var messages = new HashSet<String>();

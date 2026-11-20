@@ -66,13 +66,27 @@ public final class ProductDiagnosticCatalog implements DiagnosticDefinitionLooku
             Map<String, MessageCatalog.Rendered> templates = new LinkedHashMap<>();
             definitions.forEach((code, definition) -> {
                 if (!(entries.get(code) instanceof Map<?, ?> entry)
-                        || !entry.keySet().equals(Set.of("message", "solution"))
+                        || !entry.keySet().equals(entry.containsKey("technicalParams")
+                                ? Set.of("message", "solution", "technicalParams") : Set.of("message", "solution"))
                         || !(entry.get("message") instanceof String message) || message.isBlank()
                         || !(entry.get("solution") instanceof String solution) || solution.isBlank())
                     throw new IllegalStateException("invalid language entry " + language + "/" + code);
                 Set<String> used = new HashSet<>();
                 collectParameters(message, used);
                 collectParameters(solution, used);
+                // Technical arguments remain mandatory wire facts but never enter the human summary.
+                Set<String> technical = new HashSet<>();
+                if (entry.containsKey("technicalParams")) {
+                    if (!(entry.get("technicalParams") instanceof List<?> names))
+                        throw new IllegalStateException("invalid technical diagnostic parameters " + language + "/" + code);
+                    for (Object name : names) {
+                        if (!(name instanceof String text) || !NAME.matcher(text).matches() || !technical.add(text))
+                            throw new IllegalStateException("invalid technical diagnostic parameter " + language + "/" + code);
+                    }
+                }
+                if (!java.util.Collections.disjoint(used, technical))
+                    throw new IllegalStateException("technical diagnostic parameter occurs in summary " + language + "/" + code);
+                used.addAll(technical);
                 if (!used.equals(definition.parameters()))
                     throw new IllegalStateException("incorrect diagnostic parameters " + language + "/" + code);
                 templates.put(code, new MessageCatalog.Rendered(message, solution));

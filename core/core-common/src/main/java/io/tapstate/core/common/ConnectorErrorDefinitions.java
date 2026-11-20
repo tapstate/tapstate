@@ -88,6 +88,12 @@ public final class ConnectorErrorDefinitions {
     public static final ProductErrorDefinition RELEASE_FAILED =
             DEFINITIONS.define(40, Severity.ERROR, Set.of("connector", "detail", "resources"));
 
+    public static final ProductErrorDefinition DISCOVERY_CONNECTION_TIMEOUT =
+            DEFINITIONS.define(41, Severity.ERROR, Set.of("connector"));
+
+    public static final ProductErrorDefinition DISCOVERY_AUTHENTICATION_REJECTED =
+            DEFINITIONS.define(42, Severity.ERROR, Set.of("connector"));
+
     private ConnectorErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

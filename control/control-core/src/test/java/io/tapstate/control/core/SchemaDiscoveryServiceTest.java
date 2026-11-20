@@ -117,6 +117,34 @@ class SchemaDiscoveryServiceTest {
     }
 
     @Test
+    void discoveryFailuresKeepOnlyRedactedNativeTextInTheirTechnicalDiagnostic() {
+        for (var definition : List.of(io.tapstate.core.common.ConnectorErrorDefinitions.DISCOVER_FAILED,
+                io.tapstate.core.common.ConnectorErrorDefinitions.DISCOVERY_CONNECTION_TIMEOUT,
+                io.tapstate.core.common.ConnectorErrorDefinitions.DISCOVERY_AUTHENTICATION_REJECTED)) {
+            var code = new io.tapstate.core.common.TapstateErrorCode() {
+                public String code() { return definition.code(); }
+                public io.tapstate.core.common.Severity severity() { return definition.severity(); }
+                public java.util.Set<String> placeholders() { return definition.parameters(); }
+            };
+            var params = new java.util.HashMap<String, Object>();
+            params.put("connector", "postgres");
+            if (definition.parameters().contains("detail")) params.put("detail", "native refusal with private-secret");
+            var failure = new TapstateException(code, params, new java.sql.SQLException("native refusal with private-secret", "28P01"));
+            var service = new SchemaDiscoveryService(config -> { throw failure; }, new RecordingSchemaStore(),
+                    gate(new RecordingAuditStore()), fixedClock(), null, SourceConnectionResolver.forAdHocConnections());
+            assertThatThrownBy(() -> service.discover("source-1", "postgres", Map.of("password", "private-secret"), "alice"))
+                    .isInstanceOfSatisfying(ConnectionDiagnosticRefusal.class, safe -> {
+                        assertThat(safe.diagnostic()).containsEntry("code", definition.code())
+                                .containsEntry("codeSource", "tapstate-standard");
+                        assertThat(safe.diagnostic().get("rawMessage")).asString()
+                                .contains("native refusal", "<redacted>").doesNotContain("private-secret");
+                        if (definition.parameters().contains("detail"))
+                            assertThat(safe.args()).containsEntry("detail", "native refusal with <redacted>");
+                    });
+        }
+    }
+
+    @Test
     void requiresItsCollaborators() {
         SchemaDiscoveryProbe probe = config -> MODEL;
         RecordingSchemaStore store = new RecordingSchemaStore();

@@ -45,6 +45,23 @@ class ProductDiagnosticCatalogTest {
     }
 
     @Test
+    void explicitlyTechnicalParametersRemainRequiredWithoutEnteringTheHumanSummary() {
+        var definition = new ProductDiagnosticCatalog.Definition(CODE, Set.of("reason", "detail"));
+        String resource = "{\"TS0210001\":{\"message\":\"Invalid request: {reason}\",\"solution\":\"Correct the request.\",\"technicalParams\":[\"detail\"]}}";
+        var catalog = ProductDiagnosticCatalog.load("021", List.of(definition), language -> resource);
+        var params = Map.<String, Object>of("reason", "missing id", "detail", "original-driver-detail");
+        var result = catalog.resolve(CODE, params, List.of(), Locale.ENGLISH).orElseThrow();
+        assertThat(result.message()).isEqualTo("Invalid request: missing id");
+        assertThat(result.message() + result.solution()).doesNotContain("original-driver-detail");
+        assertThat(params).containsEntry("detail", "original-driver-detail");
+        assertThat(catalog.resolve(CODE, Map.of("reason", "missing id"), List.of(), Locale.ENGLISH)).isEmpty();
+        for (String invalid : List.of("[\"unknown\"]", "[\"detail\",\"detail\"]", "\"detail\"", "[null]"))
+            assertThatThrownBy(() -> ProductDiagnosticCatalog.load("021", List.of(definition),
+                    language -> resource.replace("[\"detail\"]", invalid)))
+                    .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
     void unknownLegacyAndPositionalInputsAreLeftToTheirOwningAdapter() {
         var catalog = ProductDiagnosticCatalog.load("021", List.of(DEFINITION), language -> RESOURCE);
         var args = Map.<String, Object>of("reason", "missing id");

@@ -24,7 +24,7 @@
     "solution": "Check the store URI setting; it must start with mongodb:// or mongodb+srv://."
   },
   "TS0470007": {
-    "message": "AI provider settings require configuration schema {required}.",
+    "message": "AI provider settings require configuration schema version {required}.",
     "solution": "Keep using the existing non-AI configuration, or explicitly initialize a supported configuration database. No automatic upgrade is performed."
   },
   "TS0470008": {

@@ -1,6 +1,5 @@
 package io.tapstate.control.restapi;
 
-import io.tapstate.control.core.ConnectionTestReport;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
 import io.tapstate.control.core.SchemaDiscoveryService;
@@ -29,6 +28,7 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 class ConnectionController {
 
+    private final io.tapstate.messages.MessageCatalog catalog;
     private final ConnectionTestService testService;
     private final ConnectionTestResultQueryService resultQueryService;
     private final SchemaDiscoveryService schemaDiscoveryService;
@@ -38,7 +38,8 @@ class ConnectionController {
             ConnectionTestService testService,
             ConnectionTestResultQueryService resultQueryService,
             SchemaDiscoveryService schemaDiscoveryService,
-            SchemaQueryService schemaQueryService) {
+            SchemaQueryService schemaQueryService, io.tapstate.messages.MessageCatalog catalog) {
+        this.catalog = catalog;
         this.testService = testService;
         this.resultQueryService = resultQueryService;
         this.schemaDiscoveryService = schemaDiscoveryService;
@@ -47,14 +48,14 @@ class ConnectionController {
 
     @Verb("connection.test")
     @PostMapping("/connections:test")
-    ConnectionTestReport test(@RequestBody(required = false) ConnectionTestRequest request) {
+    ConnectionTestResponse test(@RequestBody(required = false) ConnectionTestRequest request) {
         // Refuse a missing / blank-field body at the boundary as a coded 400, rather than letting a null trip
         // the connection-config invariant guard deeper down (a 500).
         ConnectionTestRequest body =
                 MalformedRequest.require(request, "the request must carry a connection to test");
         MalformedRequest.requireText(body.id(), "a connection `id` is required");
         MalformedRequest.requireText(body.connectorId(), "a `connectorId` is required");
-        try { return testService.test(body.id(), body.connectorId(), body.settings(), AuthenticatedCaller.subject()); }
+        try { return ConnectionTestResponse.from(testService.test(body.id(), body.connectorId(), body.settings(), AuthenticatedCaller.subject()), catalog, ApiExceptionHandler.requestLocale()); }
         catch (io.tapstate.core.common.TapstateException failure) {
             if (io.tapstate.core.common.ConnectorErrorDefinitions.INSTANCES_BUSY.code().equals(failure.code().code())
                     || "connector.instances-busy".equals(failure.code().code())) throw new UnavailableCodedException(failure);
@@ -64,11 +65,11 @@ class ConnectionController {
 
     @Verb("connection.test-result")
     @GetMapping("/connections/{id}/test-result")
-    ResponseEntity<ConnectionTestReport> testResult(@PathVariable("id") String id) {
+    ResponseEntity<ConnectionTestResponse> testResult(@PathVariable("id") String id) {
         // ResponseEntity.of maps a stored result to 200 and a never-tested connection to 404, with no error
         // logic here. The path variable is named explicitly: this build compiles without -parameters, so an
         // inferred name would not resolve at runtime.
-        return ResponseEntity.of(resultQueryService.find(id));
+        return ResponseEntity.of(resultQueryService.find(id).map(report -> ConnectionTestResponse.from(report, catalog, ApiExceptionHandler.requestLocale())));
     }
 
     @Verb("connection.discover-schema")
