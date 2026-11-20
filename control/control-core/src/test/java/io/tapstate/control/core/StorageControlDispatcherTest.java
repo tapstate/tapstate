@@ -242,6 +242,53 @@ class StorageControlDispatcherTest {
             assertThat(error.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE); assertThat(error.args()).isEmpty(); assertThat(error.getCause()).isNull();
         });
     }
+    @Test void migratedStoreDefinitionsPreserveTheStorageSafetyBoundary() {
+        var allowed = Set.of(io.tapstate.core.common.StoreErrorDefinitions.STORAGE_CONNECTION_UNSUPPORTED,
+                io.tapstate.core.common.StoreErrorDefinitions.INVALID_URI,
+                io.tapstate.core.common.StoreErrorDefinitions.TLS_TRUST_INVALID,
+                io.tapstate.core.common.StoreErrorDefinitions.INITIALIZATION_REFUSED);
+        for (var definition : io.tapstate.core.common.StoreErrorDefinitions.registered()) {
+            var code = new io.tapstate.core.common.TapstateErrorCode() {
+                public String code() { return definition.code(); }
+                public io.tapstate.core.common.Severity severity() { return definition.severity(); }
+                public Set<String> placeholders() { return definition.parameters(); }
+            };
+            var f = new Fixture();
+            var caller = StorageControlAccess.ordinary(StorageBinding.Mode.OP,SCOPE,
+                    new CacheAuthScope(SCOPE.clusterId(),1,StorageBinding.Mode.OP,"incarnation",1),
+                    TapstatePrincipal.humanJwt(new VerifiedToken("admin",Scope.ADMIN)),null,
+                    () -> { throw new TapstateException(code, allowed.contains(definition) ? Map.of()
+                            : Map.of("driverSecret", "mongodb://user:sentinel-password@host/config"),
+                            new IllegalArgumentException("sentinel-cause")); });
+            assertThatThrownBy(() -> f.dispatcher().dispatch("storage.status",caller,Map.of()))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> {
+                        assertThat(error.code()).isSameAs(allowed.contains(definition) ? code : ControlError.STORAGE_UNAVAILABLE);
+                        assertThat(error.args()).isEmpty();
+                        assertThat(error.getCause()).isNull();
+                    });
+        }
+    }
+    @Test void unregisteredAndOtherModuleCodesDoNotAcquireStoreClassification() {
+        for (String identity : List.of("TS0479999", "TS0489999", "TS0440008")) {
+            var code = new io.tapstate.core.common.TapstateErrorCode() {
+                public String code() { return identity; }
+                public io.tapstate.core.common.Severity severity() { return io.tapstate.core.common.Severity.ERROR; }
+                public Set<String> placeholders() { return Set.of("reason"); }
+            };
+            var f = new Fixture();
+            var caller = StorageControlAccess.ordinary(StorageBinding.Mode.OP,SCOPE,
+                    new CacheAuthScope(SCOPE.clusterId(),1,StorageBinding.Mode.OP,"incarnation",1),
+                    TapstatePrincipal.humanJwt(new VerifiedToken("admin",Scope.ADMIN)),null,
+                    () -> { throw new TapstateException(code, Map.of("reason", "safe-owner-message"),
+                            new IllegalArgumentException("sentinel-cause")); });
+            assertThatThrownBy(() -> f.dispatcher().dispatch("storage.status",caller,Map.of()))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> {
+                        assertThat(error.code()).isSameAs(code);
+                        assertThat(error.args()).containsExactly(Map.entry("reason", "safe-owner-message"));
+                        assertThat(error.getCause()).isNull();
+                    });
+        }
+    }
     @Test void statusCannotCrossItsVerifiedClusterOrAuthenticationGeneration() {
         var f = new Fixture(); var dispatcher = f.dispatcher(); var active = new AtomicInteger();
         var access = StorageControlAccess.ordinary(StorageBinding.Mode.OP,SCOPE,new CacheAuthScope(SCOPE.clusterId(),1,StorageBinding.Mode.OP,"incarnation",2),

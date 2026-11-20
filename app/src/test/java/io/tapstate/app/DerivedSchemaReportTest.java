@@ -193,7 +193,7 @@ class DerivedSchemaReportTest {
         widenTheFactKeyColumn(store);
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("wide"))
                 .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code().code())
-                        .isEqualTo("actuation.join-output-schema-source-changed"));
+                        .isEqualTo("TS0360016"));
 
         new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide");
 
@@ -349,7 +349,7 @@ class DerivedSchemaReportTest {
 
         assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("actuation.schema-sync-while-running");
+                    assertThat(error.code().code()).isEqualTo("TS0360027");
                     assertThat(error.args()).containsEntry("pipeline", "wide")
                             .containsEntry("state", "RUNNING");
                 });
@@ -390,7 +390,7 @@ class DerivedSchemaReportTest {
 
         assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("actuation.schema-sync-while-running");
+                    assertThat(error.code().code()).isEqualTo("TS0360027");
                     assertThat(error.args()).containsEntry("state", "PAUSED")
                             .containsEntry("desired", "RUNNING");
                 });
@@ -409,7 +409,7 @@ class DerivedSchemaReportTest {
 
         assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).accept("alice", "wide"))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("actuation.schema-sync-while-running");
+                    assertThat(error.code().code()).isEqualTo("TS0360027");
                     assertThat(error.args()).containsEntry("state", "NEW")
                             .containsEntry("desired", "RUNNING");
                 });
@@ -429,7 +429,7 @@ class DerivedSchemaReportTest {
 
         assertThatThrownBy(() -> new StoreBackedDerivedSchemas(store, auditGate).derive("wide"))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("actuation.schema-sync-while-running");
+                    assertThat(error.code().code()).isEqualTo("TS0360027");
                     assertThat(error.args()).containsEntry("state", "NEW")
                             .containsEntry("desired", "RUNNING");
                 });

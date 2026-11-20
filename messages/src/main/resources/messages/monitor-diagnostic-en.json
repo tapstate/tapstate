@@ -1,0 +1,18 @@
+{
+  "TS0400001": {
+    "message": "No observation is available for pipeline {pipeline}.",
+    "solution": "Check the pipeline id for typos; a freshly started pipeline may take a moment to publish its first observation."
+  },
+  "TS0400002": {
+    "message": "The cursor for {operation} is invalid ({reason}).",
+    "solution": "Start a new history query, then repeat every query parameter unchanged when following its next cursor."
+  },
+  "TS0400003": {
+    "message": "The cursor for {operation} has expired.",
+    "solution": "Start a new history query; cursors are intentionally short-lived and do not hold a server-side session."
+  },
+  "TS0400004": {
+    "message": "The {operation} query exceeded the {budget} budget of {limit}.",
+    "solution": "Narrow the time range or select fewer table series, then start a new query."
+  }
+}

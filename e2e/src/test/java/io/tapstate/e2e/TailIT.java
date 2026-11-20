@@ -167,7 +167,7 @@ class TailIT {
                 try (ControlPlane.Follow refused = control.follow(SOURCE_ID, COLLECTION, null)) {
                     assertThat(refused.awaitClose(TIMEOUT, "the refusal of a follow past the ceiling"))
                             .as("what the product said when every place was already taken")
-                            .contains("connector.instance-limit-reached");
+                            .contains("TS0060033");
                 }
             } finally {
                 holding.forEach(ControlPlane.Follow::close);

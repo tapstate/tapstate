@@ -508,7 +508,7 @@ class ManagedMongoStoreIsolationIT {
                 var management = process.management(files, issued.token());
                 assertThatThrownBy(() -> management.post().uri("/installation/first-admin").body(Map.of("username", "admin", "password", "original-admin-password"))
                         .retrieve().toBodilessEntity()).isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
-                                failure -> assertThat(failure.getResponseBodyAsString()).contains("control.audit-blocked"));
+                                failure -> assertThat(failure.getResponseBodyAsString()).contains("TS0210015"));
                 assertThat(database.getCollection("users").countDocuments()).isZero();
                 assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
                 assertThat(database.getCollection("audit").countDocuments(administratorAudit)).isZero();
@@ -880,7 +880,7 @@ class ManagedMongoStoreIsolationIT {
                 });
                 String logged = events.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
                         .collect(java.util.stream.Collectors.joining("\n"));
-                assertThat(logged).contains("code=io.store-unauthorized", "driver_type=MongoSecurityException", "cause_code=18")
+                assertThat(logged).contains("code=TS0480003", "driver_type=MongoSecurityException", "cause_code=18")
                         .doesNotContain(user, PASSWORD, rejectedPassword, "mongodb://");
                 assertThat(events.list).allSatisfy(event -> assertThat(event.getThrowableProxy()).isNull());
             } finally { logger.detachAppender(events); events.stop(); logger.setLevel(previousLevel); }
@@ -1618,7 +1618,7 @@ class ManagedMongoStoreIsolationIT {
                 if (failAfterCompletion) {
                     assertThatThrownBy(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request))
                             .isInstanceOfSatisfying(org.springframework.web.client.HttpServerErrorException.ServiceUnavailable.class,
-                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("\"code\":\"control.storage-unavailable\""));
+                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("\"code\":\"TS0210030\""));
                     org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> injected.get() != null && !root.initialActivationPending());
                 }
                 else try (var callers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
@@ -1693,12 +1693,12 @@ class ManagedMongoStoreIsolationIT {
                     assertThatThrownBy(() -> cloudPost(application, fresh, "/api/storage/status", Map.of()))
                             .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class, failure -> {
                                 assertThat(failure.getStatusCode().value()).isEqualTo(503);
-                                assertThat(failure.getResponseBodyAsString()).contains("control.storage-unavailable");
+                                assertThat(failure.getResponseBodyAsString()).contains("TS0210030");
                             });
                     rootClient(application).get().uri("/auth/exchange?code=cache-outage").exchange((outageRequest, response) -> {
                         assertThat(response.getStatusCode().value()).isEqualTo(503);
                         assertThat(response.getHeaders().getFirst("Set-Cookie")).isNull();
-                        assertThat(response.bodyTo(String.class)).contains("control.storage-unavailable");
+                        assertThat(response.bodyTo(String.class)).contains("TS0210030");
                         return null;
                     });
                     assertThat(sdk.consumed).doesNotContain("cache-outage");
@@ -2046,7 +2046,7 @@ class ManagedMongoStoreIsolationIT {
                             Map.of("chainId", directContext.channelId(), "resumeFrom", Map.of("token", "never-direct"))));
                     assertThatThrownBy(() -> client.put().uri("/api/pipelines/position_flow/position").header("Authorization", "Bearer " + login.token())
                             .body(refused).retrieve().toBodilessEntity()).isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
-                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("io.direct-channel-unavailable"));
+                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("TS0480032"));
                     assertThat(sharedCollection.find(new Document("_id", sharedId)).first()).isEqualTo(sharedBefore);
                     assertThat(cursorCollection.find().first()).isEqualTo(cursorBefore);
                     assertThat(channelCollection.countDocuments()).isZero();
@@ -2310,7 +2310,7 @@ class ManagedMongoStoreIsolationIT {
                                 .retrieve().toBodilessEntity();
                     } catch (org.springframework.web.client.RestClientResponseException busy) {
                         var body = (Map<?,?>)io.tapstate.core.common.JsonReader.parse(busy.getResponseBodyAsString());
-                        if (busy.getStatusCode().value() == 500 && "io.workload-claim-fenced".equals(body.get("code")))
+                        if (busy.getStatusCode().value() == 500 && "TS0480009".equals(body.get("code")))
                             throw new AssertionError("the native control is not yet available",serverFailure.get());
                         throw busy;
                     }
@@ -2480,7 +2480,7 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(value.table()).isEqualTo("out_orders");
                 });
                 assertThat(output.unresolved()).singleElement().satisfies(problem ->
-                        assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered"));
+                        assertThat(problem.code()).isEqualTo("TS0360004"));
                 var catalog = child.getBean(io.tapstate.control.core.ViewCatalogService.class).catalog();
                 assertThat(catalog.items()).singleElement().satisfies(item -> {
                     assertThat(item.location().database()).isEqualTo(databases.master());

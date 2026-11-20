@@ -2,6 +2,8 @@ package io.tapstate.adapters.transform;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.TransformErrorDefinitions;
 
 import java.util.Set;
 
@@ -11,7 +13,7 @@ import java.util.Set;
  * author wrote a CEL expression that fails against the row it meets, or a js script that will not
  * compile, defines no entry point, throws at runtime, or produces output that is not a record.
  *
- * <p>Two-segment {@code transform.<symbol>} codes; they go through the full build-time gate set like
+ * <p>Shared product diagnostic identities; they go through the full build-time gate set like
  * any other first-party domain. Programmer errors / invariant violations stay bare and are allowed to
  * crash — a checked AST that will not build into a program, for instance, is not laundered into a
  * {@code transform.*} code that would hide the defect. {@code placeholders()} is the named-argument
@@ -26,29 +28,29 @@ public enum TransformError implements TapstateErrorCode {
      * missing field, a type clash on a dyn value, or a function that type-checks but is unbound at
      * runtime.
      */
-    EXPRESSION_FAILED("transform.expression-failed", Set.of("expr", "detail")),
+    EXPRESSION_FAILED(TransformErrorDefinitions.EXPRESSION_FAILED),
 
     /** A js transform script could not be compiled. {@code detail} is the script-engine diagnostic. */
-    SCRIPT_COMPILE_FAILED("transform.script-compile-failed", Set.of("detail")),
+    SCRIPT_COMPILE_FAILED(TransformErrorDefinitions.SCRIPT_COMPILE_FAILED),
 
     /** An exact decimal would become zero or infinity when exposed as a JavaScript number. */
-    SCRIPT_DECIMAL_OUT_OF_RANGE("transform.script-decimal-out-of-range", Set.of("value")),
+    SCRIPT_DECIMAL_OUT_OF_RANGE(TransformErrorDefinitions.SCRIPT_DECIMAL_OUT_OF_RANGE),
 
     /** A js transform script defines no {@code process(record, ctx)} function — its required entry point. */
-    SCRIPT_NO_PROCESS("transform.script-no-process", Set.of()),
+    SCRIPT_NO_PROCESS(TransformErrorDefinitions.SCRIPT_NO_PROCESS),
 
     /**
      * A js transform script raised an error while processing an event. {@code detail} is the
      * guest-side failure the script engine reported.
      */
-    SCRIPT_FAILED("transform.script-failed", Set.of("detail")),
+    SCRIPT_FAILED(TransformErrorDefinitions.SCRIPT_FAILED),
 
     /**
      * A js transform script produced output that is not a valid record — a non-record return value, or
      * a {@code before} / {@code after} / {@code schema} that is not an object. {@code detail} names
      * what was wrong.
      */
-    SCRIPT_OUTPUT_INVALID("transform.script-output-invalid", Set.of("detail")),
+    SCRIPT_OUTPUT_INVALID(TransformErrorDefinitions.SCRIPT_OUTPUT_INVALID),
 
     /**
      * Running: an expansion met an update or a delete whose earlier row is not a whole row, so what
@@ -67,8 +69,7 @@ public enum TransformError implements TapstateErrorCode {
      * once produced stays in the target with nothing left pointing at it - green run, no error, and
      * a delete case over a source that does send whole rows passes throughout.
      */
-    UNWIND_NEEDS_A_COMPLETE_BEFORE_IMAGE(
-            "transform.unwind-needs-a-complete-before-image", Set.of("path", "detail")),
+    UNWIND_NEEDS_A_COMPLETE_BEFORE_IMAGE(TransformErrorDefinitions.UNWIND_NEEDS_A_COMPLETE_BEFORE_IMAGE),
 
     /**
      * Running: two elements of one row expand to rows carrying the same key, so the target keeps
@@ -81,35 +82,13 @@ public enum TransformError implements TapstateErrorCode {
      * saying it is the only reason anyone finds out. {@code key} is the shared key value as the
      * comparison sees it, which is what makes the offending row findable at the source.
      */
-    UNWIND_ROWS_SHARE_A_KEY(
-            "transform.unwind-rows-share-a-key", Set.of("path", "key"), Severity.WARNING);
+    UNWIND_ROWS_SHARE_A_KEY(TransformErrorDefinitions.UNWIND_ROWS_SHARE_A_KEY);
 
-    private final String code;
-    private final Set<String> placeholders;
-    private final Severity severity;
+    private final ProductErrorDefinition definition;
 
-    TransformError(String code, Set<String> placeholders) {
-        this(code, placeholders, Severity.ERROR);
-    }
+    TransformError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    TransformError(String code, Set<String> placeholders, Severity severity) {
-        this.code = code;
-        this.placeholders = placeholders;
-        this.severity = severity;
-    }
-
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return severity;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

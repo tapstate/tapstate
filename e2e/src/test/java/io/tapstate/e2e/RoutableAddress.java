@@ -19,13 +19,15 @@ final class RoutableAddress {
     private RoutableAddress() {
     }
 
-    /** The first routable IPv4 address of an interface that is up. */
+    /** The first routable IPv4 address on an up, non-point-to-point interface. */
     static String ofThisMachine() {
         try {
             Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
             while (interfaces.hasMoreElements()) {
                 NetworkInterface candidate = interfaces.nextElement();
-                if (!candidate.isUp() || candidate.isLoopback()) {
+                // Tunnel endpoints may be assigned locally while their traffic is intercepted by a VPN.
+                // A process cluster needs an address on the host's directly attached network.
+                if (!candidate.isUp() || candidate.isLoopback() || candidate.isPointToPoint()) {
                     continue;
                 }
                 Enumeration<InetAddress> addresses = candidate.getInetAddresses();

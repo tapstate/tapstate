@@ -62,6 +62,27 @@ class MongoCachePipelineStoresIT {
     private static final Runnable ACTIVE = () -> {};
     private static final Instant AT = Instant.parse("2026-10-18T00:00:00Z");
 
+    @Test void exhaustedLeaseRecoveryProjectsTheCurrentEngineIdentityWithoutWritingAnObservation() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var collection = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            for (int attempts : List.of(2, 3)) {
+                collection.updateOne(new Document("_id", "orders"), new Document("$set", new Document("leaseRecovery",
+                        new Document("intentRevision", 1L).append("failedExecution", 1L)
+                                .append("attempts", attempts).append("retryAfter", AT.toEpochMilli()))));
+                var observed = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).read("orders").orElseThrow();
+                assertThat(observed.state()).isEqualTo(PipelineState.FAILED);
+                if (attempts < 3) assertThat(observed.failure()).isNull();
+                else {
+                    assertThat(observed.failure().code()).isEqualTo("TS0440003");
+                    assertThat(observed.failure().params()).containsExactly(Map.entry("pipeline", "orders"));
+                }
+                assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).countDocuments()).isZero();
+            }
+        });
+    }
+
     @Test void initialLoadDisplayRoundTripsAndNewRunReplacesOnlyItsOwnCurrentFacts() {
         withFixture(f -> {
             assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
@@ -522,11 +543,104 @@ class MongoCachePipelineStoresIT {
             var fact = io.tapstate.core.lifecycle.MetricFact.single("recordCount", io.tapstate.core.lifecycle.MetricType.GAUGE, "{record}", point);
             var expected = new Observation("orders", PipelineState.FAILED, Map.of("rows", 2L),
                     Map.of("table-a", new io.tapstate.core.lifecycle.TableSnapshot(2L, 2L, 100, true)), Map.of("table-a", "position-a"),
-                    new io.tapstate.core.lifecycle.ObservationFailure("engine.job-failed", Map.of("pipeline", "orders")), AT, List.of(fact));
+                    new io.tapstate.core.lifecycle.ObservationFailure("TS0440008", Map.of("pipeline", "orders")), AT, List.of(fact));
             var writer = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
             assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
             writer.save(expected, 1);
             assertThat(writer.read("orders")).contains(expected);
+        });
+    }
+
+    @Test void legacyAndProductFailureIdentitiesUseTheSameLatestObservationContract() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var writer = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            var params = Map.of("captureId", "capture-a");
+            var legacy = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure("capture.claim-lost", params), AT, List.of());
+            writer.save(legacy, 1);
+            var oldBytes = collection.find().first();
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(legacy);
+            assertThat(collection.find().first()).isEqualTo(oldBytes);
+
+            var current = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure(
+                            io.tapstate.core.common.CaptureErrorDefinitions.CLAIM_LOST.code(), params),
+                    AT.plusSeconds(1), List.of());
+            writer.save(current, 1);
+            writer.save(legacy, 1);
+            assertThat(collection.countDocuments()).isEqualTo(1);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(current);
+            var row = collection.find().first();
+            assertThat(row.keySet()).isEqualTo(oldBytes.keySet());
+            assertThat(row.get("failure", Document.class).keySet())
+                    .isEqualTo(oldBytes.get("failure", Document.class).keySet());
+            assertThat(row.get("failure", Document.class).getString("code")).isEqualTo("TS0350003");
+            assertThat(collection.find().first()).isEqualTo(row);
+
+            assertThat(states.compareAndSwap("orders", 1, "RUNNING", AT.plusSeconds(2)))
+                    .isInstanceOf(CasOutcome.Applied.class);
+            var recovered = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                    null, AT.plusSeconds(2), List.of());
+            writer.save(recovered, 2);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(recovered);
+        });
+    }
+
+    @Test void runtimeDiagnosticSurvivesIndependentReaderAndPreservesLatestFailure() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var writer = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0060027",
+                    Map.of("connector", "fixture", "detail", "refused"), Map.of("message", "safe cause"));
+            var expected = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    failure, AT.plusSeconds(1), List.of());
+            writer.save(expected, 1);
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            var before = collection.find().first();
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(expected);
+            String readerClasspath = System.getProperty("runtime.recovery.classpath", System.getProperty("java.class.path"));
+            var process = new ProcessBuilder(System.getProperty("java.home") + "/bin/java", "-cp", readerClasspath,
+                    RuntimeObservationReaderProcess.class.getName(), MONGO.getReplicaSetUrl(), f.database().getName(), "read")
+                    .redirectErrorStream(true).start();
+            String output = readerOutput(process);
+            assertThat(output).contains("RUNTIME_DIAGNOSTIC_RECOVERED");
+            String oldClasspath = System.getProperty("runtime.legacy.classpath");
+            if (oldClasspath != null) {
+                var oldReader = new ProcessBuilder(System.getProperty("java.home") + "/bin/java", "-cp", oldClasspath,
+                        RuntimeObservationReaderProcess.class.getName(), MONGO.getReplicaSetUrl(), f.database().getName(), "unreadable")
+                        .redirectErrorStream(true).start();
+                String oldOutput = readerOutput(oldReader);
+                assertThat(oldOutput).contains("OLD_RUNTIME_READER_REFUSED_EXTENSION");
+                assertThat(collection.find().first()).isEqualTo(before);
+            }
+            writer.save(new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure("connector.write-failed", Map.of()), AT, List.of()), 1);
+            assertThat(collection.find().first()).isEqualTo(before);
+            assertThat(collection.countDocuments()).isEqualTo(1);
+            assertThat(states.compareAndSwap("orders", 1, "RUNNING", AT.plusSeconds(2))).isInstanceOf(CasOutcome.Applied.class);
+            var recovered = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null,
+                    AT.plusSeconds(2), List.of());
+            writer.save(recovered, 2);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(recovered);
+        });
+    }
+
+    @Test void unknownRuntimeDiagnosticVersionIsRefusedWithoutRepair() {
+        withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "FAILED", AT))
+                    .isInstanceOf(CasOutcome.Applied.class);
+            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(new Observation("orders", PipelineState.FAILED,
+                    Map.of(), Map.of(), Map.of(), new io.tapstate.core.lifecycle.ObservationFailure("TS0060027",
+                    Map.of("connector", "fixture", "detail", "refused"), Map.of("message", "safe cause")), AT, List.of()), 1);
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            collection.updateOne(new Document(), new Document("$set", new Document("failure.diagnostic.formatVersion", 99)));
+            var damaged = collection.find().first();
+            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
+            assertThat(collection.find().first()).isEqualTo(damaged);
         });
     }
 
@@ -540,6 +654,20 @@ class MongoCachePipelineStoresIT {
             assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
         });
+    }
+
+    private static String readerOutput(Process process) throws Exception {
+        try {
+            assertThat(process.waitFor(20, TimeUnit.SECONDS)).isTrue();
+            String output = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            assertThat(process.exitValue()).as(output).isZero();
+            return output;
+        } finally {
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                process.waitFor(5, TimeUnit.SECONDS);
+            }
+        }
     }
 
     private static Observation observation(PipelineState state) {

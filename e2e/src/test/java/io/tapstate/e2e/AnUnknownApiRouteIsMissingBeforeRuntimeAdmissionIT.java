@@ -25,7 +25,7 @@ class AnUnknownApiRouteIsMissingBeforeRuntimeAdmissionIT {
             assertThat(get(client, base, "/healthz").statusCode()).isEqualTo(200);
             var known = get(client, base, "/api/cluster/members");
             assertThat(known.statusCode()).as(known.body()).isEqualTo(503);
-            assertThat(((Map<?, ?>) JsonReader.parse(known.body())).get("code")).isEqualTo("control.storage-unavailable");
+            assertThat(((Map<?, ?>) JsonReader.parse(known.body())).get("code")).isEqualTo("TS0210030");
 
             var missing = get(client, base, "/api/runtime-image-smoke-missing");
             assertThat(missing.statusCode()).as(missing.body()).isEqualTo(404);

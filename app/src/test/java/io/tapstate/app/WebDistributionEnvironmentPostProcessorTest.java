@@ -252,7 +252,7 @@ class WebDistributionEnvironmentPostProcessorTest {
 
             assertThat(events.list).singleElement().satisfies(event -> {
                 assertThat(event.getLevel()).isEqualTo(Level.WARN);
-                assertThat(event.getFormattedMessage()).contains("nest.state-served-from-cold-layer");
+                assertThat(event.getFormattedMessage()).contains("TS0490025");
             });
         } finally {
             if (alert != null) alert.detachAppender(events);

@@ -113,7 +113,7 @@ class CurrentUserApiTest {
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
             return response.bodyTo(Map.class);
         });
-        assertThat(body.get("code")).isEqualTo("control.unauthenticated");
+        assertThat(body.get("code")).isEqualTo("TS0210003");
         assertThat(body.toString()).doesNotContain("secret-sentinel", "invalid-credential-sentinel",
                 "human-jwt-sentinel", "stable-current-user", "current-machine");
     }

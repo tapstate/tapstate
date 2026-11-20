@@ -55,6 +55,21 @@ class PipelineLogAppenderTest {
     }
 
     @Test
+    void capturesOnlyAValidBoundedDiagnosticAlongsideTheOriginalLine() {
+        var sink = new RingBufferLogSink(8, 8);
+        var diagnostic = java.util.Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        withAppender(sink, "test.logs.diagnostic", logger -> {
+            MDC.put(MDC_KEY, "orders");
+            logger.atWarn().addKeyValue("diagnostic", diagnostic).log("safe failure");
+            logger.atWarn().addKeyValue("diagnostic", java.util.Map.of("unsupported", "payload")).log("original line");
+        });
+        assertThat(sink.tail("orders")).hasSize(2);
+        assertThat(sink.tail("orders").getFirst().diagnostic()).isEqualTo(diagnostic);
+        assertThat(sink.tail("orders").getLast().diagnostic()).isEmpty();
+        assertThat(sink.tail("orders").getLast().message()).isEqualTo("original line");
+    }
+
+    @Test
     void ignoresALineWithNoPipelineAttribution() {
         RingBufferLogSink sink = new RingBufferLogSink(8, 8);
 
@@ -127,7 +142,10 @@ class PipelineLogAppenderTest {
         logger.addAppender(appender);
         try {
             MDC.put(MDC_KEY, "orders");
-            logger.warn("connector rejected {}", "sentinel-password");
+            logger.atWarn().addKeyValue("diagnostic", java.util.Map.of(
+                    "code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "sentinel-password",
+                    "cause", java.util.Map.of("rawMessage", "nested sentinel-password")))
+                    .log("connector rejected {}", "sentinel-password");
         } finally {
             MDC.remove(MDC_KEY);
             logger.detachAppender(appender);
@@ -135,9 +153,10 @@ class PipelineLogAppenderTest {
             logger.setLevel(previousLevel);
         }
 
-        assertThat(sink.tail("orders")).singleElement().satisfies(line ->
-                assertThat(line.message())
-                        .isEqualTo("connector rejected ********")
-                        .doesNotContain("sentinel-password"));
+        assertThat(sink.tail("orders")).singleElement().satisfies(line -> {
+            assertThat(line.message()).isEqualTo("connector rejected ********");
+            assertThat(line.diagnostic()).containsEntry("code", "28000");
+            assertThat(line.diagnostic().toString()).contains("nested ********").doesNotContain("sentinel-password");
+        });
     }
 }

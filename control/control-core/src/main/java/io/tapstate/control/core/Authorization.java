@@ -9,7 +9,7 @@ import java.util.Objects;
 /**
  * The capability check every operation dispatch passes: an authenticated credential may invoke an
  * operation only when its grade is at least the grade the operation requires. A credential that falls
- * short is refused with the coded {@code control.forbidden} diagnostic — the caller is known (already
+ * short is refused with the coded {@code TS0210004} diagnostic — the caller is known (already
  * authenticated), they simply lack the grade, so this is distinct from an authentication failure and
  * may name the operation and the grade it needs.
  *
@@ -24,7 +24,7 @@ public final class Authorization {
 
     /**
      * Permits the invocation when {@code credential} carries at least the operation's required grade;
-     * throws {@code control.forbidden} otherwise, naming the operation and the grade it requires.
+     * throws {@code TS0210004} otherwise, naming the operation and the grade it requires.
      */
     public static void require(VerifiedToken credential, Operation op) {
         Objects.requireNonNull(credential, "credential");

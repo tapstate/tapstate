@@ -115,7 +115,7 @@ class SourceCaptureResolutionTest {
 
         assertThatThrownBy(() -> SourceCaptureResolution.of(source))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered");
+                .hasMessageContaining("TS0360004");
     }
 
     @Test
@@ -125,7 +125,7 @@ class SourceCaptureResolutionTest {
 
         assertThatThrownBy(() -> SourceCaptureResolution.of(source, discovered()))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-table-selection-empty");
+                .hasMessageContaining("TS0360006");
     }
 
     @Test
@@ -135,7 +135,7 @@ class SourceCaptureResolutionTest {
 
         assertThatThrownBy(() -> SourceCaptureResolution.of(source, discovered("orders")))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-table-selection-empty");
+                .hasMessageContaining("TS0360006");
     }
 
     @Test
@@ -157,7 +157,7 @@ class SourceCaptureResolutionTest {
 
         assertThatThrownBy(() -> SourceCaptureResolution.of(source))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-table-spec-unsupported");
+                .hasMessageContaining("TS0360010");
     }
 
     @Test

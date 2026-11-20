@@ -788,7 +788,7 @@ class ApplyServiceTest {
         assertThat(result.valid()).isFalse();
         assertThat(result.outcomes()).isEmpty();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic -> {
-            assertThat(diagnostic.code()).isEqualTo("dsl.unknown-field");
+            assertThat(diagnostic.code()).isEqualTo("TS0010002");
             assertThat(diagnostic.params()).containsEntry("field", "bogus_field");
         });
         assertThat(store.saveCount).isZero();
@@ -1048,7 +1048,7 @@ class ApplyServiceTest {
         List<String> attempted = new ArrayList<>();
         List<String> refreshed = new ArrayList<>();
         boolean[] fail = {true};
-        ValidationDiagnostic advisory = new ValidationDiagnostic("control.unreachable", Map.of());
+        ValidationDiagnostic advisory = new ValidationDiagnostic("TS0210005", Map.of());
         ApplyService deriving = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
                 (resources, discovered) -> List.of(advisory), pipeline -> {
@@ -1070,7 +1070,7 @@ class ApplyServiceTest {
         assertThat(refreshed).containsExactly("second_pipeline");
         assertThat(first.warnings()).hasSize(2).contains(advisory);
         assertThat(first.warnings().get(1)).satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "ora2my_ods")
                     .containsEntry("causeCode", ArtifactError.NOT_FOUND.code())
                     .containsEntry("causeParams", Map.of("id", "missing_model"));
@@ -1405,7 +1405,7 @@ class ApplyServiceTest {
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).extracting(ValidationDiagnostic::code)
-                .containsExactly("dsl.unknown-field");
+                .containsExactly("TS0010002");
         assertThat(result.warnings()).as("a batch that was refused carries no advisory findings").isEmpty();
         assertThat(reviewed).as("the advisory pass is not reached at all").isEmpty();
     }
@@ -1610,7 +1610,7 @@ class ApplyServiceTest {
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic ->
-                assertThat(diagnostic.code()).isEqualTo("artifact.version-conflict"));
+                assertThat(diagnostic.code()).isEqualTo("TS0240003"));
     }
 
     // ---- fixtures ----

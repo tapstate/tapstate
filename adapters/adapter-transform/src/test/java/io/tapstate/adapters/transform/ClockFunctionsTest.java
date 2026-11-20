@@ -121,6 +121,6 @@ class ClockFunctionsTest {
 
         assertThatThrownBy(() -> program.eval(row(Map.of("d", "2026-01-01"))))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        e -> assertThat(e.code().code()).isEqualTo("transform.expression-failed"));
+                        e -> assertThat(e.code().code()).isEqualTo("TS0450001"));
     }
 }

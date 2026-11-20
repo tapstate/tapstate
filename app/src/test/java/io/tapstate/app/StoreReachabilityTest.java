@@ -89,7 +89,7 @@ class StoreReachabilityTest {
         assertThatThrownBy(() -> StoreReachability.probing(failing, Duration.ofSeconds(5))
                 .requireReachable("views", "mongodb", SETTINGS))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("actuation.view-store-unreachable");
+                    assertThat(e.code().code()).isEqualTo("TS0360023");
                     assertThat(e.args()).containsEntry("store", "views");
                     assertThat((String) e.args().get("reason")).contains("connect", "connection refused");
                 });
@@ -119,7 +119,7 @@ class StoreReachabilityTest {
         assertThatThrownBy(() -> StoreReachability.probing(throwing, Duration.ofSeconds(5))
                 .requireReachable("views", "mongodb", SETTINGS))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("actuation.view-store-unreachable");
+                    assertThat(e.code().code()).isEqualTo("TS0360023");
                     assertThat((String) e.args().get("reason")).contains("driver blew up");
                 });
     }
@@ -151,7 +151,7 @@ class StoreReachabilityTest {
             assertThatThrownBy(() -> StoreReachability.probing(hanging, Duration.ofMillis(150))
                     .requireReachable("views", "mongodb", SETTINGS))
                     .isInstanceOfSatisfying(TapstateException.class, e -> {
-                        assertThat(e.code().code()).isEqualTo("actuation.view-store-unreachable");
+                        assertThat(e.code().code()).isEqualTo("TS0360023");
                         assertThat((String) e.args().get("reason")).contains("150ms");
                     });
             // Bounded in fact, not only in the message: a check that returned the coded refusal only after
@@ -216,10 +216,10 @@ class StoreReachabilityTest {
         assertThatThrownBy(() -> StoreReachability.probing(throwing, Duration.ofSeconds(5))
                 .requireReachable("views", "mongodb", SETTINGS))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("actuation.view-store-unreachable");
+                    assertThat(e.code().code()).isEqualTo("TS0360023");
                     assertThat(e.args()).containsEntry("store", "views");
                     assertThat((String) e.args().get("reason"))
-                            .contains("actuation.view-store-is-a-capture-source");
+                            .contains("TS0360026");
                 });
     }
 

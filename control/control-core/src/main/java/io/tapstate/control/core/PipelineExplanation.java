@@ -200,8 +200,12 @@ public record PipelineExplanation(
         }
     }
 
-    public record Failure(String code, Map<String, String> params, String message) {
+    public record Failure(String code, Map<String, String> params, String message, Map<String, Object> diagnostic) {
+        public Failure(String code, Map<String, String> params, String message) {
+            this(code, params, message, Map.of());
+        }
         public Failure {
+            diagnostic = io.tapstate.core.common.RuntimeDiagnosticProjection.fit(diagnostic);
             Objects.requireNonNull(code, "code");
             params = Collections.unmodifiableMap(new TreeMap<>(Objects.requireNonNull(params, "params")));
             Objects.requireNonNull(message, "message");

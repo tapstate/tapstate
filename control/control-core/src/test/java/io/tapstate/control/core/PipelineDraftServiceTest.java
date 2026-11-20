@@ -196,7 +196,7 @@ class PipelineDraftServiceTest {
                     assertThat(failure.code()).isEqualTo(PipelineDraftError.INVALID);
                     assertThat(failure.getCause()).isInstanceOfSatisfying(io.tapstate.core.dsl.DslException.class,
                             diagnostic -> {
-                                assertThat(diagnostic.code().code()).isEqualTo("dsl.illegal-expression");
+                                assertThat(diagnostic.code().code()).isEqualTo("TS0010010");
                                 assertThat(diagnostic.path()).isEqualTo("transforms[0].expr");
                             });
                 });
@@ -313,15 +313,15 @@ class PipelineDraftServiceTest {
     @Test
     void validationReasonKeepsReferenceLocationAndTarget() {
         assertThat(PipelineDraftService.validationReason(new ValidationDiagnostic(
-                "dsl.missing-reference", Map.of("path", "transforms[0].from", "ref", "missing-table"))))
-                .isEqualTo("dsl.missing-reference at transforms[0].from (ref: missing-table)");
+                "TS0010005", Map.of("path", "transforms[0].from", "ref", "missing-table"))))
+                .isEqualTo("TS0010005 at transforms[0].from (ref: missing-table)");
     }
 
     @Test
     void validationReasonNamesTheKeylessUpsertInput() {
         assertThat(PipelineDraftService.validationReason(new ValidationDiagnostic(
-                "dsl.upsert-needs-key", Map.of("path", "serve.sync", "source", "mysql", "table", "BB_0727"))))
-                .isEqualTo("dsl.upsert-needs-key at serve.sync (source: mysql, table: BB_0727)");
+                "TS0010023", Map.of("path", "serve.sync", "source", "mysql", "table", "BB_0727"))))
+                .isEqualTo("TS0010023 at serve.sync (source: mysql, table: BB_0727)");
     }
 
     @Test
@@ -332,8 +332,8 @@ class PipelineDraftServiceTest {
         assertThat(PipelineDraftService.validationReason(new ValidationDiagnostic("dsl.invalid", Map.of())))
                 .isEqualTo("dsl.invalid");
         assertThat(PipelineDraftService.validationReason(new ValidationDiagnostic(
-                "dsl.upsert-needs-key", Map.of("path", "serve.sync", "source", "mysql"))))
-                .isEqualTo("dsl.upsert-needs-key at serve.sync");
+                "TS0010023", Map.of("path", "serve.sync", "source", "mysql"))))
+                .isEqualTo("TS0010023 at serve.sync");
     }
 
     private static PipelineDraft draft(long revision, String updatedBy, String baseHash,

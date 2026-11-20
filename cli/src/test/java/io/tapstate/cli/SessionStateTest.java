@@ -18,6 +18,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class SessionStateTest {
 
+    @Test
+    void recognizesCurrentAndHistoricalSessionRefusalsWithoutDisplayingUnknownServerText() {
+        assertThat(SessionState.safeCode("TS0210003")).isEqualTo("TS0210003");
+        assertThat(SessionState.safeCode("control.unauthenticated")).isEqualTo("control.unauthenticated");
+        assertThat(SessionState.safeCode("TS9999999")).isEqualTo("unknown");
+        assertThat(SessionState.safeCode("private-server-text")).isEqualTo("unknown");
+    }
+
     private static final URI BASE = URI.create("https://tapstate.example.com");
     private static final Instant NOW = Instant.parse("2026-08-17T10:00:00Z");
     private static final AuthSessionRecord CACHED = new AuthSessionRecord(
@@ -125,7 +133,7 @@ class SessionStateTest {
         SessionState rejectedState = new SessionState(rejected, fixed(NOW));
         assertThatThrownBy(() -> rejectedState.accessToken(BASE, CACHED))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("cli.auth-session-rejected");
+                    assertThat(error.code().code()).isEqualTo("TS0330041");
                     assertThat(error.getMessage()).doesNotContain("tss_s01.session-secret");
                 });
 
@@ -135,7 +143,7 @@ class SessionStateTest {
         SessionState mismatchState = new SessionState(mismatch, fixed(NOW));
         assertThatThrownBy(() -> mismatchState.accessToken(BASE, CACHED))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("cli.auth-issuer-mismatch");
+                    assertThat(error.code().code()).isEqualTo("TS0330059");
                     assertThat(error.getMessage()).doesNotContain("urn:tapstate:cluster:OTHER");
                 });
     }
@@ -149,7 +157,7 @@ class SessionStateTest {
 
         assertThatThrownBy(() -> new SessionState(rejected, fixed(NOW)).accessToken(BASE, CACHED))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("cli.auth-session-rejected");
+                    assertThat(error.code().code()).isEqualTo("TS0330041");
                     assertThat(error.getMessage()).doesNotContain(injectedSession);
                 });
     }
@@ -212,7 +220,7 @@ class SessionStateTest {
     private static void assertRejectedWithoutSecret(SessionState state) {
         assertThatThrownBy(() -> state.accessToken(BASE, CACHED))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("cli.auth-session-rejected");
+                    assertThat(error.code().code()).isEqualTo("TS0330041");
                     assertThat(error.getMessage()).doesNotContain(CACHED.sessionToken());
                 });
     }

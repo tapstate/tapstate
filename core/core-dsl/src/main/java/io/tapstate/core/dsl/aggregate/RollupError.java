@@ -1,6 +1,8 @@
 package io.tapstate.core.dsl.aggregate;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.NestErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 
 import java.util.Set;
@@ -15,52 +17,37 @@ import java.util.Set;
 public enum RollupError implements TapstateErrorCode {
 
     /** Checking the tree: {@code rollup:} on an embed the level points at, which holds at most one row. */
-    ON_REFERENCE_EMBED("nest.rollup-on-reference-embed", Set.of("embedPath")),
+    ON_REFERENCE_EMBED(NestErrorDefinitions.ROLLUP_ON_REFERENCE_EMBED),
 
     /**
      * Checking the tree, or rendering: a rollup field's name is already taken on the level it lands on, by
      * a column, an embed path, a flat field or another rollup field.
      */
-    FIELD_CONFLICT("nest.rollup-field-conflict", Set.of("field", "level", "other")),
+    FIELD_CONFLICT(NestErrorDefinitions.ROLLUP_FIELD_CONFLICT),
 
     /** Checking the tree: an argument, ordering, filter, type or default does not type-check. */
-    EXPRESSION_INVALID("nest.rollup-expression-invalid", Set.of("field", "part", "reason")),
+    EXPRESSION_INVALID(NestErrorDefinitions.ROLLUP_EXPRESSION_INVALID),
 
     /** Checking the tree: a sum or average reads a value whose numeric type nothing resolved. */
-    TYPE_UNKNOWN("nest.rollup-type-unknown", Set.of("field", "expression")),
+    TYPE_UNKNOWN(NestErrorDefinitions.ROLLUP_TYPE_UNKNOWN),
 
     /** Rendering: an integer sum left 64 bits, or a decimal one needed more than 38 digits. */
-    OVERFLOW("nest.rollup-overflow", Set.of("field", "root", "type")),
+    OVERFLOW(NestErrorDefinitions.ROLLUP_OVERFLOW),
 
     /** Rendering: an element's value is not of the type its column was declared with. */
-    VALUE_TYPE_MISMATCH("nest.rollup-value-type-mismatch", Set.of("field", "root", "declared", "actual")),
+    VALUE_TYPE_MISMATCH(NestErrorDefinitions.ROLLUP_VALUE_TYPE_MISMATCH),
 
     /** Rendering: a {@code type:} conversion would round, truncate or overflow. */
-    RESULT_NOT_CONVERTIBLE("nest.rollup-result-not-convertible", Set.of("field", "root", "from", "to")),
+    RESULT_NOT_CONVERTIBLE(NestErrorDefinitions.ROLLUP_RESULT_NOT_CONVERTIBLE),
 
     /** Rendering: an argument, ordering or filter failed to evaluate on an element. */
-    EVALUATION_FAILED("nest.rollup-evaluation-failed", Set.of("field", "root", "expression", "reason"));
+    EVALUATION_FAILED(NestErrorDefinitions.ROLLUP_EVALUATION_FAILED);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    RollupError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    RollupError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

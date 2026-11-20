@@ -1,0 +1,134 @@
+{
+  "TS0210001": {
+    "message": "The request is malformed: {reason}.",
+    "solution": "Correct the request body, then send it again."
+  },
+  "TS0210002": {
+    "message": "Authentication failed: invalid username or password.",
+    "solution": "Check the username and password are correct, then sign in again."
+  },
+  "TS0210003": {
+    "message": "This operation requires authentication.",
+    "solution": "Sign in with `login` to obtain a session token, or present a machine token with `--token`."
+  },
+  "TS0210004": {
+    "message": "Operation '{op}' requires {required} capability.",
+    "solution": "Sign in as a user with that capability, or use a token issued with that scope."
+  },
+  "TS0210005": {
+    "message": "The Tapstate Server is unreachable.",
+    "solution": "Check the Server URL and availability, then retry the tool call."
+  },
+  "TS0210006": {
+    "message": "Configure an AI provider in the Pipeline Builder before requesting a proposal.",
+    "solution": "Configure the provider, then submit a new request."
+  },
+  "TS0210007": {
+    "message": "The AI provider rejected this credential. Update the API key or its model permissions.",
+    "solution": "Update the API key or its model permissions before retrying."
+  },
+  "TS0210008": {
+    "message": "The AI provider rejected the model or request protocol.",
+    "solution": "Check the model ID and API protocol. For current OpenAI models, select Responses API."
+  },
+  "TS0210009": {
+    "message": "The AI provider rate or quota limit was reached.",
+    "solution": "Check the provider quota and billing, or retry later."
+  },
+  "TS0210010": {
+    "message": "The AI provider request failed. Check the provider settings and try again.",
+    "solution": "Check the provider settings, then retry the request."
+  },
+  "TS0210011": {
+    "message": "The AI provider reached the output token limit before completing the request.",
+    "solution": "Review the incomplete response and reduce the requested scope before retrying."
+  },
+  "TS0210012": {
+    "message": "The AI response did not contain a complete valid Pipeline proposal.",
+    "solution": "Keep the existing Pipeline and request a complete valid proposal."
+  },
+  "TS0210013": {
+    "message": "The AI assistant is busy. Try again shortly.",
+    "solution": "Wait briefly, then submit a new request."
+  },
+  "TS0210014": {
+    "message": "Pipeline preview is at capacity.",
+    "solution": "Wait for an active preview to finish, then retry."
+  },
+  "TS0210015": {
+    "message": "Operation '{op}' was refused because its required audit record could not be written.",
+    "solution": "An audited operation must leave an audit record before it runs; check the store is reachable and healthy, then retry."
+  },
+  "TS0210016": {
+    "message": "The artifacts were applied, but the model refresh for pipeline `{pipeline}` did not finish: {causeCode} {causeParams}. Its models may be unchanged or partially refreshed.",
+    "solution": "Resolve the reported cause, then apply again, even if the artifact content is unchanged. Stop the pipeline and wait until it is at rest if a live run blocked the refresh. Inspect `derived-schema {pipeline}` before starting, and use `derived-schema {pipeline} --accept` only after reviewing any remaining drift."
+  },
+  "TS0210017": {
+    "message": "The initial-admin bootstrap channel accepts only local (loopback) connections.",
+    "solution": "Create the first admin from a session on the server host itself, or pre-seed one at deployment."
+  },
+  "TS0210018": {
+    "message": "The initial-admin bootstrap channel is closed because an admin account already exists.",
+    "solution": "Sign in with an existing admin account to create more users."
+  },
+  "TS0210019": {
+    "message": "The `{mode}` deployment does not expose this authentication flow.",
+    "solution": "Use the authentication entry point for the selected deployment mode."
+  },
+  "TS0210020": {
+    "message": "The browser authentication public-origin configuration is invalid.",
+    "solution": "Configure absolute HTTPS origins without paths, queries, fragments, or credentials."
+  },
+  "TS0210021": {
+    "message": "Managed Cloud authentication is not available.",
+    "solution": "Install the SDK exchange/online-validation and trusted deployment bindings, then enter from Cloud again."
+  },
+  "TS0210022": {
+    "message": "Cloud mode does not allow an explicit Nest state.database.",
+    "solution": "Remove state.database to use the deployment-owned operator-state database. On-prem deployments can still select a database."
+  },
+  "TS0210023": {
+    "message": "Stored Source configuration cannot be revealed by this release.",
+    "solution": "Use the normal Source edit flow to replace configuration. A later audited reveal flow requires dedicated permission, recent step-up authentication, and a one-time grant."
+  },
+  "TS0210024": {
+    "message": "Choose a different logical database name for each storage layer. Equal names cannot prove storage isolation.",
+    "solution": "Use distinct logical database names, then test each storage layer again."
+  },
+  "TS0210025": {
+    "message": "Test every storage layer again using the current settings before saving.",
+    "solution": "Test every required layer with the current settings before saving."
+  },
+  "TS0210026": {
+    "message": "The {layer} storage test failed ({causeCode}). Check the connection and permissions.",
+    "solution": "Check the connection and permissions, then test the same layer again."
+  },
+  "TS0210027": {
+    "message": "Cache database '{database}' already contains collections. Choose an empty database.",
+    "solution": "Enter another database name and test the connection again."
+  },
+  "TS0210028": {
+    "message": "Cache database '{database}' already contains collections. Choose a new, empty database.",
+    "solution": "Try the empty name '{suggestedDatabase}' or enter another name, then test permissions again."
+  },
+  "TS0210029": {
+    "message": "The storage operation or installation phase has changed. Read its current status.",
+    "solution": "Read the current operation and installation status before deciding the next action."
+  },
+  "TS0210030": {
+    "message": "The storage operation is temporarily unavailable. Query the original operation before retrying.",
+    "solution": "Query the original operation and restore availability before considering a retry."
+  },
+  "TS0210031": {
+    "message": "Initialization cannot complete because the storage endpoint has reached its space quota. Restore capacity and check the original operation; do not submit setup again.",
+    "solution": "Restore storage capacity and inspect the original operation; do not submit setup again."
+  },
+  "TS0210032": {
+    "message": "The managed AI service could not authenticate the request.",
+    "solution": "Contact your Tapstate administrator to check the managed service credentials and permissions."
+  },
+  "TS0210033": {
+    "message": "The request exceeds the input limit for the managed AI service.",
+    "solution": "Start a new conversation or select fewer tables, then try again."
+  }
+}

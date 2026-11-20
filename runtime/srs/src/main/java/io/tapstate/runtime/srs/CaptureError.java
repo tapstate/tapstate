@@ -2,6 +2,8 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.CaptureErrorDefinitions;
 
 import java.util.Set;
 
@@ -20,21 +22,21 @@ import java.util.Set;
 public enum CaptureError implements TapstateErrorCode {
 
     /** An optional observer failed; this diagnostic does not fail normal source processing. */
-    OBSERVER_FAILED("capture.observer-failed", Set.of("captureId", "openingId", "phase")),
+    OBSERVER_FAILED(CaptureErrorDefinitions.OBSERVER_FAILED),
     /** The original read is still running; its owner and cleanup handle must be retained. */
-    STILL_ENDING("capture.still-ending", Set.of("captureId")),
+    STILL_ENDING(CaptureErrorDefinitions.STILL_ENDING),
 
     /** A live capture could no longer renew the cluster ownership generation that fences its writes. */
-    CLAIM_LOST("capture.claim-lost", Set.of("captureId")),
+    CLAIM_LOST(CaptureErrorDefinitions.CLAIM_LOST),
 
     /** A confirmed SRS cursor cannot be served without skipping missing or unverified history. */
-    RECOVERY_LOG_GAP("capture.recovery-log-gap", Set.of("ring", "sequence", "reason")),
+    RECOVERY_LOG_GAP(CaptureErrorDefinitions.RECOVERY_LOG_GAP),
 
     /** Older state cannot prove this source node's independent recovery boundary. */
-    RECOVERY_PROGRESS_UNPROVEN("capture.recovery-progress-unproven", Set.of("pipeline", "source")),
+    RECOVERY_PROGRESS_UNPROVEN(CaptureErrorDefinitions.RECOVERY_PROGRESS_UNPROVEN),
 
     /** Shared capture cannot checkpoint until its change log is configured for durable write-through. */
-    SRS_NOT_RECOVERABLE("capture.srs-not-recoverable", Set.of("chain")),
+    SRS_NOT_RECOVERABLE(CaptureErrorDefinitions.SRS_NOT_RECOVERABLE),
 
     /**
      * A pipeline driven by a member that does not hold its capture found no change ring open to read for
@@ -43,7 +45,7 @@ public enum CaptureError implements TapstateErrorCode {
      * between waits; this is the wait that never ended. {@code captureId} names the capture, {@code seconds}
      * how long it waited.
      */
-    NO_RING_TO_ATTACH("capture.no-ring-to-attach", Set.of("captureId", "seconds")),
+    NO_RING_TO_ATTACH(CaptureErrorDefinitions.NO_RING_TO_ATTACH),
 
     /**
      * The cluster refused this member's writes into a change ring for the whole stretch the capture waits
@@ -51,7 +53,7 @@ public enum CaptureError implements TapstateErrorCode {
      * than coded; this is the one that never cleared, which says this member is not in a cluster that
      * qualifies to hold the work. {@code table} names the ring's table, {@code seconds} how long it waited.
      */
-    CLUSTER_REFUSED_WRITES("capture.cluster-refused-writes", Set.of("table", "seconds")),
+    CLUSTER_REFUSED_WRITES(CaptureErrorDefinitions.CLUSTER_REFUSED_WRITES),
 
     /**
      * The cluster refused this member's reads of a change ring for the whole stretch a source waits such a
@@ -60,11 +62,11 @@ public enum CaptureError implements TapstateErrorCode {
      * the answer while the verdicts converge; this is the one that never cleared. {@code ring} names the
      * ring, {@code seconds} how long it waited.
      */
-    CLUSTER_REFUSED_THE_READ("capture.cluster-refused-the-read", Set.of("ring", "seconds")),
+    CLUSTER_REFUSED_THE_READ(CaptureErrorDefinitions.CLUSTER_REFUSED_THE_READ),
 
     /** A {@code start_from} value that is neither the {@code earliest} / {@code latest} keyword nor a
      *  parseable ISO-8601 instant; {@code value} carries the offending token. */
-    START_FROM_UNPARSABLE("capture.start-from-unparsable", Set.of("value")),
+    START_FROM_UNPARSABLE(CaptureErrorDefinitions.START_FROM_UNPARSABLE),
 
     /**
      * A start_from instant that the replay buffer can no longer reach: it is older than every change
@@ -73,11 +75,10 @@ public enum CaptureError implements TapstateErrorCode {
      * for, earliest the oldest one still held, and retention the setting that decides how far back that
      * goes -- a reader needs all three to act on it.
      */
-    START_FROM_OUTSIDE_WINDOW(
-            "capture.start-from-outside-window", Set.of("requested", "earliest", "retention")),
+    START_FROM_OUTSIDE_WINDOW(CaptureErrorDefinitions.START_FROM_OUTSIDE_WINDOW),
 
     /** A connector emitted a table outside the selected capture streams; {@code table} is its name. */
-    EVENT_TABLE_NOT_SELECTED("capture.event-table-not-selected", Set.of("table")),
+    EVENT_TABLE_NOT_SELECTED(CaptureErrorDefinitions.EVENT_TABLE_NOT_SELECTED),
 
     /**
      * The snapshot read reported no position for its change tail to pick up from, so the run stops.
@@ -85,28 +86,13 @@ public enum CaptureError implements TapstateErrorCode {
      * source never was, and every change made while the snapshot ran would be missed silently — which is
      * why this refuses rather than choosing a start of its own.
      */
-    SNAPSHOT_REPORTS_NO_SEAM("capture.snapshot-reports-no-seam", Set.of("chain"));
+    SNAPSHOT_REPORTS_NO_SEAM(CaptureErrorDefinitions.SNAPSHOT_REPORTS_NO_SEAM);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    CaptureError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    CaptureError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return this == OBSERVER_FAILED ? Severity.WARNING : Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

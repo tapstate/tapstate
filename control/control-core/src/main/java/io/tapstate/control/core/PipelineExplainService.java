@@ -253,7 +253,7 @@ public final class PipelineExplainService {
         if (observation.failure() != null) {
             ObservationFailure found = observation.failure();
             Map<String, Object> params = new LinkedHashMap<>(found.params());
-            Failure failure = new Failure(found.code(), found.params(), messages.render(found.code(), params));
+            Failure failure = new Failure(found.code(), found.params(), messages.render(found.code(), params), found.diagnostic());
             return answer(observation, time, Kind.CODED_FAILURE,
                     text("explain.coded-failure", Map.of("code", found.code())),
                     List.of(evidence(Source.STATUS, "failure", failure)), List.of(),
