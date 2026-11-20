@@ -31,14 +31,22 @@ public interface PipelineOutputNames {
         }
     }
 
+    /** A null key means the Nest event age cannot be attributed to this output alone. */
+    record NestMeasurement(String key) { }
+
     /** Request-local lineage is kept separate from the output-name wire projection. */
-    record Description(Result names, Map<String, Set<PipelineInputs.Input>> inputs, Set<String> qualifiedTables) {
+    record Description(Result names, Map<String, Set<PipelineInputs.Input>> inputs, Set<String> qualifiedTables,
+            Map<String, NestMeasurement> nestMeasurements) {
         public Description(Result names, Map<String, Set<PipelineInputs.Input>> inputs) { this(names, inputs, Set.of()); }
+        public Description(Result names, Map<String, Set<PipelineInputs.Input>> inputs, Set<String> qualifiedTables) {
+            this(names, inputs, qualifiedTables, Map.of());
+        }
         public Description {
             var copy = new LinkedHashMap<String, Set<PipelineInputs.Input>>();
             inputs.forEach((key, value) -> copy.put(key, Set.copyOf(value)));
             inputs = Map.copyOf(copy);
             qualifiedTables = Set.copyOf(qualifiedTables);
+            nestMeasurements = Map.copyOf(nestMeasurements);
         }
     }
 
