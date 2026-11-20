@@ -101,6 +101,23 @@ class SnapshotPhaseTest {
         }
     }
 
+    @Test void aFailureInDiagnosticCaptureStillClosesTheBatch() {
+        var readFailure = new IllegalStateException("read failed");
+        var projectionFailure = new AssertionError("projection failed");
+        var cleanupFailure = new IllegalStateException("close failed");
+        var batch = new FakeBatch(List.of(), "seam") {
+            @Override public boolean hasNext() { throw readFailure; }
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+                throw projectionFailure;
+            }
+            @Override public void close() { throw cleanupFailure; }
+        };
+        var load = SnapshotPhase.open(new FakePort(batch), config(), "chain", PIPE, List.of("orders"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+        assertThatThrownBy(() -> load.read(event -> {}, table -> {})).isSameAs(projectionFailure);
+        assertThat(readFailure.getSuppressed()).containsExactly(cleanupFailure);
+    }
+
     @Test void aBackgroundSnapshotPublishesTheSameSafeFact() throws Exception {
         var primary = new IllegalStateException("snapshot failed");
         var fact = new io.tapstate.core.common.FailureFact(primary, Map.of("message", "safe snapshot"),

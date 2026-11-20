@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -20,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -418,10 +420,10 @@ public final class SnapshotPhase {
         private final String tailSeam;
         private final boolean oneBatch;
         private CaptureBatch open;
-        private volatile io.tapstate.core.common.FailureFact capturedFailure;
+        private final AtomicReference<FailureFact> capturedFailure = new AtomicReference<>();
 
         public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
-            var captured = capturedFailure;
+            var captured = capturedFailure.get();
             return captured != null && captured.cause() == failure ? captured : new io.tapstate.core.common.FailureFact(failure);
         }
         private boolean closed;
@@ -506,32 +508,49 @@ public final class SnapshotPhase {
             }
             requireOpen();
             long count = 0;
-            Throwable primary = null;
             try {
                 while (batch.hasNext()) {
                     sink.accept(batch.next().withOrder(order));
                     count++;
                 }
             } catch (RuntimeException | Error failure) {
-                primary = failure;
-                try { capturedFailure = batch.failureFact(failure); }
-                catch (RuntimeException | LinkageError unavailable) { capturedFailure = io.tapstate.core.common.FailureFact.unavailable(failure); }
-                throw failure;
-            } finally {
                 try {
-                    batch.close();
-                    synchronized (this) { if (open == batch) open = null; }
-                } catch (RuntimeException | Error cleanup) {
-                    if (primary == null) throw cleanup;
-                    if (!(primary instanceof VirtualMachineError)
-                            && (cleanup instanceof Error || primary instanceof CancellationException)) {
-                        if (cleanup != primary) cleanup.addSuppressed(primary);
-                        throw cleanup;
-                    }
-                    if (cleanup != primary) primary.addSuppressed(cleanup);
+                    recordReadFailure(batch, failure);
+                } catch (RuntimeException | Error projectionFailure) {
+                    closeReadBatch(batch, failure);
+                    throw projectionFailure;
                 }
+                closeReadBatch(batch, failure);
+                throw failure;
             }
+            closeReadBatch(batch, null);
             return count;
+        }
+
+        private void recordReadFailure(CaptureBatch batch, Throwable failure) {
+            try {
+                capturedFailure.set(batch.failureFact(failure));
+            } catch (RuntimeException | LinkageError unavailable) {
+                capturedFailure.set(FailureFact.unavailable(failure));
+            }
+        }
+
+        private void closeReadBatch(CaptureBatch batch, Throwable primary) {
+            try {
+                batch.close();
+            } catch (RuntimeException | Error cleanup) {
+                if (primary == null) throw cleanup;
+                if (!(primary instanceof VirtualMachineError)
+                        && (cleanup instanceof Error || primary instanceof CancellationException)) {
+                    if (cleanup != primary) cleanup.addSuppressed(primary);
+                    throw cleanup;
+                }
+                if (cleanup != primary) primary.addSuppressed(cleanup);
+                return;
+            }
+            synchronized (this) {
+                if (open == batch) open = null;
+            }
         }
 
         /**
@@ -547,8 +566,8 @@ public final class SnapshotPhase {
             CaptureBatch batch;
             try { batch = session.read(table); }
             catch (RuntimeException | Error failure) {
-                try { capturedFailure = session.failureFact(failure); }
-                catch (RuntimeException | LinkageError unavailable) { capturedFailure = io.tapstate.core.common.FailureFact.unavailable(failure); }
+                try { capturedFailure.set(session.failureFact(failure)); }
+                catch (RuntimeException | LinkageError unavailable) { capturedFailure.set(FailureFact.unavailable(failure)); }
                 throw failure;
             }
             try {
