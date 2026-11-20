@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.JsonReader;
+import java.util.function.Consumer;
 
 /** Reads only the top-level explanation string while tool arguments are still arriving. */
 final class ToolExplanationStream {
@@ -16,16 +17,14 @@ final class ToolExplanationStream {
     private StringKind stringKind;
     private final StringBuilder keyLiteral = new StringBuilder();
 
-    void accept(String fragment, AssistantProviderText text) {
+    void accept(String fragment, Consumer<String> text) {
         StringBuilder visible = new StringBuilder();
-        boolean complete = false;
         for (int index = 0; index < fragment.length(); index++) {
             char value = fragment.charAt(index);
             if (stringKind != null) {
                 if (stringKind == StringKind.KEY) keyLiteral.append(value);
                 if (stringKind == StringKind.EXPLANATION) {
                     explanationCharacter(value, visible);
-                    if (stringKind == null) complete = true;
                 } else if (escaped) {
                     escaped = false;
                 } else if (value == '\\') {
@@ -67,8 +66,7 @@ final class ToolExplanationStream {
                 default -> { }
             }
         }
-        if (!visible.isEmpty()) text.explanation(visible.toString());
-        if (complete) text.finishExplanation();
+        if (!visible.isEmpty()) text.accept(visible.toString());
     }
 
     private void explanationCharacter(char value, StringBuilder visible) {

@@ -25,6 +25,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -64,19 +65,21 @@ class OnPremAiProviderSettingsIT {
         }
     }
 
-    @Test void retriesAResponsesProposalExplanationBeforeReview() throws Exception {
-        String ordinaryReply = "I will use the selected schema.";
-        String wrongLanguage = "Je propose de copier le champ id dans enriched_orders.";
-        String rightLanguage = "I will copy the id from orders into enriched_orders.";
+    @Test void forwardsReplyLanguageGuidanceAndKeepsTheProposalReviewable() throws Exception {
+        String userRequest = "I would like to create an enriched order table. Please reply in German.";
+        String ordinaryReply = "Ich verwende das ausgewaehlte Schema.";
+        String explanation = "Ich kopiere id aus orders nach enriched_orders.";
         var wizard = Map.of("root", Map.of("source", "orders_src", "table", "orders", "keys", List.of("id"),
                         "columns", List.of(), "transforms", List.of()),
                 "relations", List.of(), "transforms", List.of(), "destinationSourceId", "destination",
                 "destinationTable", "enriched_orders", "destinationWriteMode", "upsert");
         var calls = new AtomicInteger();
+        var sentRequest = new AtomicReference<Map<?, ?>>();
         var upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         upstream.createContext("/v1/responses", exchange -> {
-            exchange.getRequestBody().readAllBytes();
-            String explanation = calls.getAndIncrement() == 0 ? wrongLanguage : rightLanguage;
+            calls.incrementAndGet();
+            sentRequest.set((Map<?, ?>) JsonReader.parse(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
             String arguments = "{\"explanation\":" + JsonWriter.write(explanation)
                     + ",\"candidateWizard\":" + JsonWriter.write(wizard) + "}";
             var call = Map.of("type", "function_call", "id", "proposal", "name", "propose_pipeline", "arguments", arguments);
@@ -122,15 +125,21 @@ class OnPremAiProviderSettingsIT {
                 request(client, server, control, "/api/ai-provider-settings", "PUT",
                         Map.of("providerId", "openai-responses", "model", "test-model", "apiKey", "test-key"), 204);
                 String stream = request(client, server, control, "/api/pipelines/orders/draft:assistant", "POST",
-                        Map.of("revision", 1, "messages", List.of(Map.of("role", "user", "text",
-                                "I would like to create an enriched order table"))), 200);
+                        Map.of("revision", 1, "messages", List.of(Map.of("role", "user", "text", userRequest))), 200);
                 var events = stream.lines().filter(line -> line.startsWith("data: {"))
                         .map(line -> (Map<?, ?>) JsonReader.parse(line.substring("data: ".length()))).toList();
                 var visible = events.stream().filter(record -> "text-delta".equals(record.get("type")))
                         .map(record -> (String) record.get("delta")).collect(Collectors.joining());
-                assertThat(visible).as("ordinary reply plus English proposal explanation").isEqualTo(ordinaryReply + "\n\n" + rightLanguage);
+                assertThat(visible).isEqualTo(ordinaryReply + "\n\n" + explanation);
                 assertThat(events.stream().filter(record -> "reasoning-start".equals(record.get("type")))).hasSize(1);
-                assertThat(calls).hasValue(2);
+                assertThat(calls).hasValue(1);
+                var input = (List<?>) sentRequest.get().get("input");
+                var system = (Map<?, ?>) input.getFirst();
+                assertThat(system.get("role")).isEqualTo("system");
+                assertThat(system.get("content")).asString()
+                        .contains("language of the latest user request", "unless the user explicitly requests another reply language",
+                                "Keep table names, field names and DSL identifiers unchanged");
+                assertThat(input.getLast()).isEqualTo(Map.of("role", "user", "content", userRequest));
 
                 var proposal = events.stream().filter(record -> "data-proposal".equals(record.get("type")))
                         .map(record -> (Map<?, ?>) record.get("data")).findFirst().orElseThrow();

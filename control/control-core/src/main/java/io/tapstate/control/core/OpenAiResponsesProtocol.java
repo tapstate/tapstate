@@ -42,21 +42,18 @@ final class OpenAiResponsesProtocol {
     }
 
     static final class Stream {
-        private final AssistantProviderText text;
+        private final AiProviderClient.Output text;
         private final ResponsesReasoningSummary reasoning;
         private final boolean proposalEnabled;
         private final ToolExplanationStream explanation = new ToolExplanationStream();
         private final StringBuilder arguments = new StringBuilder();
         private String toolId;
+        private String channel;
         private boolean textEmitted;
         private boolean argumentsEmitted;
         private Optional<Map<String, Object>> result = Optional.empty();
 
         Stream(AiProviderClient.Output text, boolean proposalEnabled) {
-            this(new AssistantProviderText(text, null, null), proposalEnabled);
-        }
-
-        Stream(AssistantProviderText text, boolean proposalEnabled) {
             this.text = text;
             this.reasoning = new ResponsesReasoningSummary(text::reasoning);
             this.proposalEnabled = proposalEnabled;
@@ -77,14 +74,14 @@ final class OpenAiResponsesProtocol {
                 }
                 case "response.output_text.delta" -> {
                     textEmitted = true;
-                    text.reply(string(event.get("delta")));
+                    emit(string(event.get("delta")), "text");
                 }
                 case "response.function_call_arguments.delta" -> {
                     if (toolId == null || !toolId.equals(event.get("item_id"))) throw invalid();
                     String delta = string(event.get("delta"));
                     arguments.append(delta);
                     argumentsEmitted = true;
-                    explanation.accept(delta, text);
+                    explanation.accept(delta, value -> emit(value, "tool"));
                 }
                 case "response.completed" -> {
                     complete(object(event.get("response")));
@@ -122,12 +119,16 @@ final class OpenAiResponsesProtocol {
                 if (argumentsEmitted && !arguments.toString().equals(completeArguments)) throw invalid();
                 Map<String, Object> parsed = object(JsonReader.parse(completeArguments));
                 result = Optional.of(object(parsed.get("candidateWizard")));
-                if (!argumentsEmitted && parsed.get("explanation") instanceof String value) {
-                    text.explanation(value);
-                    text.finishExplanation();
-                }
+                if (!argumentsEmitted && parsed.get("explanation") instanceof String value) emit(value, "tool");
             }
-            if (!textEmitted) text.reply(completedText.toString());
+            if (!textEmitted && !completedText.isEmpty()) emit(completedText.toString(), "text");
+        }
+
+        private void emit(String value, String nextChannel) {
+            if (value.isEmpty()) return;
+            if (channel != null && !channel.equals(nextChannel)) text.accept("\n\n");
+            channel = nextChannel;
+            text.accept(value);
         }
 
         Optional<Map<String, Object>> result() { return result; }
