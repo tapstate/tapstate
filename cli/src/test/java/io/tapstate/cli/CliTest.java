@@ -102,6 +102,37 @@ class CliTest {
         })).isSameAs(clientRequested);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"-h", "--help", "-V", "--version"})
+    void dataBrowserHelpAndVersionRunBeforeOpeningTheSession(String option) {
+        LaunchOptions launch = LaunchOptions.parse("--context", "missing", "data-browser", option);
+
+        assertThat(Cli.runSession(launch, () -> {
+            throw new AssertionError("Data-browser help or version requested a control-plane client");
+        })).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"views.orders.find({note:\"example\"})",
+            "views.orders.find({note:\"before --help after\"})"})
+    void dataBrowserQueriesReachTheSession(String query) {
+        LaunchOptions launch = LaunchOptions.parse(("--context missing data-browser " + query).split(" "));
+        IllegalStateException clientRequested = new IllegalStateException("Control-plane client requested");
+
+        assertThat(Cli.bypassesSessionResolution(launch)).isFalse();
+        assertThatThrownBy(() -> Cli.runSession(launch, () -> {
+            throw clientRequested;
+        })).isSameAs(clientRequested);
+    }
+
+    @Test
+    void explainHelpBypassesTheSessionWithAnExplicitContext() {
+        assertThat(Cli.bypassesSessionResolution(
+                LaunchOptions.parse("--context", "missing", "explain", "--help"))).isTrue();
+        assertThat(Cli.bypassesSessionResolution(
+                LaunchOptions.parse("--context", "missing", "explain", "orders"))).isFalse();
+    }
+
     @Test
     void literalHelpArgumentStillChecksConflictingLaunchTargets() {
         LaunchOptions launch = LaunchOptions.parse(

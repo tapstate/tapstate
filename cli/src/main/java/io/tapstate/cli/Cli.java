@@ -75,6 +75,8 @@ import java.util.function.Supplier;
         })
 public final class Cli implements Runnable {
 
+    private static final String LONG_HELP_OPTION = "--help";
+
     /**
      * What {@code -V} prints, on the root and on every verb alike. A compile-time constant rather than a
      * manifest or bundled-resource lookup: neither survives into the native image without extra
@@ -515,11 +517,12 @@ public final class Cli implements Runnable {
                 return null;
             }
             return switch (words.get(1)) {
-                case "-h", "--help", "-V", "--version" -> newCommandLine().execute(words.toArray(new String[0]));
+                case "-h", LONG_HELP_OPTION, "-V", "--version" ->
+                        newCommandLine().execute(words.toArray(new String[0]));
                 default -> null;
             };
         }
-        if (words.stream().noneMatch(word -> word.equals("-h") || word.equals("--help"))) {
+        if (words.stream().noneMatch(Cli::isUsageHelpOption)) {
             return null;
         }
         CommandLine commandLine = newCommandLine();
@@ -538,6 +541,10 @@ public final class Cli implements Runnable {
                 ? CommandLine.executeHelpRequest(parsed) : null;
     }
 
+    private static boolean isUsageHelpOption(String word) {
+        return word.equals("-h") || word.equals(LONG_HELP_OPTION);
+    }
+
     /**
      * Whether a one-shot can run without constructing a session. {@code version} is deliberately a
      * hybrid: without a target it reports the local binary and says no server is connected, while a
@@ -547,8 +554,7 @@ public final class Cli implements Runnable {
         if (launch.isOneShot() && !launch.command().isEmpty()
                 && launch.command().getFirst().equals("explain")
                 && (launch.command().size() == 1
-                        || launch.command().stream().anyMatch(
-                                word -> word.equals("-h") || word.equals("--help")))) {
+                        || launch.command().stream().anyMatch(Cli::isUsageHelpOption))) {
             return true;
         }
         if (!launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {
