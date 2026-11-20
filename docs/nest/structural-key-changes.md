@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/nest/structural-key-changes
+---
+
 # Nest structural key changes
 
 A nest files every row by a key it reads off that row. When one of those keys is *edited*,
