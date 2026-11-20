@@ -6,7 +6,6 @@ import org.junit.jupiter.api.Test;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -72,9 +71,14 @@ class ScopedJobFailureRegistryTest {
             f.named.set(job(2, "run-b")); var nextStarted = new CountDownLatch(1);
             var b = executor.submit(() -> { nextStarted.countDown(); return registry.attach("p", 2, "run-b"); });
             assertThat(nextStarted.await(10, TimeUnit.SECONDS)).isTrue();
-            try { b.get(1, TimeUnit.SECONDS); } catch (TimeoutException serialized) { /* The slow update may still own the original PID slot. */ }
-            finally { resume.countDown(); }
-            var old = a.get(10, TimeUnit.SECONDS); var current = b.get(10, TimeUnit.SECONDS);
+            // The later proof must be able to publish while the old name lookup is still blocked.
+            JobFailureRegistry.Recorder current;
+            try {
+                current = b.get(5, TimeUnit.SECONDS);
+            } finally {
+                resume.countDown();
+            }
+            var old = a.get(10, TimeUnit.SECONDS);
             var expected = new IllegalStateException("current"); current.record(expected); old.record(new IllegalStateException("late")); old.clear();
             assertThat(registry.existing("p", 2, "run-b").get()).containsSame(expected);
             assertThat(registry.existing("p", 1, "run-a").get()).isEmpty();

@@ -589,7 +589,7 @@ public final class CaptureRunUnit {
                         () -> meta.consumerOffsets(chain), ignored -> { }));
             }
             CaptureConfig config = new CaptureConfig(spec.config().connectorId(), spec.config().settings(),
-                    tables, spec.config().node()).sharing(sharedNotes(spec, chain));
+                    tables, spec.config().node(), null, spec.config().nodeConfig()).sharing(sharedNotes(spec, chain));
             Optional<SrsMeta> state = meta.read(chain);
             CaptureStart start = state.filter(record -> record.sourceReadDurable()
                             && record.sourceReadOffset() != null)

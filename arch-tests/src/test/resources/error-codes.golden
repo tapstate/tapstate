@@ -219,6 +219,8 @@ connector.tls-material-cleanup-failed
 connector.tls-trust-invalid
 connector.write-failed
 control.ai-invalid-proposal
+control.ai-managed-provider-auth-failed
+control.ai-managed-provider-input-limit
 control.ai-not-configured
 control.ai-overloaded
 control.ai-provider-auth-failed

@@ -29,12 +29,37 @@ class SourceModelSnapshotTest {
         var current=discovered("src","mongodb","new-sample");store.schemas().save(current);
         var captured=SourceModelSnapshot.capture("p",List.of(source),store.schemas());
         var pinned=discovered("src","mongodb","original-sample").model().tables().getFirst();
-        var planning=captured.withRetainedTables(source,Map.of("orders",pinned));
-        assertThat(planning.model(source).tables()).containsExactly(pinned);
+        var other=discovered("src","mongodb","other-sample").model().tables().getFirst();
+        var planning=captured.withRetainedTables("left",source,Map.of("orders",pinned))
+                .withRetainedTables("right",source,Map.of("orders",other));
+        assertThat(planning.modelForBinding("left",source).tables()).containsExactly(pinned);
+        assertThat(planning.modelForBinding("right",source).tables()).containsExactly(other);
+        assertThat(planning.modelForBinding("untouched",source)).isEqualTo(current.model());
         assertThat(captured.model(source)).isEqualTo(current.model());
         assertThat(store.schemas().get("src")).contains(current);
         var missing=Map.of("missing-table",new SourceTable("missing-table",List.of(),List.of(),List.of()));
-        assertThatThrownBy(() -> captured.withRetainedTables(source,missing)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> captured.withRetainedTables("left",source,missing)).isInstanceOf(TapstateException.class);
+    }
+
+    @Test
+    void preparationFencesABindingWithARetainedModelFromAnotherSource() {
+        var store = new InMemoryStorePort();
+        var oldSource = source("old", "mongodb");
+        var replacement = source("replacement", "mongodb");
+        var oldModel = discovered(oldSource.id(), oldSource.connector(), "id");
+        store.schemas().save(oldModel);
+        store.schemas().save(discovered(replacement.id(), replacement.connector(), "id"));
+        var models = SourceModelSnapshot.capture("p", List.of(oldSource, replacement), store.schemas())
+                .withRetainedTables("input", oldSource, Map.of("orders", oldModel.model().tables().getFirst()));
+        var pipeline = new io.tapstate.core.model.PipelineResource("p", null,
+                List.of(io.tapstate.core.model.SourceRef.of(replacement.id(), true, Map.of(), "input")),
+                null, null, null, null, null);
+        var scope = new PipelineIntentScope("cluster", 1, "incarnation", "p", 1);
+        var sources = Map.of(replacement.id(), replacement);
+
+        assertThatThrownBy(() -> models.preparationInputs(scope, pipeline, pipeline, sources))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
     }
 
     @Test void absentMismatchedAndDiscoveredEmptyModelsKeepTheirDistinctMeanings() {

@@ -57,7 +57,7 @@
         }
       },
       "source": "core/core-dsl/src/test/java/io/tapstate/core/dsl/CanonicalRoundTripTest.java",
-      "source_sha256": "1d9a26d11cd4edf6e1f3c585bab53d673ab54a28bf92708931dbe985be1fea8d"
+      "source_sha256": "d1caa7aeb65032c112fd3eb07f7268d3c9ecbd5fd96c934f197babbfe24f3660"
     },
     "io.tapstate.core.dsl.CorpusSemanticGateTest": {
       "module": "core/core-dsl",

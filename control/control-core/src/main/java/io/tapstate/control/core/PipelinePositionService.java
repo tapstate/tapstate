@@ -100,7 +100,11 @@ public final class PipelinePositionService {
             refuseEditsOutsideTheResumePoint(asked, stored);
             String token = asked.resumeFrom() == null ? null : asked.resumeFrom().token();
             if (token != null && !token.equals(tokenOf(stored.resumeFrom()))) {
-                moves.put(stored.chainId(), token);
+                String previous = moves.putIfAbsent(stored.chainId(), token);
+                if (previous != null && !previous.equals(token)) {
+                    throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                            Map.of("reason", "conflicting resume positions for chain " + stored.chainId()), null);
+                }
             }
         }
         if (moves.isEmpty()) {
@@ -156,11 +160,13 @@ public final class PipelinePositionService {
     /** The stored chain the request names, or a coded refusal naming the ones this pipeline does read. */
     private static PipelinePosition.Chain matching(
             PipelinePosition current, PipelinePosition.Chain asked, String pipelineId) {
+        PipelinePosition.Chain first = null;
         for (PipelinePosition.Chain chain : current.chains()) {
-            if (chain.chainId().equals(asked.chainId())) {
-                return chain;
-            }
+            if (!chain.chainId().equals(asked.chainId())) continue;
+            if (asked.sourceId() == null || asked.sourceId().equals(chain.sourceId())) return chain;
+            if (first == null) first = chain;
         }
+        if (first != null) return first; // The existing field check reports a changed sourceId.
         throw new TapstateException(PositionError.CHAIN_NOT_READ, Map.of(
                 "chain", String.valueOf(asked.chainId()),
                 "pipeline", pipelineId,
