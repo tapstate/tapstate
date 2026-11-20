@@ -40,9 +40,9 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
     private static final String ERRORS = "tapstate.pipeline.errors";
 
     private static final ObservationFailure WRITE_FAILED =
-            new ObservationFailure("connector.write-failed", Map.of());
+            new ObservationFailure("TS0060027", Map.of());
     private static final ObservationFailure JOB_FAILED =
-            new ObservationFailure("engine.job-failed", Map.of());
+            new ObservationFailure("TS0440008", Map.of());
 
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final SavedObservations observations = new SavedObservations();
@@ -62,7 +62,7 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
             assertThat(point.value()).isEqualTo(1L);
             assertThat(point.attributes()).containsOnly(
                     Map.entry("tapstate.pipeline.id", "orders"),
-                    Map.entry("code", "connector.write-failed"));
+                    Map.entry("code", "TS0060027"));
             assertThat(point.startTime()).isNotNull();
         });
     }
@@ -98,8 +98,8 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
         assertThat(factNamed(publisher, ERRORS).points())
                 .extracting(point -> point.attributes().get("code"), point -> point.value())
                 .containsExactlyInAnyOrder(
-                        org.assertj.core.groups.Tuple.tuple("connector.write-failed", 2L),
-                        org.assertj.core.groups.Tuple.tuple("engine.job-failed", 1L));
+                        org.assertj.core.groups.Tuple.tuple("TS0060027", 2L),
+                        org.assertj.core.groups.Tuple.tuple("TS0440008", 1L));
     }
 
     @Test
@@ -132,8 +132,8 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
         // because the same observation carries them as its snapshot dataset; failures have no second face,
         // so dropping them would leave them measured and readable nowhere.
         assertThat(published)
-                .containsEntry("errors.connector.write-failed", 1L)
-                .containsEntry("errors.engine.job-failed", 1L);
+                .containsEntry("errors.TS0060027", 1L)
+                .containsEntry("errors.TS0440008", 1L);
     }
 
     @Test
@@ -173,7 +173,7 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
         assertThat(facts(publisher, "deleted")).extracting(MetricFact::name).doesNotContain(ERRORS);
         publisher.publish("deleted", null);
         assertThat(observations.read("deleted").orElseThrow().metrics())
-                .doesNotContainKey("errors.connector.write-failed");
+                .doesNotContainKey("errors.TS0060027");
     }
 
     private ObservationPublisher publisher() {

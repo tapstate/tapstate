@@ -2,6 +2,8 @@ package io.tapstate.core.dsl;
 
 import io.tapstate.core.common.Severity;
 import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.common.DslErrorDefinitions;
+import io.tapstate.core.common.ProductErrorDefinition;
 import java.util.Set;
 
 /**
@@ -21,21 +23,21 @@ public enum ExecutionAdvisoryError implements TapstateErrorCode {
      * A pipeline-level setting that no longer decides anything is written. {@code setting} names it and
      * {@code instead} names what does decide it now, written on each node.
      */
-    SETTING_HAS_NO_EFFECT("dsl.setting-has-no-effect", Set.of("pipeline", "setting", "instead")),
+    SETTING_HAS_NO_EFFECT(DslErrorDefinitions.SETTING_HAS_NO_EFFECT),
 
     /**
      * A source asks to be read by more than one processor. One processor reads a source today whatever
      * is written, because a reader split into parts that never overlap and each keep their own progress is
      * a capability no connector has declared yet. {@code requested} is the number written.
      */
-    SOURCE_READ_NOT_SPLIT("dsl.source-read-not-split", Set.of("source", "requested"));
+    SOURCE_READ_NOT_SPLIT(DslErrorDefinitions.SOURCE_READ_NOT_SPLIT);
 
     private final String code;
     private final Set<String> placeholders;
 
-    ExecutionAdvisoryError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
+    ExecutionAdvisoryError(ProductErrorDefinition definition) {
+        this.code = definition.code();
+        this.placeholders = definition.parameters();
     }
 
     @Override

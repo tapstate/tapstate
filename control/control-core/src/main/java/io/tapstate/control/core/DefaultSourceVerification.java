@@ -61,7 +61,8 @@ public final class DefaultSourceVerification implements ConnectionTestService.Ob
         if (!manages(connection)) return ConnectionTestService.Attempt.NONE;
         var target = target().orElseThrow(DefaultSourceVerification::unavailable);
         if (!target.connectionHash().equals(connectionHash(connection)))
-            throw new TapstateException(ControlError.MALFORMED_REQUEST, java.util.Map.of(), null);
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    java.util.Map.of("reason", "connection settings differ from the stored Source"), null);
         var owner = execution.get();
         if (!live.test(owner)) throw unavailable();
         long deadlineNanos = System.nanoTime() + budget.toNanos();

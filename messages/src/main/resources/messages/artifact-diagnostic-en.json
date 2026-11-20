@@ -1,0 +1,8 @@
+{
+  "TS0240001": {"message": "No artifact with id `{id}` is stored.", "solution": "List artifacts to find an existing id."},
+  "TS0240002": {"message": "Deleting artifact `{id}` requires the content hash of the version you read.", "solution": "Read the artifact, then retry the delete with that content hash."},
+  "TS0240003": {"message": "Artifact `{id}` changed after it was read.", "solution": "Read the current artifact, decide again against that version, then retry."},
+  "TS0240004": {"message": "Artifact `{id}` is still referenced by: {referrers}.", "solution": "Delete or rewrite those resources first, then delete `{id}`."},
+  "TS0240005": {"message": "Pipeline `{id}` is {actual} and is headed for {desired}, so it cannot be deleted.", "solution": "Stop the pipeline, let it settle, then delete it."},
+  "TS0240006": {"message": "Artifact `{id}` was removed, but this bookkeeping was left behind ({reason}): {residue}.", "solution": "The removal stands, so do not retry it. If the pipeline is running again, stop it first; then clear the listed records by hand."}
+}

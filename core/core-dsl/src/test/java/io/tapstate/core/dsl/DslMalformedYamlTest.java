@@ -12,7 +12,7 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /**
  * Malformed-YAML wrapping. A {@code .tap.yml} whose YAML does not even parse must surface as a coded
- * {@link DslException} ({@code dsl.malformed-yaml}) — never a raw snakeyaml stack trace at the user
+ * {@link DslException} ({@code TS0010017}) — never a raw snakeyaml stack trace at the user
  * boundary, since every user-facing / diagnosable error must carry a code. This
  * is the direct witness for {@code malformed-yaml}: a syntax error cannot live in the well-formed
  * corpus, so the corpus-vocabulary gate exempts it and it is proven here instead.
@@ -22,13 +22,13 @@ class DslMalformedYamlTest {
     private final DslParser parser = new DslParser();
 
     @Test
-    @DisplayName("a syntax error parses into a coded dsl.malformed-yaml exception, not a raw snakeyaml throw")
+    @DisplayName("a syntax error parses into a coded TS0010017 exception, not a raw snakeyaml throw")
     void syntaxErrorBecomesACodedException() {
         DslException ex = catchThrowableOfType(
                 () -> parser.parse("[unterminated\n"), DslException.class);
 
         assertThat(ex).isNotNull();
-        assertThat(ex.code().code()).isEqualTo("dsl.malformed-yaml");
+        assertThat(ex.code().code()).isEqualTo("TS0010017");
         // the snakeyaml problem is carried as the detail argument, and the location is captured
         assertThat(ex.args().get("detail").toString()).isNotBlank();
         assertThat(ex.line()).isPositive();
@@ -45,7 +45,7 @@ class DslMalformedYamlTest {
         DslException ex = catchThrowableOfType(() -> WorkspaceLoader.load(dir), DslException.class);
 
         assertThat(ex).isNotNull();
-        assertThat(ex.code().code()).isEqualTo("dsl.malformed-yaml");
+        assertThat(ex.code().code()).isEqualTo("TS0010017");
         assertThat(ex.source()).isEqualTo("broken.tap.yml");
     }
 }

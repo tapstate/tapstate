@@ -1,0 +1,54 @@
+{
+  "TS0350001": {
+    "message": "Capture `{captureId}` could not apply optional observer opening `{openingId}` during {phase}.",
+    "solution": "Inspect the observer failure and retry its operation after correcting the cause. The observer diagnostic does not change the normal source operation outcome."
+  },
+  "TS0350002": {
+    "message": "Capture `{captureId}` has not finished stopping.",
+    "solution": "Retry the original stop after the source call exits; retain its original resource identity."
+  },
+  "TS0350003": {
+    "message": "Capture `{captureId}` lost its cluster ownership claim.",
+    "solution": "Let the current owner continue from the durable position; do not restart the fenced process."
+  },
+  "TS0350004": {
+    "message": "Change log `{ring}` cannot recover sequence {sequence}: {reason}.",
+    "solution": "Restore the retained SRS log or stop with state purge and perform a full reload. Do not resume from a newer cursor; a CDC-only baseline requires explicit acceptance of the missing interval."
+  },
+  "TS0350005": {
+    "message": "Pipeline `{pipeline}` source `{source}` has retained progress without a proven independent recovery boundary.",
+    "solution": "Keep the retained state for diagnosis. Perform a full reload, or explicitly accept a new CDC-only baseline and the missing interval; state is not cleared automatically."
+  },
+  "TS0350006": {
+    "message": "Shared capture `{chain}` has no recoverable SRS write-through log.",
+    "solution": "Configure durable SRS log storage before starting shared capture. An independent source channel may be used with SRS disabled."
+  },
+  "TS0350007": {
+    "message": "Capture `{captureId}` had no change ring open after {seconds}s and this member could not take it over, so the pipeline had nothing to attach to.",
+    "solution": "Check that the member holding the capture is running and that every member can reach the coordination store, then start the pipeline again."
+  },
+  "TS0350008": {
+    "message": "The cluster refused writes for table `{table}` for {seconds}s, so the capture stopped.",
+    "solution": "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."
+  },
+  "TS0350009": {
+    "message": "The cluster refused reads of change ring `{ring}` for {seconds}s, so the source stopped.",
+    "solution": "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."
+  },
+  "TS0350010": {
+    "message": "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp.",
+    "solution": "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."
+  },
+  "TS0350011": {
+    "message": "Cannot start consuming at `{requested}`; the replay buffer only goes back to `{earliest}`, and its retention is `{retention}`.",
+    "solution": "Start at or after that point, widen the source's srs retention and let the buffer refill, or read the source directly instead."
+  },
+  "TS0350012": {
+    "message": "The capture stream emitted table `{table}`, which this pipeline did not select.",
+    "solution": "Update the source table selection or verify the connector emits the configured table names."
+  },
+  "TS0350013": {
+    "message": "The snapshot of chain `{chain}` reported no position for the change tail to resume from.",
+    "solution": "This source cannot hand its full load over to an incremental tail; read it as snapshot only, or use a connector build that reports a stream position."
+  }
+}

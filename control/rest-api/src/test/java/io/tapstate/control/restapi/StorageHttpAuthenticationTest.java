@@ -80,7 +80,7 @@ class StorageHttpAuthenticationTest {
         DURING_PROBE.set(() -> GENERATION.incrementAndGet());
         var response = request("tcs_fixture");
         assertThat(response.statusCode()).as(response.body()).isEqualTo(409);
-        assertThat(response.body()).contains("control.storage-scope-conflict").doesNotContain("testStamp");
+        assertThat(response.body()).contains("TS0210029").doesNotContain("testStamp");
         assertThat(AUTHENTICATIONS).hasValue(1);
         assertThat(REAUTHENTICATIONS).hasValue(0);
         assertThat(SETUP_CHECKS).hasValue(2);

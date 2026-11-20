@@ -11,6 +11,18 @@ import org.junit.jupiter.api.Test;
 class JsonReaderTest {
 
     @Test
+    void authoritativeDocumentsRejectDuplicateMembersWithoutChangingLegacyParsing() {
+        String duplicate = "{\"code\":null,\"code\":\"replacement\"}";
+        assertThat(JsonReader.parse(duplicate)).isEqualTo(Map.of("code", "replacement"));
+        assertThatThrownBy(() -> JsonReader.parseUnique(duplicate))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("duplicate object member");
+        assertThatThrownBy(() -> JsonReader.parseUnique("{\"entry\":{\"message\":1,\"message\":2}}"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("duplicate object member");
+        assertThat(JsonReader.parseUnique("{\"first\":{\"message\":1},\"second\":{\"message\":2}}"))
+                .isEqualTo(JsonReader.parse("{\"first\":{\"message\":1},\"second\":{\"message\":2}}"));
+    }
+
+    @Test
     void parsesScalars() {
         assertThat(JsonReader.parse("\"hello\"")).isEqualTo("hello");
         assertThat(JsonReader.parse("true")).isEqualTo(Boolean.TRUE);

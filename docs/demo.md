@@ -83,7 +83,7 @@ There is no command that pauses one source. A pipeline is a single job and a job
 `pause` takes a pipeline and stops everything. The closest a person can get from outside is to cut that
 database off from the server, and that was tried on a real stack: the first half worked — the other
 engine's changes kept arriving, on screen, while the cut engine's did not — and then the pipeline
-failed, `connector.capture-failed`. A connector that loses its database fails the run rather than
+failed, `TS0060024`. A connector that loses its database fails the run rather than
 waiting it out, which is defensible behaviour and fatal to this as a demonstration.
 
 So the claim keeps its evidence, and the evidence is a test rather than a shot: the end-to-end case

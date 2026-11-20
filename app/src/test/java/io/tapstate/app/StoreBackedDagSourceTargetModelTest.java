@@ -181,7 +181,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.sync-output-identity-unresolved");
+                .hasMessageContaining("TS0360035");
     }
 
     /** Append never matches a write to an existing row, so a key it never needs is not required. */
@@ -475,7 +475,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -511,7 +511,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -528,7 +528,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -538,7 +538,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -736,7 +736,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-table-ambiguous");
+                .hasMessageContaining("TS0360009");
     }
 
     @Test

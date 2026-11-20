@@ -19,25 +19,21 @@ import java.util.regex.PatternSyntaxException;
 /** Selects the declared source tables addressed by a pipeline's input graph. */
 final class PipelineTableSelection {
 
+    static String label(String binding, String table, java.util.stream.Stream<List<String>> selections) {
+        return selections.filter(tables -> tables.contains(table)).limit(2).count() > 1
+                ? binding + "." + table : table;
+    }
+
     private PipelineTableSelection() {}
 
-    /** Test one independently observed table against only the selected output, without widening scope. */
-    static boolean selects(FromClause from, SourceResource source,
-            io.tapstate.spi.store.SourceTable knownTable) {
-        return selectsName(from, source, knownTable.name());
-    }
-
-    /** Rejects names outside the selected declaration without inventing a discovered table model. */
-    static boolean selectsName(FromClause from, SourceResource source, String table) {
-        if (!SourceTableSelection.selectsTableName(source, table)) return false;
-        var referenced = new LinkedHashSet<String>();
-        collect(from, source.id(), List.of(table), referenced, false);
-        return referenced.contains(table);
-    }
-
     static List<String> resolve(PipelineResource pipeline, SourceResource source, SourceModel discovered) {
+        return resolve(pipeline, pipeline.sourceReference(source.id()), source, discovered);
+    }
+
+    static List<String> resolve(PipelineResource pipeline, io.tapstate.core.model.SourceRef ref,
+            SourceResource source, SourceModel discovered) {
         List<String> declared = SourceTableSelection.resolve(source, discovered);
-        return referencedTables(pipeline, source.id(), declared, true);
+        return referencedTables(pipeline, ref.binding(), declared, true);
     }
 
     /** Whether the graph could select this table after discovery, without pretending other tables are absent. */
@@ -46,8 +42,8 @@ final class PipelineTableSelection {
     }
 
     /** Filters a known subset without rejecting qualified references that may belong to unresolved selectors. */
-    static List<String> forOutputNames(PipelineResource pipeline, SourceResource source, List<String> known) {
-        return referencedTables(pipeline, source.id(), known, false);
+    static List<String> forOutputNames(PipelineResource pipeline, io.tapstate.core.model.SourceRef ref, List<String> known) {
+        return referencedTables(pipeline, ref.binding(), known, false);
     }
 
     private static List<String> referencedTables(PipelineResource pipeline, String sourceId,

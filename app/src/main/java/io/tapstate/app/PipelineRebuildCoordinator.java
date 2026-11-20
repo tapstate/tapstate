@@ -68,7 +68,7 @@ final class PipelineRebuildCoordinator {
         var authored=StoredArtifacts.requirePipeline(snapshot,request.originalScope().pipelineId());
         var pipeline=PipelineInlining.inline(authored,snapshot);
         var desired=new HashMap<String,SourceResource>();
-        for(var ref:pipeline.sources())desired.put(RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.id()),PipelineNode.Purpose.CAPTURE),StoredArtifacts.requireSource(snapshot,ref.id()));
+        for(var ref:pipeline.sources())desired.put(RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.binding()),PipelineNode.Purpose.CAPTURE),PipelineSourceConfig.effective(ref,StoredArtifacts.requireSource(snapshot,ref.id())));
         if(pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync()!=null)for(var sync:serve.sync())desired.put(
                 RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),PipelineConnectorNodes.syncNodeId(sync)),PipelineNode.Purpose.SYNC),StoredArtifacts.requireSource(snapshot,sync.source()));
         // View identity is retained here; its deployment-owned target is reconciled by the binding operation.
@@ -77,7 +77,10 @@ final class PipelineRebuildCoordinator {
         if(!direct.isEmpty()) {
             var originalSources=stores.cache().originalDirectSources(original,currentNode);guard.run();
             var retained=new HashMap<String,SourceResource>();
-            direct.forEach((namespace,source) -> {if(originalSources.contains(source.id()))retained.put(namespace,source);});
+            for (var ref : pipeline.sources()) {
+                String namespace = RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.binding()),PipelineNode.Purpose.CAPTURE);
+                if (originalSources.contains(ref.binding()) && direct.containsKey(namespace)) retained.put(namespace,direct.get(namespace));
+            }
             if(!retained.isEmpty())notes.retireDirectPostgres(original,Map.copyOf(retained),guard);
         }
         var receipt=stores.cache().prepare(original,currentNode,ttl,clock.instant());guard.run();
@@ -97,7 +100,7 @@ final class PipelineRebuildCoordinator {
             if(!(ref instanceof SourceRef.Spec spec) || spec.srs())continue;
             var source=StoredArtifacts.requireSource(snapshot,ref.id());
             if(!source.connector().equals("postgres"))continue;
-            direct.put(RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.id()),PipelineNode.Purpose.CAPTURE),source);
+            direct.put(RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.binding()),PipelineNode.Purpose.CAPTURE),io.tapstate.core.model.PipelineSourceConfig.effective(ref,source));
         }
         if(!direct.isEmpty() && !CanonicalHash.of(authored).equals(request.intent().desired().revision()))throw fenced();
         return Map.copyOf(direct);

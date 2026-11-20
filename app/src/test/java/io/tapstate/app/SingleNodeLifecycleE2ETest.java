@@ -241,7 +241,7 @@ class SingleNodeLifecycleE2ETest {
                 .returns(FAILED, PipelineStatus::state)
                 .extracting(PipelineStatus::failure)
                 .as("and the status says what took the engine down")
-                .returns("engine.out-of-memory", ObservationFailure::code);
+                .returns("TS0440009", ObservationFailure::code);
         assertActualState(FAILED, 3);
 
         driver.reconcile();
@@ -249,7 +249,7 @@ class SingleNodeLifecycleE2ETest {
         assertActualState(FAILED, 3);
         assertThat(readFaces.status(PIPE).failure())
                 .as("the next tick keeps the cause rather than failing the pipeline again over another")
-                .returns("engine.out-of-memory", ObservationFailure::code);
+                .returns("TS0440009", ObservationFailure::code);
     }
 
     /** Saves the pipeline's desired target and runs one reconcile pass, the tick the scheduled driver makes. */

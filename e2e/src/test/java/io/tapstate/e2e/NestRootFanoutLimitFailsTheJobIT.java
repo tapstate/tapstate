@@ -61,7 +61,7 @@ class NestRootFanoutLimitFailsTheJobIT {
     private static final String PARENT_TABLE = "orders";
     private static final String CHILD_TABLE = "order_items";
     private static final String PIPELINE_ID = "fanout_orders";
-    private static final String EXPECTED_CODE = "nest.root-fanout-limit-exceeded";
+    private static final String EXPECTED_CODE = "TS0490019";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,

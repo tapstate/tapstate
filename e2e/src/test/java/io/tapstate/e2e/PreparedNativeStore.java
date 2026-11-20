@@ -130,7 +130,13 @@ final class PreparedNativeStore implements AutoCloseable {
     void awaitBusiness(ControlPlane control) {
         var last = new java.util.concurrent.atomic.AtomicReference<java.util.Map<?, ?>>();
         Await.until("the prepared installation to admit business work", () -> {
-            var status = control.storageStatus(); last.set(status);
+            var observed = control.storageStatusDuringStartup();
+            if (observed.isEmpty()) {
+                last.set(java.util.Map.of("code", io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code()));
+                return false;
+            }
+            var status = observed.get();
+            last.set(status);
             if (!cluster.equals(status.get("clusterId"))) throw new AssertionError("the server opened a different installation");
             return "READY".equals(status.get("businessPhase"));
         }, () -> String.valueOf(last.get()));

@@ -123,7 +123,7 @@ class NewRecipeTest {
         Run again = run(home, new ScriptedPrompter(), "new", "sample", "--yes", "-w", ws.toString());
 
         assertThat(again.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
-        assertThat(again.err()).contains("cli.artifact-exists");
+        assertThat(again.err()).contains("TS0330001");
         assertThat(Files.readString(edited)).isEqualTo("# mine now\n");
     }
 
@@ -300,7 +300,7 @@ class NewRecipeTest {
         Run r = mirrored(home, ws);
 
         assertThat(r.code()).isEqualTo(NewCmd.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("cli.artifact-exists");
+        assertThat(r.err()).contains("TS0330001");
         assertThat(ws.resolve("source/orders_src.tap.yml")).doesNotExist();
         assertThat(ws.resolve(".env")).doesNotExist();
         assertThat(Files.readString(ws.resolve("pipeline/orders_sync.tap.yml"))).isEqualTo("# mine\n");

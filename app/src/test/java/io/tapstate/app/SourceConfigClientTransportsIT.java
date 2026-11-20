@@ -131,7 +131,7 @@ class SourceConfigClientTransportsIT {
             Document edited = fixture.document(id);
             CliReply stale = cli(fixture, flavor, token, "apply", file(partial).toString(),
                     "--if-match", displayed.contentHash());
-            refusal(stale, "artifact.version-conflict");
+            refusal(stale, "TS0240003");
             assertThat(fixture.document(id)).isEqualTo(edited);
 
             Map<String, Object> replacement = Map.of("uri", uri(REPLACEMENT));
@@ -169,7 +169,7 @@ class SourceConfigClientTransportsIT {
             assertChange(mcp.success("artifact_apply", drafts(partial, hash)), id, "UPDATED");
             encrypted(fixture, id, original);
             Document edited = fixture.document(id);
-            mcp.refused("artifact_apply", drafts(partial, hash), "artifact.version-conflict");
+            mcp.refused("artifact_apply", drafts(partial, hash), "TS0240003");
             assertThat(fixture.document(id)).isEqualTo(edited);
 
             List<Document> beforeRejectedBatch = fixture.snapshot();
@@ -177,10 +177,10 @@ class SourceConfigClientTransportsIT {
             Map<String, Object> validNew = Map.of("content", source(
                     "rejected_batch_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT)));
             Map<String, Object> staleEdit = Map.of("content", partial, "expectedContentHash", hash);
-            mcp.refused("artifact_apply", Map.of("drafts", List.of(validNew, staleEdit)), "artifact.version-conflict");
-            mcp.refused("artifact_apply", drafts(envelope(id, "mysql"), null), "control.malformed-request");
+            mcp.refused("artifact_apply", Map.of("drafts", List.of(validNew, staleEdit)), "TS0240003");
+            mcp.refused("artifact_apply", drafts(envelope(id, "mysql"), null), "TS0210001");
             mcp.refused("artifact_apply", drafts(source(id, "mongodb-atlas", Map.of("uri", "<redacted>")), null),
-                    "control.malformed-request");
+                    "TS0210001");
             assertThat(fixture.snapshot()).isEqualTo(beforeRejectedBatch);
             assertThat(fixture.audit()).isEqualTo(auditBeforeRejectedBatch);
 
@@ -226,7 +226,7 @@ class SourceConfigClientTransportsIT {
             fixture.artifacts.updateOne(new Document("_id", "inventory_unknown"),
                     new Document("$set", new Document("body.config", "tscfg:77:bad:" + SECRET)));
             List<Document> snapshot = fixture.snapshot();
-            mcp.refused("artifact_get", Map.of("id", "inventory_unknown"), "io.document-unreadable");
+            mcp.refused("artifact_get", Map.of("id", "inventory_unknown"), "TS0480004");
             Map<?, ?> afterCorruption = mcp.success("source_list", Map.of("limit", 200));
             safe(JSON.writeValueAsString(afterCorruption));
             assertThat(((List<?>) afterCorruption.get("items")).stream()
@@ -274,7 +274,7 @@ class SourceConfigClientTransportsIT {
             // --allow-write exposes write tools but does not upgrade this actual read-scoped credential.
             try (McpSession exposed = mcp(fixture, mcp.token, true)) {
                 exposed.refused("artifact_apply", drafts(source(id, "mysql", config("mysql", REPLACEMENT)), null),
-                        "control.forbidden");
+                        "TS0210004");
             }
             assertThat(fixture.snapshot()).isEqualTo(artifacts);
             assertThat(fixture.audit()).isEqualTo(audit);
@@ -350,17 +350,17 @@ class SourceConfigClientTransportsIT {
             List<Document> audit = cloud.audit();
             for (String credential : List.of(localToken, "controlled-outbound-token", cloud.credential)) {
                 for (CliFlavor flavor : cliFlavors()) {
-                    refusal(cli(cloud, flavor, credential, "get", id), "control.unauthenticated");
+                    refusal(cli(cloud, flavor, credential, "get", id), "TS0210003");
                     refusal(cli(cloud, flavor, credential, "apply", file(source(
                             "cloud_rejected_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT))).toString()),
-                            "control.unauthenticated");
+                            "TS0210003");
                 }
                 try (McpSession mcp = mcp(cloud, credential, true)) {
-                    mcp.refused("artifact_get", Map.of("id", id), "control.unauthenticated");
-                    mcp.refused("source_list", Map.of(), "control.unauthenticated");
+                    mcp.refused("artifact_get", Map.of("id", id), "TS0210003");
+                    mcp.refused("source_list", Map.of(), "TS0210003");
                     mcp.refused("artifact_apply", drafts(source(
                             "cloud_rejected_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT)), null),
-                            "control.unauthenticated");
+                            "TS0210003");
                 }
             }
             assertThat(cloud.snapshot()).isEqualTo(before);

@@ -51,12 +51,19 @@ final class MongoAlertStorageSchema {
     private final String clusterId;
     private final String keyId;
     private final Runnable requireActive;
+    private final java.util.function.Consumer<Document> verifyKeyMaterial;
 
     MongoAlertStorageSchema(MongoClient client, MongoDatabase database, String clusterId,
             String keyId, Runnable requireActive) {
+        this(client, database, clusterId, keyId, requireActive, null);
+    }
+
+    MongoAlertStorageSchema(MongoClient client, MongoDatabase database, String clusterId,
+            String keyId, Runnable requireActive, java.util.function.Consumer<Document> verifyKeyMaterial) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId"); this.keyId = Objects.requireNonNull(keyId, "keyId");
         this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
+        this.verifyKeyMaterial = verifyKeyMaterial;
     }
 
     /** Load-only: absent means unprepared only when the entire feature set is absent as well. */
@@ -91,6 +98,18 @@ final class MongoAlertStorageSchema {
     int prepare(String operationId,MongoReadBudget budget) {
         return StoreIo.call(()->prepareAll(operationId,budget));
     }
+
+    /** Resumes only the additive steps left by the original installation. */
+    void resumeInitialPreparation(String operationId, MongoReadBudget budget) {
+        Document retained = budget.transaction(client, session -> marker(session, budget));
+        if (retained == null) return;
+        int version = retained.getInteger(SystemMetaStore.INSTALLED_VERSION);
+        if (version >= OPERATIONAL_VERSION && version < VERSION
+                && MongoAlertSetupMarker.hasOriginalOperation(retained, retained.get(QUERY, Document.class), operationId)) {
+            prepare(operationId, budget);
+        }
+    }
+
     private int prepareAll(String operationId,MongoReadBudget budget) {
         prepareOperational(operationId,budget);
         prepareNodes(budget);
@@ -302,12 +321,17 @@ final class MongoAlertStorageSchema {
         // The transaction owns CSOT; overriding a database or collection timeout inside it is invalid.
         budget.remainingMillis();
         MongoDatabase reads = database;
+        var keyQuery = SystemCollections.CLUSTER_KEYS.on(reads).find(session, new Document("_id", "cluster"));
+        Document keys = null;
+        if (verifyKeyMaterial != null) {
+            keys = keyQuery.first();
+            verifyKeyMaterial.accept(keys);
+        }
         Document identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(reads)
                 .find(session, new Document("_id", "cluster")).first();
         if (identity == null || !clusterId.equals(identity.get("clusterId"))
                 || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))) { throw unreadable("identity"); }
-        Document keys = SystemCollections.CLUSTER_KEYS.on(reads).find(session, new Document("_id", "cluster"))
-                .projection(new Document("keyId", 1)).first();
+        if (verifyKeyMaterial == null) keys = keyQuery.projection(new Document("keyId", 1)).first();
         if (keys == null || !keyId.equals(keys.get("keyId"))) { throw unreadable("key-binding"); }
         Document schema = SystemCollections.SCHEMA_MIGRATIONS.on(reads).find(session, new Document("_id", "config")).first();
         if (schema == null || !(schema.get("installedVersion") instanceof Integer installed)
@@ -352,13 +376,10 @@ final class MongoAlertStorageSchema {
     private Map<String, Document> structures(MongoReadBudget budget) {
         List<String> names = COLLECTIONS.stream().map(SystemCollections::collectionName).toList();
         var found = new HashMap<String, Document>();
-        try (var cursor = budget.database(database).listCollections().filter(new Document("name", new Document("$in", names)))
-                .batchSize(COLLECTIONS.size()).iterator()) {
-            while (cursor.hasNext()) {
-                budget.remainingMillis(); Document row = cursor.next();
-                if (!(row.get("name") instanceof String name) || !names.contains(name) || found.put(name, row) != null) {
-                    throw unreadable("collection-metadata");
-                }
+        for (Document row : MongoCollectionMetadata.matching(budget.database(database), names, true)) {
+            budget.remainingMillis();
+            if (found.put(row.getString("name"), row) != null) {
+                throw unreadable("collection-metadata");
             }
         }
         return found;

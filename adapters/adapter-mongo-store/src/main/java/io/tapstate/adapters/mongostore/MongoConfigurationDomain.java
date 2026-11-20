@@ -166,9 +166,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return alertSchemaVersion(new MongoReadBudget(java.time.Duration.ofSeconds(5)));
     }
     int alertSchemaVersion(MongoReadBudget budget) {
+        return alertSchemaReader().load(budget);
+    }
+
+    private MongoAlertStorageSchema alertSchemaReader() {
         requireOpen();
         return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
-                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).load(budget);
+                configurationKey.current().activeKeyId(), this::requireOpen, configurationKey::requireCurrent);
     }
 
     private synchronized void startAlertSchemaVerification() {
@@ -187,8 +191,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     private void verifyAlertSchema() {
         var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
-        Document marker = new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
-                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).loadVerifiedMarker(budget);
+        Document marker = alertSchemaReader().loadVerifiedMarker(budget);
         if (marker == null || marker.getInteger("installedVersion") != MongoAlertStorageSchema.VERSION)
             throw unreadable("alert-store", "schema-capability");
         verifiedAlertSchema = new VerifiedAlertSchema(marker, System.nanoTime());
@@ -221,6 +224,15 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         requireOpen();
         return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
+    }
+
+    /** Cloud bootstrap may finish alert preparation from its matching retained setup operation. */
+    public void resumeInitialAlertStorage(String operationId) {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(30));
+        requireOpen();
+        new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen)
+                .resumeInitialPreparation(operationId, budget);
     }
 
     <T> T alertMaintenanceTransaction(MongoReadBudget budget,java.util.function.Function<com.mongodb.client.ClientSession,T> action) {
@@ -263,6 +275,21 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     <T> T alertTransaction(MongoReadBudget budget, java.util.function.Function<com.mongodb.client.ClientSession, T> action) {
         requireOpen();
         return budget.transaction(connection.client(), session -> { requireOpen(); T value = action.apply(session); requireOpen(); return value; });
+    }
+
+    <T> T alertPollingRead(MongoReadBudget budget, Function<ClientSession, T> snapshot, Function<ClientSession, T> fallback) {
+        requireOpen();
+        return StoreIo.call(() -> {
+            if (MongoReadBudget.supportsSnapshotReads(connection.client())) {
+                try (var session = connection.client().startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())) {
+                    T result = snapshot.apply(session);
+                    budget.requireRemaining();
+                    requireOpen();
+                    if (result != null) return result;
+                }
+            }
+            return alertTransaction(budget, fallback);
+        });
     }
 
     /** Load-only progress. Absence does not authorize a normal access path to create identities. */
@@ -1119,6 +1146,53 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return bindings;
     }
 
+    public record ObservationCapture(String sourceId, String captureId) {
+        public ObservationCapture {
+            Objects.requireNonNull(sourceId, "sourceId");
+            Objects.requireNonNull(captureId, "captureId");
+        }
+    }
+
+    public record ObservationConfiguration(io.tapstate.core.model.PipelineResource pipeline,
+            Map<String, io.tapstate.core.model.SourceResource> sources,
+            Map<String, io.tapstate.spi.store.CapturePreparation> captures) {
+        public ObservationConfiguration { sources = Map.copyOf(sources); captures = Map.copyOf(captures); }
+    }
+
+    public record ObservationCheck(boolean changed, Optional<ObservationConfiguration> configuration) {
+        static ObservationCheck fallback() { return new ObservationCheck(false, Optional.empty()); }
+        static ObservationCheck superseded() { return new ObservationCheck(true, Optional.empty()); }
+    }
+
+    private final MongoStructureProof observationStructures = new MongoStructureProof();
+    private volatile boolean observationCollations;
+    public ObservationCheck observationConfiguration(io.tapstate.spi.store.PipelineIntentStore.ActuationReading before,
+            String defaultSource, Map<String, ObservationCapture> sources) {
+        requireOpen();
+        if (before.configurationRevision().isEmpty() || sources.isEmpty() || sources.size() > 4
+                || !MongoReadBudget.supportsSnapshotReads(connection.client())) return ObservationCheck.fallback();
+        try {
+            observationStructures.require(MongoStructureProof.Kind.OBSERVATION, () -> {
+                observationCollations = MongoCacheMetadataStructure.simpleCollations(connection.database(), MongoPipelineObservationConfig.COLLECTIONS);
+                if (observationCollations) {
+                    bindings.verifyObservationIndex();
+                    MongoCapturePreparationFacts.verify(connection.database());
+                }
+            });
+            if (!observationCollations) return ObservationCheck.fallback();
+            var facts = new MongoPipelineObservationConfig(connection.client(), connection.database(), bindings, artifacts)
+                    .read(before, defaultSource, sources);
+            requireOpen();
+            return facts;
+        } catch (RuntimeException failure) {
+            observationStructures.clear();
+            requireOpen();
+            if (failure instanceof TapstateException coded && coded.code() == IoError.DOCUMENT_TOO_LARGE)
+                return ObservationCheck.fallback();
+            throw failure;
+        }
+    }
+
     public io.tapstate.spi.store.PipelineIntentStore intents() {
         requireOpen();
         return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings).guardedBy(this::requireOpen);
@@ -1163,6 +1237,16 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public Optional<BoundValidationInputs> boundValidationInputs(io.tapstate.spi.store.ValidationReportAdmission.Task task,
             long revision, Runnable local) {
         return validationTaskDefinitions(local).boundInputs(task, revision, bindings);
+    }
+
+    private final MongoStructureProof unpreparedValidation = new MongoStructureProof();
+
+    public io.tapstate.spi.store.ValidationTaskStore pollingValidationTasks(Runnable local) {
+        requireOpen();
+        Objects.requireNonNull(local).run();
+        StoreIo.run(() -> MongoValidationSchema.requireReady(connection.database(), true, unpreparedValidation));
+        return MongoValidationAdmissionStore.nativeTaskDefinitions(connection.client(), connection.database(), clusterId,
+                () -> { requireOpen(); local.run(); }, artifacts);
     }
 
     private MongoValidationAdmissionStore.Definitions validationTaskDefinitions(Runnable local) {
@@ -1484,6 +1568,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", field), null);
     }
 
+    String alertReadKeyId(Document row) {
+        requireOpen();
+        return configurationKey.requireCurrent(row).activeKeyId();
+    }
+
+    String alertReadKeyId(ClientSession session){requireOpen();return configurationKey.readCurrent(session).activeKeyId();}
+
     /** One persistent key, with no node-session ACK, rotation state or cache access. */
     private static final class PersistentKey implements SourceConfigCipherProvider {
         private final MongoCollection<Document> keys;
@@ -1499,6 +1590,16 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         @Override
         public SourceConfigCipher current() {
             return cipher;
+        }
+
+        SourceConfigCipher readCurrent(ClientSession session){
+            return requireCurrent(keys.find(session,new Document("_id","cluster")).first());
+        }
+
+        SourceConfigCipher requireCurrent(Document row) {
+            SourceConfigCipher observed = decode(row);
+            if (!cipher.activeKeyId().equals(observed.activeKeyId())) throw invalidKey();
+            return observed;
         }
 
         /** The same-session fence below verifies this original immutable key before any write commits. */

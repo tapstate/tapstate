@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public final class CaptureHealth {
 
-    private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final AtomicReference<io.tapstate.core.common.FailureFact> failure = new AtomicReference<>();
 
     /**
      * Rows received, by source table and then by the op's wire symbol. Concurrent on both levels because it
@@ -77,7 +77,7 @@ public final class CaptureHealth {
 
     /** The failure the run's cdc stream died with, or empty while it is healthy or opened no tail. */
     public Optional<Throwable> failure() {
-        return Optional.ofNullable(failure.get());
+        return failureFact().map(io.tapstate.core.common.FailureFact::cause);
     }
 
     /**
@@ -86,7 +86,19 @@ public final class CaptureHealth {
      * overwrite the cause that stopped the tail.
      */
     public void fail(Throwable error) {
-        failure.compareAndSet(null, error);
+        fail(error, Map.of());
+    }
+
+    public Optional<io.tapstate.core.common.FailureFact> failureFact() {
+        return Optional.ofNullable(failure.get());
+    }
+
+    public void fail(Throwable error, Map<String, Object> diagnostic) {
+        if (error != null) fail(new io.tapstate.core.common.FailureFact(error, diagnostic));
+    }
+
+    public void fail(io.tapstate.core.common.FailureFact fact) {
+        failure.compareAndSet(null, fact);
     }
 
     /** When the counting behind {@link #receivedRows()} began. */
@@ -205,6 +217,12 @@ public final class CaptureHealth {
                 fail(error);
             }
 
+            @Override public void onError(Throwable error, Map<String, Object> diagnostic) {
+                fail(error, diagnostic);
+            }
+
+            @Override public void onFailure(io.tapstate.core.common.FailureFact fact) { fail(fact); }
+
             @Override
             public void onAcknowledged(SourcePosition position) {
                 acknowledged();
@@ -235,6 +253,12 @@ public final class CaptureHealth {
             public void onError(Throwable error) {
                 recorded.onError(error);
             }
+
+            @Override public void onError(Throwable error, Map<String, Object> diagnostic) {
+                recorded.onError(error, diagnostic);
+            }
+
+            @Override public void onFailure(io.tapstate.core.common.FailureFact fact) { recorded.onFailure(fact); }
 
             @Override
             public void onAcknowledged(SourcePosition position) {

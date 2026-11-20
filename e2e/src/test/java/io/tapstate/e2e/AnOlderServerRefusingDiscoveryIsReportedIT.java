@@ -72,7 +72,7 @@ class AnOlderServerRefusingDiscoveryIsReportedIT {
 
             assertThat(run.stderr())
                     .as("the refusal is reported as a coded diagnostic carrying what the server said")
-                    .contains("cli.issuer-discovery-rejected")
+                    .contains("TS0330058")
                     .contains(seed.toString())
                     .contains("control.unauthenticated")
                     // The whole of the original complaint: a stack trace where a sentence belonged.

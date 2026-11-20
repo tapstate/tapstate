@@ -11,6 +11,7 @@ import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.spi.store.PipelineIntentStore;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineStoreViews;
 import java.util.Objects;
@@ -54,7 +55,13 @@ final class ConvergenceDriver {
             Function<PipelineConvergencePass, RebuildAdmission> rebuilds,
             Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts,
             Consumer<PipelineIntentStore.PendingStart> prepareStart,
-            Consumer<String> resumeRebuild) {
+            Consumer<String> resumeRebuild, NativeObservationSampling observations) {
+        ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
+                Function<PipelineConvergencePass, LifecycleActuator> actuators,
+                Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain,
+                PipelineAlertFeed alerts, Consumer<PipelineIntentStore.PendingStart> prepareStart, Consumer<String> resumeRebuild) {
+            this(intents, stores, active, actuators, rebuilds, retain, alerts, prepareStart, resumeRebuild, null);
+        }
         ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
                 Function<PipelineConvergencePass, LifecycleActuator> actuators,
                 Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain) {
@@ -153,11 +160,19 @@ final class ConvergenceDriver {
             PipelineConvergencePass pass = null;
             PipelineActuationOwnership.Pass localPass = null;
             try {
+                PipelineIntentStore.ActuationReading observationOrigin = null;
                 PipelineActuationOwnership.Permit permit;
                 if (scoped == null) {
                     permit = actuation.permit(pipelineId);
                 } else {
-                    var snapshot = scoped.intents().loadForActuation(pipelineId);
+                    Optional<PipelineIntentSnapshot> snapshot;
+                    if (scoped.observations() == null) {
+                        snapshot = scoped.intents().loadForActuation(pipelineId);
+                    } else {
+                        var read = scoped.intents().readForActuation(pipelineId);
+                        observationOrigin = read.orElse(null);
+                        snapshot = read.map(PipelineIntentStore.ActuationReading::intent);
+                    }
                     if (snapshot.isEmpty()) {
                         var pendingStart = scoped.prepareStart() == null
                                 ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
@@ -203,12 +218,31 @@ final class ConvergenceDriver {
                     // observation, so a read face can say why, and into the log with its code and stack.
                     // Every later pass while the checkpoint stays FAILED publishes null and the publisher
                     // carries the stored reason forward — durably, so it survives a process restart too.
-                    failure = PipelineFailures.of(pipelineId, result.failure().orElse(null));
-                    LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
-                            failure.code(), result.failure().orElse(null));
+                    failure = PipelineFailures.of(pipelineId, result.failure().orElse(null), result.diagnostic(), result.publicFailure());
+                    var original = result.failure().orElse(null);
+                    var logDiagnostic = original == null ? failure.diagnostic()
+                            : io.tapstate.core.logging.FailureLogSnapshot.of(new io.tapstate.core.common.FailureFact(
+                                    original, failure.diagnostic(), result.publicFailure()));
+                    if (PipelineFailures.isCoded(original) && !logDiagnostic.containsKey("code")) {
+                        // The current coded primary is an observed fact, even when no connector was opened.
+                        var fields = new java.util.LinkedHashMap<String, Object>(logDiagnostic);
+                        fields.put("code", failure.code());
+                        fields.put("codeSource", io.tapstate.core.common.DiagnosticCodeSource.TAPSTATE_STANDARD);
+                        fields.put("params", failure.params());
+                        var rendered = io.tapstate.messages.MessageCatalog.bundled().render(failure.code(),
+                                new java.util.LinkedHashMap<String, Object>(failure.params()));
+                        fields.put("message", rendered.message());
+                        if (rendered.solution() != null && !rendered.solution().isBlank()) fields.put("solution", rendered.solution());
+                        logDiagnostic = io.tapstate.core.logging.LogDiagnosticProjection.fit(fields);
+                    }
+                    var logParams = PipelineFailures.isCoded(original) ? failure.params()
+                            : Map.of("pipeline", pipelineId, "cause", original == null ? "unknown" : original.getClass().getName());
+                    LOG.atWarn().addKeyValue("diagnostic", logDiagnostic)
+                            .log("Pipeline {} entered FAILED [{}]: {}", pipelineId, failure.code(), logParams);
                 }
                 var projection = scoped == null ? publisher.publish(pipelineId, failure)
-                        : publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
+                        : scoped.observations() == null ? publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure)
+                        : scoped.observations().publish(publisher, pass, result, observationOrigin, failure);
                 PipelineConvergencePass sampledPass = pass;
                 projection.ifPresent(published -> {
                     if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
@@ -259,7 +293,10 @@ final class ConvergenceDriver {
         // with whatever the deleted one had left of its budget.
         if (scoped == null) converger.retain(pipelineIds);
         else scoped.retainRebuilds().accept(pipelineIds);
-        if (scoped != null) alert(() -> scoped.alerts().retain(pipelineIds));
+        if (scoped != null) {
+            alert(() -> scoped.alerts().retain(pipelineIds));
+            if (scoped.observations() != null) scoped.observations().retain(pipelineIds);
+        }
         publisher.forgetPipelinesOutside(pipelineIds);
         if (sampler != null) {
             sampler.forgetPipelinesOutside(pipelineIds);

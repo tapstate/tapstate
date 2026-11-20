@@ -41,7 +41,7 @@ class AViewSchemaPolicyIsRefusedByTheShippedCliIT {
 
         assertThat(run.exitCode()).as("validate must refuse, so it cannot exit 0").isNotZero();
         assertThat(run.stdout() + run.stderr())
-                .contains("dsl.unknown-field")
+                .contains("TS0010002")
                 .contains("view.schema");
     }
 

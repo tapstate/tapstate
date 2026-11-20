@@ -604,7 +604,7 @@ class RegistryConnectorProvisionerTest {
         assertThatThrownBy(resolve::run).isInstanceOfSatisfying(TapstateException.class, failure -> {
             assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED);
             assertThat(failure.args()).isEqualTo(Map.of("connector", "orders"));
-            assertThat(failure).hasNoCause().hasMessage("connector.load-failed {connector=orders}");
+            assertThat(failure).hasNoCause().hasMessage("TS0060009 {connector=orders}");
         });
     }
 

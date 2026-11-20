@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.HashSet;
 import java.util.Set;
 
 /**
@@ -384,6 +385,16 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         this.settleMissingReferencesOnComplete = settleMissingReferencesOnComplete;
         this.vertex = Objects.requireNonNull(vertex, "vertex");
         this.slots = List.copyOf(slots);
+        this.rollupBoundary = rollupBoundaryOf(this.slots);
+        // An alternative whose snapshot nothing is tracking has no moment at which its absence becomes known,
+        // so it is settled from the start: the document renders whichever alternative is live, and a row
+        // turning up later under an earlier one redraws it. Holding the document instead would hold it for
+        // ever wherever only a later alternative names a row - which is the case alternatives exist for.
+        for (String alternative : alternativeLookups(this.slots)) {
+            if (!this.lookupSnapshots.containsKey(alternative)) {
+                completedObjectLookups.add(alternative);
+            }
+        }
         this.store = Objects.requireNonNull(store, "store");
         this.outputStream = Objects.requireNonNull(outputStream, "outputStream");
         this.sending = Objects.requireNonNull(sending, "sending");
@@ -611,6 +622,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     protected void init(Processor.Context context) {
         this.failures = NestFailureRecording.of(context);
         this.timer = StageTimer.of(stage(), context);
+        this.logger = context.logger();
     }
 
     // Times each drain of arrivals, which is this stage's unit of work.
@@ -699,8 +711,20 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         return true;
     }
 
+    /** Every namespace a slot with alternatives reads from, at any depth of the tree. */
+    private static Set<String> alternativeLookups(List<EmbedSlot> slots) {
+        Set<String> found = new LinkedHashSet<>();
+        for (EmbedSlot slot : slots) {
+            if (slot.hasAlternatives()) {
+                slot.references().forEach(reference -> found.add(reference.lookupMap()));
+            }
+            found.addAll(alternativeLookups(slot.children()));
+        }
+        return found;
+    }
+
     private boolean hasDirectOwnedSnapshotShape() {
-        return slots.stream().allMatch(slot -> slot.children().isEmpty()
+        return slots.stream().allMatch(slot -> slot.children().isEmpty() && !slot.hasAlternatives()
                 && (slot.isReference() ? slot.as() == io.tapstate.core.model.EmbedAs.OBJECT
                         : slot.as() == io.tapstate.core.model.EmbedAs.ARRAY));
     }
@@ -744,7 +768,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     private boolean referenceOnlyRootShape() {
         return vertex.pathId().isEmpty() && !slots.isEmpty()
-                && slots.stream().allMatch(slot -> slot.isReference()
+                && slots.stream().allMatch(slot -> slot.isReference() && !slot.hasAlternatives()
                         && slot.as() == io.tapstate.core.model.EmbedAs.OBJECT && slot.children().isEmpty());
     }
 
@@ -1641,7 +1665,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             document.emissionBytes = -1;
             recentReferenceStates.remove(key);
             document.assembly.reconcileMissingObjects(slots);
-            document.assembly.render(slots, resolved).ifPresentOrElse(
+            document.assembly.render(slots, resolved, String.valueOf(key), store::folded).ifPresentOrElse(
                     rendered -> settleRendered(key, document, rendered, resolved,
                             allowMissingReferences, allowMissingObjects, writes),
                     () -> settleDeleted(key, document));
@@ -1954,7 +1978,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 : referencesFor(assembly);
         Optional<Map<String, Object>> rendered = assembly == null
                 ? Optional.empty()
-                : assembly.render(slots, references);
+                : assembly.render(slots, references, String.valueOf(entry.getKey()), store::folded);
         if (rendered.isEmpty()) {
             open.remove();
             return false;
@@ -2072,6 +2096,40 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         return lowest;
     }
 
+    /** Documents already warned about, bounded so a nest of many wide documents cannot grow it without end. */
+    private final Set<Object> warnedWide = new HashSet<>();
+    private static final int WARNED_WIDE_LIMIT = 1_000;
+    private transient com.hazelcast.logging.ILogger logger;
+    private final long rollupBoundary;
+
+    /**
+     * Says once per document, while the pipeline runs, that a document whose tree carries rollup fields has
+     * grown past the width rollups keep up with. The estimate given when the pipeline was applied is an
+     * average and cannot see a skewed document; this sees each one as it is. The count is the document's
+     * elements across its levels, which bounds the widest of them.
+     */
+    private void warnOfARollupDocumentPastItsWidth(Object key, long elements) {
+        if (elements <= rollupBoundary || logger == null || warnedWide.size() >= WARNED_WIDE_LIMIT
+                || !warnedWide.add(key)) {
+            return;
+        }
+        logger.warning(io.tapstate.core.common.NestSizingErrorDefinitions.ROLLUP_LEVEL_WIDE.code() + ": document " + keyRow(key) + " holds " + elements
+                + " elements and carries rollup fields, past the " + rollupBoundary + " elements of its width a"
+                + " rollup keeps up with; every change rewrites the document and refolds the whole level");
+    }
+
+    /** The smallest element boundary among the tree's rollup fields; no boundary where it carries none. */
+    private static long rollupBoundaryOf(List<EmbedSlot> slots) {
+        long smallest = Long.MAX_VALUE;
+        for (EmbedSlot slot : slots) {
+            for (var spec : slot.rollups()) {
+                smallest = Math.min(smallest, spec.elementBoundary());
+            }
+            smallest = Math.min(smallest, rollupBoundaryOf(slot.children()));
+        }
+        return smallest;
+    }
+
     /**
      * Stops the job once one document has absorbed more elements than it is allowed to. Checked per
      * document rather than across the nest: how wide one has grown says nothing about the others, and a
@@ -2082,6 +2140,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     private void refuseToLetOneDocumentGrowPastItsWidth(Object key, RootAssembly assembly) {
         long elements = assembly.elements();
+        warnOfARollupDocumentPastItsWidth(key, elements);
         if (elements > elementLimit) {
             throw new TapstateException(NestError.ROOT_FANOUT_LIMIT_EXCEEDED,
                     Map.of("rootKey", String.valueOf(keyRow(key)), "elements", elements,

@@ -1,0 +1,14 @@
+{
+  "TS0460001": {
+    "message": "Nest level {embedPath} of pipeline {pipeline} is estimated to hold {estimatedEntries} entries, {multiple} times the {budget} it keeps in memory, so nearly every read of its state would come from storage.",
+    "solution": "Raise this pipeline's entries_in_memory so more of that level stays resident, or accept the round trips if the throughput they allow is enough."
+  },
+  "TS0460002": {
+    "message": "Nest level {embedPath} of pipeline {pipeline} could be sized from {counted} of the {total} inputs feeding it; the rest report no row count, so what was estimated is a floor.",
+    "solution": "Discover the sources feeding that level so their tables report row counts, then apply again to have it sized on all of them."
+  },
+  "TS0460003": {
+    "message": "Nest level {embedPath} of pipeline {pipeline} carries rollup fields over an estimated {estimatedElements} elements per document, about {estimatedBytes} bytes of state, past the {boundary} elements of this width a rollup keeps up with: every change rewrites the document and refolds the whole level.",
+    "solution": "Compute this value outside the document's render - in the target, or with a cross-row computation keyed by the parent - or narrow the level with a filter upstream. An average this high also means some documents are far wider."
+  }
+}

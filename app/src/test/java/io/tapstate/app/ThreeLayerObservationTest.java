@@ -77,6 +77,25 @@ class ThreeLayerObservationTest {
         verify(f.cache).pipelineObservations(f.scope);
     }
 
+    @ParameterizedTest
+    @EnumSource(value = IoError.class, names = {"DOCUMENT_UNREADABLE", "PIPELINE_STATE_REBUILD_REQUIRED"})
+    void aRecordedStartFailureUsesOnlyItsKnownPipelineIdentity(IoError code) {
+        var f = new Fixture();
+        var pending = new PipelinePreparation("pipeline", 1,
+                PipelinePreparation.Phase.UNASSIGNED, null, null, null);
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), pending,
+                Optional.empty(), Optional.empty(), false, Optional.of(code), 1);
+        when(f.configuration.pipelineDisplayHeaders(List.of("pipeline"), false))
+                .thenReturn(Map.of("pipeline", header));
+        var observation = f.port.observations().readAll(List.of("pipeline")).get("pipeline");
+        assertThat(observation.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(observation.failure().code()).isEqualTo(code.code());
+        assertThat(observation.failure().params()).isEqualTo(code == IoError.PIPELINE_STATE_REBUILD_REQUIRED
+                ? Map.of("pipeline", "pipeline") : Map.of());
+        assertThat(observation.failure().diagnostic()).isEmpty();
+        verifyNoInteractions(f.cache);
+    }
+
     @Test void aBatchCannotPublishAnObservationAfterItsConfigurationFenceChanges() {
         var f = new Fixture();
         var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(),

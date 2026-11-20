@@ -16,7 +16,8 @@ import java.util.Map;
 @RestController
 class ValidationReportController {
     private final ObjectProvider<ValidationReportService> services;private final ObjectMapper json;
-    ValidationReportController(ObjectProvider<ValidationReportService> services,ObjectMapper json){this.services=services;this.json=json;}
+    ValidationReportController(ObjectProvider<ValidationReportService> services,ObjectMapper json,io.tapstate.messages.MessageCatalog catalog){this.services=services;this.json=json;this.catalog=catalog;}
+    private final io.tapstate.messages.MessageCatalog catalog;
     @Verb("validation.history") @GetMapping("/pipelines/{pipeline}/validation-tasks/{task}/reports")
     void history(@PathVariable("pipeline") String pipeline,@PathVariable("task") String task,
             @RequestParam(value="offset",defaultValue="0") String offset,@RequestParam(value="limit",defaultValue="10") String limit,HttpServletResponse response)throws IOException{
@@ -25,7 +26,7 @@ class ValidationReportController {
     @Verb("validation.report") @GetMapping("/pipelines/{pipeline}/validation-tasks/{task}/reports/{run}")
     void report(@PathVariable("pipeline") String pipeline,@PathVariable("task") String task,@PathVariable("run") String run,
             @RequestParam(value="generation",required=false) String generation,@RequestParam(value="sequence",required=false) String sequence,HttpServletResponse response)throws IOException{
-        try(var report=input(()->service().report(new ValidationReportService.Reference(pipeline,task,generation,sequence,run)))){write(response,report.value());}
+        try(var report=input(()->service().report(new ValidationReportService.Reference(pipeline,task,generation,sequence,run),this::localizedFailure))){write(response,report.value());}
     }
     @Verb("validation.roots") @GetMapping("/pipelines/{pipeline}/validation-tasks/{task}/reports/{run}/roots")
     void roots(@PathVariable("pipeline") String pipeline,@PathVariable("task") String task,@PathVariable("run") String run,
@@ -37,6 +38,14 @@ class ValidationReportController {
     void root(@PathVariable("pipeline") String pipeline,@PathVariable("task") String task,@PathVariable("run") String run,@PathVariable("root") String root,
             @RequestParam(value="generation",required=false) String generation,@RequestParam(value="sequence",required=false) String sequence,HttpServletResponse response)throws IOException{
         try(var report=input(()->service().root(new ValidationReportService.Reference(pipeline,task,generation,sequence,run),root))){write(response,report.value());}
+    }
+    private ValidationReportService.Failure localizedFailure(ValidationReportService.Failure failure) {
+        if (failure.code() == null || !failure.code().matches("TS[0-9]{7}")) return failure;
+        Map<String,Object> params = new java.util.TreeMap<>(failure.params());
+        if (catalog.renderComplete(failure.code(),params).isEmpty()) return failure;
+        var rendered = catalog.render(failure.code(),params,ApiExceptionHandler.requestLocale());
+        return new ValidationReportService.Failure(failure.code(),failure.params(),failure.exceptionType(),
+                rendered.message(),failure.technical(),failure.fatal(),failure.message(),rendered.solution());
     }
     private void write(HttpServletResponse response,Object value)throws IOException{
         response.setHeader(HttpHeaders.CACHE_CONTROL,"no-store");

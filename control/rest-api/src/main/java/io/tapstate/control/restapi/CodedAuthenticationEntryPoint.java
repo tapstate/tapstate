@@ -22,7 +22,7 @@ final class CodedAuthenticationEntryPoint implements AuthenticationEntryPoint {
             AuthenticationException authenticationException) throws IOException {
         if (authenticationException instanceof CodedAuthenticationFailure dependency) {
             ApiExceptionHandler.markCloudError(request, dependency.code());
-            errors.write(response, dependency.code(), java.util.Map.of());
+            errors.write(request, response, dependency.code(), java.util.Map.of());
             return;
         }
         errors.unauthenticated(request, response);

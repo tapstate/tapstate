@@ -70,7 +70,7 @@ final class DefaultSourcePdkTest implements AutoCloseable {
         if (flight.cancelling || flight.interrupted || !flight.released()) throw timeout(config);
         var failure = flight.failure.get();
         if (failure != null) {
-            if (failure instanceof TapstateException coded && coded.code().code().startsWith("connector.")
+            if (failure instanceof TapstateException coded && (coded.code() instanceof ConnectorError || coded.code().code().startsWith("connector."))
                     && !(coded.getCause() instanceof InterruptedException))
                 return failed(config, coded.code().code());
             if (failure instanceof RuntimeException runtime) throw runtime;

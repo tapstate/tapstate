@@ -120,7 +120,7 @@ class DataBrowserFindShapeIT {
             // hand back a page the caller never asked for and cannot distinguish from the one it did.
             assertThat(control.findExpectingRefusal("src_file", COLLECTION, Map.of("limit", OVER_THE_CAP)).code())
                     .as("asking for more rows than this face will serve")
-                    .isEqualTo("data-browser.invalid-limit");
+                    .isEqualTo("TS0390002");
 
             // (4) An order that was asked for is an order that is applied. Descending, because ascending is
             // what several wrong implementations return by accident - the file's own order is ascending.

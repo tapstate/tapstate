@@ -12,11 +12,16 @@ import java.util.Optional;
 /** A load-only checkpoint view; normal convergence cannot create or retire physical state. */
 final class MongoCachePipelineStateStore implements StateStore {
     private final MongoCachePipelineAccess access;
-    MongoCachePipelineStateStore(MongoCachePipelineAccess access) { this.access = access; }
+    private final MongoStructureProof structures;
+
+    MongoCachePipelineStateStore(MongoCachePipelineAccess access, MongoStructureProof structures) {
+        this.access = access;
+        this.structures = structures;
+    }
 
     @Override public Optional<CheckpointDoc> read(String pipelineId) {
         access.requirePipeline(pipelineId);
-        return access.transaction(session -> Optional.of(MongoStateStore.toCheckpoint(access.state(session))));
+        return Optional.of(access.readCheckpoint(structures));
     }
 
     @Override public void create(String pipelineId, String stateJson, Instant touchTime) {

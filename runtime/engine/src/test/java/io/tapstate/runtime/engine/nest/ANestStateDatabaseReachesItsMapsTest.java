@@ -105,7 +105,7 @@ class ANestStateDatabaseReachesItsMapsTest {
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) thrown).code().code())
-                .isEqualTo("nest.memory-budget-changed-while-running");
+                .isEqualTo("TS0490016");
         assertThat(((TapstateException) thrown).args())
                 .containsEntry("configured", NestSettings.DEFAULT_ENTRIES_HELD_IN_MEMORY)
                 .containsEntry("requested", 40_000L);
@@ -128,7 +128,7 @@ class ANestStateDatabaseReachesItsMapsTest {
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) thrown).code().code())
-                .isEqualTo("nest.state-database-changed-while-running");
+                .isEqualTo("TS0490017");
         assertThat(((TapstateException) thrown).args())
                 .containsEntry("namespace", FIRST)
                 .containsEntry("configured", "state_a")

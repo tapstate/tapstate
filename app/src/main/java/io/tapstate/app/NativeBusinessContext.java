@@ -70,11 +70,9 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
         var diagnosticCandidate = parent.getBeanProvider(IsolatedConnectionDiagnostics.class).getIfAvailable();
-        var resultStore = diagnosticCandidate == null ? port.connectionTestResults()
-                : isolatedConnectionTestResults(diagnosticCandidate);
-        if (diagnosticCandidate != null) {
-            beans.registerSingleton("activeConnectionDiagnostics", IsolatedConnectionDiagnostics.Active.INSTANCE);
-        }
+        if (diagnosticCandidate != null && !diagnosticCandidate.matches(original.binding())) throw StorageRuntime.unavailable();
+        var resultStore = original.cache().diagnosticResults(original.preparation().businessScope(), original::requireBusiness);
+        beans.registerSingleton("activeConnectionDiagnostics", IsolatedConnectionDiagnostics.Active.INSTANCE);
         beans.registerSingleton("defaultSourceVerification", new DefaultSourceVerification(() -> {
             original.requireBusiness();
             var binding = configuration.bindings().load().orElseThrow(StorageRuntime::unavailable);
@@ -88,10 +86,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 WorkloadClaimType.NODE_SESSION, execution.owner().nodeId()))
                 .filter(reading -> reading.leased() && reading.claim().owner().equals(execution.owner())
                         && reading.claim().claimGeneration() == execution.generation()).isPresent(),
-        result -> result.items().stream().anyMatch(item -> io.tapstate.adapters.pdk.ConnectorError.TEST_TIMEOUT.code().equals(item.connectorErrorCode())),
+        result -> result.items().stream().anyMatch(item -> (io.tapstate.adapters.pdk.ConnectorError.TEST_TIMEOUT.code().equals(item.connectorErrorCode())
+                || "connector.test-timeout".equals(item.connectorErrorCode()))),
         Duration.ofSeconds(60)));
         var overrides = new LinkedHashMap<String,Object>();
-        if (diagnosticCandidate != null) overrides.put("connectionTestResultStore", resultStore);
+        overrides.put("connectionTestResultStore", resultStore);
         overrides.put("tokenStore", configuration.tokens());
         overrides.put("aiProviderSettingsStore", configuration.aiProviderSettings());
         var providerClient = parent.getBeanProvider(AiProviderClient.class).getIfAvailable();
@@ -127,11 +126,6 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         original.requireBusiness(); active.set(true);
         context.getBean(NativeValidationScheduler.class).start();
 
-    }
-
-    private io.tapstate.spi.store.ConnectionTestResultStore isolatedConnectionTestResults(IsolatedConnectionDiagnostics candidate) {
-        if (!candidate.matches(original.binding())) throw StorageRuntime.unavailable();
-        return original.cache().isolatedDiagnosticResults(original.preparation().businessScope(), original::requireBusiness);
     }
 
     @Override public void afterInitialReady() {
@@ -520,7 +514,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean NativePipelineRecovery nativePipelineRecovery(NativeBusinessContext owner,PipelineFirstStatePreparer preparer,
                 ConnectorProvisioner connectors,Engine engine,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization) {
-            return new NativePipelineRecovery(owner.configuration,owner.original.preparation().authScope(),owner.port,preparer,
+            return new NativePipelineRecovery(owner.configuration,owner.original.preparation(),owner.port,preparer,
                     connectors,engine,captures,authorization,owner.original::requireActive,owner::available,owner.original.cache());
         }
         @Bean io.tapstate.core.lifecycle.ParallelismBudget parallelismBudget(org.springframework.core.env.Environment environment) {
@@ -653,6 +647,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 active.run();
                 var setup = owner.original.binding().setup();
                 var scope=alertScope(owner,cloud);
+                // An already bound Cloud cluster can retry preparation with the alert worker.
+                CloudConfigurationInitialization.resumeAlertStorage(owner.configuration, setup, cloud);
                 var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
                         : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
                 var catalog=types.catalog();var retention=retentions.resolve(deployment);
@@ -677,21 +673,26 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,
                 PipelineAlertRuntime runtime, CloudRuntimeSettings cloud, Clock clock, AuditGate audit) {
-            return (operation, caller, input) -> {
-                owner.original.requireBusiness();
-                var setup = owner.original.binding().setup();
-                var scope=alertScope(owner,cloud);
-                var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
-                        : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
-                return new AlertManagement(runtime::managementServices, originalCaller -> {
-                    originalCaller.requireActive().run();
-                    if (!owner.active.get() || originalCaller.storageScope().filter(owner.original.preparation().authScope()::equals).isEmpty())
-                        throw ThreeLayerStorePort.refused();
-                    if (!cloud.cloud()) return owner.root.authentication().alertAccess(originalCaller, setup);
-                    return CloudAlertAccess.bind(originalCaller, scope, owner.original.preparation().authScope(), () -> {
-                        owner.original.requireBusiness(); if (!owner.active.get()) throw ThreeLayerStorePort.refused();
-                    });
-                }, runtime::health, scope, deployment, clock, audit).dispatch(operation, caller, input);
+            return new io.tapstate.control.core.AlertControlDispatcher() {
+                @Override public Map<String, Object> dispatch(String operation, io.tapstate.control.core.CredentialAuthentication caller, Map<String, Object> input) {
+                    return dispatch(operation, caller, input, java.util.Locale.ENGLISH);
+                }
+                @Override public Map<String, Object> dispatch(String operation, io.tapstate.control.core.CredentialAuthentication caller, Map<String, Object> input, java.util.Locale locale) {
+                    owner.original.requireBusiness();
+                    var setup = owner.original.binding().setup();
+                    var scope=alertScope(owner,cloud);
+                    var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
+                            : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
+                    return new AlertManagement(runtime::managementServices, originalCaller -> {
+                        originalCaller.requireActive().run();
+                        if (!owner.active.get() || originalCaller.storageScope().filter(owner.original.preparation().authScope()::equals).isEmpty())
+                            throw ThreeLayerStorePort.refused();
+                        if (!cloud.cloud()) return owner.root.authentication().alertAccess(originalCaller, setup);
+                        return CloudAlertAccess.bind(originalCaller, scope, owner.original.preparation().authScope(), () -> {
+                            owner.original.requireBusiness(); if (!owner.active.get()) throw ThreeLayerStorePort.refused();
+                        });
+                    }, runtime::health, scope, deployment, clock, audit).dispatch(operation, caller, input, locale);
+                }
             };
         }
         @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
@@ -720,6 +721,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     rebuilds::rebuild, (original, command) -> plans.forRun(original, () -> {
                         owner.memberStorage.requireNode(); if (!ownership.proveClaim(original.scope(), command)) throw ThreeLayerStorePort.refused();
                     }));
+            var observationSampling = new NativeObservationSampling(owner.configuration, owner.original.cache(), scopedCaptures,
+                    pipeline -> engine.captureRun(pipeline).map(run -> {
+                        if (!(run.operatorManifest().executionIdentity() instanceof ExecutionFence original)) throw ThreeLayerStorePort.refused();
+                        return original;
+                    }), pipeline -> plans.current(List.of(pipeline)).get(pipeline), owner.original.binding().defaultSourceId(), clock);
             return ConvergenceDriver.scoped(converger, observations, samples, export,
                     () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
@@ -733,7 +739,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                         try (var ignored = ownership.enterPass(intent.scope())) {
                                             rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
                                         }
-                                    })));
+                                    }), observationSampling));
         }
         @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {

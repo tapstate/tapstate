@@ -11,11 +11,17 @@ import java.util.Objects;
  * @param timestampMillis when the line was logged, epoch milliseconds
  * @param level           the log level (for example {@code INFO}, {@code WARN}, {@code ERROR})
  * @param message         the formatted log message
+ * @param diagnostic      an optional already-redacted owner snapshot; structural bounds do not sanitize it
  */
-public record LogLine(long timestampMillis, String level, String message) {
+public record LogLine(long timestampMillis, String level, String message, java.util.Map<String, Object> diagnostic) {
+
+    public LogLine(long timestampMillis, String level, String message) {
+        this(timestampMillis, level, message, java.util.Map.of());
+    }
 
     public LogLine {
         Objects.requireNonNull(level, "level");
         Objects.requireNonNull(message, "message");
+        diagnostic = LogDiagnosticProjection.fit(diagnostic);
     }
 }

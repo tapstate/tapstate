@@ -12,6 +12,25 @@ class MemoryValidationSchedulesTest {
     private static ValidationScheduleObservations.Fact fact(ValidationReportAdmission.Task task,long revision,ValidationScheduleObservations.Origin origin){
         return new ValidationScheduleObservations.Fact(task,revision,origin,Instant.EPOCH,Instant.EPOCH.plusSeconds(60),null,ValidationScheduleObservations.State.WAITING,null,null,null);
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"validation.schedule-no-date","TS0300003"})
+    void failedScheduleFactsKeepTheirOriginalReason(String code){
+        var store=new MemoryValidationSchedules();var origin=origin();var task=task("task");
+        var failure=new ValidationScheduleObservations.Fact(task,1,origin,Instant.EPOCH,null,null,
+                ValidationScheduleObservations.State.FAILED,code,null,null);
+        try(var writer=store.open(origin)){
+            assertThat(writer.publish(failure)).isTrue();
+            assertThat(store.view(origin).read(task,1)).contains(failure);
+            assertThat(store.view(origin).read(task,1).orElseThrow().reason()).isEqualTo(code);
+        }
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"TS0000003","TS0300000"," TS0300003","TS0300003x","TS030000"})
+    void malformedProductCodesCannotBecomeScheduleFacts(String code){
+        assertThatThrownBy(()->new ValidationScheduleObservations.Fact(task("task"),1,origin(),Instant.EPOCH,null,null,
+                ValidationScheduleObservations.State.FAILED,code,null,null))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+    }
     @Test void oldPublishAndClearCannotRecreateOrEraseAReplacementWritersFacts(){
         var store=new MemoryValidationSchedules();var first=origin();var second=origin();var task=task("task");
         try(var old=store.open(first)){

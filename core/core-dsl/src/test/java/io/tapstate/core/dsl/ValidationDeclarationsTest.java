@@ -89,11 +89,11 @@ class ValidationDeclarationsTest {
                 """);
         var resources = definitions();
         assertThatThrownBy(() -> inspect(pipeline, resources, ValidationDeclarations.OutputKind.VIEW, "output"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference")
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005")
                 .hasMessageContaining("transforms.selected.use");
         resources.put("unavailable", source("unavailable"));
         assertThatThrownBy(() -> inspect(pipeline, resources, ValidationDeclarations.OutputKind.VIEW, "output"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
     }
 
     @Test
@@ -119,7 +119,7 @@ class ValidationDeclarationsTest {
         assertThatThrownBy(() -> inspect(pipeline("""
                 serve: { from: src.orders, sync: [{ id: selected, source: target }] }
                 """), resources, ValidationDeclarations.OutputKind.SYNC, "selected"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
     }
 
     @Test
@@ -131,7 +131,7 @@ class ValidationDeclarationsTest {
                 new io.tapstate.core.model.ViewBlock.Inline("output", FromRef.literal("mapped"), "id", null),
                 null, null, null);
         assertThatThrownBy(() -> inspect(pipeline, definitions(), ValidationDeclarations.OutputKind.VIEW, "output"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.composition")
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010011")
                 .hasMessageContaining("transforms.mapped.from");
     }
 
@@ -145,9 +145,9 @@ class ValidationDeclarationsTest {
                     - { id: duplicate, source: target }
                 """);
         assertThatThrownBy(() -> inspect(pipeline, definitions(), ValidationDeclarations.OutputKind.SYNC, "missing"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
         assertThatThrownBy(() -> inspect(pipeline, definitions(), ValidationDeclarations.OutputKind.SYNC, "duplicate"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.duplicate-id");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010012");
     }
 
     @Test
@@ -166,7 +166,7 @@ class ValidationDeclarationsTest {
         assertThatThrownBy(() -> ValidationDeclarations.inspect(pipeline, resources,
                 new ValidationDeclarations.Output(ValidationDeclarations.OutputKind.VIEW, "output"),
                 new ValidationDeclarations.Limits(128, 1024, 128, 32, 8192)))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("validation.value-limit-exceeded");
+                .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300012");
     }
 
     @Test
@@ -175,7 +175,7 @@ class ValidationDeclarationsTest {
         assertThatThrownBy(() -> ValidationDeclarations.inspect(pipeline, definitions(),
                 new ValidationDeclarations.Output(ValidationDeclarations.OutputKind.VIEW, "output"),
                 new ValidationDeclarations.Limits(128, 1024, 128, 32, 1024)))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("validation.value-limit-exceeded");
+                .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300012");
         var result = inspect(pipeline, definitions(), ValidationDeclarations.OutputKind.VIEW, "output");
         assertThat(result.accountedMetadataBytes()).isBetween(512L, LIMITS.metadataBytes());
         assertThatThrownBy(() -> result.requiredResourceIds().clear()).isInstanceOf(UnsupportedOperationException.class);

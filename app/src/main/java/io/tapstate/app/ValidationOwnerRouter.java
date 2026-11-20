@@ -58,7 +58,7 @@ final class ValidationOwnerRouter implements AutoCloseable {
             Objects.requireNonNull(outcome); Objects.requireNonNull(command);
             if (outcome == Outcome.ACCEPTED && (receiver == null || claimGeneration < 1 || executionGeneration < 1 || topologyRevision < 0)
                     || outcome != Outcome.ACCEPTED && (claimGeneration != 0 || executionGeneration != 0 || topologyRevision != 0)
-                    || reasonCode != null && !reasonCode.matches("[a-z][a-z0-9.-]{0,127}")) throw invalid("routing.reply");
+                    || reasonCode != null && !reasonCode.matches("(?:[a-z][a-z0-9.-]{0,127}|TS(?!000)[0-9]{3}(?!0000)[0-9]{4})")) throw invalid("routing.reply");
         }
     }
     record Result(Outcome outcome, ValidationOwner owner, String reasonCode) {
@@ -104,7 +104,7 @@ final class ValidationOwnerRouter implements AutoCloseable {
             tables=List.copyOf(tables);if(tables.size()>io.tapstate.core.validation.ValidationTaskSpec.MAX_MAPPINGS)throw invalid("routing.tableProgress");
             if(outcome==Outcome.ACCEPTED){if(state==null)throw invalid("routing.commandState");io.tapstate.core.validation.ValidationRunState.valueOf(state);}
             else if(state!=null||admitted||waiting||unknown||retired||drained||!tables.isEmpty())throw invalid("routing.commandReply");
-            if(reasonCode!=null&&!reasonCode.matches("[a-z][a-z0-9.-]{0,127}"))throw invalid("routing.commandReason");}
+            if(reasonCode!=null&&!reasonCode.matches("(?:[a-z][a-z0-9.-]{0,127}|TS(?!000)[0-9]{3}(?!0000)[0-9]{4})"))throw invalid("routing.commandReason");}
         CommandReply(Outcome outcome,Command original,String state,boolean admitted,boolean waiting,boolean unknown,boolean retired,boolean drained,String reasonCode){
             this(outcome,original,state,admitted,waiting,unknown,retired,drained,reasonCode,List.of());}
     }

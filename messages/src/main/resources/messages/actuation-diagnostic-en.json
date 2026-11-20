@@ -1,0 +1,142 @@
+{
+  "TS0360001": {
+    "message": "The Pipeline preview was refused: {reason}.",
+    "solution": "Keep the preview within its bounded sampling and execution guarantees, then try again."
+  },
+  "TS0360002": {
+    "message": "No pipeline artifact `{pipeline}` is stored to run.",
+    "solution": "Apply the pipeline before starting it, and check the id for typos."
+  },
+  "TS0360003": {
+    "message": "Resource `{pipeline}` is a `{kind}`, not a pipeline, so it cannot be run.",
+    "solution": "Start a pipeline resource; check the id names a pipeline and not another kind of resource."
+  },
+  "TS0360004": {
+    "message": "Source `{source}` needs a discovered schema before its tables can be selected.",
+    "solution": "Run schema discovery for the source, then apply or start the pipeline again."
+  },
+  "TS0360005": {
+    "message": "Source `{source}` does not declare discovered table `{table}`.",
+    "solution": "Discover the source again or change the pipeline table selector to a discovered table."
+  },
+  "TS0360006": {
+    "message": "Source `{source}` selects no tables.",
+    "solution": "Use a table name or regex that matches at least one discovered table."
+  },
+  "TS0360007": {
+    "message": "Source `{source}` has an invalid table regex `{regex}`.",
+    "solution": "Fix the regex syntax and apply the pipeline again."
+  },
+  "TS0360008": {
+    "message": "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}.",
+    "solution": "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
+  },
+  "TS0360009": {
+    "message": "Table `{table}` is selected by more than one source: {sources}.",
+    "solution": "Use a qualified source.table reference to choose the intended source."
+  },
+  "TS0360010": {
+    "message": "Source `{source}` table `{table}` uses unsupported settings: {fields}.",
+    "solution": "Remove the unsupported table settings; this runtime currently supports only the object's `name` selector."
+  },
+  "TS0360011": {
+    "message": "Join `{step}` is driven from table `{table}`, which declares no primary key.",
+    "solution": "Give the table a primary key and run schema discovery again. A join files every row it holds under the driving row's key, so without one two different rows share an entry and the wide row is built from whichever was written last."
+  },
+  "TS0360012": {
+    "message": "Join `{step}` names source `{name}`, which is not one of the aliases the step declares.",
+    "solution": "Write the alias the step's `from:` map declares for that table, or declare an alias under the name the SQL uses. Only a declared alias is wired to an upstream, so a table name that is not also an alias has nothing feeding it."
+  },
+  "TS0360013": {
+    "message": "Join `{step}` reads step `{ref}` through alias `{alias}`, but a join can only read source tables.",
+    "solution": "Point `{alias}` at the source table the step reads, and do the step's work after the join instead. A join resolves its SQL against the discovered columns of each input and keys its rows on the driving table's primary key; a step's output has neither."
+  },
+  "TS0360014": {
+    "message": "The SQL of join `{step}` cannot be compiled against the tables it reads: {detail}.",
+    "solution": "Correct the SQL, or the table it names, then start the pipeline again. Columns are checked against each table's discovered schema, so run schema discovery again if a table changed. The pipeline stays failed until one of the two is corrected."
+  },
+  "TS0360015": {
+    "message": "Join `{step}` does not publish column `{column}` of its driving table `{table}`, so nothing identifies a row of its result.",
+    "solution": "Add `{column}` to the SELECT as a plain column, for example `SELECT t.{column} AS {column}, ...`. It has to be the column itself and not an expression over it: a computed value need not be unique where the column is, so rows the query says are distinct would be written over one another."
+  },
+  "TS0360016": {
+    "message": "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and its sources are what changed. Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}.",
+    "solution": "Nothing in your pipeline changed - a source table did. Run `derived-schema {pipeline}` to see the recorded columns beside today's and beside what the target table actually declares. Then make the target able to hold the new shape if it cannot already, and run `derived-schema {pipeline} --accept` to record today's columns as what the next start is held to. Starting before the target can hold them writes rows that succeed and lose data to truncation or rounding, which no error anywhere reports."
+  },
+  "TS0360017": {
+    "message": "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and neither the query nor the source columns changed - what changed is how we work them out ({recordedBy} -> {nowBy}). Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}.",
+    "solution": "Please report this - it is a compatibility break on our side that our own release checks should have caught before you ever saw it. To carry on, run `derived-schema {pipeline}` to see what moved, rebuild the target table for the new column types, then `derived-schema {pipeline} --accept`. Read the difference first: a type that narrowed loses data on the next write, which is a deliberate decision and not a formality. Staying on the version you were running is the other way out."
+  },
+  "TS0360018": {
+    "message": "The pipeline `from` regex `{regex}` is invalid.",
+    "solution": "Fix the regex syntax and apply the pipeline again."
+  },
+  "TS0360019": {
+    "message": "The pipeline `from` regex `{regex}` matches no upstream vertex.",
+    "solution": "Use a regex matching a selected source table or an earlier transform step."
+  },
+  "TS0360020": {
+    "message": "View `{view}` declares no primary key.",
+    "solution": "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."
+  },
+  "TS0360021": {
+    "message": "View `{view}` declares the `{tier}` storage tier, which this release does not materialize.",
+    "solution": "Remove the tier from the view. Only the warm tier is materialized today; hot and cold are reserved."
+  },
+  "TS0360022": {
+    "message": "The managed state store `{store}` a view materializes into is not configured.",
+    "solution": "Start the deployment's managed state store, or register a source under that id for views to materialize into."
+  },
+  "TS0360023": {
+    "message": "The managed state store `{store}` a view materializes into did not answer: {reason}",
+    "solution": "Check that the state store is running and reachable from the server, then start the pipeline again."
+  },
+  "TS0360024": {
+    "message": "View `{view}` declares key `{key}`, but what feeds it has no such unique identity; its recorded identity is `{identity}`.",
+    "solution": "Declare the view's primaryKey as a single-column identity the input declares unique. A composite identity cannot be served by a view today, and materializing on an unconstrained or partial identity collapses distinct records."
+  },
+  "TS0360025": {
+    "message": "View `{view}` is fed by more than one stream: {tables}.",
+    "solution": "Feed the view from a single table, or assemble the streams into one document with a nest step and feed the view from that."
+  },
+  "TS0360026": {
+    "message": "The resource under the managed state store id `{store}` declares capture settings, so it is an authored source, not the deployment's store.",
+    "solution": "Rename your source so it does not occupy the managed store's id, or remove its mode/tables if it really is the deployment's state store."
+  },
+  "TS0360027": {
+    "message": "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now.",
+    "solution": "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."
+  },
+  "TS0360028": {
+    "message": "Pipeline {pipeline} cannot start: node {node} asks for {requested} processors across {members} members, and no width within the budgets is available ({candidates}).",
+    "solution": "Lower execution.parallelism on {node}, or raise the budget named for each candidate in the server's tapstate.execution settings."
+  },
+  "TS0360029": {
+    "message": "Pipeline {pipeline} cannot start: node {node} asks for {requested} processors but can only run as one ({reason}).",
+    "solution": "Set execution.parallelism to 1 on {node}, or leave it out; the node then runs as one processor and keeps every change in order."
+  },
+  "TS0360030": {
+    "message": "Pipeline {pipeline} cannot start: rows of {stream} reach one sink both through nest {nest} and through {other}, and the two land them in different tables or on different keys.",
+    "solution": "Send {stream} to that sink one way only, or give nest {nest} the same root key the other way lands {stream} on."
+  },
+  "TS0360031": {
+    "message": "Pipeline {pipeline} was not started: member {member} cannot load connector {connector} ({reason}).",
+    "solution": "Every member loads the connectors a pipeline writes through from the shared connector registry into its own plugins directory. Check that member's access to the store and that its plugins directory is writable, then start the pipeline again."
+  },
+  "TS0360032": {
+    "message": "Pipeline {pipeline} was not started: the members load different artifacts for connector {connector} ({artifacts}).",
+    "solution": "Check that every member reads the same store; a registration replaced while the pipeline was starting is picked up by starting it again."
+  },
+  "TS0360033": {
+    "message": "Pipeline {pipeline} was not submitted: member {member} could not prepare its original operator state ({reason}).",
+    "solution": "Resolve the reported member, configuration or execution-authority failure before retrying. Keep the original cache state; do not delete claims or change storage to bypass the refusal."
+  },
+  "TS0360034": {
+    "message": "Shared capture {capture} recovery could not verify member {member} ({reason}).",
+    "solution": "Keep the original recovery scope and storage. Resolve the member or authority failure, then repeat preflight if the membership or original control facts changed. All affected old executions and source or target connections must be isolated before confirmation."
+  },
+  "TS0360035": {
+    "message": "Pipeline {pipeline} cannot start: stream {stream} publishes no key, and this sync matches writes on one.",
+    "solution": "Publish every column of the source's key under any name - as the column itself, or as a pure read of it. A projection that drops or replaces any component leaves nothing for a later change to match, so the rows are written where nothing can find them again."
+  }
+}

@@ -124,6 +124,27 @@ final class PdkConnectionDiagnostic {
 
     private static void identifyCode(Map<String, Object> node, Throwable failure,
             PdkDiagnosticCatalog catalog, Locale locale) {
+        if (failure instanceof io.tapstate.core.common.TapstateException coded) {
+            put(node, "code", coded.code().code());
+            if (coded.code() instanceof ConnectorError || coded.code() instanceof io.tapstate.spi.store.IoError
+                    || coded.code() instanceof io.tapstate.core.validation.ValidationError
+                    || coded.code() instanceof io.tapstate.core.event.RowValueError) {
+                node.put(DiagnosticCodeSource.FIELD, DiagnosticCodeSource.TAPSTATE_STANDARD);
+                node.remove(DEFINITION_STATUS);
+            } else {
+                node.remove(DiagnosticCodeSource.FIELD);
+                node.put(DEFINITION_STATUS, UNVERIFIED);
+            }
+            var params = new LinkedHashMap<String, Object>();
+            for (var entry : coded.args().entrySet()) {
+                if (params.size() == ARGUMENT_LIMIT) { node.put(TRUNCATED, true); break; }
+                String value = String.valueOf(entry.getValue());
+                if (value.length() > TEXT_LIMIT) node.put(TRUNCATED, true);
+                else params.put(entry.getKey(), value);
+            }
+            node.put("params", params);
+            return;
+        }
         if (!(node.get("code") instanceof String code)) return;
         if (failure instanceof SQLException) {
             node.put(DiagnosticCodeSource.FIELD, DiagnosticCodeSource.JDBC_SQLSTATE);

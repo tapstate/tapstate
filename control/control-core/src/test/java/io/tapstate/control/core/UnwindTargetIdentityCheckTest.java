@@ -22,7 +22,7 @@ class UnwindTargetIdentityCheckTest {
         StartOutcome outcome = bench.service().start("alice", "pl", List.of(), null);
         assertThat(outcome.report().outcome()).isEqualTo(StartCheckReport.Outcome.READY);
         assertThat(outcome.report().findings()).anySatisfy(finding -> {
-            assertThat(finding.code()).isEqualTo("start-check.target-identity-automatic");
+            assertThat(finding.code()).isEqualTo("TS0290001");
             assertThat(finding.params()).containsEntry("identityStatus", "automatic")
                     .containsEntry("preserved", "_unwind_source_id");
         });

@@ -262,7 +262,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 return new SrsLogBounds(bounds.getLong(LARGEST_SEQUENCE), bounds.getLong(TRIMMED_THROUGH));
             } catch (RuntimeException e) {
                 throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                        Map.of("id", boundsId(ring)), e);
+                        Map.of("id", boundsId(ring), "field", "bounds"), e);
             }
         }
         // Older logs have no independent bounds record. Their surviving highest sequence is known,
@@ -445,7 +445,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
         return Map.copyOf(result);
     }
 
-    private static SrsLogBounds decodeSplitBounds(Document stored) {
+    static SrsLogBounds decodeSplitBounds(Document stored) {
         if (!stored.keySet().equals(java.util.Set.of("_id", LARGEST_SEQUENCE, TRIMMED_THROUGH))
                 || !(stored.get(LARGEST_SEQUENCE) instanceof Long largest) || !(stored.get(TRIMMED_THROUGH) instanceof Long trimmed)) {
             throw unreadableSplit("bounds");
@@ -473,7 +473,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
         return sequence;
     }
 
-    private static SrsLogRecord splitRecord(Document stored) {
+    static SrsLogRecord splitRecord(Document stored) {
         splitSequence(stored);
         if (stored.containsKey("captureFence")) {
             if (!(stored.get("captureFence") instanceof Document fence)
@@ -569,7 +569,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
         Object id = document.get("_id");
         if (!(id instanceof Document key) || !(key.get(SEQ) instanceof Number seq)) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", String.valueOf(id)), null);
+                    Map.of("id", String.valueOf(id), "field", "_id.seq"), null);
         }
         return seq.longValue();
     }
@@ -578,7 +578,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
      * The key of one change. Field order is load-bearing: {@code ring} first is what makes one ring a
      * contiguous run of the {@code _id} index, and {@code seq} second is what orders that run.
      */
-    private static Document key(String ring, long seq) {
+    static Document key(String ring, long seq) {
         return new Document(RING, ring).append(SEQ, seq);
     }
 
@@ -630,7 +630,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                     document.containsKey("epoch") ? document.getLong("epoch") : 0L);
         } catch (RuntimeException e) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", String.valueOf(document.get("_id"))), e);
+                    Map.of("id", String.valueOf(document.get("_id")), "field", "record"), e);
         }
     }
 

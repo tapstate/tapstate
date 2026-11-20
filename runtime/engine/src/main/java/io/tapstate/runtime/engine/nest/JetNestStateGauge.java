@@ -53,6 +53,21 @@ final class JetNestStateGauge implements NestStateGauge {
         buckets(NestStateMetricNames.COMMIT_NANOS_BUCKET, namespace, commits.durationBuckets());
     }
 
+    @Override
+    public void weightReading(String namespace, NestStateStats.Weight weight) {
+        metric(NestStateMetricNames.DOCUMENT_COUNT, namespace).set(weight.documents());
+        metric(NestStateMetricNames.DOCUMENT_BYTES_SUM, namespace).set(weight.documentBytes());
+        metric(NestStateMetricNames.LARGEST_DOCUMENT_BYTES, namespace).set(weight.largestDocument());
+        metric(NestStateMetricNames.COMMIT_BYTES_COUNT, namespace).set(weight.groups());
+        metric(NestStateMetricNames.COMMIT_BYTES_SUM, namespace).set(weight.groupBytes());
+        metric(NestStateMetricNames.FOLD_COUNT, namespace).set(weight.folds());
+        metric(NestStateMetricNames.FOLD_NANOS_SUM, namespace).set(weight.foldNanos());
+        metric(NestStateMetricNames.WEIGHT_SINCE, namespace).set(weight.countingSinceMillis());
+        buckets(NestStateMetricNames.DOCUMENT_BYTES_BUCKET, namespace, weight.documentBuckets());
+        buckets(NestStateMetricNames.COMMIT_BYTES_BUCKET, namespace, weight.groupBuckets());
+        buckets(NestStateMetricNames.FOLD_NANOS_BUCKET, namespace, weight.foldBuckets());
+    }
+
     private void buckets(String kind, String namespace, long[] counts) {
         for (int i = 0; i < counts.length; i++) {
             metric(kind + i, namespace).set(counts[i]);

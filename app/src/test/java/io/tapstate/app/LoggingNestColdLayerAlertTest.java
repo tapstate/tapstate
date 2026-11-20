@@ -63,7 +63,7 @@ class LoggingNestColdLayerAlertTest {
         ILoggingEvent event = only();
         assertThat(event.getLevel()).isEqualTo(Level.WARN);
         assertThat(event.getFormattedMessage())
-                .contains("nest.state-served-from-cold-layer")
+                .contains("TS0490025")
                 .contains("nest.p1.items")
                 .contains("950")
                 .contains("1000")
@@ -86,7 +86,7 @@ class LoggingNestColdLayerAlertTest {
         ILoggingEvent event = only();
         assertThat(event.getLevel()).isEqualTo(Level.INFO);
         assertThat(event.getFormattedMessage())
-                .contains("nest.state-served-from-cold-layer")
+                .contains("TS0490025")
                 .contains("nest.p1.items");
     }
 

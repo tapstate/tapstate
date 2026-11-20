@@ -44,16 +44,20 @@ record SourceCaptureResolution(
 
     static Optional<SourceCaptureResolution> forPipeline(
             PipelineResource pipeline, SourceResource source, SourceModel discovered) {
-        return forSelectedTables(pipeline, source, PipelineTableSelection.resolve(pipeline, source, discovered));
+        return forPipeline(pipeline, pipeline.sourceReference(source.id()), source, discovered);
+    }
+
+    static Optional<SourceCaptureResolution> forPipeline(PipelineResource pipeline, SourceRef ref,
+            SourceResource source, SourceModel discovered) {
+        return forSelectedTables(pipeline, ref, source, PipelineTableSelection.resolve(pipeline, ref, source, discovered));
     }
 
     /** Carries an already selected subset; write callers must validate it through forPipeline. */
     static Optional<SourceCaptureResolution> forSelectedTables(
-            PipelineResource pipeline, SourceResource source, List<String> tables) {
-        boolean direct = pipeline.sources().stream().anyMatch(ref -> ref.id().equals(source.id())
-                && ref instanceof SourceRef.Spec spec && !spec.srs());
+            PipelineResource pipeline, SourceRef ref, SourceResource source, List<String> tables) {
+        boolean direct = ref instanceof SourceRef.Spec spec && Boolean.FALSE.equals(spec.srs());
         return tables.isEmpty() ? Optional.empty()
-                : Optional.of(withTables(source, tables).scopedTo(pipeline.id(), !direct));
+                : Optional.of(withTables(source, tables, ref).scopedTo(pipeline.id(), !direct));
     }
 
     /** Current diagnostic reads use the actual attached scope; retained run handles keep their original namespace. */
@@ -65,7 +69,13 @@ record SourceCaptureResolution(
     /** Describes a never-read chain without granting access to another consumer's progress. */
     static Optional<SourceCaptureResolution> forStoredPipeline(io.tapstate.spi.store.StorePort store,
             PipelineResource pipeline,SourceResource source,SourceModel discovered,boolean requireAttachment) {
-        return forPipeline(pipeline,source,discovered).flatMap(resolution -> store instanceof ThreeLayerStorePort nativeStore
+        return forStoredPipeline(store, pipeline, pipeline.sourceReference(source.id()), source, discovered, requireAttachment);
+    }
+
+    static Optional<SourceCaptureResolution> forStoredPipeline(io.tapstate.spi.store.StorePort store,
+            PipelineResource pipeline, SourceRef ref, SourceResource source, SourceModel discovered,
+            boolean requireAttachment) {
+        return forPipeline(pipeline,ref,source,discovered).flatMap(resolution -> store instanceof ThreeLayerStorePort nativeStore
                 ?nativeStore.sharedReading(pipeline,source,resolution,requireAttachment):Optional.of(resolution));
     }
 
@@ -93,10 +103,16 @@ record SourceCaptureResolution(
     }
 
     private static SourceCaptureResolution withTables(SourceResource source, List<String> tables) {
-        CaptureConfig config = new CaptureConfig(source.connector(), source.config(), tables);
+        return withTables(source, tables, null);
+    }
+
+    private static SourceCaptureResolution withTables(SourceResource source, List<String> tables, SourceRef ref) {
+        var settings = ref == null ? source.config() : io.tapstate.core.model.PipelineSourceConfig.settings(ref, source);
+        var overrides = ref == null ? java.util.Map.<String,Object>of() : io.tapstate.core.model.PipelineSourceConfig.overrides(ref, source);
+        CaptureConfig config = new CaptureConfig(source.connector(), settings, tables, null, null, overrides);
         String srsKey = source.srs() != null ? source.srs().key() : null;
         return new SourceCaptureResolution(
-                source.id(), config, tables, srsKey, MiningChainId.resolve(config, srsKey));
+                ref == null ? source.id() : ref.binding(), config, tables, srsKey, MiningChainId.resolve(config, srsKey));
     }
 
     /** Returns the first selected table; callers that need the full selection must use {@link #tables()}. */

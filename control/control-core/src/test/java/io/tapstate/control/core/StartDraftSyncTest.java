@@ -99,7 +99,7 @@ class StartDraftSyncTest {
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> service().start("alice", "pl",
                 List.of(new StartDecision(KEY, "clear")), before))
                 .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
-                        failure -> assertThat(failure.code().code()).isEqualTo("pipeline.definition-change-unavailable"));
+                        failure -> assertThat(failure.code().code()).isEqualTo("TS0230007"));
 
         assertThat(bench.hash("pl")).isEqualTo(before);
         assertThat(drafts.get("pl")).contains(unchanged);

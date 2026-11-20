@@ -74,7 +74,7 @@ class AMemberThatCannotStageTheConnectorRefusesTheStartIT {
 
                 ControlPlane.Failure refused = Await.answered("the start to be refused", Duration.ofMinutes(3),
                         () -> control.failure(PIPELINE));
-                assertThat(refused.code()).isEqualTo("actuation.connector-unavailable-on-member");
+                assertThat(refused.code()).isEqualTo("TS0360031");
                 assertThat(refused.params())
                         .as("the refusal names the member that cannot load the connector, and the connector")
                         .containsEntry("member", UNABLE)

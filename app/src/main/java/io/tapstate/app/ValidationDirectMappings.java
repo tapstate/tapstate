@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.ValidationDeclarations;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TableRename;
@@ -28,7 +29,12 @@ final class ValidationDirectMappings {
     }
 
     record Declared(ValidationTaskSpec.Mapping mapping, SourceResource source, SourceResource target,
-            io.tapstate.core.model.SyncElement sync, io.tapstate.core.model.FromClause from) {
+            io.tapstate.core.model.SyncElement sync, List<ValidationDeclarations.Route> sourceRoutes) {
+        boolean selectsSourceTable(String name) {
+            return SourceTableSelection.selectsTableName(source, name)
+                    && sourceRoutes.stream().anyMatch(route -> route.table() == null || route.table().equals(name));
+        }
+
         @Override public String toString(){return "DirectValidationDeclaration[id="+mapping.mappingId()+"]";}
     }
 
@@ -55,7 +61,7 @@ final class ValidationDirectMappings {
 
     /** Server-derived candidates and saved definitions share the same direct-path restrictions. */
     static List<Declared> declare(io.tapstate.spi.store.ArtifactStore artifacts,List<ValidationTaskSpec.Mapping> mappings,
-            Function<ValidationTaskSpec.Mapping,io.tapstate.core.dsl.ValidationDeclarations.Inspection> inspections){
+            Function<ValidationTaskSpec.Mapping,ValidationDeclarations.Inspection> inspections){
         Objects.requireNonNull(artifacts);Objects.requireNonNull(mappings);Objects.requireNonNull(inspections);
         var declarations = new ArrayList<Declared>();
         var targets=new java.util.HashSet<List<Object>>();
@@ -80,6 +86,9 @@ final class ValidationDirectMappings {
                 throw invalid("nodeBinding");
             if (!TableRename.apply(mapping.source().table(), selected.sync().rename()).equals(mapping.target().table()))
                 throw invalid("targetTableScope");
+            // Inspection has already resolved aliases to the physical sources reached by this output.
+            var declaration = new Declared(mapping, source, target, selected.sync(),
+                    selected.routes().stream().filter(route -> route.source().equals(source.id())).toList());
             // The output scope includes routes omitted from the user's comparison selection.
             for (var route : selected.routes()) {
                 if (route.table() == null) {
@@ -89,7 +98,6 @@ final class ValidationDirectMappings {
                     if (rename != null && (rename.caseMode() != null || rename.map() != null && !rename.map().isEmpty())) {
                         if (source.tables() == null || source.tables().stream().anyMatch(TableRef.Regex.class::isInstance))
                             throw unsupported(mapping.outputId(), "from", "direct.table-scope-unknown");
-                        var declaration = new Declared(mapping, source, target, selected.sync(), selected.from());
                         for (var selector : source.tables()) {
                             String name = selector instanceof TableRef.Literal literal ? literal.name() : ((TableRef.Spec) selector).name();
                             requireObservedSourceTable(declaration, name);
@@ -106,21 +114,24 @@ final class ValidationDirectMappings {
             var schema=targetTable.schema()!=null?targetTable.schema():target.config().get("schema");
             if(!targets.add(java.util.Arrays.asList(target.id(),database,schema,targetTable.table())))
                 throw unsupported(mapping.outputId(),"table","direct.target-fan-in");
-            declarations.add(new Declared(mapping, source, target, selected.sync(), selected.from()));
+            declarations.add(declaration);
         }
         return List.copyOf(declarations);
     }
 
     static void requireSourceTable(Declared declaration,SourceTable actual) {
-        if(!actual.name().equals(declaration.mapping().source().table())
-                ||!PipelineTableSelection.selects(declaration.from(),declaration.source(),actual))throw invalid("sourceTableScope");
+        requireSourceTable(declaration, actual.name());
+    }
+
+    private static void requireSourceTable(Declared declaration, String name) {
+        if (!name.equals(declaration.mapping().source().table()) || !declaration.selectsSourceTable(name))
+            throw invalid("sourceTableScope");
     }
 
     /** Other observed namespaces may reveal a rename collision even when the task selects one table. */
     static void requireObservedSourceTable(Declared declaration,String nativeName){
-        var actual=new SourceTable(nativeName,List.of(),List.of(),List.of());
-        if(nativeName.equals(declaration.mapping().source().table())){requireSourceTable(declaration,actual);return;}
-        if(PipelineTableSelection.selects(declaration.from(),declaration.source(),actual)
+        if(nativeName.equals(declaration.mapping().source().table())){requireSourceTable(declaration,nativeName);return;}
+        if(declaration.selectsSourceTable(nativeName)
                 &&TableRename.apply(nativeName,declaration.sync().rename()).equals(declaration.mapping().target().table()))
             throw unsupported(declaration.mapping().outputId(),"table","direct.target-fan-in");
     }
