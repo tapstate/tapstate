@@ -35,14 +35,11 @@ final class MongoAlertStorageSchema {
     private static final List<SystemCollections> BASE_COLLECTIONS = Stream.of(MongoAlertConfigurationStore.COLLECTIONS,
             MongoAlertStateStore.COLLECTIONS, MongoAlertNotificationStore.COLLECTIONS).flatMap(List::stream).toList();
     static final List<SystemCollections> COLLECTIONS = Stream.concat(BASE_COLLECTIONS.stream(),Stream.of(SystemCollections.ALERT_NODE_LIFECYCLES)).toList();
-    private static final String INSTALLED_VERSION = "installedVersion";
-    private static final String OPERATION_ID = "operationId";
-    private static final String AUTHORITY_PREPARATION_OPERATION_ID = "authorityPreparationOperationId";
-    private static final Set<String> LEGACY_FIELDS = Set.of(INSTALLED_VERSION, "clusterId", "layoutId", "keyId", OPERATION_ID);
-    private static final Set<String> MARKER_FIELDS = Set.of(INSTALLED_VERSION, "clusterId", "layoutId", "keyId", OPERATION_ID,
-            AUTHORITY_PREPARATION_OPERATION_ID);
-    private static final Set<String> QUERY_FIELDS = Set.of(INSTALLED_VERSION, "clusterId", "layoutId", "keyId", OPERATION_ID,
-            AUTHORITY_PREPARATION_OPERATION_ID, "queryPreparation");
+    private static final Set<String> LEGACY_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId");
+    private static final Set<String> MARKER_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId",
+            "authorityPreparationOperationId");
+    private static final Set<String> QUERY_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId",
+            "authorityPreparationOperationId", "queryPreparation");
     private static final String QUERY = "queryPreparation";
     private enum Structures { LEGACY, PREPARING, READY }
     record QueryIndex(SystemCollections collection, SystemCollections.IndexSpec index) { }
@@ -72,7 +69,7 @@ final class MongoAlertStorageSchema {
     /** Load-only: absent means unprepared only when the entire feature set is absent as well. */
     int load(MongoReadBudget budget) {
         Document marker = loadVerifiedMarker(budget);
-        return marker == null ? 0 : marker.getInteger(INSTALLED_VERSION);
+        return marker == null ? 0 : marker.getInteger("installedVersion");
     }
 
     Document loadVerifiedMarker(MongoReadBudget budget) {
@@ -89,7 +86,7 @@ final class MongoAlertStorageSchema {
             requireActive.run(); Document marker = verifiedMarker(budget);
             if (marker == null || !marker.containsKey(QUERY)) { return java.util.Optional.empty(); }
             Document query = marker.get(QUERY, Document.class);
-            var result = new io.tapstate.spi.store.AlertQueryPreparation(marker.getInteger(INSTALLED_VERSION), query.getString(OPERATION_ID),
+            var result = new io.tapstate.spi.store.AlertQueryPreparation(marker.getInteger("installedVersion"), query.getString("operationId"),
                     "READY".equals(query.getString("phase")) ? io.tapstate.spi.store.AlertQueryPreparation.Phase.READY
                             : io.tapstate.spi.store.AlertQueryPreparation.Phase.PREPARING,
                     query.getInteger("nextIndex"), query.getInteger("indexContractVersion"));
@@ -106,11 +103,9 @@ final class MongoAlertStorageSchema {
     void resumeInitialPreparation(String operationId, MongoReadBudget budget) {
         Document retained = budget.transaction(client, session -> marker(session, budget));
         if (retained == null) return;
-        int version = retained.getInteger(INSTALLED_VERSION);
+        int version = retained.getInteger(SystemMetaStore.INSTALLED_VERSION);
         if (version >= OPERATIONAL_VERSION && version < VERSION
-                && operationId.equals(retained.getString(OPERATION_ID))
-                && operationId.equals(retained.getString(AUTHORITY_PREPARATION_OPERATION_ID))
-                && operationId.equals(retained.get(QUERY, Document.class).getString(OPERATION_ID))) {
+                && MongoAlertSetupMarker.hasOriginalOperation(retained, retained.get(QUERY, Document.class), operationId)) {
             prepare(operationId, budget);
         }
     }
@@ -121,19 +116,19 @@ final class MongoAlertStorageSchema {
         budget.transaction(client,session->{
             Document original=marker(session,budget);
             if(original==null)throw unreadable("missing-node-preparation");
-            int version=original.getInteger(INSTALLED_VERSION);
+            int version=original.getInteger("installedVersion");
             if(version>=DOMAIN_VERSION)return null;
             if(version!=NODE_VERSION)throw unreadable("operation-domain-preparation");
-            replaceMarker(session,original,new Document(original).append(INSTALLED_VERSION,DOMAIN_VERSION));
+            replaceMarker(session,original,new Document(original).append("installedVersion",DOMAIN_VERSION));
             return null;
         });
         budget.transaction(client,session->{
             Document original=marker(session,budget);
             if(original==null)throw unreadable("missing-rule-binding-preparation");
-            int version=original.getInteger(INSTALLED_VERSION);
+            int version=original.getInteger("installedVersion");
             if(version==VERSION)return null;
             if(version!=DOMAIN_VERSION)throw unreadable("rule-binding-preparation");
-            replaceMarker(session,original,new Document(original).append(INSTALLED_VERSION,VERSION));
+            replaceMarker(session,original,new Document(original).append("installedVersion",VERSION));
             return null;
         });
         return load(budget);
@@ -146,14 +141,14 @@ final class MongoAlertStorageSchema {
         return StoreIo.call(() -> {
             requireActive.run();
             Document existing = verifiedMarker(budget);
-            if (existing != null && existing.getInteger(INSTALLED_VERSION)>=OPERATIONAL_VERSION) { return existing.getInteger(INSTALLED_VERSION); }
+            if (existing != null && existing.getInteger("installedVersion")>=OPERATIONAL_VERSION) { return existing.getInteger("installedVersion"); }
             try (var session = client.startSession()) {
                 session.withTransaction(() -> {
                     requireActive.run();
                     Document original = marker(session, budget);
-                    if (original != null && original.getInteger(INSTALLED_VERSION)>=OPERATIONAL_VERSION) { return null; }
-                    if (original != null && Integer.valueOf(QUERY_VERSION).equals(original.get(INSTALLED_VERSION))) {
-                        Document upgraded = new Document(original).append(INSTALLED_VERSION, OPERATIONAL_VERSION);
+                    if (original != null && original.getInteger("installedVersion")>=OPERATIONAL_VERSION) { return null; }
+                    if (original != null && Integer.valueOf(QUERY_VERSION).equals(original.get("installedVersion"))) {
+                        Document upgraded = new Document(original).append("installedVersion", OPERATIONAL_VERSION);
                         if (SystemCollections.SCHEMA_MIGRATIONS.on(database).updateOne(session,
                                 new Document("_id","config").append(FIELD,original),
                                 new Document("$set",new Document(FIELD,upgraded))).getModifiedCount()!=1) throw unreadable("operational-preparation-fence");
@@ -166,14 +161,14 @@ final class MongoAlertStorageSchema {
                     Document installed;
                     if (original == null) { installed = initialMarker(clusterId, keyId, operationId); }
                     else {
-                        installed = new Document(original).append(INSTALLED_VERSION, AUTHORITY_VERSION)
+                        installed = new Document(original).append("installedVersion", AUTHORITY_VERSION)
                                 .append(QUERY, queryProgress(operationId, "PREPARING", 0));
-                        if (Integer.valueOf(LEGACY_VERSION).equals(original.get(INSTALLED_VERSION))) {
-                            installed.append(AUTHORITY_PREPARATION_OPERATION_ID, operationId);
+                        if (Integer.valueOf(LEGACY_VERSION).equals(original.get("installedVersion"))) {
+                            installed.append("authorityPreparationOperationId", operationId);
                         }
                     }
                     if (MongoAlertConfigurationCodec.size(installed) > 2048) { throw unreadable("marker-size"); }
-                    if (original == null || Integer.valueOf(LEGACY_VERSION).equals(original.get(INSTALLED_VERSION))) {
+                    if (original == null || Integer.valueOf(LEGACY_VERSION).equals(original.get("installedVersion"))) {
                         ConfigurationVersion.prepareAlertFence(session, SystemCollections.CONFIGURATION_VERSION.on(database));
                     }
                     if (schemas.updateOne(session, filter, new Document("$set",
@@ -194,11 +189,11 @@ final class MongoAlertStorageSchema {
     private void prepareNodes(MongoReadBudget budget) {
         Document retained=verifiedMarker(budget);
         if(retained==null)throw unreadable("missing-query-preparation");
-        if(retained.getInteger(INSTALLED_VERSION)>=NODE_VERSION)return;
+        if(retained.getInteger("installedVersion")>=NODE_VERSION)return;
         budget.transaction(client,session->{
             Document original=marker(session,budget);
-            if(original==null || original.getInteger(INSTALLED_VERSION)<OPERATIONAL_VERSION)throw unreadable("original-query-capability");
-            if(original.getInteger(INSTALLED_VERSION)>=NODE_VERSION)return null;
+            if(original==null || original.getInteger("installedVersion")<OPERATIONAL_VERSION)throw unreadable("original-query-capability");
+            if(original.getInteger("installedVersion")>=NODE_VERSION)return null;
             Document query=original.get(QUERY,Document.class);
             if(query.getInteger("indexContractVersion")==2)return null;
             if(query.getInteger("indexContractVersion")!=1 || !"READY".equals(query.getString("phase"))
@@ -209,7 +204,7 @@ final class MongoAlertStorageSchema {
         for(int attempt=0;attempt<3;attempt++) {
             Document current=verifiedMarker(budget);
             if(current==null)throw unreadable("missing-query-preparation");
-            if(current.getInteger(INSTALLED_VERSION)>=NODE_VERSION)return;
+            if(current.getInteger("installedVersion")>=NODE_VERSION)return;
             Document progress=current.get(QUERY,Document.class);int cursor=progress.getInteger("nextIndex");
             if(cursor==BASE_QUERY_COUNT) {
                 MongoAlertNodeLifecycleStore.prepareNamespace(budget.database(database).withWriteConcern(WriteConcern.MAJORITY.withJournal(true)));
@@ -218,14 +213,14 @@ final class MongoAlertStorageSchema {
             budget.transaction(client,session->{
                 Document original=marker(session,budget);
                 if(original==null)throw unreadable("missing-query-preparation");
-                if(original.getInteger(INSTALLED_VERSION)>=NODE_VERSION)return null;
+                if(original.getInteger("installedVersion")>=NODE_VERSION)return null;
                 Document query=original.get(QUERY,Document.class);
-                if(!query.getString(OPERATION_ID).equals(progress.getString(OPERATION_ID)))throw unreadable("node-query-operation");
+                if(!query.getString("operationId").equals(progress.getString("operationId")))throw unreadable("node-query-operation");
                 if(query.getInteger("nextIndex")>cursor)return null;
                 if(query.getInteger("nextIndex")!=cursor)throw unreadable("node-query-cursor");
                 Document next=new Document(query).append("nextIndex",QUERY_INDEXES.size());
                 Document updated=new Document(original).append(QUERY,next);
-                if(cursor==QUERY_INDEXES.size()){next.put("phase","READY");updated.put(INSTALLED_VERSION,NODE_VERSION);}
+                if(cursor==QUERY_INDEXES.size()){next.put("phase","READY");updated.put("installedVersion",NODE_VERSION);}
                 replaceMarker(session,original,updated);return null;
             });
         }
@@ -239,9 +234,9 @@ final class MongoAlertStorageSchema {
 
     static Document initialMarker(String clusterId, String keyId, String operationId) {
         requireOperation(operationId);
-        Document result = new Document(INSTALLED_VERSION, OPERATIONAL_VERSION).append("clusterId", clusterId)
-                .append("layoutId", MongoConfigurationDomain.LAYOUT).append("keyId", keyId).append(OPERATION_ID, operationId)
-                .append(AUTHORITY_PREPARATION_OPERATION_ID, operationId).append(QUERY, queryProgress(operationId, "READY", BASE_QUERY_COUNT));
+        Document result = new Document("installedVersion", OPERATIONAL_VERSION).append("clusterId", clusterId)
+                .append("layoutId", MongoConfigurationDomain.LAYOUT).append("keyId", keyId).append("operationId", operationId)
+                .append("authorityPreparationOperationId", operationId).append(QUERY, queryProgress(operationId, "READY", BASE_QUERY_COUNT));
         if (MongoAlertConfigurationCodec.size(result) > 2048) { throw unreadable("marker-size"); }
         return result;
     }
@@ -250,17 +245,17 @@ final class MongoAlertStorageSchema {
         return new QueryIndex(collection, collection.indexes().stream().filter(index -> index.indexName().equals(name)).findFirst().orElseThrow());
     }
     private static Document queryProgress(String operation, String phase, int next) {
-        return new Document(OPERATION_ID, operation).append("phase", phase).append("nextIndex", next).append("indexContractVersion", 1);
+        return new Document("operationId", operation).append("phase", phase).append("nextIndex", next).append("indexContractVersion", 1);
     }
     private static void requireQueryOperation(Document marker, String expected) {
-        if (!expected.equals(marker.get(QUERY, Document.class).getString(OPERATION_ID))) { throw unreadable("query-operation"); }
+        if (!expected.equals(marker.get(QUERY, Document.class).getString("operationId"))) { throw unreadable("query-operation"); }
     }
 
     private void prepareQueries(String operation, MongoReadBudget budget) {
         for (int step = 0; step <= BASE_QUERY_COUNT; step++) {
             Document current = budget.transaction(client, session -> marker(session, budget));
             if (current == null) { throw unreadable("missing-query-operation"); }
-            if (current.getInteger(INSTALLED_VERSION)>=OPERATIONAL_VERSION) { return; }
+            if (current.getInteger("installedVersion")>=OPERATIONAL_VERSION) { return; }
             requireQueryOperation(current, operation);
             int cursor = current.get(QUERY, Document.class).getInteger("nextIndex");
             verify(budget, Structures.PREPARING,1);
@@ -284,13 +279,13 @@ final class MongoAlertStorageSchema {
         budget.transaction(client, session -> {
             Document original = marker(session, budget);
             if (original == null) { throw unreadable("missing-query-operation"); }
-            if (original.getInteger(INSTALLED_VERSION)>=OPERATIONAL_VERSION) { return null; }
+            if (original.getInteger("installedVersion")>=OPERATIONAL_VERSION) { return null; }
             requireQueryOperation(original, operation);
             int current = original.get(QUERY, Document.class).getInteger("nextIndex");
             if (current > cursor) { return null; }
             if (current != cursor || ready && cursor != BASE_QUERY_COUNT) { throw unreadable("query-progress"); }
             Document updated = new Document(original).append(QUERY, queryProgress(operation, ready ? "READY" : "PREPARING", ready ? cursor : cursor + 1));
-            if (ready) { updated.put(INSTALLED_VERSION, OPERATIONAL_VERSION); }
+            if (ready) { updated.put("installedVersion", OPERATIONAL_VERSION); }
             if (MongoAlertConfigurationCodec.size(updated) > 2048) { throw unreadable("marker-size"); }
             if (SystemCollections.SCHEMA_MIGRATIONS.on(database).updateOne(session, new Document("_id", "config").append(FIELD, original),
                     new Document("$set", new Document(FIELD, updated))).getModifiedCount() != 1) { throw unreadable("query-progress-fence"); }
@@ -311,7 +306,7 @@ final class MongoAlertStorageSchema {
         if (marker == null) { if (!structures(budget).isEmpty()) { throw unreadable("unmarked-collections"); } return; }
         int contract=marker.containsKey(QUERY)?marker.get(QUERY,Document.class).getInteger("indexContractVersion"):1;
         Structures mode=marker.containsKey(QUERY) && "PREPARING".equals(marker.get(QUERY,Document.class).getString("phase"))
-                ? Structures.PREPARING : marker.getInteger(INSTALLED_VERSION)>=QUERY_VERSION ? Structures.READY : Structures.LEGACY;
+                ? Structures.PREPARING : marker.getInteger("installedVersion")>=QUERY_VERSION ? Structures.READY : Structures.LEGACY;
         verify(budget,mode,contract);
     }
 
@@ -339,7 +334,7 @@ final class MongoAlertStorageSchema {
         if (verifyKeyMaterial == null) keys = keyQuery.projection(new Document("keyId", 1)).first();
         if (keys == null || !keyId.equals(keys.get("keyId"))) { throw unreadable("key-binding"); }
         Document schema = SystemCollections.SCHEMA_MIGRATIONS.on(reads).find(session, new Document("_id", "config")).first();
-        if (schema == null || !(schema.get(INSTALLED_VERSION) instanceof Integer installed)
+        if (schema == null || !(schema.get("installedVersion") instanceof Integer installed)
                 || installed < 1 || installed > MongoConfigurationDomain.SCHEMA_VERSION) { throw unreadable("config-version"); }
         Document counter = SystemCollections.CONFIGURATION_VERSION.on(reads)
                 .find(session, new Document("_id", ConfigurationVersion.ID)).first();
@@ -350,20 +345,20 @@ final class MongoAlertStorageSchema {
     static Document verifyAuthorityState(Document schema, Document counter, String clusterId, String keyId) {
         if (!schema.containsKey(FIELD)) { ConfigurationVersion.validateAlertState(counter, false); return null; }
         if (!(schema.get(FIELD) instanceof Document value)
-                || !(value.get(INSTALLED_VERSION) instanceof Integer installed)
+                || !(value.get("installedVersion") instanceof Integer installed)
                 || (installed < LEGACY_VERSION || installed > VERSION)
                 || !value.keySet().equals(installed == LEGACY_VERSION ? LEGACY_FIELDS : value.containsKey(QUERY) ? QUERY_FIELDS : MARKER_FIELDS)
                 || !clusterId.equals(value.get("clusterId")) || !keyId.equals(value.get("keyId"))
                 || !MongoConfigurationDomain.LAYOUT.equals(value.get("layoutId"))
-                || !(value.get(OPERATION_ID) instanceof String operation)) { throw unreadable("feature-version"); }
+                || !(value.get("operationId") instanceof String operation)) { throw unreadable("feature-version"); }
         requireStoredOperation(operation);
         if (installed >= AUTHORITY_VERSION) {
-            if (!(value.get(AUTHORITY_PREPARATION_OPERATION_ID) instanceof String authority)) { throw unreadable("authority-operation"); }
+            if (!(value.get("authorityPreparationOperationId") instanceof String authority)) { throw unreadable("authority-operation"); }
             requireStoredOperation(authority);
         }
         if(value.containsKey(QUERY)) {
-            if(!(value.get(QUERY) instanceof Document query) || !query.keySet().equals(Set.of(OPERATION_ID,"phase","nextIndex","indexContractVersion"))
-                    || !(query.get(OPERATION_ID) instanceof String id) || !(query.get("nextIndex") instanceof Integer next)
+            if(!(value.get(QUERY) instanceof Document query) || !query.keySet().equals(Set.of("operationId","phase","nextIndex","indexContractVersion"))
+                    || !(query.get("operationId") instanceof String id) || !(query.get("nextIndex") instanceof Integer next)
                     || !(query.get("indexContractVersion") instanceof Integer contract))throw unreadable("query-preparation");
             boolean supported=contract==1 && next>=0 && next<=BASE_QUERY_COUNT
                     && (installed==AUTHORITY_VERSION && "PREPARING".equals(query.get("phase"))

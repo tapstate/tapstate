@@ -188,6 +188,8 @@ class MongoAlertStorageSchemaIT {
             Document before = schema(fixture);
             String keyId = SystemCollections.CLUSTER_KEYS.on(fixture.database()).find().first().getString("keyId");
             assertThat(fixture.domain().alertSchemaVersion()).isZero();
+            fixture.domain().resumeInitialAlertStorage("setup-a");
+            assertThat(schema(fixture)).isEqualTo(before);
             assertNoAlertTables(fixture);
             assertThat(fixture.domain().prepareAlertStorage("alert-upgrade-a")).isEqualTo(MongoAlertStorageSchema.VERSION);
             assertThat(schema(fixture).get("installedVersion")).isEqualTo(before.get("installedVersion"));
