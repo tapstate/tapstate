@@ -39,6 +39,19 @@ class PipelineInputClosureTest {
                 f.target.id(),CanonicalHash.of(f.target),f.view.id(),CanonicalHash.of(f.view),f.serve.id(),CanonicalHash.of(f.serve)));
     }
 
+    @Test void anInputAliasDoesNotHideASeparateTargetArtifactFromTheRecoveryProof() {
+        var f = fixture();
+        var ref = new SourceRef.Spec(f.input.id(), true, Map.of(), f.target.id());
+        var pipeline = new PipelineResource(f.authored.id(), null, List.of(ref), null,
+                new ViewBlock.Use("materialized", f.view.id(), FromRef.literal(ref.binding() + ".orders")),
+                f.authored.serve(), null, null);
+        var inputs = PipelinePreparationInputs.of(new PipelineIntentScope("cluster", 1, "cache", pipeline.id(), 2),
+                pipeline, Map.of(f.input.id(), f.input), Map.of(ref.binding(), Set.of("orders")));
+        assertThat(PipelineInputClosure.dependencyHashes(f.live.artifacts(), pipeline, inputs))
+                .containsEntry(f.target.id(), CanonicalHash.of(f.target))
+                .doesNotContainKey(f.input.id());
+    }
+
     @Test void laterAuthoringCannotChangeTheCapturedDependencyProofOrAddUnrelatedResources() {
         var f=fixture();var captured=ReadOnlyArtifactSnapshot.capture(f.live.artifacts());var inputs=f.inputs(captured);
         var fixed=PipelineInputClosure.dependencyHashes(captured,f.authored,inputs);

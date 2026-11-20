@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.core.catalog.ConnectorForm;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.TapstateException;
 

@@ -25,6 +25,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
     private final MongoClaimOperations claimOperations;
+    private final MongoStructureProof structures = new MongoStructureProof();
+    private final MongoSrsControlProofs srsControlProofs = new MongoSrsControlProofs();
+    private volatile boolean srsControlSnapshotCollations;
+    private volatile boolean srsControlReadinessCollations;
+    private volatile boolean srsReclaimReferenceCollations;
     private final Duration rateRetention;
     private final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
     private final String targetFingerprint;
@@ -35,7 +40,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                              io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
         this.operatorDatabases = operatorDatabases;
         this.connection = connection; this.client = connection.client(); this.database = connection.database(); this.rateRetention = rateRetention; this.targetFingerprint = targetFingerprint;
-        this.claimOperations = new MongoClaimOperations(client);
+        this.claimOperations = new MongoClaimOperations(client,true);
     }
 
     /** Connectivity alone creates no identity, schema, session, membership or business resource. */
@@ -388,7 +393,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
         claimOperations.requireAdmission();
         loadBusinessScope(expected);
-        StoreIo.run(() -> MongoCacheWorkloadClaimStore.requireCollection(database));
+        StoreIo.run(() -> claimOperations.structures.require(MongoStructureProof.Kind.CLAIMS,
+                () -> MongoCacheWorkloadClaimStore.requireCollection(database)));
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive,null,claimOperations);
     }
 
@@ -443,18 +449,55 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected);
         var structure = new MongoCacheMetadataStructure(database, rateRetention);
-        if (runtime) structure.verifySrsRuntime(); else structure.verifySrs();
+        boolean reuseStructure = runtime && !"transaction".equals(System.getProperty(MongoSrsLease.VALIDATION_PROPERTY));
+        if (reuseStructure) structures.require(MongoStructureProof.Kind.SRS_RUNTIME, structure::verifySrsRuntime);
+        else if (runtime) structure.verifySrsRuntime();
+        else structure.verifySrs();
         active.run();
-        Runnable verifyStructure = planning ? () -> {} : () -> {
-            if (!runtime || !expected.equals(admittedCaptureStartup.get())) structure.verifySrs();
-        };
-        var lease = MongoSrsLease.selected();
-        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease);
+        Runnable verifyStructure = planning ? () -> {} : structure::verifySrs;
+        if (reuseStructure) {
+            Runnable physical = structures.check(MongoStructureProof.Kind.SRS, structure::verifySrs);
+            verifyStructure = new MongoStructureProof.Check() {
+                public void run() { if (!expected.equals(admittedCaptureStartup.get())) physical.run(); }
+                public void invalidate() { structures.clear(); }
+                public long remainingNanos() { return structures.remainingSrs(); }
+                public long generation() { return structures.currentGeneration(); }
+            };
+        }
+        var lease = MongoSrsLease.selected(verifyStructure);
+        java.util.function.BooleanSupplier batchSrsRelations = reuseStructure ? this::canBatchSrsControlSnapshot : () -> false;
+        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease, batchSrsRelations,
+                reuseStructure ? this::canBatchSrsControlReadiness : () -> false,
+                reuseStructure ? this::canBatchSrsReclaimReferences : () -> false);
         return new io.tapstate.spi.store.SrsStores(
-                new MongoSrsChainStore(client, database, expected, active, verifyStructure, lease), models,
+                new MongoSrsChainStore(client, database, expected, active, verifyStructure, lease,srsControlProofs), models,
                 new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease),
-                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(), runtime));
+                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(verifyStructure),
+                        runtime, srsControlProofs, batchSrsRelations,
+                        reuseStructure ? this::canBatchSrsControlReadiness : () -> false));
+    }
+
+    private boolean canBatchSrsControlSnapshot() {
+        if (!MongoReadBudget.supportsSnapshotReads(client)) return false;
+        structures.require(MongoStructureProof.Kind.SRS_CONTROL_SNAPSHOT, () ->
+                srsControlSnapshotCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                        SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)));
+        return srsControlSnapshotCollations;
+    }
+
+    private boolean canBatchSrsControlReadiness() {
+        structures.require(MongoStructureProof.Kind.SRS_CONTROL_READINESS, () ->
+                srsControlReadinessCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                        SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS)));
+        return srsControlReadinessCollations;
+    }
+
+    private boolean canBatchSrsReclaimReferences() {
+        structures.require(MongoStructureProof.Kind.SRS_RECLAIM_REFERENCES, () ->
+                srsReclaimReferenceCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                        SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_LOG_BOUNDS)));
+        return srsReclaimReferenceCollations;
     }
 
     @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,
@@ -633,7 +676,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** A fixed read view refuses missing checkpoints rather than interpreting them as a new Pipeline. */
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope) {
-        return new MongoCachePipelineStateStore(pipelineAccess(scope, null, () -> {}));
+        return pipelineStateView(scope,null,()->{});
     }
     /** Only the original prepared control header, without positions or operator state materialization. */
     public io.tapstate.core.lifecycle.CheckpointDoc validationPipelineState(io.tapstate.spi.store.PipelineIntentScope scope,Runnable local){
@@ -644,7 +687,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     /** A write view retains exactly the original claim; a later pass opens its own view. */
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
-        return new MongoCachePipelineStateStore(pipelineAccess(scope, Objects.requireNonNull(original, "original"), requireActive));
+        return pipelineStateView(scope,Objects.requireNonNull(original,"original"),requireActive);
+    }
+
+    private MongoCachePipelineStateStore pipelineStateView(io.tapstate.spi.store.PipelineIntentScope scope,io.tapstate.spi.store.WorkloadClaimFence original,Runnable active){
+        var access=pipelineAccess(scope,original,active);
+        var reader=new MongoCacheWorkloadClaimStore(client,database,new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation()),
+                ()->{businessActive();active.run();},null,claimOperations);
+        return new MongoCachePipelineStateStore(access,()->reader.readCheckpoint(scope));
     }
 
     /** Read observations and their existing checkpoint and claim fences in one CACHE snapshot. */
@@ -710,6 +760,64 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         for (var row : table.on(database).find(session, new Document("_id", new Document("$in", ids))))
             result.put(row.get("_id"), row);
         return result;
+    }
+
+    private volatile boolean observationCollations;
+
+    public record ObservationSource(String sourceId, long snapshotEpoch, Set<String> tables) {
+        public ObservationSource {
+            Objects.requireNonNull(sourceId, "sourceId");
+            tables = Set.copyOf(tables);
+        }
+    }
+
+    public record ObservationFacts(io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
+            Map<String, io.tapstate.spi.store.ConsumerOffset> cursors, Map<String, Map<String, Long>> counts,
+            Map<String, io.tapstate.spi.store.DiscoveredSourceModel> schemas) {
+        public ObservationFacts {
+            cursors = Map.copyOf(cursors); counts = Map.copyOf(counts); schemas = Map.copyOf(schemas);
+        }
+    }
+
+    public java.util.Optional<ObservationFacts> readObservation(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence original, Map<io.tapstate.spi.store.SrsConsumerRun, ObservationSource> sources,
+            Runnable active) {
+        var access = pipelineAccess(scope, original, active);
+        access.requireObservationActive();
+        if (!MongoReadBudget.supportsSnapshotReads(client)
+                || "transaction".equals(System.getProperty(MongoSrsLease.VALIDATION_PROPERTY))) return java.util.Optional.empty();
+        var metadata = new MongoCacheMetadataStructure(database, rateRetention);
+        try {
+            structures.require(MongoStructureProof.Kind.SRS, metadata::verifySrs);
+            structures.require(MongoStructureProof.Kind.OBSERVATION, () -> {
+                observationCollations = MongoCacheMetadataStructure.simpleCollations(database, MongoPipelineObservationRead.COLLECTIONS);
+                if (observationCollations) metadata.verifyObservation();
+            });
+            if (!observationCollations) return java.util.Optional.empty();
+            var facts = new MongoPipelineObservationRead(client, database, access).read(Map.copyOf(sources));
+            access.requireObservationActive();
+            return facts;
+        } catch (RuntimeException failure) {
+            structures.clear();
+            access.requireObservationActive();
+            if (failure instanceof TapstateException coded && coded.code() == IoError.DOCUMENT_TOO_LARGE)
+                return java.util.Optional.empty();
+            throw failure;
+        }
+    }
+
+    public boolean updateObservation(io.tapstate.spi.store.PipelineIntentScope scope, io.tapstate.spi.store.WorkloadClaimFence original,
+            Runnable active, io.tapstate.core.lifecycle.Observation observation, long epoch) {
+        var access = pipelineAccess(scope, original, active);
+        access.requireObservationActive();
+        if (structures.remaining(MongoStructureProof.Kind.OBSERVATION) == 0L) return false;
+        try {
+            return new MongoCachePipelineObservationStore(access).updateExisting(observation, epoch);
+        } catch (RuntimeException failure) {
+            structures.clear();
+            access.requireObservationActive();
+            throw failure;
+        }
     }
 
     /** Missing projections are unknown; they do not permit creation of a missing checkpoint. */

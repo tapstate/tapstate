@@ -3,8 +3,12 @@ package io.tapstate.runtime.engine;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
+import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
+import io.tapstate.core.dsl.aggregate.AggregateDefinition;
+import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
@@ -18,6 +22,8 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.runtime.engine.aggregate.AggregateProcessor;
+import io.tapstate.runtime.engine.aggregate.AggregateStores;
 import io.tapstate.runtime.engine.join.JoinDag;
 import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.NestDag;
@@ -289,6 +295,12 @@ public final class PipelineDagBuilder {
         return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest ? nest : null;
     }
 
+    /** The aggregate this step declares, or {@code null} where the step is anything else. */
+    private static TransformBody.Aggregate aggregateOf(Step step) {
+        return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Aggregate aggregate
+                ? aggregate : null;
+    }
+
     /**
      * The join this step declares, or {@code null} where the step is anything else. One place answers
      * it so that everything walking a pipeline's transforms agrees on what a join is.
@@ -371,7 +383,7 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
         PipelineChains chains = frontier == null ? null : new PipelineChains();
 
-        for (String sourceId : pipeline.sourceIds()) {
+        for (String sourceId : pipeline.sourceBindings()) {
             List<String> sourceKeys = bindings.sourceKeys().apply(sourceId);
             if (sourceKeys == null || sourceKeys.isEmpty()) {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
@@ -462,6 +474,46 @@ public final class PipelineDagBuilder {
                     assembled = true;
                     continue;
                 }
+                if (aggregateOf(step) != null) {
+                    // An aggregate step is one processor for the whole cluster, whatever the width of the
+                    // nodes around it: both of its sides commit under the pipeline's one claim, and a row
+                    // leaving a group has to be applied before the same row arriving in another.
+                    if (bindings.aggregate() == null) {
+                        throw new IllegalStateException("transform step '" + step.id()
+                                + "' is an aggregate, but no aggregate binding was supplied to the builder");
+                    }
+                    if (shape.isNative(step.id())) {
+                        throw new IllegalStateException("aggregate step '" + step.id()
+                                + "' was given a width; it runs as one processor");
+                    }
+                    List<String> upstream = resolveClause(step.from(), bindings);
+                    Map<Integer, List<String>> carried = chains == null ? null : chains.perOrdinal(upstream);
+                    AggregateStepSpec spec = bindings.aggregate().specs().apply(step);
+                    AggregateStores stores = bindings.aggregate().stores();
+                    AggregateDefinition definition = AggregateDefinition.of(upstream, spec);
+                    ReplayFloorFactory aggregateFloor = bindings.aggregate().replayFloor();
+                    AggregateProcessor.Sweep sweep = bindings.aggregate().sweep();
+                    String pipelineId = pipeline.id();
+                    String name = step.id();
+                    SupplierEx<Processor> processors = axes == null
+                            ? () -> new AggregateProcessor(pipelineId, name, spec, definition, stores, null, aggregateFloor, sweep)
+                            : () -> new AggregateProcessor(pipelineId, name, spec, definition, stores,
+                                    new LevelBounds(carried, axes, LevelBounds.HOLDS_NOTHING), aggregateFloor, sweep);
+                    Vertex vertex = dag.newVertex(name,
+                            TotalOne.passingBounds(ProcessorSupplier.of(processors), name, axes, carried));
+                    byKey.put(name, vertex);
+                    drawn.add(name, name);
+                    if (chains != null) {
+                        // The rows it sends are rows of its own, never rows a source read.
+                        chains.assembled(name, upstream);
+                    }
+                    connect(dag, verticesOf(upstream, byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
+                    attachTraceInputs(dag, name, step.from(), bindings, byKey, trace,
+                            outboundOrdinal, inboundOrdinal, shape);
+                    attachTrace(dag, name, vertex, trace, outboundOrdinal, inboundOrdinal, shape);
+                    assembled = true;
+                    continue;
+                }
                 List<String> upstream = resolveClause(step.from(), bindings);
                 Vertex vertex = transformVertex(dag, step, bindings, axes,
                         chains == null ? null : chains.perOrdinal(upstream), shape);
@@ -514,7 +566,7 @@ public final class PipelineDagBuilder {
         boolean readsSnapshot = pipeline.settings() == null || pipeline.settings().readMode() != ReadMode.CDC_ONLY;
         if (sinkAck != null && chains != null && readsSnapshot) {
             Map<String, List<AwaitedLoad>> gates = loadGates(sinks, chains, shape);
-            for (String sourceId : pipeline.sourceIds()) {
+            for (String sourceId : pipeline.sourceBindings()) {
                 for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {
                     List<AwaitedLoad> awaited = gates.get(frontier.chainOf(sourceKey));
                     if (awaited != null) {

@@ -1,0 +1,54 @@
+# A js step placed after a nest runs on the whole assembled document, every time the nest writes it.
+#
+# The nest sends a document as one unit, so a script downstream of it sees the parent's columns and
+# every embedded array together. That is what makes a script the place to do what the declarative
+# steps cannot: put an array in a chosen order, or turn it into a joined string.
+#
+# What the assertions have to discriminate:
+#
+# - The joined string is the observable. It holds the array's order and the script's own output in one
+#   value: a document that never went through the script has no such field, and one that went through a
+#   script that did not sort it reads in another order (the rows are seeded in ascending sku order, so
+#   an unsorted array joins ascending and fails the descending expectation).
+#
+# - The script must run again when only a child changes. A child insert rewrites the parent document,
+#   and the expectation after it names the new sku first, so an implementation that ran the script once
+#   at snapshot time and passed later rewrites through untouched fails here, not just on the count.
+#
+# - The second order is held to its own value after the first one changes, so a script whose output
+#   leaked across documents shows up there.
+#
+# - A parent delete reaches the script with no after image. The script returns the record unchanged,
+#   and the document has to leave the target: the count dropping to one is that check.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: a-script-reshapes-the-assembled-document
+setup:
+  databases:
+    src: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  managed_target: views.tap.yml
+  apply: [src_js_orders.tap.yml, src_js_items.tap.yml, pipeline.tap.yml]
+  discover: [src_js_orders, src_js_items]
+pipeline: pipeline.tap.yml
+seed:
+  src_js_orders.js_orders:
+    values:
+      - { id: 1, customer: ada }
+      - { id: 2, customer: grace }
+  src_js_items.js_items:
+    values:
+      - { id: 1, order_id: 1, sku: sku-1 }
+      - { id: 2, order_id: 1, sku: sku-2 }
+      - { id: 3, order_id: 2, sku: sku-5 }
+steps:
+  - start
+  - await: { count: { views.scripted_state: 2 } }
+  - await: { doc: { views.scripted_state: { where: { id: 1 }, expect: { customer: ada, skus: "sku-2,sku-1", item_count: 2 }, size: { items: 2 } } } }
+  - cdc: { src_js_items.js_items: { insert: { values: [ { id: 4, order_id: 1, sku: sku-3 } ] } } }
+  - await: { doc: { views.scripted_state: { where: { id: 1 }, expect: { customer: ada, skus: "sku-3,sku-2,sku-1", item_count: 3 }, size: { items: 3 } } } }
+  - assert: { doc: { views.scripted_state: { where: { id: 2 }, expect: { customer: grace, skus: "sku-5", item_count: 1 } } } }
+  - cdc: { src_js_orders.js_orders: { delete: { where: { id: 2 } } } }
+  - await: { count: { views.scripted_state: 1 } }

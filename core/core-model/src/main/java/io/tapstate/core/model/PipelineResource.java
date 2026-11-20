@@ -59,6 +59,15 @@ public record PipelineResource(
         return Collections.unmodifiableList(ids);
     }
 
+    /** Input names used in the graph, independent of the shared Source artifact ids. */
+    public List<String> sourceBindings() {
+        return sources.stream().map(SourceRef::binding).distinct().toList();
+    }
+
+    public SourceRef sourceReference(String binding) {
+        return sources.stream().filter(ref -> ref.binding().equals(binding)).findFirst().orElseThrow();
+    }
+
     @Override
     public String kind() {
         return "pipeline";

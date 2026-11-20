@@ -1,0 +1,52 @@
+version: tapstate/v1
+kind: pipeline
+id: player_ledger
+source: [ ledger_db ]
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  # Each table's rows say which table they came from, on the row itself.
+  - id: point_moves
+    type: map
+    from: ledger_points
+    fields: { kind: points }
+  - id: comp_moves
+    type: map
+    from: ledger_comps
+    fields: { kind: comps }
+  - id: award_moves
+    type: map
+    from: ledger_awards
+    fields: { kind: awards }
+  # Three tables, one stream.
+  - id: movements
+    type: union
+    from: [ point_moves, comp_moves, award_moves ]
+  # Every shard of the session table, read by pattern and tagged with the table each row came from.
+  - id: sessions
+    type: map
+    from: "/^ledger_session[0-9]$/"
+    fields: { shard: "=src" }
+  - id: player_doc
+    type: nest
+    from: { p: ledger_players, m: movements, s: sessions }
+    root:
+      from: p
+      key: [ id ]
+      embed:
+        - { from: m, on: { player_id: id }, as: array, path: item_movement, arrayKey: [ kind, id ] }
+        - { from: s, on: { player_id: id }, as: array, path: sessions, arrayKey: [ shard, id ] }
+  # Element order inside an array is not part of the contract, so each element the case reads is picked
+  # out by its identity into a field of its own.
+  - id: picked
+    type: map
+    from: player_doc
+    fields:
+      point_1: "=after.item_movement.filter(e, e.kind == 'points' && e.id == 1).map(e, e.note)"
+      comp_1: "=after.item_movement.filter(e, e.kind == 'comps' && e.id == 1).map(e, e.note)"
+      award_1: "=after.item_movement.filter(e, e.kind == 'awards' && e.id == 1).map(e, e.note)"
+      session0_7: "=after.sessions.filter(e, e.shard == 'ledger_session0' && e.id == 7).map(e, e.note)"
+      session3_7: "=after.sessions.filter(e, e.shard == 'ledger_session3' && e.id == 7).map(e, e.note)"
+view:
+  id: ledger_state
+  from: picked
+  primary_key: id

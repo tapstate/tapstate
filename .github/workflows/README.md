@@ -50,7 +50,7 @@ admission.
 
 ## Nightly Test
 
-`nightly-test.yml` runs at 01:00 Asia/Shanghai and can be run manually from
+`nightly-test.yml` is scheduled for 21:00 Asia/Shanghai and can be run manually from
 `main`. The full reactor regression runs in parallel with real connectors,
 the full Join performance matrix, native CLI and MCP bundles for four
 platforms, the paired Cloud and OP image smoke, release-script self-tests,

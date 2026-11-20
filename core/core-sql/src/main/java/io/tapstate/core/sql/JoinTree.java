@@ -25,10 +25,27 @@ public sealed interface JoinTree extends Serializable {
     /**
      * Rows read from one table.
      *
-     * @param name  what the SQL calls it -- its alias where it has one, otherwise the table name
-     * @param table the table the rows come from
+     * @param name          what the SQL calls it -- its alias where it has one, otherwise the table name
+     * @param table         the table the rows come from
+     * @param alternativeOf for a source the front end added to carry one alternative of an {@code OR}
+     *                      join condition, the name of the source as the SQL wrote it; null for every
+     *                      source the SQL itself names. The added source reads the same rows as that
+     *                      one, under state of its own, because it matches them on other columns
      */
-    record Source(String name, String table) implements JoinTree {
+    record Source(String name, String table, String alternativeOf) implements JoinTree {
+
+        public Source(String name, String table) {
+            this(name, table, null);
+        }
+
+        /**
+         * The name the statement's author declared for these rows: the name for a source the SQL
+         * names, and the name of the source it stands in for when the front end added it. Whatever
+         * resolves a source to the rows that feed it goes by this, never by {@link #name()}.
+         */
+        public String declared() {
+            return alternativeOf == null ? name : alternativeOf;
+        }
     }
 
     /**

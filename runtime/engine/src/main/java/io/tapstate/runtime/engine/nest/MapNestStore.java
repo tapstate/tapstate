@@ -53,6 +53,7 @@ final class MapNestStore<S> implements NestStore<S> {
     private final NestStateGauge gauge;
     private boolean keyPublisherBound;
     private long publishedGroups;
+    private long publishedWeight;
     private long publishedEvictions;
 
     MapNestStore(IMap<Object, S> map) {
@@ -121,6 +122,14 @@ final class MapNestStore<S> implements NestStore<S> {
             stats.publishKeys(namespace, gauge.keyPublisher(namespace));
             keyPublisherBound = true;
         } else stats.refreshKeys(namespace);
+        long weighed = stats.weightObservations(namespace);
+        if (weighed != publishedWeight) {
+            var weight = stats.weight(namespace);
+            if (weight != null) {
+                gauge.weightReading(namespace, weight);
+                publishedWeight = weighed;
+            }
+        }
         long evictions = local.getEvictionCount();
         if (stats.commitGroups(namespace) != publishedGroups || evictions != publishedEvictions) {
             var commits = stats.commits(namespace);
@@ -137,6 +146,13 @@ final class MapNestStore<S> implements NestStore<S> {
      * gives, and leaves the reading at once: the count changes only here, and a document is the moment a
      * reader watching a load wants it to move.
      */
+    @Override
+    public void folded(long nanos) {
+        if (stats != null) {
+            stats.folded(map.getName(), nanos);
+        }
+    }
+
     @Override
     public void rendered(long documents) {
         if (stats != null && documents > 0) {
