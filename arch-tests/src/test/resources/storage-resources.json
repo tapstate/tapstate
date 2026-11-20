@@ -4751,14 +4751,14 @@
     {
       "id": "local.connector-support-snapshot",
       "resourceVersion": 1,
-      "proposalVersion": 2,
+      "proposalVersion": 3,
       "kind": "FILE_SET",
       "layer": "CACHE",
       "database": "LOCAL",
       "physicalNames": [
         "${dataDir}/cache/connector-support.json"
       ],
-      "responsibility": "One most recent valid official connector support manifest, including format version, independent manifest version and entries.",
+      "responsibility": "One most recent valid official connector support manifest. Bundled and online entries use the same optional loaderRetirementEligible boolean per PDK connector ID. Missing eligibility is false. Invalid values reject the candidate manifest and preserve the last valid snapshot.",
       "writers": [
         "io.tapstate.app.ConnectorSupportSnapshot"
       ],
@@ -4767,9 +4767,10 @@
       ],
       "recovery": "connector-support-snapshot",
       "consistency": "connector-support-snapshot",
-      "growth": "One published manifest per instance, linear in the number of supported connectors and independent of refresh count.",
+      "growth": "One published manifest per instance, with at most one additional boolean per supported connector. Growth is linear in the connector count and independent of refresh count.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ConnectorSupportSnapshotTest.java"
+        "app/src/test/java/io/tapstate/app/ConnectorSupportSnapshotTest.java",
+        "app/src/test/java/io/tapstate/app/ConnectorCatalogRefreshTest.java"
       ]
     },
     {

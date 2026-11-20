@@ -44,16 +44,36 @@ class ConnectorSupportSnapshotTest {
         assertThat(snapshot.restore(manifest(10, "mysql")).entries()).containsOnlyKeys("mysql");
     }
 
+    @Test
+    void theSameEligibilitySurvivesBundledStartupAndOfflineSnapshotRecovery() throws IOException {
+        var snapshot = new ConnectorSupportSnapshot(directory);
+        String legacy = manifest(10, "mysql");
+        String eligible = manifestWithEligibility(11, "mysql", "true");
+
+        assertThat(snapshot.restore(legacy).entries().get("mysql").loaderRetirementEligible()).isFalse();
+        assertThat(snapshot.restore(eligible).entries().get("mysql").loaderRetirementEligible()).isTrue();
+        assertThat(snapshot.restore(legacy).entries().get("mysql").loaderRetirementEligible()).isTrue();
+        assertThat(Files.readString(directory.resolve("cache/connector-support.json"))).isEqualTo(eligible);
+    }
+
     static String manifest(long version, String id) {
+        return manifest(version, id, "");
+    }
+
+    static String manifestWithEligibility(long version, String id, String value) {
+        return manifest(version, id, ", \"loaderRetirementEligible\": " + value);
+    }
+
+    private static String manifest(long version, String id, String entrySuffix) {
         return """
                 {
                   "schemaVersion": 1,
                   "version": %d,
                   "connectors": [{
                     "id": "%s", "name": "Fixture", "roles": ["source", "target"],
-                    "minimumTapstateVersion": "0.8.0", "repository": "oss", "artifactId": "%s-connector"
+                    "minimumTapstateVersion": "0.8.0", "repository": "oss", "artifactId": "%s-connector"%s
                   }]
                 }
-                """.formatted(version, id, id);
+                """.formatted(version, id, id, entrySuffix);
     }
 }

@@ -16,7 +16,7 @@ record ConnectorSupportManifest(long version, Map<String, Entry> entries) {
     private static final List<String> ROLES = List.of("source", "target");
 
     record Entry(String id, String name, List<String> roles, String minimumTapstateVersion,
-                 String repository, String artifactId) {
+                 String repository, String artifactId, boolean loaderRetirementEligible) {
         boolean supportsRole(String role) {
             return roles.contains(role);
         }
@@ -39,7 +39,7 @@ record ConnectorSupportManifest(long version, Map<String, Entry> entries) {
                 Entry entry = new Entry(text(row, "id", ID), text(row, "name", null),
                         roles.stream().map(String.class::cast).distinct().toList(),
                         text(row, "minimumTapstateVersion", ENGINE_VERSION), text(row, "repository", ID),
-                        text(row, "artifactId", ID));
+                        text(row, "artifactId", ID), retirementEligibility(row));
                 if (entries.putIfAbsent(entry.id(), entry) != null) {
                     throw new IllegalArgumentException("Duplicate connector in support manifest");
                 }
@@ -57,6 +57,13 @@ record ConnectorSupportManifest(long version, Map<String, Entry> entries) {
             return Optional.empty();
         }
         return Optional.of(entry);
+    }
+
+    private static boolean retirementEligibility(Map<?, ?> row) {
+        String key = "loaderRetirementEligible";
+        if (!row.containsKey(key)) return false;
+        if (row.get(key) instanceof Boolean eligible) return eligible;
+        throw new IllegalArgumentException("Invalid support manifest field: " + key);
     }
 
     private static String text(Map<?, ?> row, String key, Pattern pattern) {

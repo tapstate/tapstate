@@ -80,6 +80,31 @@ class ConnectorCatalogRefreshTest {
     }
 
     @Test
+    void refreshReadsTheSameEligibilityAndRejectsInvalidEligibilityWithoutReplacingTheSnapshot() throws Exception {
+        var remote = new RepositoryFixture();
+        URI repository = URI.create("https://repository.test/");
+        remote.publish(repository, "mysql", DIGEST);
+        remote.repoint(repository);
+
+        String bundled = ConnectorSupportSnapshotTest.manifestWithEligibility(10, "mysql", "false");
+        String online = ConnectorSupportSnapshotTest.manifestWithEligibility(11, "mysql", "true");
+        var refresh = catalog(remote, bundled);
+        assertThat(refresh.current().support().entries().get("mysql").loaderRetirementEligible()).isFalse();
+
+        remote.files.put(SUPPORT, online);
+        var accepted = refresh.refresh();
+        assertThat(accepted.support().entries().get("mysql").loaderRetirementEligible()).isTrue();
+        assertThat(catalog(new RepositoryFixture(), bundled).current().support().entries())
+                .isEqualTo(accepted.support().entries());
+
+        remote.files.put(SUPPORT, ConnectorSupportSnapshotTest.manifestWithEligibility(12, "mysql", "null"));
+        assertThatThrownBy(refresh::refresh).isInstanceOf(IOException.class)
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+        assertThat(refresh.current()).isSameAs(accepted);
+        assertThat(Files.readString(directory.resolve("cache/connector-support.json"))).isEqualTo(online);
+    }
+
+    @Test
     void anUnsupportedOrUnavailableArtifactIsNotOffered() throws Exception {
         var remote = new RepositoryFixture();
         URI repository = URI.create("https://repository.test/");
