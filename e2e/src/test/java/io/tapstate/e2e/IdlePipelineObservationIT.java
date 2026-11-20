@@ -45,9 +45,31 @@ class IdlePipelineObservationIT {
                 control.apply(Map.of("source.tap.yml", sourceYaml(sourceUri), "target.tap.yml", targetYaml(targetUri),
                         "pipeline.tap.yml", pipelineYaml()));
                 control.discoverSchema(SOURCE, "mongodb", Map.of("isUri", true, "uri", sourceUri));
-                control.lifecycle(PIPELINE, LifecycleVerb.START);
-                Await.until("the first snapshot row to reach the native target", () -> target.countDocuments() == 1,
-                        () -> "target rows=" + target.countDocuments());
+                var admin = client.getDatabase("admin");
+                admin.runCommand(new Document("setParameter", 1)
+                        .append("logComponentVerbosity", new Document("command", new Document("verbosity", 2))));
+                try {
+                    control.lifecycle(PIPELINE, LifecycleVerb.START);
+                    Await.until("the first snapshot row to reach the native target", () -> target.countDocuments() == 1,
+                            () -> "target rows=" + target.countDocuments());
+                } finally {
+                    admin.runCommand(new Document("setParameter", 1)
+                            .append("logComponentVerbosity", new Document("command", new Document("verbosity", -1))));
+                }
+                var cacheCommands = mongo.getLogs().lines()
+                        .filter(line -> line.contains("\"msg\":\"About to run the command\"")
+                                && line.contains("\"db\":\"" + storage.cacheDatabase() + "\""))
+                        .map(Document::parse)
+                        .map(line -> line.getEmbedded(List.of("attr", "commandArgs"), Document.class))
+                        .toList();
+                assertThat(cacheCommands).as("pipeline startup reads the CACHE checkpoint")
+                        .anyMatch(command -> "cache_identity".equals(command.get("aggregate"))
+                                && command.getList("pipeline", Document.class).stream().anyMatch(stage ->
+                                        stage.get("$lookup") instanceof Document lookup && "pipeline_state".equals(lookup.get("from"))));
+                assertThat(cacheCommands).as("pipeline startup avoids the unsupported CACHE metadata filter")
+                        .noneMatch(command -> command.containsKey("listCollections")
+                                && command.get("filter") instanceof Document filter
+                                && filter.get("name") instanceof Document name && name.containsKey("$in"));
 
                 var observations = client.getDatabase(storage.cacheDatabase()).getCollection("pipeline_observation");
                 Date first = awaitObservation(observations, new Date(0));
