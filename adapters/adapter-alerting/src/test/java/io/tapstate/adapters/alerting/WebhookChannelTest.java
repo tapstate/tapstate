@@ -60,6 +60,11 @@ class WebhookChannelTest {
             assertThat(result.protocolStatus()).isEqualTo(202);
             assertThat(peerClosed.await(2, TimeUnit.SECONDS)).isTrue();
             assertThat(channel.activeAttempts()).isZero();
+            // A cancelled periodic task can briefly reenter the executor queue.
+            long cleanupDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            while (channel.queuedClientTasks() != 0 && System.nanoTime() - cleanupDeadline < 0) {
+                TimeUnit.MILLISECONDS.sleep(10);
+            }
             assertThat(channel.queuedClientTasks()).isZero();
             assertThat(body.get()).isEqualTo(new String(request.payload(), StandardCharsets.UTF_8));
             assertThat(headers.get().toLowerCase()).contains("authorization: bearer fixture-token", "x-tapstate-delivery-id: delivery", "x-tapstate-signature: v1=");
