@@ -11,9 +11,9 @@
 #   secrets.CLOUD_GHCR_TOKEN      GHCR token with packages: write
 #   secrets.RELEASE_SATELLITE_TOKEN  read access to the private tapstate-web repository
 #
-# This lane runs no test suite. The reactor packages the Boot JAR with test compilation and
-# execution skipped, the Web step only bundles the pinned checkout, and the image check below
-# is a packaging assertion rather than a test run.
+# This lane runs no test suite: the reactor packages the Boot JAR with -DskipTests, which skips
+# test execution while test sources still compile for the modules that publish test-jars. The Web
+# step only bundles its pinned checkout, and the image check below is a packaging assertion.
 #
 # Nothing is published when verification fails: the connector seed, the Web bundle, the Boot
 # JAR and both image platforms are checked against the build inputs before the push.
@@ -125,7 +125,7 @@ jobs:
           java-version: "21"
           cache: maven
       - name: build the Cloud Boot JAR
-        run: mvn -B -pl app -am -Dmaven.test.skip=true package
+        run: mvn -B -pl app -am -DskipTests package
       - name: read the Cloud build provenance
         id: provenance
         env:
