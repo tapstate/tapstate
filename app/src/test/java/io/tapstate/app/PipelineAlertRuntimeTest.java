@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.core.alerting.*;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.spi.store.*;
 import java.time.*;
@@ -51,6 +53,37 @@ class PipelineAlertRuntimeTest {
         return new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, fixture.host), intentStore,
                 (scope, claim) -> Optional.of(()->{}), () -> { }, fixture.clock);
     }
+
+    @Test void cloudAlertPreparationRetriesWithoutRestartingTheAlertRuntime() {
+        var properties = new CloudProperties();
+        properties.setBaseUrl("https://cloud.example");
+        properties.setToken("local-test-token");
+        properties.setClusterId("cluster");
+        properties.setAtlasUri("mongodb://fixture/config");
+        var cloud = CloudRuntimeSettings.resolve(properties);
+        var setup = new StorageSetupScope("cluster", "cloud-cluster", "original-operation", 1);
+        var configuration = mock(MongoConfigurationDomain.class);
+        var databaseAvailable = new AtomicBoolean();
+        doAnswer(call -> {
+            if (!databaseAvailable.get()) throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of(), null);
+            return null;
+        }).when(configuration).resumeInitialAlertStorage(setup.operationId());
+
+        try (var runtime = new PipelineAlertRuntime(() -> {
+            CloudConfigurationInitialization.resumeAlertStorage(configuration, setup, cloud);
+            return new PipelineAlertRuntime.Services(fixture.store, fixture.host);
+        }, intentStore, (scope, claim) -> Optional.empty(), () -> {}, fixture.clock)) {
+            runtime.start();
+            await().atMost(Duration.ofSeconds(5)).until(() -> runtime.health().degraded());
+            assertThat(runtime.health().code()).isEqualTo(IoError.STORE_UNAVAILABLE.code());
+
+            databaseAvailable.set(true);
+            await().atMost(Duration.ofSeconds(5)).until(() -> !runtime.health().degraded());
+            assertThat(runtime.managementServices().store()).isSameAs(fixture.store);
+            verify(configuration, atLeast(2)).resumeInitialAlertStorage(setup.operationId());
+        }
+    }
+
     @Test void anAuthoritativeFailureSummaryIsCapturedWhenTheThrowableIsNoLongerAvailable() {
         var redactor=new io.tapstate.core.logging.SecretRedactor();redactor.replace("source",List.of("original-source-secret"));
         try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host),intentStore,
