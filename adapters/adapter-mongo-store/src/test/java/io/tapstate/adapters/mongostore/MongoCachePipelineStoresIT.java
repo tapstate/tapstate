@@ -5,6 +5,8 @@ import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.connection.ClusterDescription;
+import com.mongodb.connection.ClusterType;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandFailedEvent;
@@ -14,6 +16,7 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.StorageBinding;
@@ -43,6 +46,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.AdditionalAnswers.delegatesTo;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
 
 /** Explicit business and checkpoint fixtures witness load/write views, not controlled preparation. */
 @RequiresDocker
@@ -123,6 +129,23 @@ class MongoCachePipelineStoresIT {
             assertThat(states.compareAndSwap("orders", 1, "PAUSED", AT)).isInstanceOf(CasOutcome.Applied.class);
             observations.save(observation(PipelineState.PAUSED), 2);
             assertThat(observations.read("orders").orElseThrow().state()).isEqualTo(PipelineState.PAUSED);
+        });
+    }
+
+    @Test void claimReadsKeepTheirScopeWithAndWithoutSnapshotSessions() {
+        withFixture(f -> {
+            var claims = (DeadlineWorkloadClaimStore) f.domain().workloadClaims(BUSINESS);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            var expected = claims.withDeadline(deadline, () -> claims.readPipeline(SCOPE)).orElseThrow();
+            assertThat(WorkloadClaimFence.from(expected.claim())).isEqualTo(f.fence());
+
+            var olderTopology = mock(ClusterDescription.class);
+            doReturn(ClusterType.UNKNOWN).when(olderTopology).getType();
+            var legacyClient = mock(MongoClient.class, delegatesTo(f.admin()));
+            doReturn(olderTopology).when(legacyClient).getClusterDescription();
+            var legacy = new MongoCacheWorkloadClaimStore(legacyClient, f.database(), BUSINESS, ACTIVE);
+            assertThat(legacy.readPipeline(SCOPE).orElseThrow().claim()).isEqualTo(expected.claim());
+            assertCode(() -> legacy.readPipeline(scope(2)), IoError.CACHE_BUSINESS_FENCED);
         });
     }
 
@@ -380,7 +403,8 @@ class MongoCachePipelineStoresIT {
             var before = snapshot(f.database());
             try (var observed = client(listener)) {
                 var store = new MongoCachePipelineStateStore(new MongoCachePipelineAccess(observed,
-                        observed.getDatabase(f.database().getName()), SCOPE, f.fence(), () -> { if (!active.get()) throw MongoCachePipelineAccess.fenced(); }));
+                        observed.getDatabase(f.database().getName()), SCOPE, f.fence(), () -> { if (!active.get()) throw MongoCachePipelineAccess.fenced(); }),
+                        new MongoStructureProof());
                 f.admin().getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
                         .append("data", new Document("failCommands", List.of("update")).append("errorCode", 112).append("errorLabels", List.of("TransientTransactionError"))));
                 try { assertCode(() -> store.compareAndSwap("orders", 0, "RUNNING", AT), IoError.CACHE_BUSINESS_FENCED); }
@@ -398,15 +422,17 @@ class MongoCachePipelineStoresIT {
             assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
             f.database().createCollection("pipeline_observation");
+            var nanos = new java.util.concurrent.atomic.AtomicLong();
+            var states = new MongoCachePipelineStateStore(
+                    new MongoCachePipelineAccess(f.admin(), f.database(), SCOPE, null, ACTIVE),
+                    new MongoStructureProof(nanos::get));
+            assertThat(states.read("orders")).isPresent();
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).createIndex(new Document("touchMillis", 1),
                     new com.mongodb.client.model.IndexOptions().expireAfter(60L, TimeUnit.SECONDS));
-            long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(11);
-            for(;;){
-                try{f.domain().pipelineStates(SCOPE).read("orders");}
-                catch(TapstateException failure){assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);break;}
-                assertThat(System.nanoTime()).as("physical drift is detected when the ten-second proof expires").isLessThan(deadline);
-                Thread.sleep(25);
-            }
+            nanos.set(TimeUnit.SECONDS.toNanos(10) - 1);
+            assertThat(states.read("orders")).as("a warm read reuses the structure proof").isPresent();
+            nanos.incrementAndGet();
+            assertCode(() -> states.read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).listIndexes().into(new ArrayList<>()))
                     .anySatisfy(index->assertThat(index).containsKey("expireAfterSeconds"));
         });
