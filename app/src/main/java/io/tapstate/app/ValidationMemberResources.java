@@ -495,6 +495,11 @@ final class ValidationMemberResources implements AutoCloseable {
         boolean stopCleanup;synchronized(this){stopCleanup=probes.isEmpty();}
         if(stopCleanup){controlTicks.shutdown();cleanup.shutdown();}
     }
+    void awaitStopped(long deadline) {
+        for (var worker : List.of(queries, decoders, checks, controls, controlTicks, cleanup)) {
+            ShutdownAwait.executor(worker, deadline);
+        }
+    }
     private static ExecutorService pool(String name, int workers, int queue) {
         return new ThreadPoolExecutor(workers, workers, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(queue), task -> {
             var thread = new Thread(task, name); thread.setDaemon(true); return thread;

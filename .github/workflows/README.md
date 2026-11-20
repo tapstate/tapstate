@@ -221,9 +221,10 @@ the Web commit, the Boot JAR from the Tapstate commit, stages the locked
 connector seed, verifies both image platforms, and publishes
 `ghcr.io/tapstate/tapstate-cloud:<next-minor>-dev`. The version calculator counts
 up from the tagged `main` history, so a feature branch needs no release tag of
-its own. The lane runs no test suite: the Boot JAR is packaged with test
-compilation and execution skipped, the Web step only bundles its pinned
-checkout, and the image check before the push is a packaging assertion.
+its own. The lane runs no test suite: the Boot JAR is packaged with
+`-DskipTests`, so test sources still compile for the modules that publish
+test-jars but no test executes. The Web step only bundles its pinned checkout,
+and the image check before the push is a packaging assertion.
 
 The job summary and the `json` job output carry the branch pair, build version,
 digest reference, tag, Web commit id, and run URL. Unlike the dev lane above,
