@@ -1,12 +1,57 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoTimeoutException;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.connection.ClusterDescription;
+import com.mongodb.connection.ClusterType;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
+import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class MongoStructureProofTest {
+    private static final PipelineIntentScope PIPELINE = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+
+    @Test void aCheckpointReadFailureInvalidatesTheCachedStructure() {
+        var client = mock(MongoClient.class);
+        var database = mock(MongoDatabase.class);
+        when(client.startSession()).thenThrow(new MongoTimeoutException("cache unavailable"));
+        var access = new MongoCachePipelineAccess(client, database, PIPELINE, null, () -> {});
+        var proof = new MongoStructureProof(() -> 0L);
+        proof.require(MongoStructureProof.Kind.PIPELINE_STATE, () -> {});
+
+        assertThatThrownBy(() -> access.readCheckpoint(proof))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+        assertThat(proof.remaining(MongoStructureProof.Kind.PIPELINE_STATE)).isZero();
+    }
+
+    @Test void aClaimReadFailureInvalidatesTheCachedStructure() {
+        var client = mock(MongoClient.class);
+        var database = mock(MongoDatabase.class);
+        var topology = mock(ClusterDescription.class);
+        when(topology.getType()).thenReturn(ClusterType.UNKNOWN);
+        when(client.getClusterDescription()).thenReturn(topology).thenThrow(new MongoTimeoutException("cache unavailable"));
+        when(database.getCollection(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName()))
+                .thenReturn(mock(MongoCollection.class, RETURNS_SELF));
+        var operations = new MongoClaimOperations(client);
+        operations.structures.require(MongoStructureProof.Kind.CLAIMS, () -> {});
+        var scope = new CacheBusinessScope(PIPELINE.clusterId(), PIPELINE.bindingVersion(), PIPELINE.cacheIncarnation());
+        var claims = new MongoCacheWorkloadClaimStore(client, database, scope, () -> {}, null, operations);
+
+        assertThatThrownBy(() -> claims.readPipeline(PIPELINE))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+        assertThat(operations.structures.remaining(MongoStructureProof.Kind.CLAIMS)).isZero();
+    }
     @Test void aPhysicalProofExpiresTenSecondsAfterVerificationStartedAndFailureDropsOtherProofs(){
         var now=new AtomicLong();var calls=new AtomicInteger();var proof=new MongoStructureProof(now::get);
         var srs=proof.check(MongoStructureProof.Kind.SRS,calls::incrementAndGet);
