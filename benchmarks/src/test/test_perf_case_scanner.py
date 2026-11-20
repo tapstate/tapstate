@@ -118,11 +118,27 @@ class PerfCaseScannerTest(unittest.TestCase):
                           f"import io.tapstate.benchmarks.PerfCase.Cases;\n{body}")
         explicit = self.scan()
         self.assertEqual(0, explicit.returncode, explicit.stderr)
+        self.assertEqual(["sample.direct", "sample.repeated"],
+                         [row["id"] for row in json.loads(explicit.stdout)["cases"]])
         path.write_text(f"import io.tapstate.benchmarks.*;\n"
                         f"import io.tapstate.benchmarks.PerfCase.*;\n{body}", encoding="utf-8")
         wildcard = self.scan()
         self.assertEqual(0, wildcard.returncode, wildcard.stderr)
         self.assertEqual(explicit.stdout, wildcard.stdout)
+
+    def test_wildcard_does_not_take_precedence_over_a_same_package_annotation(self):
+        self.write("sample/PerfCase.java", "package sample; @interface PerfCase {}")
+        valid = declaration("sample.qualified", annotation="io.tapstate.benchmarks.PerfCase")
+        self.write("sample/Sample.java", "package sample; import io.tapstate.benchmarks.*; "
+                   f"@PerfCase class Local {{}} {valid} class Canonical {{}}")
+        result = self.scan()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sample.qualified"], [row["id"] for row in json.loads(result.stdout)["cases"]])
+
+    def test_rejects_array_creation_with_an_annotation_location(self):
+        invalid = declaration("sample.array").replace('operators = "nest"', "operators = new String[1]")
+        self.write("Sample.java", f"import io.tapstate.benchmarks.PerfCase;\n{invalid} class Sample {{}}")
+        self.assert_rejected("Sample.java:2: Use a brace list or a single annotation value")
 
     def test_reports_duplicate_ids_from_two_sources(self):
         for name in ("First", "Second"):

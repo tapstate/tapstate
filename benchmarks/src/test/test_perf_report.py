@@ -59,6 +59,14 @@ class PerfReportTest(unittest.TestCase):
         result = report.reconcile(self.manifest, [self.summary], self.baseline)
         self.assertEqual("incompatible", result["results"][0]["comparisons"]["status"])
 
+    def test_completed_arms_do_not_qualify_an_incomplete_baseline_repeat(self):
+        self.row["paired_arms"] = {"limited": copy.deepcopy(self.row)}
+        baseline = self.baseline["cases"][self.row["case_id"]]
+        baseline["paired_arms"] = {"limited": copy.deepcopy(baseline)}
+        baseline["status"] = "measurement-incomplete"
+        result = report.reconcile(self.manifest, [self.summary], self.baseline)
+        self.assertEqual("baseline-result-unavailable", result["results"][0]["comparisons"]["status"])
+
     def test_summarizes_comparable_covered_repeats_and_keeps_raw_values(self):
         second = copy.deepcopy(self.row)
         second["repeat"] = 2

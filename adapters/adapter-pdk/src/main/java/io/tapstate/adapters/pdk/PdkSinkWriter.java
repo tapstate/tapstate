@@ -25,9 +25,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Supplier;
 
 /**
  * A write session over one sink connector, opened once and held across batches. Each write encodes the
@@ -75,7 +77,7 @@ final class PdkSinkWriter implements SinkWriter {
         return thread;
     });
     private final Object lifecycle = new Object();
-    private final Set<CompletableFuture<WriteResult>> pending = new HashSet<>();
+    private final Set<CompletableFuture<?>> pending = new HashSet<>();
     private boolean closed;
     private final java.util.concurrent.CountDownLatch closeFinished = new java.util.concurrent.CountDownLatch(1);
 
@@ -206,18 +208,22 @@ final class PdkSinkWriter implements SinkWriter {
     }
     @Override
     public CompletionStage<WriteResult> write(List<Envelope> records) {
+        // A cancelled stage releases the caller's batch even while its interrupted callback unwinds.
+        List<Envelope> batch = List.copyOf(records);
+        return submit(() -> deliver(batch));
+    }
+
+    private <T> CompletableFuture<T> submit(Supplier<T> delivery) {
         synchronized (lifecycle) {
             if (closed) {
                 throw new IllegalStateException("write called after the sink writer was closed");
             }
-            // A cancelled stage releases the caller's batch even while its interrupted callback unwinds.
-            List<Envelope> batch = List.copyOf(records);
-            CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> {
+            CompletableFuture<T> result = CompletableFuture.supplyAsync(() -> {
                 synchronized (lifecycle) {
                     if (closed) throw new java.util.concurrent.CancellationException("the sink writer was closed");
                     delivering = true;
                 }
-                try { return deliver(batch); }
+                try { return delivery.get(); }
                 finally { delivering = false; }
             }, writes);
             pending.add(result);
@@ -231,9 +237,22 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     @Override
-    public synchronized void snapshotDelivered(String stream) {
+    public void snapshotDelivered(String stream) {
         TargetTable target = projectedTarget(stream, targets.get(stream));
         if (target == null || !target.hasDeferredDecimal()) return;
+        try {
+            submit(() -> {
+                prepareSnapshotTarget(stream, target);
+                return null;
+            }).join();
+        } catch (CompletionException failure) {
+            if (failure.getCause() instanceof RuntimeException runtime) throw runtime;
+            if (failure.getCause() instanceof Error invariant) throw invariant;
+            throw failure;
+        }
+    }
+
+    private void prepareSnapshotTarget(String stream, TargetTable target) {
         try {
             connector.underLoader(() -> {
                 prepareDeferredTarget(stream, target, tableModel(stream, target));
@@ -396,7 +415,7 @@ final class PdkSinkWriter implements SinkWriter {
         if (Thread.currentThread() == writeThread && delivering) {
             throw new IllegalStateException("a target callback cannot close its active writer");
         }
-        List<CompletableFuture<WriteResult>> abandoned;
+        List<CompletableFuture<?>> abandoned;
         boolean first;
         synchronized (lifecycle) {
             first = !closed;

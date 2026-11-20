@@ -14,7 +14,7 @@ and specification reference. Related profiles and measurement modes share a file
 calibration status are in `cases/contracts.json`. Keep the case version in step with
 changes to its load, correctness rules or measurement boundary.
 
-The catalog records the source revision and whether the benchmark tree has local changes.
+The catalog records the source revision and whether the checkout has local changes.
 The definition digest binds the metadata and resolved workload specification. The catalog digest
 identifies the full inventory, including when the output is narrowed to one case.
 These definitions describe candidates for calibration. Connector qualification, workload execution
@@ -224,8 +224,11 @@ are instance totals. Queue release, physical state size and host OOM attribution
 require a supported signal. Missing observations and unfrozen thresholds remain
 visible in the report.
 
-For node timing and overhead experiments, use the same manifest on matched
-runtime builds and capture their exact identities and environment separately.
+For node timing and overhead experiments, replay the same manifest from its
+bound checkout and pass each matched OP build explicitly with `--boot-jar`.
+The manifest verifies the fixture checkout. Each run records the actual OP JAR
+digest, so record the build revision, digest, and environment for each runtime
+artifact.
 Use `mixed.snapshot.double-map.standard` to distinguish the two Map nodes,
 `copy.snapshot.basic.standard` for batch and event units, Nest and Join for
 amplification and state, and `copy.live.slow-target.large` for target wait.

@@ -40,6 +40,7 @@ LOAD_DEFAULTS = {
     "timeout_seconds": 45,
     "mix": None,
 }
+MAX_FIXTURE_INTEGER = 2**31 - 1
 
 
 def select(cases, explicit, where, suite, *, allow_empty=False):
@@ -150,6 +151,9 @@ def checked_entries(entries):
         case = entry["case"]
         if not implemented(case):
             raise ValueError(f"{case['id']}: execution is pending")
+        for name in LOAD_DEFAULTS:
+            if name != "mix" and (type(entry[name]) is not int or not 1 <= entry[name] <= MAX_FIXTURE_INTEGER):
+                raise ValueError(f"--{name.replace('_', '-')} must fit a positive signed 32-bit integer")
         if entry["mix"] is not None:
             source = case["workload_spec"].get("incremental", {})
             if not source.get("allow_manual_mix_override", False):

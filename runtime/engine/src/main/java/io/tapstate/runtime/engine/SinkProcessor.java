@@ -108,6 +108,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // The ack this processor reports through: the one supplied, bound to this processor as a writer once
     // init knows its index. See init.
     private SinkAck ack;
+    // Frontiers only advance positions. Bounds, flushes and writer registration still use the bound ack directly.
+    private final SinkAck frontierAck = this::advanceAfterSnapshot;
     private final SinkFrontier frontier;
     private final FrontierGauge suppliedGauge;
     // Which of the two the frontier readings go to, settled at init for the reason the delivery readings'
@@ -155,7 +157,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // make it wait for the newer one's rows too, and on a chain whose rows never stop coming that is for good.
     private final Map<Byte, ArrayDeque<Held<Watermark>>> heldBounds = new LinkedHashMap<>();
     private final Map<String, List<String>> pendingAssembledSnapshots = new LinkedHashMap<>();
-    private final java.util.Set<String> deliveredSnapshots = new java.util.HashSet<>();
+    private final Map<String, Long> deliveredSnapshots = new LinkedHashMap<>();
     // Words that chains got past positions with nothing to deliver, each waiting, as a bound does, for every
     // row taken in before it to land; the highest position per chain among words waiting for the same rows.
     private final ArrayDeque<Held<Map<String, ChainPosition>>> heldWords = new ArrayDeque<>();
@@ -650,7 +652,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         while (!heldWords.isEmpty() && heldWords.peek().before() <= landedBelow) {
             List<ChainEntry> entries = new ArrayList<>();
             heldWords.poll().value().forEach((chain, position) -> entries.add(new ChainEntry(chain, position)));
-            frontier.settled(entries, ack);
+            frontier.settled(entries, frontierAck);
         }
         for (ArrayDeque<Held<Watermark>> held : heldBounds.values()) {
             Watermark due = null;
@@ -663,7 +665,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             }
             String chain = frontier.chainOf(due);
             SourceOrder through = chain == null ? null : FrontierOrders.unpack(due.timestamp());
-            frontier.bound(due, ack);
+            frontier.bound(due, frontierAck);
             // Every change this writer was given at or below the bound has landed, whatever the frontier made
             // of it: a writer given none of a chain's rows says so here and holds no chain back by having
             // nothing to write for it.
@@ -675,21 +677,32 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     private void notifySnapshotDelivered(Watermark bound) {
         if (isSnapshotBound(bound)) {
-            try {
-                String chain = frontier.chainOf(bound);
+            notifySnapshotDelivered(frontier.chainOf(bound), FrontierOrders.unpack(bound.timestamp()));
+        }
+    }
+
+    private void advanceAfterSnapshot(String chain, ChainPosition position) {
+        SourceOrder order = position.order();
+        if (order != null && order.seq() == SourceOrder.SNAPSHOT_SEQ) {
+            notifySnapshotDelivered(chain, order);
+        }
+        ack.advance(chain, position);
+    }
+
+    private void notifySnapshotDelivered(String chain, SourceOrder order) {
+        try {
+            if (deliveredSnapshots.getOrDefault(chain, Long.MIN_VALUE) < order.epoch()) {
                 writer.snapshotDelivered(chain);
-                if (!pendingAssembledSnapshots.isEmpty()) {
-                    deliveredSnapshots.add(chain);
-                    pendingAssembledSnapshots.entrySet().removeIf(output -> {
-                        if (!deliveredSnapshots.containsAll(output.getValue())) return false;
-                        writer.snapshotDelivered(output.getKey());
-                        return true;
-                    });
-                }
-            } catch (RuntimeException | Error failure) {
-                if (failureRegistry != null) failureRegistry.record(failure);
-                throw failure;
+                deliveredSnapshots.put(chain, order.epoch());
             }
+            pendingAssembledSnapshots.entrySet().removeIf(output -> {
+                if (!deliveredSnapshots.keySet().containsAll(output.getValue())) return false;
+                writer.snapshotDelivered(output.getKey());
+                return true;
+            });
+        } catch (RuntimeException | Error failure) {
+            if (failureRegistry != null) failureRegistry.record(failure);
+            throw failure;
         }
     }
 
@@ -763,7 +776,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 throw failure;
             }
             if (frontier != null) {
-                frontier.settled(batch.positions(), ack);
+                frontier.settled(batch.positions(), frontierAck);
             }
             // Counted here and nowhere earlier: this is the first line after the write is known to have
             // succeeded, which is the boundary the count is defined at. A row counted on hand-off would be

@@ -503,7 +503,7 @@ class BenchmarkRunIT {
             long acknowledged = settled(control);
             return row != null && anchorValue.equals(row.get("s0"))
                     && acknowledged > preAnchorSettled && changes > 0 && acknowledged == initial + changes
-                    && (!handoff || changes == 1 && control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == initial
+                    && (!handoff || control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == initial
                             && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent())
                     && current != null && !current.equals(preAnchorToken);
         });
@@ -630,6 +630,7 @@ class BenchmarkRunIT {
         witness.put("expected_snapshot_rows", initial);
         evidence.result.put("snapshot_handoff", witness);
         try (var history = boundedTarget.watch(List.of(match))
+                .fullDocument(com.mongodb.client.model.changestream.FullDocument.UPDATE_LOOKUP)
                 .maxAwaitTime(100, java.util.concurrent.TimeUnit.MILLISECONDS).cursor()) {
             hold.holdSnapshotWrites();
             control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -656,6 +657,10 @@ class BenchmarkRunIT {
             });
             if (!BenchmarkOperatorOracle.equivalent(original, writes.getFirst().getFullDocument())) {
                 throw new Unverified("The first target write of the handoff key did not carry its snapshot value");
+            }
+            if (writes.getLast().getFullDocument() == null
+                    || !anchorValue.equals(writes.getLast().getFullDocument().get("s0"))) {
+                throw new Unverified("The subsequent target write of the handoff key did not carry its updated value");
             }
             witness.put("repeated_key_target_writes", writes.size());
         }
@@ -1254,7 +1259,11 @@ class BenchmarkRunIT {
     }
 
     private static int number(BsonDocument doc, String name) {
-        return doc.getNumber(name).intValue();
+        var value = doc.get(name);
+        if (value == null || !(value.isInt32() || value.isInt64())) {
+            throw new IllegalArgumentException(name + " must be a BSON integer");
+        }
+        return Math.toIntExact(value.asNumber().longValue());
     }
 
     private static final class Limit extends RuntimeException {

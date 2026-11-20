@@ -78,7 +78,7 @@ class PerfRunnerTest(unittest.TestCase):
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(["git", "-C", str(root), "add", fixture.name], check=True)
             subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c",
-                            "user.email=fixture@example.org", "commit", "-qm", "Initial fixture"], check=True)
+                            "user.email=fixture@example.org", "commit", "--no-gpg-sign", "-qm", "Initial fixture"], check=True)
             with patch.object(catalog, "BENCHMARKS", root / "benchmarks"):
                 clean = catalog.build_catalog()
                 fixture.write_text("class BenchmarkRunIT { int changed; }")
@@ -104,6 +104,10 @@ class PerfRunnerTest(unittest.TestCase):
             code, error = self.invoke(allocate + ["--mix", "100/0/0"], clean)
             self.assertEqual(1, code)
             self.assertIn("does not admit", error)
+            self.assertFalse((root / "manifest.json").exists())
+            code, error = self.invoke(allocate + ["--rows", "4294967328"], clean)
+            self.assertEqual(1, code)
+            self.assertIn("--rows must fit", error)
             self.assertFalse((root / "manifest.json").exists())
             self.assertEqual(0, self.invoke(allocate + ["--rows", "48"], clean)[0])
             with patch.object(runner, "run_entries", return_value=0) as execute:

@@ -33,6 +33,8 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.LongConsumer;
+import java.util.function.LongSupplier;
 import org.bson.BsonBoolean;
 import org.bson.BsonDocument;
 import org.bson.BsonInt64;
@@ -108,10 +110,17 @@ public final class MongoWorkloadGenerator {
     private final WorkloadRecipe recipe;
     private final String runId;
     private final int batchSize;
+    private final LongSupplier nanoClock;
+    private final LongConsumer waitNanos;
     private final AtomicBoolean preparationStarted = new AtomicBoolean();
     private final Map<String, WorkloadRows> rows = new LinkedHashMap<>();
 
     public MongoWorkloadGenerator(MongoDatabase isolatedSource, WorkloadRecipe recipe, String runId, int batchSize) {
+        this(isolatedSource, recipe, runId, batchSize, System::nanoTime, LockSupport::parkNanos);
+    }
+
+    public MongoWorkloadGenerator(MongoDatabase isolatedSource, WorkloadRecipe recipe, String runId, int batchSize,
+            LongSupplier nanoClock, LongConsumer waitNanos) {
         if (runId == null || runId.isBlank() || batchSize < 1 || batchSize > 1000) {
             throw new IllegalArgumentException("A run ID and a source batch size in 1-1000 are required");
         }
@@ -120,6 +129,8 @@ public final class MongoWorkloadGenerator {
         this.recipe = Objects.requireNonNull(recipe);
         this.runId = runId;
         this.batchSize = batchSize;
+        this.nanoClock = Objects.requireNonNull(nanoClock);
+        this.waitNanos = Objects.requireNonNull(waitNanos);
         recipe.inputs.forEach(input -> rows.put(input.name(), new WorkloadRows(recipe, input)));
     }
 
@@ -272,7 +283,7 @@ public final class MongoWorkloadGenerator {
             if (warm.complete()) {
                 try {
                     afterWarmup.run();
-                } catch (RuntimeException failure) {
+                } catch (RuntimeException | AssertionError failure) {
                     blocked = "Warm-up readiness check failed: " + failure;
                 }
             } else {
@@ -334,13 +345,17 @@ public final class MongoWorkloadGenerator {
             var delays = new Delays();
             Long cpu = cpuNanos();
             Instant startedAt = Instant.now();
-            long start = System.nanoTime();
+            long start = nanoClock.getAsLong();
             if (rate == null) {
                 prewriteBatches(states, lengths, delays);
             } else {
                 injectPaced(states, lengths, rate, liveDuration, delays, start);
             }
-            long duration = System.nanoTime() - start;
+            long duration = nanoClock.getAsLong() - start;
+            if (liveDuration != null && (duration < liveDuration.toNanos()
+                    || Thread.currentThread().isInterrupted())) {
+                for (var state : states) state.recordError("The live write window ended before its scheduled boundary");
+            }
             Instant writesFinishedAt = Instant.now();
             Long writerCpu = cpuElapsed(cpu);
             String callbackError = null;
@@ -397,10 +412,10 @@ public final class MongoWorkloadGenerator {
                     continue;
                 }
                 long delay;
-                while ((delay = next - System.nanoTime()) > 0 && !Thread.currentThread().isInterrupted()) {
-                    LockSupport.parkNanos(delay);
+                while ((delay = next - nanoClock.getAsLong()) > 0 && !Thread.currentThread().isInterrupted()) {
+                    waitNanos.accept(delay);
                 }
-                long now = System.nanoTime();
+                long now = nanoClock.getAsLong();
                 if (now >= deadline || Thread.currentThread().isInterrupted()) {
                     return;
                 }
@@ -413,8 +428,8 @@ public final class MongoWorkloadGenerator {
             }
         }
         long remainder;
-        while ((remainder = deadline - System.nanoTime()) > 0 && !Thread.currentThread().isInterrupted()) {
-            LockSupport.parkNanos(remainder);
+        while ((remainder = deadline - nanoClock.getAsLong()) > 0 && !Thread.currentThread().isInterrupted()) {
+            waitNanos.accept(remainder);
         }
     }
 
@@ -580,7 +595,7 @@ public final class MongoWorkloadGenerator {
                     }
                     var kind = switch (event.getOperationType()) {
                         case INSERT -> WorkloadChanges.Kind.INSERT;
-                        case UPDATE -> WorkloadChanges.Kind.UPDATE;
+                        case UPDATE, REPLACE -> WorkloadChanges.Kind.UPDATE;
                         case DELETE -> WorkloadChanges.Kind.DELETE;
                         default -> throw new IllegalStateException("Unexpected source event " + event.getOperationType());
                     };

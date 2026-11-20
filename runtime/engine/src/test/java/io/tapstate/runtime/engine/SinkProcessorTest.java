@@ -588,6 +588,29 @@ class SinkProcessorTest {
     }
 
     @Test
+    void a_mixed_batch_cannot_ack_its_snapshot_if_delivery_notification_fails() throws Exception {
+        var failure = new IllegalStateException("snapshot preparation failed");
+        var writer = new RecordingSnapshotWriter(new ArrayList<>()) {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return CompletableFuture.completedFuture(new WriteResult(records.size()));
+            }
+
+            @Override
+            public void snapshotDelivered(String stream) {
+                throw failure;
+            }
+        };
+        var ack = new RecordingAck();
+        var processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 4));
+        var inbox = new TestInbox();
+        inbox.addAll(List.of(snapshotRow("orders"), at("orders", "p1")));
+
+        assertThatThrownBy(() -> pump(processor, inbox)).isSameAs(failure);
+        assertThat(ack.positions).isEmpty();
+    }
+
+    @Test
     void a_bound_that_arrives_before_the_write_settles_still_acks_once_it_does() throws Exception {
         RecordingAck ack = new RecordingAck();
         ManualWriter writer = new ManualWriter();

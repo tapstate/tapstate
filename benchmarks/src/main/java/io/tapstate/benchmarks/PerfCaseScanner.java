@@ -18,10 +18,13 @@ import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -33,6 +36,7 @@ import javax.tools.ToolProvider;
 /** Emits the case inventory using only the Java parse phase. */
 public final class PerfCaseScanner {
     private static final String ANNOTATION = "io.tapstate.benchmarks.PerfCase";
+    private static final String BENCHMARK_PACKAGE = "io.tapstate.benchmarks";
     private static final Pattern CASE_ID = Pattern.compile("[a-z0-9]+(?:[.-][a-z0-9]+)+");
 
     private PerfCaseScanner() {
@@ -80,33 +84,52 @@ public final class PerfCaseScanner {
         try (var files = compiler.getStandardFileManager(diagnostics, Locale.ROOT, StandardCharsets.UTF_8)) {
             JavacTask task = (JavacTask) compiler.getTask(null, files, diagnostics, List.of("-proc:none"),
                     null, files.getJavaFileObjectsFromPaths(sources));
-            var units = task.parse();
+            List<CompilationUnitTree> units = new ArrayList<>();
+            task.parse().forEach(units::add);
             for (var diagnostic : diagnostics.getDiagnostics()) {
                 if (diagnostic.getKind() == Diagnostic.Kind.ERROR) {
                     throw new IllegalArgumentException(diagnostic.toString());
                 }
             }
             var positions = Trees.instance(task).getSourcePositions();
+            Map<String, Set<String>> packageTypes = new LinkedHashMap<>();
             for (CompilationUnitTree unit : units) {
-                scanUnit(root, unit, positions, cases);
+                var types = packageTypes.computeIfAbsent(String.valueOf(unit.getPackageName()), key -> new HashSet<>());
+                unit.getTypeDecls().stream().filter(ClassTree.class::isInstance).map(ClassTree.class::cast)
+                        .forEach(type -> types.add(type.getSimpleName().toString()));
+            }
+            for (CompilationUnitTree unit : units) {
+                scanUnit(root, unit, positions, cases, packageTypes.get(String.valueOf(unit.getPackageName())));
             }
         }
     }
 
     private static void scanUnit(Path root, CompilationUnitTree unit,
-            SourcePositions positions, Map<String, Map<String, Object>> cases) {
+            SourcePositions positions, Map<String, Map<String, Object>> cases, Set<String> packageTypes) {
         Path source = Path.of(unit.getSourceFile().toUri());
         String relativeSource = relativePath(root, source);
         List<String> imports = unit.getImports().stream()
                 .map(item -> item.getQualifiedIdentifier().toString()).toList();
-        boolean shortName = "io.tapstate.benchmarks".equals(String.valueOf(unit.getPackageName()))
-                || imports.contains(ANNOTATION) || imports.contains("io.tapstate.benchmarks.*");
-        boolean shortContainer = imports.contains(ANNOTATION + ".Cases") || imports.contains(ANNOTATION + ".*");
+        boolean shortName = resolvesShortName(imports, ANNOTATION, BENCHMARK_PACKAGE,
+                BENCHMARK_PACKAGE.equals(String.valueOf(unit.getPackageName())), packageTypes);
+        boolean shortContainer = resolvesShortName(imports, ANNOTATION + ".Cases", ANNOTATION, false, packageTypes);
         new TreeScanner<Void, Void>() {
+            private boolean shadowsCase;
+            private boolean shadowsContainer;
+
             @Override
             public Void visitClass(ClassTree node, Void unused) {
                 node.getModifiers().getAnnotations().forEach(this::read);
-                return super.visitClass(node, unused);
+                boolean previousCase = shadowsCase;
+                boolean previousContainer = shadowsContainer;
+                shadowsCase |= declaresMemberType(node, "PerfCase");
+                shadowsContainer |= declaresMemberType(node, "Cases");
+                try {
+                    return super.visitClass(node, unused);
+                } finally {
+                    shadowsCase = previousCase;
+                    shadowsContainer = previousContainer;
+                }
             }
 
             @Override
@@ -119,15 +142,15 @@ public final class PerfCaseScanner {
                 String name = annotation.getAnnotationType().toString();
                 if (isCaseAnnotation(annotation)) {
                     add(annotation);
-                } else if (name.equals(ANNOTATION + ".Cases") || shortName && name.equals("PerfCase.Cases")
-                        || shortContainer && name.equals("Cases")) {
+                } else if (name.equals(ANNOTATION + ".Cases") || shortName && !shadowsCase && name.equals("PerfCase.Cases")
+                        || shortContainer && !shadowsContainer && name.equals("Cases")) {
                     readContainer(annotation);
                 }
             }
 
             private boolean isCaseAnnotation(AnnotationTree annotation) {
                 String type = annotation.getAnnotationType().toString();
-                return type.equals(ANNOTATION) || shortName && type.equals("PerfCase");
+                return type.equals(ANNOTATION) || shortName && !shadowsCase && type.equals("PerfCase");
             }
 
             private void readContainer(AnnotationTree annotation) {
@@ -142,7 +165,7 @@ public final class PerfCaseScanner {
                     }
                     value = named.getExpression();
                 }
-                for (ExpressionTree element : elements(value)) {
+                for (ExpressionTree element : elements(value, location(annotation))) {
                     if (!(element instanceof AnnotationTree nested) || !isCaseAnnotation(nested)) {
                         throw invalid(location(annotation), "Expected @PerfCase inside @PerfCase.Cases");
                     }
@@ -171,6 +194,19 @@ public final class PerfCaseScanner {
                 return relativeSource + ":" + line(annotation);
             }
         }.scan(unit, null);
+    }
+
+    private static boolean declaresMemberType(ClassTree node, String name) {
+        return node.getMembers().stream().anyMatch(member ->
+                member instanceof ClassTree type && type.getSimpleName().contentEquals(name));
+    }
+
+    private static boolean resolvesShortName(List<String> imports, String qualified, String owner,
+            boolean samePackage, Set<String> packageTypes) {
+        String name = qualified.substring(qualified.lastIndexOf('.') + 1);
+        if (imports.contains(qualified)) return true;
+        if (imports.stream().anyMatch(imported -> imported.endsWith("." + name))) return false;
+        return samePackage || !packageTypes.contains(name) && imports.contains(owner + ".*");
     }
 
     private static Map<String, Object> readCase(Path root, Path source, AnnotationTree annotation, String location) {
@@ -257,8 +293,12 @@ public final class PerfCaseScanner {
         throw invalid(location, name + " must be a positive integer literal");
     }
 
-    private static List<? extends ExpressionTree> elements(ExpressionTree value) {
-        return value instanceof NewArrayTree array ? array.getInitializers() : List.of(value);
+    private static List<? extends ExpressionTree> elements(ExpressionTree value, String location) {
+        if (!(value instanceof NewArrayTree array)) return List.of(value);
+        if (array.getType() != null || array.getInitializers() == null) {
+            throw invalid(location, "Use a brace list or a single annotation value instead of array creation");
+        }
+        return array.getInitializers();
     }
 
     private static List<String> strings(ExpressionTree value, String name, String location, boolean required) {
@@ -268,7 +308,7 @@ public final class PerfCaseScanner {
         if (value == null) {
             throw invalid(location, "Missing " + name);
         }
-        List<String> items = elements(value).stream().map(element -> string(element, name, location)).toList();
+        List<String> items = elements(value, location).stream().map(element -> string(element, name, location)).toList();
         if (items.stream().distinct().count() != items.size()) {
             throw invalid(location, "Duplicate value in " + name);
         }

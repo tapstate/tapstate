@@ -112,6 +112,8 @@ def compare(row, baseline, environment):
     if baseline["environment"] != environment:
         return {"status": "environment-mismatch"}
     reference = baseline["cases"].get(row["case_id"])
+    if reference is not None and reference.get("status") != "completed":
+        return {"status": "baseline-result-unavailable"}
     if not reference or any(key not in row or key not in reference or row[key] != reference[key]
                             for key in CASE_CONDITIONS):
         return {"status": "incompatible"}

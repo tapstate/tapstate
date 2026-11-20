@@ -24,6 +24,54 @@ class ScopedTargetPreparationTest {
             List.of(new TargetIndex(List.of("id"), true)));
 
     @Test
+    void closeWaitsForAnActiveSnapshotPreparation(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var connectorCleanup = new java.util.concurrent.CountDownLatch(1);
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls, DEFERRED);
+        var connector = PdkConnector.open("demo", new ConnectorRef(List.of(Synthetic.countingSink(directory)),
+                "synthetic.CountingSink", "2.0.8", null), Map.of());
+        connector.functions().supportCreateTableV2(functions(calls).getCreateTableV2Function());
+        connector.functions().supportClearTable((context, event) -> {
+            entered.countDown();
+            boolean interrupted = false;
+            while (release.getCount() != 0) {
+                try {
+                    release.await();
+                } catch (InterruptedException stopping) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) throw new InterruptedException("held preparation interrupted");
+        });
+        var config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null,
+                NODE, OnFullLoad.CLEAR, true);
+        try (var tasks = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+                var writer = new PdkSinkWriter(connector, connector.functions().getWriteRecordFunction(), config,
+                        Map.of("input", DEFERRED), null, true, connectorCleanup::countDown,
+                        PipelineNode.Purpose.SYNC, binding(store))) {
+            var preparing = tasks.submit(() -> writer.snapshotDelivered("input"));
+            try {
+                assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var closing = tasks.submit(writer::close);
+                assertThat(connectorCleanup.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> closing.get(200, java.util.concurrent.TimeUnit.MILLISECONDS))
+                        .isInstanceOf(java.util.concurrent.TimeoutException.class);
+                release.countDown();
+                closing.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                assertThatThrownBy(() -> preparing.get(5, java.util.concurrent.TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(TapstateException.class);
+            } finally {
+                release.countDown();
+            }
+        } finally {
+            connector.close();
+        }
+    }
+
+    @Test
     void aNewDeferredUnwindTargetVerifiesItsLogicalIndexAfterPreparation(
             @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
         var calls = new ArrayList<String>();

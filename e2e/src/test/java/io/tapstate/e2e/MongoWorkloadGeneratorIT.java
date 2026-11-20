@@ -37,10 +37,13 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.bson.BsonDocument;
 import org.bson.BsonType;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 @RequiresDocker
 class MongoWorkloadGeneratorIT {
@@ -174,7 +177,10 @@ class MongoWorkloadGeneratorIT {
     @Test
     void liveInjectionSeparatesWarmupAndMeasurementAndPacesIndividualOperations() throws Exception {
         withSource(source -> {
-            var generator = generator(source, "copy.live.basic.standard", Map.of("records", 40));
+            String id = "copy.live.basic.standard";
+            var clock = new AtomicLong();
+            var generator = new MongoWorkloadGenerator(source, WorkloadRecipe.fromCatalog(definition(id),
+                    Map.of("records", 40), null), id, 17, clock::get, clock::addAndGet);
             var prepared = generator.prepare(generator.calibrateStringLengths());
             AtomicInteger boundary = new AtomicInteger();
             var result = prepared.inject(new LiveWindow(10, Duration.ofMillis(600), Duration.ofMillis(1200)),
@@ -202,8 +208,9 @@ class MongoWorkloadGeneratorIT {
         });
     }
 
-    @Test
-    void readinessFailureKeepsWarmupEvidenceAndSkipsScoring() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void readinessFailureKeepsWarmupEvidenceAndSkipsScoring(boolean assertion) throws Exception {
         withSource(source -> {
             var generator = generator(source, "copy.live.basic.standard", Map.of("records", 10));
             var prepared = generator.prepare(generator.calibrateStringLengths());
@@ -211,6 +218,7 @@ class MongoWorkloadGeneratorIT {
             var result = prepared.inject(new LiveWindow(1, Duration.ofMillis(1900), Duration.ofSeconds(5)),
                     new Mix(100, 0, 0), null, () -> {
                         called.set(true);
+                        if (assertion) throw new AssertionError("reader not ready");
                         throw new IllegalStateException("reader not ready");
                     });
             assertTrue(called.get());
