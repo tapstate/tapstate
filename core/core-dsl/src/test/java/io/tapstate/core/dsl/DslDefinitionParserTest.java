@@ -1,5 +1,6 @@
 package io.tapstate.core.dsl;
 
+import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.ServeResource;
@@ -235,6 +236,62 @@ class DslDefinitionParserTest {
         TransformBody.Nest again = (TransformBody.Nest) ((TransformResource) parser.parse(writer.write(t))).body();
         assertThat(again.root().trackKeyChanges()).isTrue();
         assertThat(again.root().embed().get(0).trackKeyChanges()).isTrue();
+    }
+
+    @Test
+    void nestEmbedListsOrOnAlternativesInTheOrderTheyAreTried() {
+        String yaml = """
+                version: tapstate/v1
+                kind: transform
+                id: wallet_doc
+                type: nest
+                root:
+                  from: tran
+                  key: [tran_id]
+                  embed:
+                    - from: loc
+                      on: { locn_code: locn_code }
+                      orOn:
+                        - { hub_locn_id: hub_locn_id }
+                        - { site_code: site, site_region: region }
+                      as: object
+                      path: location
+                """;
+
+        TransformResource t = (TransformResource) parser.parse(yaml);
+
+        Embed embed = ((TransformBody.Nest) t.body()).root().embed().get(0);
+        assertThat(embed.on()).containsExactly(Map.entry("locn_code", "locn_code"));
+        assertThat(embed.orOn()).containsExactly(
+                Map.of("hub_locn_id", "hub_locn_id"), Map.of("site_code", "site", "site_region", "region"));
+        // Re-parsed from the canonical form: the alternatives keep their order, which is what they mean.
+        Embed again = ((TransformBody.Nest) ((TransformResource) parser.parse(writer.write(t))).body())
+                .root().embed().get(0);
+        assertThat(again.alternatives()).isEqualTo(embed.alternatives());
+    }
+
+    @Test
+    void nestEmbedRefusesAnEmptyOrOnAlternative() {
+        String yaml = """
+                version: tapstate/v1
+                kind: transform
+                id: wallet_doc
+                type: nest
+                root:
+                  from: tran
+                  key: [tran_id]
+                  embed:
+                    - from: loc
+                      on: { locn_code: locn_code }
+                      orOn: [ {} ]
+                      as: object
+                      path: location
+                """;
+
+        Throwable thrown = catchThrowable(() -> parser.parse(yaml));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        assertThat(((DslException) thrown).code()).isEqualTo(DslError.ILLEGAL_VALUE);
     }
 
     @Test
