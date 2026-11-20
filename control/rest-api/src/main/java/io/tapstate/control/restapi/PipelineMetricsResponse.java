@@ -56,7 +56,8 @@ import java.util.TreeMap;
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record PipelineMetricsResponse(String pipelineId, Map<String, Long> metrics,
-        Map<String, String> targetAckedPosition, List<String> positionsNotCollected, List<Fact> facts) {
+        @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, String> targetAckedPosition,
+        List<String> positionsNotCollected, List<Fact> facts) {
 
     /** One metric as measured: what it is called, what kind of measurement, in what unit, and its points. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -87,9 +88,6 @@ public record PipelineMetricsResponse(String pipelineId, Map<String, Long> metri
     }
 
     private static Map<String, String> wirePositions(Map<String, String> acknowledgedPositions) {
-        if (acknowledgedPositions.isEmpty()) {
-            return null;
-        }
         Map<String, String> positions = new TreeMap<>(acknowledgedPositions);
         positions.replaceAll((table, position) -> hasSerializedStreamHeader(position)
                 ? "opaque-v1:" + CanonicalHash.ofText(position) : position);
