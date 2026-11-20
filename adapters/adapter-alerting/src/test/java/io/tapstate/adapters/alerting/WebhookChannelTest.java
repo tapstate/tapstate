@@ -22,6 +22,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLServerSocket;
 import org.junit.jupiter.api.BeforeAll;
@@ -63,7 +64,7 @@ class WebhookChannelTest {
             // A cancelled periodic task can briefly reenter the executor queue.
             long cleanupDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
             while (channel.queuedClientTasks() != 0 && System.nanoTime() - cleanupDeadline < 0) {
-                TimeUnit.MILLISECONDS.sleep(10);
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
             }
             assertThat(channel.queuedClientTasks()).isZero();
             assertThat(body.get()).isEqualTo(new String(request.payload(), StandardCharsets.UTF_8));
