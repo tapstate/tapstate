@@ -46,7 +46,8 @@ final class MongoPipelineObservationRead {
         for (int i = 0; i < chains.size(); i++) {
             query.add(lookup(SRS_CHAINS, "chain" + i, chainQuery(business, chains.get(i))));
         }
-        List<String> ids = sources.keySet().stream().map(SrsConsumerRun::sourceId).toList();
+        List<String> ids = sources.values().stream().map(MongoCacheDomain.ObservationSource::sourceId)
+                .distinct().toList();
         for (int i = 0; i < ids.size(); i++) {
             String id = ids.get(i);
             var tables = lookup(CACHE_SOURCE_SCHEMAS, "tables", List.of(

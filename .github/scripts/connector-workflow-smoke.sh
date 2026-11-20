@@ -35,6 +35,16 @@ def check(text):
     assert 'run: .github/scripts/witness-gate.sh' in aggregate
     assert 'shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]' in witness and 'fail-fast: false' in witness
     assert 'needs: [connector-plan, connector-jars]' in witness
+    for job in (plan, witness):
+        assert 'run: bash .github/scripts/setup-ci-maven.sh' in job, 'Connector jobs must use the shared Maven Wrapper'
+    assert plan.index('setup-ci-maven.sh') < plan.index('mvn -N -B -C -U')
+    assert 'mvn -N -B -C -U -Dmaven.repo.local="$RUNNER_TEMP/connector-preflight-m2" -DskipTests install' in plan
+    assert plan.index('ci-maven-cache.sh collect') < plan.index('sha256sum connector-maven-inputs.tar.gz')
+    assert 'name: connector-maven-inputs' in plan and 'name: connector-maven-inputs' in witness
+    assert witness.index('setup-ci-maven.sh') < witness.index('ci-maven-cache.sh seed')
+    assert witness.index('ci-maven-cache.sh seed') < witness.index('sha256sum --check --strict')
+    assert witness.index('sha256sum --check --strict') < witness.index('tar -xzf connector-maven-inputs.tar.gz')
+    assert witness.index('tar -xzf connector-maven-inputs.tar.gz') < witness.index('-DskipTests install')
     assert '-DskipTests install' in witness and '-Dmaven.repo.local="$RUNNER_TEMP/m2"' in witness
     assert 'connector-witnesses.sh run --input-mode' in witness and 'connector-witnesses.sh pack --input-mode' in witness
     assert '-Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=' in witness
@@ -88,10 +98,15 @@ check(workflow)
 assert 'options: [upstream, release]' in nightly and 'default: upstream' in nightly
 assert 'connector-inputs: upstream' in release
 assert 'gh workflow run real-connectors.yml' not in release
-for before,after in [
+mutations = [
     ('  real-connectors:', '  real-connectors-renamed:'),
     ('real-connectors-release', 'unbound-release-verdict'),
     ('_connector-inputs.py verify', '_connector-inputs.py record'),
+    ('run: bash .github/scripts/setup-ci-maven.sh', 'run: mvn --version'),
+    ('mvn -N -B -C -U', 'mvn -N -B -U'),
+    ('name: connector-maven-inputs', 'name: unbound-maven-inputs'),
+    ('sha256sum --check --strict', 'true'),
+    ('tar -xzf connector-maven-inputs.tar.gz', 'true'),
     ('--inputs "$RUNNER_TEMP/connectors/connector-inputs.json"', ''),
     ('--inputs "$RUNNER_TEMP/connector-input-identity/connector-inputs.json"', ''),
     ("if: env.CONNECTOR_INPUT_MODE == 'upstream'", "if: true"),
@@ -112,11 +127,12 @@ for before,after in [
     ('TAPSTATE_ATLAS_TEST_URI: ${{ secrets.TAPSTATE_ATLAS_TEST_URI }}', 'TAPSTATE_ATLAS_TEST_URI: ""'),
     ('TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}', 'TAPSTATE_ATLAS_STANDARD_URI: ""'),
     ('prepare-test-inputs.py --output', 'true --output'),
-    ('echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=', 'echo "UNUSED_CLOUD_RELEASE_DIR=')]:
+    ('echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=', 'echo "UNUSED_CLOUD_RELEASE_DIR=')]
+for before,after in mutations:
     mutated=workflow.replace(before,after)
     assert mutated!=workflow
     try: check(mutated)
     except (AssertionError,KeyError,ValueError): pass
     else: raise AssertionError('workflow mutation survived: '+before)
-print('connector-workflow smoke: fixed check name, explicit artifact selection/Atlas deferral, complete active admission and 19 mutations passed')
+print(f'connector-workflow smoke: fixed check name, verified inputs, complete active admission and {len(mutations)} mutations passed')
 PY

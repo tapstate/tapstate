@@ -603,7 +603,7 @@ class MongoSrsConsumerStoreIT {
                     new SourceTable("orders",List.of(new SourceField("id","int")),List.of(),List.of())))));
             var access=new MongoCachePipelineAccess(f.client(),f.database(),scope,f.fenceA(),()->{});
             var reader=new MongoPipelineObservationRead(f.client(),f.database(),access);
-            var selected=Map.of(run,new MongoCacheDomain.ObservationSource(1,Set.of("orders")));
+            var selected=Map.of(run,new MongoCacheDomain.ObservationSource(A.key().sourceId(),1,Set.of("orders")));
             assertThat(reader.read(selected)).isPresent();
             var next=new SrsModel(new SrsModelKey(CHAIN,"orders",SCOPE.cacheIncarnation(),1,1),ring("orders"),
                     new SourceTable("orders",List.of(new SourceField("id","long")),List.of(),List.of()),100);

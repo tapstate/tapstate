@@ -87,7 +87,7 @@ final class StoreBackedPipelineCaptures implements PipelineCaptures {
             // streams a capture reads, so the whole source's tables would name a claim nobody took.
             Optional<SourceCaptureResolution> selected;
             try {
-                selected = SourceCaptureResolution.forPipeline(pipeline, resolved, reads.discovery(resolved));
+                selected = SourceCaptureResolution.forPipeline(pipeline, ref, resolved, reads.discovery(resolved));
             } catch (TapstateException unresolvable) {
                 // The start is refused with this same code, so no capture of it exists; and this face
                 // answers for every pipeline at once, which one that cannot resolve must not take down.

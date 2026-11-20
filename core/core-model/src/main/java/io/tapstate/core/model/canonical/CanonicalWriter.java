@@ -265,7 +265,9 @@ public final class CanonicalWriter {
                 case SourceRef.Spec spec -> {
                     B e = new B();
                     e.scalar("id", spec.id());
+                    e.scalar("as", spec.alias());
                     e.scalar("srs", spec.srs());
+                    e.freeMap("nodeConfig", spec.nodeConfig().isEmpty() ? null : spec.nodeConfig());
                     items.add(e.build());
                 }
             }

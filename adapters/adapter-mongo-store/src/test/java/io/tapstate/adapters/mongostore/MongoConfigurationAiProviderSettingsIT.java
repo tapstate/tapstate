@@ -30,14 +30,26 @@ class MongoConfigurationAiProviderSettingsIT {
     @Test void encryptedConfigurationSurvivesReopenAndExplicitDeletionWithoutAnyCache() {
         fixture((uri, config, raw) -> {
             var store = config.aiProviderSettings();
-            assertThat(store.get(OWNER)).isEmpty(); store.put(OWNER, setting());
+            assertThat(store.get(OWNER)).isEmpty();
+            assertThat(store.selectManaged(OWNER, true)).isFalse();
+            store.put(OWNER, setting());
             var saved = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).find().first();
             assertThat(saved.toJson()).doesNotContain(SECRET);
             assertThat(saved.getString("secret")).startsWith("tsai:1:");
             assertThat(raw.listCollectionNames().into(new java.util.ArrayList<>())).doesNotContain("system_meta", "cache_identity");
             try (var reopened = MongoConfigurationDomain.open(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)), CLUSTER)) {
-                assertThat(reopened.aiProviderSettings().get(OWNER)).contains(setting());
-                reopened.aiProviderSettings().delete(OWNER);
+                var persisted = reopened.aiProviderSettings();
+                assertThat(persisted.get(OWNER)).contains(setting());
+                assertThat(persisted.selectManaged(OWNER, true)).isTrue();
+                assertThat(store.get(OWNER)).hasValueSatisfying(value -> {
+                    assertThat(value.managedSelected()).isTrue();
+                    assertThat(value.apiKey()).isEqualTo(SECRET);
+                });
+                var parked = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).find().first();
+                assertThat(parked.getString("secret")).isEqualTo(saved.getString("secret"));
+                assertThat(persisted.selectManaged(OWNER, false)).isTrue();
+                assertThat(store.get(OWNER)).contains(setting());
+                persisted.delete(OWNER);
             }
             try (var reopened = MongoConfigurationDomain.open(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)), CLUSTER)) {
                 assertThat(reopened.aiProviderSettings().get(OWNER)).isEmpty();

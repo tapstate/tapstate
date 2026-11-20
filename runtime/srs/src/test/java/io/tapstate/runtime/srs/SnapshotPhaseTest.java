@@ -97,6 +97,23 @@ class SnapshotPhaseTest {
     }
 
     @Test
+    void narrowedSnapshotKeepsTheLocalOverrideAndItsKeyedCaptureIdentity() {
+        FakePort port = new FakePort(new FakeBatch(List.of(row(1)), "p0"));
+        var overrides = Map.<String, Object>of("preImage", false);
+        var config = new CaptureConfig("mysql", Map.of("host", "shared", "preImage", false),
+                List.of("orders", "customers"), new PipelineNode(PIPE, "source"), null, overrides);
+        SnapshotPhase.run(port, config, "chain", PIPE, List.of("orders"),
+                1L, new RecordingMeta(new ArrayList<>()), e -> {});
+        assertThat(port.configs).singleElement().satisfies(read -> {
+            assertThat(read.streams()).containsExactly("orders");
+            assertThat(read.settings()).containsEntry("preImage", false).containsEntry("host", "shared");
+            assertThat(read.nodeConfig()).isEqualTo(overrides);
+            assertThat(MiningChainId.resolve(read, "shared-key")).isEqualTo(MiningChainId.resolve(config, "shared-key"));
+            assertThat(MiningChainId.resolve(read, "shared-key")).isNotEqualTo(MiningChainId.ofKey("shared-key"));
+        });
+    }
+
+    @Test
     void drainOrdersTheSnapshotBatchWithoutRecordingACdcStart() {
         List<Envelope> rows = List.of(row(1), row(2), row(3));
         FakePort port = new FakePort(new FakeBatch(rows, "p0"));

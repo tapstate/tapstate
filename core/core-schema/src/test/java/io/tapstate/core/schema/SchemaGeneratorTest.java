@@ -208,14 +208,13 @@ class SchemaGeneratorTest {
         assertThat(element).contains(
                 new Json.Obj(List.of(new Json.Entry("type", new Json.Str("string")))),
                 new Json.Obj(List.of(new Json.Entry("$ref", new Json.Str("#/$defs/SourceRef.Spec")))));
-        // Both keys are required on the object form: `srs` is registered as having no constant
-        // default, because reading it back as absent would mean "take the source's value" -- the
-        // link the field exists to cut.
+        // Either local setting may be omitted on an authored Source reference.
         Json.Obj spec = (Json.Obj) defs.get("SourceRef.Spec");
         assertThat(((Json.Arr) spec.get("required")).items())
-                .containsExactlyInAnyOrder(new Json.Str("id"), new Json.Str("srs"));
-        assertThat(((Json.Obj) ((Json.Obj) spec.get("properties")).get("srs")).get("type"))
-                .isEqualTo(new Json.Str("boolean"));
+                .containsExactly(new Json.Str("id"));
+        Json.Obj refProperties = (Json.Obj) spec.get("properties");
+        assertThat(((Json.Obj) refProperties.get("srs")).get("type")).isEqualTo(new Json.Str("boolean"));
+        assertThat(((Json.Obj) refProperties.get("nodeConfig")).get("type")).isEqualTo(new Json.Str("object"));
 
         // embed keeps camelCase keys (the canonical writer's exception to snake_case).
         Json.Obj embed = (Json.Obj) ((Json.Obj) defs.get("Embed")).get("properties");

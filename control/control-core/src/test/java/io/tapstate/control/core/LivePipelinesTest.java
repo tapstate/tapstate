@@ -166,6 +166,23 @@ class LivePipelinesTest {
     }
 
     @Test
+    void refusesRestoringInheritanceWhileAnOverriddenCaptureIsRunning() {
+        state.put("p1", PipelineState.RUNNING);
+        desired.put("p1", PipelineState.RUNNING);
+        PipelineResource inherited = pipelineWithSwitch("p1", "orders", true);
+        PipelineResource configured = new PipelineResource(inherited.id(), inherited.metadata(),
+                List.of(SourceRef.of("orders", true, Map.of("preImage", false))), inherited.transforms(),
+                inherited.view(), inherited.serve(), inherited.settings(), inherited.experimental());
+
+        assertThatThrownBy(() -> live.refuseBufferingChangeWhileLive(configured, inherited))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ArtifactError.PIPELINE_NOT_STOPPED);
+                    assertThat(refused.args()).containsEntry("id", "p1");
+                });
+        live.refuseBufferingChangeWhileLive(configured, configured);
+    }
+
+    @Test
     void allowsTheChangeOnceEveryPipelineReadingItIsStopped() {
         state.put("p1", PipelineState.STOPPED);
         desired.put("p1", PipelineState.STOPPED);

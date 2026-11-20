@@ -803,7 +803,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
         var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
         when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-        when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
+        when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
         when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(chain.get())));
         when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
         when(consumers.find(context.key())).thenReturn(Optional.of(membership));
@@ -848,7 +848,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
             var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
             when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-            when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
+            when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
             when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(chain.get())));
             when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
             when(consumers.find(context.key())).thenReturn(Optional.of(membership));
@@ -883,7 +883,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             verify(f.notes,never()).open(new RequiredNoteOwner(1,"pdk.chain."+physical,RequiredNoteOwner.Kind.CHAIN,physical,0));
             verify(f.ownership).acquire(new CaptureId(captureId));
             verify(f.runtime).startTail(eq(BUSINESS),any(),eq(WorkloadClaimFence.from(capture)),any(),any(),any(),any(),eq(true));
-            verify(f.configuration).inspectSharedHistory(eq(prepared),eq("input"),anyString());
+            verify(f.configuration).inspectSharedHistory(eq(prepared),eq("input"),anyString(),eq("flow"),anyString());
         }
     }
 
@@ -903,7 +903,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var retained=new SrsConsumerProgress(context,1,1,cursor,null);
             var consumers=mock(SrsConsumerStore.class);var chains=mock(SrsChainStore.class);
             when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-            when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
+            when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
             when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(originalChain)));
             when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
             when(consumers.find(context.key())).thenReturn(Optional.of(membership));
@@ -1038,7 +1038,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                     SourceCaptureIdentity.physical(f.source.connector(),f.source.config()),UUID.randomUUID().toString());
             when(f.configuration.read(BUSINESS,captureId)).thenReturn(Optional.of(prepared));
             var origin=ConnectorNoteOrigin.capture("mongodb","a".repeat(64),f.source.config());
-            when(f.configuration.inspectSharedOrigin(eq(BUSINESS),eq("input"),anyString())).thenReturn(Optional.of(origin));
+            when(f.configuration.inspectSharedOrigin(eq(BUSINESS),eq("input"),anyString(),anyString(),anyString())).thenReturn(Optional.of(origin));
             var key=f.streamingProgress.get().snapshot().models().get("orders");
             var pinned=new SourceTable("orders",List.of(new SourceField("old-sample","STRING(100)")),List.of(),List.of());
             var srs=f.sources.srs(BUSINESS,() -> {});
@@ -1046,7 +1046,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var pass=mock(PipelineConvergencePass.class);when(pass.scope()).thenReturn(SCOPE);
             var captured=f.models();
             var planning=f.coordinator.retainedPlanningModels(pass,f.snapshot(),captured);
-            assertThat(planning.model(f.source).tables()).containsExactly(pinned);
+            assertThat(planning.modelForBinding("input", f.source).tables()).containsExactly(pinned);
             assertThat(captured.model(f.source).tables()).containsExactly(observed);
             assertThat(f.models().model(f.source).tables()).containsExactly(observed);
             verify(srs.models(),never()).publishedForNewSnapshot(anyString(),anyMap());
@@ -1109,7 +1109,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var prepared=new CapturePreparation(BUSINESS,bounded?CapturePreparation.Mode.SNAPSHOT_ONLY:CapturePreparation.Mode.SHARED_SRS,"mck-key",id,SourceCaptureIdentity.physical(source.connector(),source.config()),UUID.randomUUID().toString());
             capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id),bounded?OWNER:new WorkloadOwner("remote","remote-boot"),1,0,1,Instant.now().plusSeconds(60));
             when(configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-            if (!bounded) when(configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,false));
+            if (!bounded) when(configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,false));
             var cached = new CaptureCacheState(prepared, WorkloadClaimFence.from(capture),
                     bounded ? Optional.empty() : Optional.of(streamingChain()));
             when(cache.load(prepared)).thenReturn(cached);

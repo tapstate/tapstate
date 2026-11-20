@@ -226,6 +226,15 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
     }
 
+    /** Cloud bootstrap may finish alert preparation from its matching retained setup operation. */
+    public void resumeInitialAlertStorage(String operationId) {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(30));
+        requireOpen();
+        new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen)
+                .resumeInitialPreparation(operationId, budget);
+    }
+
     <T> T alertMaintenanceTransaction(MongoReadBudget budget,java.util.function.Function<com.mongodb.client.ClientSession,T> action) {
         requireOpen();return budget.maintenanceTransaction(connection.client(),session->{requireOpen();T result=action.apply(session);requireOpen();return result;});
     }
@@ -1137,6 +1146,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return bindings;
     }
 
+    public record ObservationCapture(String sourceId, String captureId) {
+        public ObservationCapture {
+            Objects.requireNonNull(sourceId, "sourceId");
+            Objects.requireNonNull(captureId, "captureId");
+        }
+    }
+
     public record ObservationConfiguration(io.tapstate.core.model.PipelineResource pipeline,
             Map<String, io.tapstate.core.model.SourceResource> sources,
             Map<String, io.tapstate.spi.store.CapturePreparation> captures) {
@@ -1150,7 +1166,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     private final MongoStructureProof observationStructures = new MongoStructureProof();
     public ObservationCheck observationConfiguration(io.tapstate.spi.store.PipelineIntentStore.ActuationReading before,
-            String defaultSource, Map<String, String> sources) {
+            String defaultSource, Map<String, ObservationCapture> sources) {
         requireOpen();
         if (before.configurationRevision().isEmpty() || sources.isEmpty() || sources.size() > 4
                 || !MongoReadBudget.supportsSnapshotReads(connection.client())) return ObservationCheck.fallback();
