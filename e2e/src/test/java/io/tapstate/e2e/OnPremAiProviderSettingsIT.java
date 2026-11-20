@@ -65,35 +65,31 @@ class OnPremAiProviderSettingsIT {
         }
     }
 
+    private record ReplyExample(String request, String reply, String explanation) { }
+
     @Test void forwardsReplyLanguageGuidanceAndKeepsTheProposalReviewable() throws Exception {
-        String userRequest = "I would like to create an enriched order table. Please reply in German.";
-        String ordinaryReply = "Ich verwende das ausgewaehlte Schema.";
-        String explanation = "Ich kopiere id aus orders nach enriched_orders.";
+        String reportedRequest = "I would like to create an enriched order table";
+        var examples = List.of(
+                new ReplyExample(reportedRequest, "I will use the selected schema.",
+                        "I will copy id from orders to enriched_orders."),
+                new ReplyExample(reportedRequest + ". Please reply in German.", "Ich verwende das ausgewählte Schema.",
+                        "Ich kopiere id aus orders nach enriched_orders."));
         var wizard = Map.of("root", Map.of("source", "orders_src", "table", "orders", "keys", List.of("id"),
                         "columns", List.of(), "transforms", List.of()),
                 "relations", List.of(), "transforms", List.of(), "destinationSourceId", "destination",
                 "destinationTable", "enriched_orders", "destinationWriteMode", "upsert");
         var calls = new AtomicInteger();
         var sentRequest = new AtomicReference<Map<?, ?>>();
+        var reply = new AtomicReference<ReplyExample>();
         var upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         upstream.createContext("/v1/responses", exchange -> {
             calls.incrementAndGet();
             sentRequest.set((Map<?, ?>) JsonReader.parse(
                     new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
-            String arguments = "{\"explanation\":" + JsonWriter.write(explanation)
-                    + ",\"candidateWizard\":" + JsonWriter.write(wizard) + "}";
-            var call = Map.of("type", "function_call", "id", "proposal", "name", "propose_pipeline", "arguments", arguments);
-            var message = Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", ordinaryReply)));
-            String stream = event(Map.of("type", "response.reasoning_summary_text.delta", "item_id", "summary",
-                            "summary_index", 0, "delta", "Checking the order schema."))
-                    + event(Map.of("type", "response.output_text.delta", "delta", ordinaryReply))
-                    + event(Map.of("type", "response.output_item.added", "item", call))
-                    + event(Map.of("type", "response.function_call_arguments.delta", "item_id", "proposal", "delta", arguments))
-                    + event(Map.of("type", "response.completed", "response",
-                            Map.of("status", "completed", "output", List.of(message, call))));
+            byte[] stream = providerStream(reply.get(), wizard).getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
             exchange.sendResponseHeaders(200, 0);
-            try (var response = exchange.getResponseBody()) { response.write(stream.getBytes(StandardCharsets.UTF_8)); }
+            try (var response = exchange.getResponseBody()) { response.write(stream); }
         });
         upstream.start();
         try (var storage = PreparedNativeStore.create();
@@ -124,35 +120,71 @@ class OnPremAiProviderSettingsIT {
                 var originalDraft = configuration.drafts().get("orders").orElseThrow();
                 request(client, server, control, "/api/ai-provider-settings", "PUT",
                         Map.of("providerId", "openai-responses", "model", "test-model", "apiKey", "test-key"), 204);
-                String stream = request(client, server, control, "/api/pipelines/orders/draft:assistant", "POST",
-                        Map.of("revision", 1, "messages", List.of(Map.of("role", "user", "text", userRequest))), 200);
-                var events = stream.lines().filter(line -> line.startsWith("data: {"))
-                        .map(line -> (Map<?, ?>) JsonReader.parse(line.substring("data: ".length()))).toList();
-                var visible = events.stream().filter(record -> "text-delta".equals(record.get("type")))
-                        .map(record -> (String) record.get("delta")).collect(Collectors.joining());
-                assertThat(visible).isEqualTo(ordinaryReply + "\n\n" + explanation);
-                assertThat(events.stream().filter(record -> "reasoning-start".equals(record.get("type")))).hasSize(1);
-                assertThat(calls).hasValue(1);
-                var input = (List<?>) sentRequest.get().get("input");
-                var system = (Map<?, ?>) input.getFirst();
-                assertThat(system.get("role")).isEqualTo("system");
-                assertThat(system.get("content")).asString()
-                        .contains("language of the latest user request", "unless the user explicitly requests another reply language",
-                                "Keep table names, field names and DSL identifiers unchanged");
-                assertThat(input.getLast()).isEqualTo(Map.of("role", "user", "content", userRequest));
+                for (var example : examples) {
+                    reply.set(example);
+                    int callsBefore = calls.get();
+                    var proposal = requestProposal(client, server, control, example);
+                    assertThat(calls).hasValue(callsBefore + 1);
+                    assertForwardedRequest(sentRequest.get(), example.request());
 
-                var proposal = events.stream().filter(record -> "data-proposal".equals(record.get("type")))
-                        .map(record -> (Map<?, ?>) record.get("data")).findFirst().orElseThrow();
-                assertThat(proposal.get("baseRevision")).isEqualTo(1L);
-                String review = request(client, server, control, "/api/pipelines/orders/draft:assistant-validate", "POST",
-                        Map.of("revision", 1, "candidateWizard", proposal.get("candidateWizard")), 200);
-                var result = (Map<?, ?>) JsonReader.parse(review);
-                assertThat(result.get("valid")).isEqualTo(true);
-                assertThat(((Map<?, ?>) result.get("diff")).get("after")).asString()
-                        .contains("orders_src.orders", "enriched_orders");
-                assertThat(configuration.drafts().get("orders")).contains(originalDraft);
+                    String review = request(client, server, control, "/api/pipelines/orders/draft:assistant-validate", "POST",
+                            Map.of("revision", 1, "candidateWizard", proposal.get("candidateWizard")), 200);
+                    var result = (Map<?, ?>) JsonReader.parse(review);
+                    assertThat(result.get("valid")).isEqualTo(true);
+                    assertThat(((Map<?, ?>) result.get("diff")).get("after")).asString()
+                            .contains("orders_src.orders", "enriched_orders");
+                    assertThat(configuration.drafts().get("orders")).contains(originalDraft);
+                }
             }
         } finally { upstream.stop(0); }
+    }
+
+    private static String providerStream(ReplyExample reply, Map<String, Object> wizard) {
+        String explanation = "{\"explanation\":" + JsonWriter.write(reply.explanation());
+        String candidate = ",\"candidateWizard\":" + JsonWriter.write(wizard) + "}";
+        var call = Map.of("type", "function_call", "id", "proposal", "name", "propose_pipeline",
+                "status", "completed", "arguments", explanation + candidate);
+        var message = Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", reply.reply())));
+        return event(Map.of("type", "response.reasoning_summary_text.delta", "item_id", "summary",
+                        "summary_index", 0, "delta", "Checking the order schema."))
+                + event(Map.of("type", "response.output_text.delta", "delta", reply.reply()))
+                + event(Map.of("type", "response.output_item.added", "item",
+                        Map.of("type", "function_call", "id", "proposal", "name", "propose_pipeline",
+                                "status", "in_progress", "arguments", "")))
+                + event(Map.of("type", "response.function_call_arguments.delta", "item_id", "proposal", "delta", explanation))
+                + event(Map.of("type", "response.function_call_arguments.delta", "item_id", "proposal", "delta", candidate))
+                + event(Map.of("type", "response.completed", "response",
+                        Map.of("status", "completed", "output", List.of(message, call))));
+    }
+
+    private static Map<?, ?> requestProposal(HttpClient client, ServerHandle server, ControlPlane control,
+            ReplyExample example) throws Exception {
+        String stream = request(client, server, control, "/api/pipelines/orders/draft:assistant", "POST",
+                Map.of("revision", 1, "messages", List.of(Map.of("role", "user", "text", example.request()))), 200);
+        var events = stream.lines().filter(line -> line.startsWith("data: {"))
+                .map(line -> (Map<?, ?>) JsonReader.parse(line.substring("data: ".length()))).toList();
+        var visible = events.stream().filter(record -> "text-delta".equals(record.get("type")))
+                .map(record -> (String) record.get("delta")).collect(Collectors.joining());
+        assertThat(visible).isEqualTo(example.reply() + "\n\n" + example.explanation());
+        assertThat(events.stream().map(record -> (String) record.get("type")))
+                .contains("finish").doesNotContain("error");
+        assertThat(events.stream().filter(record -> "reasoning-start".equals(record.get("type")))).hasSize(1);
+        var proposals = events.stream().filter(record -> "data-proposal".equals(record.get("type"))).toList();
+        assertThat(proposals).hasSize(1);
+        var proposal = (Map<?, ?>) proposals.getFirst().get("data");
+        assertThat(proposal.get("baseRevision")).isEqualTo(1L);
+        return proposal;
+    }
+
+    private static void assertForwardedRequest(Map<?, ?> request, String userRequest) {
+        var input = (List<?>) request.get("input");
+        assertThat(input).hasSize(2);
+        var system = (Map<?, ?>) input.getFirst();
+        assertThat(system.get("role")).isEqualTo("system");
+        assertThat(system.get("content")).asString()
+                .contains("language of the latest user request", "unless the user explicitly requests another reply language",
+                        "when referring to them in prose");
+        assertThat(input.getLast()).isEqualTo(Map.of("role", "user", "content", userRequest));
     }
 
     private static String request(HttpClient client, ServerHandle server, ControlPlane control, String path,
