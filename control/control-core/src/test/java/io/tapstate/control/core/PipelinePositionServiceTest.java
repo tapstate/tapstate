@@ -231,7 +231,8 @@ class PipelinePositionServiceTest {
                 new PipelinePosition(pipeline, List.of(first, withResumeToken(second, "earlier"))));
 
         assertThat(meta.rewinds).containsExactly(Map.entry(CHAIN, "earlier"));
-        assertThat(after.chains()).allSatisfy(chain -> assertThat(chain.resumeFrom().token()).isEqualTo("earlier"));
+        assertThat(after.chains()).extracting(chain -> chain.resumeFrom().token())
+                .containsExactly("earlier", "earlier");
     }
 
     private static PipelinePosition.Chain withResumeToken(PipelinePosition.Chain row, String token) {

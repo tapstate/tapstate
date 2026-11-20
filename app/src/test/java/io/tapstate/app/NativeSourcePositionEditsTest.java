@@ -44,6 +44,20 @@ class NativeSourcePositionEditsTest {
         verifyNoInteractions(f.owners, f.writes, f.captures);
     }
 
+    @Test
+    void anUnmaterializedSwitchOnAnotherPipelineDoesNotBreakTheReaderScan() {
+        var f = new Fixture();
+        ArtifactStore artifacts = f.configuration.artifacts();
+        var inventory = new ArrayList<>(artifacts.list());
+        inventory.add(new PipelineResource("unmaterialized", null,
+                List.of(SourceRef.of("source-a", null, Map.of(), "input")),
+                null, null, null, null, null));
+        when(artifacts.list()).thenReturn(inventory);
+
+        assertThatCode(() -> f.edits.prepare("flow", f.current, f.moves)).doesNotThrowAnyException();
+        verify(f.port, never()).scope("unmaterialized");
+    }
+
     private static final class Fixture {
         final MongoConfigurationDomain configuration = mock(MongoConfigurationDomain.class);
         final ThreeLayerStorePort port = mock(ThreeLayerStorePort.class);

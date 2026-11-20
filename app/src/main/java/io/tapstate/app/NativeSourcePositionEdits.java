@@ -57,7 +57,7 @@ final class NativeSourcePositionEdits implements PipelinePositionService.WriteBa
             var sourceReading=current.chains().stream().filter(item -> item.chainId().equals(move.getKey())).findFirst().orElseThrow(NativeSourcePositionEdits::fenced);
             var reference = pipeline.sourceReference(sourceReading.sourceId());
             var source=StoredArtifacts.requireSource(configuration.artifacts(),reference.id());
-            boolean privateChannel=reference instanceof SourceRef.Spec spec && !spec.srs();
+            boolean privateChannel=reference instanceof SourceRef.Spec spec && Boolean.FALSE.equals(spec.srs());
             if (privateChannel) {
                 var mode=pipeline.settings()==null || pipeline.settings().readMode()==null?ReadMode.SNAPSHOT_AND_CDC:pipeline.settings().readMode();
                 if (mode==ReadMode.SNAPSHOT_ONLY) throw fenced();
@@ -76,7 +76,7 @@ final class NativeSourcePositionEdits implements PipelinePositionService.WriteBa
                 logged.add(new Logged(before,Map.copyOf(consumers),move.getValue()));
                 for (var resource:inventory) if (resource instanceof PipelineResource candidate) {
                     for (var candidateRef:candidate.sources()) {
-                        if (!(candidateRef instanceof SourceRef.Spec spec) || !spec.srs()) continue;
+                        if (!(candidateRef instanceof SourceRef.Spec spec) || !Boolean.TRUE.equals(spec.srs())) continue;
                         var declared=StoredArtifacts.requireSource(configuration.artifacts(),candidateRef.id());
                         if (move.getKey().equals(PipelineSourceConfig.chain(candidateRef,declared))) readers.add(candidate.id());
                     }
