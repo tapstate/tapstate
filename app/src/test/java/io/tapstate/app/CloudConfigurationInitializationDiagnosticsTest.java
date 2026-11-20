@@ -29,7 +29,7 @@ class CloudConfigurationInitializationDiagnosticsTest {
 
     @ParameterizedTest
     @EnumSource(value = StorageSetupStateStore.Phase.class, names = {"CONFIG_PREPARED", "COMPLETE"})
-    void retainedConfigurationResumesOriginalAlertsBeforeItIsPublished(StorageSetupStateStore.Phase phase) {
+    void retainedConfigurationResumesAlertsBeforeConfirmingAnUnboundSetup(StorageSetupStateStore.Phase phase) {
         var fixture = retainedConfiguration(phase);
         var domain = fixture.domain();
         var bridge = fixture.bridge();
@@ -39,12 +39,14 @@ class CloudConfigurationInitializationDiagnosticsTest {
 
             assertThat(initialization.open()).isSameAs(domain);
 
-            var order = inOrder(domain, bridge);
-            order.verify(domain).resumeInitialAlertStorage(OPERATION);
-            if (phase == StorageSetupStateStore.Phase.CONFIG_PREPARED)
+            if (phase == StorageSetupStateStore.Phase.CONFIG_PREPARED) {
+                var order = inOrder(domain, bridge);
+                order.verify(domain).resumeInitialAlertStorage(OPERATION);
                 order.verify(bridge).completeConfiguration(eq(OPERATION), anyString());
-            else
+            } else {
+                verify(domain, never()).resumeInitialAlertStorage(anyString());
                 verifyNoInteractions(bridge);
+            }
             verify(bridge, never()).claimConfiguration(anyString(), anyString());
         }
     }
@@ -68,10 +70,15 @@ class CloudConfigurationInitializationDiagnosticsTest {
             } else {
                 assertThat(initialization.open()).isSameAs(domain);
                 verify(domain, never()).close();
+                verify(domain, never()).resumeInitialAlertStorage(anyString());
             }
             verifyNoInteractions(fixture.bridge());
-            assertThat(logs.events.list).singleElement().satisfies(event ->
-                    assertThat(event.getFormattedMessage()).contains("io.store-unavailable", "MongoCommandException code=8000"));
+            if (unbound) {
+                assertThat(logs.events.list).singleElement().satisfies(event ->
+                        assertThat(event.getFormattedMessage()).contains("io.store-unavailable", "MongoCommandException code=8000"));
+            } else {
+                assertThat(logs.events.list).isEmpty();
+            }
             assertSafe(logs);
         }
     }
