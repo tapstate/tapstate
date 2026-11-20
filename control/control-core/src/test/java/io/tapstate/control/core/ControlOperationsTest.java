@@ -87,6 +87,8 @@ class ControlOperationsTest {
                         "pipeline.set-position",
                         "pipeline.derived-schema",
                         "pipeline.accept-derived-schema",
+                        "pipeline.aggregate-check",
+                        "pipeline.aggregate-repair",
                         "auth.current-user",
                         "user.create",
                         "user.passwd",
@@ -249,7 +251,7 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(86);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(88);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"system.pdk-version".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.") && !op.id().startsWith("alert.") && !op.id().startsWith("connector-center.")).allSatisfy(op ->

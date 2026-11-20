@@ -177,7 +177,12 @@ class OpenAiCompatibleClientTest {
             Map<?, ?> tool = (Map<?, ?>) ((List<?>) submitted.get().get("tools")).getFirst();
             Map<?, ?> function = (Map<?, ?>) tool.get("function");
             Map<?, ?> parameters = (Map<?, ?>) function.get("parameters");
-            Map<?, ?> candidateSchema = (Map<?, ?>) ((Map<?, ?>) parameters.get("properties")).get("candidateWizard");
+            Map<?, ?> properties = (Map<?, ?>) parameters.get("properties");
+            Map<?, ?> explanation = (Map<?, ?>) properties.get("explanation");
+            String identifierGuidance = "Preserve the exact spelling of table names, field names and DSL identifiers when referring to them in prose.";
+            assertThat(explanation.get("description")).asString()
+                    .contains("language of the latest user request", "unless the user explicitly requests another reply language", identifierGuidance);
+            Map<?, ?> candidateSchema = (Map<?, ?>) properties.get("candidateWizard");
             assertThat(candidateSchema).as("the provider must receive the Builder candidate contract").isNotNull();
             assertThat(candidateSchema.get("properties")).as("candidateWizard must declare its Builder fields").isNotNull();
             Map<?, ?> rootSchema = (Map<?, ?>) ((Map<?, ?>) candidateSchema.get("properties")).get("root");
@@ -202,6 +207,8 @@ class OpenAiCompatibleClientTest {
                     .map(item -> (Map<?, ?>) item).filter(item -> "system".equals(item.get("role")))
                     .map(item -> (String) item.get("content")).findFirst().orElseThrow();
             assertThat(systemPrompt).contains("passthroughUnlisted", "ruleType", "$<sourceField>");
+            assertThat(systemPrompt).contains("language of the latest user request",
+                    "unless the user explicitly requests another reply language", identifierGuidance);
             assertThat(systemPrompt).contains("Bundled DSL semantics", "CEL boolean predicate",
                     "A rename consumes its source name", "ctx.emit(record)", "explicit alias map");
             assertThat(systemPrompt).contains("function process(record, ctx)", "record.after",

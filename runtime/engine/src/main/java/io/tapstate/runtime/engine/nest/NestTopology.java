@@ -2,7 +2,13 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Embed;
+import io.tapstate.core.dsl.RollupCompiler;
+import io.tapstate.core.dsl.aggregate.RollupError;
+import io.tapstate.core.dsl.aggregate.RollupScope;
+import io.tapstate.core.dsl.aggregate.RollupSpec;
+import io.tapstate.core.dsl.aggregate.ValueType;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.WriteMode;
@@ -110,6 +116,8 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             node.referenced(referenced(node, tables));
         }
         checkFlatFieldConflicts(root.from(), List.of(), top, tables);
+        checkRollupFieldConflicts(root.from(), List.of(), top, tables);
+        compileRollups(all, tables);
         List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, claimants(top));
         for (Node node : all) {
             if (!node.children().isEmpty()) {
@@ -268,14 +276,25 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                 // is one row shared by however many documents name it, so it enters the tree once and is
                 // read from there. It takes no hops - nothing cascades from it, and the read that finds it
                 // happens where the document is rendered rather than on the way in.
+                //
+                // One place per way of matching it. Each alternative keys the same rows by different columns,
+                // so each needs its own filing and its own record of who points where: a row edited under one
+                // alternative has to wake exactly the documents naming it under that one, and a document
+                // whose first choice turns up later has to be told even though it rendered its second.
                 NestVertex pointing = vertexAt(vertices, node.parentPathId());
-                NestLookup lookup = new NestLookup(node.pathId(), node.embed().from(),
-                        lookupName(nodeId, node.pathId()), mapName(pipelineId, nodeId, node.pathId()),
-                        referenceIdentity(node.embed()), node.parentAlias(),
-                        referenceFields(node.embed()), identities.get(node.parentPathId()),
-                        node.parentPathId(), touchOrdinal(pointing, node));
-                lookups.add(lookup);
-                streams.add(new NestStream(node.embed().from(), node.pathId(), 0, lookup.name(), null));
+                List<Map<String, String>> alternatives = node.embed().alternatives();
+                List<String> rowIdentity = node.embed().hasAlternatives() ? rowIdentityOrNone(node, tables) : List.of();
+                for (int i = 0; i < alternatives.size(); i++) {
+                    List<String> pathId = alternativePathId(node.pathId(), i);
+                    NestLookup lookup = new NestLookup(pathId, node.embed().from(),
+                            lookupName(nodeId, pathId), mapName(pipelineId, nodeId, pathId),
+                            referenceIdentity(alternatives.get(i)), node.parentAlias(),
+                            referenceFields(alternatives.get(i)), identities.get(node.parentPathId()),
+                            node.parentPathId(), touchOrdinal(pointing, pathId),
+                            node.embed().hasAlternatives(), rowIdentity);
+                    lookups.add(lookup);
+                    streams.add(new NestStream(node.embed().from(), pathId, 0, lookup.name(), null));
+                }
                 continue;
             }
             boolean leaf = node.children().isEmpty();
@@ -296,14 +315,43 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * worked out twice is an ordinal that can disagree with itself, and the disagreement would land the
      * word on some other edge's handling with nothing to say so.
      */
-    private static int touchOrdinal(NestVertex pointing, Node referenced) {
+    private static int touchOrdinal(NestVertex pointing, List<String> referenced) {
         for (NestInbound edge : pointing.inbound()) {
-            if (edge.carriesTouches() && edge.pathId().equals(referenced.pathId())) {
+            if (edge.carriesTouches() && edge.pathId().equals(referenced)) {
                 return edge.ordinal();
             }
         }
-        throw new IllegalStateException("no edge into the level above " + referenced.pathId()
+        throw new IllegalStateException("no edge into the level above " + referenced
                 + " carries word that it was edited");
+    }
+
+    /**
+     * Where the {@code index}th way of matching a referenced embed keeps its rows. The first is the embed's
+     * own path, so an embed with no alternatives keeps exactly the state it always had; each further one
+     * takes a sibling segment no declared path can spell, since a declared path never holds a dollar sign
+     * followed by these letters and a flat embed's segment is bracketed.
+     */
+    static List<String> alternativePathId(List<String> pathId, int index) {
+        if (index == 0) {
+            return pathId;
+        }
+        List<String> alternative = new ArrayList<>(pathId);
+        alternative.set(alternative.size() - 1, pathId.getLast() + "$or" + index);
+        return List.copyOf(alternative);
+    }
+
+    /**
+     * What identifies one row of a referenced embed with alternatives, or nothing where nothing does. Asked
+     * only so an alternative key edited on that row can be taken out from under the value it left while the
+     * entry there is still that same row - so where there is no answer, the entry is compared whole instead
+     * of refusing a tree that never needed one.
+     */
+    private static List<String> rowIdentityOrNone(Node node, Function<String, NestTable> tables) {
+        if (node.embed().key() != null && !node.embed().key().isEmpty()) {
+            return node.embed().key();
+        }
+        NestTable table = tables.apply(node.embed().from());
+        return table == null ? List.of() : table.primaryKey();
     }
 
     /** The compiled vertex serving {@code pathId}. Every level a reference hangs off has one. */
@@ -349,13 +397,13 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * these columns, the level pointing at it off the ones they are mapped to - so neither side has to know
      * anything about the other's table for the two keys to match.
      */
-    private static List<String> referenceIdentity(Embed embed) {
-        return List.copyOf(embed.on().keySet());
+    private static List<String> referenceIdentity(Map<String, String> on) {
+        return List.copyOf(on.keySet());
     }
 
     /** The columns on the pointing level that hold the reference, in that same order. */
-    private static List<String> referenceFields(Embed embed) {
-        return List.copyOf(embed.on().values());
+    private static List<String> referenceFields(Map<String, String> on) {
+        return List.copyOf(on.values());
     }
 
     private static NestVertex vertexOf(String pipelineId, String nodeId, Node node, List<String> parentIdentity,
@@ -411,8 +459,10 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         // than from a source, which is why it is drawn separately from every edge above.
         for (Node child : children) {
             if (child.referenced()) {
-                edges.add(NestInbound.touchesOf(edges.size(), child.embed().from(), child.pathId(),
-                        identity));
+                for (int i = 0; i < child.embed().alternatives().size(); i++) {
+                    edges.add(NestInbound.touchesOf(edges.size(), child.embed().from(),
+                            alternativePathId(child.pathId(), i), identity));
+                }
             }
         }
         return edges;
@@ -510,6 +560,10 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * wrong.
      */
     private static boolean referenced(Node node, Function<String, NestTable> tables) {
+        if (node.embed().hasAlternatives()) {
+            checkAlternativesPointAtTheChild(node, tables);
+            return true;
+        }
         Set<String> childSide = new LinkedHashSet<>(node.embed().on().keySet());
         Set<String> parentSide = new LinkedHashSet<>(node.embed().on().values());
         List<String> parentKey =
@@ -537,6 +591,29 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     }
 
     /**
+     * Refuses an embed with alternatives where one of them matches on what identifies the parent. Such an
+     * alternative gathers child rows under the parent rather than pointing at one shared row, and an ordered
+     * choice "this match, or else that one" has no meaning where a match is a whole set of rows. Where
+     * nothing identifies the parent there is nothing to compare against, and every alternative is read as
+     * pointing at the child.
+     */
+    private static void checkAlternativesPointAtTheChild(Node node, Function<String, NestTable> tables) {
+        List<String> parentKey =
+                keyOrNone(node.parentAlias(), node.parentKey(), render(node.parentPathId()), tables);
+        if (parentKey == null) {
+            return;
+        }
+        for (Map<String, String> alternative : node.embed().alternatives()) {
+            if (new LinkedHashSet<>(alternative.values()).equals(new LinkedHashSet<>(parentKey))) {
+                throw new TapstateException(NestError.OR_ON_NOT_A_REFERENCE,
+                        Map.of("embedPath", render(node.pathId()),
+                                "fields", String.join(", ", alternative.values()),
+                                "parentKey", String.join(", ", parentKey)), null);
+            }
+        }
+    }
+
+    /**
      * Refuses two embeds under one parent that claim the same place in the document, or one that claims a
      * place inside the other's. Either way one would silently overwrite the other, and either way their
      * paths from the root would render the same - which is also what keeps a rendered path unique.
@@ -560,8 +637,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         }
         for (int i = 0; i < children.size(); i++) {
             for (int j = i + 1; j < children.size(); j++) {
-                if (children.get(i).embed().as() == EmbedAs.FLAT
-                        || children.get(j).embed().as() == EmbedAs.FLAT) {
+                if (children.get(i).embed().path() == null || children.get(j).embed().path() == null) {
                     continue;
                 }
                 List<String> a = segments(children.get(i).embed().path());
@@ -592,7 +668,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             }
         }
         for (Node child : children) {
-            if (child.embed().as() != EmbedAs.FLAT) {
+            if (child.embed().path() != null) {
                 occupied.putIfAbsent(child.embed().path(), render(child.pathId()));
             }
         }
@@ -624,7 +700,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         for (Node child : node.children()) {
             Map<String, String> contributed = child.embed().as() == EmbedAs.FLAT
                     ? knownFlatOutput(child, tables)
-                    : Map.of(child.embed().path(), render(child.pathId()));
+                    : renderedOutput(child);
             Map<String, String> collisions = conflicts(contributed.keySet(), output);
             if (!collisions.isEmpty()) {
                 throw flatFieldConflict(child.embed().as() == EmbedAs.FLAT ? child : node, collisions);
@@ -632,6 +708,109 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             contributed.forEach(output::put);
         }
         return output;
+    }
+
+    /** The fields a non-flat embed writes on its parent: its path, if it renders one, and its rollup fields. */
+    private static Map<String, String> renderedOutput(Node child) {
+        Map<String, String> output = new LinkedHashMap<>();
+        if (child.embed().path() != null) {
+            output.put(child.embed().path(), render(child.pathId()));
+        }
+        for (String field : child.embed().rollupFields().keySet()) {
+            output.put(field, render(child.pathId()) + " rollup field");
+        }
+        return output;
+    }
+
+    // ---- rollup fields ----------------------------------------------------------------------------
+
+    /**
+     * Refuses a rollup field whose name is already taken where it lands: by a column of the parent row, an
+     * embed's path, a flat field, or another rollup field, from this embed or a sibling. The existing pass
+     * for flat fields, widened to the one namespace every field of a level shares. A model that was not
+     * discovered contributes nothing here, and the render checks the actual row the same way.
+     */
+    private static void checkRollupFieldConflicts(String parentAlias, List<String> parentPathId,
+            List<Node> children, Function<String, NestTable> tables) {
+        String level = parentPathId.isEmpty() ? ROOT_NAMESPACE : render(parentPathId);
+        Map<String, String> occupied = new LinkedHashMap<>();
+        NestTable parent = tables.apply(parentAlias);
+        if (parent != null) {
+            for (String field : new TreeSet<>(parent.fields())) {
+                occupied.putIfAbsent(field, level + " row");
+            }
+        }
+        for (Node child : children) {
+            if (child.embed().path() != null) {
+                occupied.putIfAbsent(child.embed().path(), render(child.pathId()));
+            } else if (child.embed().as() == EmbedAs.FLAT) {
+                knownFlatOutput(child, tables).keySet()
+                        .forEach(field -> occupied.putIfAbsent(field, render(child.pathId())));
+            }
+        }
+        for (Node child : children) {
+            for (String field : child.embed().rollupFields().keySet()) {
+                for (Map.Entry<String, String> taken : occupied.entrySet()) {
+                    if (pathsOverlap(field, taken.getKey())) {
+                        throw new TapstateException(RollupError.FIELD_CONFLICT,
+                                Map.of("field", field, "level", level, "other", taken.getValue()), null);
+                    }
+                }
+                occupied.put(field, render(child.pathId()) + " rollup field");
+            }
+        }
+        for (Node child : children) {
+            checkRollupFieldConflicts(child.embed().from(), child.pathId(), child.children(), tables);
+        }
+    }
+
+    /**
+     * Checks and types every rollup field of the tree, deepest first, so a level's scope already carries the
+     * fields its own children's rollups write on its elements. A rollup can read those - a total over line
+     * totals - but nothing shallower, since it is computed before anything above it is.
+     */
+    private static void compileRollups(List<Node> deepestFirst, Function<String, NestTable> tables) {
+        for (Node node : deepestFirst) {
+            Map<String, RollupField> fields = node.embed().rollupFields();
+            if (fields.isEmpty()) {
+                continue;
+            }
+            if (node.referenced()) {
+                throw new TapstateException(RollupError.ON_REFERENCE_EMBED,
+                        Map.of("embedPath", render(node.pathId())), null);
+            }
+            RollupScope scope = scopeOf(node, tables);
+            List<RollupSpec> specs = new ArrayList<>();
+            fields.forEach((name, field) -> specs.add(RollupCompiler.compile(name, field, scope)));
+            node.rollups(specs);
+        }
+    }
+
+    /** One element of {@code node} as its rollup fields read it: columns, merged flat fields, references. */
+    private static RollupScope scopeOf(Node node, Function<String, NestTable> tables) {
+        NestTable table = tables.apply(node.embed().from());
+        Map<String, ValueType> columns = new LinkedHashMap<>(table == null ? Map.of() : table.types());
+        boolean known = table != null && !table.types().isEmpty();
+        Map<String, RollupScope> objects = new LinkedHashMap<>();
+        Map<String, RollupScope> arrays = new LinkedHashMap<>();
+        Map<String, Boolean> gathered = new LinkedHashMap<>();
+        for (Node child : node.children()) {
+            Embed embed = child.embed();
+            NestTable childTable = tables.apply(embed.from());
+            Map<String, ValueType> childTypes = childTable == null ? Map.of() : childTable.types();
+            if (embed.as() == EmbedAs.FLAT) {
+                childTypes.forEach(columns::putIfAbsent);
+            } else if (child.referenced() && embed.path() != null) {
+                RollupScope referenced = RollupScope.ofColumns(childTypes, !childTypes.isEmpty());
+                (embed.as() == EmbedAs.OBJECT ? objects : arrays).put(embed.path(), referenced);
+            } else if (embed.path() != null) {
+                gathered.put(embed.path(), embed.as() == EmbedAs.ARRAY);
+            }
+            for (RollupSpec spec : child.rollups()) {
+                columns.put(spec.field(), spec.resultType());
+            }
+        }
+        return new RollupScope(columns, known, objects, arrays, gathered);
     }
 
     /** Every candidate field that overlaps an occupied field, mapped to the existing owner. */
@@ -772,7 +951,9 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     private static void checkVertexCount(List<Node> all, int limit) {
         int vertices = 0;
         for (Node node : all) {
-            if (node.referenced() || !node.children().isEmpty()) {
+            if (node.referenced()) {
+                vertices += node.embed().alternatives().size();
+            } else if (!node.children().isEmpty()) {
                 vertices++;
             }
         }
@@ -793,13 +974,25 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             Embed embed = node.embed();
             slots.add(node.referenced()
                     ? new EmbedSlot(embed.treeSegment(), embed.path(), render(node.pathId()), embed.as(),
-                            referenceFields(embed),
+                            referenceFields(embed.on()),
                             mapName(pipelineId, nodeId, node.pathId()),
-                            slotsOf(pipelineId, nodeId, node.children()))
+                            slotsOf(pipelineId, nodeId, node.children()), node.rollups(),
+                            alternativeReferences(pipelineId, nodeId, node))
                     : new EmbedSlot(embed.treeSegment(), embed.path(), render(node.pathId()), embed.as(),
-                            null, null, slotsOf(pipelineId, nodeId, node.children())));
+                            null, null, slotsOf(pipelineId, nodeId, node.children()), node.rollups(), List.of()));
         }
         return slots;
+    }
+
+    /** Where a referenced slot's further alternatives are read from, after its own reference. */
+    private static List<EmbedSlot.Reference> alternativeReferences(String pipelineId, String nodeId, Node node) {
+        List<Map<String, String>> alternatives = node.embed().alternatives();
+        List<EmbedSlot.Reference> references = new ArrayList<>();
+        for (int i = 1; i < alternatives.size(); i++) {
+            references.add(new EmbedSlot.Reference(referenceFields(alternatives.get(i)),
+                    mapName(pipelineId, nodeId, alternativePathId(node.pathId(), i))));
+        }
+        return references;
     }
 
     private static String vertexName(String nodeId, List<String> pathId) {
@@ -872,6 +1065,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         private List<String> identity = List.of();
         private List<String> arrayKey;
         private boolean referenced;
+        private List<RollupSpec> rollups = List.of();
 
         private Node(Embed embed, List<String> pathId, List<String> parentPathId, String parentAlias,
                 List<String> parentKey, List<Node> children) {
@@ -889,6 +1083,15 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
 
         private List<String> parentKey() {
             return parentKey;
+        }
+
+        /** The rollup fields this embed writes on its parent, checked and typed; empty until compiled. */
+        private List<RollupSpec> rollups() {
+            return rollups;
+        }
+
+        private void rollups(List<RollupSpec> compiled) {
+            this.rollups = List.copyOf(compiled);
         }
 
         /** Whether the level above points at this embed's rows, rather than its rows naming that level. */

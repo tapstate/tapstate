@@ -21,6 +21,10 @@ final class ThreeLayerStorePort implements StorePort {
     private final BiConsumer<PipelineIntentScope, PipelinePreparationInputs> prepareCaptured;
     private final Control control;
     private final boolean deferFirstStart;
+    private SrsStores metadataStores;
+    private synchronized SrsStores metadataStores(){
+        active();if(metadataStores==null)metadataStores=bound.cache().srs(business(),this::active);return metadataStores;
+    }
     private record Control(PipelineIntentScope scope, WorkloadClaimFence claim, Runnable active,
             MongoConfigurationDomain.AuthoringModels models) {}
 
@@ -117,7 +121,7 @@ final class ThreeLayerStorePort implements StorePort {
     Optional<SourceCaptureResolution> sharedReading(io.tapstate.core.model.PipelineResource pipeline,
             io.tapstate.core.model.SourceResource source,SourceCaptureResolution canonical,boolean requireAttachment) {
         return sharedReading(pipeline, source, canonical, requireAttachment,
-                () -> bound.cache().srs(business(), this::active), true);
+                this::metadataStores, true);
     }
 
     SrsStores startPlanningSrs() {
@@ -525,6 +529,14 @@ final class ThreeLayerStorePort implements StorePort {
         });
     }
     Optional<SrsMeta> startProgress(String chain, SrsStores stores) {
+        if(stores.consumers().supportsControlSnapshot()){
+            var held=stores.consumers().controlSnapshot(chain);
+            if(held.isEmpty())return directPosition(chain);
+            var original=held.orElseThrow().chain();
+            return Optional.of(new SrsMeta(chain,original.resumeOverride()!=null?new ChainPosition(null,original.resumeOverride().token())
+                    :original.checkpoint()==null?null:original.checkpoint().position(),held.orElseThrow().cursors(),List.of(),original.retention(),original.epoch(),
+                    original.resumeOverride()!=null?original.resumeOverride().editedAt():original.checkpointAt(),original.resumeOverride()==null&&original.checkpoint()!=null));
+        }
         var shared = stores.chains().load(chain);
         if (shared.isEmpty()) return directPosition(chain);
         return shared.map(original -> {
@@ -541,7 +553,7 @@ final class ThreeLayerStorePort implements StorePort {
 
     @Override public SrsMetaStore meta() {
         return new SrsMetaStore() {
-            private SrsStores stores() { active(); return bound.cache().srs(business(), ThreeLayerStorePort.this::active); }
+            private SrsStores stores() { return metadataStores(); }
             @Override public Optional<SrsMeta> read(String chain) {
                 return startProgress(chain, stores());
             }

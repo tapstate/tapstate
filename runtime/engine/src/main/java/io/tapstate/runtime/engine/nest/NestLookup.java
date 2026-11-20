@@ -36,6 +36,13 @@ import java.util.Objects;
  * Both are settled while the tree is compiled, so nothing on a member works out where to send to - a graph
  * drawn from one answer and read with another would deliver every word to the wrong handling.
  *
+ * <p>{@code alternative} marks a lookup that files rows under one of an embed's {@code orOn} alternatives
+ * rather than under what identifies them. Such a key is an ordinary column: it can be null on many rows and
+ * it can be edited. A null never matches - it is neither filed nor registered, so the rows sharing it do not
+ * all wake each other - and an edit is followed by taking the row out from under the value it left, which
+ * needs the earlier row and is only done where the source sends one. {@code rowIdentity} names what does
+ * identify a row there, so a departure removes the entry only while it still holds that same row.
+ *
  * <p><b>Taking a record back out needs the row an update replaces, and that is a requirement on the
  * source rather than a switch here.</b> Recording where a row points needs only the row; knowing which
  * entry to take it out of needs where it pointed before, which is on the earlier row and nowhere else. So
@@ -53,7 +60,9 @@ public record NestLookup(
         List<String> referenceFields,
         List<String> referrerIdentity,
         List<String> referrerPathId,
-        int touchOrdinal) implements Serializable {
+        int touchOrdinal,
+        boolean alternative,
+        List<String> rowIdentity) implements Serializable {
 
     /**
      * How many buckets the identities pointing at one row are spread over.
@@ -91,8 +100,17 @@ public record NestLookup(
         return new LinkedHashMap<>();
     }
 
+    /** A lookup filing rows under what identifies them, which is every lookup not made for an alternative. */
+    public NestLookup(List<String> pathId, String alias, String name, String mapName, List<String> partitionKey,
+            String referrerAlias, List<String> referenceFields, List<String> referrerIdentity,
+            List<String> referrerPathId, int touchOrdinal) {
+        this(pathId, alias, name, mapName, partitionKey, referrerAlias, referenceFields, referrerIdentity,
+                referrerPathId, touchOrdinal, false, List.of());
+    }
+
     public NestLookup {
         Objects.requireNonNull(alias, "alias");
+        rowIdentity = rowIdentity == null ? List.of() : List.copyOf(rowIdentity);
         Objects.requireNonNull(name, "name");
         Objects.requireNonNull(mapName, "mapName");
         Objects.requireNonNull(referrerAlias, "referrerAlias");

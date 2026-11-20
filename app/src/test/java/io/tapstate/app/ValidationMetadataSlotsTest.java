@@ -18,7 +18,7 @@ class ValidationMetadataSlotsTest {
     @Test @Timeout(10) void realDiscoveryCanOwnAFrameAfterAReportHasFinishedAndAcquisitionRetainsItsOwnPartialSlots() throws Exception {
         var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var hold = new AtomicBoolean(true);
         var configuration = mock(MongoConfigurationDomain.class); var tasks = mock(ValidationTaskStore.class);
-        when(configuration.validationTasks(any(Runnable.class))).thenReturn(tasks);
+        when(configuration.pollingValidationTasks(any(Runnable.class))).thenReturn(tasks);
         when(tasks.pipelines(any(), eq(1))).thenReturn(List.of());
         Runnable active = () -> {
             if (Thread.currentThread().getName().startsWith("validation-control-io") && hold.compareAndSet(true, false)) {
@@ -41,7 +41,7 @@ class ValidationMetadataSlotsTest {
                 release.countDown(); owned = future.get(2, TimeUnit.SECONDS);
                 assertThat(owned).hasSize(4); assertThat(member.snapshot().metadataFrames()).isEqualTo(4);
                 assertThat(member.snapshot().processReserved().isEmpty()).isTrue();
-                verify(configuration, atLeastOnce()).validationTasks(any(Runnable.class));
+                verify(configuration, atLeastOnce()).pollingValidationTasks(any(Runnable.class));
             } finally {
                 release.countDown(); owned.forEach(ValidationMemberResources.Metadata::close);
                 if (future != null) future.cancel(true);

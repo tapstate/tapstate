@@ -24,9 +24,11 @@ class MongoValidationAiSchemaCompositionIT {
         try(var f=new MongoValidationSchemaIT.Fixture(0,StorageBinding.Mode.CLOUD,true)){
             assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(2);
             assertThatThrownBy(f.configuration::validationPreparations).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.configuration.pollingValidationTasks(() -> {})).isInstanceOf(TapstateException.class);
             f.configuration.aiProviderSettings().put(OWNER,SETTING);var row=SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first();
             var original=f.configuration.bindings().cachePreparation().orElseThrow();
             var receipt=f.configuration.prepareInitialValidationSchema(original,f.cache,()->{});assertThat(receipt.ready()).isTrue();
+            assertThat(f.configuration.pollingValidationTasks(() -> {})).isNotNull();
             assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(3);assertThat(f.cacheSchema().getInteger("installedVersion")).isEqualTo(2);
             assertThat(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first()).isEqualTo(row);
             try(var reopened=MongoConfigurationDomain.open(f.settings,"cluster")){

@@ -19,6 +19,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Judges a batch's row expressions against the columns their sources hold. The offline layers check
@@ -178,7 +179,7 @@ public final class RowExpressionTypeRules {
         }
         for (DiscoveredTable table : tablesReaching(expr, upstream, path)) {
             judgeTypes(expr, referenced, table, path,
-                    RowExpressions.typedPredicateError(expr, table.columns()));
+                    columns -> RowExpressions.typedPredicateError(expr, columns));
         }
     }
 
@@ -189,7 +190,7 @@ public final class RowExpressionTypeRules {
         }
         for (DiscoveredTable table : tablesReaching(expr, upstream, path)) {
             judgeTypes(expr, referenced, table, path,
-                    RowExpressions.typedValueError(expr, table.columns()));
+                    columns -> RowExpressions.typedValueError(expr, columns));
         }
     }
 
@@ -230,7 +231,7 @@ public final class RowExpressionTypeRules {
                         ? definition.body() : null;
             };
             if (body instanceof TransformBody.MapProjection projection) {
-                columns = projectedTypes(projection.fields(), columns);
+                columns = projectedTypes(projection.outputFields(), columns);
             }
         }
         return new DiscoveredTable(table.name(), columns);
@@ -282,7 +283,7 @@ public final class RowExpressionTypeRules {
     }
 
     private void judgeTypes(String expr, Set<String> referenced, DiscoveredTable table,
-            String path, String compileError) {
+            String path, Function<Map<String, TapstateType>, String> check) {
         // A column nothing resolved is refused however it is used - even a presence test - because
         // what may be done with it is exactly what is not known.
         for (String column : referenced) {
@@ -291,20 +292,37 @@ public final class RowExpressionTypeRules {
                         Map.of("expr", expr, "column", column, "table", table.name()));
             }
         }
+        String compileError = check.apply(table.columns());
         if (compileError == null) {
             return;
         }
-        // The expression does not check out. Naming the column whose type has no exact counterpart
-        // separates "this column cannot be computed on" from "this expression is wrong", which are
-        // different problems with different fixes.
-        for (String column : referenced) {
-            TapstateType type = table.columns().get(column);
-            if (type != null && RowExpressions.withoutExactCelType(type)) {
-                throw error(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED, path, Map.of(
-                        "expr", expr, "column", column, "type", type.name(), "table", table.name()));
-            }
+        String column = unsupportedColumn(referenced, table.columns(), compileError, check);
+        if (column != null) {
+            throw error(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED, path, Map.of(
+                    "expr", expr, "column", column, "type", table.columns().get(column).name(), "table", table.name()));
         }
         throw error(DslError.ILLEGAL_EXPRESSION, path, Map.of("expr", expr, "detail", compileError));
+    }
+
+    private static String unsupportedColumn(Set<String> referenced, Map<String, TapstateType> columns,
+            String compileError, Function<Map<String, TapstateType>, String> check) {
+        List<String> opaque = new ArrayList<>();
+        for (String column : referenced) {
+            TapstateType type = columns.get(column);
+            if (type != null && RowExpressions.withoutExactCelType(type)) opaque.add(column);
+        }
+        if (opaque.isEmpty() || compileError.equals(DecimalComparisonFunctions.EXACT_LITERAL_RANGE)) return null;
+        // Opaque columns can still take part in valid reads and comparisons. Attribute the
+        // error to a column only when restoring its type brings back the failure.
+        Map<String, TapstateType> probe = new LinkedHashMap<>(columns);
+        opaque.forEach(probe::remove);
+        if (check.apply(probe) != null) return null;
+        for (int i = opaque.size() - 1; i > 0; i--) {
+            String column = opaque.get(i);
+            probe.put(column, columns.get(column));
+            if (check.apply(probe) != null) return column;
+        }
+        return opaque.getFirst();
     }
 
     private static DslException error(DslError code, String path, Map<String, Object> args) {

@@ -91,6 +91,52 @@ class RowExpressionTypeRulesTest {
     }
 
     @Test
+    @DisplayName("comparing an exact fixed-point column to an integer or double passes without precision loss")
+    void decimalComparisonPasses() {
+        assertThatCode(() -> RowExpressionTypeRules.validate(
+                batch(filterPipeline("after.amount > 25")), model("amount", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(
+                batch(filterPipeline("after.i_name != 'cK6J3' && after.i_price > 25")),
+                model("i_name", TapstateType.STRING, "i_price", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void aValidDecimalComparisonDoesNotHideAnUnrelatedTypeError() {
+        String expression = "after.amount > 25 && after.qty > 'five'";
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(filterPipeline(expression)),
+                        model("amount", TapstateType.DECIMAL, "qty", TapstateType.INT64)));
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code()).isEqualTo(DslError.ILLEGAL_EXPRESSION);
+        assertThat(thrown.args()).containsEntry("expr", expression).doesNotContainKey("column");
+    }
+
+    @Test
+    void aDecimalTypeDiagnosticNamesTheOperandThatFails() {
+        String expression = "after.amount > 25 && after.fee * 2 > 0";
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(filterPipeline(expression)),
+                        model("amount", TapstateType.DECIMAL, "fee", TapstateType.DECIMAL)));
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+        assertThat(thrown.args()).containsEntry("column", "fee");
+    }
+
+    @Test
+    void anOpaqueColumnInAValidPresenceTestDoesNotHideInvalidDecimalArithmetic() {
+        String expression = "after.amount * 2 > 0 && has(after.created)";
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(filterPipeline(expression)),
+                        model("amount", TapstateType.DECIMAL, "created", TapstateType.DATE)));
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+        assertThat(thrown.args()).containsEntry("column", "amount");
+    }
+
+    @Test
     @DisplayName("a lossless numeric column passes, so the gate is not refusing numbers as a class")
     void losslessNumericPasses() {
         assertThatCode(() -> RowExpressionTypeRules.validate(
@@ -509,7 +555,7 @@ class RowExpressionTypeRulesTest {
                 kind: transform
                 id: keep_big
                 type: filter
-                expr: "after.amount > 0"
+                expr: "after.amount * 2 > 0"
                 """;
         String pipeline = """
                 version: tapstate/v1
