@@ -53,7 +53,7 @@ public final class AssemblyIdentity {
             return resource;
         }
         List<SourceRef> withoutSwitches = pipeline.sources().stream()
-                .map(ref -> SourceRef.of(ref.id(), null, ref.nodeConfig()))
+                .map(ref -> SourceRef.of(ref.id(), null, ref.nodeConfig(), ref.alias()))
                 .toList();
         return new PipelineResource(
                 pipeline.id(), pipeline.metadata(), withoutSwitches, pipeline.transforms(),

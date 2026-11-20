@@ -63,12 +63,14 @@ public final class PipelineDraftCompiler {
         requiredText(root.table(), "wizard root table");
         validateWizardIds(root, wizard.related());
 
-        LinkedHashSet<String> sourceIds = new LinkedHashSet<>();
-        sourceIds.add(root.sourceId());
-        wizard.related().forEach(related -> sourceIds.add(related.sourceId()));
-        addUnionSources(root.preTransforms(), sourceIds);
-        wizard.related().forEach(related -> addUnionSources(related.preTransforms(), sourceIds));
-        addUnionSources(wizard.transforms(), sourceIds);
+        Map<String, String> inputSources = new LinkedHashMap<>();
+        inputSources.put(root.id(), root.sourceId());
+        wizard.related().forEach(related -> inputSources.put(related.id(), related.sourceId()));
+        LinkedHashSet<String> unionSources = new LinkedHashSet<>();
+        addUnionSources(root.preTransforms(), unionSources);
+        wizard.related().forEach(related -> addUnionSources(related.preTransforms(), unionSources));
+        addUnionSources(wizard.transforms(), unionSources);
+        var bindings = sourceBindings(inputSources, unionSources, wizard.sourceNodeConfigs(), Map.of());
 
         Set<String> currentInputs = new LinkedHashSet<>();
         currentInputs.add(root.sourceId() + "." + root.table());
@@ -81,7 +83,7 @@ public final class PipelineDraftCompiler {
         LinkedHashMap<String, FromRef> aliases = new LinkedHashMap<>();
         List<Step> steps = new ArrayList<>();
         Map<String, String> outputAliases = new LinkedHashMap<>();
-        outputAliases.put(root.id(), compileBranch(root.id(), root.sourceId() + "." + root.table(),
+        outputAliases.put(root.id(), compileBranch(root.id(), bindings.get(root.id()).binding() + "." + root.table(),
                 root.preTransforms(), aliases, steps, currentInputs));
 
         Map<String, List<PipelineDraft.Related>> children = new LinkedHashMap<>();
@@ -91,7 +93,7 @@ public final class PipelineDraftCompiler {
             }
             children.computeIfAbsent(related.parentId(), ignored -> new ArrayList<>()).add(related);
             outputAliases.put(related.id(), compileBranch(related.id(),
-                    related.sourceId() + "." + related.table(), related.preTransforms(), aliases, steps,
+                    bindings.get(related.id()).binding() + "." + related.table(), related.preTransforms(), aliases, steps,
                     currentInputs));
         }
 
@@ -122,7 +124,7 @@ public final class PipelineDraftCompiler {
                 || firstText(wizard.output().config(), "table", "destinationTable") == null)
                 ? null : compileWizardOutput(wizard.output(), previous, root.table());
         return new PipelineResource(draft.pipelineId(), metadata(draft),
-                sourceRefs(sourceIds, wizard.sourceNodeConfigs()), steps, null, serve, null, Map.of());
+                sourceRefs(bindings, unionSources), steps, null, serve, null, Map.of());
     }
 
     private static ServeBlock compileWizardOutput(PipelineDraft.Output output, String from, String inputTable) {
@@ -321,11 +323,36 @@ public final class PipelineDraftCompiler {
         return Step.inline(transform.id(), from, body, Map.of());
     }
 
-    private static List<SourceRef> sourceRefs(Set<String> ids, Map<String, Map<String, Object>> configs) {
-        if (!ids.containsAll(configs.keySet())) {
-            throw new IllegalArgumentException("source node settings must refer to a Pipeline input");
+    private static Map<String, SourceRef> sourceBindings(Map<String, String> nodes, Set<String> otherSources,
+            Map<String, Map<String, Object>> configs, Map<String, String> existingAliases) {
+        if (!nodes.keySet().containsAll(configs.keySet())) {
+            throw new IllegalArgumentException("sourceNodeConfigs must reference input nodes");
         }
-        return ids.stream().map(id -> SourceRef.of(id, null, configs.get(id))).toList();
+        Map<String, Long> uses = nodes.values().stream().collect(java.util.stream.Collectors.groupingBy(
+                java.util.function.Function.identity(), java.util.stream.Collectors.counting()));
+        Set<String> occupied = new HashSet<>(nodes.values());
+        occupied.addAll(otherSources);
+        for (String alias : existingAliases.values()) {
+            if (!occupied.add(alias)) throw new IllegalArgumentException("duplicate source binding: " + alias);
+        }
+        Map<String, SourceRef> result = new LinkedHashMap<>();
+        nodes.forEach((node, source) -> {
+            String alias = existingAliases.get(node);
+            var config = configs.getOrDefault(node, Map.of());
+            if (alias == null && !config.isEmpty() && (uses.get(source) > 1 || otherSources.contains(source))) {
+                alias = "input_" + io.tapstate.core.model.canonical.CanonicalHash.ofText(node);
+                while (!occupied.add(alias)) alias += "_";
+            }
+            result.put(node, SourceRef.of(source, null, config, alias));
+        });
+        return result;
+    }
+
+    private static List<SourceRef> sourceRefs(Map<String, SourceRef> bindings, Set<String> otherSources) {
+        Map<String, SourceRef> refs = new LinkedHashMap<>();
+        bindings.values().forEach(ref -> refs.putIfAbsent(ref.binding(), ref));
+        otherSources.forEach(id -> refs.putIfAbsent(id, SourceRef.bare(id)));
+        return List.copyOf(refs.values());
     }
 
     private static void addUnionSources(List<PipelineDraft.Transform> transforms, Set<String> sourceIds) {
@@ -409,16 +436,20 @@ public final class PipelineDraftCompiler {
         if (graph.edges().size() > MAX_GRAPH_EDGES) {
             throw new IllegalArgumentException("graph exceeds the maximum edge count of " + MAX_GRAPH_EDGES);
         }
-        LinkedHashSet<String> sourceIds = new LinkedHashSet<>();
+        Map<String, String> inputSources = new LinkedHashMap<>();
+        Map<String, String> existingAliases = new LinkedHashMap<>();
         Map<String, PipelineDraft.Node> nodes = new LinkedHashMap<>();
         for (PipelineDraft.Node node : graph.nodes()) {
             if (nodes.put(node.id(), node) != null) {
                 throw new IllegalArgumentException("duplicate graph node: " + node.id());
             }
             if ("source".equals(node.type()) && node.sourceId() != null && !node.sourceId().isBlank()) {
-                sourceIds.add(node.sourceId());
+                inputSources.put(node.id(), node.sourceId());
+                String alias = optionalText(node.metadata(), "sourceAlias");
+                if (alias != null) existingAliases.put(node.id(), alias);
             }
         }
+        var bindings = sourceBindings(inputSources, Set.of(), graph.sourceNodeConfigs(), existingAliases);
         Map<String, List<String>> inputs = new LinkedHashMap<>();
         for (PipelineDraft.Edge edge : graph.edges()) {
             if (!nodes.containsKey(edge.source()) || !nodes.containsKey(edge.target())) {
@@ -436,7 +467,7 @@ public final class PipelineDraftCompiler {
                 if (view != null) {
                     throw new IllegalArgumentException("graph has more than one view node");
                 }
-                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
+                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps, bindings);
                 if (refs.size() != 1) {
                     throw new IllegalArgumentException("view node requires exactly one input: " + node.id());
                 }
@@ -451,7 +482,7 @@ public final class PipelineDraftCompiler {
                 if (serve != null) {
                     throw new IllegalArgumentException("graph has more than one target node");
                 }
-                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
+                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps, bindings);
                 if (refs.isEmpty()) {
                     throw new IllegalArgumentException("target node requires an input: " + node.id());
                 }
@@ -475,11 +506,11 @@ public final class PipelineDraftCompiler {
                         List.of(new SyncElement(node.id(), targetSource, writeMode(node.config(), node.id()), rename,
                                 null, onFullLoad(node.config(), node.id()))), null, null);
             } else {
-                graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
+                graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps, bindings);
             }
         }
         return new PipelineResource(draft.pipelineId(), metadata(draft),
-                sourceRefs(sourceIds, graph.sourceNodeConfigs()),
+                sourceRefs(bindings, Set.of()),
                 steps, view, serve, null, Map.of());
     }
 
@@ -636,7 +667,8 @@ public final class PipelineDraftCompiler {
     }
 
     private static List<String> graphOutputs(String nodeId, Map<String, PipelineDraft.Node> nodes,
-            Map<String, List<String>> inputs, Map<String, List<String>> outputs, Set<String> visiting, List<Step> steps) {
+            Map<String, List<String>> inputs, Map<String, List<String>> outputs, Set<String> visiting, List<Step> steps,
+            Map<String, SourceRef> bindings) {
         List<String> existing = outputs.get(nodeId);
         if (existing != null) {
             return existing;
@@ -651,14 +683,15 @@ public final class PipelineDraftCompiler {
         PipelineDraft.Node node = nodes.get(nodeId);
         List<String> result;
         if ("source".equals(node.type())) {
-            String sourceId = requiredNodeText(node.sourceId(), "source id", node.id());
+            requiredNodeText(node.sourceId(), "source id", node.id());
+            String sourceId = bindings.get(node.id()).binding();
             result = sourceTableSelections(node).stream()
                     .map(selection -> selection.reference(sourceId))
                     .toList();
         } else {
             List<String> refs = new ArrayList<>();
             for (String input : inputs.getOrDefault(nodeId, List.of())) {
-                refs.addAll(graphOutputs(input, nodes, inputs, outputs, visiting, steps));
+                refs.addAll(graphOutputs(input, nodes, inputs, outputs, visiting, steps, bindings));
             }
             if ("view".equals(node.type()) || "target".equals(node.type())) {
                 result = List.copyOf(refs);
@@ -666,7 +699,8 @@ public final class PipelineDraftCompiler {
                 if (!isGraphTransform(node)) {
                     throw new IllegalArgumentException("unsupported graph node: " + node.type());
                 }
-                FromClause from = graphTransformFrom(node, refs);
+                FromClause from = graphTransformFrom(node, refs, graphInputRenames(
+                        inputs.getOrDefault(node.id(), List.of()), nodes, bindings));
                 TransformBody body = graphTransformBody(node);
                 String stepId = graphStepId(node);
                 steps.add(Step.inline(stepId, from, body, graphTransformExperimental(node)));
@@ -690,7 +724,24 @@ public final class PipelineDraftCompiler {
                 ? node.id() : optionalText(node.metadata(), "stepId");
     }
 
-    private static FromClause graphTransformFrom(PipelineDraft.Node node, List<String> graphRefs) {
+    private static Map<String, String> graphInputRenames(List<String> inputIds,
+            Map<String, PipelineDraft.Node> nodes, Map<String, SourceRef> bindings) {
+        Map<String, String> renamed = new LinkedHashMap<>();
+        Set<String> ambiguous = new HashSet<>();
+        for (String inputId : inputIds) {
+            SourceRef ref = bindings.get(inputId);
+            if (ref == null || ref.alias() == null) continue;
+            for (var selection : sourceTableSelections(nodes.get(inputId))) {
+                String original = selection.reference(ref.id());
+                if (renamed.putIfAbsent(original, selection.reference(ref.binding())) != null) ambiguous.add(original);
+            }
+        }
+        ambiguous.forEach(renamed::remove);
+        return renamed;
+    }
+
+    private static FromClause graphTransformFrom(PipelineDraft.Node node, List<String> graphRefs,
+            Map<String, String> inputRenames) {
         Object configured = node.config().get("from");
         boolean aliasMap = "join".equals(node.type()) || "nest".equals(node.type());
         if (configured != null) {
@@ -706,12 +757,12 @@ public final class PipelineDraftCompiler {
                         throw new IllegalArgumentException("graph transform from aliases must map names to refs: "
                                 + node.id());
                     }
-                    refs.put(alias, graphFromRef(ref));
+                    refs.put(alias, graphFromRef(inputRenames.getOrDefault(ref, ref)));
                 }
                 return FromClause.aliases(refs);
             }
             if (configured instanceof String ref && !ref.isBlank()) {
-                return FromClause.list(graphFromRef(ref));
+                return FromClause.list(graphFromRef(inputRenames.getOrDefault(ref, ref)));
             }
             if (configured instanceof List<?> values) {
                 List<FromRef> refs = new ArrayList<>();
@@ -720,7 +771,7 @@ public final class PipelineDraftCompiler {
                         throw new IllegalArgumentException("graph transform from must contain non-blank refs: "
                                 + node.id());
                     }
-                    refs.add(graphFromRef(ref));
+                    refs.add(graphFromRef(inputRenames.getOrDefault(ref, ref)));
                 }
                 if (!refs.isEmpty()) {
                     return new FromClause.Flow(refs);

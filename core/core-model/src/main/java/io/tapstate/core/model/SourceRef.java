@@ -20,9 +20,22 @@ public sealed interface SourceRef {
         return Map.of();
     }
 
+    /** Optional Pipeline-local name for an independently configured use of this Source. */
+    default String alias() {
+        return null;
+    }
+
+    default String binding() {
+        return alias() == null ? id() : alias();
+    }
+
     static SourceRef of(String id, Boolean srs, Map<String, Object> nodeConfig) {
-        return srs == null && (nodeConfig == null || nodeConfig.isEmpty())
-                ? bare(id) : new Spec(id, srs, nodeConfig);
+        return of(id, srs, nodeConfig, null);
+    }
+
+    static SourceRef of(String id, Boolean srs, Map<String, Object> nodeConfig, String alias) {
+        return srs == null && alias == null && (nodeConfig == null || nodeConfig.isEmpty())
+                ? bare(id) : new Spec(id, srs, nodeConfig, alias);
     }
 
     static Spec spec(String id, Boolean srs) {
@@ -47,17 +60,26 @@ public sealed interface SourceRef {
             Boolean srs,
             @Doc(value = "Connector node parameters for this Pipeline. Omitted fields inherit from the Source.",
                     key = "nodeConfig")
-            Map<String, Object> nodeConfig)
+            Map<String, Object> nodeConfig,
+            @Doc(value = "Pipeline-local input name used in from references.", key = "as")
+            String alias)
             implements SourceRef {
         public Spec(String id, Boolean srs) {
-            this(id, srs, Map.of());
+            this(id, srs, Map.of(), null);
+        }
+
+        public Spec(String id, Boolean srs, Map<String, Object> nodeConfig) {
+            this(id, srs, nodeConfig, null);
         }
 
         public Spec {
             Objects.requireNonNull(id, "id");
             nodeConfig = nodeConfig == null ? Map.of()
                     : Collections.unmodifiableMap(new LinkedHashMap<>(nodeConfig));
-            if (srs == null && nodeConfig.isEmpty()) {
+            if (alias != null && (alias.isBlank() || alias.contains("."))) {
+                throw new IllegalArgumentException("source alias must be non-blank and contain no dot");
+            }
+            if (srs == null && alias == null && nodeConfig.isEmpty()) {
                 throw new IllegalArgumentException("a Source reference with no settings must use the bare form");
             }
         }

@@ -11,8 +11,12 @@ public final class PipelineSourceConfig {
 
     /** Shared capture identity for this Pipeline's effective use of a Source. */
     public static String chain(PipelineResource pipeline, SourceResource source) {
+        return chain(pipeline.sourceReference(source.id()), source);
+    }
+
+    public static String chain(SourceRef reference, SourceResource source) {
         return io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(source.connector(),
-                settings(pipeline, source), source.srs() == null ? null : source.srs().key(), overrides(pipeline, source));
+                settings(reference, source), source.srs() == null ? null : source.srs().key(), overrides(reference, source));
     }
 
     /** The connector/configuration fingerprint used by preparation guards. */
@@ -22,15 +26,22 @@ public final class PipelineSourceConfig {
 
     /** A detached runtime view used by connector operations that accept a Source value. */
     public static SourceResource effective(PipelineResource pipeline, SourceResource source) {
-        var settings = settings(pipeline, source);
+        return effective(pipeline.sourceReference(source.id()), source);
+    }
+
+    public static SourceResource effective(SourceRef reference, SourceResource source) {
+        var settings = settings(reference, source);
         return settings == source.config() ? source : new SourceResource(source.id(), source.metadata(), source.connector(),
                 settings, source.mode(), source.tables(), source.srs(), source.execution(), source.experimental());
     }
 
     /** Local values that change the connector's effective configuration. */
     public static Map<String, Object> overrides(PipelineResource pipeline, SourceResource source) {
-        var reference = pipeline.sources().stream().filter(ref -> ref.id().equals(source.id()))
-                .findFirst().orElseThrow(() -> new IllegalArgumentException("Pipeline does not reference Source"));
+        return overrides(pipeline.sourceReference(source.id()), source);
+    }
+
+    public static Map<String, Object> overrides(SourceRef reference, SourceResource source) {
+        if (!reference.id().equals(source.id())) throw new IllegalArgumentException("Source binding mismatch");
         if (reference.nodeConfig().isEmpty()) return Map.of();
         var result = new LinkedHashMap<String, Object>();
         reference.nodeConfig().forEach((name, value) -> {
@@ -43,7 +54,11 @@ public final class PipelineSourceConfig {
 
     /** Explicit local false and null values take precedence just as any other authored value does. */
     public static Map<String, Object> settings(PipelineResource pipeline, SourceResource source) {
-        var overrides = overrides(pipeline, source);
+        return settings(pipeline.sourceReference(source.id()), source);
+    }
+
+    public static Map<String, Object> settings(SourceRef reference, SourceResource source) {
+        var overrides = overrides(reference, source);
         if (overrides.isEmpty()) return source.config();
         var result = new LinkedHashMap<>(source.config());
         result.putAll(overrides);

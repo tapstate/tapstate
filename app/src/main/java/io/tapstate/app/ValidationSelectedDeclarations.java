@@ -54,8 +54,14 @@ final class ValidationSelectedDeclarations {
                     table(source.id(),source,choice.table()),table(choice.outputId(),target,TableRename.apply(choice.table(),inspection.sync().rename())),null));
         }
         var mappings=ValidationDirectMappings.declare(artifacts,draft,mapping->inspections.get(mapping.outputId()));
-        for(var mapping:mappings)if(!PipelineTableSelection.selectsName(mapping.from(),mapping.source(),mapping.mapping().source().table()))
-            throw invalid("sourceTableScope");
+        for (var mapping : mappings) {
+            var source = mapping.source();
+            var table = mapping.mapping().source().table();
+            if (pipeline.sources().stream().filter(ref -> ref.id().equals(source.id())).noneMatch(ref ->
+                    PipelineTableSelection.selectsName(mapping.from(), source, ref.binding(), table, ref.alias() != null))) {
+                throw invalid("sourceTableScope");
+            }
+        }
         return new ValidationSelectedDeclarations(original,artifacts,mappings,inspections);
     }
     private static ValidationTaskSpec.Table table(String node,SourceResource resource,String table){

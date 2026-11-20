@@ -87,13 +87,14 @@ final class PipelineRecoveryInspector {
         var artifacts=new TreeMap<String,String>();var modelHashes=new TreeMap<String,String>();
         var originalContexts=new LinkedHashMap<String,SourceResource>();
         var resolver=new TargetModelResolver(store,snapshot,models::model);
-        for(var source:sources.values()) {
+        for(var ref:pipeline.sources()) {
+            var source=sources.get(ref.id());
             var registered=inspectConnector(source,artifacts);requireCapability(source,registered,"batch_read_function");
             if(source.mode()==SourceMode.CDC && (pipeline.settings()==null || pipeline.settings().readMode()!=ReadMode.SNAPSHOT_ONLY))
                 requireCapability(source,registered,"stream_read_function");
             var model=models.model(source);
             if(model==null)throw new TapstateException(ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED,Map.of("source",source.id()),null);
-            var selected=inputs.selectedTables().get(source.id());
+            var selected=inputs.selectedTables().get(ref.binding());
             for(var table:model.tables())if(selected.contains(table.name()) && table.fields().stream().anyMatch(field -> field.type()==TapstateType.UNKNOWN))
                 throw new TapstateException(ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED,Map.of("source",source.id()),null);
             var resolved=resolver.resolveAll(source.id());
@@ -102,18 +103,18 @@ final class PipelineRecoveryInspector {
                 modelHashes.put(source.id()+"."+table,PdkSinkPreparations.modelHash(target));
             }
             if(probeSources) {
-                active.run();var live=liveModels.apply(PipelineSourceConfig.effective(pipeline, source),artifacts.get(source.connector()));active.run();
-                if(live==null || !selected.equals(Set.copyOf(PipelineTableSelection.resolve(pipeline,source,live))))throw staleModel(source);
+                active.run();var live=liveModels.apply(PipelineSourceConfig.effective(ref, source),artifacts.get(source.connector()));active.run();
+                if(live==null || !selected.equals(Set.copyOf(PipelineTableSelection.resolve(pipeline,ref,source,live))))throw staleModel(source);
                 var actual=new TargetModelResolver(store,snapshot,ignored -> live).resolveAll(source.id());
                 for(String table:selected)if(actual.get(table)==null || !PdkSinkPreparations.modelHash(actual.get(table)).equals(modelHashes.get(source.id()+"."+table)))
                     throw staleModel(source);
             }
-            originalContexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,source.id()),PipelineNode.Purpose.CAPTURE),PipelineSourceConfig.effective(pipeline, source));
-            boolean shared=pipeline.sources().stream().anyMatch(reference -> reference.id().equals(source.id()) && reference instanceof SourceRef.Spec spec && spec.srs())
+            originalContexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE),PipelineSourceConfig.effective(ref, source));
+            boolean shared=ref instanceof SourceRef.Spec spec && spec.srs()
                     && (pipeline.settings()==null || pipeline.settings().readMode()!=ReadMode.SNAPSHOT_ONLY);
             if(shared) {
-                var retained=configuration.capturePreparations().inspectSharedOrigin(new CacheBusinessScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation()),source.id(),CanonicalHash.of(source),pipeline.id(),CanonicalHash.of(authored));
-                var expected=ConnectorNoteOrigin.capture(source.connector(),artifacts.get(source.connector()),PipelineSourceConfig.settings(pipeline, source));
+                var retained=configuration.capturePreparations().inspectSharedOrigin(new CacheBusinessScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation()),ref.binding(),CanonicalHash.of(source),pipeline.id(),CanonicalHash.of(authored));
+                var expected=ConnectorNoteOrigin.capture(source.connector(),artifacts.get(source.connector()),PipelineSourceConfig.settings(ref, source));
                 if(retained.isPresent() && !retained.orElseThrow().equals(expected))throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH,Map.of(),null);
             }
         }

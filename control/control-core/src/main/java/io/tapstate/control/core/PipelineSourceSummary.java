@@ -7,7 +7,7 @@ import java.util.Objects;
 
 /** Stable Source identity and display metadata embedded in a Pipeline projection. */
 public record PipelineSourceSummary(String id, Metadata metadata, String connector, boolean resolved,
-        Map<String, Object> nodeConfig) {
+        Map<String, Object> nodeConfig, String alias) {
 
     public PipelineSourceSummary {
         Objects.requireNonNull(id, "id");
@@ -15,6 +15,15 @@ public record PipelineSourceSummary(String id, Metadata metadata, String connect
         if (resolved) {
             Objects.requireNonNull(connector, "connector");
         }
+    }
+
+    public PipelineSourceSummary(String id, Metadata metadata, String connector, boolean resolved,
+            Map<String, Object> nodeConfig) {
+        this(id, metadata, connector, resolved, nodeConfig, null);
+    }
+
+    String binding() {
+        return alias == null ? id : alias;
     }
 
     public PipelineSourceSummary(String id, Metadata metadata, String connector, boolean resolved) {

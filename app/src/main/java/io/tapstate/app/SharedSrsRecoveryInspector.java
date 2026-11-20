@@ -52,10 +52,12 @@ final class SharedSrsRecoveryInspector {
         var origin=configuration.requiredNotes().guardedBy(active).origin(token);ConnectorNoteOrigin.requireReadable(origin);
         for(var consumer:observed.consumers()) {
             var key=consumer.context().key();
-            var source=StoredArtifacts.requireSource(artifacts,key.sourceId());
             var pipeline=StoredArtifacts.requirePipeline(artifacts,key.pipelineId());
-            var settings=io.tapstate.core.model.PipelineSourceConfig.settings(pipeline,source);
-            String canonical=io.tapstate.core.model.PipelineSourceConfig.chain(pipeline,source);
+            if (!pipeline.sourceBindings().contains(key.sourceId())) throw fenced();
+            var ref=pipeline.sourceReference(key.sourceId());
+            var source=StoredArtifacts.requireSource(artifacts,ref.id());
+            var settings=io.tapstate.core.model.PipelineSourceConfig.settings(ref,source);
+            String canonical=io.tapstate.core.model.PipelineSourceConfig.chain(ref,source);
             if(!canonical.equals(selection.canonicalChain()) || !SourceCaptureIdentity.physical(source.connector(),settings).equals(observed.previous().sourceIdentityHash())
                     || !origin.equals(ConnectorNoteOrigin.capture(source.connector(),origin.artifactHash(),settings)))throw fenced();
         }

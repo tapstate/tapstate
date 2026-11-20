@@ -216,15 +216,16 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         String expectedHash = completed.inputs.sourceHashes().get(sourceId);
         if (expectedHash == null) throw fenced();
         var owner = completed.owner;
-        var source = owner.artifacts.get(sourceId).filter(io.tapstate.core.model.SourceResource.class::isInstance)
-                .map(io.tapstate.core.model.SourceResource.class::cast).orElseThrow(MongoPipelineStateRebuilds::fenced);
         var pipeline = owner.artifacts.get(completed.targetScope.pipelineId()).filter(io.tapstate.core.model.PipelineResource.class::isInstance)
                 .map(io.tapstate.core.model.PipelineResource.class::cast).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        if (!pipeline.sourceBindings().contains(sourceId)) throw fenced();
+        var ref = pipeline.sourceReference(sourceId);
+        var source = owner.artifacts.get(ref.id()).filter(io.tapstate.core.model.SourceResource.class::isInstance)
+                .map(io.tapstate.core.model.SourceResource.class::cast).orElseThrow(MongoPipelineStateRebuilds::fenced);
         if (!expectedHash.equals(CanonicalHash.of(source))
                 || pipeline.settings() != null && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY
-                || pipeline.sources().stream().noneMatch(ref -> ref.id().equals(sourceId)
-                    && ref instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs())) throw fenced();
-        String actual = io.tapstate.core.model.PipelineSourceConfig.chain(pipeline, source);
+                || !(ref instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs())) throw fenced();
+        String actual = io.tapstate.core.model.PipelineSourceConfig.chain(ref, source);
         var target = completed.targetScope;
         var captures = new MongoCaptureStatePreparations(owner.client, owner.database, owner.clusterId, owner.bindings, owner.artifacts, owner.requireActive);
         var prepared = captures.read(new CacheBusinessScope(target.clusterId(), target.bindingVersion(), target.cacheIncarnation()),
@@ -355,7 +356,12 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                     known.put(target.id(), target); queue.add(target);
                 }
                 if (!edge.kind().equals(target.kind())) throw fenced();
-                String actual = CanonicalHash.of(target), capture = inputs.sourceHashes().get(edge.id());
+                String actual = CanonicalHash.of(target);
+                String capture = resource == root && root instanceof io.tapstate.core.model.PipelineResource pipeline
+                        ? pipeline.sources().stream().filter(ref -> ref.id().equals(edge.id()))
+                                .map(ref -> inputs.sourceHashes().get(ref.binding()))
+                                .filter(java.util.Objects::nonNull).findFirst().orElse(null)
+                        : inputs.sourceHashes().get(edge.id());
                 String dependency = dependencies.get(edge.id());
                 if (capture == null ? !actual.equals(dependency) : !actual.equals(capture)) throw fenced();
                 if (dependency != null) {

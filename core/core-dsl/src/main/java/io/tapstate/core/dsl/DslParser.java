@@ -134,7 +134,7 @@ public final class DslParser {
     private static final Set<String> COLD_KEYS = Set.of("partition_by");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
-    static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs", "nodeConfig");
+    static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs", "nodeConfig", "as");
     static final Set<String> SYNC_KEYS = Set.of(
             "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD, EXECUTION_FIELD);
     static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
@@ -453,7 +453,7 @@ public final class DslParser {
         YamlMap ref = YamlMap.requireMapping(item, SOURCE_TOKEN);
         ref.requireOnly(SOURCE_REF_KEYS);
         Boolean srs = boolValue(ref, "srs");
-        return SourceRef.of(ref.requireString("id"), srs, ref.freeMap("nodeConfig"));
+        return SourceRef.of(ref.requireString("id"), srs, ref.freeMap("nodeConfig"), ref.string("as"));
     }
 
     // ---- transforms ---------------------------------------------------------------

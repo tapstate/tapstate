@@ -54,9 +54,9 @@ final class SourceModelSnapshot {
         requirePipeline(scope.pipelineId());
         if (!original.id().equals(scope.pipelineId()) || !selected.id().equals(original.id()) || !original.sources().equals(selected.sources())) throw fenced();
         var selections = new LinkedHashMap<String,java.util.Set<String>>();
-        for (String id : original.sourceIds()) {
-            var source = sources.get(id); if (source == null) throw fenced();
-            selections.put(id,java.util.Set.copyOf(PipelineTableSelection.resolve(selected,source,model(source))));
+        for (var ref : original.sources()) {
+            var source = sources.get(ref.id()); if (source == null) throw fenced();
+            selections.put(ref.binding(),java.util.Set.copyOf(PipelineTableSelection.resolve(selected,ref,source,model(source))));
         }
         return PipelinePreparationInputs.of(scope,original,sources,selections);
     }

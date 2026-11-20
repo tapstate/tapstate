@@ -61,20 +61,30 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
-    void compilesOneOverrideForAllWizardTablesOfTheSameSource() {
+    void compilesIndependentOverridesForWizardTablesOfTheSameSource() {
         PipelineDraft template = wizardDraft();
         PipelineDraft.Wizard wizard = template.wizard();
         PipelineDraft configured = new PipelineDraft(template.pipelineId(), template.schemaVersion(),
                 template.revision(), template.mode(), template.name(), template.description(), null,
                 new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(), wizard.output(),
-                        Map.of("crm", Map.of("preImage", false))),
+                        Map.of("orders", Map.of("preImage", true), "policy", Map.of("preImage", false))),
                 template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
                 template.createdAt(), template.updatedAt(), template.updatedBy());
 
         PipelineResource compiled = compiler.compile(configured);
 
-        assertThat(compiled.sourceIds()).containsExactly("crm");
-        assertThat(compiled.sources().getFirst().nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", false));
+        assertThat(compiled.sourceIds()).containsExactly("crm", "crm", "crm");
+        assertThat(compiled.sourceBindings()).doesNotHaveDuplicates();
+        var root = compiled.sources().get(0);
+        var policy = compiled.sources().get(1);
+        assertThat(root.nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", true));
+        assertThat(policy.nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", false));
+        assertThat(compiled.sources().get(2).nodeConfig()).isEmpty();
+        var nest = compiled.transforms().stream().filter(step -> step.id().endsWith("__nest")).findFirst().orElseThrow();
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("orders", FromRef.literal(root.binding() + ".orders"));
+        var policyStep = compiled.transforms().stream().filter(step -> step.id().equals("policy__pre")).findFirst().orElseThrow();
+        assertThat(policyStep.from()).isEqualTo(FromClause.list(FromRef.literal(policy.binding() + ".policies")));
     }
 
     @Test
@@ -327,7 +337,7 @@ class PipelineDraftCompilerTest {
                         new PipelineDraft.Edge("source-to-filter", "source-orders", "active-orders"),
                         new PipelineDraft.Edge("filter-to-view", "active-orders", "orders-view"),
                         new PipelineDraft.Edge("filter-to-target", "active-orders", "warehouse-orders")),
-                new PipelineDraft.Viewport(0, 0, 1), Map.of("crm", Map.of("preImage", false)));
+                new PipelineDraft.Viewport(0, 0, 1), Map.of("source-orders", Map.of("preImage", false)));
         PipelineDraft draft = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG,
                 "Orders", "", graph, null, null, null, null,
                 java.time.Instant.parse("2026-09-21T00:00:00Z"),

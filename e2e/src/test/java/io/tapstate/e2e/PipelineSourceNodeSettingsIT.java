@@ -54,7 +54,7 @@ class PipelineSourceNodeSettingsIT {
 
             control.createPipelineDraft(OVERRIDDEN, draft(OVERRIDDEN, "healthy", Map.of()));
             String endpoint = "/api/pipelines/" + OVERRIDDEN;
-            Map<String, Object> overrides = Map.of(SOURCE, Map.of("fail_cdc", false));
+            Map<String, Object> overrides = Map.of("orders", Map.of("fail_cdc", false));
             control.sourceRequest("PUT", endpoint + "/draft", draft(OVERRIDDEN, "healthy", overrides), "\"1\"", 200);
             Map<?, ?> reopened = (Map<?, ?>) control.pipelineDraft(OVERRIDDEN).orElseThrow().get("wizard");
             assertThat(reopened.get("sourceNodeConfigs")).isEqualTo(overrides);
@@ -93,6 +93,68 @@ class PipelineSourceNodeSettingsIT {
         }
     }
 
+    @Test
+    void nodesOfOnePipelineOpenSeparateCapturesAndRestoreOneOverride(@TempDir Path directory) throws Exception {
+        Path input = Files.createDirectory(directory.resolve("input"));
+        Path output = Files.createDirectory(directory.resolve("output"));
+        FileEndpoints.replaceTable(input.resolve("orders.csv"), "id,seq\n1,10\n");
+        FileEndpoints.replaceTable(input.resolve("items.csv"), "id,order_id,seq\n2,1,20\n");
+
+        try (var storage = PreparedNativeStore.create(); var server = Tiers.IN_PROCESS.launch(storage)) {
+            var control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            control.apply(Map.of("input.tap.yml", """
+                    version: tapstate/v1
+                    kind: source
+                    id: shared_orders
+                    connector: e2e_file
+                    config: { uri: "%s", fail_cdc: false }
+                    mode: cdc
+                    tables: [orders, items]
+                    srs: { key: order_database }
+                    """.formatted(input), "target.tap.yml", Workspaces.targetYaml("output", output)));
+            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", input.toString()));
+            String originalSource = control.contentHash(SOURCE);
+            String pipeline = "orders_with_items";
+            String endpoint = "/api/pipelines/" + pipeline;
+            Map<String, Object> overrides = Map.of(
+                    "orders", Map.of("fail_cdc", false), "items", Map.of("fail_cdc", true));
+            control.createPipelineDraft(pipeline, draftWithItems(pipeline, overrides));
+            control.sourceRequest("POST", endpoint + "/draft:publish", Map.of("revision", 1), null, 200);
+
+            Map<?, ?> published = (Map<?, ?>) JsonReader.parse(
+                    control.sourceRequest("GET", endpoint, null, null, 200).body());
+            var sources = (List<?>) published.get("sources");
+            assertThat(sources).hasSize(2);
+            assertThat(sources.stream().map(value -> ((Map<?, ?>) value).get("nodeConfig")).toList())
+                    .isEqualTo(List.of(Map.of("fail_cdc", false), Map.of("fail_cdc", true)));
+            control.lifecycle(pipeline, LifecycleVerb.START);
+            awaitState(control, pipeline, PipelineState.FAILED);
+            control.stop(pipeline, false);
+            awaitState(control, pipeline, PipelineState.STOPPED);
+
+            String previousArtifact = control.contentHash(pipeline);
+            Map<String, Object> restored = Map.of("orders", Map.of("fail_cdc", false));
+            control.sourceRequest("PUT", endpoint + "/draft", draftWithItems(pipeline, restored), "\"1\"", 200);
+            control.sourceRequest("POST", endpoint + "/draft:publish",
+                    Map.of("revision", 2, "artifactHash", previousArtifact), null, 200);
+            Map<?, ?> wizard = (Map<?, ?>) control.pipelineDraft(pipeline).orElseThrow().get("wizard");
+            assertThat(wizard.get("sourceNodeConfigs")).isEqualTo(restored);
+            control.lifecycle(pipeline, LifecycleVerb.START);
+            awaitState(control, pipeline, PipelineState.RUNNING);
+            assertThat(control.contentHash(SOURCE)).isEqualTo(originalSource);
+        }
+    }
+
+    private static Map<String, Object> draftWithItems(String id, Map<String, Object> overrides) {
+        return draft(id, "output", overrides, List.of(Map.of(
+                "id", "items", "parentId", "orders", "sourceId", SOURCE, "table", "items",
+                "relation", Map.of("shape", "array", "path", "items", "key", List.of("id"),
+                        "arrayKey", List.of("id"), "on", List.of(Map.of("childField", "order_id", "parentField", "id"))))));
+    }
+
     private static void awaitState(ControlPlane control, String id, PipelineState state) {
         Await.until(id + " to reach " + state, TIMEOUT,
                 () -> control.state(id).filter(state::equals).isPresent(),
@@ -100,10 +162,15 @@ class PipelineSourceNodeSettingsIT {
     }
 
     private static Map<String, Object> draft(String id, String target, Map<String, Object> overrides) {
+        return draft(id, target, overrides, List.of());
+    }
+
+    private static Map<String, Object> draft(String id, String target, Map<String, Object> overrides,
+            List<Map<String, Object>> related) {
         return Map.of("pipelineId", id, "mode", "wizard", "name", id, "wizard", Map.of(
                 "root", Map.of("id", "orders", "sourceId", SOURCE, "table", "orders",
                         "key", List.of("id"), "preTransforms", List.of()),
-                "related", List.of(), "transforms", List.of(), "sourceNodeConfigs", overrides,
+                "related", related, "transforms", List.of(), "sourceNodeConfigs", overrides,
                 "output", Map.of("kind", "source", "config", Map.of("sourceId", target, "table", "orders"))));
     }
 }

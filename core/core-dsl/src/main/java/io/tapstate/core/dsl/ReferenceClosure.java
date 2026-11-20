@@ -169,7 +169,7 @@ final class ReferenceClosure {
         if (p.transforms() == null) {
             return;
         }
-        Set<String> sourceIds = new LinkedHashSet<>(p.sourceIds());
+        Set<String> sourceIds = new LinkedHashSet<>(p.sourceBindings());
         Set<String> literalTables = new HashSet<>();
         for (SourceTables st : universe) {
             literalTables.addAll(st.literals);
@@ -313,20 +313,22 @@ final class ReferenceClosure {
     }
 
     private List<SourceTables> universeOf(PipelineResource p) {
-        // The universe is a SET of sources: a source listed twice contributes one table set, so a
-        // duplicate id never inflates the cross-source match count into a false ambiguity. (Rejecting
-        // a duplicate id in the source list itself is a separate concern, out of B3-6 closure scope.)
-        List<SourceTables> out = new ArrayList<>();
-        for (String sid : new LinkedHashSet<>(p.sourceIds())) {
-            out.add(tableSetOf(sources.get(sid)));     // sources resolved above
+        Map<String, SourceTables> out = new LinkedHashMap<>();
+        Set<String> aliases = new HashSet<>();
+        for (var ref : p.sources()) {
+            if (ref.alias() != null) aliases.add(ref.binding());
+            if (out.putIfAbsent(ref.binding(), tableSetOf(ref.binding(), sources.get(ref.id()))) != null
+                    && aliases.contains(ref.binding())) {
+                throw new DslException(DslError.DUPLICATE_ID, "source", 0, 0, null, Map.of("id", ref.binding()));
+            }
         }
-        return out;
+        return List.copyOf(out.values());
     }
 
-    private static SourceTables tableSetOf(SourceResource s) {
+    private static SourceTables tableSetOf(String binding, SourceResource s) {
         List<TableRef> tables = s.tables();
         if (tables == null) {
-            return new SourceTables(s.id(), Set.of(), true);    // omitted = whole source (open, §4)
+            return new SourceTables(binding, Set.of(), true);    // omitted = whole source (open, §4)
         }
         Set<String> literals = new HashSet<>();
         boolean open = false;
@@ -337,7 +339,7 @@ final class ReferenceClosure {
                 case TableRef.Regex r -> open = true;           // dynamic: new tables may join
             }
         }
-        return new SourceTables(s.id(), literals, open);
+        return new SourceTables(binding, literals, open);
     }
 
     private static FromRef viewFrom(ViewBlock v) {

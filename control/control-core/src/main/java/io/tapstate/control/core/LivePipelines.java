@@ -155,7 +155,7 @@ public final class LivePipelines {
         Map<String, Map<String, Object>> configs = new LinkedHashMap<>();
         for (SourceRef ref : pipeline.sources()) {
             if (!ref.nodeConfig().isEmpty()) {
-                configs.put(ref.id(), ref.nodeConfig());
+                configs.put(ref.binding(), ref.nodeConfig());
             }
         }
         return configs;

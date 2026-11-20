@@ -243,6 +243,40 @@ class SourceCaptureResolutionTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void sameSourceBindingsKeepIndependentSettingsAndPreparedReaders(boolean shared) {
+        var source = new SourceResource("crm", null, "mongodb", Map.of("host", "h", "preImage", true),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("items")),
+                new Srs("same-database", null, null, null, null), null);
+        var orders = new SourceRef.Spec("crm", shared, Map.of("preImage", true), "root_input");
+        var items = new SourceRef.Spec("crm", shared, Map.of("preImage", false), "items_input");
+        var view = new io.tapstate.core.model.ViewBlock.Inline("orders_view",
+                io.tapstate.core.model.FromRef.literal("root_input.orders"), null, null);
+        var step = io.tapstate.core.model.Step.inline("items",
+                io.tapstate.core.model.FromClause.list(io.tapstate.core.model.FromRef.literal("items_input.items")),
+                new io.tapstate.core.model.TransformBody.Filter("true"), Map.of());
+        var pipeline = new PipelineResource("pipeline", null, List.of(orders, items), List.of(step), view,
+                null, null, null);
+        var root = SourceCaptureResolution.forPipeline(pipeline, orders, source, null).orElseThrow();
+        var child = SourceCaptureResolution.forPipeline(pipeline, items, source, null).orElseThrow();
+        assertThat(root.config().streams()).containsExactly("orders");
+        assertThat(child.config().streams()).containsExactly("items");
+        assertThat(root.config().settings()).containsEntry("preImage", true);
+        assertThat(child.config().settings()).containsEntry("preImage", false);
+        assertThat(root.chainId()).isNotEqualTo(child.chainId());
+        var scope = new io.tapstate.spi.store.PipelineIntentScope("cluster", 1L, "cache", pipeline.id(), 1L);
+        var inputs = io.tapstate.spi.store.PipelinePreparationInputs.of(scope, pipeline, Map.of("crm", source),
+                Map.of(orders.binding(), java.util.Set.of("orders"), items.binding(), java.util.Set.of("items")));
+        assertThat(inputs.sourceHashes()).containsOnlyKeys(orders.binding(), items.binding());
+        assertThat(inputs.sourceHashes().values()).containsOnly(io.tapstate.core.model.canonical.CanonicalHash.of(source));
+        if (!shared) assertThat(inputs.directChannels()).extracting(channel -> channel.context().channelId())
+                .containsExactlyInAnyOrder(root.chainId().value(), child.chainId().value());
+        var inherited = new SourceRef.Spec("crm", shared, Map.of(), "items_input");
+        assertThat(io.tapstate.core.model.PipelineSourceConfig.settings(inherited, source)).containsEntry("preImage", true);
+        assertThat(source.config()).containsEntry("preImage", true);
+    }
+
     private static PipelineResource pipeline(String id, SourceRef... refs) {
         return new PipelineResource(id, null, List.of(refs), null, null, null, null, null);
     }

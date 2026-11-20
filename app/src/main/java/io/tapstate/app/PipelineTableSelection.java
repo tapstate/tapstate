@@ -29,68 +29,78 @@ final class PipelineTableSelection {
 
     /** Rejects names outside the selected declaration without inventing a discovered table model. */
     static boolean selectsName(FromClause from, SourceResource source, String table) {
+        return selectsName(from, source, source.id(), table, false);
+    }
+
+    static boolean selectsName(FromClause from, SourceResource source, String binding, String table, boolean qualified) {
         if (!SourceTableSelection.selectsTableName(source, table)) return false;
         var referenced = new LinkedHashSet<String>();
-        collect(from, source.id(), List.of(table), referenced, false);
+        collect(from, binding, List.of(table), referenced, false, qualified);
         return referenced.contains(table);
     }
 
     static List<String> resolve(PipelineResource pipeline, SourceResource source, SourceModel discovered) {
+        return resolve(pipeline, pipeline.sourceReference(source.id()), source, discovered);
+    }
+
+    static List<String> resolve(PipelineResource pipeline, io.tapstate.core.model.SourceRef ref,
+            SourceResource source, SourceModel discovered) {
         List<String> declared = SourceTableSelection.resolve(source, discovered);
-        return referencedTables(pipeline, source.id(), declared, true);
+        return referencedTables(pipeline, ref.binding(), declared, true, ref.alias() != null);
     }
 
     /** Whether the graph could select this table after discovery, without pretending other tables are absent. */
     static boolean references(PipelineResource pipeline, String sourceId, String table) {
-        return !referencedTables(pipeline, sourceId, List.of(table), false).isEmpty();
+        return !referencedTables(pipeline, sourceId, List.of(table), false,
+                pipeline.sourceReference(sourceId).alias() != null).isEmpty();
     }
 
     /** Filters a known subset without rejecting qualified references that may belong to unresolved selectors. */
-    static List<String> forOutputNames(PipelineResource pipeline, SourceResource source, List<String> known) {
-        return referencedTables(pipeline, source.id(), known, false);
+    static List<String> forOutputNames(PipelineResource pipeline, io.tapstate.core.model.SourceRef ref, List<String> known) {
+        return referencedTables(pipeline, ref.binding(), known, false, ref.alias() != null);
     }
 
     private static List<String> referencedTables(PipelineResource pipeline, String sourceId,
-            List<String> declared, boolean requireSelected) {
+            List<String> declared, boolean requireSelected, boolean qualified) {
         if (pipeline.transforms() == null && pipeline.view() == null && pipeline.serve() == null) {
             return declared;
         }
         Set<String> referenced = new LinkedHashSet<>();
         if (pipeline.transforms() != null) {
             for (Step step : pipeline.transforms()) {
-                collect(step.from(), sourceId, declared, referenced, requireSelected);
+                collect(step.from(), sourceId, declared, referenced, requireSelected, qualified);
             }
         }
         if (pipeline.view() instanceof ViewBlock.Inline view) {
-            collect(view.from(), sourceId, declared, referenced, requireSelected);
+            collect(view.from(), sourceId, declared, referenced, requireSelected, qualified);
         } else if (pipeline.view() instanceof ViewBlock.Use view) {
-            collect(view.from(), sourceId, declared, referenced, requireSelected);
+            collect(view.from(), sourceId, declared, referenced, requireSelected, qualified);
         }
         if (pipeline.serve() instanceof ServeBlock.Inline serve) {
-            collect(serve.from(), sourceId, declared, referenced, requireSelected);
+            collect(serve.from(), sourceId, declared, referenced, requireSelected, qualified);
         } else if (pipeline.serve() instanceof ServeBlock.Use serve) {
-            collect(serve.from(), sourceId, declared, referenced, requireSelected);
+            collect(serve.from(), sourceId, declared, referenced, requireSelected, qualified);
         }
         return declared.stream().filter(referenced::contains).toList();
     }
 
     private static void collect(FromClause from, String sourceId, List<String> declared, Set<String> referenced,
-            boolean requireSelected) {
+            boolean requireSelected, boolean qualified) {
         if (from instanceof FromClause.Flow flow) {
-            flow.refs().forEach(ref -> collect(ref, sourceId, declared, referenced, requireSelected));
+            flow.refs().forEach(ref -> collect(ref, sourceId, declared, referenced, requireSelected, qualified));
         } else if (from instanceof FromClause.Aliases aliases) {
-            aliases.aliases().values().forEach(ref -> collect(ref, sourceId, declared, referenced, requireSelected));
+            aliases.aliases().values().forEach(ref -> collect(ref, sourceId, declared, referenced, requireSelected, qualified));
         }
     }
 
     private static void collect(FromRef from, String sourceId, List<String> declared, Set<String> referenced,
-            boolean requireSelected) {
+            boolean requireSelected, boolean qualified) {
         if (from instanceof FromRef.Literal literal) {
             String token = literal.ref();
             if (token.equals(sourceId)) {
                 referenced.addAll(declared);
             } else {
-                declared.stream().filter(table -> token.equals(table) || token.equals(sourceId + "." + table))
+                declared.stream().filter(table -> (!qualified && token.equals(table)) || token.equals(sourceId + "." + table))
                         .forEach(referenced::add);
                 if (requireSelected && token.startsWith(sourceId + ".")
                         && !referenced.contains(token.substring(sourceId.length() + 1))) {
@@ -111,7 +121,7 @@ final class PipelineTableSelection {
         if (pattern.matcher(sourceId).matches()) {
             referenced.addAll(declared);
         } else {
-            declared.stream().filter(table -> pattern.matcher(table).matches()
+            declared.stream().filter(table -> (!qualified && pattern.matcher(table).matches())
                     || pattern.matcher(sourceId + "." + table).matches()).forEach(referenced::add);
         }
     }

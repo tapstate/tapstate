@@ -420,9 +420,10 @@ public final class ApplyService {
         return previous != null && !previous.connector().equals(replacement.connector());
     }
 
-    void validateDraftSourceNodeConfigs(Map<String, Map<String, Object>> configs) {
+    void validateDraftSourceNodeConfigs(Map<String, String> inputs, Map<String, Map<String, Object>> configs) {
         configs.forEach((id, config) -> {
-            SourceResource source = store.get(id).filter(SourceResource.class::isInstance)
+            String sourceId = inputs.get(id);
+            SourceResource source = sourceId == null ? null : store.get(sourceId).filter(SourceResource.class::isInstance)
                     .map(SourceResource.class::cast).orElse(null);
             SourceNodeConfigRules.validate(source, config, connectorDetail);
         });
@@ -452,7 +453,8 @@ public final class ApplyService {
         if (existing instanceof PipelineResource stored) {
             for (SourceRef ref : stored.sources()) {
                 if (ref instanceof SourceRef.Spec spec) {
-                    alreadyRecorded.put(spec.id(), spec.srs());
+                    alreadyRecorded.put(spec.binding(), spec.srs());
+                    alreadyRecorded.putIfAbsent(spec.id(), spec.srs());
                 }
             }
         }
@@ -464,7 +466,7 @@ public final class ApplyService {
                 anyRecorded = true;
                 continue;
             }
-            Boolean own = alreadyRecorded.get(ref.id());
+            Boolean own = alreadyRecorded.getOrDefault(ref.binding(), alreadyRecorded.get(ref.id()));
             if (own == null) {
                 // The source is read from the batch alone, because the batch is the closure: a pipeline
                 // referencing a source that is not in it is refused before this runs. A reference left
@@ -473,7 +475,7 @@ public final class ApplyService {
                 SourceResource declaring = batchSources.get(ref.id());
                 own = declaring == null ? null : declaring.srsEnabled();
             }
-            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own, ref.nodeConfig()));
+            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own, ref.nodeConfig(), ref.alias()));
             anyRecorded |= own != null;
         }
         return anyRecorded

@@ -134,8 +134,8 @@ final class ThreeLayerStorePort implements StorePort {
             io.tapstate.core.model.SourceResource source, SourceCaptureResolution canonical, boolean requireAttachment,
             Supplier<SrsStores> stores, boolean verifyMissingCapture) {
         active();
-        if(pipeline.sources().stream().anyMatch(reference -> reference.id().equals(source.id())
-                && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs())
+        if(pipeline.sourceReference(canonical.sourceId()) instanceof io.tapstate.core.model.SourceRef.Spec spec
+                && Boolean.FALSE.equals(spec.srs())
                 || pipeline.settings()!=null && pipeline.settings().readMode()==io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY)
             return Optional.of(canonical);
         var original=scope(pipeline.id());String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
@@ -151,10 +151,10 @@ final class ThreeLayerStorePort implements StorePort {
         var fixed=prepared.orElseThrow();
         if(fixed.mode()!=CapturePreparation.Mode.SHARED_SRS || !business().equals(fixed.scope()) || !capture.equals(fixed.captureId())
                 || !canonical.chainId().value().equals(fixed.canonicalChainId())
-                || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.PipelineSourceConfig.physical(pipeline,source)))throw refused();
+                || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),canonical.config().settings())))throw refused();
         var topology=stores.get().consumers().attached(fixed.chainId());
         var reader=topology.consumers().stream().filter(member -> member.context().key().pipelineId().equals(pipeline.id())
-                && member.context().key().sourceId().equals(source.id())).findFirst();
+                && member.context().key().sourceId().equals(canonical.sourceId())).findFirst();
         active();if(!original.equals(scope(pipeline.id())))throw refused();
         if(reader.isEmpty() && requireAttachment)return Optional.empty();
         if(reader.isPresent() && reader.orElseThrow().context().stateGeneration()!=original.stateGeneration())throw refused();
@@ -481,10 +481,13 @@ final class ThreeLayerStorePort implements StorePort {
                 if (!(reference instanceof io.tapstate.core.model.SourceRef.Spec spec) || spec.srs()) continue;
                 var source = StoredArtifacts.requireSource(configuration.artifacts(), reference.id());
                 var key = source.srs() == null ? null : source.srs().key();
-                if (!chain.equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(source.connector(), io.tapstate.core.model.PipelineSourceConfig.settings(pipeline, source), key, pipeline.id(), source.id(), io.tapstate.core.model.PipelineSourceConfig.overrides(pipeline, source)))) continue;
+                var settings = io.tapstate.core.model.PipelineSourceConfig.settings(reference, source);
+                var overrides = io.tapstate.core.model.PipelineSourceConfig.overrides(reference, source);
+                if (!chain.equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(
+                        source.connector(), settings, key, pipeline.id(), reference.binding(), overrides))) continue;
                 if (unprepared(pipeline.id())) return Optional.empty();
-                var tables = PipelineTableSelection.resolve(pipeline, source, SourceDiscovery.model(this, source));
-                var channel = DirectChannelPreparation.of(scope(pipeline.id()), source, pipeline, mode,
+                var tables = PipelineTableSelection.resolve(pipeline, reference, source, SourceDiscovery.model(this, source));
+                var channel = DirectChannelPreparation.of(scope(pipeline.id()), source, reference, mode,
                         pipeline.settings() == null ? null : pipeline.settings().startFrom(), tables);
                 var original = bound.cache().directChannels(business(), this::active).load(channel.context());
                 return Optional.of(original);

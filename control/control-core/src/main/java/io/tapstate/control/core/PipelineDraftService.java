@@ -16,6 +16,7 @@ import io.tapstate.spi.store.PipelineDraftSummary;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -152,8 +153,19 @@ public final class PipelineDraftService {
 
     private void validateSourceNodeConfigs(PipelineDraft draft) {
         if (validation != null) {
-            validation.validateDraftSourceNodeConfigs(draft.graph() == null
-                    ? draft.wizard().sourceNodeConfigs() : draft.graph().sourceNodeConfigs());
+            Map<String, String> inputs = new java.util.LinkedHashMap<>();
+            Map<String, Map<String, Object>> configs;
+            if (draft.graph() != null) {
+                draft.graph().nodes().stream().filter(node -> "source".equals(node.type()))
+                        .forEach(node -> inputs.put(node.id(), node.sourceId()));
+                configs = draft.graph().sourceNodeConfigs();
+            } else {
+                var wizard = draft.wizard();
+                if (wizard.root() != null) inputs.put(wizard.root().id(), wizard.root().sourceId());
+                wizard.related().forEach(node -> inputs.put(node.id(), node.sourceId()));
+                configs = wizard.sourceNodeConfigs();
+            }
+            validation.validateDraftSourceNodeConfigs(inputs, configs);
         }
     }
 

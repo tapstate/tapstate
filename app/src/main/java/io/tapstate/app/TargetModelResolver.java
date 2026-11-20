@@ -78,10 +78,10 @@ final class TargetModelResolver {
     /** Resolves one target model per selected source table, preserving source and discovery order. */
     Map<String, TargetTable> resolveAll(PipelineResource pipeline) {
         Map<String, TargetTable> targets = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
+        for (var ref : pipeline.sources()) {
+            SourceResource source = StoredArtifacts.requireSource(artifacts, ref.id());
             SourceModel discovered = modelInputs.apply(source);
-            resolveAll(PipelineTableSelection.resolve(pipeline, source, discovered), discovered)
+            resolveAll(PipelineTableSelection.resolve(pipeline, ref, source, discovered), discovered)
                     .forEach(targets::putIfAbsent);
         }
         return Collections.unmodifiableMap(new LinkedHashMap<>(targets));

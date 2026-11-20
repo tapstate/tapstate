@@ -55,12 +55,13 @@ final class NativeSourcePositionEdits implements PipelinePositionService.WriteBa
         var readers=new TreeSet<String>(); readers.add(pipelineId);
         for (var move:moves.entrySet()) {
             var sourceReading=current.chains().stream().filter(item -> item.chainId().equals(move.getKey())).findFirst().orElseThrow(NativeSourcePositionEdits::fenced);
-            var source=StoredArtifacts.requireSource(configuration.artifacts(),sourceReading.sourceId());
-            boolean privateChannel=pipeline.sources().stream().anyMatch(ref -> ref.id().equals(source.id()) && ref instanceof SourceRef.Spec spec && !spec.srs());
+            var reference = pipeline.sourceReference(sourceReading.sourceId());
+            var source=StoredArtifacts.requireSource(configuration.artifacts(),reference.id());
+            boolean privateChannel=reference instanceof SourceRef.Spec spec && !spec.srs();
             if (privateChannel) {
                 var mode=pipeline.settings()==null || pipeline.settings().readMode()==null?ReadMode.SNAPSHOT_AND_CDC:pipeline.settings().readMode();
                 if (mode==ReadMode.SNAPSHOT_ONLY) throw fenced();
-                var preparation=DirectChannelPreparation.of(port.scope(pipelineId),source,pipeline,mode,pipeline.settings()==null?null:pipeline.settings().startFrom(),sourceReading.tables());
+                var preparation=DirectChannelPreparation.of(port.scope(pipelineId),source,reference,mode,pipeline.settings()==null?null:pipeline.settings().startFrom(),sourceReading.tables());
                 var before=cache.directChannels(business,active).load(preparation.context());
                 if (!before.context().channelId().equals(move.getKey()) || before.cursor().sinkAcked()==null) throw fenced();
                 direct.add(new Direct(before,move.getValue()));
@@ -74,11 +75,10 @@ final class NativeSourcePositionEdits implements PipelinePositionService.WriteBa
                 }
                 logged.add(new Logged(before,Map.copyOf(consumers),move.getValue()));
                 for (var resource:inventory) if (resource instanceof PipelineResource candidate) {
-                    for (var reference:candidate.sources()) {
-                        if (!(reference instanceof SourceRef.Spec spec) || !spec.srs()) continue;
-                        var declared=StoredArtifacts.requireSource(configuration.artifacts(),reference.id());
-                        String key=declared.srs()==null?null:declared.srs().key();
-                        if (move.getKey().equals(PipelineSourceConfig.chain(candidate,declared))) readers.add(candidate.id());
+                    for (var candidateRef:candidate.sources()) {
+                        if (!(candidateRef instanceof SourceRef.Spec spec) || !spec.srs()) continue;
+                        var declared=StoredArtifacts.requireSource(configuration.artifacts(),candidateRef.id());
+                        if (move.getKey().equals(PipelineSourceConfig.chain(candidateRef,declared))) readers.add(candidate.id());
                     }
                 }
             }

@@ -154,7 +154,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var source = StoredArtifacts.requireSource(artifacts, reference.id());
         if (!source.connector().equals("mongodb")) return result;
         var selected =
-                SourceCaptureResolution.forPipeline(pipeline, source, discovered.model(source));
+                SourceCaptureResolution.forPipeline(pipeline, reference, source, discovered.model(source));
         if (selected.isEmpty()) return result;
         var scope = pass.scope();
         var canonical = selected.orElseThrow().chainId().value();
@@ -163,12 +163,12 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                         .read(stores.scope(), SourceCaptureIdentity.sharedCapture(canonical));
         if (prepared.isEmpty()) return result;
         var original = prepared.orElseThrow();
-        requirePlanningPreparation(original, canonical, io.tapstate.core.model.PipelineSourceConfig.effective(pipeline, source));
+        requirePlanningPreparation(original, canonical, io.tapstate.core.model.PipelineSourceConfig.effective(reference, source));
         var origin =
                 stores.configuration()
                         .inspectSharedOrigin(
                                 stores.scope(),
-                                source.id(),
+                                reference.binding(),
                                 io.tapstate.core.model.canonical.CanonicalHash.of(source),
                                 pipeline.id(), io.tapstate.core.model.canonical.CanonicalHash.of(StoredArtifacts.requirePipeline(artifacts, pipeline.id())))
                         .orElseThrow(
@@ -179,7 +179,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if (!origin.artifactHash().equals(artifact.contentHash())
                 || !origin.equals(
                         io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture(
-                                source.connector(), origin.artifactHash(), io.tapstate.core.model.PipelineSourceConfig.settings(pipeline, source))))
+                                source.connector(), origin.artifactHash(), io.tapstate.core.model.PipelineSourceConfig.settings(reference, source))))
             throw refused();
         if (io.tapstate.adapters.pdk.PdkSourceModelComparison.forVerifiedArtifact(
                         source.connector(), artifact)
@@ -194,7 +194,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                 });
         var context =
                 new SrsConsumerContext(
-                        new SrsConsumerKey(original.chainId(), scope.pipelineId(), source.id()),
+                        new SrsConsumerKey(original.chainId(), scope.pipelineId(), reference.binding()),
                         scope.stateGeneration());
         var membership = srs.consumers().find(context.key());
         if (membership.isEmpty()
@@ -435,34 +435,29 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             Map<String, SourceResource> sourceDefinitions,
             SourceModelSnapshot models,
             WorkloadClaimFence node) {
-        for (var definition : sourceDefinitions.values()) {
-            prepareSource(session, pipeline, definition, models, node);
+        for (String binding : pipeline.sourceBindings()) {
+            var reference = pipeline.sourceReference(binding);
+            prepareSource(session, pipeline, reference, sourceDefinitions.get(reference.id()), models, node);
         }
     }
 
     private void prepareSource(
             Session session,
             PipelineResource pipeline,
+            SourceRef reference,
             SourceResource definition,
             SourceModelSnapshot models,
             WorkloadClaimFence node) {
         var frozenModel = models.model(definition);
-        var selected = SourceCaptureResolution.forPipeline(pipeline, definition, frozenModel);
+        var selected = SourceCaptureResolution.forPipeline(pipeline, reference, definition, frozenModel);
         if (selected.isEmpty()) return;
-        boolean shared =
-                !session.bounded
-                        && pipeline.sources().stream()
-                                .anyMatch(
-                                        ref ->
-                                                ref.id().equals(definition.id())
-                                                        && ref instanceof SourceRef.Spec spec
-                                                        && spec.srs().booleanValue());
+        boolean shared = !session.bounded && reference instanceof SourceRef.Spec spec && Boolean.TRUE.equals(spec.srs());
         var request =
                 new CapturePreparationRequest(
                         session.original.scope(),
                         claim(session.original),
                         node,
-                        definition.id(),
+                        reference.binding(),
                         session.inputs);
         var issued = stores.configuration().issueFirstCreate(request);
         var prepared =
@@ -483,9 +478,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                         prepared.preparation().canonicalChainId(),
                                         prepared.preparation().chainId())
                         : selected.orElseThrow();
-        var source = new Source(definition.id(), resolution, shared, frozenModel);
+        var source = new Source(reference.binding(), resolution, shared, frozenModel);
         session.sources.put(source.id, source);
-        source.identity=sourceIdentities.apply(source.id).filter(identity->identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
+        source.identity=sourceIdentities.apply(definition.id()).filter(identity->identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
         source.prepared = prepared.preparation();
         source.owner = owner(session, source, prepared);
         if (shared) attachSharedSource(session, source, issued instanceof CaptureCreationResult.Issued first

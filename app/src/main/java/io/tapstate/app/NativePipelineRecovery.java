@@ -91,7 +91,8 @@ final class NativePipelineRecovery {
         if(summary.isEmpty())return Map.of();
         if(!summary.orElseThrow().targetScope().equals(pass.scope()))throw fenced();
         var contexts=new LinkedHashMap<String,SourceResource>();
-        for(String source:pipeline.sourceIds())contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,source),PipelineNode.Purpose.CAPTURE),StoredArtifacts.requireSource(snapshot,source));
+        for(var ref:pipeline.sources())contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE),
+                io.tapstate.core.model.PipelineSourceConfig.effective(ref,sources.get(ref.id())));
         if(pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync()!=null)for(var sync:serve.sync())
             contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,PipelineConnectorNodes.syncNodeId(sync)),PipelineNode.Purpose.SYNC),StoredArtifacts.requireSource(snapshot,sync.source()));
         if(pipeline.view() instanceof ViewBlock.Inline view) {
