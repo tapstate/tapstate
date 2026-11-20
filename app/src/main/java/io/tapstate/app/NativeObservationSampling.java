@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 /** Couples a running observation to its original control pass and current engine execution. */
 final class NativeObservationSampling {
@@ -49,14 +50,22 @@ final class NativeObservationSampling {
         this.clock = clock;
     }
 
+    boolean hasPublishedRunning(PipelineConvergencePass pass, ConvergeResult result) {
+        var last = published.get(pass.scope().pipelineId());
+        return last != null && result.checkpoint().filter(checkpoint ->
+                StateJson.parse(checkpoint.stateJson()) == PipelineState.RUNNING
+                        && last.equals(new Published(checkpoint.epoch(), new ExecutionFence(pass.scope(), pass.claim()))))
+                .isPresent();
+    }
+
     Optional<Observation> publish(ObservationPublisher publisher, PipelineConvergencePass pass, ConvergeResult result,
             PipelineIntentStore.ActuationReading config, ObservationFailure failure) {
-        return publish(publisher, pass, result, config, failure, java.util.function.UnaryOperator.identity());
+        return publish(publisher, pass, result, config, failure, null);
     }
 
     Optional<Observation> publish(ObservationPublisher publisher, PipelineConvergencePass pass, ConvergeResult result,
             PipelineIntentStore.ActuationReading config, ObservationFailure failure,
-            java.util.function.UnaryOperator<ObservationStore> stores) {
+            UnaryOperator<ObservationStore> deferred) {
         String id = pass.scope().pipelineId();
         var checkpoint = result.checkpoint().orElse(null);
         var current = execution.apply(id);
@@ -66,22 +75,25 @@ final class NativeObservationSampling {
             var original = current.orElseThrow();
             var reading = new Published(checkpoint.epoch(), original);
             if (reading.equals(published.get(id)) && config != null && config.configurationRevision().isPresent()) {
-                var fast = combined(publisher, pass, config, checkpoint, original, stores);
+                var fast = combined(publisher, pass, config, checkpoint, original, deferred);
                 if (fast.superseded() || fast.observation().isPresent()) return fast.observation();
             }
-            var fallback = publisher.publishScoped(pass.scope(), pass.state(),
-                    stores.apply(guarded(pass.observationSample(), () -> requireExecution(pass, original))), failure);
-            if (fallback.filter(value -> value.state() == PipelineState.RUNNING).isPresent() && execution.apply(id).equals(current))
+            var store = pass.observationSample();
+            if (deferred != null) store = deferred.apply(guarded(store, () -> requireExecution(pass, original)));
+            var fallback = publisher.publishScoped(pass.scope(), pass.state(), store, failure);
+            if (deferred == null && fallback.filter(value -> value.state() == PipelineState.RUNNING).isPresent()
+                    && execution.apply(id).equals(current))
                 published.put(id, reading);
             return fallback;
         }
         published.remove(id);
-        return publisher.publishScoped(pass.scope(), pass.state(), stores.apply(pass.observationSample()), failure);
+        var store = pass.observationSample();
+        return publisher.publishScoped(pass.scope(), pass.state(), deferred == null ? store : deferred.apply(store), failure);
     }
 
     private Attempt combined(ObservationPublisher publisher, PipelineConvergencePass pass,
             PipelineIntentStore.ActuationReading config, CheckpointDoc checkpoint, ExecutionFence original,
-            java.util.function.UnaryOperator<ObservationStore> stores) {
+            UnaryOperator<ObservationStore> deferred) {
         String id = pass.scope().pipelineId();
         var inputs = captures.observationSelection(original);
         if (inputs.isEmpty()) return Attempt.fallback();
@@ -111,7 +123,8 @@ final class NativeObservationSampling {
             }
             @Override public void delete(String pipeline) { pass.observationSample().delete(pipeline); }
         };
-        return new Attempt(false, publisher.publishRunning(pass.scope(), checkpoint, stores.apply(sink), sample.orElseThrow()));
+        return new Attempt(false, publisher.publishRunning(pass.scope(), checkpoint,
+                deferred == null ? sink : deferred.apply(sink), sample.orElseThrow()));
     }
 
     private void requireExecution(PipelineConvergencePass pass, ExecutionFence original) {

@@ -39,6 +39,19 @@ class NativeObservationSamplingTest {
     private static final PipelineIntentStore.ActuationReading CONFIG =
             new PipelineIntentStore.ActuationReading(null, OptionalLong.of(1));
 
+    @Test void aSynchronousRunningPublicationEnablesBatchingOnlyForItsOwnEpochAndExecution() {
+        var f = new Fixture();
+        assertThat(f.sampling.hasPublishedRunning(f.pass, f.result)).isFalse();
+        f.warm();
+        assertThat(f.sampling.hasPublishedRunning(f.pass, f.result)).isTrue();
+
+        when(f.result.checkpoint()).thenReturn(Optional.of(new CheckpointDoc(PIPELINE, "RUNNING", 5, Instant.EPOCH)));
+        assertThat(f.sampling.hasPublishedRunning(f.pass, f.result)).isFalse();
+        when(f.result.checkpoint()).thenReturn(Optional.of(CHECKPOINT));
+        when(f.pass.claim()).thenReturn(new WorkloadClaimFence(CLAIM.key(), CLAIM.owner(), 2, 4, 1));
+        assertThat(f.sampling.hasPublishedRunning(f.pass, f.result)).isFalse();
+    }
+
     @Test void supersededConfigurationSuppressesBothPublishPaths() {
         var f = new Fixture();
         f.warm();

@@ -300,9 +300,8 @@ final class ConvergenceDriver {
 
     private void publishObservation(String pipeline, PipelineConvergencePass pass, ConvergeResult result,
             PipelineIntentStore.ActuationReading origin, ObservationFailure failure) {
-        if (scoped != null && scoped.writes() != null && failure == null
-                && result.checkpoint().filter(checkpoint -> io.tapstate.core.lifecycle.StateJson.parse(checkpoint.stateJson())
-                        == io.tapstate.core.lifecycle.PipelineState.RUNNING).isPresent()) {
+        if (scoped != null && scoped.writes() != null && scoped.observations() != null && failure == null
+                && scoped.observations().hasPublishedRunning(pass, result)) {
             var stage = scoped.writes().stage(pass);
             var projection = projection(pipeline, pass, result, origin, null, stage::wrap);
             projection.ifPresent(value -> scoped.writes().submit(stage,
@@ -310,8 +309,8 @@ final class ConvergenceDriver {
                     () -> alert(() -> scoped.alerts().unavailable(pass))));
             return;
         }
-        writeObservationNow(pipeline, () -> projection(pipeline, pass, result, origin, failure,
-                java.util.function.UnaryOperator.identity()).ifPresent(value -> published(pass, result, value)));
+        writeObservationNow(pipeline, () -> projection(pipeline, pass, result, origin, failure, null)
+                .ifPresent(value -> published(pass, result, value)));
     }
 
     private Optional<io.tapstate.core.lifecycle.Observation> projection(String pipeline, PipelineConvergencePass pass,
@@ -319,7 +318,7 @@ final class ConvergenceDriver {
             java.util.function.UnaryOperator<io.tapstate.spi.store.ObservationStore> stores) {
         if (scoped == null) return publisher.publish(pipeline, failure);
         if (scoped.observations() == null)
-            return publisher.publishScoped(pass.scope(), pass.state(), stores.apply(pass.observationSample()), failure);
+            return publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
         return scoped.observations().publish(publisher, pass, result, origin, failure, stores);
     }
 
