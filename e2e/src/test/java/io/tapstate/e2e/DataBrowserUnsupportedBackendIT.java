@@ -90,7 +90,7 @@ class DataBrowserUnsupportedBackendIT {
                 ControlPlane.Refusal refused = control.findExpectingRefusal(SOURCE_ID, TABLE, Map.of());
                 assertThat(refused.code())
                         .as("the code a row read of a backend this face cannot ask in is refused with")
-                        .isEqualTo("data-browser.connector-not-browsable");
+                        .isEqualTo("TS0390004");
             }
         }
     }

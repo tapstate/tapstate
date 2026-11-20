@@ -64,7 +64,7 @@ class ValidationLinearRulesTest {
                   - { id: computed, from: excluded, type: map, fields: { total: '=1' } }
                 serve: { from: computed, sync: [{ id: output, source: target }] }
                 """))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("validation.rule-unsupported")
+                .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300007")
                 .hasMessageContaining("computed");
     }
 

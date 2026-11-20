@@ -206,7 +206,7 @@ class APipelineBudgetReachesItsOwnMapsTest {
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) thrown).code().code())
-                .isEqualTo("nest.memory-budget-changed-while-running");
+                .isEqualTo("TS0490016");
         // Both numbers, because the author has to be told which one is actually in force - and it is not
         // the one they just wrote.
         assertThat(((TapstateException) thrown).args())
@@ -232,7 +232,7 @@ class APipelineBudgetReachesItsOwnMapsTest {
         // 40,000, and the map goes on holding the process-wide number with nothing anywhere disagreeing.
         assertThat(thrown).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) thrown).code().code())
-                .isEqualTo("nest.memory-budget-changed-while-running");
+                .isEqualTo("TS0490016");
     }
 
     @Test

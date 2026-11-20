@@ -413,7 +413,7 @@ class RingDependencyRulesTest {
                         && access.getOrigin().getName().equals("of")
                         && access.getOrigin().getRawParameterTypes().stream().map(JavaClass::getName).toList()
                                 .equals(List.of("io.tapstate.control.core.PipelineCatalogItem",
-                                        "io.tapstate.messages.MessageCatalog", "java.time.Clock"))
+                                        "io.tapstate.messages.MessageCatalog", "java.time.Clock", "java.util.Locale"))
                         && access.getAccessType() == JavaFieldAccess.AccessType.GET
                         && access.getTarget().getFullName().equals("io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE"));
     }

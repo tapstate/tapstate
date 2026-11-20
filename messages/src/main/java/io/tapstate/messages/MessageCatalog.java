@@ -10,6 +10,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * The error-code message catalog — the presentation-layer renderer. It turns a coded exception
@@ -57,7 +60,12 @@ public final class MessageCatalog {
 
     /** Renders the code's message and solution, substituting named placeholders from the args. */
     public Rendered render(TapstateErrorCode code, Map<String, Object> args) {
-        return render(code.code(), args);
+        return render(code, args, Locale.ENGLISH);
+    }
+
+    /** Localizes a typed product error without consulting historical string-only entries. */
+    public Rendered render(TapstateErrorCode code, Map<String, Object> args, Locale locale) {
+        return registered(code.code(), args, locale).orElseGet(() -> new Rendered(code.code(), null));
     }
 
     /**
@@ -67,12 +75,79 @@ public final class MessageCatalog {
      * code renders as itself rather than blank, so a message never silently disappears.
      */
     public Rendered render(String code, Map<String, Object> args) {
+        return render(code, args, Locale.ENGLISH);
+    }
+
+    /** Localizes registered product codes; legacy text retains its original catalog language. */
+    public Rendered render(String code, Map<String, Object> args, Locale locale) {
+        var current = registered(code, args, locale);
+        if (current.isPresent()) return current.orElseThrow();
+        var historical = IoDiagnosticCatalog.renderHistoricalWithoutParameters(code, args, locale);
+        if (historical.isPresent()) return historical.orElseThrow();
         Entry entry = entries.get(code);
         if (entry == null) {
             return new Rendered(code, null);
         }
         String solution = entry.solution() == null ? null : substitute(entry.solution(), args);
         return new Rendered(substitute(entry.message(), args), solution);
+    }
+
+    /** Renders an optional wire diagnostic only when its known parameter contract is complete. */
+    public Optional<Rendered> renderComplete(String code, Map<String, Object> args) {
+        var current = registered(code, args, Locale.ENGLISH);
+        if (current.isPresent()) return current;
+        Entry entry = entries.get(code);
+        if (entry == null) return Optional.empty();
+        Set<String> required = new HashSet<>();
+        collectLegacyParameters(entry.message(), required);
+        collectLegacyParameters(entry.solution(), required);
+        return required.equals(args.keySet()) ? Optional.of(render(code, args)) : Optional.empty();
+    }
+
+    /** Presentation text may describe an explicitly supported old record without completing its facts. */
+    public Optional<Rendered> renderAvailable(String code, Map<String, Object> args, Locale locale) {
+        if (renderComplete(code, args).isPresent()) return Optional.of(render(code, args, locale));
+        return IoDiagnosticCatalog.renderHistoricalWithoutParameters(code, args, locale);
+    }
+
+    private static Optional<Rendered> registered(String code, Map<String, Object> args, Locale locale) {
+        return RequestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale)
+                .or(() -> DslDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> SourceDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> MutationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> McpDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> SchemaDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> LifecycleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> StartCheckDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ValidationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> BootDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> RoleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> CliDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> AlertDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> CaptureDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ActuationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ClusterDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ConnectorCatalogDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> DataBrowserDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> MonitorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> PositionDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> AggregateDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> MigrationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> RowValueDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> EngineDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> TransformDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> NestSizingDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> StoreDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> IoDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> NestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ConnectorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .map(text -> new Rendered(text.message(), text.solution()));
+    }
+
+    private static void collectLegacyParameters(String template, Set<String> required) {
+        if (template == null) return;
+        var matcher = java.util.regex.Pattern.compile("\\{([a-zA-Z0-9_]+)}").matcher(template);
+        while (matcher.find()) required.add(matcher.group(1));
     }
 
     /** Resolves an exact PDK test-item resource key, preserving unknown connector text. */

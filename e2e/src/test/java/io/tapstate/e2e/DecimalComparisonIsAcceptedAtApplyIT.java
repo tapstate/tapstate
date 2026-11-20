@@ -26,7 +26,7 @@ class DecimalComparisonIsAcceptedAtApplyIT {
 
     private static final String ACCEPTED_PIPELINE = "decimal_filter_pipeline";
     private static final String REFUSED_PIPELINE = "decimal_arithmetic_pipeline";
-    private static final String TYPE_UNSUPPORTED = "dsl.row-expression-type-unsupported";
+    private static final String TYPE_UNSUPPORTED = "TS0010021";
 
     @BeforeAll
     static void requireDockerAndRealConnectors() {

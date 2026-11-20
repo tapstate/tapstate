@@ -11,6 +11,57 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ScopedJobFailureRegistryTest {
+    @Test void aLegacyRecorderKeepsSafeFieldsAlongsideItsOriginalThrowable() {
+        var current = job(1, "run-a");
+        var f = new EngineRunHandleTest.Fixture(current);
+        var registry = JobFailureRegistry.of(f.member);
+        var recorder = registry.forJob(1, new com.hazelcast.jet.config.JobConfig().setName("p"));
+        var cause = new IllegalStateException("raw secret");
+        var safe = new io.tapstate.core.common.FailureFact.PublicFailure("code", java.util.Map.of("detail", "[redacted]"));
+        var fact = new io.tapstate.core.common.FailureFact(cause, java.util.Map.of("message", "safe"), safe);
+        recorder.record(fact);
+        current.status.set(JobStatus.FAILED);
+        assertThat(f.engine.failureFactOf("p")).containsSame(fact);
+        assertThat(f.engine.failureOf("p")).containsSame(cause);
+    }
+
+    @Test void aMissingMemberNeedsNoProcessorContextAndTheLegacyBridgeStillRecords() {
+        assertThat(JobFailureRegistry.forProcessor(null, null)).isNull();
+        var fixture = new EngineRunHandleTest.Fixture(job(1, "run-a"));
+        var registry = JobFailureRegistry.of(fixture.member);
+        var bridge = (io.tapstate.core.lifecycle.ExecutionFailureRecorder) fixture.member.getUserContext()
+            .get(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY);
+        var cause = new IllegalStateException("legacy bridge failure");
+        bridge.forExecution("legacy", 1, null).accept(cause);
+        assertThat(registry.fact("legacy")).hasValueSatisfying(fact -> assertThat(fact.cause()).isSameAs(cause));
+        bridge.forExecution(null, 1, null).accept(new IllegalStateException("unnamed"));
+        assertThat(registry.get("legacy")).containsSame(cause);
+        var scoped = new IllegalStateException("scoped bridge failure");
+        bridge.forExecution("p", 1, "run-a").accept(scoped);
+        assertThat(registry.existing("p", 1, "run-a").get()).containsSame(scoped);
+    }
+
+    @Test void aLocalProviderNeverConsultsTheNamedFacadeWhenNoExecutionCanBeProved() {
+        var context = new java.util.concurrent.ConcurrentHashMap<String, Object>();
+        var member = (com.hazelcast.core.HazelcastInstance) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{com.hazelcast.core.HazelcastInstance.class},
+                (proxy, method, arguments) -> {
+                    if (method.getName().equals("getUserContext")) return context;
+                    throw new AssertionError("local startup must not call the named member facade: " + method.getName());
+                });
+        new Engine(member);
+        var bridge = (io.tapstate.core.lifecycle.ExecutionFailureRecorder) context
+                .get(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY);
+        var typed = new io.tapstate.core.common.TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
+                java.util.Map.of("pipeline", "p"), null);
+        bridge.forProcessor("p", 1, 2, "run-a").accept(typed);
+        bridge.forProcessor(null, 0, 0, null).accept(typed);
+        assertThat(JobFailureRegistry.of(member).fact("p")).isEmpty();
+        bridge.forExecution("legacy", 1, null).accept(typed);
+        assertThat(JobFailureRegistry.of(member).fact("legacy"))
+                .hasValueSatisfying(fact -> assertThat(fact.cause()).isSameAs(typed));
+    }
+
     @Test void anOldRecorderAndClearCannotOverwriteOrRemoveTheNewRunFailure() {
         var first = job(1, "run-a"); var next = job(2, "run-b"); var f = new EngineRunHandleTest.Fixture(first);
         var registry = JobFailureRegistry.of(f.member); var a = registry.attach("p", 1, "run-a");
@@ -129,6 +180,32 @@ class ScopedJobFailureRegistryTest {
         var early = f.engine.findRun("p", "run-b").orElseThrow(); early.cancel();
         registry.forJob(2, current.job.getConfig()).record(new IllegalStateException("late current init"));
         assertThat(registry.existing("p", 2, "run-b").get()).isEmpty(); assertThat(early.failure()).isEmpty();
+    }
+
+    @Test void originalThrowableAndSafeAttachmentStayPairedAcrossReplacementAndRetirement() {
+        var current = job(1, "run-a");
+        var fixture = new EngineRunHandleTest.Fixture(current);
+        var registry = JobFailureRegistry.of(fixture.member);
+        var recorder = registry.attach("p", 1, "run-a");
+        var sharedThrowable = new IllegalStateException("original");
+        recorder.record(sharedThrowable, java.util.Map.of("message", "source-a"));
+        current.status.set(JobStatus.FAILED);
+        var run = fixture.engine.findRun("p", "run-a").orElseThrow();
+        assertThat(run.failureFact()).hasValueSatisfying(fact -> {
+            assertThat(fact.cause()).isSameAs(sharedThrowable);
+            assertThat(fact.diagnostic()).containsEntry("message", "source-a");
+        });
+        fixture.named.set(job(2, "run-b"));
+        var next = registry.attach("p", 2, "run-b");
+        next.record(sharedThrowable, java.util.Map.of("message", "source-b"));
+        recorder.record(sharedThrowable, java.util.Map.of("message", "late-source-a"));
+        assertThat(next.fact()).hasValueSatisfying(fact -> {
+            assertThat(fact.cause()).isSameAs(sharedThrowable);
+            assertThat(fact.diagnostic()).containsEntry("message", "source-b");
+        });
+        assertThat(recorder.fact()).isEmpty();
+        next.clear();
+        assertThat(next.fact()).isEmpty();
     }
 
     private static EngineRunHandleTest.FakeJob job(long id, String identity) { return new EngineRunHandleTest.FakeJob(id, identity, JobStatus.RUNNING); }

@@ -709,7 +709,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         try {
             writer.snapshotDelivered(stream);
         } catch (RuntimeException | Error failure) {
-            if (failureRegistry != null) failureRegistry.record(failure);
+            recordWriterFailure(failure);
             throw failure;
         }
     }
@@ -784,9 +784,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // machinery: once the job's terminal result is durable Jet can no longer hand back this
                 // exact cause (see JobFailureRegistry), so the last point this processor still holds the
                 // real, unwrapped cause is the only reliable place to keep it.
-                if (failureRegistry != null) {
-                    failureRegistry.record(failure);
-                }
+                recordWriterFailure(failure);
                 throw failure;
             }
             if (frontier != null) {
@@ -809,6 +807,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         if (ack != null) ack.flush(false);
             reportTrailing();
         }
+    }
+
+    private void recordWriterFailure(Throwable failure) {
+        if (failureRegistry == null) {
+            return;
+        }
+        io.tapstate.core.common.FailureFact fact;
+        try {
+            fact = writer.failureFact(failure);
+            if (fact.cause() != failure) throw new IllegalArgumentException("failure owner changed the cause");
+        } catch (RuntimeException | LinkageError unavailable) {
+            fact = io.tapstate.core.common.FailureFact.unavailable(failure);
+        }
+        failureRegistry.record(fact);
     }
 
     /**

@@ -1,0 +1,6 @@
+{
+  "TS0270001": {
+    "message": "Pipeline {pipeline} writes column {column} of table {table} to {target}, which reads a dot in a key as a step into a nested document rather than as part of a name.",
+    "solution": "The rows cross correctly and the key is really written, but a read for {column} on {target} answers nothing unless the dot is escaped, and no index can be declared over it at all, because an index key is written in that same path syntax. If it is a column you will query or index, rename it in {source}, or give it a name without a dot in a map step before it is written."
+  }
+}

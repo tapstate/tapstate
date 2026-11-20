@@ -2,6 +2,9 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineLogs;
+import io.tapstate.core.logging.LogLine;
+import io.tapstate.messages.MessageCatalog;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -21,7 +24,10 @@ class PipelineLogsController {
 
     private final PipelineLogQueryService logs;
 
-    PipelineLogsController(PipelineLogQueryService logs) {
+    private final MessageCatalog catalog;
+
+    PipelineLogsController(PipelineLogQueryService logs, MessageCatalog catalog) {
+        this.catalog = catalog;
         this.logs = logs;
     }
 
@@ -29,10 +35,13 @@ class PipelineLogsController {
     @GetMapping("/pipelines/{id}/logs")
     PipelineLogs logs(
             @PathVariable("id") String id,
-            @RequestParam(value = "limit", required = false) Integer limit) {
+            @RequestParam(value = "limit", required = false) Integer limit, HttpServletRequest request) {
         if (limit != null && limit < 1) {
             throw MalformedRequest.rejecting("limit must be positive", null);
         }
-        return limit == null ? logs.logs(id) : logs.logs(id, limit);
+        var result = limit == null ? logs.logs(id) : logs.logs(id, limit);
+        var locale = ApiExceptionHandler.localeFor(request);
+        return new PipelineLogs(id, result.lines().stream().map(line -> new LogLine(line.timestampMillis(),
+                line.level(), line.message(), ApiError.localizeDiagnostic(line.diagnostic(), catalog, locale))).toList());
     }
 }

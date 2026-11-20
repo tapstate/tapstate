@@ -32,7 +32,7 @@ class ViewSinkWritersTest {
                 .satisfies(failure -> {
                     TapstateException coded = (TapstateException) failure;
                     assertThat(coded.code().code())
-                            .isEqualTo("engine.view-key-missing-from-before-image");
+                            .isEqualTo("TS0440007");
                     assertThat(coded.args()).containsEntry("view", "order_state")
                             .containsEntry("key", "id")
                             .containsEntry("operation", "delete");

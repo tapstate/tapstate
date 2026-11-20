@@ -201,19 +201,19 @@ class MongoObservationStoreTest {
     @Test
     void documentCarriesTheCodedFailure() {
         Observation obs = new Observation("orders_sync", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
-                new ObservationFailure("engine.job-failed", Map.of("pipeline", "orders_sync", "cause", "sink refused")));
+                new ObservationFailure("TS0440008", Map.of("pipeline", "orders_sync", "cause", "sink refused")));
 
         Document document = MongoObservationStore.toDocument(obs);
 
         Document failure = (Document) document.get("failure");
-        assertThat(failure.getString("code")).isEqualTo("engine.job-failed");
+        assertThat(failure.getString("code")).isEqualTo("TS0440008");
         assertThat(((Document) failure.get("params")).get("cause")).isEqualTo("sink refused");
     }
 
     @Test
     void roundTripPreservesTheCodedFailure() {
         Observation obs = new Observation("orders_sync", PipelineState.FAILED, Map.of("errorCount", 1L), Map.of(),
-                Map.of(), new ObservationFailure("engine.job-failed", Map.of("pipeline", "orders_sync")));
+                Map.of(), new ObservationFailure("TS0440008", Map.of("pipeline", "orders_sync")));
 
         assertThat(MongoObservationStore.toObservation(MongoObservationStore.toDocument(obs))).isEqualTo(obs);
     }

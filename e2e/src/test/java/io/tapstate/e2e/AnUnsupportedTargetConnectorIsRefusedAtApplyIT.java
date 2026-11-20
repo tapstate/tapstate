@@ -31,7 +31,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
 
-    private static final String UNSUPPORTED_TARGET_CONNECTOR = "dsl.unsupported-target-connector";
+    private static final String UNSUPPORTED_TARGET_CONNECTOR = "TS0010026";
 
     private static final String SOURCE = """
             version: tapstate/v1

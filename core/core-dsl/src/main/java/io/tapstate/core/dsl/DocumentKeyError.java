@@ -2,6 +2,8 @@ package io.tapstate.core.dsl;
 
 import io.tapstate.core.common.Severity;
 import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.SchemaErrorDefinitions;
 
 import java.util.Set;
 
@@ -25,21 +27,17 @@ public enum DocumentKeyError implements TapstateErrorCode {
      * {@code source} where it comes from, {@code pipeline} what writes it, and {@code target} the
      * declared source the write lands in.
      */
-    COLUMN_NAME_READS_AS_A_PATH(
-            "schema.column-name-reads-as-a-path",
-            Set.of("pipeline", "source", "table", "column", "target"));
+    COLUMN_NAME_READS_AS_A_PATH(SchemaErrorDefinitions.COLUMN_NAME_READS_AS_A_PATH);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    DocumentKeyError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
+    DocumentKeyError(ProductErrorDefinition definition) {
+        this.definition = definition;
     }
 
     @Override
     public String code() {
-        return code;
+        return definition.code();
     }
 
     /**
@@ -49,11 +47,11 @@ public enum DocumentKeyError implements TapstateErrorCode {
      */
     @Override
     public Severity severity() {
-        return Severity.WARNING;
+        return definition.severity();
     }
 
     @Override
     public Set<String> placeholders() {
-        return placeholders;
+        return definition.parameters();
     }
 }

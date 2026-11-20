@@ -218,9 +218,27 @@ final class ConvergenceDriver {
                     // observation, so a read face can say why, and into the log with its code and stack.
                     // Every later pass while the checkpoint stays FAILED publishes null and the publisher
                     // carries the stored reason forward — durably, so it survives a process restart too.
-                    failure = PipelineFailures.of(pipelineId, result.failure().orElse(null));
-                    LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
-                            failure.code(), result.failure().orElse(null));
+                    failure = PipelineFailures.of(pipelineId, result.failure().orElse(null), result.diagnostic(), result.publicFailure());
+                    var original = result.failure().orElse(null);
+                    var logDiagnostic = original == null ? failure.diagnostic()
+                            : io.tapstate.core.logging.FailureLogSnapshot.of(new io.tapstate.core.common.FailureFact(
+                                    original, failure.diagnostic(), result.publicFailure()));
+                    if (PipelineFailures.isCoded(original) && !logDiagnostic.containsKey("code")) {
+                        // The current coded primary is an observed fact, even when no connector was opened.
+                        var fields = new java.util.LinkedHashMap<String, Object>(logDiagnostic);
+                        fields.put("code", failure.code());
+                        fields.put("codeSource", io.tapstate.core.common.DiagnosticCodeSource.TAPSTATE_STANDARD);
+                        fields.put("params", failure.params());
+                        var rendered = io.tapstate.messages.MessageCatalog.bundled().render(failure.code(),
+                                new java.util.LinkedHashMap<String, Object>(failure.params()));
+                        fields.put("message", rendered.message());
+                        if (rendered.solution() != null && !rendered.solution().isBlank()) fields.put("solution", rendered.solution());
+                        logDiagnostic = io.tapstate.core.logging.LogDiagnosticProjection.fit(fields);
+                    }
+                    var logParams = PipelineFailures.isCoded(original) ? failure.params()
+                            : Map.of("pipeline", pipelineId, "cause", original == null ? "unknown" : original.getClass().getName());
+                    LOG.atWarn().addKeyValue("diagnostic", logDiagnostic)
+                            .log("Pipeline {} entered FAILED [{}]: {}", pipelineId, failure.code(), logParams);
                 }
                 var projection = scoped == null ? publisher.publish(pipelineId, failure)
                         : scoped.observations() == null ? publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure)

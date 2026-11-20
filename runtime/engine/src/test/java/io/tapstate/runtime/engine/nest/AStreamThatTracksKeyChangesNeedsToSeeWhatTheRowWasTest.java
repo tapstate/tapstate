@@ -74,7 +74,7 @@ class AStreamThatTracksKeyChangesNeedsToSeeWhatTheRowWasTest {
         assertThatThrownBy(() -> feed(policies, CLAIMS, claimUpdateWithNoBefore(1, "k1", "p1")))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.key-change-tracking-requires-before-image");
+                .isEqualTo("TS0490026");
     }
 
     /**
@@ -109,7 +109,7 @@ class AStreamThatTracksKeyChangesNeedsToSeeWhatTheRowWasTest {
                         + "reported")
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.key-change-tracking-requires-before-image");
+                .isEqualTo("TS0490026");
     }
 
     /**
@@ -172,7 +172,7 @@ class AStreamThatTracksKeyChangesNeedsToSeeWhatTheRowWasTest {
         assertThatThrownBy(() -> feed(policies, OWN_ROWS, policyUpdateWithNoBefore(1, "p1", "c1")))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.key-change-tracking-requires-before-image");
+                .isEqualTo("TS0490026");
     }
 
     /** The root has the same switch, and its own key can move exactly as an embed's can. */
@@ -183,7 +183,7 @@ class AStreamThatTracksKeyChangesNeedsToSeeWhatTheRowWasTest {
         assertThatThrownBy(() -> feed(assembler, OWN_ROWS, customerUpdateWithNoBefore(1, "c1")))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.key-change-tracking-requires-before-image");
+                .isEqualTo("TS0490026");
     }
 
     /**

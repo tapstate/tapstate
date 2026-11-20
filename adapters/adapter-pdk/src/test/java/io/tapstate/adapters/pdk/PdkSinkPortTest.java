@@ -36,6 +36,27 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PdkSinkPortTest {
 
     @Test
+    void aWriterOpenedWithoutALogicalNodeStillFreezesItsSecretContext(@TempDir Path dir) throws Throwable {
+        Path jar = Synthetic.countingSink(dir);
+        String spec = """
+                {"properties":{"id":"demo","name":"demo"},"configOptions":{"connection":{"properties":{
+                "credential":{"type":"string","x-component":"Password"}}}}}
+                """;
+        var ref = new ConnectorRef(List.of(jar), "synthetic.CountingSink", "2.0.8", null, spec);
+        var port = new PdkSinkPort(id -> ref);
+        var config = new SinkConfig("demo", Map.of("credential", "node-less-secret"), WriteMode.UPSERT, DdlPolicy.FAIL);
+        try (var writer = port.open(config)) {
+            var failure = new TapstateException(ConnectorError.WRITE_FAILED,
+                    Map.of("connector", "demo", "detail", "node-less-secret"), null);
+            var fact = writer.failureFact(failure);
+            assertThat(fact.cause()).isSameAs(failure);
+            assertThat(fact.publicFailure()).isNotNull();
+            assertThat(fact.publicFailure().params()).containsEntry("connector", "demo");
+            assertThat(fact.publicFailure().params().toString()).doesNotContain("node-less-secret");
+        }
+    }
+
+    @Test
     void aDeferredTargetRequiresScopedPreparationBeforeAnyConnectorIsProvisioned() {
         var provisions = new AtomicInteger();
         var port = new PdkSinkPort(id -> {

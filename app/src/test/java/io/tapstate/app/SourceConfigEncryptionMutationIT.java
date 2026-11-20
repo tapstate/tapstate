@@ -148,7 +148,7 @@ class SourceConfigEncryptionMutationIT {
             assertThat(replies).extracting(Reply::status).containsExactlyInAnyOrder(200, 412);
             Reply success = replies.stream().filter(reply -> reply.status() == 200).findFirst().orElseThrow();
             Reply conflict = replies.stream().filter(reply -> reply.status() == 412).findFirst().orElseThrow();
-            assertThat(JSON.readTree(conflict.body()).path("code").asText()).isEqualTo("source.version-conflict");
+            assertThat(JSON.readTree(conflict.body()).path("code").asText()).isEqualTo("TS0220005");
             SourceView winner = JSON.readValue(success.body(), SourceView.class);
             String winningSecret = switch (winner.metadata().description()) {
                 case "alpha" -> ALPHA_SECRET;
@@ -166,7 +166,7 @@ class SourceConfigEncryptionMutationIT {
             Reply stale = put(fixture.client, "/api/sources/" + id, created.etag(),
                     typedReplacement(initialView, atlasConfig(OLD_SECRET), "stale"));
             assertThat(stale.status()).isEqualTo(412);
-            assertThat(JSON.readTree(stale.body()).path("code").asText()).isEqualTo("source.version-conflict");
+            assertThat(JSON.readTree(stale.body()).path("code").asText()).isEqualTo("TS0220005");
             sameDocument(fixture, id, winningDocument);
         }
     }
@@ -187,7 +187,7 @@ class SourceConfigEncryptionMutationIT {
                     draft(source("batch_valid_sibling", Map.of("uri", uri(ALPHA_SECRET)), "valid"), null),
                     draft(sourceWithOnlyConfig(existing, Map.of("uri", uri(BETA_SECRET))), "0".repeat(64)))));
             assertThat(stale.status()).isEqualTo(412);
-            assertThat(JSON.readTree(stale.body()).path("code").asText()).isEqualTo("artifact.version-conflict");
+            assertThat(JSON.readTree(stale.body()).path("code").asText()).isEqualTo("TS0240003");
             assertThat(fixture.artifacts.countDocuments(new Document("_id", "batch_valid_sibling"))).isZero();
             sameDocument(fixture, existing, originalDocument);
 
@@ -206,7 +206,7 @@ class SourceConfigEncryptionMutationIT {
                 Reply failed = post(fixture.client, "/api/artifacts:apply", Map.of("drafts", rollbackDrafts));
                 assertThat(failed.status()).isEqualTo(500);
                 var error = JSON.readTree(failed.body());
-                assertThat(error.path("code").asText()).isEqualTo("io.store-unavailable");
+                assertThat(error.path("code").asText()).isEqualTo("TS0480001");
                 assertThat(error.path("params").path("detail").asText()).contains("code=11000");
                 assertThat(fixture.artifacts.countDocuments(new Document("_id", rollbackFirst))).isZero();
                 assertThat(fixture.artifacts.countDocuments(new Document("_id", rollbackSecond))).isZero();

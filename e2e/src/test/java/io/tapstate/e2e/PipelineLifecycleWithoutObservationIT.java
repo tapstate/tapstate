@@ -68,7 +68,7 @@ class PipelineLifecycleWithoutObservationIT {
                         && !status.containsKey("observedState") && !status.containsKey("observedAt");
             }, () -> String.valueOf(control.pipelineStatus(ID)));
             var metrics = control.sourceRequest("GET", "/api/pipelines/" + ID + "/metrics", null, null, 404);
-            assertThat(metrics.body()).contains("monitor.no-observation");
+            assertThat(metrics.body()).contains("TS0400001");
             var catalog = (Map<?, ?>) JsonReader.parse(control.sourceRequest("GET", "/api/pipelines", null, null, 200).body());
             var item = (Map<?, ?>) ((List<?>) catalog.get("items")).getFirst();
             assertThat(item.get("id")).isEqualTo(ID);

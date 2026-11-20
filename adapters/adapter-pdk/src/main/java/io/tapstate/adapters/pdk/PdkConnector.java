@@ -72,6 +72,7 @@ final class PdkConnector implements AutoCloseable {
     private final ConnectorTrustMaterial trust;
     private final Runnable driveGuard;
     private final String specification;
+    private PdkRuntimeDiagnostic runtimeDiagnostic;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
@@ -297,6 +298,7 @@ final class PdkConnector implements AutoCloseable {
             PdkConnector result = new PdkConnector(
                     connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId,
                     () -> notesActive.set(false), driveGuard, material, ref.spec());
+            result.runtimeDiagnostic = PdkRuntimeDiagnostic.bind(connectorId, ref, settings, node, purpose);
             try {
                 result.requireActive();
             } catch (RuntimeException | Error failure) {
@@ -520,6 +522,15 @@ final class PdkConnector implements AutoCloseable {
      */
     void requireActive() {
         driveGuard.run();
+    }
+
+    io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        return runtimeDiagnostic == null ? io.tapstate.core.common.FailureFact.unavailable(failure)
+                : runtimeDiagnostic.failureFact(failure);
+    }
+
+    Map<String, Object> diagnostic(Throwable failure) {
+        return runtimeDiagnostic == null ? Map.of() : runtimeDiagnostic.capture(failure);
     }
 
     <T> T underLoader(Action<T> action) throws Throwable {

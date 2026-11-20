@@ -108,12 +108,12 @@ class HttpControlPlaneClientDataBrowserTest {
 
     @Test
     void carriesACodedRefusalBackInsteadOfAnEmptyAnswer() {
-        serverAnswers(404, "{\"code\":\"data-browser.unknown-collection\","
+        serverAnswers(404, "{\"code\":\"TS0390001\","
                 + "\"message\":\"no collection named orders\"}");
 
         assertThat(client.collections(base(), "tok", "views"))
                 .isEqualTo(new DataBrowserOutcome.Collections.Rejected(
-                        "data-browser.unknown-collection", "no collection named orders"));
+                        "TS0390001", "no collection named orders"));
     }
 
     @Test

@@ -135,9 +135,9 @@ class ReplConnectionCancellationTest {
                 assertThat(repl.session().isConnected()).isTrue();
                 assertThat(repl.session().isAuthenticated()).isTrue();
                 assertThat(repl.session().landingNode()).isEqualTo(base);
-                assertThat(output.toString()).contains("request failed:", "terminal-cancellation-server",
+                assertThat(output.toString()).contains("TS0330061", "terminal-cancellation-server",
                                 verb.equals("test") ? "PASSED" : "orders")
-                        .doesNotContain("cli.request-timed-out", "connection lost", "reconnected to");
+                        .doesNotContain("TS0330019", "connection lost", "reconnected to");
             } finally {
                 release.countDown();
                 server.stop(0);

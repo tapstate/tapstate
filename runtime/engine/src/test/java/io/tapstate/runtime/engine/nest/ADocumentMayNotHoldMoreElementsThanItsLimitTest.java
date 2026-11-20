@@ -107,7 +107,7 @@ class ADocumentMayNotHoldMoreElementsThanItsLimitTest {
                 .describedAs("a claim under a policy is one more element of that document")
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.root-fanout-limit-exceeded");
+                .isEqualTo("TS0490019");
     }
 
     /**

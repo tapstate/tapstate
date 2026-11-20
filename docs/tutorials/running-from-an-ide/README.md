@@ -125,7 +125,7 @@ Without it the server starts, `/healthz` answers, and everything looks correct -
 `discover-schema`:
 
 ```
-error: connector.discover-failed
+error: TS0060026
   Connector 'mysql' could not discover its schema: ExceptionInInitializerError
   <- CodeGenerationException: InaccessibleObjectException--> Unable to make protected final
   java.lang.Class java.lang.ClassLoader.defineClass(...) accessible:
@@ -166,7 +166,7 @@ cp mysql-connector-*.jar mongodb-connector-*.jar ~/tapstate-run/connectors/
 An empty seed directory is a valid deployment: the server starts with nothing registered, which is
 enough to reach the end of this page. You need the jars for any tutorial that moves data.
 `scripts/build-real-connectors.sh /tmp/connectors` builds them from the connector sources. This release
-accepts `mysql` and `mongodb`; another id is refused with `connector.not-official`.
+accepts `mysql` and `mongodb`; another id is refused with `TS0060008`.
 
 That build wants a JDK 17, not the 21 the rest of this page uses: some connectors pin a Lombok that
 JDK 21 breaks. Point `TAPSTATE_CONNECTOR_JAVA_HOME` at one - the script refuses up front rather than
@@ -321,7 +321,7 @@ The prompt names who and where: `tapstate(admin@127.0.0.1:8080)>`. Two things wo
 | What you see | What it actually is |
 |---|---|
 | `Non-resolvable import POM: io.tapstate:bom` | The checkout moved to another version mid-build. Compare `Reactor Summary for Tapstate <version>` against `<revision>` and rerun. |
-| `connector.discover-failed` with `InaccessibleObjectException` | The server's VM options are missing `--add-opens java.base/java.lang=ALL-UNNAMED`. |
+| `TS0060026` with `InaccessibleObjectException` | The server's VM options are missing `--add-opens java.base/java.lang=ALL-UNNAMED`. |
 | `/actuator/health` returns 404 | Wrong path. It is `/healthz`. |
 | The server cannot reach its store on startup | Mongo is not a replica set, or the URI says `replicaSet=rs0` while the address it discovers belongs to a different set. Use `directConnection=true`. |
 | Port 27017 already in use | Something else already serves it. Publish another port rather than stopping it, and connect directly. |

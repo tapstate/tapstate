@@ -125,7 +125,7 @@ class ArtifactDeleteReclaimsDependentDocsIT {
                 Await.until("obsolete Pipeline observations to be reaped",
                         () -> observations.find(observationId).first() == null,
                         () -> String.valueOf(observations.find(observationId).first()));
-                assertThat(control.stateExpectingRefusal(pipelineId).code()).isEqualTo("lifecycle.unknown-pipeline");
+                assertThat(control.stateExpectingRefusal(pipelineId).code()).isEqualTo("TS0280005");
             } finally {
                 if (server instanceof RealProcessServer process)
                     FailureScene.writeMemberLogs(storage.clusterId(), java.util.Map.of("member", process.output()));

@@ -208,7 +208,7 @@ class BoundedPipelinePreviewExecutorTest {
             PipelinePreviewEvent failed = stream.next();
             assertThat(failed.kind()).isEqualTo("run.failed");
             assertThat(failed.payload()).containsKeys("code", "reason");
-            assertThat(failed.payload().get("code")).isEqualTo("dsl.unsupported-version");
+            assertThat(failed.payload().get("code")).isEqualTo("TS0010001");
             // Stream exhaustion observes worker finalization; the queued failure event does not.
             assertThat(stream.next()).isNull();
             assertThat(member.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP).size()).isZero();

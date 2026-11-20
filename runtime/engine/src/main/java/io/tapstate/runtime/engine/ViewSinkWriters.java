@@ -87,6 +87,16 @@ public final class ViewSinkWriters {
             }
 
             @Override
+            public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+                return delegate.failureFact(failure);
+            }
+
+            @Override
+            public Map<String, Object> diagnostic(Throwable failure) {
+                return delegate.diagnostic(failure);
+            }
+
+            @Override
             public void snapshotDelivered(String stream) {
                 delegate.snapshotDelivered(stream);
             }

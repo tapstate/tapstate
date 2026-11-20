@@ -98,7 +98,7 @@ nothing and keeps the document correct if that ever stops being true.
 
 An embed over a source table can fall back on that table's primary key to tell its elements apart. An
 embed over a step's output, such as a `union`, has no table key to fall back on, so it must declare
-`arrayKey`. Leaving it out is refused when the pipeline starts, with `nest.array-key-unresolvable`.
+`arrayKey`. Leaving it out is refused when the pipeline starts, with `TS0490007`.
 
 If the merged level has embeds of its own beneath it, also declare `key` with the same fields: that is
 what the children below it are filed under.

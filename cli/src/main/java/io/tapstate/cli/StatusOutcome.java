@@ -28,7 +28,17 @@ sealed interface StatusOutcome {
      *                          its own
      */
     record Found(String pipelineId, String state, String failureCode, String failureMessage,
-            Long observedAgeMillis) implements StatusOutcome {
+            Long observedAgeMillis, java.util.Map<String, Object> failureParams,
+            java.util.Map<String, Object> diagnostic) implements StatusOutcome {
+        public Found {
+            failureParams = failureParams == null ? java.util.Map.of()
+                    : java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(failureParams));
+            diagnostic = io.tapstate.core.common.RuntimeDiagnosticProjection.fit(diagnostic);
+        }
+
+        Found(String pipelineId, String state, String failureCode, String failureMessage, Long observedAgeMillis) {
+            this(pipelineId, state, failureCode, failureMessage, observedAgeMillis, java.util.Map.of(), java.util.Map.of());
+        }
 
         /** A reading from a server that did not say how old it is — the shape before the time was carried. */
         Found(String pipelineId, String state, String failureCode, String failureMessage) {

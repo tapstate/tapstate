@@ -41,8 +41,8 @@ class NewCmdNotOfficialTest {
                 "--connector", "kafka", "--id", "src_k", "--out", dir.toString());
 
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.connector-not-official")
-                .doesNotContain("cli.unknown-connector");
+        assertThat(r.all()).contains("TS0330014")
+                .doesNotContain("TS0330013");
         assertThat(dir.resolve("src_k.tap.yml")).doesNotExist();
     }
 
@@ -63,7 +63,7 @@ class NewCmdNotOfficialTest {
         Run r = run("new", "--non-interactive", "--kind", "source",
                 "--connector", "not-a-real-connector", "--id", "src_x", "--dry-run");
 
-        assertThat(r.all()).contains("cli.unknown-connector")
-                .doesNotContain("cli.connector-not-official");
+        assertThat(r.all()).contains("TS0330013")
+                .doesNotContain("TS0330014");
     }
 }

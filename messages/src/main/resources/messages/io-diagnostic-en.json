@@ -1,0 +1,170 @@
+{
+  "TS0480001": {
+    "message": "A store operation could not complete: {detail}.",
+    "solution": "Check the store is reachable and healthy, then retry."
+  },
+  "TS0480002": {
+    "message": "The storage endpoint refused a write because its space quota is exhausted.",
+    "solution": "Ask the storage administrator to restore capacity, then query the original operation. Do not delete initialized storage or repeat setup."
+  },
+  "TS0480003": {
+    "message": "The store rejected the credentials for the operation.",
+    "solution": "Check the store username and password in the connection settings."
+  },
+  "TS0480004": {
+    "message": "A stored document with id '{id}' could not be read back; the fault is in '{field}'.",
+    "solution": "The stored document is corrupt or was written by a newer version; inspect or restore it.",
+    "historicalWithoutParameters": {
+      "message": "A stored document could not be read. This failure did not record the affected document or field.",
+      "solution": "Preserve the existing data and inspect the original operation and service logs. Restore the document from a verified compatible backup if needed; do not delete retained state or repeat setup."
+    }
+  },
+  "TS0480005": {
+    "message": "Cleanup of artifact {hash} upload {upload} could not be confirmed.",
+    "solution": "Query the original registration result. Keep an unpublished upload quarantined and clean only that upload after its writes are known to have ended."
+  },
+  "TS0480006": {
+    "message": "The document '{id}' cannot be stored without changing the value in '{field}'.",
+    "solution": "Use values supported by the storage format and submit the document again."
+  },
+  "TS0480007": {
+    "message": "The schema for connection '{connectionId}' changed during every read attempt.",
+    "solution": "Wait for re-discovery to finish, then retry."
+  },
+  "TS0480008": {
+    "message": "The schema for connection '{connectionId}' could not be published because its writer lease was reclaimed or concurrent discovery kept changing it.",
+    "solution": "Wait for re-discovery to finish, then retry discovery."
+  },
+  "TS0480009": {
+    "message": "The store rejected a write from an expired or superseded workload owner.",
+    "solution": "Let the current cluster owner continue the workload; do not retry from the fenced generation."
+  },
+  "TS0480010": {
+    "message": "Pipeline '{pipeline}' has retained sink progress from before progress was recorded per writer, but it now has multiple sink writers.",
+    "solution": "Stop the pipeline to clear its retained state. Then run a full resync, or explicitly choose and accept a new incremental starting point knowing earlier changes will not be replayed. The old aggregate may belong only to the fastest sink, so it cannot be used as evidence for every target."
+  },
+  "TS0480011": {
+    "message": "Connector notes changed during this operation.",
+    "solution": "Stop this connector drive and verify the current notes before reopening. Do not overwrite the newer value by refreshing the expected revision."
+  },
+  "TS0480012": {
+    "message": "The diagnostic command no longer owns its original storage binding, state generation or retirement operation.",
+    "solution": "Verify the original Pipeline state and operation. Do not retarget an old callback or clear an active namespace."
+  },
+  "TS0480013": {
+    "message": "The same source event names different retained row, deletion or token facts.",
+    "solution": "Keep the existing diagnostic and verify the original event before retrying through its current authorized execution."
+  },
+  "TS0480014": {
+    "message": "The captured cache authentication generation is unavailable or no longer current.",
+    "solution": "Load the current trusted storage binding and authentication readiness before retrying."
+  },
+  "TS0480015": {
+    "message": "The lifecycle intent no longer owns its captured storage binding or Pipeline state generation.",
+    "solution": "Load the current trusted storage and Pipeline state before starting a new lifecycle operation. Do not retarget the old operation."
+  },
+  "TS0480016": {
+    "message": "Pipeline {pipeline} cannot prove its original checkpoint preparation and claim history.",
+    "solution": "Inspect the original operation or explicitly confirm a full rebuild. Do not recreate missing claims, epochs or preparation authority."
+  },
+  "TS0480017": {
+    "message": "Capture {capture} has missing or unproven canonical claim history.",
+    "solution": "Keep the original state and explicitly confirm Cluster cache recovery, including affected pipelines and sessions. Do not recreate the claim or reset its generations."
+  },
+  "TS0480018": {
+    "message": "The captured cache business incarnation is unavailable or no longer current.",
+    "solution": "Verify the original storage binding and business recovery state before starting a new operation. Do not retarget an old callback."
+  },
+  "TS0480019": {
+    "message": "Ring {ring} cannot prove actual model {version} at capture epoch {epoch}.",
+    "solution": "Stop continuation and restore the exact model and log history, or complete the authorized full rebuild. Do not substitute the latest discovery model."
+  },
+  "TS0480020": {
+    "message": "Consumer membership or progress for chain {chain} cannot be verified.",
+    "solution": "Keep the original consumer state and inspect the missing or mismatched membership, cursor and state generation before resuming."
+  },
+  "TS0480021": {
+    "message": "The source checkpoint for chain {chain} cannot prove its durable table and model closure.",
+    "solution": "Keep the original state and inspect the missing checkpoint, log or model facts before resuming."
+  },
+  "TS0480022": {
+    "message": "Actual model {version} for table {table} on chain {chain} is unavailable in its captured context.",
+    "solution": "Stop continuation and restore the exact retained model or complete the authorized full rebuild. Do not use the latest discovery model as a substitute."
+  },
+  "TS0480023": {
+    "message": "Required retained models for chain {chain} exceed the {bytes}-byte history budget.",
+    "solution": "Keep required history intact. Allow confirmed consumers to advance or complete an authorized rebuild before retrying; do not delete referenced models."
+  },
+  "TS0480024": {
+    "message": "The pending full baseline for chain {chain} exceeds its {bytes}-byte control budget.",
+    "solution": "Reduce the selected model references or source token size before retrying the same explicit full. Keep all required existing history intact."
+  },
+  "TS0480025": {
+    "message": "The original clear-state full baseline for chain {chain} cannot be verified.",
+    "solution": "Keep the original preparation, snapshot pin, model and progress facts. Retry only the same verified full operation; do not create a replacement from missing history."
+  },
+  "TS0480026": {
+    "message": "The requested source position for chain {chain} cannot prove compatibility with its model history.",
+    "solution": "Arbitrary position editing is unavailable after model handoff or replacement-cache history. Stop, clear the task state and explicitly rerun a full load instead."
+  },
+  "TS0480027": {
+    "message": "Model {version} for table {table} on chain {chain} already names different content.",
+    "solution": "Keep the original version unchanged and verify the capture context before publishing a new model version."
+  },
+  "TS0480028": {
+    "message": "The connector context does not match the retained notes. Retire the original resources before using a new connection or artifact.",
+    "solution": "Continue the original retirement operation with the saved connection and exact registered artifact."
+  },
+  "TS0480029": {
+    "message": "A shared capture still depends on these private connector notes.",
+    "solution": "Keep the retained identity until the original shared capture and its external resources have retired. Do not clear the notes or bypass the recorded dependency."
+  },
+  "TS0480030": {
+    "message": "The captured connector-note scope is missing, changed, or no longer current.",
+    "solution": "Stop this connector drive and verify the original configuration binding and note scope before reopening. Do not substitute an empty map or retry against a newer generation."
+  },
+  "TS0480031": {
+    "message": "Pipeline `{pipeline}` has legacy progress that cannot prove each source node's confirmed SRS cursor.",
+    "solution": "Keep the retained state for diagnosis and perform a full reload, or explicitly accept a new incremental baseline with the missing interval."
+  },
+  "TS0480032": {
+    "message": "Private direct channel {channel} cannot prove its retained recovery state.",
+    "solution": "Restore the original cache facts or explicitly confirm a full rebuild before continuing."
+  },
+  "TS0480033": {
+    "message": "Pipeline {pipeline} cannot prove that its capture identity matches the prepared state. If its source or table selection changed, stop with Clear all state and start a full load before applying it.",
+    "solution": "Keep the retained recovery facts. If source references, coordinates, SRS mode or selection changed, explicitly confirm a full rebuild."
+  },
+  "TS0480034": {
+    "message": "Pipeline {pipeline} cannot apply added tables ({tables}) while retaining state. Stop with Clear all state, then start a full load to apply them.",
+    "solution": "Pause/resume and ordinary stop/start retain the original table selection."
+  },
+  "TS0480035": {
+    "message": "Configuration import was refused ({reason}).",
+    "solution": "Check the original import status. Preserve unknown outcomes and request a new preflight only after the original operation is known not to have committed."
+  },
+  "TS0480036": {
+    "message": "Configuration import exceeded its {limit} budget.",
+    "solution": "Use a smaller package or resolve the retained original operations. Do not delete unknown or committed receipts to bypass the limit."
+  },
+  "TS0480037": {
+    "message": "The record for '{id}' no longer fits in one stored document.",
+    "solution": "The store is healthy and retrying will not help. Reduce what is held under this one id."
+  },
+  "TS0480038": {
+    "message": "Prepared target '{target}' for pipeline '{pipeline}' requires {bytes} bytes, exceeding its {limit} byte budget.",
+    "solution": "Reduce the prepared target metadata. Required original models are not discarded to fit the budget."
+  },
+  "TS0480039": {
+    "message": "Connector artifact '{hash}' upload '{attempt}' could not be reconciled.",
+    "solution": "Restore store connectivity and inspect this upload's file and chunks. Retained chunks may still belong to a committed artifact; do not delete them based only on a missing-file read."
+  },
+  "TS0480040": {
+    "message": "Source '{id}' does not have a usable lifecycle binding.",
+    "solution": "Complete the supported Source identity preparation or restore its original configuration before retrying."
+  },
+  "TS0480041": {
+    "message": "The lifecycle revision of Source '{id}' cannot advance.",
+    "solution": "Replace the Source through its supported lifecycle after preserving required state. Do not reset its identity or counters in place."
+  }
+}

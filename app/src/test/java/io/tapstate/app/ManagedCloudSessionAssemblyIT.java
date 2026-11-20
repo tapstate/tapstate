@@ -425,7 +425,7 @@ class ManagedCloudSessionAssemblyIT {
                     assertThat(response.getStatusCode().value()).isEqualTo(401);
                     return response.bodyTo(String.class);
                 });
-        assertThat(body).contains("control.unauthenticated").doesNotContain(cookie);
+        assertThat(body).contains("TS0210003").doesNotContain(cookie);
     }
 
     private static void assertPipelineCatalog(RestClient client, String cookie, TwoUserPorts ports) {

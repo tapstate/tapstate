@@ -47,7 +47,7 @@ class NativeCloudAlertManagementIT {
                 var saved=post.apply("configuration/save",Map.of("kind","RULE","id","managed-rule","etag","0","form",Map.of("name","Managed rule","typeId","pipeline.failed","resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true)));
                 assertThat(saved.statusCode()).as(saved.body()).isEqualTo(200);
                 assertThat(post.apply("configuration/list",Map.of("kind","RULE")).body()).contains("Managed rule");
-                var denied=post.apply("configuration/list",Map.of("kind","RECEIVER"));assertThat(denied.statusCode()).isEqualTo(409);assertThat(denied.body()).contains("alert.stale-action","managed-external-configuration").doesNotContain("credentialId","ciphertext");
+                var denied=post.apply("configuration/list",Map.of("kind","RECEIVER"));assertThat(denied.statusCode()).isEqualTo(409);assertThat(denied.body()).contains("TS0340008","managed-external-configuration").doesNotContain("credentialId","ciphertext");
                 var calls=Map.of(
                         "configuration/save",AlertHttpModel.map("kind","RECEIVER","id","forged-op","etag","0","form",AlertManagementIT.email()),
                         "configuration/retire",AlertHttpModel.map("kind","RECEIVER","id","forged-op","etag","1"),

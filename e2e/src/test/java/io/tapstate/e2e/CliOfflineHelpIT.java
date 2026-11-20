@@ -41,7 +41,7 @@ class CliOfflineHelpIT {
                 ("--context missing " + command).split(" "));
 
         assertThat(run.exitCode()).isEqualTo(1);
-        assertThat(run.stderr()).contains("error: cli.context-not-found");
+        assertThat(run.stderr()).contains("error: TS0330051");
     }
 
     @ParameterizedTest
@@ -51,7 +51,7 @@ class CliOfflineHelpIT {
                 "--context", "missing", "data-browser", "views.orders.find({note: \"before", flag, "after\"})");
 
         assertThat(run.exitCode()).as("data-browser stdout: %s", run.stdout()).isEqualTo(1);
-        assertThat(run.stderr()).contains("error: cli.context-not-found");
+        assertThat(run.stderr()).contains("error: TS0330051");
     }
 
     @ParameterizedTest

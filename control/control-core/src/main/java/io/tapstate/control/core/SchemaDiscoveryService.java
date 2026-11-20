@@ -2,6 +2,8 @@ package io.tapstate.control.core;
 
 import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.ConnectorErrorDefinitions;
+import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SchemaStore;
@@ -73,7 +75,26 @@ public final class SchemaDiscoveryService {
                         return SchemaReport.from(discovered);
                     });
         } catch (TapstateException failure) {
-            throw ConnectionTestResultRedactor.redact(failure, resolved.secretValues());
+            TapstateException safe = ConnectionTestResultRedactor.redact(failure, resolved.secretValues());
+            String code = safe.code().code();
+            if (code.equals(ConnectorErrorDefinitions.DISCOVERY_AUTHENTICATION_REJECTED.code())
+                    || code.equals(ConnectorErrorDefinitions.DISCOVERY_CONNECTION_TIMEOUT.code())
+                    || code.equals(ConnectorErrorDefinitions.DISCOVER_FAILED.code())) {
+                Object detail = safe.args().get("detail");
+                Throwable cause = failure.getCause();
+                String raw = detail instanceof String text ? text : null;
+                if (raw == null && cause != null && cause.getMessage() != null) {
+                    raw = SecretRedactor.redactConnectionDiagnostic(
+                            cause.getClass().getSimpleName() + ": " + cause.getMessage(), resolved.secretValues());
+                }
+                if (raw != null && !raw.isBlank()) {
+                    Map<String, Object> diagnostic = raw.length() <= 4096
+                            ? Map.of("code", code, "codeSource", "tapstate-standard", "rawMessage", raw)
+                            : Map.of("code", code, "codeSource", "tapstate-standard", "rawMessage", raw.substring(0, 4096), "truncated", true);
+                    throw new ConnectionDiagnosticRefusal(safe, diagnostic);
+                }
+            }
+            throw safe;
         }
     }
 }

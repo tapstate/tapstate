@@ -376,7 +376,7 @@ class CliTest {
         Run r = run("validate", resource("ws-invalid").toString());
         assertThat(r.code()).isEqualTo(1);
         // the dsl-domain error code surfaces, located at the offending file
-        assertThat(r.all()).contains("dsl.unknown-field");
+        assertThat(r.all()).contains("TS0010002");
         assertThat(r.all()).contains("src_typo.tap.yml");
     }
 
@@ -399,7 +399,7 @@ class CliTest {
         // the rendered, user-facing message — not only the bare dev string
         assertThat(r.all()).contains("Unknown field");
         // the canonical code stays visible as the stable, machine-referable identity
-        assertThat(r.all()).contains("dsl.unknown-field");
+        assertThat(r.all()).contains("TS0010002");
     }
 
     @Test
@@ -416,7 +416,7 @@ class CliTest {
         Run r = run("validate", "-o", "json", resource("ws-invalid").toString());
         assertThat(r.code()).isEqualTo(1);
         assertThat(r.out()).contains("\"status\": \"invalid\"")
-                .contains("\"code\": \"dsl.unknown-field\"")
+                .contains("\"code\": \"TS0010002\"")
                 .contains("\"severity\": \"ERROR\"")
                 .contains("\"source\": \"src_typo.tap.yml\"")
                 .contains("Unknown field");
@@ -467,12 +467,12 @@ class CliTest {
 
     @Test
     void validateRendersMalformedYamlAsACodedDiagnosticNotARawStack(@TempDir Path dir) throws Exception {
-        // a syntactically broken file must surface as a coded dsl.malformed-yaml, never a raw snakeyaml stack
+        // a syntactically broken file must surface as a coded TS0010017, never a raw snakeyaml stack
         Path artifact = dir.resolve("broken.tap.yml");
         Files.writeString(artifact, "[unterminated\n");
         Run r = run("validate", artifact.toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.err()).contains("dsl.malformed-yaml");
+        assertThat(r.err()).contains("TS0010017");
         assertThat(r.all()).doesNotContain("org.yaml.snakeyaml");
     }
 
@@ -529,7 +529,7 @@ class CliTest {
         // naming the offending file, not a silent pass
         Run r = run("validate", "-w", resource("ws-misplaced").toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.kind-dir-mismatch");
+        assertThat(r.all()).contains("TS0330016");
         assertThat(r.all()).contains("src_misplaced.tap.yml");
         // the rendered, user-facing message — not only the bare code — naming the declared kind
         assertThat(r.all()).contains("declares kind 'source'");
@@ -542,7 +542,7 @@ class CliTest {
         // diagnostic names the offending file, its declared kind, and the directory it sits in.
         Run r = run("validate", "-w", resource("ws-view-misplaced").toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.kind-dir-mismatch");
+        assertThat(r.all()).contains("TS0330016");
         assertThat(r.all()).contains("src_in_view.tap.yml");
         assertThat(r.all()).contains("declares kind 'source'");
         // the directory naming half of the message — proving the gate read view/, not some other dir
@@ -556,7 +556,7 @@ class CliTest {
         // parent is the root directory name, which never equals a kind
         Run r = run("validate", "-w", resource("ws-root-misplaced").toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.kind-dir-mismatch");
+        assertThat(r.all()).contains("TS0330016");
         assertThat(r.all()).contains("src_root.tap.yml");
     }
 
@@ -567,7 +567,7 @@ class CliTest {
         Run r = run("validate", resource("ws-misplaced").toString());
         assertThat(r.code()).isZero();
         assertThat(r.out()).startsWith("valid:");
-        assertThat(r.all()).doesNotContain("cli.kind-dir-mismatch");
+        assertThat(r.all()).doesNotContain("TS0330016");
     }
 
     @Test
@@ -578,7 +578,7 @@ class CliTest {
                 resource("ws-misplaced").resolve("pipeline").resolve("src_misplaced.tap.yml").toString());
         assertThat(r.code()).isZero();
         assertThat(r.out()).startsWith("valid:");
-        assertThat(r.all()).doesNotContain("cli.kind-dir-mismatch");
+        assertThat(r.all()).doesNotContain("TS0330016");
     }
 
     @Test
@@ -592,7 +592,7 @@ class CliTest {
         Run r = run("validate", flat.toString());
         assertThat(r.code()).isZero();
         assertThat(r.out()).startsWith("valid:");
-        assertThat(r.all()).doesNotContain("cli.kind-dir-mismatch");
+        assertThat(r.all()).doesNotContain("TS0330016");
     }
 
     @Test
@@ -600,7 +600,7 @@ class CliTest {
         Run r = run("validate", "-o", "json", "-w", resource("ws-misplaced").toString());
         assertThat(r.code()).isEqualTo(1);
         assertThat(r.out()).contains("\"status\": \"invalid\"")
-                .contains("\"code\": \"cli.kind-dir-mismatch\"")
+                .contains("\"code\": \"TS0330016\"")
                 .contains("\"severity\": \"ERROR\"")
                 .contains("\"source\": \"src_misplaced.tap.yml\"")
                 // all three declared params travel in the structured contract (TreeMap-sorted)
@@ -614,7 +614,7 @@ class CliTest {
         Run r = run("validate", "-o", "yaml", "-w", resource("ws-misplaced").toString());
         assertThat(r.code()).isEqualTo(1);
         assertThat(r.out()).contains("status: invalid")
-                .contains("code: cli.kind-dir-mismatch")
+                .contains("code: TS0330016")
                 .contains("source: src_misplaced.tap.yml")
                 .contains("dir: pipeline")
                 .contains("kind: source");
@@ -624,7 +624,7 @@ class CliTest {
     void connectedVerbReportsNotConnectedRatherThanMissing() {
         Run r = run("apply");
         assertThat(r.code()).isEqualTo(3);
-        assertThat(r.err()).contains("cli.not-connected");
+        assertThat(r.err()).contains("TS0330020");
     }
 
     @ParameterizedTest
@@ -634,7 +634,7 @@ class CliTest {
         assertThat(r.code()).isEqualTo(3);
         // the shared handler must render a coded diagnostic naming the verb actually typed, for all of
         // them — not just apply, and not a bare string that no catalog or machine reader can resolve
-        assertThat(r.err()).contains("cli.not-connected").contains(verb);
+        assertThat(r.err()).contains("TS0330020").contains(verb);
     }
 
     @ParameterizedTest
@@ -645,7 +645,7 @@ class CliTest {
         // usage instead, telling the user nothing about the connection they are missing.
         Run r = run(verb, "some-id", "--force");
         assertThat(r.code()).isEqualTo(3);
-        assertThat(r.err()).contains("cli.not-connected").contains(verb);
+        assertThat(r.err()).contains("TS0330020").contains(verb);
     }
 
     @ParameterizedTest
@@ -655,8 +655,8 @@ class CliTest {
         assertThat(r.code()).isEqualTo(3);
         // these verbs compose registered operations but have no implementation yet, so "you are not
         // connected" is simply false — connecting would not make them work
-        assertThat(r.err()).contains("cli.verb-not-implemented").contains(verb);
-        assertThat(r.err()).doesNotContain("cli.not-connected");
+        assertThat(r.err()).contains("TS0330022").contains(verb);
+        assertThat(r.err()).doesNotContain("TS0330020");
     }
 
     @ParameterizedTest
@@ -664,7 +664,7 @@ class CliTest {
     void anUnimplementedCompositeVerbSaysSoEvenWhenGivenArguments(String verb) {
         Run r = run(verb, "some-id", "--force");
         assertThat(r.code()).isEqualTo(3);
-        assertThat(r.err()).contains("cli.verb-not-implemented").contains(verb);
+        assertThat(r.err()).contains("TS0330022").contains(verb);
     }
 
     @Test
@@ -722,7 +722,7 @@ class CliTest {
         // user was told to type as a typo, and named an unrelated verb as the fix
         Run r = run("connect", "http://127.0.0.1:8080");
         assertThat(r.code()).isEqualTo(3);
-        assertThat(r.err()).contains("cli.repl-builtin-only").contains("connect");
+        assertThat(r.err()).contains("TS0330023").contains("connect");
         assertThat(r.err()).doesNotContain("Did you mean");
     }
 

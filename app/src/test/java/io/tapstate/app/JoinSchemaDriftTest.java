@@ -91,7 +91,7 @@ class JoinSchemaDriftTest {
         assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, after), after))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code().code())
-                            .isEqualTo("actuation.join-output-schema-source-changed");
+                            .isEqualTo("TS0360016");
                     assertThat(error.args()).containsEntry("pipeline", "flow");
                     assertThat(error.args()).containsEntry("step", "widen");
                     // The difference names the column and both types: "one or more columns changed"
@@ -137,7 +137,7 @@ class JoinSchemaDriftTest {
         assertThatThrownBy(() -> drift.checkAndRecord("flow", "widen", join(SQL), plan(SQL, tables), tables))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code().code())
-                            .isEqualTo("actuation.join-output-schema-engine-changed");
+                            .isEqualTo("TS0360017");
                     // Nothing about the sources moved, so pointing at them would send an operator to
                     // look at a database that is exactly as they left it.
                     assertThat(error.args()).containsEntry("added", "o_total, customer_name");

@@ -77,7 +77,7 @@ class RestApiSecurityConfiguration {
                             jakarta.servlet.http.HttpServletResponse response, jakarta.servlet.FilterChain chain)
                             throws jakarta.servlet.ServletException, java.io.IOException {
                         try { installations.getObject().requireManagementRequest(request); }
-                        catch (io.tapstate.core.common.TapstateException refused) { errors.write(response, refused.code(), refused.args()); return; }
+                        catch (io.tapstate.core.common.TapstateException refused) { errors.write(request, response, refused.code(), refused.args()); return; }
                         chain.doFilter(request, response);
                     }
                 }, SecurityContextHolderFilter.class)

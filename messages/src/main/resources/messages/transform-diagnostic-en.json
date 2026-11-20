@@ -1,0 +1,34 @@
+{
+  "TS0450001": {
+    "message": "Expression {expr} could not be evaluated for a row: {detail}.",
+    "solution": "Check the expression against the fields and types the row actually carries at runtime."
+  },
+  "TS0450002": {
+    "message": "The js transform script could not be compiled: {detail}.",
+    "solution": "Fix the script so it parses as valid JavaScript."
+  },
+  "TS0450003": {
+    "message": "The js transform cannot expose exact decimal {value} as a JavaScript number without changing it to zero or infinity.",
+    "solution": "Use a value whose conversion to a JavaScript number stays finite and does not underflow to zero, or keep this value outside the js transform."
+  },
+  "TS0450004": {
+    "message": "The js transform script defines no process(record, ctx) function.",
+    "solution": "Add a process(record, ctx) function; it is the required entry point of a js transform."
+  },
+  "TS0450005": {
+    "message": "The js transform script raised an error while processing a row: {detail}.",
+    "solution": "Fix the script so it does not throw for this input, or guard the failing operation."
+  },
+  "TS0450006": {
+    "message": "The js transform script produced output that is not a valid record: {detail}.",
+    "solution": "Ensure process returns a record (or emits one) whose before, after and schema are objects or null."
+  },
+  "TS0450007": {
+    "message": "Expanding `{path}` needs the row that an update or a delete replaces, but {detail}, so the rows that row produced cannot be removed.",
+    "solution": "Configure the source to send the whole earlier row: a document store needs change-stream pre-images turned on for the collection, and a relational source needs its replica identity set to full. Sending only the key columns is not enough here."
+  },
+  "TS0450008": {
+    "message": "Two elements of one row expanded `{path}` onto the same key {key}, so the target keeps whichever was written last and the other is lost.",
+    "solution": "Give the elements something that differs between them - a field of their own named by element_key, or their position in the list via include_array_index - or stop the source producing two elements with one identity."
+  }
+}

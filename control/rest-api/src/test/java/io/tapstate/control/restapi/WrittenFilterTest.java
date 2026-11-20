@@ -35,7 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertAll;
  */
 class WrittenFilterTest {
 
-    private static final String MALFORMED = "control.malformed-request";
+    private static final String MALFORMED = "TS0210001";
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("theVocabularyDownBothRoads")

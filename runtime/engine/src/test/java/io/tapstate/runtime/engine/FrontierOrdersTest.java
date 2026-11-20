@@ -127,21 +127,21 @@ class FrontierOrdersTest {
     void refusesAGenerationOrSequencePastWhatTheFieldsHold() {
         assertThatThrownBy(() -> FrontierOrders.pack("orders", new SourceOrder(65_535, 0)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("engine.frontier-order-not-encodable")
+                .hasMessageContaining("TS0440002")
                 .hasMessageContaining("chain=orders")
                 .hasMessageContaining("epoch=65535");
         assertThatThrownBy(() -> FrontierOrders.pack("orders", new SourceOrder(-1, 0)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("engine.frontier-order-not-encodable");
+                .hasMessageContaining("TS0440002");
         assertThatThrownBy(() -> FrontierOrders.pack("orders", new SourceOrder(0, HIGHEST_SEQ + 1)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("engine.frontier-order-not-encodable")
+                .hasMessageContaining("TS0440002")
                 .hasMessageContaining("seq=" + (HIGHEST_SEQ + 1));
         assertThatThrownBy(() -> FrontierOrders.pack("orders", new SourceOrder(0, -5)))
                 .describedAs("only the one reserved sequence is below zero; any other negative is a "
                         + "sequence the ring never assigned")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("engine.frontier-order-not-encodable");
+                .hasMessageContaining("TS0440002");
     }
 
     @Test
