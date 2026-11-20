@@ -153,7 +153,9 @@ class PerfRunnerTest(unittest.TestCase):
     def test_operator_suite_lists_executable_definitions_and_preserves_scope(self):
         cases = runner.select(self.cases, [], [], "operators")
         ids = {case["id"] for case in cases}
-        self.assertEqual(49, len(ids))
+        self.assertEqual(55, len(ids))
+        self.assertTrue({f"aggregate.snapshot.basic.{profile}" for profile in ("small", "standard", "wide", "large")}
+                        | {"aggregate.live.basic.standard", "aggregate.backlog.basic.standard"} <= ids)
         self.assertNotIn("join.live.hot-update.wide", ids)
         self.assertNotIn("copy.live.slow-target.large", ids)
         self.assertEqual({"qualification-ready"}, {runner.case_listing(case)["execution_status"] for case in cases})

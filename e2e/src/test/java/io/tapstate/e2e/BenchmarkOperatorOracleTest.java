@@ -13,6 +13,21 @@ import org.junit.jupiter.api.Test;
 
 class BenchmarkOperatorOracleTest {
     @Test
+    void aggregateReadbackChecksGroupCountsAndSums() {
+        var a = BsonDocument.parse("{'_id':1,'value':9}");
+        var b = BsonDocument.parse("{'_id':9,'value':-4}");
+        var c = BsonDocument.parse("{'_id':2,'value':-6}");
+        var expected = BenchmarkOperatorOracle.aggregate(List.of(a, b, c), 8);
+
+        assertEquals(List.of("1", "2"), List.copyOf(expected.keySet()));
+        assertTrue(BenchmarkOperatorOracle.equivalent(
+                BsonDocument.parse("{'_id':1,'row_count':2,'total_value':5}"), expected.get("1")));
+        assertFalse(BenchmarkOperatorOracle.equivalent(
+                BsonDocument.parse("{'_id':1,'row_count':2,'total_value':9}"), expected.get("1")));
+        assertEquals(List.of("1"), List.copyOf(BenchmarkOperatorOracle.aggregate(List.of(a, b), 8).keySet()));
+    }
+
+    @Test
     void numeric_readback_preserves_decimal128_but_allows_integer_width_changes() {
         var decimal = new org.bson.BsonDecimal128(new org.bson.types.Decimal128(new java.math.BigDecimal("12.50")));
         assertFalse(BenchmarkOperatorOracle.equivalent(decimal, new org.bson.BsonDouble(12.5)));

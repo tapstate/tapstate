@@ -106,6 +106,22 @@ final class BenchmarkOperatorOracle {
                 : "Target row count " + seen.size() + " differs from " + expected.size() + " in " + operators.targets();
     }
 
+    static Map<String, BsonDocument> aggregate(List<BsonDocument> rows, int groupCount) {
+        var groups = new LinkedHashMap<Integer, GroupTotals>();
+        for (var row : rows) {
+            int group = Math.floorMod(number(row, "_id"), groupCount);
+            groups.merge(group, new GroupTotals(1, number(row, "value")),
+                    (left, right) -> new GroupTotals(left.count() + right.count(), left.sum() + right.sum()));
+        }
+        var expected = new LinkedHashMap<String, BsonDocument>();
+        groups.forEach((group, totals) -> expected.put(group.toString(),
+                new BsonDocument("_id", new BsonInt64(group)).append("row_count", new BsonInt64(totals.count()))
+                        .append("total_value", new BsonInt64(totals.sum()))));
+        return expected;
+    }
+
+    private record GroupTotals(long count, long sum) {}
+
     private static String targetIdentity(String scenario, String table, BsonDocument actual) {
         return switch (scenario) {
             case "unwind-basic" -> {

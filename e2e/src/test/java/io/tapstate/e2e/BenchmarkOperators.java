@@ -33,7 +33,8 @@ final class BenchmarkOperators {
         fanout = scenario.equals("nest-fanout") ? spec.getDocument("parameters").getDocument("paired_control")
                 .getDocument(variant ? "variant_trial" : "baseline").getInt32("children_per_root").getValue() : null;
         rows = switch (scenario) {
-            case "map-basic", "filter-basic", "js-basic", "mixed-double-map" -> Map.of("records", requestedRows);
+            case "map-basic", "filter-basic", "js-basic", "mixed-double-map", "aggregate-basic" ->
+                    Map.of("records", requestedRows);
             case "unwind-basic" -> Map.of("parents", requestedRows);
             case "union-basic" -> Map.of("left", positive(requestedRows / 2), "right", requestedRows - requestedRows / 2);
             case "join-basic", "join-steady-state", "join-lifecycle-release" -> Map.of("facts", requestedRows, "dimensions", Math.max(1, requestedRows / 10));
@@ -76,6 +77,7 @@ final class BenchmarkOperators {
             case "union-basic" -> List.of("left", "right");
             case "join-basic", "join-hot-update", "join-steady-state", "join-lifecycle-release" -> List.of("facts");
             case "nest-basic", "nest-child-update", "nest-fanout" -> List.of("roots");
+            case "aggregate-basic" -> List.of(nodes.getLast());
             default -> List.of("records");
         };
     }
@@ -98,6 +100,10 @@ final class BenchmarkOperators {
                             FROM f JOIN d ON f.dimension_id = d._id
                             """));
             case "nest-basic", "nest-child-update", "nest-fanout" -> List.of(nest(first, "roots", "_id"));
+            case "aggregate-basic" -> List.of(Map.of("id", first, "from", List.of("records"),
+                    "type", "aggregate", "key", List.of("_id"),
+                    "groupBy", Map.of("_id", "=int(after._id) % " + aggregateGroupCount()),
+                    "fields", Map.of("row_count", Map.of("count", true), "total_value", Map.of("sum", "$value"))));
             case "mixed-double-map" -> List.of(
                     map(first, List.of("records"), Map.of("value", "=int(after.value) + 1")),
                     filter(nodes.get(1), first),
@@ -165,7 +171,13 @@ final class BenchmarkOperators {
             byTable.put(table, source.getCollection(table, BsonDocument.class).find()
                     .sort(Sorts.ascending("_id")).into(new ArrayList<>()));
         }
-        return BenchmarkOperatorOracle.expected(scenario, byTable);
+        return scenario.equals("aggregate-basic")
+                ? BenchmarkOperatorOracle.aggregate(byTable.get("records"), aggregateGroupCount())
+                : BenchmarkOperatorOracle.expected(scenario, byTable);
+    }
+
+    private int aggregateGroupCount() {
+        return specification.getDocument("parameters").getInt32("group_count").getValue();
     }
 
     List<String> mutableInputs() {

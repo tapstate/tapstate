@@ -15,7 +15,7 @@ MODULE = importlib.util.spec_from_file_location("perf_catalog", CATALOG)
 catalog_tool = importlib.util.module_from_spec(MODULE)
 MODULE.loader.exec_module(catalog_tool)
 PROFILES = {"small", "standard", "wide", "large"}
-BASE_GROUPS = {"copy", "map", "filter", "js", "unwind", "union", "join", "nest"}
+BASE_GROUPS = {"copy", "map", "filter", "js", "unwind", "union", "join", "nest", "aggregate"}
 SPECIAL_CASES = {
     "copy.snapshot.dummy-baseline.standard",
     "copy.live.handoff.standard",
@@ -127,7 +127,7 @@ class PerfCatalogTest(unittest.TestCase):
         self.assertIn("Group children independently", description)
         self.assertIn("Both all inputs are consumed", description)
         self.assertIn(self.cases[case_id]["definition_sha256"], description)
-        self.assertIn("58 registered cases", catalog_tool.render_markdown(self.catalog))
+        self.assertIn("64 registered cases", catalog_tool.render_markdown(self.catalog))
         invalid = subprocess.run(
             [sys.executable, str(CATALOG), "--case", "missing-case"],
             text=True, capture_output=True, check=False,
