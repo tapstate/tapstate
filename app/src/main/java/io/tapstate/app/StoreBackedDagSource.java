@@ -352,7 +352,8 @@ final class StoreBackedDagSource implements DagSource {
                     pipeline, FromClause.list(view.from()), sourceKeyByTable, sourceKeysById,
                     sourceVertices, stepIds));
         }
-        targetModelResolver.requireAllDiscovered(sourceIds);
+        targetModelResolver.requireAllDiscovered(sourceIds.stream()
+                .map(binding -> pipeline.sourceReference(binding).id()).distinct().toList());
     }
 
     StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder) {
@@ -2968,7 +2969,7 @@ final class StoreBackedDagSource implements DagSource {
         return recordedForAll && storePort.meta().writerRun(chain, consumerId).isEmpty();
     }
 
-    /** The source artifacts whose rows can reach one terminal reference. */
+    /** The input bindings whose rows can reach one terminal reference. */
     private static Set<String> sourceIdsReaching(
             PipelineResource pipeline,
             FromClause from,

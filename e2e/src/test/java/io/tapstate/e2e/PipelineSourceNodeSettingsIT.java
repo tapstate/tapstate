@@ -1,8 +1,11 @@
 package io.tapstate.e2e;
 
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -145,9 +148,25 @@ class PipelineSourceNodeSettingsIT {
                     Map.of("revision", 2, "artifactHash", previousArtifact), null, 200);
             Map<?, ?> wizard = (Map<?, ?>) control.pipelineDraft(pipeline).orElseThrow().get("wizard");
             assertThat(wizard.get("sourceNodeConfigs")).isEqualTo(restored);
+            clearForUpdatedSelection(control, storage, pipeline);
             control.lifecycle(pipeline, LifecycleVerb.START);
             awaitState(control, pipeline, PipelineState.RUNNING);
             assertThat(control.contentHash(SOURCE)).isEqualTo(originalSource);
+        }
+    }
+
+    private static void clearForUpdatedSelection(ControlPlane control, PreparedNativeStore storage, String pipeline) {
+        // The inherited capture has a different input selection. Prepare the new definition for a full load.
+        try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
+                storage.configurationUri(), null, Duration.ofSeconds(5)))) {
+            long original = configuration.pipelineStates().read(pipeline).orElseThrow().stateGeneration();
+            control.stop(pipeline, true);
+            Await.until("the updated Pipeline's state to be cleared", TIMEOUT,
+                    () -> configuration.pipelineStates().read(pipeline)
+                            .filter(state -> state.stateGeneration() > original
+                                    && state.phase() == PipelineStateMapping.Phase.ACTIVE).isPresent()
+                            && control.state(pipeline).filter(PipelineState.STOPPED::equals).isPresent(),
+                    () -> configuration.pipelineStates().read(pipeline).toString());
         }
     }
 
