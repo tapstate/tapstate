@@ -107,27 +107,115 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if(current.deleted() || !current.scope().equals(scope) || current.desired().targetState()!=PipelineState.STOPPED || current.desired().purgeState())throw fenced();
     }
     @Override public Optional<PipelineIntentSnapshot> loadForActuation(String pipelineId) {
+        return actuation(pipelineId, false).map(ActuationReading::intent);
+    }
+
+    @Override public Optional<ActuationReading> readForActuation(String pipelineId) {
+        return actuation(pipelineId, true);
+    }
+
+    private record ActuationAttempt(ActuationReading reading, boolean needsTransaction) {
+        private static final ActuationAttempt ABSENT = new ActuationAttempt(null, false);
+        private static final ActuationAttempt NEEDS_TRANSACTION = new ActuationAttempt(null, true);
+    }
+
+    private Optional<ActuationReading> actuation(String pipelineId, boolean readVersion) {
         requireId(pipelineId);
-        return transaction(session -> {
-            Document row = intents.find(session, new Document("_id", pipelineId)).first();
-            if (row == null) return Optional.empty();
-            var snapshot = decodeCurrent(session, row);
-            if (snapshot.deleted() || row.containsKey(FAILURE)) return Optional.empty();
-            Document mapping = mappings.find(session, new Document("_id", pipelineId)).first();
-            var identity = MongoPipelineStateMappings.decode(pipelineId, mapping);
-            if (identity.phase() != PipelineStateMapping.Phase.ACTIVE) return Optional.empty();
-            if (identity.stateGeneration() != snapshot.scope().stateGeneration()) throw fenced();
-            if (pipelines.find(session, new Document("_id", pipelineId)).first() == null) throw fenced();
-            var prepared = MongoPipelinePreparationFacts.decode(pipelineId, mapping, clusterId);
-            if (prepared.phase() != io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE) return Optional.empty();
-            if (!snapshot.scope().equals(prepared.scope())) throw fenced();
-            var shared=MongoPipelineSharedRecoveryFacts.read(mapping);
-            if(shared.isPresent()) {
-                if(snapshot.desired().targetState()==PipelineState.STOPPED && !snapshot.desired().purgeState())return Optional.of(snapshot);
-                if(!MongoPipelineSharedRecoveryFacts.ready(session,database,shared.orElseThrow()))return Optional.empty();
-                if(snapshot.desired().targetState()!=PipelineState.STOPPED && !snapshot.desired().purgeState())return Optional.empty();
-            }
-            return Optional.of(snapshot);
+        var result = readSnapshot(session -> bindings.supportsActuationBatch()
+                ? batchActuation(session, pipelineId, readVersion)
+                : unbatchedActuation(session, pipelineId, readVersion));
+        if (result.needsTransaction()) {
+            // Shared recovery reads the complete current actuation state again in its CONFIG transaction.
+            result = transaction(session -> unbatchedActuation(session, pipelineId, readVersion));
+        }
+        return Optional.ofNullable(result.reading());
+    }
+
+    private ActuationAttempt unbatchedActuation(ClientSession session, String pipelineId, boolean readVersion) {
+        var row = intents.find(session, new Document("_id", pipelineId)).first();
+        if (row == null) return ActuationAttempt.ABSENT;
+        var snapshot = decode(row);
+        var facts = bindings.admittedFacts(session, readVersion);
+        return validateActuation(session, row, snapshot, facts,
+                () -> mappings.find(session, new Document("_id", pipelineId)).first(),
+                () -> pipelines.find(session, new Document("_id", pipelineId)).first() != null);
+    }
+
+    private ActuationAttempt batchActuation(ClientSession session, String pipelineId, boolean readVersion) {
+        var query = new java.util.ArrayList<Document>();
+        query.add(MongoPipelineObservationRead.match(new Document("_id", pipelineId)));
+        query.add(MongoPipelineObservationRead.boundedRow());
+        query.add(MongoPipelineObservationRead.originalRow());
+        query.add(MongoPipelineObservationRead.one(SystemCollections.OPERATOR_GENERATIONS, "mapping", pipelineId));
+        query.add(MongoPipelineObservationRead.lookup(SystemCollections.PIPELINES, "pipeline", List.of(
+                MongoPipelineObservationRead.match(new Document("_id", pipelineId)),
+                new Document("$project", new Document("_id", 1)), new Document("$limit", 1))));
+        query.add(MongoPipelineObservationRead.one(SystemCollections.CONFIG_CLUSTER_IDENTITY, "cluster", "cluster"));
+        query.add(MongoPipelineObservationRead.one(SystemCollections.STORAGE_SETUP, "setup", "cluster"));
+        query.add(MongoPipelineObservationRead.lookup(SystemCollections.STORAGE_BINDING, "binding", List.of(
+                MongoPipelineObservationRead.match(new Document("_id", "cluster")),
+                new Document("$project", new Document("cache", 0)), MongoPipelineObservationRead.boundedRow())));
+        query.add(MongoPipelineObservationRead.lookup(SystemCollections.STORAGE_RECOVERY, "recovery",
+                List.of(new Document("$limit", 2), MongoPipelineObservationRead.boundedRow())));
+        if (readVersion) query.add(MongoPipelineObservationRead.one(SystemCollections.CONFIGURATION_VERSION, "configuration", ConfigurationVersion.ID));
+
+        var row = intents.aggregate(session, query).first();
+        if (row == null) return ActuationAttempt.ABSENT;
+        var original = row.get("body", Document.class);
+        if (!pipelineId.equals(original.get("_id"))) return unbatchedActuation(session, pipelineId, readVersion);
+        var cluster = MongoPipelineObservationRead.single(row,"cluster");
+        var setup = MongoPipelineObservationRead.single(row,"setup");
+        var binding = MongoPipelineObservationRead.single(row,"binding");
+        var recovery = MongoPipelineObservationRead.single(row,"recovery");
+        var configuration = MongoPipelineObservationRead.single(row,"configuration");
+        if (cluster == null || setup == null || binding == null || recovery == null
+                || MongoPipelineObservationRead.overflow(row, "mapping", 1)
+                || readVersion && MongoPipelineObservationRead.overflow(row, "configuration", 1))
+            return unbatchedActuation(session, pipelineId, readVersion);
+        var mapping = MongoPipelineObservationRead.single(row, "mapping");
+        boolean pipelineExists = !MongoPipelineObservationRead.rows(row,"pipeline").isEmpty();
+        var snapshot = decode(original);
+        var facts = bindings.admittedObservationFacts(cluster, setup, binding, configuration, recovery);
+        return validateActuation(session, original, snapshot, facts, () -> mapping, () -> pipelineExists);
+    }
+
+    private ActuationAttempt validateActuation(ClientSession session, Document row, PipelineIntentSnapshot snapshot,
+            MongoStorageBindingStore.AdmittedFacts facts, java.util.function.Supplier<Document> currentMapping,
+            java.util.function.BooleanSupplier pipelineExists) {
+        var admitted = facts.preparation();
+        var scope = snapshot.scope();
+        if (admitted.isEmpty() || !admitted.orElseThrow().businessScope().equals(new io.tapstate.spi.store.CacheBusinessScope(
+                scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))) throw unreadable();
+        if (snapshot.deleted() || row.containsKey(FAILURE)) return ActuationAttempt.ABSENT;
+        Document mapping = currentMapping.get();
+        var identity = MongoPipelineStateMappings.decode(scope.pipelineId(), mapping);
+        if (identity.phase() != PipelineStateMapping.Phase.ACTIVE) return ActuationAttempt.ABSENT;
+        if (identity.stateGeneration() != scope.stateGeneration() || !pipelineExists.getAsBoolean()) throw fenced();
+        var prepared = MongoPipelinePreparationFacts.decode(scope.pipelineId(), mapping, clusterId);
+        if (prepared.phase() != io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE) return ActuationAttempt.ABSENT;
+        if (!scope.equals(prepared.scope())) throw fenced();
+        var shared = MongoPipelineSharedRecoveryFacts.read(mapping);
+        var revision = facts.version() == null ? java.util.OptionalLong.empty()
+                : java.util.OptionalLong.of(ConfigurationVersion.revision(facts.version()));
+        var attempt = new ActuationAttempt(new ActuationReading(snapshot, revision), false);
+        if (shared.isPresent()) {
+            if (snapshot.desired().targetState() == PipelineState.STOPPED && !snapshot.desired().purgeState()) return attempt;
+            if (!session.hasActiveTransaction()) return ActuationAttempt.NEEDS_TRANSACTION;
+            if (!MongoPipelineSharedRecoveryFacts.ready(session, database, shared.orElseThrow())) return ActuationAttempt.ABSENT;
+            if (snapshot.desired().targetState() != PipelineState.STOPPED && !snapshot.desired().purgeState()) return ActuationAttempt.ABSENT;
+        }
+        return attempt;
+    }
+
+    private <T> T readSnapshot(Function<ClientSession,T> read){
+        return StoreIo.call(()->{
+            try{
+                requireActive.run();
+                if(!MongoReadBudget.supportsSnapshotReads(client))return transaction(read);
+                try(var session=client.startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())){
+                    T result=read.apply(session);requireActive.run();return result;
+                }
+            }catch(RuntimeException failure){requireActive.run();throw failure;}
         });
     }
 

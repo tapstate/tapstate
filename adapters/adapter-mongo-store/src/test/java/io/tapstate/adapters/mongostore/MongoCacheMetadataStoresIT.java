@@ -66,6 +66,44 @@ class MongoCacheMetadataStoresIT {
     private static ConnectionTestResult result(long at) { return new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.PASSED,
             List.of(new ConnectionTestItem("Connection", ConnectionTestItem.Status.PASSED, null, null, null, null)), at); }
 
+    @Test void warmPhysicalProofsKeepLiveIdentityChecksAndExpireBeforeTenSecondsOfDrift() {
+        withFixture(f->{
+            for(var table:List.of(SystemCollections.SRS_CHAINS,SystemCollections.SRS_MODELS,SystemCollections.SRS_MODEL_CONTEXTS,
+                    SystemCollections.SRS_EVENTS,SystemCollections.SRS_LOG_BOUNDS,SystemCollections.SRS_CONSUMERS,
+                    SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,SystemCollections.CACHE_PIPELINE_STATE)){
+                table.prepareCollectionOn(f.database);for(var index:table.indexes())IndexEnsure.createIfAbsent(table.on(f.database),index);
+            }
+            var stores=f.domain.runtimeSrs(SCOPE,ACTIVE);assertThat(stores.chains().load("absent")).isEmpty();
+            var commands=new ArrayList<String>();MongoCommandObservation.CURRENT.set(commands::add);
+            try{assertThat(stores.chains().load("absent")).isEmpty();}
+            finally{MongoCommandObservation.CURRENT.remove();}
+            assertThat(commands).doesNotContain("listCollections","listIndexes");
+            SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id","cluster"),new Document("$set",new Document("businessPhase","PREPARING")));
+            assertThatThrownBy(()->stores.chains().load("absent")).isInstanceOf(TapstateException.class);
+            SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id","cluster"),new Document("$set",new Document("businessPhase","READY")));
+            assertThat(stores.chains().load("absent")).isEmpty();
+            SystemCollections.SRS_MODELS.on(f.database).createIndex(new Document("diagnostic_expiry",1),
+                    new com.mongodb.client.model.IndexOptions().name("unexpected_ttl").expireAfter(1L,TimeUnit.SECONDS));
+            assertThat(stores.chains().load("absent")).isEmpty();
+            TapstateException drift=null;long deadline=System.nanoTime()+Duration.ofSeconds(11).toNanos();
+            while(System.nanoTime()-deadline<0){
+                try{stores.chains().load("absent");}catch(TapstateException detected){drift=detected;break;}
+                Thread.sleep(100);
+            }
+            assertThat(drift).isNotNull();assertThat(drift.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+        });
+    }
+    @Test void aWarmClaimViewCannotRecreateADroppedClaimNamespace() {
+        withFixture(f->{
+            var claims=f.domain.workloadClaims(SCOPE);
+            var owner=new io.tapstate.spi.store.WorkloadOwner("node","boot");
+            var original=new io.tapstate.spi.store.WorkloadClaimKey(SCOPE.clusterId(),io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION,"node");
+            claims.acquire(original,owner,1,Duration.ofSeconds(30));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database).drop();
+            assertThatThrownBy(()->claims.acquire(original,owner,1,Duration.ofSeconds(30))).isInstanceOf(TapstateException.class);
+            assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName());
+        });
+    }
     @Test void smallResourcesRemainSeparateAndPreserveCanonicalBodiesAndByteExactSpecs() {
         withFixture(f -> {
             var catalog = f.domain.connectorCatalog(SCOPE, ACTIVE); var specs = f.domain.connectorSpecs(SCOPE, ACTIVE);
