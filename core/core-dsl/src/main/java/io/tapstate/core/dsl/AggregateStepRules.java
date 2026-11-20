@@ -28,6 +28,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * What an aggregate step is held to before it runs.
@@ -139,15 +141,18 @@ public final class AggregateStepRules {
         }
     }
 
-    /** The nearest aggregate step that {@code refs} read, directly or through other steps, or null. */
+    /**
+     * The nearest aggregate step that {@code refs} read, directly or through other steps, or null. A
+     * {@code /.../} reference reads every step whose id it matches; one that does not compile is taken
+     * to read every step, since the step it was meant to select cannot be ruled out.
+     */
     private static String aggregateAbove(Collection<FromRef> refs, Map<String, Step> steps,
             Map<String, Resource> byId, Set<String> visited) {
-        for (FromRef ref : refs) {
-            if (!(ref instanceof FromRef.Literal literal) || steps.get(literal.ref()) == null
-                    || !visited.add(literal.ref())) {
+        for (String id : stepIdsRead(refs, steps)) {
+            if (!visited.add(id)) {
                 continue;
             }
-            Step upstream = steps.get(literal.ref());
+            Step upstream = steps.get(id);
             if (bodyOf(upstream, byId) instanceof TransformBody.Aggregate) {
                 return upstream.id();
             }
@@ -324,6 +329,33 @@ public final class AggregateStepRules {
                 collectFilters(upstream, steps, byId, filters, visited);
             }
         }
+    }
+
+    private static List<String> stepIdsRead(Collection<FromRef> refs, Map<String, Step> steps) {
+        List<String> ids = new ArrayList<>();
+        for (FromRef ref : refs) {
+            switch (ref) {
+                case FromRef.Literal literal -> {
+                    if (steps.containsKey(literal.ref())) {
+                        ids.add(literal.ref());
+                    }
+                }
+                case FromRef.Regex regex -> {
+                    Pattern pattern;
+                    try {
+                        pattern = Pattern.compile(regex.pattern());
+                    } catch (PatternSyntaxException invalid) {
+                        pattern = null;
+                    }
+                    for (String id : steps.keySet()) {
+                        if (pattern == null || pattern.matcher(id).matches()) {
+                            ids.add(id);
+                        }
+                    }
+                }
+            }
+        }
+        return ids;
     }
 
     private static Collection<FromRef> refsOf(FromClause from) {

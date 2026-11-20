@@ -91,6 +91,30 @@ class AggregateStepRulesTest {
     }
 
     @Test
+    @DisplayName("a target reading the step through a pattern is refused as if it named the step")
+    void aTargetReadingTheStepThroughAPatternIsRefused() {
+        refused(() -> Workspace.of(servedFrom("/by_.*/")),
+                AggregateError.REBUILD_NEEDS_CLEAR, Map.of("step", "by_region", "target", "dw", "policy", "append"));
+        refused(() -> Workspace.of(servedFrom("/.*/")),
+                AggregateError.REBUILD_NEEDS_CLEAR, Map.of("step", "by_region", "target", "dw", "policy", "append"));
+    }
+
+    private static List<Resource> servedFrom(String from) {
+        DslParser parser = new DslParser();
+        return List.of(parser.parse(SOURCE), parser.parse(TARGET), parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: sales
+                source: src_orders
+                transforms:
+                %s
+                serve:
+                  from: [ %s ]
+                  sync: [ { id: dw, source: tgt, write_mode: upsert } ]
+                """.formatted(BY_REGION.stripTrailing(), from)));
+    }
+
+    @Test
     @DisplayName("a target that clears, or refuses a full load while it holds rows, is accepted")
     void aTargetThatClearsOrFailsIsAccepted() {
         assertThatCode(() -> Workspace.of(batch(BY_REGION,
