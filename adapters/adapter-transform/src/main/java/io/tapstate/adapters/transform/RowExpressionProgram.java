@@ -4,8 +4,10 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.NullValue;
 import dev.cel.common.CelAbstractSyntaxTree;
 import dev.cel.runtime.CelEvaluationException;
+import dev.cel.runtime.CelFunctionResolver;
 import dev.cel.runtime.CelRuntime;
 import dev.cel.runtime.CelRuntimeFactory;
+import io.tapstate.core.dsl.DecimalComparisonFunctions;
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
@@ -14,6 +16,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.UnaryOperator;
 
 /**
@@ -31,16 +34,19 @@ import java.util.function.UnaryOperator;
  */
 final class RowExpressionProgram {
 
-    // A standard runtime with no custom function bindings. It is immutable and shared: building the
+    // A runtime with exact decimal comparison function bindings. It is immutable and shared: building the
     // per-expression program is the only per-instance cost.
-    private static final CelRuntime RUNTIME = CelRuntimeFactory.standardCelRuntimeBuilder().build();
+    private static final CelRuntime RUNTIME = DecimalComparisonFunctions.configureRuntime(
+            CelRuntimeFactory.standardCelRuntimeBuilder()).build();
 
     private final CelRuntime.Program program;
+    private final CelFunctionResolver functions;
     // The source expression, kept so an evaluation failure can name the expression that failed.
     private final String expr;
 
-    private RowExpressionProgram(CelRuntime.Program program, String expr) {
+    private RowExpressionProgram(CelRuntime.Program program, CelFunctionResolver functions, String expr) {
         this.program = program;
+        this.functions = functions;
         this.expr = expr;
     }
 
@@ -56,7 +62,8 @@ final class RowExpressionProgram {
 
     private static RowExpressionProgram of(CelAbstractSyntaxTree ast, String expr) {
         try {
-            return new RowExpressionProgram(RUNTIME.createProgram(ast), expr);
+            var prepared = DecimalComparisonFunctions.forRuntime(ast);
+            return new RowExpressionProgram(RUNTIME.createProgram(prepared.ast()), prepared.functions(), expr);
         } catch (CelEvaluationException e) {
             // A checked AST builds into a program; a failure here is an invariant violation, not a
             // user condition.
@@ -79,7 +86,7 @@ final class RowExpressionProgram {
         vars.put("after", bind(after));
         vars.put("schema", bind(event.schema()));
         try {
-            return unbound(program.eval(vars));
+            return unbound(program.eval(name -> Optional.ofNullable(vars.get(name)), functions));
         } catch (CelEvaluationException e) {
             // A row-level evaluation failure (a missing field, a type clash on a dyn value, a function
             // that type-checks but is unbound at runtime) is a user-diagnosable condition: surface it
@@ -114,6 +121,9 @@ final class RowExpressionProgram {
         // fails nor warns. The carrier is not restored on the way out - what an expression produces is
         // a new value, and it is only the row's own untouched values that keep travelling as they came.
         if (value instanceof ConvertedValue carried) {
+            if ("DECIMAL128".equalsIgnoreCase(carried.originType()) && carried.value() instanceof Double number) {
+                return DecimalComparisonFunctions.DecimalSpecialValue.bind(number);
+            }
             return bound(carried.value());
         }
         if (value == null) {
@@ -129,6 +139,9 @@ final class RowExpressionProgram {
     // language's own wrappers; a sink is owed the row's values, so a value that merely travelled
     // through an expression leaves as the kind of value it arrived as.
     private static Object unbound(Object value) {
+        if (value instanceof DecimalComparisonFunctions.DecimalSpecialValue number) {
+            return number.doubleValue();
+        }
         if (value == NullValue.NULL_VALUE) {
             return null;
         }

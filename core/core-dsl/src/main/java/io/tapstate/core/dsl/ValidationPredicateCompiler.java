@@ -94,8 +94,18 @@ public final class ValidationPredicateCompiler {
             default -> null;
         };
         if (operator != null && args.size() == 2)
-            return new Compare(operator, expression(args.get(0), depth + 1), expression(args.get(1), depth + 1));
+            return new Compare(operator, comparisonOperand(args.get(0), depth + 1),
+                    comparisonOperand(args.get(1), depth + 1));
         throw unsupported(expression, "filter.function." + function.substring(0, Math.min(function.length(), 96)));
+    }
+
+    private Expr comparisonOperand(CelExpr operand, int depth) {
+        var literal = DecimalComparisonFunctions.floatingConstant(ast, operand);
+        if (literal != null) {
+            visit(depth);
+            return new FloatingLiteral(literal.binary(), literal.exact());
+        }
+        return expression(operand, depth);
     }
 
     private Access fieldPath(CelExpr expression, int depth) {
