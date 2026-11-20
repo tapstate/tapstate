@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoDestination;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
@@ -11,12 +12,16 @@ import io.tapstate.adapters.transform.UnwindSpec;
 import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.control.core.PipelineOutputNames;
 import io.tapstate.core.dsl.PipelineInputs;
+import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.UnwindWriteKeys;
 import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineNode;
@@ -33,7 +38,9 @@ import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.AggregateBinding;
 import io.tapstate.runtime.engine.DagBindings;
+import io.tapstate.runtime.engine.aggregate.AggregateStores;
 import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.DagTraceBinding;
 import io.tapstate.runtime.engine.FrontierBinding;
@@ -95,6 +102,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -560,6 +568,11 @@ final class StoreBackedDagSource implements DagSource {
     /** Builds the official topology with finite sources and run-scoped, no-external-write sinks. */
     DAG previewDag(PipelineResource pipeline, String sampleMap,
             String materializerMap, DagTraceBinding trace, String previewExecutionId) {
+        if (pipeline.transforms() != null
+                && pipeline.transforms().stream().anyMatch(step -> AggregateSteps.of(step) != null)) {
+            // A preview keeps no state behind it, and an aggregate step has nowhere else to keep its groups.
+            throw previewRefused("a pipeline with an aggregate step cannot be previewed");
+        }
         Map<String, SourceVertex> vertices = sourceVertices(pipeline);
         Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
         Map<String, List<String>> sourceKeysById = sourceKeysById(vertices);
@@ -791,6 +804,8 @@ final class StoreBackedDagSource implements DagSource {
                 pipeline.view() instanceof ViewBlock.Inline view ? FromClause.list(view.from()) : null,
                 bySourceTable, assembled, sourceVertices, sourceColumns);
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serving.streams());
+        requirePublishedIdentityWhereAWriteMatchesOnIt(
+                pipeline, bySourceTable, serving.targets(), serving.streams());
         Map<String, TargetTable> targets = serving.targets();
         Map<String, TargetTable> viewTargets = viewing.targets();
         Set<String> serveLanding = serving.landing();
@@ -1406,16 +1421,70 @@ final class StoreBackedDagSource implements DagSource {
             if (!(inline.body() instanceof TransformBody.Nest nest)) {
                 continue;
             }
-            NestTable root = byAlias.get(nest.root().from());
+            RootTable root = assembledRootTable(pipeline, nest, byAlias, sourceVertices);
             if (root == null) {
                 continue;
             }
-            TargetTable model = bySourceTable.get(root.name());
+            TargetTable source = bySourceTable.get(root.name());
+            TargetTable model = source == null ? null : projectedModel(source, root.projections());
             assembled.put(step.id(), model != null
                     ? TargetModelResolver.keyedOn(model, nest.root().key())
                     : new TargetTable(root.name(), List.of()));
         }
+        // An aggregate step publishes a table of its own, named by the step and keyed by its group names.
+        // One whose input cannot be described yet still contributes the name, for the reason a nest does.
+        Map<String, AggregateStepSpec> aggregates =
+                compiledAggregates(pipeline, bySourceTable, sourceVertices, compiledJoins);
+        for (Step step : pipeline.transforms()) {
+            if (AggregateSteps.of(step) != null) {
+                AggregateStepSpec spec = aggregates.get(step.id());
+                assembled.put(step.id(), spec != null ? AggregateSteps.target(spec)
+                        : new TargetTable(step.id(), List.of()));
+            }
+        }
         return assembled;
+    }
+
+    /**
+     * Each aggregate step as a run executes it, compiled against the discovered columns that reach it. A
+     * step whose input cannot be described is left out; a step that can be described and does not hold
+     * is refused here with its own code.
+     */
+    private Map<String, AggregateStepSpec> compiledAggregates(
+            PipelineResource pipeline, Map<String, TargetTable> bySourceTable,
+            Map<String, SourceVertex> sourceVertices, Map<String, CompiledJoin> compiledJoins) {
+        Map<String, AggregateStepSpec> byStep = new LinkedHashMap<>();
+        if (pipeline.transforms() == null
+                || pipeline.transforms().stream().noneMatch(step -> AggregateSteps.of(step) != null)) {
+            return byStep;
+        }
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Map<String, NodeColumns> derived = deriveSteps(pipeline, sourceVertices, sourceKeyByTable,
+                sourceKeysById, stepIds, compiledJoins, this::discoveredColumns).columns();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Aggregate aggregate = AggregateSteps.of(step);
+            if (aggregate == null) {
+                continue;
+            }
+            Map<String, NodeColumns> inputs = inputsOf(refsOf(step.from()), sourceVertices, sourceKeyByTable,
+                    sourceKeysById, stepIds, derived, this::discoveredColumns, false);
+            NodeColumns input = inputs == null ? null : NodeColumns.merged(inputs.values());
+            if (input == null || !input.known()) {
+                continue;
+            }
+            // The rows of one table carry that table's key; rows of several have no key in common.
+            Set<String> streams = streamsReaching(pipeline, step.from(), sourceKeyByTable, sourceKeysById,
+                    sourceVertices, stepIds);
+            TargetTable table = streams.size() == 1 ? bySourceTable.get(streams.iterator().next()) : null;
+            List<String> tableKey = table == null ? List.of() : table.fields().stream()
+                    .filter(TargetField::primaryKey).map(TargetField::name).toList();
+            byStep.put(step.id(), AggregateSteps.compile(step, aggregate, input, tableKey,
+                    refsOf(step.from()).stream().map(StoreBackedDagSource::referenceOf)
+                            .collect(java.util.stream.Collectors.joining(", "))));
+        }
+        return byStep;
     }
 
     /**
@@ -1527,6 +1596,7 @@ final class StoreBackedDagSource implements DagSource {
             if (!(stepOf(pipeline, key) instanceof Step.Inline inline)
                     || inline.body() instanceof TransformBody.Nest
                     || inline.body() instanceof TransformBody.Join
+                    || inline.body() instanceof TransformBody.Aggregate
                     || !visiting.add(key)) {
                 continue;
             }
@@ -1541,7 +1611,7 @@ final class StoreBackedDagSource implements DagSource {
                     }
                 }
                 if (!inputs.isEmpty()) {
-                    reached.add(NodeColumns.of(inline.body(), inputs, null));
+                    reached.add(NodeColumns.of(inline.id(), inline.body(), inputs, null));
                 }
             } finally {
                 // A shared ancestor must be visited again from another fork. Only cycles on the
@@ -1616,7 +1686,7 @@ final class StoreBackedDagSource implements DagSource {
                                 && !inputs.containsKey(nest.root().from()))) {
                     continue;
                 }
-                NodeColumns columns = NodeColumns.of(step.body(), inputs, null);
+                NodeColumns columns = NodeColumns.of(step.id(), step.body(), inputs, null);
                 // A node that cannot say what it emits carries what reached it, so the chain of models
                 // does not stop here and take everything below it with it. Only where the answer is
                 // unknown: a node that did work its columns out keeps them.
@@ -1897,10 +1967,11 @@ final class StoreBackedDagSource implements DagSource {
      * inherit its old spelling as a fallback when no element type is known.
      *
      *
-     * <p>The key starts as whatever of the table's own key still travels, key columns leading, because
-     * that is the order the sink matches an upsert in. A projection that drops a key column publishes
-     * rows with nothing to match on; that reaches the sink as a key one column short and is reported
-     * there, against the table being written, rather than being invented back here.
+     * <p>The key starts as the table's complete key, key columns leading, because that is the order
+     * the sink matches an upsert in. If a projection drops or replaces any component, output identity
+     * is unresolved: a surviving subset cannot uniquely identify rows from a composite-key source,
+     * so the target table is published without a key (which preview materialization refuses, while
+     * sync proceeds with a keyless table).
      *
      * <p><b>The table's own key is the default and no longer the whole rule</b>, because a node that
      * expands a list emits several rows carrying one parent's key, and what tells them apart is a
@@ -1908,12 +1979,10 @@ final class StoreBackedDagSource implements DagSource {
      * table would be published keyed on the parent alone. An upsert target answers that by keeping
      * the last of each parent's expanded rows and losing the rest, filling the table, reporting
      * nothing, and reading exactly like a step that never ran. So the columns each node says it adds
-     * are appended here, after the table's own and in the order the nodes added them. For rows that
-     * passed through an expansion, source origins follow pure renames so the parent identity does
-     * not disappear when its column gets another name. Other streams retain the name-intersection
-     * rule. If a projection copies a source column into several aliases, its last alias identifies
-     * the parent, matching the key passed to the expansion port. A stream that has not passed
-     * through an expansion keeps the rule it has always used.
+     * are appended here, after the table's own and in the order the nodes added them. Source origins
+     * follow pure renames so identity survives a new column name, with or without an expansion.
+     * Replacement values have no source identity. If a projection copies a source column into several
+     * aliases, its last alias identifies the parent, matching the key passed to the expansion port.
      */
     static TargetTable publishedAs(TargetTable base, NodeColumns produced, NodeColumns atTheSource) {
         Map<String, TargetField> declared = new LinkedHashMap<>();
@@ -1925,10 +1994,9 @@ final class StoreBackedDagSource implements DagSource {
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
             fields.add(publishedField(column, carried, produced, atTheSource));
-            TargetField identity = produced.expanded()
-                    ? declared.get(produced.origins().get(column)) : carried;
+            TargetField identity = declared.get(produced.origins().get(column));
             if (identity != null && identity.primaryKey()
-                    && (!produced.expanded() || column.equals(parentNames.get(identity.name())))) {
+                    && column.equals(parentNames.get(identity.name()))) {
                 key.add(column);
             }
         }
@@ -1939,6 +2007,14 @@ final class StoreBackedDagSource implements DagSource {
             if (!key.contains(added)) {
                 key.add(added);
             }
+        }
+        if (produced.keyCandidates().stream().anyMatch(Set::isEmpty)
+                || base.fields().stream().filter(TargetField::primaryKey)
+                .anyMatch(field -> !parentNames.containsKey(field.name()))) {
+            // Element locators distinguish siblings only while the complete parent key survives,
+            // so clearing the key leaves an unresolved output identity that preview refuses and sync
+            // publishes without a declared key.
+            key.clear();
         }
         return TargetModelResolver.keyedOn(
                 new TargetTable(base.name(), fields, base.indexes().stream()
@@ -2085,15 +2161,7 @@ final class StoreBackedDagSource implements DagSource {
     private static void requireFactKeyPublishedWhereAWriteMatchesOnIt(
             PipelineResource pipeline, Map<String, CompiledJoin> compiledJoins,
             Set<String> serveStreams) {
-        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null) {
-            return;
-        }
-        boolean matchesOnAKey = false;
-        for (SyncElement sync : serve.sync()) {
-            matchesOnAKey |= sync.writeMode() == null
-                    || sync.writeMode() == io.tapstate.core.model.WriteMode.UPSERT;
-        }
-        if (!matchesOnAKey) {
+        if (!matchesOnAKey(pipeline)) {
             return;
         }
         for (String stream : serveStreams) {
@@ -2108,6 +2176,49 @@ final class StoreBackedDagSource implements DagSource {
                         null);
             }
         }
+    }
+
+    /**
+     * Refuses a stream whose source table declares a key but whose published target has none, where
+     * something matches a write to an existing row on that key.
+     *
+     * <p>Identity that went away is what is refused, not identity that never existed: a source with
+     * no declared key has lost nothing and is left alone. A view is not judged here either - it
+     * declares its own key and its own gate compares that key against what feeds it. Append never
+     * matches a write to an existing row, so it is not judged at all.
+     */
+    private static void requirePublishedIdentityWhereAWriteMatchesOnIt(
+            PipelineResource pipeline, Map<String, TargetTable> bySourceTable,
+            Map<String, TargetTable> published, Set<String> streams) {
+        if (!matchesOnAKey(pipeline)) {
+            return;
+        }
+        for (String stream : streams) {
+            TargetTable source = bySourceTable.get(stream);
+            TargetTable target = published.get(stream);
+            if (source == null || target == null) {
+                continue;
+            }
+            if (source.fields().stream().anyMatch(TargetField::primaryKey)
+                    && target.fields().stream().noneMatch(TargetField::primaryKey)) {
+                throw new TapstateException(ActuationError.SYNC_OUTPUT_IDENTITY_UNRESOLVED,
+                        Map.of("pipeline", pipeline.id(), "stream", stream), null);
+            }
+        }
+    }
+
+    /** Whether any sync element of the serve block matches a write to an existing row on a key. */
+    private static boolean matchesOnAKey(PipelineResource pipeline) {
+        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null) {
+            return false;
+        }
+        for (SyncElement sync : serve.sync()) {
+            if (sync.writeMode() == null
+                    || sync.writeMode() == io.tapstate.core.model.WriteMode.UPSERT) {
+                return true;
+            }
+        }
+        return false;
     }
 
 
@@ -2239,6 +2350,26 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
+        Map<String, AggregateStepSpec> aggregates = compiledAggregates(
+                pipeline, sourceTargets(sourceVertices), sourceVertices, compiledJoins);
+        // Aggregate state is committed under the execution's claim; a run bound to no execution has none.
+        AggregateStores aggregateStores = manifest != null ? AggregateStores.bound(manifest)
+                : (member, step, kind) -> {
+                    throw new IllegalStateException("aggregate step '" + step
+                            + "' needs operator state bound to an execution, and this run has none");
+                };
+        AggregateBinding aggregateBinding = new AggregateBinding(step -> {
+            AggregateStepSpec spec = aggregates.get(step.id());
+            if (spec == null) {
+                throw new IllegalStateException("aggregate step '" + step.id()
+                        + "' was not compiled: the columns reaching it are not known");
+            }
+            return spec;
+        }, aggregateStores,
+                // What a step keeps to answer a second delivery is forgotten below the position the sinks
+                // have durably acknowledged, which only a run bound to an execution can read.
+                operators == null ? ReplayFloorFactory.NONE : new ScopedSrsReplayFloorFactory(scopedSources, scopedDirect),
+                io.tapstate.runtime.engine.aggregate.AggregateProcessor.Sweep.DEFAULT);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
                         progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),
@@ -2258,7 +2389,8 @@ final class StoreBackedDagSource implements DagSource {
                                 .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests())).withSnapshotEpochs(snapshotEpochs),
                 joinBinding(compiledJoins, manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest),
                         manifest != null && manifest.executionIdentity() instanceof ExecutionFence scoped && scoped.scope() != null
-                                ? scoped.scope().stateGeneration() : 0));
+                                ? scoped.scope().stateGeneration() : 0))
+                .withAggregate(aggregateBinding);
     }
 
     private Map<String, Long> sourceEpochs(
@@ -2318,46 +2450,51 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, Step.Inline> steps, Map<String, SourceVertex> vertices,
             Map<String, String> keysByTable, Map<String, List<String>> keysBySource, Set<String> stepIds,
             String previewExecutionId) {
-        String guardedPath = step instanceof Step.Inline inline
-                && (inline.body() instanceof TransformBody.MapProjection || inline.body() instanceof TransformBody.Js)
-                ? downstreamUnwindPath(step.id(), steps, new HashSet<>()) : null;
-        if (!(step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Unwind)
-                && guardedPath == null) {
+        if (!(step instanceof Step.Inline inline)) {
             return transformPort(step, List.of(), previewExecutionId);
         }
-        Function<FromRef, Map<String, List<String>>> sourceKeys = ref -> {
-            Map<String, List<String>> byStream = new LinkedHashMap<>();
+        String guardedPath = (inline.body() instanceof TransformBody.MapProjection || inline.body() instanceof TransformBody.Js)
+                ? downstreamUnwindPath(step.id(), steps, new HashSet<>()) : null;
+        if (!(inline.body() instanceof TransformBody.Unwind) && guardedPath == null) {
+            return transformPort(step, List.of(), previewExecutionId);
+        }
+        Function<FromRef, Map<String, SourceTable>> sourceTables = ref -> {
+            Map<String, SourceTable> byStream = new LinkedHashMap<>();
             for (String key : upstreams(ref, keysByTable, keysBySource, vertices, stepIds)) {
                 SourceVertex vertex = vertices.get(key);
                 if (vertex != null) {
-                    List<String> primaryKey = Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),vertex.sourceId())))
-                            .map(model -> discoveredTable(model, vertex.table()))
-                            .map(SourceTable::primaryKey).orElse(List.of());
-                    byStream.put(vertex.stream(), primaryKey);
+                    SourceTable table = Optional.ofNullable(modelInputs.apply(
+                                    StoredArtifacts.requireSource(artifacts(), vertex.sourceId())))
+                            .map(model -> discoveredTable(model, vertex.table())).orElse(null);
+                    byStream.put(vertex.stream(), table);
                 }
             }
             return byStream;
         };
-        Map<String, List<String>> keys = parentKeysReaching(step, steps, sourceKeys);
+        Map<String, ParentKeyState> states = parentKeyCandidates(step.id(), inline.from(),
+                steps, sourceTables, new HashSet<>());
+        Map<String, List<String>> keys = resolveParentKeys(step.id(), states);
         Set<String> guardedStreams = guardedPath == null ? Set.of()
-                : unmodifiedStreamsReaching((Step.Inline) step, steps, sourceKeys);
-        return transformPortByStream(step, keys, guardedPath, guardedStreams, previewExecutionId);
+                : unmodifiedStreamsReaching(inline, steps, sourceTables);
+        Map<String, Map<String, String>> guardedRenames = new LinkedHashMap<>();
+        if (inline.body() instanceof TransformBody.MapProjection map) {
+            states.forEach((stream, state) -> {
+                Map<String, String> renames = state.projectKeys(map).guardedRenames();
+                if (!renames.isEmpty()) guardedRenames.put(stream, renames);
+            });
+        }
+        return transformPortByStream(step, keys, guardedPath, guardedStreams, guardedRenames, previewExecutionId);
     }
 
     /** Capture a serializable factory per logical stream; input tables need not share their key names. */
     static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
             Map<String, List<String>> parentKeys, String guardedPath) {
-        return transformPortByStream(step, parentKeys, guardedPath, Set.copyOf(parentKeys.keySet()));
-    }
-
-    private static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
-            Map<String, List<String>> parentKeys, String guardedPath, Set<String> guardedStreams) {
-        return transformPortByStream(step, parentKeys, guardedPath, guardedStreams, null);
+        return transformPortByStream(step, parentKeys, guardedPath, Set.copyOf(parentKeys.keySet()), Map.of(), null);
     }
 
     private static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
             Map<String, List<String>> parentKeys, String guardedPath, Set<String> guardedStreams,
-            String previewExecutionId) {
+            Map<String, Map<String, String>> guardedRenames, String previewExecutionId) {
         Map<String, SupplierEx<? extends TransformPort>> factories = new LinkedHashMap<>();
         parentKeys.forEach((stream, key) -> factories.put(stream,
                 transformPort(step, key, previewExecutionId)));
@@ -2369,6 +2506,7 @@ final class StoreBackedDagSource implements DagSource {
                 throw unresolvedParentKey(step.id(), stream, "the source has no discovered primary key");
             }
         });
+        String stepId = step.id();
         return () -> {
             Map<String, TransformPort> ports = new LinkedHashMap<>();
             for (var entry : factories.entrySet()) {
@@ -2390,6 +2528,8 @@ final class StoreBackedDagSource implements DagSource {
                     if (port == null) {
                         throw new IllegalStateException("No parent-key binding for stream " + event.src());
                     }
+                    Map<String, String> renames = guardedRenames.get(event.src());
+                    if (renames != null) requireNoParentKeyOverwrite(stepId, event, renames);
                     return port.transform(event);
                 }
 
@@ -2401,10 +2541,21 @@ final class StoreBackedDagSource implements DagSource {
         };
     }
 
+    private static void requireNoParentKeyOverwrite(String step, Envelope event, Map<String, String> renames) {
+        for (var rename : renames.entrySet()) {
+            String source = rename.getValue();
+            if ((event.before() != null && event.before().containsKey(source))
+                    || (event.after() != null && event.after().containsKey(source))) {
+                throw unresolvedParentKey(step, event.src(),
+                        "renaming " + source + " would overwrite parent-key column " + rename.getKey());
+            }
+        }
+    }
+
     /** Check the physical earlier row once, before the first projection can change its shape. */
     private static Set<String> unmodifiedStreamsReaching(Step.Inline step, Map<String, Step.Inline> steps,
-            Function<FromRef, Map<String, List<String>>> sourceKeys) {
-        Map<String, Set<Boolean>> states = mutationStatesReaching(step.from(), steps, sourceKeys, new HashSet<>());
+            Function<FromRef, Map<String, SourceTable>> sourceTables) {
+        Map<String, Set<Boolean>> states = mutationStatesReaching(step.from(), steps, sourceTables, new HashSet<>());
         Set<String> unmodified = new LinkedHashSet<>();
         states.forEach((stream, checked) -> {
             if (checked.size() > 1) {
@@ -2419,11 +2570,11 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private static Map<String, Set<Boolean>> mutationStatesReaching(FromClause from,
-            Map<String, Step.Inline> steps, Function<FromRef, Map<String, List<String>>> sourceKeys,
+            Map<String, Step.Inline> steps, Function<FromRef, Map<String, SourceTable>> sourceTables,
             Set<String> visiting) {
         Map<String, Set<Boolean>> states = new LinkedHashMap<>();
         for (FromRef ref : refsOf(from)) {
-            sourceKeys.apply(ref).keySet().forEach(stream ->
+            sourceTables.apply(ref).keySet().forEach(stream ->
                     states.computeIfAbsent(stream, ignored -> new LinkedHashSet<>()).add(false));
             for (Step.Inline upstream : referencedSteps(ref, steps)) {
                 if (!visiting.add(upstream.id())) {
@@ -2433,7 +2584,7 @@ final class StoreBackedDagSource implements DagSource {
                 boolean mutates = body instanceof TransformBody.MapProjection || body instanceof TransformBody.Js
                         || body instanceof TransformBody.Unwind;
                 if (mutates || body instanceof TransformBody.Filter || body instanceof TransformBody.Union) {
-                    mutationStatesReaching(upstream.from(), steps, sourceKeys, visiting).forEach((stream, checked) ->
+                    mutationStatesReaching(upstream.from(), steps, sourceTables, visiting).forEach((stream, checked) ->
                             states.computeIfAbsent(stream, ignored -> new LinkedHashSet<>())
                                     .addAll(mutates ? Set.of(true) : checked));
                 }
@@ -2476,46 +2627,96 @@ final class StoreBackedDagSource implements DagSource {
 
     /** Resolve every input separately, retaining its stream identity through projection and expansion. */
     static Map<String, List<String>> parentKeysReaching(Step step, Map<String, Step.Inline> steps,
-            Function<FromRef, Map<String, List<String>>> sourceKeys) {
-        return step instanceof Step.Inline inline
-                ? parentKeysReaching(step.id(), inline.from(), steps, sourceKeys, new HashSet<>()) : Map.of();
+            Function<FromRef, Map<String, SourceTable>> sourceTables) {
+        if (!(step instanceof Step.Inline inline)) return Map.of();
+        return resolveParentKeys(step.id(),
+                parentKeyCandidates(step.id(), inline.from(), steps, sourceTables, new HashSet<>()));
     }
 
-    private static Map<String, List<String>> parentKeysReaching(String stepId, FromClause from, Map<String, Step.Inline> steps,
-            Function<FromRef, Map<String, List<String>>> sourceKeys, Set<String> visiting) {
-        Map<String, List<String>> keys = new LinkedHashMap<>();
+    private static Map<String, List<String>> resolveParentKeys(String stepId, Map<String, ParentKeyState> states) {
+        Map<String, List<String>> result = new LinkedHashMap<>();
+        states.forEach((stream, state) -> {
+            List<Set<String>> key = state.candidates();
+            if (key.stream().anyMatch(Set::isEmpty)) {
+                throw unresolvedParentKey(stepId, stream, "a parent-key column was overwritten");
+            }
+            result.put(stream, key.stream().map(names -> names.iterator().next()).toList());
+        });
+        return result;
+    }
+
+    private static Map<String, ParentKeyState> parentKeyCandidates(
+            String stepId, FromClause from, Map<String, Step.Inline> steps,
+            Function<FromRef, Map<String, SourceTable>> sourceTables, Set<String> visiting) {
+        Map<String, ParentKeyState> keys = new LinkedHashMap<>();
         for (FromRef ref : refsOf(from)) {
-            sourceKeys.apply(ref).forEach((stream, key) -> mergeParentKey(stepId, keys, stream, key));
+            sourceTables.apply(ref).forEach((stream, table) ->
+                    mergeParentKey(stepId, keys, stream, ParentKeyState.source(table)));
             for (Step.Inline upstream : referencedSteps(ref, steps)) {
                 if (!visiting.add(upstream.id())) {
                     continue;
                 }
-                Map<String, List<String>> above = parentKeysReaching(stepId, upstream.from(), steps, sourceKeys, visiting);
+                var above = parentKeyCandidates(stepId, upstream.from(), steps, sourceTables, visiting);
                 visiting.remove(upstream.id());
-                above.forEach((stream, key) -> {
-                    List<String> current = key;
-                    if (upstream.body() instanceof TransformBody.MapProjection projection) {
-                        current = KeyProjection.renamed(current, projection.fields());
-                    } else if (upstream.body() instanceof TransformBody.Unwind unwind) {
-                        String locator = UnwindWriteKeys.elementLocator(unwind);
-                        if (locator != null && !current.isEmpty() && !current.contains(locator)) {
-                            current = new ArrayList<>(current);
-                            current.add(locator);
-                            current = List.copyOf(current);
-                        }
-                    }
-                    mergeParentKey(stepId, keys, stream, current);
-                });
+                above.forEach((stream, state) ->
+                        mergeParentKey(stepId, keys, stream, state.through(upstream.body())));
             }
         }
         return keys;
     }
 
-    private static void mergeParentKey(String stepId, Map<String, List<String>> keys, String stream, List<String> key) {
-        List<String> previous = keys.putIfAbsent(stream, key);
-        if (previous != null && !previous.equals(key)) {
-            throw unresolvedParentKey(stepId, stream,
-                    "the same stream reaches this step with conflicting parent-key columns");
+    private static void mergeParentKey(
+            String stepId, Map<String, ParentKeyState> keys, String stream, ParentKeyState state) {
+        keys.merge(stream, state, (previous, next) -> {
+            // A dropped key can remain as a before-image requirement on a single path.
+            List<Set<String>> shared = KeyProjection.sharedCandidates(previous.candidates(), next.candidates(),
+                            previous.possibleFields().and(next.possibleFields()))
+                    .orElseThrow(() -> unresolvedParentKey(stepId, stream,
+                            "the same stream reaches this step with conflicting parent-key columns"));
+            return new ParentKeyState(shared, previous.knownFields().or(next.knownFields()),
+                    previous.possibleFields().or(next.possibleFields()));
+        });
+    }
+
+    private record ParentKeyState(List<Set<String>> candidates, Predicate<String> knownFields,
+            Predicate<String> possibleFields) {
+        static ParentKeyState source(SourceTable table) {
+            if (table == null) return new ParentKeyState(List.of(), name -> false, name -> true);
+            Set<String> fields = new HashSet<>(table.primaryKey());
+            table.fields().forEach(field -> fields.add(field.name()));
+            return new ParentKeyState(table.primaryKey().stream().map(Set::of).toList(),
+                    fields::contains, fields::contains);
+        }
+
+        KeyProjection.GuardedCandidates projectKeys(TransformBody.MapProjection map) {
+            return KeyProjection.guardedCandidates(candidates, map.fields(), knownFields, possibleFields);
+        }
+
+        ParentKeyState through(TransformBody body) {
+            return switch (body) {
+                case TransformBody.MapProjection map -> new ParentKeyState(
+                        projectKeys(map).names(),
+                        KeyProjection.projectedFields(map.fields(), knownFields),
+                        KeyProjection.projectedFields(map.fields(), possibleFields));
+                case TransformBody.Unwind unwind -> expanded(unwind);
+                case TransformBody.Filter ignored -> this;
+                case TransformBody.Union ignored -> this;
+                default -> new ParentKeyState(candidates, name -> false, name -> true);
+            };
+        }
+
+        private ParentKeyState expanded(TransformBody.Unwind unwind) {
+            String locator = UnwindWriteKeys.elementLocator(unwind);
+            List<Set<String>> key = candidates;
+            if (locator != null && !key.isEmpty() && key.stream().noneMatch(names -> names.contains(locator))) {
+                key = new ArrayList<>(candidates);
+                key.add(Set.of(locator));
+                key = List.copyOf(key);
+            }
+            Predicate<String> added = name ->
+                    name.equals(unwind.path()) || name.equals(unwind.includeArrayIndex())
+                            || name.equals(unwind.elementKey());
+            return new ParentKeyState(key, added.or(knownFields), added.or(possibleFields));
         }
     }
 
@@ -2734,7 +2935,8 @@ final class StoreBackedDagSource implements DagSource {
             // shape the product's own valid corpus writes, so the validator accepted a pipeline the
             // builder then would not build. Its identity is the target model registered for the step,
             // which the branch below reads like any other single stream's.
-            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
+            if (step instanceof Step.Inline inline && (inline.body() instanceof TransformBody.Join
+                    || inline.body() instanceof TransformBody.Aggregate)) {
                 streams.add(step.id());
                 return;
             }
@@ -2913,15 +3115,18 @@ final class StoreBackedDagSource implements DagSource {
             Set<String> stepIds) {
         Map<String, Set<String>> passedOn = new LinkedHashMap<>();
         for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
-            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
-                    && (nest.root().embed() == null || nest.root().embed().isEmpty())
-                    && inline.from() instanceof FromClause.Aliases aliases
-                    && aliases.aliases().get(nest.root().from()) != null) {
-                passedOn.put(step.id(), streamsReaching(pipeline, aliases.aliases().get(nest.root().from()),
+            FromRef root = passthroughNestRoot(step);
+            if (root != null) {
+                passedOn.put(step.id(), streamsReaching(pipeline, root,
                         sourceKeyByTable, sourceKeysById, sourceVertices, stepIds));
             }
         }
         return passedOn;
+    }
+
+    private static FromRef passthroughNestRoot(Step step) {
+        return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
+                && (nest.root().embed() == null || nest.root().embed().isEmpty()) ? assemblyRoot(step) : null;
     }
 
     /**
@@ -3065,7 +3270,8 @@ final class StoreBackedDagSource implements DagSource {
             // Assemblies replace terminal streams, but every source feeding them contributes freshness.
             if (!sourceInputs && step instanceof Step.Inline inline
                     && (inline.body() instanceof TransformBody.Nest
-                            || inline.body() instanceof TransformBody.Join)) {
+                            || inline.body() instanceof TransformBody.Join
+                            || inline.body() instanceof TransformBody.Aggregate)) {
                 streams.add(step.id());
                 continue;
             }
@@ -3296,10 +3502,14 @@ final class StoreBackedDagSource implements DagSource {
         Set<String> declaredAliases = step.from() instanceof FromClause.Aliases declared
                 ? declared.aliases().keySet()
                 : Set.of();
+        // A source the front end added for an OR alternative answers to the alias it stands in for.
         for (io.tapstate.core.sql.JoinTree.Source source : plan.from().sources()) {
-            if (!declaredAliases.contains(source.name())) {
+            if (!declaredAliases.contains(source.declared())) {
                 throw new TapstateException(ActuationError.JOIN_SOURCE_NOT_DECLARED,
-                        Map.of("step", step.id(), "name", source.name()), null);
+                        Map.of("step", step.id(), "name", source.declared()), null);
+            }
+            if (!source.declared().equals(source.name())) {
+                tableByName.put(source.name(), tableByName.getOrDefault(source.declared(), source.table()));
             }
         }
         String driving = plan.factSource().table();
@@ -3313,7 +3523,7 @@ final class StoreBackedDagSource implements DagSource {
             if (source.name().equals(plan.factSource().name())) {
                 continue;
             }
-            List<String> sourceKey = keyByTable.getOrDefault(source.name(), List.of());
+            List<String> sourceKey = keyByTable.getOrDefault(source.declared(), List.of());
             if (!sourceKey.isEmpty()) {
                 dimensionRowKeyColumns.put(source.name(), List.copyOf(sourceKey));
             }
@@ -3444,6 +3654,7 @@ final class StoreBackedDagSource implements DagSource {
         if (pipeline.transforms() == null) {
             return byAlias;
         }
+        Map<String, NodeColumns>[] stepColumns = new Map[1];
         for (Step step : pipeline.transforms()) {
             if (!(step instanceof Step.Inline inline) || !(inline.body() instanceof TransformBody.Nest)) {
                 continue;
@@ -3452,7 +3663,9 @@ final class StoreBackedDagSource implements DagSource {
                 continue;
             }
             aliases.aliases().forEach((alias, ref) -> {
-                NestTable resolved = nestTable(ref, sourceTables);
+                NestTable resolved = withStepColumns(
+                        keyedThroughSteps(pipeline, ref, nestTable(ref, sourceTables), sourceTables),
+                        ref, stepColumns, pipeline);
                 NestTable existing = byAlias.putIfAbsent(alias, resolved);
                 if (existing != null && !existing.name().equals(resolved.name())) {
                     throw new IllegalStateException("alias '" + alias + "' names table '" + existing.name()
@@ -3462,6 +3675,101 @@ final class StoreBackedDagSource implements DagSource {
             });
         }
         return byAlias;
+    }
+
+    /**
+     * An alias that names another step - a {@code map}, a {@code union} - reads that step's output, which has
+     * no table behind it and so no key; but its columns and their types are worked out like any other node's.
+     * They are what a rollup over the level computes in: without them a {@code sum} over a mapped or merged
+     * level would have no type to be exact in and could not be declared at all. The key stays the author's
+     * to declare. A step whose columns nobody can work out stays untyped, as before.
+     */
+    @SuppressWarnings("unchecked")
+    private NestTable withStepColumns(NestTable table, FromRef ref, Map<String, NodeColumns>[] stepColumns,
+            PipelineResource pipeline) {
+        if (!table.fields().isEmpty() || !(ref instanceof FromRef.Literal literal)
+                || !(stepOf(pipeline, literal.ref()) instanceof Step.Inline)) {
+            return table;
+        }
+        if (stepColumns[0] == null) {
+            try {
+                Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+                stepColumns[0] = deriveSteps(pipeline, vertices, sourceKeyByTable(vertices), sourceKeysById(vertices),
+                        stepIds(pipeline), compiledJoins(pipeline, sourceTablesByName(vertices)),
+                        this::discoveredColumns).columns();
+            } catch (RuntimeException underivable) {
+                stepColumns[0] = Map.of();
+            }
+        }
+        NodeColumns columns = stepColumns[0].get(literal.ref());
+        if (columns == null || !columns.known()) {
+            return table;
+        }
+        Map<String, io.tapstate.core.dsl.aggregate.ValueType> types = new LinkedHashMap<>();
+        columns.columns().forEach((name, declared) -> {
+            // A column whose type nothing declared stays untyped, rather than failing the whole level.
+            io.tapstate.core.common.TapstateType type = declared == null
+                    ? io.tapstate.core.common.TapstateType.UNKNOWN : JoinSchemaDrift.typeOf(declared);
+            var numeric = columns.numericTypes().get(name);
+            Integer scale = type == io.tapstate.core.common.TapstateType.DECIMAL && numeric != null
+                    ? numeric.scale() : null;
+            types.put(name, new io.tapstate.core.dsl.aggregate.ValueType(type, scale));
+        });
+        return new NestTable(table.name(), table.primaryKey(), table.uniqueIndexes(),
+                List.copyOf(columns.columns().keySet()), types);
+    }
+
+    /**
+     * An alias over a map or a filter keyed as the table that step's rows come from. The step writes
+     * that table's rows one for one, so its key - under the names the maps gave it - identifies them;
+     * without this an alias that leaves its key to discovery is refused for having none. The name is
+     * left as the alias resolved it, since state is named after it, and so are the fields, which only
+     * feed a collision check that a map's computed columns would make incomplete.
+     */
+    private NestTable keyedThroughSteps(PipelineResource pipeline, FromRef ref, NestTable resolved,
+            Map<String, SourceVertex> sourceTables) {
+        if (!resolved.primaryKey().isEmpty() || !resolved.uniqueIndexes().isEmpty()) {
+            return resolved;
+        }
+        RowPreservingSource walked = rowPreservingSource(pipeline, ref, sourceTables);
+        if (walked == null) {
+            return resolved;
+        }
+        NestTable behind = nestTable(FromRef.literal(walked.stream()), sourceTables);
+        return new NestTable(resolved.name(),
+                carriedKey(behind.primaryKey(), walked.projections()).orElse(List.of()),
+                behind.uniqueIndexes().stream()
+                        .map(index -> carriedKey(index, walked.projections()))
+                        .flatMap(Optional::stream).toList(),
+                resolved.fields(), resolved.types());
+    }
+
+    /**
+     * Key columns as they are named after the given maps, nearest the source first, or empty where a
+     * map writes something else over one of them. A rename carries the key's values under a new name;
+     * a literal, a computed value, a drop or another column renamed onto the key's name replaces them,
+     * and a key inferred over replaced values would give distinct rows one identity.
+     */
+    private static Optional<List<String>> carriedKey(List<String> key, List<Map<String, FieldRule>> projections) {
+        List<String> current = key;
+        for (Map<String, FieldRule> rules : projections) {
+            List<String> renamed = KeyProjection.renamed(current, rules);
+            if (renamed.size() != current.size()) {
+                return Optional.empty();
+            }
+            for (int i = 0; i < current.size(); i++) {
+                if (renamed.get(i).equals(current.get(i)) && replaces(rules.get(current.get(i)), current.get(i))) {
+                    return Optional.empty();
+                }
+            }
+            current = renamed;
+        }
+        return Optional.of(current);
+    }
+
+    /** Whether a map's rule for a column writes something other than that column's own value. */
+    private static boolean replaces(FieldRule rule, String column) {
+        return rule != null && !(rule instanceof FieldRule.Rename rename && rename.sourceField().equals(column));
     }
 
     /** One alias's table: its discovered key when the reference names a table, no key otherwise. */
@@ -3495,7 +3803,8 @@ final class StoreBackedDagSource implements DagSource {
                         resolvedTable,
                         discovered.primaryKey(),
                         uniqueIndexesOf(discovered),
-                        discovered.fields().stream().map(field -> field.name()).toList()))
+                        discovered.fields().stream().map(field -> field.name()).toList(),
+                        rollupTypesOf(discovered)))
                 .orElseGet(() -> new NestTable(resolvedTable, List.of()));
     }
 
@@ -3505,6 +3814,18 @@ final class StoreBackedDagSource implements DagSource {
      * non-unique indexes are dropped here rather than downstream: an index that does not identify a row
      * is not a candidate, and carrying it further would only give the compiler more to reject.
      */
+    private static Map<String, io.tapstate.core.dsl.aggregate.ValueType> rollupTypesOf(SourceTable table) {
+        Map<String, io.tapstate.core.dsl.aggregate.ValueType> types = new LinkedHashMap<>();
+        for (var field : table.fields()) {
+            // A decimal keeps the scale it was declared with, which is the scale its sums are exact at. The
+            // precision is not carried: a sum widens to 38 digits whatever the column held.
+            Integer scale = field.type() == io.tapstate.core.common.TapstateType.DECIMAL
+                    && field.numericType() != null ? field.numericType().scale() : null;
+            types.put(field.name(), new io.tapstate.core.dsl.aggregate.ValueType(field.type(), scale));
+        }
+        return types;
+    }
+
     private static List<List<String>> uniqueIndexesOf(SourceTable table) {
         List<List<String>> unique = new ArrayList<>();
         for (SourceIndex index : table.indexes()) {
@@ -3881,6 +4202,8 @@ final class StoreBackedDagSource implements DagSource {
         List<PipelineOutputNames.Output> outputs = new ArrayList<>();
         List<PipelineOutputNames.Unresolved> unresolved = new ArrayList<>();
         Map<String, Set<PipelineInputs.Input>> inputs = new LinkedHashMap<>();
+        Map<String, Set<String>> outputStreams = new LinkedHashMap<>();
+        Map<String, PipelineOutputNames.NestMeasurement> nestMeasurements = Map.of();
         Set<String> qualifiedTables = Set.of();
         try {
             if (pipeline.view() instanceof ViewBlock.Inline view) {
@@ -3897,16 +4220,70 @@ final class StoreBackedDagSource implements DagSource {
                 if (resources != null && pipeline.view() instanceof ViewBlock.Inline view) {
                     Set<String> terminal = new LinkedHashSet<>();
                     partial.collect(view.from(), terminal, new HashSet<>());
+                    outputStreams.put(view.id(), terminal);
                     if (view.from() instanceof FromRef.Literal && terminal.size() == 1)
                         inputs.put(view.id(), inputLineage(pipeline, partial, FromClause.list(view.from())));
                 }
-                if (sync) outputs.addAll(syncOutputNames(pipeline, partial, resources != null, inputs));
-                if (resources != null) qualifiedTables = qualifiedTables(pipeline, partial);
+                if (sync) outputs.addAll(syncOutputNames(pipeline, partial, resources != null, inputs, outputStreams));
+                if (resources != null) {
+                    qualifiedTables = qualifiedTables(pipeline, partial);
+                    nestMeasurements = nestMeasurements(pipeline, partial, inputs, outputs, outputStreams);
+                }
             } catch (TapstateException unavailable) {
                 unresolved.add(outputProblem(pipeline, unavailable));
             }
         }
-        return new PipelineOutputNames.Description(new PipelineOutputNames.Result(outputs, unresolved), inputs, qualifiedTables);
+        return new PipelineOutputNames.Description(
+                new PipelineOutputNames.Result(outputs, unresolved), inputs, qualifiedTables, nestMeasurements);
+    }
+
+    private Map<String, PipelineOutputNames.NestMeasurement> nestMeasurements(PipelineResource pipeline, PartialOutputStreams partial,
+            Map<String, Set<PipelineInputs.Input>> inputs, List<PipelineOutputNames.Output> outputs,
+            Map<String, Set<String>> outputStreams) {
+        Set<String> nestSteps = partial.assemblies.stream()
+                .filter(stream -> stepOf(pipeline, stream) instanceof Step.Inline step
+                        && step.body() instanceof TransformBody.Nest)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        if (nestSteps.isEmpty()) return Map.of();
+
+        Map<String, Integer> consumers = new HashMap<>();
+        outputStreams.values().forEach(streams -> streams.stream().flatMap(stream -> partial.arrivingStreams(stream).stream()).distinct()
+                .forEach(stream -> consumers.merge(stream, 1, Integer::sum)));
+        Set<PipelineOutputNames.Output> sharedTargets = sharedOutputTargets(outputs);
+        Map<String, PipelineOutputNames.NestMeasurement> result = new LinkedHashMap<>();
+        for (var output : outputs) {
+            String identity = output.identity();
+            Set<String> streams = outputStreams.getOrDefault(identity, Set.of());
+            if (java.util.Collections.disjoint(streams, nestSteps)) continue;
+            // A stream-keyed sample cannot separate sinks or cover another stream in the same collection.
+            Set<String> arriving = streams.size() == 1 ? partial.arrivingStreams(streams.iterator().next()) : Set.of();
+            String key = null;
+            if (!sharedTargets.contains(output) && arriving.size() == 1
+                    && !inputs.getOrDefault(identity, Set.of()).isEmpty()) {
+                String stream = arriving.iterator().next();
+                if (consumers.get(stream) == 1
+                        && !(partial.sourceStreams.contains(stream) && partial.assemblies.contains(stream))) key = stream;
+            }
+            result.put(identity, new PipelineOutputNames.NestMeasurement(key));
+        }
+        return result;
+    }
+
+    private Set<PipelineOutputNames.Output> sharedOutputTargets(List<PipelineOutputNames.Output> outputs) {
+        record Target(String collection, String connection, String database, String srvService, String host) { }
+        Map<String, Optional<MongoDestination>> mongoDestinations = new HashMap<>();
+        Map<Target, List<PipelineOutputNames.Output>> writers = new HashMap<>();
+        for (var output : outputs) {
+            var mongo = mongoDestinations.computeIfAbsent(output.connection(), id -> artifacts().get(id)
+                    .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)
+                    .map(MongoDestination::from));
+            var targets = mongo.map(destination -> destination.hosts().stream()
+                            .map(host -> new Target(output.table(), null, destination.database(), destination.srvService(), host)).toList())
+                    .orElseGet(() -> List.of(new Target(output.table(), output.connection(), null, null, null)));
+            targets.forEach(target -> writers.computeIfAbsent(target, ignored -> new ArrayList<>()).add(output));
+        }
+        return writers.values().stream().filter(owners -> owners.size() > 1).flatMap(List::stream)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
     }
 
     private static Set<String> qualifiedTables(PipelineResource pipeline, PartialOutputStreams partial) {
@@ -3938,7 +4315,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private List<PipelineOutputNames.Output> syncOutputNames(PipelineResource pipeline, PartialOutputStreams partial,
-            boolean includeInputs, Map<String, Set<PipelineInputs.Input>> inputs) {
+            boolean includeInputs, Map<String, Set<PipelineInputs.Input>> inputs, Map<String, Set<String>> outputStreams) {
         ServeBlock.Inline serve = (ServeBlock.Inline) pipeline.serve();
         Map<String, SourceVertex> vertices = partial.vertices;
         Set<String> streams = new LinkedHashSet<>();
@@ -3957,6 +4334,7 @@ final class StoreBackedDagSource implements DagSource {
                     outputs.add(new PipelineOutputNames.Output(syncNodeId(sync), kind, sync.source(), entry.getValue().name(), identity));
                 }
                 if (includeInputs) {
+                    outputStreams.computeIfAbsent(identity, ignored -> new LinkedHashSet<>()).add(entry.getKey());
                     SourceVertex direct = vertices.values().stream().filter(vertex -> vertex.stream().equals(entry.getKey())).findFirst().orElse(null);
                     Set<PipelineInputs.Input> reached = partial.unresolvedTargetPossible(sync, entry.getValue().name()) ? Set.of() : direct == null
                             ? inputLineage(pipeline, partial, FromClause.list(FromRef.literal(entry.getKey())))
@@ -3983,13 +4361,17 @@ final class StoreBackedDagSource implements DagSource {
         private final Map<String, String> keys;
         private final Map<String, List<String>> sources;
         private final Set<String> steps;
+        private final Set<String> sourceStreams;
         private final Set<String> assemblies = new HashSet<>();
+        private final Map<String, Set<String>> forwardedStreams = new HashMap<>();
         private final Map<String, List<String>> resolvedSteps = new LinkedHashMap<>();
 
         private PartialOutputStreams(PipelineResource pipeline, List<PipelineOutputNames.Unresolved> unresolved) {
             this.pipeline = pipeline;
             this.unresolved = unresolved;
             vertices = sourceVertices(pipeline, false, failures);
+            sourceStreams = vertices.values().stream().map(SourceVertex::stream)
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
             keys = sourceKeyByTable(vertices);
             sources = sourceKeysById(vertices);
             pipeline.sourceIds().forEach(id -> sources.putIfAbsent(id, List.of()));
@@ -4045,13 +4427,23 @@ final class StoreBackedDagSource implements DagSource {
             if (root != null) {
                 Set<String> roots = new LinkedHashSet<>();
                 collect(root, roots, visiting);
-                if (roots.size() != 1) return;
+                boolean passthrough = passthroughNestRoot(step) != null;
+                if (roots.isEmpty() || !passthrough && roots.size() != 1) return;
                 requireStableAssemblyName(step, roots);
                 assemblies.add(step.id());
+                if (passthrough) {
+                    Set<String> arriving = new LinkedHashSet<>();
+                    roots.forEach(stream -> arriving.addAll(arrivingStreams(stream)));
+                    forwardedStreams.put(step.id(), Set.copyOf(arriving));
+                }
                 streams.add(step.id());
             } else {
                 for (FromRef upstream : refsOf(step.from())) collect(upstream, streams, visiting);
             }
+        }
+
+        private Set<String> arrivingStreams(String stream) {
+            return sourceStreams.contains(stream) ? Set.of(stream) : forwardedStreams.getOrDefault(stream, Set.of(stream));
         }
 
         private void requireStableAssemblyName(Step step, Set<String> roots) {
@@ -4248,13 +4640,17 @@ final class StoreBackedDagSource implements DagSource {
             Step step = stepOf(pipeline, stream);
             String table = null;
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest) {
-                NestTable root = roots.get(nest.root().from());
+                RootTable root = assembledRootTable(pipeline, nest, roots, vertices);
                 if (root != null) table = root.name();
             } else if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
                 // A join's compiled fact name retains qualification when physical source names repeat.
                 // Preserve that existing write address instead of silently relocating its collection.
                 table = nestTable(assemblyRoot(step), tables).name();
                 names.put(stream, new TargetTable(table, List.of()));
+                continue;
+            } else if (AggregateSteps.of(step) != null) {
+                // An aggregate's rows land in a table named by the step, whatever its input is called.
+                names.put(stream, new TargetTable(stream, List.of()));
                 continue;
             }
             if (table != null) {
@@ -4264,8 +4660,213 @@ final class StoreBackedDagSource implements DagSource {
         return names;
     }
 
+    /**
+     * The table a nest's documents are written as: the root alias's own table, or - where the alias
+     * names a step - the table that step reads, followed through steps that keep each row as one row
+     * under the same key. A map or a filter over a single input is such a step: a map that adds a
+     * column, or turns deletes into marked updates, still writes the root table's rows. Without this
+     * the alias resolves to the step's name with no key, and the target is then created under that
+     * name and appended to on every change instead of upserted by the root key.
+     *
+     * <p>Anything else - a script, a union, an unwind, a nest - stops the walk where it is, since what
+     * such a step emits is not the table it reads one row for one row.
+     */
+    private RootTable assembledRootTable(PipelineResource pipeline, TransformBody.Nest nest,
+            Map<String, NestTable> byAlias, Map<String, SourceVertex> sourceVertices) {
+        NestTable alias = byAlias.get(nest.root().from());
+        if (alias == null) {
+            return null;
+        }
+        Map<String, SourceVertex> sourceTables = sourceTablesByName(sourceVertices);
+        RowPreservingSource walked = rowPreservingSource(pipeline, aliasRef(pipeline, nest), sourceTables);
+        return walked == null
+                ? new RootTable(alias, List.of())
+                : new RootTable(nestTable(FromRef.literal(walked.stream()), sourceTables), walked.projections());
+    }
+
+    /**
+     * The table an assembly's documents land in, and the maps between that table and the nest, nearest
+     * the table first. The maps are what turn the table's column names into the ones the root's key is
+     * written in.
+     */
+    private record RootTable(NestTable table, List<Map<String, FieldRule>> projections) {
+        String name() {
+            return table.name();
+        }
+    }
+
+    /** The reference a nest step binds its root alias to, or null where the step declares no aliases. */
+    private static FromRef aliasRef(PipelineResource pipeline, TransformBody.Nest nest) {
+        for (Step step : pipeline.transforms()) {
+            if (step instanceof Step.Inline inline && inline.body() == nest
+                    && inline.from() instanceof FromClause.Aliases aliases) {
+                return aliases.aliases().get(nest.root().from());
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Where the rows behind a reference come from when they reach it one row per source row: the source
+     * stream, and the maps they passed on the way, nearest the source first.
+     *
+     * <p>The walk follows single-input maps and filters only. It answers null where the reference is not
+     * a step at all (it already names its table), and where the walk stops at any other step - a script,
+     * a union, an unwind, a nest - because what such a step emits is not the table it reads, and naming
+     * that step's input as the table would move an existing target somewhere its rows never were.
+     *
+     * <p>A source that selects one table is read by its id, and that id is not a stream: the walk ends
+     * at the stream that source's table is read as, which keeps a requalified stream - two sources
+     * reading tables of one name - attached to the source it was named through.
+     */
+    private static RowPreservingSource rowPreservingSource(PipelineResource pipeline, FromRef ref,
+            Map<String, SourceVertex> sourceTables) {
+        List<Map<String, FieldRule>> projections = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        boolean walked = false;
+        while (ref instanceof FromRef.Literal literal) {
+            Step step = stepOf(pipeline, literal.ref());
+            if (step == null) {
+                if (!walked) {
+                    return null;
+                }
+                projections = new ArrayList<>(projections);
+                java.util.Collections.reverse(projections);
+                return new RowPreservingSource(streamOf(literal.ref(), sourceTables), List.copyOf(projections));
+            }
+            if (!seen.add(literal.ref()) || !(step instanceof Step.Inline inline)
+                    || !(inline.body() instanceof TransformBody.MapProjection
+                            || inline.body() instanceof TransformBody.Filter)
+                    || !(inline.from() instanceof FromClause.Flow flow) || flow.refs().size() != 1) {
+                return null;
+            }
+            if (inline.body() instanceof TransformBody.MapProjection projection) {
+                projections.add(projection.outputFields());
+            }
+            walked = true;
+            ref = flow.refs().get(0);
+        }
+        return null;
+    }
+
+    private record RowPreservingSource(String stream, List<Map<String, FieldRule>> projections) { }
+
+    /** A reference as the stream it reads: a stream or table name as written, a one-table source's id as that table's stream. */
+    private static String streamOf(String ref, Map<String, SourceVertex> sourceTables) {
+        if (sourceTables.containsKey(ref)) {
+            return ref;
+        }
+        Set<String> streams = new LinkedHashSet<>();
+        sourceTables.values().stream().filter(vertex -> vertex.sourceId().equals(ref))
+                .forEach(vertex -> streams.add(vertex.stream()));
+        return streams.size() == 1 ? streams.iterator().next() : ref;
+    }
+
+    /**
+     * A source table's model as the given maps write its rows, nearest the source first: the columns
+     * each map names, in its order and including any soft-delete marker it adds, then the columns it
+     * passes through. A renamed or passed-through column keeps what the source declared about it; a
+     * literal or computed column is a new value with only the type the pipeline gives it, and is never
+     * part of the source's key. An index survives only while every column it covers still carries the
+     * source's value.
+     */
+    private static TargetTable projectedModel(TargetTable model, List<Map<String, FieldRule>> projections) {
+        if (projections.isEmpty()) {
+            return model;
+        }
+        ProjectedColumns projected = ProjectedColumns.of(model.fields());
+        for (Map<String, FieldRule> rules : projections) {
+            projected = projected.through(rules);
+        }
+        Map<String, String> nowNamed = new LinkedHashMap<>();
+        projected.carriedFrom().forEach((output, source) -> nowNamed.put(source, output));
+        List<TargetIndex> indexes = model.indexes().stream()
+                .filter(index -> nowNamed.keySet().containsAll(index.fields()))
+                .map(index -> new TargetIndex(index.fields().stream().map(nowNamed::get).toList(),
+                        index.unique(), index.constrainsEveryRow()))
+                .toList();
+        return new TargetTable(model.name(), projected.fields(), indexes, model.unwindIdentity());
+    }
+
+    /**
+     * A table's columns after some maps, and for each column that still holds a source column's value,
+     * which source column that is.
+     */
+    private record ProjectedColumns(List<TargetField> fields, Map<String, String> carriedFrom) {
+
+        static ProjectedColumns of(List<TargetField> fields) {
+            Map<String, String> carriedFrom = new LinkedHashMap<>();
+            for (TargetField field : fields) {
+                carriedFrom.put(field.name(), field.name());
+            }
+            return new ProjectedColumns(fields, carriedFrom);
+        }
+
+        /** These columns as one map writes them: its named columns in its order, then the ones it passes through. */
+        ProjectedColumns through(Map<String, FieldRule> rules) {
+            Map<String, TargetField> upstream = new LinkedHashMap<>();
+            Map<String, TapstateType> types = new LinkedHashMap<>();
+            for (TargetField field : fields) {
+                upstream.put(field.name(), field);
+                types.put(field.name(), field.inferredType() == null ? TapstateType.UNKNOWN : field.inferredType());
+            }
+            Map<String, TargetField> out = new LinkedHashMap<>();
+            Map<String, String> carried = new LinkedHashMap<>();
+            Set<String> consumed = new HashSet<>();
+            rules.forEach((output, rule) -> {
+                if (rule instanceof FieldRule.Rename rename) {
+                    consumed.add(rename.sourceField());
+                    TargetField field = upstream.get(rename.sourceField());
+                    if (field != null) {
+                        out.put(output, new TargetField(output, field.type(), field.primaryKey(),
+                                field.inferredType(), field.numericType(), field.stringType()));
+                        carry(output, rename.sourceField(), carried);
+                    }
+                } else if (rule instanceof FieldRule.Literal literal) {
+                    out.put(output, new TargetField(output, null, false, NodeColumns.literalType(literal.value())));
+                } else if (rule instanceof FieldRule.Computed computed) {
+                    out.put(output, computedField(output, computed.celExpr(), upstream, types));
+                }
+            });
+            for (TargetField field : fields) {
+                if (!out.containsKey(field.name()) && !consumed.contains(field.name())
+                        && !(rules.get(field.name()) instanceof FieldRule.Drop)) {
+                    out.put(field.name(), field);
+                    carry(field.name(), field.name(), carried);
+                }
+            }
+            return new ProjectedColumns(List.copyOf(out.values()), carried);
+        }
+
+        /**
+         * A computed column. One that does nothing but read another column holds that column's own
+         * value, so it keeps the numeric and string descriptors a rename keeps; any other expression
+         * produces a value nothing was declared about.
+         */
+        private static TargetField computedField(String output, String expr, Map<String, TargetField> upstream,
+                Map<String, TapstateType> types) {
+            TapstateType type = RowExpressions.typedValueType(expr, types);
+            String movedColumn = RowExpressions.movedColumn(expr);
+            TargetField moved = movedColumn == null ? null : upstream.get(movedColumn);
+            return moved == null ? new TargetField(output, null, false, type)
+                    : new TargetField(output, null, false, type, moved.numericType(), moved.stringType());
+        }
+
+        private void carry(String output, String upstreamName, Map<String, String> carried) {
+            String source = carriedFrom.get(upstreamName);
+            if (source != null) {
+                carried.put(output, source);
+            }
+        }
+    }
+
     /** The source reference that determines an assembly's physical output name and source ownership. */
     private static FromRef assemblyRoot(Step step) {
+        if (AggregateSteps.of(step) != null) {
+            // An aggregate reads one input; what it publishes belongs to the source of that input.
+            List<FromRef> refs = refsOf(step.from());
+            return refs.size() == 1 ? refs.getFirst() : null;
+        }
         if (!(step instanceof Step.Inline inline) || !(step.from() instanceof FromClause.Aliases aliases)) {
             return null;
         }

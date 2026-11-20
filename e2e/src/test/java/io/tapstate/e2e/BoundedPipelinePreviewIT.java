@@ -1,7 +1,10 @@
 package io.tapstate.e2e;
 
+import com.mongodb.client.MongoClients;
 import io.tapstate.testsupport.DockerGate;
+import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -24,6 +27,121 @@ class BoundedPipelinePreviewIT {
     @BeforeAll
     static void requireDocker() {
         DockerGate.require();
+    }
+
+    @Test
+    void aPlainMapKeyRenameCompletesADefaultSyncPreview(@TempDir Path directory) throws Exception {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectory(directory.resolve("source"));
+            Files.writeString(source.resolve("orders.csv"), "id,company_name\norder-1,Northwind\norder-2,Contoso\n");
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: preview_pipeline
+                    source: preview_source
+                    settings: { read_mode: snapshot_and_cdc }
+                    transforms:
+                      - id: renamed_orders
+                        from: [ orders ]
+                        type: map
+                        fields:
+                          ORDER_ID: $id
+                          company: $company_name
+                    serve:
+                      from: renamed_orders
+                      sync:
+                        - { id: preview_sync, source: preview_target }
+                    """;
+            List<Map<String, Object>> events = control.preview(PIPELINE_ID, "preview_sync", 1,
+                    SAMPLE_ID + "-plain-rename", List.of(
+                            new ControlPlane.PreviewDraft("source.tap.yml", """
+                                    version: tapstate/v1
+                                    kind: source
+                                    id: preview_source
+                                    connector: e2e_file
+                                    config: { uri: "%s" }
+                                    mode: cdc
+                                    tables: [ orders ]
+                                    """.formatted(source)),
+                            new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline),
+                            new ControlPlane.PreviewDraft("target.tap.yml",
+                                    targetYaml(source.resolve("preview-target")))));
+
+            assertThat(events).extracting(event -> event.get("kind"))
+                    .as("default sync preview events: %s", events)
+                    .startsWith("run.accepted", "compile.completed", "sample.completed")
+                    .endsWith("result.completed", "run.completed");
+            assertThat(((Number) payload(events, "sample.completed").get("rootRows")).intValue()).isEqualTo(1);
+            assertThat(documents(payload(events, "result.completed")))
+                    .isEqualTo(List.of(Map.of("ORDER_ID", "order-1", "company", "Northwind")));
+            assertThat(control.artifactIds()).doesNotContain(SOURCE_ID, PIPELINE_ID, "preview_target");
+            assertThat(source.resolve("preview-target")).doesNotExist();
+        }
+    }
+
+    @Test
+    void previewDoesNotReadUnrelatedTransformDefinitions(@TempDir Path directory) throws Exception {
+        try (var storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage);
+                var observer = MongoClients.create(storage.configurationUri())) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectories(directory.resolve("source"));
+            Files.writeString(source.resolve("orders.csv"), "id,customer_id,company_name,amount\n"
+                    + "order-1,customer-1,Northwind,12\n"
+                    + "order-2,customer-2,Contoso,7\n"
+                    + "order-3,customer-3,Fabrikam,9\n");
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            var drafts = new java.util.LinkedHashMap<String, String>();
+            drafts.put("preview_source.tap.yml", sourceYaml(source).replace(
+                    "tables: [ orders, customers, orders_archive, order_items, item_labels ]", "tables: [ orders ]"));
+            List<String> unrelatedIds = List.of("unrelated_one", "unrelated_two", "unrelated_three");
+            for (String id : unrelatedIds) {
+                drafts.put(id + ".tap.yml", """
+                        version: tapstate/v1
+                        kind: transform
+                        id: %s
+                        type: filter
+                        expr: "true"
+                        """.formatted(id));
+            }
+            control.apply(drafts);
+
+            var database = observer.getDatabase(storage.configurationDatabase());
+            database.runCommand(new Document("profile", 1)
+                    .append("filter", new Document("command.find", "transform_definitions")));
+            try {
+                assertThat(database.getCollection("transform_definitions")
+                        .find(new Document("_id", unrelatedIds.getFirst())).first()).isNotNull();
+                var unrelatedLookup = new Document("command.find", "transform_definitions")
+                        .append("command.filter._id", new Document("$in", unrelatedIds));
+                var profile = database.getCollection("system.profile");
+                long before = profile.countDocuments(unrelatedLookup);
+                assertThat(before).as("the profiler records an exact unrelated-definition lookup").isEqualTo(1);
+
+                List<Map<String, Object>> events = control.preview(PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID,
+                        List.of(new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml())));
+
+                assertThat(events).extracting(event -> event.get("kind"))
+                        .endsWith("result.completed", "run.completed");
+                List<?> documents = documents(payload(events, "result.completed"));
+                assertThat(documents).hasSize(2);
+                assertDocument(documents.get(0), "order-1", "Northwind", 24);
+                assertDocument(documents.get(1), "order-2", "Contoso", 14);
+                assertThat(profile.countDocuments(unrelatedLookup))
+                        .as("preview reads its dependency closure without looking up unrelated definitions")
+                        .isEqualTo(before);
+            } finally {
+                database.runCommand(new Document("profile", 0));
+            }
+        }
     }
 
     @ParameterizedTest

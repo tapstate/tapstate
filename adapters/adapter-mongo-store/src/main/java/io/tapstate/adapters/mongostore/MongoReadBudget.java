@@ -45,6 +45,12 @@ public final class MongoReadBudget {
 
     long operationMillis() { return Math.min(MAX_OPERATION_MILLIS, remainingMillis()); }
 
+    static boolean supportsSnapshotReads(MongoClient client){
+        var topology=client.getClusterDescription();
+        return topology.getType()==com.mongodb.connection.ClusterType.REPLICA_SET&&!topology.getServerDescriptions().isEmpty()
+                &&topology.getServerDescriptions().stream().allMatch(server->server.getMaxWireVersion()>=13);
+    }
+
     <T> T transaction(MongoClient client, Function<ClientSession, T> read) {
         if(!retryCallbacks)return maintenanceTransaction(client,read);
         return StoreIo.call(() -> {

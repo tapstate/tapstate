@@ -109,12 +109,22 @@ join a measurement to `tapstate.pipeline.nest.namespace.info`, which gives its s
 | `tapstate.pipeline.state.commit.round_trips` | Histogram | Synchronous backend commands per successful write call |
 | `tapstate.pipeline.state.commit.duration` | Histogram | Seconds from store call to acknowledgement |
 | `tapstate.pipeline.state.evictions` | Counter | Local state-map evictions |
+| `tapstate.pipeline.state.document.bytes` | Histogram | Bytes per written key; at a root namespace, the weight of each document as stored |
+| `tapstate.pipeline.state.document.bytes.max` | Gauge | The most bytes one key's state has taken |
+| `tapstate.pipeline.state.commit.bytes` | Histogram | Bytes per successful write call |
+| `tapstate.pipeline.nest.rollup.fold.duration` | Histogram | Seconds to fold one document's rollup fields at a level that declares them |
 
 The root counter measures output from the operator. Target acknowledgement and table loading are
 shown by the existing pipeline metrics and snapshot interfaces. Compare cumulative samples only
 within the same execution and counting lifetime. An acknowledged store call may contain multiple
 database transactions. Command counts cover the synchronous Mongo adapter; commands on other
 threads are outside the measurement.
+
+Every change to a document rewrites its whole stored state, so `state.document.bytes` at a root namespace is
+what one change costs. A document holding about a megabyte or more is past what rollup fields keep up with
+(see [rollup fields](../nest/rollup-fields.md)); `state.document.bytes.max` shows how close the heaviest has
+come to the 16 MB a stored document may hold. `nest.rollup.fold.duration` separates the time spent folding
+rollup fields from the time spent writing state.
 
 ## Current-run initial-load display
 
@@ -391,7 +401,7 @@ No explanation rule reads it; it answers beside the diagnosis.
 | `nodes[].requested`, `nodes[].requestedOrigin` | The target total the node was given, and whether its author wrote it (`explicit`) or it is the default for the node's kind (`node-default`) |
 | `nodes[].scope` | `total-one`: one processor for the whole cluster. `native`: the same number of processors on every member |
 | `nodes[].memberCount`, `nodes[].computedLocal`, `nodes[].effective` | The member count and per-member count the width was worked out for, and the processors that makes in total. `computedLocal` is absent for `total-one` |
-| `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `rounded-up`, `rounded-down`, or `budget:<name>` |
+| `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `state-has-one-writer`, `rounded-up`, `rounded-down`, or `budget:<name>` |
 | `nodes[].batch` | `maxRecords` and `maxWaitMillis`: the batch the node takes its input in |
 | `nodes[].change` | How the node's width moved from the run before: `previousEffective`, and `causes` naming each input that moved it apart - `members-changed`, `target-changed`, `capability-changed`. Absent where the width did not move |
 | `nodes[].resources` | Sinks only: `writers`; `connectorMode` (`isolated`: a connector per writer, `shared`: one per member, used only for an artifact certified to be shared) and `connectorInstances`; `bufferedRecords`, two batches per writer; and `edgeQueueRecords`, a full queue from every processor sending into the sink to every processor it takes its input on. These are upper bounds worked out before anything opens. A connector's own connection pool is sized inside the connector and is not counted; see [Connections behind a connector instance](#connections-behind-a-connector-instance) |

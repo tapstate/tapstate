@@ -34,9 +34,11 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 
 | Features | |
 |---|---|
+| [Aggregate](aggregate/) | Keep one row per group current, with counts, sums and extremes over the group's rows. |
 | [Filter](filter/) | Keep matching rows in a live view, including removals and source before-image requirements. |
 | [Join](join/) | SQL subset, dimension-key uniqueness, output keys, and usage requirements. |
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |
+| [Soft delete](soft-delete/) | Keep a deleted row in the target, or a deleted child in its document, marked deleted instead of removed. |
 | [Unwind](unwind/) | Expand array elements into individually keyed rows and keep them current. |
 | [Observability](observability/) | Read current state, bounded output-rate and lag history, and one shared evidence-backed explanation. |
 | [Start checks](start-checks/) | What a start looks at before it writes anything, how its questions are answered from each client, and how a new check is added. |

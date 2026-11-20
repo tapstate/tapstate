@@ -1041,7 +1041,7 @@ final class PipelineActuationOwnership {
         long askedAt=nanoTime.getAsLong();
         var reading=membership.businessEligible()?claims.readPipeline(scope):claims.readActuationControl(scope,original);
         if(reading.isEmpty()||!WorkloadClaimFence.from(reading.orElseThrow().claim()).equals(expected))return Optional.empty();
-        long budget=Math.min(reading.orElseThrow().leaseRemaining().toNanos(),ttl.toNanos());
+        long budget=Math.min(Math.min(reading.orElseThrow().leaseRemaining().toNanos(),ttl.toNanos()),TimeUnit.SECONDS.toNanos(10));
         Runnable guard=()->{
             synchronized(this){var current=held.get(scope.pipelineId());long elapsed=nanoTime.getAsLong()-askedAt;
                 if(closing||elapsed<0||elapsed>=budget||!accepts(scope)

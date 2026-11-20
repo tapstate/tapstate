@@ -27,6 +27,9 @@ public final class OperatorStepMaps implements Serializable {
     public OperatorMapBinding join(OperatorPlacement.Resource kind,String alias) {
         return require(new At(kind,"root",OperatorMapCoordinates.joinNamespace(kind,alias)));
     }
+    public OperatorMapBinding aggregate(OperatorMapCoordinates.AggregateStore kind) {
+        return require(new At(OperatorPlacement.Resource.AGGREGATE_STATE,"root",OperatorMapCoordinates.aggregateNamespace(kind)));
+    }
     private OperatorMapBinding require(At coordinate) { var found = maps.get(coordinate); if (found == null) throw refused(); return found; }
     private TapstateException refused() { return new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline",pipeline),null); }
 }

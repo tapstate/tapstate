@@ -23,6 +23,7 @@ class PeriodicObservationIsolationIT {
     private static final String ENGINE = "io.tapstate.runtime.engine.Engine";
     private static final String PROXY = "com.hazelcast.jet.impl.JobProxy";
     private static final String STORE = "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore";
+    private static final String OBSERVATION_WRITE = "(Lio/tapstate/core/lifecycle/Observation;JZ)Z";
     private static final String DRIVER = "io.tapstate.app.ConvergenceDriver";
     private static final Duration START = Duration.ofSeconds(120), DELIVERY = Duration.ofSeconds(12);
     private enum Mode { NATIVE_METRICS, OBSERVATION_WRITE }
@@ -189,7 +190,7 @@ class PeriodicObservationIsolationIT {
         if (type.size() != 1) throw new AssertionError("Unexpected class identity " + name + ": " + type.size());
         Location site = mode == Mode.NATIVE_METRICS
                 ? type.getFirst().methodsByName("getMetrics", "()Lcom/hazelcast/jet/core/metrics/JobMetrics;").getFirst().location()
-                : type.getFirst().locationsOfLine(202).stream().filter(l -> l.method().name().startsWith("lambda$save$")).findFirst().orElseThrow();
+                : type.getFirst().methodsByName("write", OBSERVATION_WRITE).getFirst().location();
         var manager = vm.eventRequestManager();
         var request = manager.createBreakpointRequest(site);
         request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
@@ -205,10 +206,11 @@ class PeriodicObservationIsolationIT {
                         if (!(event instanceof BreakpointEvent bp) || !request.equals(bp.request())) continue;
                         var frames = bp.thread().frames();
                         if (frames.stream().noneMatch(f -> frameIs(f, DRIVER, "reconcile")
+                                || frameIs(f, DRIVER, "reconcilePipeline")
                                 || frameIs(f, DRIVER, "publishPeriodicObservation"))) continue;
                         var scope = frames.stream().filter(f -> mode == Mode.NATIVE_METRICS
                                         ? frameIs(f, ENGINE, "nestStateReadings")
-                                        : frameIs(f, STORE, "save") && f.getArgumentValues().size() == 2)
+                                        : frameIs(f, STORE, "write") && OBSERVATION_WRITE.equals(f.location().method().signature()))
                                 .findFirst().orElse(null);
                         if (scope == null) continue;
                         Value arg = scope.getArgumentValues().getFirst();

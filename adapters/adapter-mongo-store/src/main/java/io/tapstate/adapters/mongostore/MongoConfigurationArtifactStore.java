@@ -830,7 +830,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return table;
     }
 
-    private Resource decode(Document document) {
+    Resource decode(Document document) {
         Resource resource = codec.decode(document);
         String id = document.getString("_id");
         if (!id.equals(resource.id()) || !resource.kind().equals(document.get("kind"))

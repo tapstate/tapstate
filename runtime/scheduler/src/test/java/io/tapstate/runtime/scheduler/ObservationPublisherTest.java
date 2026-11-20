@@ -21,6 +21,8 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -106,8 +108,9 @@ class ObservationPublisherTest {
         }
     }
 
-    @Test
-    void aPeriodicReadingLosesItsOriginalExecutionWhileCollecting() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aPeriodicReadingLosesItsOriginalExecutionWhileCollecting(boolean batched) {
         state.seed("orders", PipelineState.RUNNING);
         var previous = publisher.publish("orders").orElseThrow();
         var checkpoint = state.read("orders").orElseThrow();
@@ -118,7 +121,11 @@ class ObservationPublisherTest {
             return Map.of("nest.orders", new NestStateReading(8, 100, 400, 2_000));
         });
 
-        assertThat(collecting.publishRunningScoped(scope, checkpoint, observations, current::get)).isEmpty();
+        var capture = new ObservationPublisher.CaptureSample(SnapshotReading.NONE, SnapshotReading.NONE, Map.of(), null);
+        var result = batched
+                ? collecting.publishRunning(scope, checkpoint, observations, capture, current::get)
+                : collecting.publishRunningScoped(scope, checkpoint, observations, current::get);
+        assertThat(result).isEmpty();
         assertThat(current).isFalse();
         assertThat(observations.read("orders").orElseThrow()).isSameAs(previous);
     }

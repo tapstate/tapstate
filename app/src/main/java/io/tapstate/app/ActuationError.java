@@ -216,6 +216,18 @@ enum ActuationError implements TapstateErrorCode {
     STREAM_LANDS_TWO_WAYS("actuation.stream-lands-two-ways", Set.of("pipeline", "stream", "nest", "other")),
 
     /**
+     * A sync that matches writes on a key is fed a stream whose published target has no key:
+     * {@code pipeline} is the pipeline and {@code stream} the stream. The stream's source table declared
+     * a key and the target cannot carry it - a projection dropped or replaced a component of it - so
+     * nothing identifies the row a later change is about. Refused where the pipeline is built, because
+     * at write time the loss is invisible: the rows arrive, the table fills, and a run that looks like
+     * it converged has appended instead. Append mode is not judged, because it never matches a write to
+     * an existing row.
+     */
+    SYNC_OUTPUT_IDENTITY_UNRESOLVED("actuation.sync-output-identity-unresolved",
+            Set.of("pipeline", "stream")),
+
+    /**
      * A member a run would take part on cannot load a connector the pipeline's sinks open: {@code pipeline} is
      * the pipeline, {@code member} the member by stable id, {@code connector} the connector id and {@code reason}
      * what the member answered - its own coded refusal, the failure it hit, or that it did not answer in time.

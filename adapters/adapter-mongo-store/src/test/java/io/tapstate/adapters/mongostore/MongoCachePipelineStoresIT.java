@@ -78,6 +78,31 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void existingObservationUpdatesDoNotCreateOrReplaceAnotherExecutionsProjection() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var observations = (MongoCachePipelineObservationStore) f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            var first = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, AT, List.of());
+            var later = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, AT.plusSeconds(1), List.of());
+            var table = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            assertThat(observations.updateExisting(first, 1)).isFalse();
+            observations.save(first, 1);
+            assertThat(observations.updateExisting(later, 1)).isTrue();
+            assertThat(observations.updateExisting(first, 1)).isTrue();
+            assertThat(observations.read("orders")).contains(later);
+            assertThat(observations.updateExisting(later, 2)).isFalse();
+            var other = new WorkloadClaimFence(f.fence().key(), f.fence().owner(), f.fence().claimGeneration(),
+                    f.fence().executionGeneration() + 1, f.fence().topologyRevision());
+            var replacement = (MongoCachePipelineObservationStore) f.domain().pipelineObservations(SCOPE, other, ACTIVE);
+            assertThat(replacement.updateExisting(later, 1)).isFalse();
+            assertThat(table.countDocuments()).isOne();
+            table.drop();
+            assertThat(observations.updateExisting(later, 1)).isFalse();
+            assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
+        });
+    }
+
     @Test void checkpointsAndProjectionsUseTheOriginalScopeAndLiveClaimInOneCacheDomain() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
@@ -452,7 +477,15 @@ class MongoCachePipelineStoresIT {
             f.database().createCollection("pipeline_observation");
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).createIndex(new Document("touchMillis", 1),
                     new com.mongodb.client.model.IndexOptions().expireAfter(60L, TimeUnit.SECONDS));
-            assertCode(() -> f.domain().pipelineStates(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
+            long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(11);
+            for(;;){
+                try{f.domain().pipelineStates(SCOPE).read("orders");}
+                catch(TapstateException failure){assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);break;}
+                assertThat(System.nanoTime()).as("physical drift is detected when the ten-second proof expires").isLessThan(deadline);
+                Thread.sleep(25);
+            }
+            assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).listIndexes().into(new ArrayList<>()))
+                    .anySatisfy(index->assertThat(index).containsKey("expireAfterSeconds"));
         });
     }
 

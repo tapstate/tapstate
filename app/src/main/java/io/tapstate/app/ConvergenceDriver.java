@@ -64,7 +64,13 @@ final class ConvergenceDriver {
             Function<PipelineConvergencePass, RebuildAdmission> rebuilds,
             Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts,
             Consumer<PipelineIntentStore.PendingStart> prepareStart,
-            Consumer<String> resumeRebuild) {
+            Consumer<String> resumeRebuild, NativeObservationSampling observations) {
+        ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
+                Function<PipelineConvergencePass, LifecycleActuator> actuators,
+                Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain,
+                PipelineAlertFeed alerts, Consumer<PipelineIntentStore.PendingStart> prepareStart, Consumer<String> resumeRebuild) {
+            this(intents, stores, active, actuators, rebuilds, retain, alerts, prepareStart, resumeRebuild, null);
+        }
         ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
                 Function<PipelineConvergencePass, LifecycleActuator> actuators,
                 Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain) {
@@ -206,7 +212,10 @@ final class ConvergenceDriver {
         // with whatever the deleted one had left of its budget.
         if (scoped == null) converger.retain(pipelineIds);
         else scoped.retainRebuilds().accept(pipelineIds);
-        if (scoped != null) alert(() -> scoped.alerts().retain(pipelineIds));
+        if (scoped != null) {
+            alert(() -> scoped.alerts().retain(pipelineIds));
+            if (scoped.observations() != null) scoped.observations().retain(pipelineIds);
+        }
         publisher.forgetPipelinesOutside(pipelineIds);
         if (sampler != null) {
             sampler.forgetPipelinesOutside(pipelineIds);
@@ -226,11 +235,19 @@ final class ConvergenceDriver {
         PipelineActuationOwnership.Pass localPass = null;
         boolean periodic = false;
         try {
+            PipelineIntentStore.ActuationReading observationOrigin = null;
             PipelineActuationOwnership.Permit permit;
             if (scoped == null) {
                 permit = actuation.permit(pipelineId);
             } else {
-                var snapshot = scoped.intents().loadForActuation(pipelineId);
+                Optional<PipelineIntentSnapshot> snapshot;
+                if (scoped.observations() == null) {
+                    snapshot = scoped.intents().loadForActuation(pipelineId);
+                } else {
+                    var reading = scoped.intents().readForActuation(pipelineId);
+                    observationOrigin = reading.orElse(null);
+                    snapshot = reading.map(PipelineIntentStore.ActuationReading::intent);
+                }
                 if (snapshot.isEmpty()) {
                     var pendingStart = scoped.prepareStart() == null
                             ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
@@ -286,9 +303,10 @@ final class ConvergenceDriver {
                 var checkpoint = result.checkpoint().orElseThrow();
                 // The worker owns observations only, never the local lifecycle pass.
                 periodic = true;
+                var config = observationOrigin;
                 periodicObservations.offer(pipelineId,
                         new ObservationVersion(observedPass.intent(), original, checkpoint),
-                        admitted -> publishPeriodicObservation(observedPass, original, checkpoint, admitted));
+                        admitted -> publishPeriodicObservation(observedPass, original, checkpoint, config, admitted));
                 reconcileFailures.remove(pipelineId);
                 return;
             }
@@ -305,7 +323,9 @@ final class ConvergenceDriver {
                         failure.code(), result.failure().orElse(null));
             }
             var projection = scoped == null ? publisher.publish(pipelineId, failure)
-                    : publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
+                    : scoped.observations() == null
+                            ? publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure)
+                            : scoped.observations().publish(publisher, pass, result, observationOrigin, failure);
             PipelineConvergencePass sampledPass = pass;
             projection.ifPresent(published -> {
                 if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
@@ -348,11 +368,12 @@ final class ConvergenceDriver {
     private void discardPeriodic(String pipelineId) {
         if (periodicObservations != null) {
             periodicObservations.discard(pipelineId);
+            if (scoped.observations() != null) scoped.observations().forget(pipelineId);
         }
     }
 
     private void publishPeriodicObservation(PipelineConvergencePass pass, WorkloadClaimFence original,
-            CheckpointDoc checkpoint, BooleanSupplier admitted) {
+            CheckpointDoc checkpoint, PipelineIntentStore.ActuationReading config, BooleanSupplier admitted) {
         var scope = pass.scope();
         String pipelineId = scope.pipelineId();
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
@@ -367,7 +388,11 @@ final class ConvergenceDriver {
                         && actuation.proveObservationClaim(scope, original) && admitted.getAsBoolean();
             };
             var observation = scoped.stores().pipelineObservations(scope, original, scoped.requireActive());
-            publisher.publishRunningScoped(scope, checkpoint, observation, current).ifPresent(published -> {
+            var projection = scoped.observations() == null
+                    ? publisher.publishRunningScoped(scope, checkpoint, observation, current)
+                    : scoped.observations().publishRunning(publisher, pass, checkpoint, config, current,
+                            () -> publisher.publishRunningScoped(scope, checkpoint, observation, current));
+            projection.ifPresent(published -> {
                 if (unavailableObservations.remove(pipelineId)) {
                     LOG.info("Periodic observation publication recovered for pipeline {}", pipelineId);
                 }

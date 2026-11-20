@@ -189,6 +189,14 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     }
 
     @Override public void save(Observation observation, long checkpointEpoch) {
+        write(observation, checkpointEpoch, true);
+    }
+
+    boolean updateExisting(Observation observation, long checkpointEpoch) {
+        return write(observation, checkpointEpoch, false);
+    }
+
+    private boolean write(Observation observation, long checkpointEpoch, boolean create) {
         access.requirePipeline(observation.pipelineId());
         if (access.originalClaim() == null) throw MongoCachePipelineAccess.fenced();
         if (checkpointEpoch < 0 || observation.observedAt() == null) throw new IllegalArgumentException("invalid observation checkpoint");
@@ -196,14 +204,15 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         var captured = document(observation, id);
         // One document, one atomic update. A delayed sample may populate only its original key.
         var keepExisting = new Document("$gte", List.of("$observedAt", captured.get("observedAt")));
-        StoreIo.run(() -> {
+        var result = StoreIo.call(() -> {
             access.requireObservationActive();
-            access.verifyObservationStructure();
-            collection().withWriteConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).updateOne(new Document("_id", id),
+            if (create) access.verifyObservationStructure();
+            return collection().withWriteConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).updateOne(new Document("_id", id),
                     List.of(new Document("$replaceWith", new Document("$cond",
                             List.of(keepExisting, "$$ROOT", new Document("$literal", captured))))),
-                    new UpdateOptions().upsert(true));
+                    new UpdateOptions().upsert(create));
         });
+        if (!create && result.getMatchedCount() != 1) return false;
         if ((WRITES.incrementAndGet() & 63) == 0) {
             var scope = access.scope;
             var prior = new Document("_id.scope.clusterId", scope.clusterId()).append("_id.scope.bindingVersion", scope.bindingVersion())
@@ -212,6 +221,7 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
                     scopeFilter(scope).append("_id.epoch", new Document("$lt", checkpointEpoch - 1))));
             reap(access.database, prior);
         }
+        return true;
     }
 
     private com.mongodb.client.MongoCollection<Document> collection() {

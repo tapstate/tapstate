@@ -2,10 +2,14 @@ name: Nightly Test
 
 on:
   schedule:
-    # 01:00 Asia/Shanghai on the next calendar day.
-    - cron: "0 17 * * *"
+    # 21:00 Asia/Shanghai.
+    - cron: "0 13 * * *"
   workflow_dispatch:
     inputs:
+      reactor-only:
+        description: Run only the full reactor regression for the selected branch
+        type: boolean
+        default: false
       connector-inputs:
         description: Connector input policy
         type: choice
@@ -16,7 +20,13 @@ permissions:
   contents: read
 
 jobs:
+  reactor-regression:
+    uses: ./.github/workflows/reactor-regression.yml
+    with:
+      source-sha: ${{ github.sha }}
+
   prepare:
+    if: ${{ !inputs.reactor-only }}
     runs-on: ubuntu-latest
     outputs:
       web-sha: ${{ steps.inputs.outputs.web-sha }}
@@ -131,7 +141,7 @@ jobs:
 
   notify-feishu:
     if: ${{ !cancelled() && github.event_name == 'schedule' && contains(needs.*.result, 'failure') }}
-    needs: [prepare, real-connectors, join-perf, cli-native, release-images, gate-selftests, distribution]
+    needs: [prepare, reactor-regression, real-connectors, join-perf, cli-native, release-images, gate-selftests, distribution]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -140,6 +150,7 @@ jobs:
           WEBHOOK: ${{ secrets.NIGHTLY_FEISHU_WEBHOOK }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PREPARE: ${{ needs.prepare.result }}
+          REACTOR_REGRESSION: ${{ needs.reactor-regression.result }}
           REAL_CONNECTORS: ${{ needs.real-connectors.result }}
           JOIN_PERF: ${{ needs.join-perf.result }}
           CLI_NATIVE: ${{ needs.cli-native.result }}
@@ -154,6 +165,7 @@ jobs:
           fi
           failed=()
           [[ "$PREPARE" != failure ]] || failed+=(prepare)
+          [[ "$REACTOR_REGRESSION" != failure ]] || failed+=(reactor-regression)
           [[ "$REAL_CONNECTORS" != failure ]] || failed+=(real-connectors)
           [[ "$JOIN_PERF" != failure ]] || failed+=(join-perf)
           [[ "$CLI_NATIVE" != failure ]] || failed+=(cli-native)

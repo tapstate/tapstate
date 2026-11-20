@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -50,11 +51,23 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.bounded;
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.boundedRow;
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.lookup;
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.one;
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.match;
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.originalRow;
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.overflow;
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.rows;
+import static io.tapstate.adapters.mongostore.MongoPipelineObservationRead.single;
+
 /** Membership, its cursor and minimal chain dependency facts change in one cache transaction. */
 public final class MongoSrsConsumerStore implements SrsConsumerStore {
+    private static final int CONTROL_SNAPSHOT_RELATIONS = 128;
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private static final TransactionOptions PIN_TRANSACTION = TransactionOptions.builder()
@@ -66,7 +79,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     private final Runnable requireActive;
     private final Runnable requireStructure;
     private final boolean runtimeStructure;
+    private final BooleanSupplier batchControlSnapshot;
+    private final BooleanSupplier batchControlReadiness;
     private final MongoSrsChainStore chains;
+    private final MongoSrsControlProofs proofs;
+    private MongoSrsControlProofs controlProofs(){return proofs;}
     private final MongoSrsConsumerRecords records;
     private final MongoSrsLease readLease;
     private final AtomicReference<ProvenReads> provenReads;
@@ -96,13 +113,21 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             Runnable requireStructure, MongoSrsLease readLease, boolean runtimeStructure) {
-        this(client, database, scope, requireActive, requireStructure, readLease, runtimeStructure, new AtomicReference<>(),
-                readLease.enabled() ? MongoSrsLease.selected() : MongoSrsLease.perTransaction(), new AtomicReference<>());
+        this(client, database, scope, requireActive, requireStructure, readLease, runtimeStructure,
+                new MongoSrsControlProofs(), () -> false, () -> false);
+    }
+    MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable active,
+            Runnable structure, MongoSrsLease lease, boolean runtime, MongoSrsControlProofs proofs, BooleanSupplier batchControlSnapshot,
+            BooleanSupplier batchControlReadiness) {
+        this(client, database, scope, active, structure, lease, runtime, new AtomicReference<>(), lease.fork(),
+                new AtomicReference<>(), proofs, batchControlSnapshot, batchControlReadiness);
     }
 
     private MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             Runnable requireStructure, MongoSrsLease readLease, boolean runtimeStructure, AtomicReference<ProvenReads> provenReads,
-            MongoSrsLease cursorLease, AtomicReference<ProvenCursor> provenCursor) {
+            MongoSrsLease cursorLease, AtomicReference<ProvenCursor> provenCursor, MongoSrsControlProofs proofs,
+            BooleanSupplier batchControlSnapshot, BooleanSupplier batchControlReadiness) {
+        this.proofs=proofs;
         this.readLease = readLease;
         this.provenReads = provenReads;
         this.cursorLease = cursorLease;
@@ -111,11 +136,13 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = requireStructure == null ? this::verifyConsumerStructure : requireStructure;
         this.runtimeStructure = runtimeStructure;
-        this.chains = new MongoSrsChainStore(client, database, scope, requireActive, this.requireStructure); this.records = new MongoSrsConsumerRecords(scope);
+        this.batchControlSnapshot = batchControlSnapshot;
+        this.batchControlReadiness = batchControlReadiness;
+        this.chains = new MongoSrsChainStore(client, database, scope, requireActive, this.requireStructure,readLease.fork(),proofs); this.records = new MongoSrsConsumerRecords(scope);
     }
     @Override public MongoSrsConsumerStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, readLease, runtimeStructure, provenReads, cursorLease, provenCursor);
+        return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, readLease, runtimeStructure, provenReads, cursorLease, provenCursor, controlProofs(), batchControlSnapshot, batchControlReadiness);
     }
 
     @Override public SharedSrsRecoverySnapshot inspectSharedRecovery(CapturePreparation previous) {
@@ -547,13 +574,126 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     @Override public AttachedChain attachedWithChain(String chain) {
         requireChainName(chain);
-        return transaction(session -> {
-            var view = view(session, chain);
-            List<SrsConsumerMembership> active = view.members().values().stream().filter(member -> !member.detached())
-                    .sorted(Comparator.comparing(member -> member.context().key().consumerId())).toList();
+        return readSnapshot(session -> {
+            var view = readView(session, chain);
+            var active = activeConsumers(view);
             var topology = new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active);
             return new AttachedChain(topology, view.state());
         });
+    }
+
+    @Override public boolean supportsControlSnapshot(){return true;}
+    @Override public Optional<ControlSnapshot> controlSnapshot(String chain) {
+        return readControlSnapshot(chain, view -> {
+            var active = activeConsumers(view);
+            var cursors = active.stream().map(member -> view.cursors().get(member.context().key().consumerId()).value()).toList();
+            return new ControlSnapshot(new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active),
+                    view.state(), cursors);
+        });
+    }
+
+    @Override public Optional<RetentionSnapshot> retentionSnapshot(String chain) {
+        return readControlSnapshot(chain, true, view -> {
+            var consumers = activeConsumers(view).stream()
+                    .map(member -> new RetentionConsumer(member,
+                            view.cursors().get(member.context().key().consumerId()).ringDoneThrough()))
+                    .toList();
+            return new RetentionSnapshot(view.state(), consumers);
+        });
+    }
+
+    private static List<SrsConsumerMembership> activeConsumers(View view) {
+        return view.members().values().stream().filter(member -> !member.detached())
+                .sorted(Comparator.comparing(member -> member.context().key().consumerId())).toList();
+    }
+
+    private <T> Optional<T> readControlSnapshot(String chain, Function<View, T> project) {
+        return readControlSnapshot(chain, false, project);
+    }
+
+    private <T> Optional<T> readControlSnapshot(String chain, boolean retention, Function<View, T> project) {
+        requireChainName(chain);
+        return readSnapshot(
+                session -> Optional.ofNullable(controlView(session, chain))
+                        .map(view -> projectControlSnapshot(session, chain, view, retention, project)),
+                session -> Optional.ofNullable(readReadyControlView(session, chain))
+                        .map(view -> Optional.of(projectControlSnapshot(session, chain, view, retention, project))));
+    }
+
+    private <T> T projectControlSnapshot(ClientSession session, String chain, View view, boolean retention, Function<View, T> project) {
+        var root = view.root();
+        var models=new java.util.HashSet<SrsModelKey>();
+        for(var member:view.members().values())if(!member.detached()
+                && (!retention || !java.util.Collections.disjoint(member.tables(),view.state().servingTables()))){
+            var pin=view.cursors().get(member.context().key().consumerId()).snapshot();
+            if(pin!=null)for(var key:pin.models().values()){
+                if(!chain.equals(key.miningChainId())||!scope.cacheIncarnation().equals(key.cacheIncarnation()))throw unavailable(chain);
+                models.add(key);
+            }
+        }
+        var ordered=models.stream().map(key->MongoSrsModelStore.key(key).toJson()).sorted().toList();
+        String fingerprint=io.tapstate.core.model.canonical.CanonicalHash.ofText(MongoSrsChainStore.controlFingerprint(root)+retention+ordered);
+        if(!chains.referencesProved(root,fingerprint)){
+            var check=chains.beginReferences();chains.state(session,root,true);
+            if(!models.isEmpty())new MongoSrsModelStore(client,database,scope,requireActive,requireStructure).requireSnapshotReferences(session,models);
+            chains.rememberReferences(session,root,fingerprint,check);
+        }
+        return project.apply(view);
+    }
+
+    private record BatchedRelations(Document root, List<Document> members, List<Document> offsets) {}
+
+    private BatchedRelations readBatchedRelations(ClientSession session, String chain) {
+        return decodeBatchedRelations(SystemCollections.SRS_CHAINS.on(database)
+                .aggregate(session, batchedRelationsQuery(chain)).first());
+    }
+
+    private List<Document> batchedRelationsQuery(String chain) {
+        var key = records.chain(chain);
+        return List.of(
+                match(new Document("_id", chain)), boundedRow(), originalRow(),
+                lookup(SystemCollections.SRS_CONSUMERS, "members", bounded(match(key), CONTROL_SNAPSHOT_RELATIONS)),
+                lookup(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS, "offsets",
+                        List.of(match(key), new Document("$limit", CONTROL_SNAPSHOT_RELATIONS + 1),
+                                boundedRow(16 * 1024))));
+    }
+
+    private static BatchedRelations decodeBatchedRelations(Document combined) {
+        if (combined == null || overflow(combined, "members", CONTROL_SNAPSHOT_RELATIONS)
+                || overflow(combined, "offsets", CONTROL_SNAPSHOT_RELATIONS)) return null;
+        var root = combined.get("body", Document.class);
+        return root.containsKey("_id") ? new BatchedRelations(root, rows(combined, "members"), rows(combined, "offsets")) : null;
+    }
+
+    private View readReadyControlView(ClientSession session, String chain) {
+        if (!batchControlSnapshot.getAsBoolean() || !batchControlReadiness.getAsBoolean()) return null;
+        var combined = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                match(new Document("_id", "cluster")), boundedRow(), originalRow(),
+                one(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
+                lookup(SystemCollections.SRS_CHAINS, "chain", batchedRelationsQuery(chain)))).first();
+        if (combined == null || overflow(combined, "schema", 1)) return null;
+        var identity = combined.get("body", Document.class);
+        if (!identity.containsKey("_id")) return null;
+        MongoCacheBusinessIdentity.requireObservedReady(identity, single(combined, "schema"), scope);
+        return decodeControlView(chain, decodeBatchedRelations(single(combined, "chain")));
+    }
+
+    private View decodeControlView(String chain, BatchedRelations batched) {
+        if (batched == null) return null;
+        var root = batched.root();
+        var state = MongoSrsChainStore.decode(root, scope, new MongoSrsModelContexts(database, scope));
+        return relations(chain, root, state, batched.members().iterator(), batched.offsets().iterator());
+    }
+
+    private View controlView(ClientSession session, String chain) {
+        if (batchControlSnapshot.getAsBoolean()) {
+            var batched = decodeControlView(chain, readBatchedRelations(session, chain));
+            if (batched != null) return batched;
+        }
+        // The original path handles oversized results and distinguishes a missing chain from retained orphan rows.
+        var root = chains.readRoot(session, chain);
+        return root == null ? null : relations(session, chain, root,
+                MongoSrsChainStore.decode(root, scope, new MongoSrsModelContexts(database, scope)));
     }
 
     /** Limits a fixed requested cut and serializes actual deletion with membership replacement. */
@@ -576,16 +716,26 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         requireActive.run(); return safe;
     }
 
-    /** Serializes model reclamation with attach, detach and exact snapshot-pin publication. */
-    Set<io.tapstate.spi.store.SrsModelKey> retainedModels(ClientSession session,String chain) {
-        var held=view(session,chain);var result=new java.util.HashSet<io.tapstate.spi.store.SrsModelKey>();
-        for(var member:held.members().values()) {
-            if(member.detached())continue;
-            var snapshot=held.cursors().get(member.context().key().consumerId()).snapshot();
-            validateSnapshot(session,member.context(),snapshot);
-            if(snapshot!=null)result.addAll(snapshot.models().values());
+    record RetainedModels(Document chain, SrsChainState state, Set<SrsModelKey> pinned) {}
+
+    /** Called only after reclaim has checked business identity and fenced its capture in this transaction. */
+    RetainedModels fenceRetainedModels(ClientSession session, String chain, boolean batchRelations, boolean batchReferences) {
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("model reclamation requires the original transaction");
+        var batched = batchRelations ? readBatchedRelations(session, chain) : null;
+        var root = batched == null ? chains.requireRoot(session, chain) : batched.root();
+        if (batched != null) MongoSrsRecoveryControls.requireOrdinary(root);
+        var retained = chains.stateForReclaim(session, root, batchReferences);
+        var held = batched == null ? relations(session, chain, root, retained.state())
+                : relations(chain, root, retained.state(), batched.members().iterator(), batched.offsets().iterator());
+        var result = new java.util.HashSet<SrsModelKey>();
+        for (var member : held.members().values()) {
+            if (member.detached()) continue;
+            var snapshot = held.cursors().get(member.context().key().consumerId()).snapshot();
+            validateSnapshot(session, member.context(), snapshot, root, retained.checkpointModels());
+            if (snapshot != null) result.addAll(snapshot.models().values());
         }
-        chains.replace(session,held.root(),new Document(held.root()));return Set.copyOf(result);
+        chains.replace(session, root, new Document(root));
+        return new RetainedModels(root, held.state(), Set.copyOf(result));
     }
 
     /**
@@ -633,10 +783,14 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     @Override public Optional<ConsumerOffset> cursor(SrsConsumerContext context) { return progress(context).map(SrsConsumerProgress::cursor); }
     @Override public Optional<SrsConsumerProgress> progress(SrsConsumerContext context) {
         Objects.requireNonNull(context, "context");
-        return transaction(session -> {
-            var own = own(session,context);
+        return readSnapshot(session -> {
+            var own = own(session,context,true,true);
             if (own == null || own.member().detached()) return Optional.empty();
-            var held = own.cursor(); validateSnapshot(session, context, held.snapshot());
+            var held = own.cursor();
+            var pin=held.snapshot();
+            var checkpoint=MongoSrsChainStore.controlState(own.root(),scope,new MongoSrsModelContexts(database,scope)).checkpoint();
+            var proved=checkpoint==null?Set.<SrsModelKey>of():checkpoint.tables().values().stream().map(io.tapstate.spi.store.SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
+            if(pin!=null&&!proved.containsAll(pin.models().values()))validateSnapshot(session,context,pin);
             return Optional.of(new SrsConsumerProgress(context,own.member().revision(),held.revision(),held.value(),held.snapshot(),held.writerRun(),held.ringDoneThrough()));
         });
     }
@@ -714,6 +868,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             }
             return true;
         } catch (RuntimeException failure) {
+            MongoStructureProof.invalidate(requireStructure);
             readLease.drop();
             throw failure;
         }
@@ -785,6 +940,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (published != null) provenReads.set(new ProvenReads(published, run, proof.models()));
             return Optional.of(proof.model());
         } catch (RuntimeException failure) {
+            MongoStructureProof.invalidate(requireStructure);
             readLease.drop();
             throw failure;
         }
@@ -939,6 +1095,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             }
             return result.advanced();
         } catch (RuntimeException failure) {
+            MongoStructureProof.invalidate(requireStructure);
             cursorLease.drop();
             throw failure;
         }
@@ -1056,6 +1213,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 requireActive.run();
                 return result.accepted;
             } catch (RuntimeException failure) {
+            MongoStructureProof.invalidate(requireStructure);
                 requireActive.run();
                 throw failure;
             }
@@ -1082,14 +1240,22 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot) {
+        validateSnapshot(session, context, snapshot, null, Set.of());
+    }
+
+    private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot,
+            Document verifiedChain, Set<SrsModelKey> checkpointModels) {
         if (snapshot == null) return;
-        var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
         for (var key : snapshot.models().values()) {
             if (!context.key().miningChainId().equals(key.miningChainId()) || !scope.cacheIncarnation().equals(key.cacheIncarnation())) {
                 throw unavailable(context.key().miningChainId());
             }
         }
-        models.requireSnapshotReferences(session, Set.copyOf(snapshot.models().values()));
+        var keys = Set.copyOf(snapshot.models().values());
+        if (!checkpointModels.containsAll(keys)) {
+            new MongoSrsModelStore(client, database, scope, requireActive, requireStructure)
+                    .requireSnapshotReferences(session, keys, verifiedChain);
+        }
     }
     @Override public Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision); Set<String> selected = Set.copyOf(Objects.requireNonNull(tables, "tables"));
@@ -1107,7 +1273,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             ConsumerOffset cursor = previousCursor == null ? records.initial(context.key(), selected) : records.include(previousCursor.value(), selected);
             Document cursorRow = records.cursor(next, cursor, previousCursor == null ? 0 : previousCursor.revision(), previousCursor == null ? null : previousCursor.snapshot(),previousCursor == null ? null : previousCursor.writerRun(),previousCursor == null ? Map.of() : previousCursor.ringDoneThrough());
             writeMember(session, held, next);
-            if (previousCursor == null) SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).insertOne(session, cursorRow);
+            if (previousCursor == null) {
+                MongoStructureProof.invalidate(requireStructure);requireStructure.run();
+                SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).insertOne(session,cursorRow);
+            }
             else if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
                     new Document("_id", records.id(context.key())).append("membershipRevision", held.revision()), cursorRow).getMatchedCount() != 1) throw unavailable(chain);
             changeRoot(session, view, held == null || held.detached() ? 1 : 0);
@@ -1203,7 +1372,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
     private void writeMember(ClientSession session, SrsConsumerMembership before, SrsConsumerMembership next) {
         Document row = records.membership(next);
-        if (before == null) SystemCollections.SRS_CONSUMERS.on(database).insertOne(session, row);
+        if (before == null) {
+            MongoStructureProof.invalidate(requireStructure);requireStructure.run();
+            SystemCollections.SRS_CONSUMERS.on(database).insertOne(session,row);
+        }
         else if (SystemCollections.SRS_CONSUMERS.on(database).replaceOne(session,
                 new Document("_id", records.id(before.context().key())).append("revision", before.revision()), row).getMatchedCount() != 1) {
             throw unavailable(next.context().key().miningChainId());
@@ -1222,11 +1394,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return own(session, context, false);
     }
 
-    private Own own(ClientSession session, SrsConsumerContext context, boolean businessChecked) {
+    private Own own(ClientSession session, SrsConsumerContext context, boolean businessChecked) {return own(session,context,businessChecked,false);}
+    private Own own(ClientSession session,SrsConsumerContext context,boolean businessChecked,boolean controlRead){
         String chain = context.key().miningChainId();
         var root = SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
         if (root == null) throw unavailable(chain);
-        var state = chains.state(session, root, businessChecked); var id = new Document("_id",records.id(context.key()));
+        var state = controlRead?chains.readState(session,root,businessChecked):chains.state(session,root,businessChecked); var id = new Document("_id",records.id(context.key()));
         var row = SystemCollections.SRS_CONSUMERS.on(database).find(session,id).first();
         if (row == null) {
             // Prove absence through the complete dependency view before allowing a new caller to prepare.
@@ -1274,8 +1447,14 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return own;
     }
 
-    private record View(Document root, SrsChainState state, Map<String, SrsConsumerMembership> members,
+    record View(Document root, SrsChainState state, Map<String, SrsConsumerMembership> members,
                         Map<String, MongoSrsConsumerRecords.Cursor> cursors, List<Document> membershipRows, List<Document> cursorRows) {}
+
+    private View readView(ClientSession session,String chain){
+        Document root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
+        if(root==null)throw unavailable(chain);
+        return relations(session,chain,root,chains.state(session,root,true));
+    }
 
     private View view(ClientSession session, String chain) {
         Document root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
@@ -1306,30 +1485,37 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return view.root();
     }
     private View relations(ClientSession session,String chain,Document root,SrsChainState state) {
-        var membershipRows=new ArrayList<Document>();var cursorRows=new ArrayList<Document>();
+        var members = SystemCollections.SRS_CONSUMERS.on(database).find(session, records.chain(chain)).into(new ArrayList<>());
+        try (var cursors = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).find(session, records.chain(chain)).cursor()) {
+            return relations(chain, root, state, members.iterator(), cursors);
+        }
+    }
+
+    View relations(String chain, Document root, SrsChainState state, Iterator<Document> memberRows, Iterator<Document> offsetRows) {
+        var membershipRows = new ArrayList<Document>();
+        var cursorRows = new ArrayList<Document>();
         var members = new HashMap<String, SrsConsumerMembership>();
         long revisions = 0;
-        try (var cursor = SystemCollections.SRS_CONSUMERS.on(database).find(session, records.chain(chain)).iterator()) {
-            while (cursor.hasNext()) {
-                var row=cursor.next();SrsConsumerMembership member = records.membership(row);membershipRows.add(row);
-                if (!chain.equals(member.context().key().miningChainId()) || members.put(member.context().key().consumerId(), member) != null) throw unavailable(chain);
-                try { revisions = Math.addExact(revisions, member.revision()); }
-                catch (ArithmeticException invalid) { throw unavailable(chain); }
-            }
+        while (memberRows.hasNext()) {
+            var row = memberRows.next();
+            var member = records.membership(row);
+            membershipRows.add(row);
+            if (!chain.equals(member.context().key().miningChainId())
+                    || members.put(member.context().key().consumerId(), member) != null) throw unavailable(chain);
+            try { revisions = Math.addExact(revisions, member.revision()); }
+            catch (ArithmeticException invalid) { throw unavailable(chain); }
         }
         var cursors = new HashMap<String, MongoSrsConsumerRecords.Cursor>();
-        try (var cursor = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).find(session, records.chain(chain)).iterator()) {
-            while (cursor.hasNext()) {
-                Document row = cursor.next();
-                cursorRows.add(row);
-                if (!(row.get("_id") instanceof Document id) || !(id.get("consumer") instanceof String consumer)) throw unavailable(chain);
-                SrsConsumerMembership member = members.get(consumer);
-                if (member == null || member.detached() || cursors.put(consumer, records.cursor(member, row)) != null) throw unavailable(chain);
-            }
+        while (offsetRows.hasNext()) {
+            Document row = offsetRows.next();
+            cursorRows.add(row);
+            if (!(row.get("_id") instanceof Document id) || !(id.get("consumer") instanceof String consumer)) throw unavailable(chain);
+            var member = members.get(consumer);
+            if (member == null || member.detached() || cursors.put(consumer, records.cursor(member, row)) != null) throw unavailable(chain);
         }
         long active = members.values().stream().filter(member -> !member.detached()).count();
         if (active != state.consumerCount() || cursors.size() != active || revisions != state.consumerRevision()) throw unavailable(chain);
-        return new View(root, state, members, cursors,membershipRows,cursorRows);
+        return new View(root, state, members, cursors, membershipRows, cursorRows);
     }
     private void prove(ClientSession session,SrsConsumerContext context,WorkloadClaimFence fence) {
         prove(session, context, fence, false);
@@ -1387,6 +1573,34 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         new MongoCacheBusinessIdentity(database, scope).requireReady(session);
     }
 
+    private <T> T readSnapshot(Function<ClientSession,T> read) {
+        return readSnapshot(read, null);
+    }
+
+    private <T> T readSnapshot(Function<ClientSession, T> read, Function<ClientSession, Optional<T>> tryCombined) {
+        return StoreIo.call(()->{
+            try{
+                requireActive.run();if(!MongoReadBudget.supportsSnapshotReads(client))return transaction(read);
+                try(var session=client.startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())){
+                    requireStructure.run();
+                    requireActive.run();
+                    var combined = tryCombined == null ? Optional.<T>empty() : tryCombined.apply(session);
+                    if (combined.isPresent()) {
+                        requireActive.run();
+                        return combined.orElseThrow();
+                    }
+                    new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+                    T result = read.apply(session);
+                    requireActive.run();
+                    return result;
+                }
+            }catch(RuntimeException failure){
+                chains.invalidateControlProofs();MongoStructureProof.invalidate(requireStructure);
+                try{requireActive.run();}catch(RuntimeException fenced){if(fenced!=failure)failure.addSuppressed(fenced);}
+                throw failure;
+            }
+        });
+    }
     private <T> T inTransaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
@@ -1398,6 +1612,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     }, TRANSACTION);
                 }
             } catch (RuntimeException failure) {
+                chains.invalidateControlProofs();MongoStructureProof.invalidate(requireStructure);
                 try { requireActive.run(); }
                 catch (RuntimeException fence) {
                     if (fence != failure) failure.addSuppressed(fence);
