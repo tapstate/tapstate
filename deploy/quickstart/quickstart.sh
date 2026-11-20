@@ -44,6 +44,26 @@ die() {
     exit 1
 }
 
+# $1 as one shell word that pastes back as itself: bare when every character is one no shell treats
+# specially, otherwise single-quoted, with each single quote inside closed, escaped and reopened. The
+# demo directory's path goes into commands printed to be copied, and a path holding a space or a quote
+# would otherwise split into several words, or open a quote that never closes.
+shell_quote() {
+    case "$1" in
+        *[!A-Za-z0-9_./-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# $1, a command printed for the reader to paste, in the form that runs where it has to. In place it
+# stays bare: the reader's shell is already in the demo directory. Piped, it becomes
+# (cd <demo directory> && $1). The subshell reaches the stack without moving the reader's shell, so the
+# installer run again from that shell is the same piped run, from the same place, and lands back in the
+# directory it made.
+in_demo_dir() {
+    if [ -n "$demo_cd" ]; then printf '(%s && %s)' "$demo_cd" "$1"; else printf '%s' "$1"; fi
+}
+
 # Download $1 to the file $2 with whichever of curl / wget is present.
 #
 # The transfer lands in $2.part and is moved into place only once it has completed, so an interrupted
@@ -358,12 +378,15 @@ EOF
 
 print_next_steps() {
     demo_dir="$(basename "$PWD")"
-    # Whole-directory removal is only ever offered for a directory this script made. Run in place --
-    # a saved script executed where it sits -- the directory is the user's and holds their files, so
-    # printing `rm -rf` on it puts a command that destroys unrelated work in front of someone who has
-    # been told, correctly, that everything above was safe to copy.
+    # Whole-directory removal is only ever offered for a directory this script made, which main() reads
+    # off the file it leaves there. Run in place anywhere else -- a saved script executed where it
+    # sits -- the directory is the user's and holds their files, so printing `rm -rf` on it puts a
+    # command that destroys unrelated work in front of someone who has been told, correctly, that
+    # everything above was safe to copy. The name is quoted: run from inside the directory it made, the
+    # script reads it off that directory, which the user may have renamed, and a bare name holding a
+    # space removes the words of it beside the directory instead of the directory.
     if [ "${demo_dir_is_ours:-no}" = yes ]; then
-        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, agent configuration)"
+        removal_line="  cd .. && rm -rf $(shell_quote "$demo_dir")  remove this directory (CLI, jars, workspace, agent configuration)"
     else
         removal_line="  this directory is yours, so nothing here removes it. What the quickstart added:
     tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ docker-compose.yml tapstate-mcp.json"
@@ -374,7 +397,7 @@ print_next_steps() {
         agent_lines="    1. Give your agent the Tapstate authoring skills. Without them it can write a pipeline that
        validates and runs but does not mean what you asked:
          npx --yes skills add tapstate/tapstate-skills
-    2. Connect it: $agent_config in this directory starts Tapstate's MCP server with a write token.
+    2. Connect it: $agent_config in $this_dir starts Tapstate's MCP server with a write token.
          Claude Code:   claude --mcp-config $agent_config
          other agents:  copy its \"tapstate\" entry into the agent's MCP settings
     3. Ask it, for example:
@@ -384,6 +407,15 @@ print_next_steps() {
         agent_lines="    Not set up: $agent_note"
     fi
     uri="mongodb://mongo:27017/views?directConnection=true"
+    # Piped, the reader's shell is still where the one-liner was typed, and every command below runs in
+    # the directory this run works in -- not "made": on a piped re-run, mkdir -p finds the directory an
+    # earlier run left. Said once, at the top, with the cd that gets there; in place there is nothing to
+    # say, and the line stays empty.
+    go_there=""
+    [ -z "$demo_cd" ] || go_there="
+The commands below run in $this_dir, the directory this run works in; your shell is still where you started:
+  $demo_cd
+"
     # How long a pasted wait keeps trying. Taken for the slowest healthy machine, not the fastest: a
     # single change crosses in about a second here, so a minute is not a guess at the duration but a
     # ceiling far above it - small enough that nobody sits in front of a hung terminal, large enough
@@ -391,7 +423,7 @@ print_next_steps() {
     cdc_wait_seconds=60
     cat <<EOF
 quickstart: pipeline started. The stack is running.
-
+$go_there
 What you have: one object per order, assembled out of two different databases. The orders are in
 MySQL, their shipments are in PostgreSQL, and neither engine can see the other's table -- so this is
 not a view and not a join. Tapstate keeps it fresh from both sides at once.
@@ -459,10 +491,10 @@ Reach the store from your own machine (optional -- the reads above go through th
   meaning something only inside the container, so a URI carrying replicaSet=rs0 makes the driver
   discover that name and dial an address on your own machine where nothing is listening.
 
-Stop, and pick it up later (run in this directory):
+Stop, and pick it up later (run in $this_dir):
   docker compose stop        stop the stack and keep its data (docker compose start resumes it)
 
-Tear down -- this one is not reversible (run in this directory):
+Tear down -- this one is not reversible (run in $this_dir):
   docker compose down -v     stop the stack and delete its data (a re-run re-registers the connectors)
 $removal_line
 The pulled images remain; remove them with:  docker image rm <image>
@@ -556,7 +588,7 @@ await_entry() {
         i=$((i + 1))
         sleep "$poll"
     done
-    die "the installation did not reach $* (last state: ${entry:-unavailable}); inspect it with: docker compose logs server"
+    die "the installation did not reach $* (last state: ${entry:-unavailable}); inspect it with: $(in_demo_dir 'docker compose logs server')"
 }
 
 setup_post() {
@@ -599,16 +631,35 @@ main() {
     # everything this script adds must stay inside one removable directory. Either marker file says
     # "work here": the saved script is the download-then-run form, the compose file is a re-run of an
     # earlier one (piped re-runs land back in the same directory rather than nesting a second).
-    # Whether this directory is ours decides what the teardown may offer. Working in place is a
+    #
+    # Whether this directory is ours decides what the teardown may offer, and the directory itself
+    # keeps the answer: the piped form leaves .tapstate-quickstart-made in the directory it takes, and
+    # a directory holding that file is ours wherever the run starts. Where it starts cannot say. The
+    # closing text sends the reader's shell into the directory a piped run made, and the next run from
+    # there -- to resume after `docker compose stop`, say -- finds the compose file and works in place,
+    # in a directory that is still the one this script made. Working in place anywhere else is a
     # supported form -- a saved script run where it sits -- and there the directory is the user's, with
     # their files in it.
     demo_dir_is_ours=no
+    # Where every command printed from here on has to run, said in the command itself. In place, the
+    # reader's shell is already in this directory and the commands stay bare. Piped from elsewhere, the
+    # script works in a directory the reader's shell is not in -- and no child process can move the
+    # shell that started it -- so each printed failure command carries the cd that gets there (see
+    # in_demo_dir), and the prose names the directory rather than calling it "this directory". The
+    # `working in` line below is no substitute: it is the first line of the run, long scrolled away by
+    # the time a failure is printed.
+    this_dir="this directory"; demo_cd=""
     if [ ! -f ./quickstart.sh ] && [ ! -f ./docker-compose.yml ]; then
         mkdir -p tapstate-demo
         cd tapstate-demo
-        demo_dir_is_ours=yes
+        [ -f .tapstate-quickstart-made ] \
+            || printf 'Made by the Tapstate quickstart, which treats this directory as its own and offers to remove it whole while this file is here.\n' \
+                > .tapstate-quickstart-made
+        this_dir="$PWD"
+        demo_cd="cd $(shell_quote "$PWD")"
         printf 'quickstart: working in %s\n' "$PWD"
     fi
+    [ ! -f .tapstate-quickstart-made ] || demo_dir_is_ours=yes
 
     # The whole product runs as a compose stack, so a machine without Docker is refused here, before
     # anything is downloaded -- an actionable sentence beats "docker: command not found" three
@@ -722,7 +773,7 @@ main() {
     fi
 
     grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' docker-compose.yml \
-        || die "this directory has an older demo Compose file. Run the installer from a new directory."
+        || die "$this_dir has an older demo Compose file. Run the installer from a new directory."
 
     require_admin_credentials_source
     docker compose run --rm --no-deps -T --entrypoint sh server -ec '
@@ -772,7 +823,7 @@ main() {
     printf '%s\n' "$repl_out"
     case "$repl_out" in
         *control.auth-failed*|*cli.not-authenticated*)
-            die "the CLI could not log in with those administrator credentials. Re-run with the ones you chose on the first run; if you no longer have them, start over with: docker compose down -v (in this directory; it deletes the demo's data), then run the installer again." ;;
+            die "the CLI could not log in with those administrator credentials. Re-run with the ones you chose on the first run; if you no longer have them, start over with: $(in_demo_dir 'docker compose down -v') (it deletes the demo's data), then run the installer again." ;;
     esac
     # Check both the session status and its diagnostics: a refusal now leaves the
     # REPL running but makes it exit 1, while older CLIs can still exit zero.
@@ -841,7 +892,7 @@ main() {
     # only evidence the script has that a pipeline is moving data. The stack is left standing rather
     # than torn down -- the server log is the next thing to read, and a teardown would take it along.
     { [ "$orders" -ge "$seeded_orders" ] && [ "$shipments" -ge "$seeded_shipments" ]; } \
-        || die "the two engines were not assembled (orders $orders of $seeded_orders, embedded shipments $shipments of $seeded_shipments); inspect it with: docker compose logs server"
+        || die "the two engines were not assembled (orders $orders of $seeded_orders, embedded shipments $shipments of $seeded_shipments); inspect it with: $(in_demo_dir 'docker compose logs server')"
     printf 'quickstart: %s orders from MySQL, each carrying its shipments from PostgreSQL -- %s of them, in one object per order\n' \
         "$orders" "$shipments"
 
