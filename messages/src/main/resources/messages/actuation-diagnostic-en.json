@@ -134,5 +134,9 @@
   "TS0360034": {
     "message": "Shared capture {capture} recovery could not verify member {member} ({reason}).",
     "solution": "Keep the original recovery scope and storage. Resolve the member or authority failure, then repeat preflight if the membership or original control facts changed. All affected old executions and source or target connections must be isolated before confirmation."
+  },
+  "TS0360035": {
+    "message": "Pipeline {pipeline} cannot start: stream {stream} publishes no key, and this sync matches writes on one.",
+    "solution": "Publish every column of the source's key under any name - as the column itself, or as a pure read of it. A projection that drops or replaces any component leaves nothing for a later change to match, so the rows are written where nothing can find them again."
   }
 }

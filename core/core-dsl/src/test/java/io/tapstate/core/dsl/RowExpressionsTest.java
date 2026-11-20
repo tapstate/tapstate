@@ -175,6 +175,8 @@ class RowExpressionsTest {
     void onlyABareColumnReadIsAMove() {
         assertThat(RowExpressions.movedColumn("after.amount")).isEqualTo("amount");
         assertThat(RowExpressions.movedColumn("before.amount")).isEqualTo("amount");
+        assertThat(RowExpressions.movedAfterColumn("after.amount")).isEqualTo("amount");
+        assertThat(RowExpressions.movedAfterColumn("before.amount")).isNull();
 
         assertThat(RowExpressions.movedColumn("after.amount + 1")).isNull();
         assertThat(RowExpressions.movedColumn("has(after.amount)")).isNull();

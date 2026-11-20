@@ -11,7 +11,7 @@ class ActuationDiagnosticContractTest {
     @Test void actuationDefinitionsKeepParametersSeverityAndHistoricalRecovery() {
         var codes = new ArrayList<TapstateErrorCode>();
         codes.addAll(List.of(ActuationError.values()));
-        assertThat(codes).hasSize(34);
+        assertThat(codes).hasSize(35);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String legacy = "actuation."

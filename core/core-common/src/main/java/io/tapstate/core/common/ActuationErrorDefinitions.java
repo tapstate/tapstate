@@ -76,6 +76,9 @@ public final class ActuationErrorDefinitions {
     public static final ProductErrorDefinition SHARED_RECOVERY_MEMBER_UNAVAILABLE =
             DEFINITIONS.define(34, Severity.ERROR, Set.of("capture","member","reason"));
 
+    public static final ProductErrorDefinition SYNC_OUTPUT_IDENTITY_UNRESOLVED =
+            DEFINITIONS.define(35, Severity.ERROR, Set.of("pipeline", "stream"));
+
     private ActuationErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

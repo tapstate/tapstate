@@ -218,6 +218,108 @@ class StoreBackedDagSourceTest {
     }
 
     @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+        "absent, false", "present, true", "generated, true", "dropped, false"
+    })
+    void aRenameOverwritesTheUnwindParentKeyOnlyWhenItsSourceCanReachIt(
+            String region, boolean overwritten) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        List<SourceField> fields = new ArrayList<>(List.of(
+                new SourceField("o_id", "bigint", TapstateType.INT64),
+                new SourceField("items", "array", TapstateType.ARRAY)));
+        if (region.equals("present") || region.equals("dropped")) {
+            fields.add(new SourceField("o_region", "varchar", TapstateType.STRING));
+        }
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", fields, List.of("o_id"), List.of())))));
+        List<Step> steps = new ArrayList<>();
+        String upstream = "orders";
+        if (region.equals("generated") || region.equals("dropped")) {
+            FieldRule rule = region.equals("generated") ? FieldRule.literal("east") : FieldRule.drop();
+            steps.add(Step.inline("prepare", FromClause.list(FromRef.literal(upstream)),
+                    new TransformBody.MapProjection(Map.of("o_region", rule)), null));
+            upstream = "prepare";
+        }
+        Step.Inline rename = Step.inline("rename", FromClause.list(FromRef.literal(upstream)),
+                new TransformBody.MapProjection(Map.of("o_id", FieldRule.rename("o_region"))), null);
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("rename")),
+                new TransformBody.Unwind("items", null, false, "sku", null), null);
+        steps.add(rename);
+        steps.add(expand);
+        var pipeline = new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                steps, null, null, null, null);
+        var source = new StoreBackedDagSource(store);
+        if (overwritten) {
+            assertThatThrownBy(() -> source.transformBinding(pipeline, expand))
+                    .isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+        } else {
+            List<Map<String, String>> items = List.of(Map.of("sku", "same"));
+            Map<String, Object> before = new LinkedHashMap<>(Map.of("o_id", 1L, "items", items));
+            Map<String, Object> after = new LinkedHashMap<>(Map.of("o_id", 2L, "items", items));
+            if (region.equals("dropped")) {
+                before.put("o_region", "east");
+                after.put("o_region", "east");
+            }
+            var event = new io.tapstate.core.event.Envelope(io.tapstate.core.event.Op.UPDATE, 1L, "orders",
+                    before, after, null);
+            for (Step projection : steps.subList(0, steps.size() - 1)) {
+                event = source.transformBinding(pipeline, projection).get().transform(event).getFirst();
+            }
+            assertThat(source.transformBinding(pipeline, expand).get().transform(event))
+                    .extracting(io.tapstate.core.event.Envelope::op)
+                    .containsExactly(io.tapstate.core.event.Op.DELETE, io.tapstate.core.event.Op.INSERT);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"absent,false", "before,false", "after,false", "after,true"})
+    void aRenameAfterJavaScriptChecksActualParentKeyOverwrites(String replacementImage, boolean stableAlias) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("o_id", "bigint", TapstateType.INT64),
+                        new SourceField("items", "array", TapstateType.ARRAY)), List.of("o_id"), List.of())))));
+        String mutation = replacementImage.equals("absent") ? "" : "r." + replacementImage + ".o_region = 'east';";
+        Step.Inline script = Step.inline("script", FromClause.list(FromRef.literal("orders")),
+                new TransformBody.Js("function process(r, ctx) { " + mutation + " return r; }"), null);
+        Map<String, FieldRule> relayRules = new LinkedHashMap<>(Map.of("region", FieldRule.rename("o_region")));
+        if (stableAlias) relayRules.put("order_key", FieldRule.computed("after.o_id"));
+        Step.Inline relay = Step.inline("relay", FromClause.list(FromRef.literal("script")),
+                new TransformBody.MapProjection(relayRules), null);
+        Step.Inline rename = Step.inline("rename", FromClause.list(FromRef.literal("relay")),
+                new TransformBody.MapProjection(Map.of("o_id", FieldRule.rename("region"))), null);
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("rename")),
+                new TransformBody.Unwind("items", null, false, "sku", null), null);
+        var pipeline = new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                List.of(script, relay, rename, expand), null, null, null, null);
+        var source = new StoreBackedDagSource(store);
+        var items = List.of(Map.of("sku", "same"));
+        var update = new io.tapstate.core.event.Envelope(io.tapstate.core.event.Op.UPDATE, 1L, "orders",
+                Map.of("o_id", 1L, "items", items), Map.of("o_id", 2L, "items", items), null);
+        try (var scriptPort = source.transformBinding(pipeline, script).get();
+             var relayPort = source.transformBinding(pipeline, relay).get();
+             var renamePort = source.transformBinding(pipeline, rename).get();
+             var expandPort = source.transformBinding(pipeline, expand).get()) {
+            var relayed = relayPort.transform(scriptPort.transform(update).getFirst()).getFirst();
+            if (replacementImage.equals("absent") || stableAlias) {
+                String key = stableAlias ? "order_key" : "o_id";
+                var events = expandPort.transform(renamePort.transform(relayed).getFirst());
+                assertThat(events).extracting(io.tapstate.core.event.Envelope::op)
+                        .containsExactly(io.tapstate.core.event.Op.DELETE, io.tapstate.core.event.Op.INSERT);
+                assertThat(events.getFirst().before()).containsEntry(key, 1L);
+                assertThat(events.getLast().after()).containsEntry(key, 2L);
+            } else {
+                assertThatThrownBy(() -> renamePort.transform(relayed))
+                        .isInstanceOf(TapstateException.class)
+                        .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+            }
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"DELETE,false", "UPDATE,false", "DELETE,true", "UPDATE,true"})
     void projectionCannotManufactureAnUnwindsBeforeImage(String operation, boolean computed) throws Exception {
         FakeStorePort store = new FakeStorePort();

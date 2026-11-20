@@ -12,6 +12,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.spi.transform.TransformPort;
+import io.tapstate.spi.store.SourceTable;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,10 +38,10 @@ import org.junit.jupiter.api.Test;
 class UnwindParentKeyTest {
 
     /** The discovered key of the one table here; every other reference names no table. */
-    private static final Function<FromRef, List<String>> ORDERS_KEYED_ON_O_ID =
+    private static final Function<FromRef, Map<String, SourceTable>> ORDERS_KEYED_ON_O_ID =
             ref -> ref instanceof FromRef.Literal literal && literal.ref().equals("orders")
-                    ? List.of("o_id")
-                    : List.of();
+                    ? Map.of("orders", new SourceTable("orders", List.of(), List.of("o_id"), List.of()))
+                    : Map.of();
 
     private static Step.Inline step(String id, String from, TransformBody body) {
         return new Step.Inline(id, new FromClause.Flow(List.of(new FromRef.Literal(from))), body,
@@ -60,10 +61,8 @@ class UnwindParentKeyTest {
     }
 
     private static List<String> keyReaching(Step.Inline step, Step.Inline... chain) {
-        return StoreBackedDagSource.parentKeysReaching(step, chain(chain), ref -> {
-            List<String> key = ORDERS_KEYED_ON_O_ID.apply(ref);
-            return key.isEmpty() ? Map.of() : Map.of("orders", key);
-        }).getOrDefault("orders", List.of());
+        return StoreBackedDagSource.parentKeysReaching(step, chain(chain), ORDERS_KEYED_ON_O_ID)
+                .getOrDefault("orders", List.of());
     }
 
     @Test
@@ -105,6 +104,56 @@ class UnwindParentKeyTest {
         assertThat(out).extracting(Envelope::op).containsExactly(Op.DELETE, Op.INSERT);
         assertThat(out.getFirst().before()).containsEntry("order_id", 7L);
         assertThat(out.getLast().after()).containsEntry("order_id", 8L);
+    }
+
+    @Test
+    void aSurvivingOriginalKeyRemainsAvailableAfterAnAliasIsDropped() {
+        Step.Inline alias = step("alias", "orders", new TransformBody.MapProjection(
+                Map.of("alias_id", FieldRule.computed("after.o_id"))));
+        Step.Inline drop = step("drop", "alias", new TransformBody.MapProjection(
+                Map.of("alias_id", FieldRule.drop())));
+        Step.Inline expand = step("expand", "drop", unwind(null, "sku"));
+        assertThat(keyReaching(expand, alias, drop, expand)).containsExactly("o_id");
+        Step.Inline dropOriginal = step("dropOriginal", "alias", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.drop())));
+        Step.Inline expandAlias = step("expandAlias", "dropOriginal", unwind(null, "sku"));
+        assertThat(keyReaching(expandAlias, alias, dropOriginal, expandAlias)).containsExactly("alias_id");
+    }
+
+    @Test
+    void sameStreamBranchesResolveTheParentKeyTheyBothCarry() {
+        Step.Inline copy = step("copy", "orders", new TransformBody.MapProjection(
+                Map.of("key_copy", FieldRule.computed("after.o_id"))));
+        Step.Inline keep = step("keep", "copy", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.rename("absent"))));
+        Step.Inline drop = step("drop", "copy", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.drop())));
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("keep"), FromRef.literal("drop")),
+                unwind(null, "sku"), null);
+
+        assertThat(keyReaching(expand, copy, keep, drop, expand)).containsExactly("key_copy");
+
+        Step.Inline dropCopy = step("keep", "copy", new TransformBody.MapProjection(
+                Map.of("key_copy", FieldRule.drop())));
+        assertThatThrownBy(() -> keyReaching(expand, copy, dropCopy, drop, expand))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("conflicting parent-key columns");
+
+        Step.Inline discard = step("drop", "discardCopy", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.drop())));
+        Step.Inline discardCopy = step("discardCopy", "copy", new TransformBody.MapProjection(
+                Map.of("key_copy", FieldRule.drop())));
+        assertThatThrownBy(() -> keyReaching(expand, copy, keep, discardCopy, discard, expand))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("conflicting parent-key columns");
+    }
+
+    @Test
+    void anOverwrittenParentKeyCannotMasqueradeAsItsOriginalIdentity() {
+        Step.Inline map = step("map", "orders", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.computed("before.o_id"))));
+        Step.Inline expand = step("expand", "map", unwind(null, "sku"));
+        assertThatThrownBy(() -> keyReaching(expand, map, expand)).isInstanceOf(TapstateException.class);
     }
 
     @Test
@@ -233,7 +282,7 @@ class UnwindParentKeyTest {
         Step.Inline merged = Step.inline("expand",
                 FromClause.list(FromRef.literal("left"), FromRef.literal("right")), unwind("item_no", null), null);
         assertThatThrownBy(() -> StoreBackedDagSource.parentKeysReaching(merged, chain(left, right, merged),
-                ref -> ref.equals(FromRef.literal("orders")) ? Map.of("orders", List.of("o_id")) : Map.of()))
+                ORDERS_KEYED_ON_O_ID))
                 .isInstanceOf(TapstateException.class)
                 .hasMessageContaining("TS0360008");
     }

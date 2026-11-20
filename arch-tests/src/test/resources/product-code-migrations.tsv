@@ -281,6 +281,7 @@ actuation.connector-unavailable-on-member	TS0360031
 actuation.connector-differs-across-members	TS0360032
 actuation.operator-state-unavailable-on-member	TS0360033
 actuation.shared-recovery-member-unavailable	TS0360034
+actuation.sync-output-identity-unresolved	TS0360035
 cluster.membership-unreadable	TS0370001
 connector.not-found	TS0380001
 data-browser.unknown-collection	TS0390001
