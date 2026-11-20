@@ -2,7 +2,8 @@
 set -euo pipefail
 
 distribution="$(sed -n 's|^distributionUrl=.*/apache-maven-\(.*\)-bin\.zip$|\1|p' .mvn/wrapper/maven-wrapper.properties)"
-version_output="$(MAVEN_USER_HOME="$RUNNER_TEMP/tapstate-ci-maven" ./mvnw -B -Dstyle.color=never --version)"
+version_output="$(MVNW_REPOURL="${MVNW_REPOURL:-https://repository.apache.org/content/repositories/releases}" \
+    MAVEN_USER_HOME="$RUNNER_TEMP/tapstate-ci-maven" ./mvnw -B -Dstyle.color=never --version)"
 maven_home="$(sed -n 's/^Maven home: //p' <<< "$version_output")"
 
 if [[ -z "$distribution" || ! -x "$maven_home/bin/mvn" ]] ||
