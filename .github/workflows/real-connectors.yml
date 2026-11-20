@@ -228,7 +228,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-          cache: maven
       - name: Set up the pinned reactor Maven
         run: bash .github/scripts/setup-ci-maven.sh
       - uses: actions/download-artifact@v4
@@ -244,7 +243,11 @@ jobs:
           name: connector-jars
           path: ${{ runner.temp }}/connectors
       - name: Seed isolated Maven dependencies
-        run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+        run: |
+          set -euo pipefail
+          .github/scripts/ci-maven-cache.sh seed "$RUNNER_TEMP/empty-maven-cache" "$RUNNER_TEMP/m2"
+          test -z "$(find "$RUNNER_TEMP/m2" -mindepth 1 -print -quit)"
+          echo "Confirmed empty connector reactor Maven repository before applying the verified seed"
       - name: Seed verified install plugin dependencies
         working-directory: ${{ runner.temp }}/connector-maven-inputs
         run: |
