@@ -70,7 +70,7 @@ class ValidationConfigurationServiceTest {
     @Test void failedAuditNeverInvokesMetadataOrConfigMutation(){
         var probe=new Probe();var store=new Store();var service=service(store,probe,ignored->{throw new IllegalStateException("audit unavailable");});
         assertThatThrownBy(()->service.save("alice",new ValidationConfigurationService.Save(input("0"),"a".repeat(64),UUID.randomUUID().toString(),10,null,false)))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("audit-blocked");
+                .isInstanceOf(TapstateException.class).hasMessageContaining("TS0210015");
         assertThat(probe.calls).isZero();assertThat(store.creates+store.updates).isZero();
     }
     @Test void saveUsesOneAdmittedEvaluationAndOriginalStoreWrite(){

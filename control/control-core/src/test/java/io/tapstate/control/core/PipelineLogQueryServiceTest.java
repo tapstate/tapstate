@@ -13,7 +13,7 @@ import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 /**
  * The logs read face: it tails the node-local log sink for one pipeline. Unlike status / metrics /
  * snapshot, a read of a pipeline with no captured lines is a benign empty tail, not a coded
- * {@code monitor.no-observation} error — the absence of log lines is normal.
+ * {@code TS0400001} error — the absence of log lines is normal.
  */
 class PipelineLogQueryServiceTest {
 

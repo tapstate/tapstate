@@ -1,0 +1,34 @@
+{
+  "TS0340001": {
+    "message": "Alert field `{field}` is invalid: {reason}.",
+    "solution": "Use the supported field type, bounds and trusted identity binding."
+  },
+  "TS0340002": {
+    "message": "The notification channel `{channel}` did not accept the request at stage `{phase}`.",
+    "solution": "Review the bounded protocol status and the original delivery binding before retrying."
+  },
+  "TS0340003": {
+    "message": "The notification channel `{channel}` has an unknown result at stage `{phase}`.",
+    "solution": "The receiver may have accepted it. Preserve the delivery identity and inspect the existing result."
+  },
+  "TS0340004": {
+    "message": "The notification channel `{channel}` is unavailable at stage `{phase}`.",
+    "solution": "Restore the required capability or bounded capacity without changing the original delivery identity."
+  },
+  "TS0340005": {
+    "message": "The notification test command was already accepted with different parameters.",
+    "solution": "Query the original command. Use a new command only for another explicit test."
+  },
+  "TS0340006": {
+    "message": "The notification test command's first-admission window has expired.",
+    "solution": "Query the original result if it exists. Create a new command only for another explicit test."
+  },
+  "TS0340007": {
+    "message": "The notification test command was created too far in the future.",
+    "solution": "Correct the client clock before explicitly starting a new test."
+  },
+  "TS0340008": {
+    "message": "The alert action `{action}` does not match the current episode or evaluation generation.",
+    "solution": "Read the current alert and act on its exact identity."
+  }
+}

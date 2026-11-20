@@ -43,7 +43,7 @@ class AnAppendOnlyTargetIsRefusedIT {
             }
 
             ControlPlane.Refusal refusal = control.applyExpectingRefusal(resources);
-            assertThat(refusal.code()).isEqualTo("dsl.unwind-needs-an-upsert-target");
+            assertThat(refusal.code()).isEqualTo("TS0010025");
             assertThat(control.artifactIds()).doesNotContain("src_file", "tgt_file", "append_unwind");
 
             // Change only the write mode: a validator that rejects all expansions fails this half.

@@ -262,7 +262,7 @@ class ControlPlaneAssemblyIT {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
                     return response.bodyTo(Map.class);
                 });
-        assertThat(body.get("code")).isEqualTo("connector.not-registered");
+        assertThat(body.get("code")).isEqualTo("TS0060004");
         assertThat(((Map<?, ?>) body.get("params")).get("connector")).isEqualTo("mysql");
     }
 
@@ -289,7 +289,7 @@ class ControlPlaneAssemblyIT {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
                     return response.bodyTo(Map.class);
                 });
-        assertThat(body.get("code")).isEqualTo("connector.not-registered");
+        assertThat(body.get("code")).isEqualTo("TS0060004");
         assertThat(((Map<?, ?>) body.get("params")).get("connector")).isEqualTo("mysql");
 
         // The read face renders the never-discovered state as a 404, through the same assembled store.
@@ -359,7 +359,7 @@ class ControlPlaneAssemblyIT {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(Map.class);
                 });
-        assertThat(body.get("code")).isEqualTo("connector.no-connector-class");
+        assertThat(body.get("code")).isEqualTo("TS0060014");
     }
 
     @Test

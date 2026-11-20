@@ -86,6 +86,29 @@ class ControlPlaneTest {
     }
 
     @Test
+    void onlyStartupStorageUnavailabilityIsPending() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            AtomicInteger reads = new AtomicInteger();
+            fixture.server.createContext("/api/storage/status", exchange -> {
+                int read = reads.incrementAndGet();
+                Map<String, String> reply = switch (read) {
+                    case 1 -> Map.of("code", "TS0210030");
+                    case 2 -> Map.of("code", io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE.code());
+                    default -> Map.of("businessPhase", "READY");
+                };
+                byte[] bytes = JsonWriter.write(reply).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(read < 3 ? 503 : 200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            assertThat(fixture.control.storageStatusDuringStartup()).isEmpty();
+            assertThatThrownBy(fixture.control::storageStatusDuringStartup)
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("503");
+            assertThat(fixture.control.storageStatusDuringStartup().orElseThrow().get("businessPhase"))
+                    .isEqualTo("READY");
+        }
+    }
+
+    @Test
     void readsThePublishedState() {
         assertThat(ControlPlane.interpretState(200, status("RUNNING"), PIPELINE)).contains(PipelineState.RUNNING);
     }
@@ -210,7 +233,7 @@ class ControlPlaneTest {
         // failed two ways -- which is the ordinary case for anything that fails more than once.
         String body = JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of(
                 "errors.connector.write-failed", 2L,
-                "errors.engine.job-failed", 1L,
+                "errors.TS0440008", 1L,
                 "recordCount", 500L)));
 
         assertThat(ControlPlane.interpretErrorCount(200, body, PIPELINE)).contains(3L);
@@ -366,9 +389,9 @@ class ControlPlaneTest {
 
     @Test
     void readsAClientErrorAsTheRefusalItIs() {
-        assertThat(ControlPlane.interpretRefusal(400, coded("dsl.row-expression-type-unsupported"), "the batch"))
+        assertThat(ControlPlane.interpretRefusal(400, coded("TS0010021"), "the batch"))
                 .isEqualTo(new ControlPlane.Refusal(
-                        400, "dsl.row-expression-type-unsupported", Map.of("pipeline", PIPELINE)));
+                        400, "TS0010021", Map.of("pipeline", PIPELINE)));
     }
 
     /**

@@ -59,7 +59,7 @@ status unwind_snapshot
 
 Apply the connection resources first, then discover the source before applying the
 whole workspace. Its map expression reads `revision`, so applying the entire workspace
-before discovery is refused with `dsl.row-expression-needs-discovery`. After discovery,
+before discovery is refused with `TS0010020`. After discovery,
 use bare `apply` to submit the pipeline together with both connection definitions;
 applying the pipeline file alone cannot resolve those references in its batch.
 

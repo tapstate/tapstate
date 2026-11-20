@@ -394,7 +394,7 @@ class AiProviderProtocolTest {
                     (settings, client) -> assertThatThrownBy(() -> client.check(new AiProviderSettings(
                             responses ? "openai-responses" : "openai-compatible", settings.baseUrl(), settings.model(), settings.apiKey())))
                             .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
-                                    error -> assertThat(error.code().code()).isEqualTo("control.ai-provider-output-limit")),
+                                    error -> assertThat(error.code().code()).isEqualTo("TS0210011")),
                     new AtomicReference<>());
         }
     }

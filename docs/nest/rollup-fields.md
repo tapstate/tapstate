@@ -135,10 +135,10 @@ narrowed.
 
 | Argument | `sum` | `avg` |
 |---|---|---|
-| 64-bit integer | 64-bit integer; overflow is `nest.rollup-overflow` | decimal, scale 6, rounded half-even |
-| decimal `(p, s)` | decimal `(38, s)`, exact; more than 38 digits is `nest.rollup-overflow` | decimal `(38, max(s, 6))`, rounded half-even |
+| 64-bit integer | 64-bit integer; overflow is `TS0490033` | decimal, scale 6, rounded half-even |
+| decimal `(p, s)` | decimal `(38, s)`, exact; more than 38 digits is `TS0490033` | decimal `(38, max(s, 6))`, rounded half-even |
 | double | double, added in element-key order so every render gives the same bits | double |
-| unknown | refused at apply: `nest.rollup-type-unknown` | refused at apply |
+| unknown | refused at apply: `TS0490032` | refused at apply |
 
 - `avg` is the only rounding, and its scale and rounding mode are part of its type.
 - The types come from discovery. A level read from a `map` or `union` step takes the types those steps
@@ -146,7 +146,7 @@ narrowed.
   sums exactly. A column nothing typed - an undiscovered source, a schemaless field, a computed decimal -
   cannot be summed or averaged; `count`, `min`, `max`, `first` and `last` still work on it.
 - A value whose type differs from its column's declared type (a double in a decimal column) stops the
-  document with `nest.rollup-value-type-mismatch` rather than being coerced.
+  document with `TS0490034` rather than being coerced.
 - Arithmetic on decimals inside an expression is not available yet: `=after.qty * after.unit_price` over
   a decimal is refused at apply. Summing a single decimal column (`$unit_price`) is exact.
 
@@ -155,7 +155,7 @@ narrowed.
 `type:` converts the result, exactly or not at all: `int64`, `decimal` or `double`.
 
 - `decimal` to `int64` succeeds only for an integral value that fits 64 bits; `3.75` is refused with
-  `nest.rollup-result-not-convertible`, `3.00` renders `3`.
+  `TS0490035`, `3.00` renders `3`.
 - `int64` to `decimal` always succeeds.
 - `double` is allowed because you asked for it; it rounds as binary floating point rounds.
 
@@ -201,17 +201,17 @@ while they are missing.
 
 | Code | When | Instead |
 |---|---|---|
-| `dsl.rollup-function-unknown` | a field names no function, an unknown one, or more than one | one of `count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `first`, `last` |
-| `dsl.rollup-on-single-row-embed` | `rollup:` on `as: object` or `as: flat` | read the row's columns directly |
-| `dsl.rollup-level-without-fields` | `as: rollup` with no `rollup:` | add the fields, or `as: array` to show the rows |
-| `nest.rollup-on-reference-embed` | `rollup:` on an embed its parent points at (it holds one row) | read the referenced columns from the level above: `=after.<path>.<column>` |
-| `nest.rollup-field-conflict` | the name is already a column, an embed path, a flat field or another rollup field on that level | rename it; these share one namespace per level |
-| `nest.rollup-expression-invalid` | an argument, `by`, filter, `type:` or default does not check | the message names the part and why |
-| `nest.rollup-type-unknown` | a `sum` or `avg` over a value with no discovered numeric type | discover the source, or compute over a typed column |
-| `nest.rollup-overflow` | a sum past 64 bits or 38 digits, at render | check for an outlier; such a total cannot be a rollup field |
-| `nest.rollup-value-type-mismatch` | a value of another type than its column, at render | fix the row or rediscover the source |
-| `nest.rollup-result-not-convertible` | a `type:` conversion that would not be exact, at render | drop `type:` or convert to `decimal` |
-| `nest.rollup-evaluation-failed` | an expression failed on an element, at render | check the element's values against what the expression expects |
+| `TS0010034` | a field names no function, an unknown one, or more than one | one of `count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `first`, `last` |
+| `TS0010035` | `rollup:` on `as: object` or `as: flat` | read the row's columns directly |
+| `TS0010036` | `as: rollup` with no `rollup:` | add the fields, or `as: array` to show the rows |
+| `TS0490029` | `rollup:` on an embed its parent points at (it holds one row) | read the referenced columns from the level above: `=after.<path>.<column>` |
+| `TS0490030` | the name is already a column, an embed path, a flat field or another rollup field on that level | rename it; these share one namespace per level |
+| `TS0490031` | an argument, `by`, filter, `type:` or default does not check | the message names the part and why |
+| `TS0490032` | a `sum` or `avg` over a value with no discovered numeric type | discover the source, or compute over a typed column |
+| `TS0490033` | a sum past 64 bits or 38 digits, at render | check for an outlier; such a total cannot be a rollup field |
+| `TS0490034` | a value of another type than its column, at render | fix the row or rediscover the source |
+| `TS0490035` | a `type:` conversion that would not be exact, at render | drop `type:` or convert to `decimal` |
+| `TS0490036` | an expression failed on an element, at render | check the element's values against what the expression expects |
 
 The render-time refusals stop the document's pipeline and name the document; the field is never written
 with a guessed value.
@@ -244,17 +244,17 @@ thousand elements takes about 0.4 ms per field for narrow rows and up to 2 ms fo
 
 You are told when a level is past that, twice:
 
-- **When the pipeline is applied**, `nest.rollup-level-wide` names each level whose discovered tables average
+- **When the pipeline is applied**, `TS0460003` names each level whose discovered tables average
   more elements per document than its width allows (its rows over its parent level's rows). An average cannot
   see one unusually wide document, and a level nobody discovered is not estimated.
-- **While it runs**, the engine logs `nest.rollup-level-wide` once for each document that grows past the
+- **While it runs**, the engine logs `TS0460003` once for each document that grows past the
   boundary of its rollups' width.
 
 Beyond that, compute the value outside the document's render: in the target, or with a cross-row computation
 keyed by the parent once one is available.
 
 Independent of rollups, a nest level also meets these limits as it widens: a snapshot that reads more than
-10,000 children before their parent row stops with `nest.pending-limit-exceeded`; a document holds 20,000
+10,000 children before their parent row stops with `TS0490021`; a document holds 20,000
 elements by default (`max_elements_per_document`); and a document's stored state must fit one MongoDB document
 (16 MB) across all its levels together.
 

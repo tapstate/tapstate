@@ -2113,7 +2113,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 || !warnedWide.add(key)) {
             return;
         }
-        logger.warning("nest.rollup-level-wide: document " + keyRow(key) + " holds " + elements
+        logger.warning(io.tapstate.core.common.NestSizingErrorDefinitions.ROLLUP_LEVEL_WIDE.code() + ": document " + keyRow(key) + " holds " + elements
                 + " elements and carries rollup fields, past the " + rollupBoundary + " elements of its width a"
                 + " rollup keeps up with; every change rewrites the document and refolds the whole level");
     }

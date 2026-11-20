@@ -64,7 +64,7 @@ class NestTrackingRefusesASourceWithoutBeforeImagesIT {
     private static final String PIPELINE_ID = "blind_tracking";
 
     /** The connector's own diagnosis, which is the part worth carrying all the way to the read faces. */
-    private static final String EXPECTED_CODE = "connector.capture-failed";
+    private static final String EXPECTED_CODE = "TS0060024";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,

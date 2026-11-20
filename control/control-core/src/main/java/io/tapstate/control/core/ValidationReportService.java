@@ -9,7 +9,12 @@ import java.util.*;
 public final class ValidationReportService {
     public record Reference(String pipeline,String task,String generation,String sequence,String run) {}
     public record Window(String startedAt,String finishedAt) {}
-    public record Failure(String code,Map<String,String> params,String exceptionType,String message,String technical,boolean fatal) {}
+    public record Failure(String code,Map<String,String> params,String exceptionType,String message,String technical,boolean fatal,
+            String rawMessage,String solution) {
+        public Failure(String code,Map<String,String> params,String exceptionType,String message,String technical,boolean fatal) {
+            this(code,params,exceptionType,message,technical,fatal,null,null);
+        }
+    }
     public record Summary(Reference reference,String method,boolean closed,String terminal,String terminalKnownAt,String endedAt,Window window,
             String rootCount,String retainedBytes,String countedTables,String mismatchedTables) {}
     public record Page<T>(List<T> items,String total,int offset,int limit) {}
@@ -41,6 +46,9 @@ public final class ValidationReportService {
                     Integer.toString(value.countedTables()),Integer.toString(value.mismatchedTables()))).toList(),Long.toString(found.total()),page.offset(),page.limit());});
     }
     public Response<Report> report(Reference identity){
+        return report(identity,java.util.function.UnaryOperator.identity());
+    }
+    public Response<Report> report(Reference identity,java.util.function.UnaryOperator<Failure> present){
         var reference=reference(identity);
         return read(()->reports.find(reference).map(value->{
             var spec=value.specification();var comparison=spec.task();
@@ -48,14 +56,14 @@ public final class ValidationReportService {
                     Long.toString(count.difference()),boundary(count.sourceRead()),boundary(count.targetRead()))).toList();
             boolean complete=value.terminal()==ValidationRunState.COMPLETED;
             boolean issues=value.rootCount()!=0||value.counts().stream().anyMatch(count->!count.sameCount());
-            var tableFailures=value.tableFailures().stream().map(ValidationReportService::tableFailure).toList();
+            var tableFailures=value.tableFailures().stream().map(ValidationReportService::tableFailure).map(f -> new TableFailure(f.mapping(),f.side(),present.apply(f.failure()))).toList();
             String result;
             if (!complete) result=value.closed()?"INCOMPLETE":"IN_PROGRESS";
             else if (!tableFailures.isEmpty()) result="COMPLETE_WITH_FAILURES";
             else result=issues?"COMPLETE_WITH_OBSERVATIONS":"COMPLETE_NO_ISSUES_OBSERVED";
             return new Report(reference(value.reference()),spec.method().name(),Long.toString(comparison.mappingRevision()),comparison.comparisonRulesVersion(),spec.fingerprint(),
                     comparison.mappings().stream().map(ValidationReportService::mapping).toList(),value.closed(),state(value.terminal()),instant(value.terminalKnownAt()),instant(value.endedAt()),
-                    window(value.window()),failure(value.failure()),Long.toString(value.rootCount()),Long.toString(value.retainedBytes()),counts,tableFailures,result,
+                    window(value.window()),value.failure()==null?null:present.apply(failure(value.failure())),Long.toString(value.rootCount()),Long.toString(value.retainedBytes()),counts,tableFailures,result,
                     "INITIAL_SYNC_FINISHED_AND_BOTH_SIDES_STABLE",false,"READ_OBSERVATIONS_NO_COMMON_TIME_SNAPSHOT","UNKNOWN");
         }).orElse(null));
     }

@@ -100,7 +100,9 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     private static io.tapstate.core.lifecycle.ObservationFailure leaseRecoveryFailure(Reading reading, PipelineState actual) {
         var recovery = actual == PipelineState.FAILED ? MongoStateStore.leaseRecovery(reading.state()) : null;
         return recovery == null || recovery.attempts() < 3 ? null
-                : new io.tapstate.core.lifecycle.ObservationFailure("engine.execution-not-authorized", Map.of("pipeline", reading.pipeline()));
+                : new io.tapstate.core.lifecycle.ObservationFailure(
+                        io.tapstate.core.common.EngineErrorDefinitions.EXECUTION_NOT_AUTHORIZED.code(),
+                        Map.of("pipeline", reading.pipeline()));
     }
 
     /** A previous RUNNING observation can witness progress, without serving its stale payload. */
@@ -177,6 +179,13 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
                     || !MongoPipelinePreparationFacts.scope(access.scope).equals(expected.get("scope"))
                     || !access.scope.pipelineId().equals(row.get("pipelineId"))) throw access.unreadable("observation");
             var decoded = MongoObservationStore.toObservation(new Document(row).append("_id", access.scope.pipelineId()));
+            if (decoded.failure() != null && row.get("failure", Document.class).containsKey("diagnostic")) {
+                var diagnostic = MongoRuntimeDiagnostic.read(row.get("failure", Document.class).get("diagnostic"));
+                var original = decoded.failure();
+                decoded = new Observation(decoded.pipelineId(), decoded.state(), decoded.metrics(), decoded.snapshot(),
+                        decoded.positions(), new io.tapstate.core.lifecycle.ObservationFailure(original.code(), original.params(), diagnostic),
+                        decoded.observedAt(), decoded.facts(), decoded.initialLoad());
+            }
             if (!document(decoded, expected).equals(row)) throw access.unreadable("observation");
             return Optional.of(decoded);
         } catch (TapstateException | NullPointerException | ClassCastException | IllegalArgumentException invalid) {
@@ -229,7 +238,11 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     }
 
     private static Document document(Observation observation, Document id) {
-        return MongoObservationStore.toDocument(observation).append("_id", id).append("pipelineId", observation.pipelineId());
+        var document = MongoObservationStore.toDocument(observation).append("_id", id).append("pipelineId", observation.pipelineId());
+        if (observation.failure() != null && !observation.failure().diagnostic().isEmpty()) {
+            document.get("failure", Document.class).append("diagnostic", MongoRuntimeDiagnostic.document(observation.failure().diagnostic()));
+        }
+        return document;
     }
 
     private static Document keyOfFence(MongoCachePipelineAccess access, long epoch, WorkloadClaimFence fence) {

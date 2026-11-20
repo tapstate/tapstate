@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
+import io.tapstate.core.common.FailureFact;
 import java.io.Serializable;
 import java.util.Map;
 import java.util.Objects;
@@ -45,19 +46,23 @@ public final class JobFailureRegistry {
     }
 
     /** Legacy-only recording never overwrites a scope-aware run's slot. */
-    public void record(String pipelineId, Throwable cause) {
+    public void record(String pipelineId, Throwable cause) { record(pipelineId, new FailureFact(cause)); }
+
+    private void record(String pipelineId, FailureFact fact) {
         failures.compute(pipelineId, (id, before) -> {
             if (before != null && before.legacy() == null) return before;
             Slot slot = before == null ? new Slot(pipelineId, 0, null) : before.legacy();
-            slot.capture(cause);
+            slot.capture(fact);
             return before == null ? new Slots(slot, null) : before;
         });
     }
 
-    public Optional<Throwable> get(String pipelineId) {
+    public Optional<Throwable> get(String pipelineId) { return fact(pipelineId).map(FailureFact::cause); }
+
+    public Optional<FailureFact> fact(String pipelineId) {
         Slots slots = failures.get(pipelineId);
         Slot legacy = slots == null ? null : slots.legacy();
-        return legacy == null ? Optional.empty() : legacy.get();
+        return legacy == null ? Optional.empty() : legacy.fact();
     }
 
     public void clear(String pipelineId) {
@@ -94,6 +99,18 @@ public final class JobFailureRegistry {
                 EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", config.getName()), null);
         if (phase == null) return attach(config.getName(), jobId, immutable);
         return attachLocal(new JetLiveExecution.Startup(config.getName(), jobId, executionId, immutable, phase));
+    }
+
+    Recorder forExecution(String pipelineId, long jobId, Serializable identity) {
+        if (pipelineId == null) return Recorder.NONE;
+        return identity == null ? new Recorder(this, pipelineId, null) : attach(pipelineId, jobId, identity);
+    }
+
+    Recorder forProcessor(String pipelineId, long jobId, long executionId, Serializable identity) {
+        if (pipelineId == null) return Recorder.NONE;
+        return identity == null ? new Recorder(this, pipelineId, null)
+                : attachLocal(new JetLiveExecution.Startup(pipelineId, jobId, executionId, identity,
+                        JetLiveExecution.StartupPhase.PROCESSOR));
     }
 
     private Recorder attachLocal(JetLiveExecution.Startup startup) {
@@ -156,7 +173,7 @@ public final class JobFailureRegistry {
         return slots == null ? Optional.empty() : slots.retained(identity);
     }
 
-    record RetainedFailure(Throwable cause) {}
+    record RetainedFailure(Throwable cause, Map<String, Object> diagnostic) {}
 
     Recorder existing(String pipelineId, long jobId, Serializable identity) {
         Slots slots = failures.get(pipelineId);
@@ -248,6 +265,16 @@ public final class JobFailureRegistry {
             if (slot != null) slot.capture(failure);
             else if (registry != null) registry.record(pipelineId, failure);
         }
+        public void record(Throwable failure, Map<String, Object> diagnostic) {
+            record(new FailureFact(failure, diagnostic));
+        }
+        public void record(FailureFact fact) {
+            if (slot != null) slot.capture(fact);
+            else if (registry != null) registry.record(pipelineId, fact);
+        }
+        Optional<FailureFact> fact() {
+            return slot != null ? slot.fact() : registry == null ? Optional.empty() : registry.fact(pipelineId);
+        }
         Optional<Throwable> get() {
             return slot != null ? slot.get() : registry == null ? Optional.empty() : registry.get(pipelineId);
         }
@@ -283,7 +310,7 @@ public final class JobFailureRegistry {
         final String pipelineId;
         final long jobId;
         final Serializable identity;
-        private Throwable cause;
+        private FailureFact failure;
         private boolean retired;
         Slot(String pipelineId, long jobId, Serializable identity) {
             this.pipelineId = pipelineId; this.jobId = jobId; this.identity = identity;
@@ -293,10 +320,12 @@ public final class JobFailureRegistry {
         }
         synchronized Optional<RetainedFailure> retained(Serializable expectedIdentity) {
             return !retired && jobId != 0 && identity != null && identity.equals(expectedIdentity)
-                    ? Optional.of(new RetainedFailure(cause)) : Optional.empty();
+                    ? Optional.of(new RetainedFailure(failure == null ? null : failure.cause(), failure == null ? Map.of() : failure.diagnostic())) : Optional.empty();
         }
-        synchronized void capture(Throwable failure) { if (!retired) cause = Objects.requireNonNull(failure, "failure"); }
-        synchronized Optional<Throwable> get() { return retired ? Optional.empty() : Optional.ofNullable(cause); }
-        synchronized void retire() { retired = true; cause = null; }
+        synchronized void capture(Throwable cause) { capture(new FailureFact(cause)); }
+        synchronized void capture(FailureFact next) { if (!retired) failure = Objects.requireNonNull(next, "failure"); }
+        synchronized Optional<FailureFact> fact() { return retired ? Optional.empty() : Optional.ofNullable(failure); }
+        synchronized Optional<Throwable> get() { return fact().map(FailureFact::cause); }
+        synchronized void retire() { retired = true; failure = null; }
     }
 }

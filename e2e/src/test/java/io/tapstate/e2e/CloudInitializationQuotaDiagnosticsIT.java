@@ -96,7 +96,7 @@ class CloudInitializationQuotaDiagnosticsIT {
                         var failure = http.send(HttpRequest.newBuilder(server.baseUrl().resolve("/auth/exchange?code=" + code))
                                 .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString());
                         assertThat(failure.statusCode()).isEqualTo(503);
-                        assertThat(Document.parse(failure.body())).containsEntry("code", "control.storage-quota-exceeded")
+                        assertThat(Document.parse(failure.body())).containsEntry("code", "TS0210031")
                                 .containsEntry("params", new Document());
                         assertThat(failure.headers().firstValue("Set-Cookie")).isEmpty();
                         assertThat(failure.body()).doesNotContain(TOKEN, OPERATION, "unrelated-user-value-sentinel", "513 MB", uri);

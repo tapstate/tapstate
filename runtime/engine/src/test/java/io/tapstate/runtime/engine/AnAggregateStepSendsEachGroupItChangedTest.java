@@ -256,7 +256,7 @@ class AnAggregateStepSendsEachGroupItChangedTest {
                 .containsEntry("orders", 1L).containsEntry("revenue", new BigDecimal("100.00"));
         Map<String, Object> marker = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>)
                 held.get("EU").after().get("__tap")).get("aggregate")).get("by_region");
-        assertThat(marker).containsEntry("status", "failed").containsEntry("code", "aggregate.value-type-mismatch")
+        assertThat(marker).containsEntry("status", "failed").containsEntry("code", "TS0500009")
                 .containsKeys("failed_since", "last_good_at");
         assertThat(held.get("US").after()).as("every other group carries on, and a current row carries no marker")
                 .containsEntry("orders", 2L).doesNotContainKey("__tap");
@@ -276,7 +276,7 @@ class AnAggregateStepSendsEachGroupItChangedTest {
 
         assertThatThrownBy(() -> run(List.of(insert(2, 2, "US", "open", "5.00")),
                 YAML.replace("region: $region", "region: $status")))
-                .hasStackTraceContaining("aggregate.definition-changed")
+                .hasStackTraceContaining("TS0500011")
                 .hasStackTraceContaining("groupBy");
 
         assertThat(WRITTEN).isEmpty();
@@ -390,7 +390,7 @@ class AnAggregateStepSendsEachGroupItChangedTest {
             assertThat(lastPerGroup()).as("a repair of a group the step does not hold sends nothing").doesNotContainKey("XX");
 
             AggregateRequests.Report refused = ask(AggregateRequests.Request.one(AggregateRequests.Action.CHECK, Map.of("country", "EU")));
-            assertThat(refused.refusal()).isEqualTo("aggregate.group-invalid");
+            assertThat(refused.refusal()).isEqualTo("TS0500015");
             assertThat(refused.refusalArgs()).containsEntry("step", "by_region");
 
             AggregateRequests.Report after = ask(AggregateRequests.Request.page(AggregateRequests.Action.CHECK, null, 10));

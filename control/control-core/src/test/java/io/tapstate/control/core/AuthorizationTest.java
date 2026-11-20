@@ -11,7 +11,7 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 /**
  * The capability check: an authenticated credential may invoke an operation only when its grade is at
  * least the grade the operation requires. A credential that carries enough passes silently; one that
- * falls short is refused with the coded {@code control.forbidden} diagnostic, which names the
+ * falls short is refused with the coded {@code TS0210004} diagnostic, which names the
  * operation and the grade it needs (safe to echo — the caller is already authenticated).
  */
 class AuthorizationTest {
@@ -35,7 +35,7 @@ class AuthorizationTest {
                 () -> Authorization.require(credential(Scope.READ), WRITE_OP));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("control.forbidden");
+        assertThat(thrown.code().code()).isEqualTo("TS0210004");
         // The operation and the grade it needs are echoed to help the caller, not the credential's own grade.
         assertThat(thrown.args()).containsEntry("op", "artifact.apply").containsEntry("required", "write");
     }
@@ -46,7 +46,7 @@ class AuthorizationTest {
                 () -> Authorization.require(credential(Scope.WRITE), ADMIN_OP));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("control.forbidden");
+        assertThat(thrown.code().code()).isEqualTo("TS0210004");
         assertThat(thrown.args()).containsEntry("op", "token.create").containsEntry("required", "admin");
     }
 

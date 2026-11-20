@@ -351,7 +351,7 @@
             "start_refused": {
               "type": "string",
               "description": "Exact canonical code returned by an HTTP 409 start admission refusal.",
-              "pattern": "^[a-z0-9]+\\.[a-z0-9-]+$"
+              "pattern": "^(?:TS(?!000)[0-9]{3}(?!0000)[0-9]{4}|[a-z0-9]+\\.[a-z0-9-]+)$"
             }
           }
         },
@@ -546,8 +546,8 @@
           "properties": {
             "failure_code": {
               "type": "string",
-              "description": "The canonical code of the failure the pipeline this specification names is expected to publish, written '<domain>.<symbol>'.",
-              "pattern": "^[a-z0-9]+\\.[a-z0-9-]+$"
+              "description": "The canonical code of the failure the pipeline this specification names is expected to publish, as a canonical TS identity or historical '<domain>.<symbol>'.",
+              "pattern": "^(?:TS(?!000)[0-9]{3}(?!0000)[0-9]{4}|[a-z0-9]+\\.[a-z0-9-]+)$"
             }
           }
         },

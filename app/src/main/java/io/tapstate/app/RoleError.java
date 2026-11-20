@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.RoleErrorDefinitions;
 
 import java.util.Set;
 
@@ -17,28 +19,13 @@ import java.util.Set;
 enum RoleError implements TapstateErrorCode {
 
     /** A {@code --role} value other than the L1-supported {@code all}. */
-    UNSUPPORTED("role.unsupported", Set.of("role"));
+    UNSUPPORTED(RoleErrorDefinitions.UNSUPPORTED);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    RoleError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    RoleError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

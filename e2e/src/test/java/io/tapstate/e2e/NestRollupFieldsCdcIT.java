@@ -246,8 +246,8 @@ class NestRollupFieldsCdcIT {
                     return false;
                 }
             }, last::get);
-            for (var failing : Map.of("decimal", "nest.rollup-overflow", "integer", "nest.rollup-overflow",
-                    "fraction", "nest.rollup-result-not-convertible").entrySet()) {
+            for (var failing : Map.of("decimal", "TS0490033", "integer", "TS0490033",
+                    "fraction", "TS0490035").entrySet()) {
                 String id = "rollup_" + failing.getKey() + "_" + suffix;
                 Await.until(id + " to stop with " + failing.getValue(),
                         () -> control.failureCode(id).filter(failing.getValue()::equals).isPresent(),

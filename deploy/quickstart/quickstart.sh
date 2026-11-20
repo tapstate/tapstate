@@ -771,7 +771,7 @@ main() {
     # same silence was reproduced later on hardware where that could not be the cause.
     printf '%s\n' "$repl_out"
     case "$repl_out" in
-        *control.auth-failed*|*cli.not-authenticated*)
+        *TS0210002*|*control.auth-failed*|*cli.not-authenticated*|*TS0330021*)
             die "the CLI could not log in with those administrator credentials. Re-run with the ones you chose on the first run; if you no longer have them, start over with: docker compose down -v (in this directory; it deletes the demo's data), then run the installer again." ;;
     esac
     # Check both the session status and its diagnostics: a refusal now leaves the

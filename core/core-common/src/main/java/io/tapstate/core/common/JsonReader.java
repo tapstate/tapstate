@@ -22,7 +22,16 @@ public final class JsonReader {
 
     /** Parses a JSON document into a {@code Map}/{@code List}/scalar tree. */
     public static Object parse(String json) {
-        Parser parser = new Parser(json);
+        return parse(json, false);
+    }
+
+    /** Parses an authoritative document, refusing duplicate object members instead of overwriting them. */
+    public static Object parseUnique(String json) {
+        return parse(json, true);
+    }
+
+    private static Object parse(String json, boolean uniqueMembers) {
+        Parser parser = new Parser(json, uniqueMembers);
         parser.skipWhitespace();
         Object value = parser.readValue(0);
         parser.skipWhitespace();
@@ -40,10 +49,12 @@ public final class JsonReader {
         private static final int MAX_DEPTH = 200;
 
         private final String src;
+        private final boolean uniqueMembers;
         private int pos;
 
-        Parser(String src) {
+        Parser(String src, boolean uniqueMembers) {
             this.src = src;
+            this.uniqueMembers = uniqueMembers;
         }
 
         Object readValue(int depth) {
@@ -78,6 +89,7 @@ public final class JsonReader {
                     throw error("expected object key string");
                 }
                 String key = readString();
+                if (uniqueMembers && object.containsKey(key)) throw error("duplicate object member");
                 skipWhitespace();
                 expect(':');
                 skipWhitespace();

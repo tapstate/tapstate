@@ -4,6 +4,8 @@ import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineView;
 import io.tapstate.control.core.PipelineViewService;
+import io.tapstate.messages.MessageCatalog;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -18,19 +20,23 @@ class PipelineViewController {
 
     private final PipelineCatalogService catalog;
     private final PipelineViewService pipelines;
+    private final MessageCatalog messages;
 
-    PipelineViewController(PipelineCatalogService catalog, PipelineViewService pipelines) {
+    PipelineViewController(PipelineCatalogService catalog, PipelineViewService pipelines, MessageCatalog messages) {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.pipelines = Objects.requireNonNull(pipelines, "pipelines");
+        this.messages = Objects.requireNonNull(messages, "messages");
     }
 
     @Verb("pipeline.catalog")
     @GetMapping("/pipelines")
     PipelineList list(
             @RequestParam(name = "limit", required = false) Integer limit,
-            @RequestParam(name = "offset", required = false) Integer offset) {
+            @RequestParam(name = "offset", required = false) Integer offset,
+            HttpServletRequest request) {
         ListWindow.Window window = ListWindow.window(limit, offset);
-        return new PipelineList(catalog.list(window.offset(), window.limit()));
+        return PipelineList.of(catalog.list(window.offset(), window.limit()), messages,
+                ApiExceptionHandler.localeFor(request));
     }
 
     @Verb("pipeline.list")

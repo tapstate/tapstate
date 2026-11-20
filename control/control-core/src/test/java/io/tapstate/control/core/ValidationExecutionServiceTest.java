@@ -36,7 +36,7 @@ class ValidationExecutionServiceTest {
         var calls=new AtomicInteger();var service=new ValidationExecutionService(op->{calls.incrementAndGet();throw new AssertionError("no start");},
                 op->{calls.incrementAndGet();throw new AssertionError("no read");},op->{calls.incrementAndGet();throw new AssertionError("no stop");},
                 new AuditGate(ignored->{throw new IllegalStateException("audit failed");},Clock.systemUTC()));
-        assertThatThrownBy(()->service.start("alice",input())).isInstanceOf(TapstateException.class).hasMessageContaining("audit-blocked");
+        assertThatThrownBy(()->service.start("alice",input())).isInstanceOf(TapstateException.class).hasMessageContaining("TS0210015");
         var valid=input();var bad=new ValidationExecutionService.Input(valid.context(),valid.pipeline(),valid.task(),valid.taskGeneration(),"1.0",valid.sequence(),valid.command());
         assertThatThrownBy(()->service.read(bad)).isInstanceOf(TapstateException.class);assertThat(calls).hasValue(0);
     }

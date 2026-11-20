@@ -2,6 +2,8 @@ package io.tapstate.cli;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.CliErrorDefinitions;
 
 import java.util.Set;
 
@@ -17,7 +19,7 @@ import java.util.Set;
 enum CliError implements TapstateErrorCode {
 
     /** The scaffold target file already exists and {@code --force} was not given. */
-    ARTIFACT_EXISTS("cli.artifact-exists", Set.of("path")),
+    ARTIFACT_EXISTS(CliErrorDefinitions.ARTIFACT_EXISTS),
 
     /**
      * The workspace already holds a demo resource and {@code --force} was not given; {@code path} is
@@ -25,7 +27,7 @@ enum CliError implements TapstateErrorCode {
      * files it is theirs, and a command whose whole purpose is to save typing must not be the thing
      * that discards an afternoon of it.
      */
-    DEMO_WORKSPACE_EXISTS("cli.demo-workspace-exists", Set.of("path")),
+    DEMO_WORKSPACE_EXISTS(CliErrorDefinitions.DEMO_WORKSPACE_EXISTS),
 
     /**
      * A workspace directory or file could not be written; {@code path} is the one that failed and
@@ -33,7 +35,7 @@ enum CliError implements TapstateErrorCode {
      * ordinary condition a reader meets - a read-only directory, a name already taken by a plain file -
      * and the answer is something they can act on rather than a stack trace.
      */
-    WORKSPACE_NOT_WRITABLE("cli.workspace-not-writable", Set.of("path", Names.REASON)),
+    WORKSPACE_NOT_WRITABLE(CliErrorDefinitions.WORKSPACE_NOT_WRITABLE),
 
     /**
      * A workspace {@code up} was asked to bring up could not be read; {@code path} is the workspace and
@@ -42,35 +44,35 @@ enum CliError implements TapstateErrorCode {
      * grant writing), and a reader who is told "could not write" about a command that writes nothing
      * goes looking in the wrong place.
      */
-    WORKSPACE_UNREADABLE("cli.workspace-unreadable", Set.of("path", Names.REASON)),
+    WORKSPACE_UNREADABLE(CliErrorDefinitions.WORKSPACE_UNREADABLE),
 
     /**
      * A workspace {@code up} was asked to bring up holds no pipeline, so there is nothing to start;
      * {@code path} is the workspace. A refusal rather than a quiet no-op: an empty or half-written
      * workspace is the state a first run most often gets stuck in, and the way out is a scaffold.
      */
-    WORKSPACE_HAS_NO_PIPELINE("cli.workspace-has-no-pipeline", Set.of("path")),
+    WORKSPACE_HAS_NO_PIPELINE(CliErrorDefinitions.WORKSPACE_HAS_NO_PIPELINE),
 
     /**
      * The optional {@code tap} shortcut cannot be managed because that name belongs to something else;
      * {@code path} is where it sits. Refused rather than replaced or deleted: the name is a working
      * command on that machine, and a convenience shortcut does not get to remove one.
      */
-    ALIAS_NAME_TAKEN("cli.alias-name-taken", Set.of("path")),
+    ALIAS_NAME_TAKEN(CliErrorDefinitions.ALIAS_NAME_TAKEN),
 
     /**
      * The shortcut cannot be managed because no installed {@code tapstate} was found where one was
      * expected; {@code path} is the directory looked in. Refused rather than guessed at: another
      * directory would manage a shortcut for an installation the user did not mean.
      */
-    ALIAS_INSTALL_DIR_UNKNOWN("cli.alias-install-dir-unknown", Set.of("path")),
+    ALIAS_INSTALL_DIR_UNKNOWN(CliErrorDefinitions.ALIAS_INSTALL_DIR_UNKNOWN),
 
     /**
      * The {@code tap} shortcut could not be written or removed; {@code path} is the shortcut and
      * {@code reason} is what the filesystem said. Distinct from the name-taken refusal: nothing here is
      * anyone's file, the link simply could not be made.
      */
-    ALIAS_LINK_FAILED("cli.alias-link-failed", Set.of("path", Names.REASON)),
+    ALIAS_LINK_FAILED(CliErrorDefinitions.ALIAS_LINK_FAILED),
 
     /**
      * The local development stack the guided first run starts in Docker could not be started, or was
@@ -79,7 +81,7 @@ enum CliError implements TapstateErrorCode {
      * up and stayed silent. One code for the whole route rather than one per step: what a reader does
      * about any of them is the same - fix Docker, or point the workspace at a server they already run.
      */
-    DOCKER_UNAVAILABLE("cli.docker-unavailable", Set.of(Names.REASON)),
+    DOCKER_UNAVAILABLE(CliErrorDefinitions.DOCKER_UNAVAILABLE),
 
     /**
      * {@code up} was asked to bring up a workspace that names no server, with nobody to ask which one;
@@ -87,14 +89,14 @@ enum CliError implements TapstateErrorCode {
      * loopback address would bind a script to whatever happens to be listening on that machine, which
      * is a different server on every machine the script runs on.
      */
-    SERVER_NOT_NAMED("cli.server-not-named", Set.of("server")),
+    SERVER_NOT_NAMED(CliErrorDefinitions.SERVER_NOT_NAMED),
 
     /**
      * Signing in to {@code server} needs a password that was neither asked for nor supplied;
      * {@code variable} names the environment variable a script puts it in. Its own code rather than a
      * login refusal: nothing was sent, so the credential was never wrong - it was never given.
      */
-    PASSWORD_REQUIRED("cli.password-required", Set.of("server", "variable")),
+    PASSWORD_REQUIRED(CliErrorDefinitions.PASSWORD_REQUIRED),
 
     /**
      * Signing in to {@code server} while binding a workspace returned nothing that can be kept: the
@@ -102,10 +104,10 @@ enum CliError implements TapstateErrorCode {
      * can use. Names the server rather than a context, because a binding that fails here has settled a
      * context name without writing it - naming it would point at an entry no later command can find.
      */
-    SIGN_IN_UNUSABLE("cli.sign-in-unusable", Set.of("server")),
+    SIGN_IN_UNUSABLE(CliErrorDefinitions.SIGN_IN_UNUSABLE),
 
     /** A connector id supplied to the wizard that is not in the bundled catalog. */
-    UNKNOWN_CONNECTOR("cli.unknown-connector", Set.of("connector")),
+    UNKNOWN_CONNECTOR(CliErrorDefinitions.UNKNOWN_CONNECTOR),
 
     /**
      * A connector id that is in the catalog but outside the set this release installs. Distinct from
@@ -114,37 +116,46 @@ enum CliError implements TapstateErrorCode {
      * for; {@code official} lists what this release does install, so the refusal states the boundary
      * instead of leaving it to be guessed.
      */
-    CONNECTOR_NOT_OFFICIAL("cli.connector-not-official", Set.of("connector", "official")),
+    CONNECTOR_NOT_OFFICIAL(CliErrorDefinitions.CONNECTOR_NOT_OFFICIAL),
 
     /** A published connector id could not be fetched as a complete jar before registration. */
-    CONNECTOR_DOWNLOAD_FAILED("cli.connector-download-failed", Set.of("connector", Names.REASON)),
+    CONNECTOR_DOWNLOAD_FAILED(CliErrorDefinitions.CONNECTOR_DOWNLOAD_FAILED),
 
     /** A workspace artifact sits in a directory whose name does not match its declared kind. */
-    KIND_DIR_MISMATCH("cli.kind-dir-mismatch", Set.of("path", "kind", "dir")),
+    KIND_DIR_MISMATCH(CliErrorDefinitions.KIND_DIR_MISMATCH),
 
     /** A describe / browse verb was given an id that resolves to no resource in the workspace. */
-    RESOURCE_NOT_FOUND("cli.resource-not-found", Set.of("id")),
+    RESOURCE_NOT_FOUND(CliErrorDefinitions.RESOURCE_NOT_FOUND),
 
     /** No server among the connect seeds answered the reachability probe. */
-    CONNECT_FAILED("cli.connect-failed", Set.of("seeds")),
+    CONNECT_FAILED(CliErrorDefinitions.CONNECT_FAILED),
 
     /** A heavy online verb reached the server but no response arrived within its timeout window. */
-    REQUEST_TIMED_OUT("cli.request-timed-out", Set.of("server")),
+    REQUEST_TIMED_OUT(CliErrorDefinitions.REQUEST_TIMED_OUT),
+
+    /** A transport failure left the request result unconfirmed. */
+    REQUEST_FAILED(CliErrorDefinitions.REQUEST_FAILED),
+
+    /** No cluster member answered after a connected session lost its transport. */
+    CONNECTION_LOST(CliErrorDefinitions.CONNECTION_LOST),
+
+    /** Repeated stream attachments ended without receiving a frame. */
+    STREAM_NO_FRAMES(CliErrorDefinitions.STREAM_NO_FRAMES),
 
     /** A verb that needs a live connection was run before the session connected; {@code verb} names it. */
-    NOT_CONNECTED("cli.not-connected", Set.of("verb")),
+    NOT_CONNECTED(CliErrorDefinitions.NOT_CONNECTED),
 
     /** A connected online verb was run before the session authenticated; {@code verb} names it. */
-    NOT_AUTHENTICATED("cli.not-authenticated", Set.of("verb")),
+    NOT_AUTHENTICATED(CliErrorDefinitions.NOT_AUTHENTICATED),
 
     /** A verb whose name is declared and reserved but which is not built yet; {@code verb} names it. */
-    VERB_NOT_IMPLEMENTED("cli.verb-not-implemented", Set.of("verb")),
+    VERB_NOT_IMPLEMENTED(CliErrorDefinitions.VERB_NOT_IMPLEMENTED),
 
     /** A REPL builtin typed as a one-shot command, where it does not exist; {@code verb} names it. */
-    REPL_BUILTIN_ONLY("cli.repl-builtin-only", Set.of("verb")),
+    REPL_BUILTIN_ONLY(CliErrorDefinitions.REPL_BUILTIN_ONLY),
 
     /** The installed MCP sidecar or its required Java runtime cannot be launched. */
-    MCP_UNAVAILABLE("cli.mcp-unavailable", Set.of(Names.REASON)),
+    MCP_UNAVAILABLE(CliErrorDefinitions.MCP_UNAVAILABLE),
 
     /**
      * The in-place view was asked for where its output does not go to a terminal. Refused rather than
@@ -152,7 +163,7 @@ enum CliError implements TapstateErrorCode {
      * degraded view but a file of control characters. Decided entirely on the client — the server is
      * never asked, and would have no way to know.
      */
-    WATCH_NEEDS_A_TERMINAL("cli.watch-needs-a-terminal", Set.of()),
+    WATCH_NEEDS_A_TERMINAL(CliErrorDefinitions.WATCH_NEEDS_A_TERMINAL),
 
     /**
      * A verb that clears what a pipeline accumulated was run where there is no terminal to confirm at,
@@ -161,124 +172,124 @@ enum CliError implements TapstateErrorCode {
      * going to arrive, and going ahead would make an irreversible clearing the default of the one
      * situation -- a script, a job, a container step -- where nobody is watching it happen.
      */
-    CONFIRMATION_NEEDS_A_TERMINAL("cli.confirmation-needs-a-terminal", Set.of("verb")),
+    CONFIRMATION_NEEDS_A_TERMINAL(CliErrorDefinitions.CONFIRMATION_NEEDS_A_TERMINAL),
 
     /**
      * A version precondition was offered for a batch holding more than one resource; {@code count} is how
      * many it holds. One hash names one version, so there is no resource it could be describing.
      */
-    IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count")),
+    IF_MATCH_NEEDS_ONE_RESOURCE(CliErrorDefinitions.IF_MATCH_NEEDS_ONE_RESOURCE),
 
     /**
      * A start whose start checks ask questions, where nothing answered them and there is no terminal to ask
      * at: {@code count} questions are open, {@code commands} are the command lines that answer them. Refused
      * rather than answered by default, because every default here keeps rows or deletes them.
      */
-    START_NEEDS_AN_ANSWER("cli.start-needs-an-answer", Set.of("pipeline", "count", "commands")),
+    START_NEEDS_AN_ANSWER(CliErrorDefinitions.START_NEEDS_AN_ANSWER),
 
     /**
      * An option that only start checks can honour, sent to a server that runs none: {@code option} is the
      * option. Refused before anything is started, since the server would take the start and drop the option.
      */
-    START_CHECKS_UNSUPPORTED("cli.start-checks-unsupported", Set.of("option")),
+    START_CHECKS_UNSUPPORTED(CliErrorDefinitions.START_CHECKS_UNSUPPORTED),
 
     /** A server started {@code pipeline} without running start checks; it is likely older than this client. */
-    START_CHECKS_NOT_RUN("cli.start-checks-not-run", Set.of("pipeline"), Severity.WARNING),
+    START_CHECKS_NOT_RUN(CliErrorDefinitions.START_CHECKS_NOT_RUN),
 
     /** A {@code --decide} that is not {@code <check>[/<subject>]=<action>}: {@code decide} is what was given. */
-    DECIDE_MALFORMED("cli.decide-malformed", Set.of("decide")),
+    DECIDE_MALFORMED(CliErrorDefinitions.DECIDE_MALFORMED),
 
     /**
      * A {@code --decide} naming an answer some of its questions do not offer: {@code findings} are those
      * questions, which have to be answered one by one instead.
      */
-    DECIDE_NOT_OFFERED("cli.decide-not-offered", Set.of("decide", "findings")),
+    DECIDE_NOT_OFFERED(CliErrorDefinitions.DECIDE_NOT_OFFERED),
 
     /** A {@code --decide} answering a start check that refuses the start, which no answer changes. */
-    DECIDE_ON_A_REFUSAL("cli.decide-on-a-refusal", Set.of("decide")),
+    DECIDE_ON_A_REFUSAL(CliErrorDefinitions.DECIDE_ON_A_REFUSAL),
 
     /**
      * A start that was sent and got no answer in time. It may have gone ahead, so it is neither sent again
      * nor sent to another member: a person checks first.
      */
-    START_MAY_HAVE_GONE_AHEAD("cli.start-may-have-gone-ahead", Set.of("pipeline", "server")),
+    START_MAY_HAVE_GONE_AHEAD(CliErrorDefinitions.START_MAY_HAVE_GONE_AHEAD),
 
     /** The context configuration is not a valid, unambiguous versioned document. */
-    CONTEXT_CONFIG_INVALID("cli.context-config-invalid", Set.of("path", Names.REASON)),
+    CONTEXT_CONFIG_INVALID(CliErrorDefinitions.CONTEXT_CONFIG_INVALID),
 
     /** No registered migration can safely interpret the context configuration version. */
-    CONTEXT_CONFIG_VERSION("cli.context-config-version", Set.of("path", "version")),
+    CONTEXT_CONFIG_VERSION(CliErrorDefinitions.CONTEXT_CONFIG_VERSION),
 
     /** The context configuration path cannot prove that only its owner may change it. */
-    CONTEXT_CONFIG_PERMISSIONS("cli.context-config-permissions", Set.of("path", Names.REASON)),
+    CONTEXT_CONFIG_PERMISSIONS(CliErrorDefinitions.CONTEXT_CONFIG_PERMISSIONS),
 
     /** The auth cache is not a valid, unambiguous versioned session document. */
-    AUTH_CACHE_INVALID("cli.auth-cache-invalid", Set.of("path", Names.REASON)),
+    AUTH_CACHE_INVALID(CliErrorDefinitions.AUTH_CACHE_INVALID),
 
     /** No registered CLI release can safely interpret the auth cache version. */
-    AUTH_CACHE_VERSION("cli.auth-cache-version", Set.of("path", "version")),
+    AUTH_CACHE_VERSION(CliErrorDefinitions.AUTH_CACHE_VERSION),
 
     /** The auth cache path cannot prove that only its owner may read or change it. */
-    AUTH_CACHE_PERMISSIONS("cli.auth-cache-permissions", Set.of("path", Names.REASON)),
+    AUTH_CACHE_PERMISSIONS(CliErrorDefinitions.AUTH_CACHE_PERMISSIONS),
 
     /** A cached session could not be exchanged because the server rejected it. */
-    AUTH_SESSION_REJECTED("cli.auth-session-rejected", Set.of("code", "principal")),
+    AUTH_SESSION_REJECTED(CliErrorDefinitions.AUTH_SESSION_REJECTED),
 
     /** A cached session could not be exchanged because no server answered safely. */
-    AUTH_SESSION_UNREACHABLE("cli.auth-session-unreachable", Set.of("principal")),
+    AUTH_SESSION_UNREACHABLE(CliErrorDefinitions.AUTH_SESSION_UNREACHABLE),
 
     /** Persistent login could not obtain the complete access-and-session response safely. */
-    AUTH_LOGIN_UNREACHABLE("cli.auth-login-unreachable", Set.of("context")),
+    AUTH_LOGIN_UNREACHABLE(CliErrorDefinitions.AUTH_LOGIN_UNREACHABLE),
 
     /** Persistent login was rejected without rendering an untrusted server response body. */
-    AUTH_LOGIN_REJECTED("cli.auth-login-rejected", Set.of("code", "principal")),
+    AUTH_LOGIN_REJECTED(CliErrorDefinitions.AUTH_LOGIN_REJECTED),
 
     /** Remote session revocation could not be confirmed, so the local cache was retained. */
-    AUTH_LOGOUT_UNREACHABLE("cli.auth-logout-unreachable", Set.of("context")),
+    AUTH_LOGOUT_UNREACHABLE(CliErrorDefinitions.AUTH_LOGOUT_UNREACHABLE),
 
     /** Logout revoked an older session while a newer local session replaced its cache entry. */
-    AUTH_LOGOUT_CACHE_CHANGED("cli.auth-logout-cache-changed", Set.of("context")),
+    AUTH_LOGOUT_CACHE_CHANGED(CliErrorDefinitions.AUTH_LOGOUT_CACHE_CHANGED),
 
     /** The persistent auth namespace was invoked with an invalid action or operand shape. */
-    STORAGE_USAGE("cli.storage-usage", Set.of(Names.REASON)),
+    STORAGE_USAGE(CliErrorDefinitions.STORAGE_USAGE),
 
-    AUTH_USAGE("cli.auth-usage", Set.of(Names.REASON)),
+    AUTH_USAGE(CliErrorDefinitions.AUTH_USAGE),
 
     /** The interactive context manager could not continue with the current input or terminal state. */
-    CONTEXT_USAGE("cli.context-usage", Set.of(Names.REASON)),
+    CONTEXT_USAGE(CliErrorDefinitions.CONTEXT_USAGE),
 
     /** A context definition supplied to the manager violates the persisted schema. */
-    CONTEXT_INVALID("cli.context-invalid", Set.of("name", Names.REASON)),
+    CONTEXT_INVALID(CliErrorDefinitions.CONTEXT_INVALID),
 
     /** A context manager operation named a context that does not exist. */
-    CONTEXT_NOT_FOUND("cli.context-not-found", Set.of("name")),
+    CONTEXT_NOT_FOUND(CliErrorDefinitions.CONTEXT_NOT_FOUND),
 
     /** A context manager create operation tried to reuse an existing name. */
-    CONTEXT_ALREADY_EXISTS("cli.context-already-exists", Set.of("name")),
+    CONTEXT_ALREADY_EXISTS(CliErrorDefinitions.CONTEXT_ALREADY_EXISTS),
 
     /** Mutually exclusive temporary and durable context sources were supplied together. */
-    CONTEXT_SOURCE_CONFLICT("cli.context-source-conflict", Set.of()),
+    CONTEXT_SOURCE_CONFLICT(CliErrorDefinitions.CONTEXT_SOURCE_CONFLICT),
 
     /** An online verb has no explicit, environment, or exact workspace target. */
-    CONTEXT_REQUIRED("cli.context-required", Set.of("verb")),
+    CONTEXT_REQUIRED(CliErrorDefinitions.CONTEXT_REQUIRED),
 
     /** A non-loopback seed would expose authentication traffic over plaintext HTTP. */
-    REMOTE_PLAINTEXT("cli.remote-plaintext", Set.of("seed")),
+    REMOTE_PLAINTEXT(CliErrorDefinitions.REMOTE_PLAINTEXT),
 
     /** A configured seed did not answer anonymous issuer discovery. */
-    ISSUER_DISCOVERY_FAILED("cli.issuer-discovery-failed", Set.of("seed")),
+    ISSUER_DISCOVERY_FAILED(CliErrorDefinitions.ISSUER_DISCOVERY_FAILED),
 
     /** A seed answered discovery with fields that cannot identify a Tapstate cluster. */
-    ISSUER_DISCOVERY_INVALID("cli.issuer-discovery-invalid", Set.of("seed", Names.REASON)),
+    ISSUER_DISCOVERY_INVALID(CliErrorDefinitions.ISSUER_DISCOVERY_INVALID),
 
     /**
      * A seed refused anonymous discovery outright; {@code reason} carries what it said. A server older
      * than this CLI does not serve the discovery endpoint, and answers this way every time.
      */
-    ISSUER_DISCOVERY_REJECTED("cli.issuer-discovery-rejected", Set.of("seed", Names.REASON)),
+    ISSUER_DISCOVERY_REJECTED(CliErrorDefinitions.ISSUER_DISCOVERY_REJECTED),
 
     /** A cached issuer or another seed differs from the anonymously discovered issuer. */
-    AUTH_ISSUER_MISMATCH("cli.auth-issuer-mismatch", Set.of("expected", "actual", "seed")),
+    AUTH_ISSUER_MISMATCH(CliErrorDefinitions.AUTH_ISSUER_MISMATCH),
 
     /**
      * This CLI and the server it just connected to are different versions; {@code cli} and
@@ -286,47 +297,13 @@ enum CliError implements TapstateErrorCode {
      * verb still works. It is said at all because the two halves are installed by different paths, so
      * they drift silently, and a reader who can see only one number reports it as though it were both.
      */
-    VERSION_MISMATCH("cli.version-mismatch", Set.of("cli", "server"), Severity.WARNING);
+    VERSION_MISMATCH(CliErrorDefinitions.VERSION_MISMATCH);
 
-    /**
-     * Placeholder names carried by enough of the codes above to be worth naming once. A nested class
-     * rather than a field of the enum: an enum's constants come first in its body, so a field of the
-     * enum itself would be a forward reference from every argument list that used it, constant or not.
-     * Qualified through another class, the same value is an ordinary compile-time constant.
-     */
-    private static final class Names {
-        private static final String REASON = "reason";
+    private final ProductErrorDefinition definition;
 
-        private Names() {
-        }
-    }
+    CliError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    private final String code;
-    private final Set<String> placeholders;
-    private final Severity severity;
-
-    CliError(String code, Set<String> placeholders) {
-        this(code, placeholders, Severity.ERROR);
-    }
-
-    CliError(String code, Set<String> placeholders, Severity severity) {
-        this.code = code;
-        this.placeholders = placeholders;
-        this.severity = severity;
-    }
-
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return severity;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

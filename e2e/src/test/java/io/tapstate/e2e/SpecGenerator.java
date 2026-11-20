@@ -458,8 +458,8 @@ final class SpecGenerator {
     private static Map<String, Object> failureCodeBody() {
         Map<String, Object> code = scalar("string",
                 "The canonical code of the failure the pipeline this specification names is expected to "
-                        + "publish, written '<domain>.<symbol>'.");
-        code.put("pattern", "^[a-z0-9]+\\.[a-z0-9-]+$");
+                        + "publish, as a canonical TS identity or historical '<domain>.<symbol>'.");
+        code.put("pattern", "^(?:TS(?!000)[0-9]{3}(?!0000)[0-9]{4}|[a-z0-9]+\\.[a-z0-9-]+)$");
         return code;
     }
 

@@ -143,7 +143,7 @@ class PreviewMaterializerSinkWriterFactoryTest {
             assertThatThrownBy(writeFuture::join)
                     .isInstanceOf(CompletionException.class)
                     .hasCauseInstanceOf(io.tapstate.core.common.TapstateException.class)
-                    .hasRootCauseMessage("actuation.preview-refused {reason=the output identity for stream 'orders' is unresolved}");
+                    .hasRootCauseMessage("TS0360001 {reason=the output identity for stream 'orders' is unresolved}");
             assertThat((Map<?, ?>) member.getMap(resultMap)).isEmpty();
         }
     }

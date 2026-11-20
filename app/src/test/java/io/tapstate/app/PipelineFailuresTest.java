@@ -20,6 +20,64 @@ import static org.assertj.core.api.Assertions.entry;
  */
 class PipelineFailuresTest {
 
+    @Test void ownerRedactionSurvivesMissingAttachmentWithoutReadingRawValues() {
+        var raw = new Object() { public String toString() { throw new AssertionError("raw value accessed"); } };
+        var coded = new TapstateException(EngineError.NO_SUCH_JOB, Map.of("pipeline", raw), null);
+        var safe = new io.tapstate.core.common.FailureFact.PublicFailure(coded.code().code(), Map.of("pipeline", "[redacted]"));
+        assertThat(PipelineFailures.of("orders", coded, Map.of("truncated", true), safe).params())
+                .containsOnly(entry("pipeline", "[redacted]"));
+        var unavailable = io.tapstate.core.common.FailureFact.unavailable(coded);
+        assertThat(PipelineFailures.of("orders", coded, unavailable.diagnostic(), unavailable.publicFailure()).params())
+                .containsOnly(entry("pipeline", "[diagnostic unavailable]"));
+    }
+
+    @Test
+    void anUncodedOwnerKeepsTheKnownPipelineAndItsSafeBoundedCause() {
+        var raw = new RuntimeException("private driver value");
+        String safe = "safe owner failure" + "x".repeat(250) + "\nprivate stack";
+        var fact = new io.tapstate.core.common.FailureFact(raw, Map.of("message", safe),
+                new io.tapstate.core.common.FailureFact.PublicFailure("", Map.of()));
+        var failure = PipelineFailures.of("orders", raw, fact.diagnostic(), fact.publicFailure());
+        assertThat(failure.code()).isEqualTo(EngineError.JOB_FAILED.code());
+        assertThat(failure.params()).containsEntry("pipeline", "orders");
+        assertThat(failure.params().get("cause")).isEqualTo(safe.substring(0, 200) + " …")
+                .doesNotContain("private driver value", "private stack");
+        assertThat(failure.diagnostic()).isEqualTo(fact.diagnostic());
+    }
+
+    @Test
+    void anUnavailableUncodedOwnerStillKeepsTheKnownPipelineWithoutReadingRawDetails() {
+        var raw = new RuntimeException("private driver value") {
+            @Override public String getMessage() { throw new AssertionError("raw owner message accessed"); }
+        };
+        var fact = io.tapstate.core.common.FailureFact.unavailable(raw);
+        var failure = PipelineFailures.of("orders", raw, fact.diagnostic(), fact.publicFailure());
+        assertThat(failure.code()).isEqualTo(EngineError.JOB_FAILED.code());
+        assertThat(failure.params()).containsOnly(entry("pipeline", "orders"),
+                entry("cause", "[diagnostic unavailable]"));
+        assertThat(failure.diagnostic()).containsEntry("truncated", true);
+    }
+
+    @Test
+    void sinkClassificationDoesNotStringifyDriverParameters() {
+        var raw = new Object() { public String toString() { throw new AssertionError("raw connector parameter accessed"); } };
+        var cause = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED,
+                Map.of("connector", "demo", "detail", raw), null);
+        assertThat(PipelineFailures.isSinkWriteFailure("orders", cause)).isTrue();
+    }
+
+    @Test
+    void anEarlyConnectorRefusalWithoutOwnerFactsDoesNotReadRawParameters() {
+        var raw = new Object() { public String toString() { throw new AssertionError("raw connector parameter accessed"); } };
+        var cause = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED,
+                Map.of("connector", "demo", "detail", raw), null);
+        var result = PipelineFailures.of("orders", cause, Map.of(), null);
+        assertThat(result.code()).isEqualTo(cause.code().code());
+        assertThat(result.params()).containsOnly(entry("connector", "[diagnostic unavailable]"),
+                entry("detail", "[diagnostic unavailable]"));
+        assertThat(result.diagnostic()).containsEntry("truncated", true);
+    }
+
     @Test
     void aCodedCauseKeepsItsOwnCodeAndArguments() {
         TapstateException coded = new TapstateException(
@@ -27,7 +85,7 @@ class PipelineFailuresTest {
 
         ObservationFailure failure = PipelineFailures.of("orders", coded);
 
-        assertThat(failure.code()).isEqualTo("engine.no-such-job");
+        assertThat(failure.code()).isEqualTo("TS0440001");
         assertThat(failure.params()).containsOnly(entry("pipeline", "orders"));
     }
 
@@ -40,14 +98,14 @@ class PipelineFailuresTest {
                 EngineError.NO_SUCH_JOB, Map.of("pipeline", "orders"), null);
         Throwable wrapped = new IllegalStateException("job execution failed", new RuntimeException(coded));
 
-        assertThat(PipelineFailures.of("orders", wrapped).code()).isEqualTo("engine.no-such-job");
+        assertThat(PipelineFailures.of("orders", wrapped).code()).isEqualTo("TS0440001");
     }
 
     @Test
     void anUncodedCauseBecomesTheGenericEngineFailureCarryingItsMessage() {
         ObservationFailure failure = PipelineFailures.of("orders", new IllegalStateException("ring buffer closed"));
 
-        assertThat(failure.code()).isEqualTo("engine.job-failed");
+        assertThat(failure.code()).isEqualTo("TS0440008");
         assertThat(failure.params())
                 .containsOnly(entry("pipeline", "orders"), entry("cause", "ring buffer closed"));
     }

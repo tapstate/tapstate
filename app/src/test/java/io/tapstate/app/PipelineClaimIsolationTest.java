@@ -184,6 +184,25 @@ class PipelineClaimIsolationTest {
         }
     }
 
+    @Test
+    void aStoreAdvanceUnderAnObsoleteTopologyNeverAuthorizesSubmission() {
+        var owner = owner();
+        var expected = WorkloadClaimFence.from(owner.permit(A).claim());
+        when(boundary.advanceExecution(any(), anyLong(), any())).thenAnswer(call -> {
+            var advanced = claims.advanceExecution(call.getArgument(0), call.getArgument(1), call.getArgument(2));
+            assertThat(advanced).isPresent();
+            when(membership.committed()).thenReturn(new ClusterMembership("cluster", 8, Set.of("node", "joined")));
+            return advanced;
+        });
+
+        assertThat(owner.beginExecution(A, expected).allowed()).isFalse();
+        var advanced = claims.read(key(A)).orElseThrow().claim();
+        assertThat(advanced.executionGeneration()).isEqualTo(expected.executionGeneration() + 1);
+        assertThat(owner.proveObservationClaim(A, WorkloadClaimFence.from(advanced))).isFalse();
+        owner.retain(List.of(A.pipelineId()));
+        assertThat(claims.read(key(A)).orElseThrow().leased()).isFalse();
+    }
+
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void aGrantRefusedAfterATopologyChangeIsReleasedEvenWithALocalPlaceholder(boolean nodeBacked) {
