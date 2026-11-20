@@ -51,12 +51,19 @@ final class MongoAlertStorageSchema {
     private final String clusterId;
     private final String keyId;
     private final Runnable requireActive;
+    private final java.util.function.Consumer<Document> verifyKeyMaterial;
 
     MongoAlertStorageSchema(MongoClient client, MongoDatabase database, String clusterId,
             String keyId, Runnable requireActive) {
+        this(client, database, clusterId, keyId, requireActive, null);
+    }
+
+    MongoAlertStorageSchema(MongoClient client, MongoDatabase database, String clusterId,
+            String keyId, Runnable requireActive, java.util.function.Consumer<Document> verifyKeyMaterial) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId"); this.keyId = Objects.requireNonNull(keyId, "keyId");
         this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
+        this.verifyKeyMaterial = verifyKeyMaterial;
     }
 
     /** Load-only: absent means unprepared only when the entire feature set is absent as well. */
@@ -316,12 +323,17 @@ final class MongoAlertStorageSchema {
         // The transaction owns CSOT; overriding a database or collection timeout inside it is invalid.
         budget.remainingMillis();
         MongoDatabase reads = database;
+        var keyQuery = SystemCollections.CLUSTER_KEYS.on(reads).find(session, new Document("_id", "cluster"));
+        Document keys = null;
+        if (verifyKeyMaterial != null) {
+            keys = keyQuery.first();
+            verifyKeyMaterial.accept(keys);
+        }
         Document identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(reads)
                 .find(session, new Document("_id", "cluster")).first();
         if (identity == null || !clusterId.equals(identity.get("clusterId"))
                 || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))) { throw unreadable("identity"); }
-        Document keys = SystemCollections.CLUSTER_KEYS.on(reads).find(session, new Document("_id", "cluster"))
-                .projection(new Document("keyId", 1)).first();
+        if (verifyKeyMaterial == null) keys = keyQuery.projection(new Document("keyId", 1)).first();
         if (keys == null || !keyId.equals(keys.get("keyId"))) { throw unreadable("key-binding"); }
         Document schema = SystemCollections.SCHEMA_MIGRATIONS.on(reads).find(session, new Document("_id", "config")).first();
         if (schema == null || !(schema.get("installedVersion") instanceof Integer installed)

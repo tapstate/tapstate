@@ -16,6 +16,22 @@ final class MongoCacheBusinessIdentity {
     MongoCacheBusinessIdentity(MongoDatabase database, CacheBusinessScope scope) { this.database = database; this.scope = scope; }
     void requireReady(ClientSession session) { readyIdentity(session); }
 
+    /** Keeps the original readiness predicates within the caller's transaction snapshot. */
+    void requireReadyCombined(ClientSession session) {
+        var result = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                MongoPipelineObservationRead.match(new Document("_id", "cluster")),
+                MongoPipelineObservationRead.boundedRow(), MongoPipelineObservationRead.originalRow(),
+                MongoPipelineObservationRead.one(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"))).first();
+        if (result != null && !MongoPipelineObservationRead.overflow(result, "schema", 1)) {
+            var identity = result.get("body", Document.class);
+            if (identity.containsKey("_id")) {
+                requireObservedReady(identity, MongoPipelineObservationRead.single(result, "schema"), scope);
+                return;
+            }
+        }
+        requireReady(session);
+    }
+
     private Document readyIdentity(ClientSession session) { return readyIdentity(session, null); }
 
     void requireValidationPreparation(ClientSession session, String operation) { readyIdentity(session, java.util.Objects.requireNonNull(operation)); }
@@ -29,9 +45,13 @@ final class MongoCacheBusinessIdentity {
     }
 
     static void requireObservedAdmission(Document identity, Document schema, CacheBusinessScope scope) {
+        requireObservedReady(identity, schema, scope);
+        admissionRevision(identity);
+    }
+
+    static void requireObservedReady(Document identity, Document schema, CacheBusinessScope scope) {
         requireReadyIdentity(identity, scope);
         requireReadySchema(identity, schema, scope, null);
-        admissionRevision(identity);
     }
 
     private static void requireReadyIdentity(Document identity, CacheBusinessScope scope) {
