@@ -51,6 +51,12 @@ final class NativeObservationSampling {
 
     Optional<Observation> publish(ObservationPublisher publisher, PipelineConvergencePass pass, ConvergeResult result,
             PipelineIntentStore.ActuationReading config, ObservationFailure failure) {
+        return publish(publisher, pass, result, config, failure, java.util.function.UnaryOperator.identity());
+    }
+
+    Optional<Observation> publish(ObservationPublisher publisher, PipelineConvergencePass pass, ConvergeResult result,
+            PipelineIntentStore.ActuationReading config, ObservationFailure failure,
+            java.util.function.UnaryOperator<ObservationStore> stores) {
         String id = pass.scope().pipelineId();
         var checkpoint = result.checkpoint().orElse(null);
         var current = execution.apply(id);
@@ -60,28 +66,27 @@ final class NativeObservationSampling {
             var original = current.orElseThrow();
             var reading = new Published(checkpoint.epoch(), original);
             if (reading.equals(published.get(id)) && config != null && config.configurationRevision().isPresent()) {
-                var fast = combined(publisher, pass, config, checkpoint, original);
+                var fast = combined(publisher, pass, config, checkpoint, original, stores);
                 if (fast.superseded() || fast.observation().isPresent()) return fast.observation();
             }
-            var fallback = publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
+            var fallback = publisher.publishScoped(pass.scope(), pass.state(),
+                    stores.apply(guarded(pass.observationSample(), () -> requireExecution(pass, original))), failure);
             if (fallback.filter(value -> value.state() == PipelineState.RUNNING).isPresent() && execution.apply(id).equals(current))
                 published.put(id, reading);
             return fallback;
         }
         published.remove(id);
-        return publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
+        return publisher.publishScoped(pass.scope(), pass.state(), stores.apply(pass.observationSample()), failure);
     }
 
     private Attempt combined(ObservationPublisher publisher, PipelineConvergencePass pass,
-            PipelineIntentStore.ActuationReading config, CheckpointDoc checkpoint, ExecutionFence original) {
+            PipelineIntentStore.ActuationReading config, CheckpointDoc checkpoint, ExecutionFence original,
+            java.util.function.UnaryOperator<ObservationStore> stores) {
         String id = pass.scope().pipelineId();
         var inputs = captures.observationSelection(original);
         if (inputs.isEmpty()) return Attempt.fallback();
         var selection = inputs.orElseThrow();
-        Runnable current = () -> {
-            pass.requirePipeline(id);
-            if (!execution.apply(id).filter(original::equals).isPresent()) throw ThreeLayerStorePort.refused();
-        };
+        Runnable current = () -> requireExecution(pass, original);
         var facts = cache.readObservation(pass.scope(), pass.claim(), selection.sources(), current);
         if (facts.isEmpty() || !checkpoint.equals(facts.get().checkpoint())) return Attempt.fallback();
 
@@ -95,7 +100,8 @@ final class NativeObservationSampling {
         var sample = captures.observationSample(selection, facts.orElseThrow(), plans.apply(id), clock.instant());
         if (sample.isEmpty()) return Attempt.fallback();
 
-        ObservationStore sink = new ObservationStore() {
+        ObservationStore sink = new ProcessObservationWriter.ActiveStore() {
+            @Override public void requireWriteActive() { current.run(); }
             @Override public Optional<Observation> read(String pipeline) { return pass.observationSample().read(pipeline); }
             @Override public void save(Observation value) { throw new IllegalArgumentException("observation checkpoint is required"); }
             @Override public void save(Observation value, long epoch) {
@@ -105,7 +111,24 @@ final class NativeObservationSampling {
             }
             @Override public void delete(String pipeline) { pass.observationSample().delete(pipeline); }
         };
-        return new Attempt(false, publisher.publishRunning(pass.scope(), checkpoint, sink, sample.orElseThrow()));
+        return new Attempt(false, publisher.publishRunning(pass.scope(), checkpoint, stores.apply(sink), sample.orElseThrow()));
+    }
+
+    private void requireExecution(PipelineConvergencePass pass, ExecutionFence original) {
+        pass.requirePipeline(pass.scope().pipelineId());
+        if (!execution.apply(pass.scope().pipelineId()).filter(original::equals).isPresent()) throw ThreeLayerStorePort.refused();
+    }
+
+    private static ObservationStore guarded(ObservationStore store, Runnable current) {
+        return new ProcessObservationWriter.ActiveStore() {
+            @Override public void requireWriteActive() { current.run(); }
+            @Override public void save(Observation value) { current.run(); store.save(value); }
+            @Override public void save(Observation value, long epoch) { current.run(); store.save(value, epoch); }
+            @Override public void afterSave(Runnable action) { store.afterSave(action); }
+            @Override public Optional<Observation> read(String pipeline) { return store.read(pipeline); }
+            @Override public Optional<Observation> beforeCompletion(String pipeline, long epoch) { return store.beforeCompletion(pipeline, epoch); }
+            @Override public void delete(String pipeline) { store.delete(pipeline); }
+        };
     }
 
     private static boolean matches(MongoConfigurationDomain.ObservationConfiguration current, MongoCacheDomain.ObservationFacts facts,

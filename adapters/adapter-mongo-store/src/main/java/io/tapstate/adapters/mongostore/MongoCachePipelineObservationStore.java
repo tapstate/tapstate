@@ -1,6 +1,11 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoBulkWriteException;
+import com.mongodb.MongoWriteException;
 import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.BulkWriteOptions;
+import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.common.TapstateException;
@@ -12,6 +17,8 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -197,22 +204,80 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     }
 
     private boolean write(Observation observation, long checkpointEpoch, boolean create) {
+        var update = prepare(observation, checkpointEpoch, create);
+        var result = StoreIo.call(() -> {
+            access.requireObservationActive();
+            if (create) access.verifyObservationStructure();
+            return collection().updateOne(update.getFilter(), update.getUpdatePipeline(), update.getOptions());
+        });
+        if (!create && result.getMatchedCount() != 1) return false;
+        written(checkpointEpoch);
+        return true;
+    }
+
+    record BatchWrite(MongoCachePipelineObservationStore store, Observation observation, long checkpointEpoch) {}
+    private record PreparedWrite(int index, BatchWrite write, UpdateOneModel<Document> update) {}
+
+    static List<RuntimeException> writeBatch(List<BatchWrite> batch) {
+        List<RuntimeException> failures = new ArrayList<>(Collections.nCopies(batch.size(), null));
+        var prepared = new ArrayList<PreparedWrite>(batch.size());
+        boolean verified = false;
+        for (int i = 0; i < batch.size(); i++) {
+            var write = batch.get(i);
+            var store = write.store();
+            try {
+                var update = store.prepare(write.observation(), write.checkpointEpoch(), true);
+                store.access.requireObservationActive();
+                if (!verified) {
+                    store.access.verifyObservationStructure();
+                    verified = true;
+                }
+                prepared.add(new PreparedWrite(i, write, update));
+            } catch (RuntimeException failure) {
+                failures.set(i, failure);
+            }
+        }
+        if (prepared.isEmpty()) return Collections.unmodifiableList(failures);
+
+        try {
+            StoreIo.run(() -> {
+                try {
+                    prepared.getFirst().write().store().collection().bulkWrite(
+                            prepared.stream().map(PreparedWrite::update).toList(),
+                            new BulkWriteOptions().ordered(false));
+                } catch (MongoBulkWriteException failure) {
+                    if (failure.getWriteConcernError() != null) throw failure;
+                    for (var error : failure.getWriteErrors()) {
+                        int index = prepared.get(error.getIndex()).index();
+                        failures.set(index, StoreIo.coded(new MongoWriteException(error, failure.getServerAddress())));
+                    }
+                }
+            });
+        } catch (RuntimeException failure) {
+            for (var entry : prepared) {
+                if (failures.get(entry.index()) == null) failures.set(entry.index(), failure);
+            }
+        }
+        for (var entry : prepared) {
+            if (failures.get(entry.index()) == null) entry.write().store().written(entry.write().checkpointEpoch());
+        }
+        return Collections.unmodifiableList(failures);
+    }
+
+    private UpdateOneModel<Document> prepare(Observation observation, long checkpointEpoch, boolean create) {
         access.requirePipeline(observation.pipelineId());
         if (access.originalClaim() == null) throw MongoCachePipelineAccess.fenced();
         if (checkpointEpoch < 0 || observation.observedAt() == null) throw new IllegalArgumentException("invalid observation checkpoint");
         var id = keyOfFence(access, checkpointEpoch, access.originalClaim());
         var captured = document(observation, id);
-        // One document, one atomic update. A delayed sample may populate only its original key.
+        // A delayed sample may populate only its original key and cannot replace a later measurement.
         var keepExisting = new Document("$gte", List.of("$observedAt", captured.get("observedAt")));
-        var result = StoreIo.call(() -> {
-            access.requireObservationActive();
-            if (create) access.verifyObservationStructure();
-            return collection().withWriteConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).updateOne(new Document("_id", id),
-                    List.of(new Document("$replaceWith", new Document("$cond",
-                            List.of(keepExisting, "$$ROOT", new Document("$literal", captured))))),
-                    new UpdateOptions().upsert(create));
-        });
-        if (!create && result.getMatchedCount() != 1) return false;
+        var changes = List.of(new Document("$replaceWith", new Document("$cond",
+                List.of(keepExisting, "$$ROOT", new Document("$literal", captured)))));
+        return new UpdateOneModel<>(new Document("_id", id), changes, new UpdateOptions().upsert(create));
+    }
+
+    private void written(long checkpointEpoch) {
         if ((WRITES.incrementAndGet() & 63) == 0) {
             var scope = access.scope;
             var prior = new Document("_id.scope.clusterId", scope.clusterId()).append("_id.scope.bindingVersion", scope.bindingVersion())
@@ -221,11 +286,11 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
                     scopeFilter(scope).append("_id.epoch", new Document("$lt", checkpointEpoch - 1))));
             reap(access.database, prior);
         }
-        return true;
     }
 
-    private com.mongodb.client.MongoCollection<Document> collection() {
-        return SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database);
+    private MongoCollection<Document> collection() {
+        return SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database)
+                .withWriteConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true));
     }
 
     private static Document document(Observation observation, Document id) {

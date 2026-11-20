@@ -125,17 +125,17 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireScope(original);
         var key = pipelineKey(original);
-        return transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl));
+        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl)));
     }
 
     @Override public WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope original, WorkloadClaimFence node,
             long topologyRevision) {
         requireScope(original);
         if (topologyRevision != 1 || !node.owner().nodeId().equals(scope.clusterId())) throw claimFenced();
-        return transaction(true, original, (store, session) -> {
+        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(true, original, (store, session) -> {
             MongoCachePipelinePreparations.proveNode(session, database, scope, node);
             return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
-        });
+        }));
     }
     private record PipelineReading(Document state,Document claim,Document node) { }
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original){
@@ -259,13 +259,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public boolean release(WorkloadClaim expected) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, (store, session) -> {
+        java.util.function.Supplier<Boolean> change = () -> transaction(false, (store, session) -> {
             if (knownRetiredPipeline(session, expected.key())) return false;
             var retained = storedScope(session, expected.key());
             boolean released = store.release(expected);
             if (released && retained != null) fenceProgress(session, retained);
             return released;
         });
+        return expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                ? MongoCachePipelineStateStore.writeTransaction(client, change) : change.get();
     }
     private boolean knownRetiredPipeline(ClientSession session, WorkloadClaimKey key) {
         if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION) return false;
@@ -285,13 +287,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision, Set<String> nodeIds) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, (store, session) -> {
+        java.util.function.Supplier<Optional<WorkloadClaim>> change = () -> transaction(false, (store, session) -> {
             validateMutationScope(session, store, expected);
             var advanced = store.advanceExecution(expected, topologyRevision, nodeIds);
             if (advanced.isPresent() && expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION)
                 fenceProgress(session, storedScope(session, expected.key()));
             return advanced;
         });
+        return expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                ? MongoCachePipelineStateStore.writeTransaction(client, change) : change.get();
     }
     @Override public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
         requireKey(Objects.requireNonNull(expected, "expected").key());

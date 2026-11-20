@@ -55,7 +55,14 @@ final class ConvergenceDriver {
             Function<PipelineConvergencePass, RebuildAdmission> rebuilds,
             Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts,
             Consumer<PipelineIntentStore.PendingStart> prepareStart,
-            Consumer<String> resumeRebuild, NativeObservationSampling observations) {
+            Consumer<String> resumeRebuild, NativeObservationSampling observations, ProcessObservationWriter writes) {
+        ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
+                Function<PipelineConvergencePass, LifecycleActuator> actuators,
+                Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain,
+                PipelineAlertFeed alerts, Consumer<PipelineIntentStore.PendingStart> prepareStart, Consumer<String> resumeRebuild,
+                NativeObservationSampling observations) {
+            this(intents, stores, active, actuators, rebuilds, retain, alerts, prepareStart, resumeRebuild, observations, null);
+        }
         ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
                 Function<PipelineConvergencePass, LifecycleActuator> actuators,
                 Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain,
@@ -207,8 +214,7 @@ final class ConvergenceDriver {
                 if (scoped != null) alert(() -> scoped.alerts().expecting(originalPass));
                 ConvergeResult result = scoped == null ? converger.converge(pipelineId)
                         : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
-                                scoped.rebuilds().apply(pass), ignored -> publisher.publishScoped(originalPass.scope(),
-                                        originalPass.state(), originalPass.observationSample(), null),
+                                scoped.rebuilds().apply(pass), ignored -> publishBeforeCompletion(originalPass),
                                 () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
                 if (result.status() == ConvergeStatus.RECOVERING) continue;
                 ObservationFailure failure = null;
@@ -222,15 +228,7 @@ final class ConvergenceDriver {
                     LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
                             failure.code(), result.failure().orElse(null));
                 }
-                var projection = scoped == null ? publisher.publish(pipelineId, failure)
-                        : scoped.observations() == null ? publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure)
-                        : scoped.observations().publish(publisher, pass, result, observationOrigin, failure);
-                PipelineConvergencePass sampledPass = pass;
-                projection.ifPresent(published -> {
-                    if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
-                    sample(published, sampledPass);
-                    export(published);
-                });
+                publishObservation(pipelineId, pass, result, observationOrigin, failure);
                 // A clean pass ends the failure streak; the next throw starts counting from one again.
                 reconcileFailures.remove(pipelineId);
             } catch (RuntimeException e) {
@@ -248,8 +246,11 @@ final class ConvergenceDriver {
                         pipelineId, failures, e);
                 try {
                     if (scoped == null) publisher.publishReconcileFailure(pipelineId, failures);
-                    else if (pass != null) publisher.publishReconcileFailureScoped(
-                            pass.scope(), pass.state(), pass.observationSample(), failures);
+                    else if (pass != null) {
+                        PipelineConvergencePass original = pass;
+                        writeObservationNow(pipelineId, () -> publisher.publishReconcileFailureScoped(
+                                original.scope(), original.state(), original.observationSample(), failures));
+                    }
                 } catch (RuntimeException unpublishable) {
                     // The read face is unreachable too (e.g. the same store backs both), so nothing can be
                     // surfaced this tick; the warning above is the only record.
@@ -278,12 +279,61 @@ final class ConvergenceDriver {
         if (scoped != null) {
             alert(() -> scoped.alerts().retain(pipelineIds));
             if (scoped.observations() != null) scoped.observations().retain(pipelineIds);
+            if (scoped.writes() != null) scoped.writes().retain(pipelineIds);
         }
         publisher.forgetPipelinesOutside(pipelineIds);
         if (sampler != null) {
             sampler.forgetPipelinesOutside(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    private void publishBeforeCompletion(PipelineConvergencePass pass) {
+        writeObservationNow(pass.scope().pipelineId(), () -> publisher.publishScoped(pass.scope(),
+                pass.state(), pass.observationSample(), null));
+    }
+
+    private void writeObservationNow(String pipeline, Runnable publication) {
+        if (scoped != null && scoped.writes() != null) scoped.writes().now(pipeline, publication);
+        else publication.run();
+    }
+
+    private void publishObservation(String pipeline, PipelineConvergencePass pass, ConvergeResult result,
+            PipelineIntentStore.ActuationReading origin, ObservationFailure failure) {
+        if (scoped != null && scoped.writes() != null && failure == null
+                && result.checkpoint().filter(checkpoint -> io.tapstate.core.lifecycle.StateJson.parse(checkpoint.stateJson())
+                        == io.tapstate.core.lifecycle.PipelineState.RUNNING).isPresent()) {
+            var stage = scoped.writes().stage(pass);
+            var projection = projection(pipeline, pass, result, origin, null, stage::wrap);
+            projection.ifPresent(value -> scoped.writes().submit(stage,
+                    () -> publicationCommitted(pass, result, value), () -> sample(value, pass),
+                    () -> alert(() -> scoped.alerts().unavailable(pass))));
+            return;
+        }
+        writeObservationNow(pipeline, () -> projection(pipeline, pass, result, origin, failure,
+                java.util.function.UnaryOperator.identity()).ifPresent(value -> published(pass, result, value)));
+    }
+
+    private Optional<io.tapstate.core.lifecycle.Observation> projection(String pipeline, PipelineConvergencePass pass,
+            ConvergeResult result, PipelineIntentStore.ActuationReading origin, ObservationFailure failure,
+            java.util.function.UnaryOperator<io.tapstate.spi.store.ObservationStore> stores) {
+        if (scoped == null) return publisher.publish(pipeline, failure);
+        if (scoped.observations() == null)
+            return publisher.publishScoped(pass.scope(), pass.state(), stores.apply(pass.observationSample()), failure);
+        return scoped.observations().publish(publisher, pass, result, origin, failure, stores);
+    }
+
+    private void publicationCommitted(PipelineConvergencePass pass, ConvergeResult result,
+            io.tapstate.core.lifecycle.Observation value) {
+        if (scoped != null) alert(() -> scoped.alerts().published(pass, value, result.failure().orElse(null)));
+        export(value);
+    }
+
+    private void published(PipelineConvergencePass pass, ConvergeResult result,
+            io.tapstate.core.lifecycle.Observation value) {
+        if (scoped != null) alert(() -> scoped.alerts().published(pass, value, result.failure().orElse(null)));
+        sample(value, pass);
+        export(value);
     }
 
     private void prepareStart(PipelineIntentStore.PendingStart pending) {
@@ -328,7 +378,7 @@ final class ConvergenceDriver {
         }
         try {
             if (pass == null) sampler.offer(published);
-            else sampler.offer(published, pass.scope(), pass.rateHistory());
+            else sampler.offer(published, pass.scope(), pass.rateHistory(scoped.writes() != null));
         } catch (RuntimeException unsampled) {
             LOG.warn("Could not sample the history of pipeline {}", published.pipelineId(), unsampled);
         }

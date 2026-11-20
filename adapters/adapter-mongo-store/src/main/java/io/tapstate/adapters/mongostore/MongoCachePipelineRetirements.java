@@ -26,7 +26,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
     }
     @Override public PipelineRetirementReceipt retire(PipelineRetirementPreparation original,WorkloadClaimFence currentNode,Optional<PipelineRetirementRequest.CacheOriginal> isolated) {
         MongoPipelineRetirements.requireOriginalPending(original);Objects.requireNonNull(isolated);requireScope(original.request().scope());Objects.requireNonNull(currentNode);
-        var receipt = transaction(original,session -> {
+        var receipt = checkpointTransaction(original,session -> {
             MongoCachePipelinePreparations.proveNode(session,database,business,currentNode);
             if(original.request().cache().isEmpty()) {
                 if(original.previousPreparation().phase()!=PipelinePreparation.Phase.UNASSIGNED)throw fenced();
@@ -67,9 +67,9 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
                     .append("pipelinePreparation",MongoCachePipelinePreparations.marker(retired.preparationId(),PipelineCachePreparations.Phase.RETIRED))
                     .append("pipelineRetirement",MongoPipelineRetirementFacts.cache(retired));
             if(claims.updateOne(session,expected,new Document("$set",values)).getMatchedCount()!=1)throw fenced();
-            if(SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session,new Document("_id",scope.pipelineId()).append("scope",state.get("scope"))
-                            .append("epoch",state.get("epoch")).append("runtimeWriteFence",state.get("runtimeWriteFence")),
-                    new Document("$set",new Document("stateJson",StateJson.of(PipelineState.STOPPED)).append("epoch",epoch).append("runtimeWriteFence",write))).getMatchedCount()!=1)throw fenced();
+            var checkpoint = new Document("stateJson", StateJson.of(PipelineState.STOPPED))
+                    .append("epoch", epoch).append("runtimeWriteFence", write);
+            if (!MongoCachePipelineStateStore.update(database, session, state, new Document("$set", checkpoint))) throw fenced();
             models(scope).retireInTransaction(session, false);
             return new Receipt(this,original,Optional.of(retired));
         });
@@ -131,6 +131,9 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
             else receipt.owner.requireAbsent(session,receipt.preparation().request().scope());
             receipt.owner.models(receipt.preparation().request().scope()).requireAbsentInTransaction(session);return null;
         });
+    }
+    private <T> T checkpointTransaction(PipelineRetirementPreparation original, Function<ClientSession, T> action) {
+        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(original, action));
     }
     private <T>T transaction(PipelineRetirementPreparation original,Function<ClientSession,T> action) {
         return StoreIo.call(() -> {check(original);try(var session=client.startSession()) {

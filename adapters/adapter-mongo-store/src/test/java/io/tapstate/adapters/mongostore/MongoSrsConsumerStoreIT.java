@@ -23,6 +23,7 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.spi.store.WriterProgressUpdate;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
@@ -1127,6 +1128,23 @@ class MongoSrsConsumerStoreIT {
                 assertThat(reopened.advanceWriter(A,1,"run-a","orders","slow",point(1,7,"t7"),f.fenceA())).isTrue();
                 assertThat(reopened.cursor(A).orElseThrow().sinkAcked().token()).isEqualTo("t7");
             }
+        });
+    }
+
+    @Test
+    void reportsInOneOriginalRunAdvanceTheCheckpointFenceOnce() {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A, 1, "run", Map.of("orders", List.of("fast", "slow")), f.fenceA())).isTrue();
+            var checkpoints = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var id = new Document("_id", positionScope(A).pipelineId());
+            long fence = checkpoints.find(id).first().getLong("runtimeWriteFence");
+            assertThat(f.consumers().advanceWriters(A, 1, "run", List.of(
+                    new WriterProgressUpdate("orders", "fast", point(1, 10, "t10")),
+                    new WriterProgressUpdate("orders", "slow", point(1, 6, "t6"))), f.fenceA())).isTrue();
+            assertThat(f.consumers().progress(A).orElseThrow().cursor().sinkAcked())
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 6), "t6"));
+            assertThat(checkpoints.find(id).first().getLong("runtimeWriteFence")).isEqualTo(fence + 1);
         });
     }
 

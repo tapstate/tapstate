@@ -177,6 +177,25 @@ class MongoCacheRateHistoryStoreIT {
         });
     }
 
+    @Test void runtimeSamplingBudgetAlsoBoundsAMetadataStall() {
+        withFixture(Duration.ofDays(15), f -> {
+            var before = f.snapshot();
+            failpoint(f.client, new Document("failCommands", List.of("listCollections"))
+                    .append("blockConnection", true).append("blockTimeMS", 4000));
+            long started = System.nanoTime();
+            try {
+                assertCode(() -> f.writer(f.client, ACTIVE).appendWithin(sample(0, 1), Duration.ofMillis(400)),
+                        IoError.STORE_UNAVAILABLE);
+                assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(3));
+            } finally {
+                clearFailpoint(f.client);
+            }
+            assertThat(f.snapshot()).isEqualTo(before);
+            f.writer(f.client, ACTIVE).append(sample(0, 1));
+            assertThat(f.rows().countDocuments()).isEqualTo(1);
+        });
+    }
+
     @Test void losingTheOriginalGuardAfterInsertionRollsBackTheSampleAndBothWriteFences() {
         withFixture(Duration.ofDays(15), f -> {
             var before = f.snapshot(); var live = new AtomicBoolean(true); var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent e) {

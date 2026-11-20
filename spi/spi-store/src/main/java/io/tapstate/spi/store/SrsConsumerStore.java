@@ -106,6 +106,16 @@ public interface SrsConsumerStore {
     boolean advanceWriter(SrsConsumerContext context, long membershipRevision, String runId, String table, String writerId,
                           WriterProgress progress, WorkloadClaimFence originalPipelineFence);
 
+    /** Applies reports for one original run and returns only after the original store has committed them. */
+    default boolean advanceWriters(SrsConsumerContext context, long membershipRevision, String runId,
+            List<WriterProgressUpdate> reports, WorkloadClaimFence fence) {
+        for (var report : reports) {
+            if (!advanceWriter(context, membershipRevision, runId, report.table(), report.writerId(), report.progress(), fence))
+                return false;
+        }
+        return true;
+    }
+
     /**
      * Saves the original first arrival and its initial read cursor together. A retained confirmed place is never raised by a later arrival.
      * A held place covering the requested floor succeeds without adopting a later progress revision; a new place uses only the original expected revision.

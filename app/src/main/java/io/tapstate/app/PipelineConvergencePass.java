@@ -31,20 +31,28 @@ final class PipelineConvergencePass {
     private final StateStore state;
     private final AtomicReference<PipelineCaptureBindings> captures = new AtomicReference<>();
 
-    private final io.tapstate.spi.store.RateHistoryStore rateHistory = new io.tapstate.spi.store.RateHistoryStore() {
-        @Override public void append(io.tapstate.core.lifecycle.RateSample sample) {
-            WorkloadClaimFence original = claim.get(); requirePipeline(sample.pipelineId());
-            views.pipelineRateHistory(scope(), original, requireActive).append(sample);
-        }
-        @Override public Page readPage(String id, Instant from, Instant to, Key after, int limit) {
-            requirePipeline(id); return views.pipelineRateHistory(scope()).readPage(id, from, to, after, limit);
-        }
-        @Override public Optional<Entry> read(String id, Key key) { requirePipeline(id); return views.pipelineRateHistory(scope()).read(id, key); }
-        @Override public Optional<Entry> predecessor(String id, Instant at) { requirePipeline(id); return views.pipelineRateHistory(scope()).predecessor(id, at); }
-        @Override public Optional<Entry> successor(String id, Instant at) { requirePipeline(id); return views.pipelineRateHistory(scope()).successor(id, at); }
-        @Override public void deleteAll(String id) { throw fenced(); }
-        @Override public java.time.Duration retention() { requirePipeline(scope().pipelineId()); return views.pipelineRateHistory(scope()).retention(); }
-    };
+    private final io.tapstate.spi.store.RateHistoryStore rateHistory = rateHistory(null);
+    private final io.tapstate.spi.store.RateHistoryStore timedRateHistory = rateHistory(java.time.Duration.ofSeconds(2));
+
+    private io.tapstate.spi.store.RateHistoryStore rateHistory(java.time.Duration timeout) {
+        return new io.tapstate.spi.store.RateHistoryStore() {
+            @Override public void append(io.tapstate.core.lifecycle.RateSample sample) {
+                WorkloadClaimFence original = claim.get(); requirePipeline(sample.pipelineId());
+                var destination = views.pipelineRateHistory(scope(), original, requireActive);
+                if (timeout == null) destination.append(sample);
+                else destination.appendWithin(sample, timeout);
+            }
+            @Override public Page readPage(String id, Instant from, Instant to, Key after, int limit) {
+                requirePipeline(id); return views.pipelineRateHistory(scope()).readPage(id, from, to, after, limit);
+            }
+            @Override public Optional<Entry> read(String id, Key key) { requirePipeline(id); return views.pipelineRateHistory(scope()).read(id, key); }
+            @Override public Optional<Entry> predecessor(String id, Instant at) { requirePipeline(id); return views.pipelineRateHistory(scope()).predecessor(id, at); }
+            @Override public Optional<Entry> successor(String id, Instant at) { requirePipeline(id); return views.pipelineRateHistory(scope()).successor(id, at); }
+            @Override public void deleteAll(String id) { throw fenced(); }
+            @Override public java.time.Duration retention() { requirePipeline(scope().pipelineId()); return views.pipelineRateHistory(scope()).retention(); }
+        };
+    }
+
     private final io.tapstate.spi.store.DerivedSchemaStore derivedSchemas = new io.tapstate.spi.store.DerivedSchemaStore() {
         @Override public boolean supportsStartupBatch() { return true; }
         @Override public Map<String, io.tapstate.spi.store.DerivedSchema> latestMany(String id, java.util.Set<String> steps) {
@@ -136,6 +144,9 @@ final class PipelineConvergencePass {
     }
     io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() { return derivedSchemas; }
     io.tapstate.spi.store.RateHistoryStore rateHistory() { return rateHistory; }
+    io.tapstate.spi.store.RateHistoryStore rateHistory(boolean deadline) {
+        return deadline ? timedRateHistory : rateHistory;
+    }
 
     io.tapstate.spi.store.NestShapeStore nestShapes(String database) {
         Objects.requireNonNull(database, "database");

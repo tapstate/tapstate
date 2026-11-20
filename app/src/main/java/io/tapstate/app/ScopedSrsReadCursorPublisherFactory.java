@@ -21,9 +21,13 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
     @Override public boolean requiresDurableLog() { return true; }
     @Override public LongConsumer resolve(HazelcastInstance member) {
         var bound = ScopedSrsConsumerAccess.bind(member,run);
+        var progressWrites = CheckpointProgressWrites.of(member);
         return sequence -> {
             bound.requireClaim(null);
-            if (!bound.store().advanceReadSequence(run.context(),run.membershipRevision(),table,sequence,run.originalClaim())) throw ScopedSrsConsumerAccess.refused(run);
+            boolean committed = progressWrites == null
+                    ? bound.store().advanceReadSequence(run.context(),run.membershipRevision(),table,sequence,run.originalClaim())
+                    : progressWrites.read(bound, table, sequence);
+            if (!committed) throw ScopedSrsConsumerAccess.refused(run);
         };
     }
     @Override public io.tapstate.runtime.srs.SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {

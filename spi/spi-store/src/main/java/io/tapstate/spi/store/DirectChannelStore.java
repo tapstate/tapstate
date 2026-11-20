@@ -26,4 +26,14 @@ public interface DirectChannelStore {
     boolean beginWriterRun(DirectChannelContext context,long epoch,String runId,Map<String,List<String>> expected,WorkloadClaimFence originalPipeline);
     boolean recordBatch(DirectBatch original,long expectedRecordedThrough,WorkloadClaimFence originalCapture,WorkloadClaimFence originalPipeline);
     boolean advanceWriter(DirectChannelContext context,long epoch,String runId,String table,String writer,WriterProgress report,WorkloadClaimFence originalPipeline);
+
+    /** Applies reports for one original run and returns only after the original store has committed them. */
+    default boolean advanceWriters(DirectChannelContext context, long epoch, String runId,
+            List<WriterProgressUpdate> reports, WorkloadClaimFence originalPipeline) {
+        for (var report : reports) {
+            if (!advanceWriter(context, epoch, runId, report.table(), report.writerId(), report.progress(), originalPipeline))
+                return false;
+        }
+        return true;
+    }
 }

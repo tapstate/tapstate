@@ -134,18 +134,34 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
             settleAndReplace(session,old,added,old.cursor(),old.writerRun(),pending); return true;
         });
     }
-    @Override public boolean advanceWriter(DirectChannelContext context,long epoch,String runId,String table,String writer,WriterProgress report,WorkloadClaimFence pipeline) {
-        Objects.requireNonNull(report,"report");
-        return transaction(context,pipeline,(session,held) -> {
-            var old = held.value(); var current = old.current(); var run = old.writerRun();
-            if (current == null || current.epoch() != epoch || run == null || !run.accounting().runId().equals(runId)) return false;
-            if (!current.pipelineFence().equals(pipeline) || !run.commandFence().equals(pipeline)) throw fenced();
-            if (!run.accounting().expectedFor(table).contains(writer)) throw unavailable(context);
-            if (current.anchor() == null && !snapshotBeforeRequestedAnchor(old, report)) throw unavailable(context);
-            var next = DirectChannelAccounting.report(old,table,writer,report);
-            if (!next.cursor().equals(old.cursor()) || !next.writers().equals(run)) {
-                if (current.anchor() == null) replace(session,old,next(old,current,old.retained(),next.cursor(),next.writers()),held.current(),held.retained());
-                else settleAndReplace(session,old,current,next.cursor(),next.writers(),held.current());
+    @Override public boolean advanceWriter(DirectChannelContext context, long epoch, String runId,
+            String table, String writer, WriterProgress report, WorkloadClaimFence pipeline) {
+        return advanceWriters(context, epoch, runId, List.of(new WriterProgressUpdate(table, writer, report)), pipeline);
+    }
+
+    @Override public boolean advanceWriters(DirectChannelContext context, long epoch, String runId,
+            List<WriterProgressUpdate> reports, WorkloadClaimFence pipeline) {
+        List<WriterProgressUpdate> original = List.copyOf(reports);
+        if (original.isEmpty()) return true;
+        return transaction(context, pipeline, (session, first) -> {
+            var held = first;
+            for (int i = 0; i < original.size(); i++) {
+                var update = original.get(i);
+                var old = held.value();
+                var current = old.current();
+                var run = old.writerRun();
+                if (current == null || current.epoch() != epoch || run == null || !run.accounting().runId().equals(runId))
+                    return false;
+                if (!current.pipelineFence().equals(pipeline) || !run.commandFence().equals(pipeline)) throw fenced();
+                if (!run.accounting().expectedFor(update.table()).contains(update.writerId())) throw unavailable(context);
+                if (current.anchor() == null && !snapshotBeforeRequestedAnchor(old, update.progress())) throw unavailable(context);
+                var next = DirectChannelAccounting.report(old, update.table(), update.writerId(), update.progress());
+                if (!next.cursor().equals(old.cursor()) || !next.writers().equals(run)) {
+                    if (current.anchor() == null)
+                        replace(session, old, next(old, current, old.retained(), next.cursor(), next.writers()), held.current(), held.retained());
+                    else settleAndReplace(session, old, current, next.cursor(), next.writers(), held.current());
+                }
+                if (i + 1 < original.size()) held = held(session, context);
             }
             return true;
         });

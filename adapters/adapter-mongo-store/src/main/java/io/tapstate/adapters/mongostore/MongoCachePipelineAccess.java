@@ -83,6 +83,14 @@ final class MongoCachePipelineAccess {
 
     <T> T observationTransaction(Function<ClientSession, T> action) { return transaction(true, action); }
 
+    <T> T checkpointTransaction(Function<ClientSession, T> action) {
+        return checkpointTransaction(TRANSACTION, action);
+    }
+
+    private <T> T checkpointTransaction(TransactionOptions options, Function<ClientSession, T> action) {
+        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(false, options, action));
+    }
+
     private <T> T transaction(boolean observation, Function<ClientSession, T> action) {
         return transaction(observation, TRANSACTION, action);
     }
@@ -244,7 +252,7 @@ final class MongoCachePipelineAccess {
 
     <T> T metadataTransaction(SystemCollections table, MongoDatabase target, boolean mutation, Function<ClientSession, T> action) {
         if(authoringModels!=null)authoringModels.requireActive();
-        T result = transaction(session -> {
+        Function<ClientSession, T> write = session -> {
             if (unpreparedModels) {
                 if (table != SystemCollections.CACHE_DERIVED_SCHEMAS || !database.getName().equals(target.getName())) throw fenced();
                 requireUnpreparedModels(session);
@@ -265,10 +273,46 @@ final class MongoCachePipelineAccess {
             new MongoCacheMetadataStructure(target, rateRetention).verifyFacet(table);
             if (mutation) { proveClaim(session); updateState(session, current, new Document(), false); }
             return action.apply(session);
-        });
+        };
+        T result = mutation ? checkpointTransaction(write) : transaction(write);
         if(authoringModels!=null)authoringModels.requireActive();
         requireActive.run(); return result;
     }
+    <T> T appendRateSample(java.time.Duration timeout, Function<ClientSession, T> action) {
+        var budget = new MongoReadBudget(timeout);
+        try {
+            requireActive.run();
+            return budget.transaction(client, session -> {
+                requireActive.run();
+                new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(),
+                        scope.bindingVersion(), scope.cacheIncarnation())).requireAdmissionState(session);
+                verifyStateStructure(budget);
+                MongoCacheWorkloadClaimStore.requireCollection(budget.database(database));
+                T result = rateHistoryOperation(session, true, budget, action);
+                requireActive.run();
+                return result;
+            });
+        } catch (RuntimeException failure) {
+            requireActive.run();
+            throw failure;
+        }
+    }
+
+    <T> T rateHistoryTransaction(boolean mutation, Function<ClientSession, T> action) {
+        return transaction(session -> rateHistoryOperation(session, mutation, null, action));
+    }
+
+    private <T> T rateHistoryOperation(ClientSession session, boolean mutation, MongoReadBudget budget,
+            Function<ClientSession, T> action) {
+        state(session, budget != null);
+        new MongoCacheMetadataStructure(database, rateRetention)
+                .verifyFacet(SystemCollections.CACHE_PIPELINE_RATE_HISTORY, budget == null ? null : budget::remainingMillis);
+        // Keep the original claim write in the sample transaction. Ordinary checkpoint
+        // progress neither invalidates this claim nor needs to serialize with sampling.
+        if (mutation) proveClaim(session, "fencedPipelineWrites", budget != null);
+        return action.apply(session);
+    }
+
     private void requireUnpreparedModels(ClientSession session) {
         var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
         var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
@@ -294,7 +338,7 @@ final class MongoCachePipelineAccess {
 
     <T> T operatorPreparation(Function<ClientSession, T> action) {
         var local = TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
-        return transaction(false, local, session -> {
+        return checkpointTransaction(local, session -> {
             Document current = state(session); proveClaim(session); updateState(session, current, new Document(), false);
             return action.apply(session);
         });
@@ -302,7 +346,7 @@ final class MongoCachePipelineAccess {
 
     <T> T recoveredOperatorPreparation(WorkloadClaimFence node,Function<ClientSession,T> action) {
         var local=TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
-        return transaction(false,local,session -> {
+        return checkpointTransaction(local,session -> {
             var business=new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation());
             new MongoCacheBusinessIdentity(database,business).admitMetadataWrite(session);
             MongoCachePipelinePreparations.proveNode(session,database,business,node);
@@ -454,16 +498,7 @@ final class MongoCachePipelineAccess {
 
     /** This real write also serializes an observation with replacement of the current state scope. */
     void updateState(ClientSession session, Document current, Document values, boolean advanceEpoch) {
-        long revision = current.getLong("runtimeWriteFence");
-        if (revision == Long.MAX_VALUE - 1 || (advanceEpoch && current.getLong("epoch") == Long.MAX_VALUE - 1)) throw fenced();
-        Document increments = new Document("runtimeWriteFence", 1L);
-        if (advanceEpoch) increments.append("epoch", 1L);
-        Document update = new Document("$inc", increments);
-        if (!values.isEmpty()) update.append("$set", values);
-        if (SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session,
-                new Document("_id", scope.pipelineId()).append("scope", current.get("scope"))
-                        .append("epoch", current.getLong("epoch")).append("runtimeWriteFence", revision), update).getMatchedCount() != 1)
-            throw new IllegalStateException("Pipeline state changed within its transaction snapshot");
+        MongoCachePipelineStateStore.advanceFence(database, session, current, values, advanceEpoch);
     }
 
     void verifyStructures() {

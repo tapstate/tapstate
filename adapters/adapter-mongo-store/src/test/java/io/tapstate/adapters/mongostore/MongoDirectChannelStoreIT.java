@@ -69,8 +69,13 @@ class MongoDirectChannelStoreIT {
             f.store().recordBatch(first,0,f.captureFence(),f.pipelineFence()); f.store().recordBatch(second,1,f.captureFence(),f.pipelineFence());
             f.store().advanceWriter(CONTEXT,1,"run","quiet","writer",point(1,3),f.pipelineFence());
             assertThat(f.store().pending(CONTEXT,1)).containsExactly(first,second);
-            f.store().advanceWriter(CONTEXT,1,"run","orders","fast",point(1,1),f.pipelineFence());
-            f.store().advanceWriter(CONTEXT,1,"run","orders","slow",point(1,1),f.pipelineFence());
+            var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var id = new Document("_id", SCOPE.pipelineId());
+            long fence = checkpoint.find(id).first().getLong("runtimeWriteFence");
+            assertThat(f.store().advanceWriters(CONTEXT, 1, "run", List.of(
+                    new WriterProgressUpdate("orders", "fast", point(1, 1)),
+                    new WriterProgressUpdate("orders", "slow", point(1, 1))), f.pipelineFence())).isTrue();
+            assertThat(checkpoint.find(id).first().getLong("runtimeWriteFence")).isEqualTo(fence + 1);
             assertThat(f.store().pending(CONTEXT,1)).isEmpty(); assertThat(f.store().load(CONTEXT).cursor().sinkAcked()).isEqualTo(second.boundary());
             assertThat(f.store().recordBatch(first,0,f.captureFence(),f.pipelineFence())).isFalse();
         });

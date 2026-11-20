@@ -1,20 +1,97 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StateStore;
 import org.bson.Document;
 
 import java.time.Instant;
+import java.util.Map;
 import java.util.Objects;
+import java.util.WeakHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 import java.util.Optional;
 
-/** A load-only checkpoint view; normal convergence cannot create or retire physical state. */
+/** Writes the native checkpoint within each caller's original CACHE transaction. */
 final class MongoCachePipelineStateStore implements StateStore {
+    private static final int MAX_CALLERS = 1024;
+    private record Writer(ReentrantLock transaction, Semaphore capacity) {
+        private Writer() { this(new ReentrantLock(true), new Semaphore(MAX_CALLERS)); }
+    }
+
+    private static final Map<MongoClient, Writer> WRITERS = new WeakHashMap<>();
+
+    /** Admit a write before starting its transaction. Independent clients still contend at MongoDB. */
+    static <T> T writeTransaction(MongoClient client, Supplier<T> operation) {
+        Writer writer;
+        synchronized (WRITERS) {
+            writer = WRITERS.computeIfAbsent(client, ignored -> new Writer());
+        }
+        if (writer.transaction().isHeldByCurrentThread()) return operation.get();
+        if (!writer.capacity().tryAcquire()) throw unavailable("checkpoint writer capacity exhausted");
+        try {
+            writer.transaction().lockInterruptibly();
+            try {
+                return operation.get();
+            } finally {
+                writer.transaction().unlock();
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw unavailable("checkpoint writer interrupted");
+        } finally {
+            writer.capacity().release();
+        }
+    }
+
+    private static TapstateException unavailable(String detail) {
+        return new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", detail), null);
+    }
+
     private final MongoCachePipelineAccess access;
     private final java.util.function.Supplier<CheckpointDoc> reading;
     MongoCachePipelineStateStore(MongoCachePipelineAccess access){this(access,null);}
     MongoCachePipelineStateStore(MongoCachePipelineAccess access,java.util.function.Supplier<CheckpointDoc> reading){this.access=access;this.reading=reading;}
+
+    static void advanceFence(MongoDatabase database, ClientSession session, Document current,
+            Document values, boolean advanceEpoch) {
+        long revision = current.getLong("runtimeWriteFence");
+        if (revision == Long.MAX_VALUE - 1
+                || (advanceEpoch && current.getLong("epoch") == Long.MAX_VALUE - 1))
+            throw MongoCachePipelineAccess.fenced();
+        Document increments = new Document("runtimeWriteFence", 1L);
+        if (advanceEpoch) increments.append("epoch", 1L);
+        Document changes = new Document("$inc", increments);
+        if (!values.isEmpty()) changes.append("$set", values);
+        if (!update(database, session, current, changes))
+            throw new IllegalStateException("Pipeline state changed within its transaction snapshot");
+    }
+
+    static boolean update(MongoDatabase database, ClientSession session, Document current, Document changes) {
+        return SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session, version(current), changes)
+                .getMatchedCount() == 1;
+    }
+
+    static boolean seed(MongoDatabase database, ClientSession session, Document initial, Document retired) {
+        var rows = SystemCollections.CACHE_PIPELINE_STATE.on(database);
+        if (retired == null) {
+            rows.insertOne(session, initial);
+            return true;
+        }
+        return rows.replaceOne(session, version(retired), initial).getMatchedCount() == 1;
+    }
+
+    private static Document version(Document row) {
+        return new Document("_id", row.get("_id")).append("scope", row.get("scope"))
+                .append("epoch", row.get("epoch")).append("runtimeWriteFence", row.get("runtimeWriteFence"));
+    }
 
     @Override public Optional<CheckpointDoc> read(String pipelineId) {
         access.requirePipeline(pipelineId);
@@ -30,7 +107,7 @@ final class MongoCachePipelineStateStore implements StateStore {
     @Override public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime) {
         access.requirePipeline(pipelineId); Objects.requireNonNull(nextStateJson, "stateJson"); Objects.requireNonNull(touchTime, "touchTime");
         if (expectedEpoch < 0) throw new IllegalArgumentException("expected epoch must be nonnegative");
-        return access.transaction(session -> {
+        return access.checkpointTransaction(session -> {
             Document current = access.state(session);
             access.proveClaim(session);
             long epoch = current.getLong("epoch");
@@ -48,7 +125,7 @@ final class MongoCachePipelineStateStore implements StateStore {
     @Override public CasOutcome recordLeaseRecovery(String pipelineId, CheckpointDoc expected,
             CheckpointDoc.LeaseRecovery recovery, Instant at) {
         access.requirePipeline(pipelineId);
-        return access.transaction(session -> {
+        return access.checkpointTransaction(session -> {
             Document current = access.state(session);
             var checkpoint = MongoStateStore.toCheckpoint(current);
             if (checkpoint.epoch() != expected.epoch()
