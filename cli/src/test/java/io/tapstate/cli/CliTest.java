@@ -103,6 +103,17 @@ class CliTest {
     }
 
     @Test
+    void literalHelpArgumentStillChecksConflictingLaunchTargets() {
+        LaunchOptions launch = LaunchOptions.parse(
+                "--connect", "http://127.0.0.1:1", "--context", "dev", "status", "--", "--help");
+        var controlPlane = new FakeHealthProbe(false);
+
+        assertThat(Cli.runSession(launch, () -> controlPlane)).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(controlPlane.probed).isEmpty();
+        assertThat(controlPlane.logins).isEmpty();
+    }
+
+    @Test
     void theCompositeVerbIsUpAndNoLongerAReservedRun() {
         // `run` was the placeholder for apply-then-start; the verb shipped as `up`, so the placeholder
         // is gone rather than kept beside the real thing, and `up` is a real command on the table
