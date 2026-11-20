@@ -98,7 +98,7 @@ class AStreamedReadEndsSoTheSessionCanMoveTest {
                 """;
         var observed = new java.util.concurrent.atomic.AtomicReference<StatusOutcome.Found>();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        try (var server = ClosingWebsocketServer.start(frame); var client = new HttpControlPlaneClient()) {
+        try (var server = ClosingWebsocketServer.untilPeerCloses(frame); var client = new HttpControlPlaneClient()) {
             client.watchStatus(server.baseUrl(), "tok", "pl1", new StatusStream() {
                 public void state(String pipeline, String state, String code, String message) { throw new AssertionError("frame flattened"); }
                 public void state(StatusOutcome.Found found) { observed.set(found); }
@@ -169,6 +169,7 @@ class AStreamedReadEndsSoTheSessionCanMoveTest {
         private final String frame;
         private final boolean pong;
         private final boolean wrongPong;
+        private final boolean waitForPeerClose;
         private volatile boolean refuse;
         private final AtomicInteger pongs = new AtomicInteger();
         private final Thread accepting;
@@ -179,10 +180,16 @@ class AStreamedReadEndsSoTheSessionCanMoveTest {
         }
 
         private ClosingWebsocketServer(ServerSocket socket, String frame, boolean pong, boolean wrongPong) {
+            this(socket, frame, pong, wrongPong, false);
+        }
+
+        private ClosingWebsocketServer(ServerSocket socket, String frame, boolean pong, boolean wrongPong,
+                boolean waitForPeerClose) {
             this.socket = socket;
             this.frame = frame;
             this.pong = pong;
             this.wrongPong = wrongPong;
+            this.waitForPeerClose = waitForPeerClose;
             this.accepting = new Thread(this::acceptUntilClosed, "closing-websocket-server");
             this.accepting.setDaemon(true);
             this.accepting.start();
@@ -196,6 +203,11 @@ class AStreamedReadEndsSoTheSessionCanMoveTest {
 
         static ClosingWebsocketServer start(String frame) throws IOException {
             return new ClosingWebsocketServer(new ServerSocket(0, 16, InetAddress.getLoopbackAddress()), frame);
+        }
+
+        static ClosingWebsocketServer untilPeerCloses(String frame) throws IOException {
+            return new ClosingWebsocketServer(new ServerSocket(0, 16, InetAddress.getLoopbackAddress()),
+                    frame, false, false, true);
         }
 
         static ClosingWebsocketServer withPongs(boolean wrong) throws IOException {
@@ -228,6 +240,12 @@ class AStreamedReadEndsSoTheSessionCanMoveTest {
                         if (bytes.length < 126) output.writeByte(bytes.length);
                         else { output.writeByte(126); output.writeShort(bytes.length); }
                         output.write(bytes); output.flush();
+                    }
+                    if (waitForPeerClose) {
+                        // A flushed frame is not a delivery acknowledgement. Keep this content fixture
+                        // alive until the client observes it and cancels; abrupt EOF is tested separately.
+                        connection.setSoTimeout(5000);
+                        while (connection.getInputStream().read() >= 0) { }
                     }
                     if (pong) answerPings(connection);
                 } catch (IOException | RuntimeException closedOrRefused) {
