@@ -44,6 +44,11 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private final HttpClient http;
     private final Function<String, URI> requestUriFactory;
     private final Duration responseTimeout;
+    private final ManagedAiProvider.Signer signer;
+    private final int requestsPerMinute;
+    private long requestWindow = System.nanoTime();
+    private int attemptsInWindow;
+    private final java.util.concurrent.Semaphore managedConcurrency = new java.util.concurrent.Semaphore(4);
 
     public OpenAiCompatibleClient() {
         this(OpenAiCompatibleEndpointPolicy::requestUri, DEFAULT_RESPONSE_TIMEOUT);
@@ -58,6 +63,13 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
 
     OpenAiCompatibleClient(Function<String, URI> requestUriFactory, Duration responseTimeout) {
+        this(requestUriFactory, responseTimeout, null, 0);
+    }
+
+    OpenAiCompatibleClient(Function<String, URI> requestUriFactory, Duration responseTimeout,
+            ManagedAiProvider.Signer signer, int requestsPerMinute) {
+        this.signer = signer;
+        this.requestsPerMinute = requestsPerMinute;
         this.requestUriFactory = java.util.Objects.requireNonNull(requestUriFactory);
         this.responseTimeout = java.util.Objects.requireNonNull(responseTimeout);
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10))
@@ -171,6 +183,29 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
 
     @Override public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
             Map<String, Object> context, AiProviderClient.Output output) {
+        if (signer == null) return proposeOnce(settings, messages, context, output, null);
+        if (!managedConcurrency.tryAcquire()) throw AiProviderService.error(ControlError.AI_OVERLOADED);
+        long started = System.nanoTime();
+        var usage = new TokenUsage();
+        String outcome = "stream-completed";
+        try {
+            return proposeOnce(settings, messages, context, output, usage);
+        } catch (TapstateException error) {
+            outcome = error.code().code();
+            throw error;
+        } catch (RuntimeException error) {
+            outcome = "interrupted";
+            throw error;
+        } finally {
+            managedConcurrency.release();
+            LOG.log(System.Logger.Level.INFO, "Managed AI model={0} outcome={1} elapsedMs={2} inputTokens={3} outputTokens={4}",
+                    settings.model(), outcome, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+                    usage.input, usage.output);
+        }
+    }
+
+    private Optional<Map<String, Object>> proposeOnce(AiProviderSettings settings, List<Map<String, String>> messages,
+            Map<String, Object> context, AiProviderClient.Output output, TokenUsage usage) {
         boolean proposalEnabled = !Boolean.FALSE.equals(context.get("proposalEnabled"));
         List<Map<String, String>> prompt = new ArrayList<>();
         String guidance = guidance(proposalEnabled, context);
@@ -187,7 +222,11 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         requestBody.put("model", settings.model());
         requestBody.put("messages", prompt);
         requestBody.put("stream", true);
-        requestBody.put("max_tokens", 8192);
+        if (signer != null) {
+            requestBody.put("max_completion_tokens", 4096);
+            requestBody.put("reasoning_effort", "low");
+            requestBody.put("stream_options", Map.of("include_usage", true));
+        } else requestBody.put("max_tokens", 8192);
         if (responses(settings)) requestBody.put("reasoning", Map.of("summary", "concise"));
         if (proposalEnabled) {
             requestBody.put("tools", List.of(tool));
@@ -195,8 +234,9 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                     JSON_FUNCTION, Map.of("name", "propose_pipeline")));
         }
         Map<String, Object> body = Map.copyOf(requestBody);
+        if (signer != null) return read(settings, body, output, proposalEnabled, usage);
         var safeOutput = new RedactedOutput(settings.apiKey(), output);
-        Optional<Map<String, Object>> candidate = read(settings, body, safeOutput, proposalEnabled);
+        Optional<Map<String, Object>> candidate = read(settings, body, safeOutput, proposalEnabled, null);
         if (candidate.stream().anyMatch(value -> containsSecret(value, settings.apiKey()))) throw invalid();
         safeOutput.finish();
         return candidate;
@@ -418,7 +458,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
 
     @SuppressWarnings("unchecked")
     private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, AiProviderClient.Output text,
-            boolean proposalEnabled) {
+            boolean proposalEnabled, TokenUsage usage) {
         for (int attempt = 0; attempt < STREAM_ATTEMPTS; attempt++) {
             long deadline = System.nanoTime() + responseTimeout.toNanos();
             boolean[] emitted = {false};
@@ -428,18 +468,23 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                     if (response.statusCode() < 200 || response.statusCode() >= 300) {
                         LOG.log(System.Logger.Level.WARNING, "AI provider stream returned HTTP {0}", response.statusCode());
                     }
+                    if (signer != null && (response.statusCode() == 429 || response.statusCode() == 503)
+                            && attempt < STREAM_ATTEMPTS - 1) {
+                        Thread.sleep(250);
+                        continue;
+                    }
                     requireSuccessfulResponse(response.statusCode());
                     AiProviderClient.Output emit = new AiProviderClient.Output() {
                         public void accept(String delta) { emitted[0] = true; text.accept(delta); }
                         public void reasoning(AiProviderClient.Reasoning part) { emitted[0] = true; text.reasoning(part); }
                     };
                     return responses(settings) ? readResponses(input, emit, proposalEnabled)
-                            : readEvents(input, emit, proposalEnabled);
+                            : readEvents(input, emit, proposalEnabled, usage);
                 }
             } catch (RetryableStreamException error) {
                 if (emitted[0]) throw failed();
                 if (attempt >= STREAM_ATTEMPTS - 1) {
-                    if (responses(settings)) throw failed();
+                    if (responses(settings) || signer != null) throw failed();
                     return readNonStreaming(settings, body, text, proposalEnabled);
                 }
                 LOG.log(System.Logger.Level.WARNING, "Retrying AI provider after an empty upstream error stream");
@@ -487,7 +532,8 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             throw failed();
         } catch (IllegalArgumentException | ClassCastException error) { throw invalid(); }
     }
-    private static Optional<Map<String, Object>> readEvents(InputStream input, Consumer<String> text, boolean proposalEnabled) throws java.io.IOException {
+    private static Optional<Map<String, Object>> readEvents(InputStream input, Consumer<String> text,
+            boolean proposalEnabled, TokenUsage usage) throws java.io.IOException {
         BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
         StreamState state = new StreamState();
         BoundedLine line;
@@ -503,8 +549,9 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 state.done = true;
                 break;
             }
-            readChunk(data, state, text);
+            readChunk(data, state, text, usage);
         }
+        if (usage != null && !("stop".equals(state.finish) || "tool_calls".equals(state.finish))) throw invalid();
         if (!state.done) throw invalid();
         if (!state.toolCallStarted) {
             return Optional.empty();
@@ -514,7 +561,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 || !"propose_pipeline".equals(state.function)) throw invalid();
         return Optional.of(candidate(state.arguments.toString()));
     }
-    private static void readChunk(String data, StreamState state, Consumer<String> text) {
+    private static void readChunk(String data, StreamState state, Consumer<String> text, TokenUsage usage) {
         Map<String, Object> chunk = object(JsonReader.parse(data));
         if (chunk.containsKey("error")) {
             Object error = chunk.get("error");
@@ -523,6 +570,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             LOG.log(System.Logger.Level.WARNING, "AI provider stream error payload received");
             if ("upstream_error".equals(type)) throw new RetryableStreamException();
             throw failed();
+        }
+        if (usage != null && chunk.get("usage") instanceof Map<?, ?> counts) {
+            usage.input = tokenCount(counts.get("prompt_tokens"));
+            usage.output = tokenCount(counts.get("completion_tokens"));
         }
         Object rawChoices = chunk.get("choices");
         if (!(rawChoices instanceof List<?> choices)) {
@@ -539,6 +590,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             for (Object raw : calls) appendToolCall(raw, state, text);
         }
     }
+    private static long tokenCount(Object value) {
+        return value instanceof Number count && count.longValue() >= 0 ? count.longValue() : -1;
+    }
+
     private static void appendToolCall(Object raw, StreamState state, Consumer<String> text) {
         state.toolCallStarted = true;
         Map<String, Object> call = object(raw);
@@ -579,6 +634,11 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         private boolean done;
         private boolean toolCallStarted;
     }
+    private static final class TokenUsage {
+        private long input = -1;
+        private long output = -1;
+    }
+
     private enum TextChannel { CONTENT, TOOL }
     private static final class RetryableStreamException extends RuntimeException { }
     private static Map<String, Object> object(Object value) {
@@ -657,6 +717,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private HttpResponse<InputStream> send(AiProviderSettings settings, Map<String, Object> body)
             throws java.io.IOException, InterruptedException {
         var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
+        if (signer != null) return response;
         boolean negotiable = responses(settings) ? body.containsKey("reasoning") : body.containsKey("max_tokens");
         if (response.statusCode() != 400 || !negotiable) return response;
         String rejected = rejectedParameter(response);
@@ -721,10 +782,25 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private HttpRequest request(AiProviderSettings settings, Map<String, Object> body) {
         URI uri = endpoint(settings, responses(settings) ? "/responses" : "/chat/completions");
         if (responses(settings)) body = OpenAiResponsesProtocol.request(body);
-        return HttpRequest.newBuilder(uri)
-                .timeout(responseTimeout).header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + settings.apiKey())
-                .POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(body))).build();
+        var request = HttpRequest.newBuilder(uri).timeout(responseTimeout).header("Content-Type", "application/json");
+        byte[] json = JsonWriter.write(body).getBytes(StandardCharsets.UTF_8);
+        if (signer == null) request.header("Authorization", "Bearer " + settings.apiKey());
+        else {
+            if (json.length > 128 * 1024) throw AiProviderService.error(ControlError.AI_PROVIDER_REQUEST_REJECTED);
+            reserveManagedAttempt();
+            signer.sign(request, uri, json);
+        }
+        return request.POST(HttpRequest.BodyPublishers.ofByteArray(json)).build();
+    }
+
+    private synchronized void reserveManagedAttempt() {
+        long now = System.nanoTime();
+        if (now - requestWindow >= TimeUnit.MINUTES.toNanos(1)) {
+            requestWindow = now;
+            attemptsInWindow = 0;
+        }
+        if (attemptsInWindow >= requestsPerMinute) throw AiProviderService.error(ControlError.AI_PROVIDER_RATE_LIMITED);
+        attemptsInWindow++;
     }
     private static TapstateException failed() { return AiProviderService.error(ControlError.AI_PROVIDER_FAILED); }
     private static TapstateException invalid() { return AiProviderService.error(ControlError.AI_INVALID_PROPOSAL); }

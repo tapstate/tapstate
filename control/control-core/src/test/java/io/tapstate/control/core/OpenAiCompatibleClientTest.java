@@ -66,6 +66,60 @@ class OpenAiCompatibleClientTest {
         }
     }
 
+    @Test void managedStreamCarriesConversationAndToolArgumentsWithoutUsingAWorkspaceKey() throws Exception {
+        var requests = new ArrayList<Map<?, ?>>();
+        var auth = new ArrayList<String>();
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            auth.add(exchange.getRequestHeaders().getFirst("Authorization"));
+            requests.add((Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            String arguments = JsonWriter.write(Map.of("explanation", "Map the order fields.",
+                    "candidateWizard", Map.of("root", Map.of("table", "orders"))));
+            String result = switch (requests.size()) {
+                case 1 -> chunk(Map.of("content", "Orders."), "stop") + "data: [DONE]\n\n";
+                case 2 -> chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function",
+                        Map.of("name", "propose_pipeline", "arguments", arguments)))), "tool_calls")
+                        + "data: " + JsonWriter.write(Map.of("choices", List.of(), "usage",
+                                Map.of("prompt_tokens", 80, "completion_tokens", 12))) + "\n\n"
+                        + "data: [DONE]\n\n";
+                default -> chunk(Map.of("content", "Partial"), null)
+                        + "data: {\"error\":{\"type\":\"upstream_error\"}}\n\n";
+            };
+            var bytes = result.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var out = exchange.getResponseBody()) { out.write(bytes); }
+        });
+        server.start();
+        try {
+            var endpoint = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            var client = new OpenAiCompatibleClient(ignored -> endpoint, Duration.ofSeconds(5),
+                    (request, uri, bytes) -> request.header("Authorization", "signed-test"), 3);
+            var settings = new AiProviderSettings("bedrock-managed", endpoint.toString(), "global.moonshotai.kimi-k3", null);
+            var first = Map.of("role", "user", "content", "Which table did I select?");
+            var text = new StringBuilder();
+            assertThat(client.propose(settings, List.of(first), Map.of("proposalEnabled", false), text::append)).isEmpty();
+            assertThat(text.toString()).isEqualTo("Orders.");
+            var history = Map.of("role", "assistant", "content", text.toString());
+            var second = Map.of("role", "user", "content", "Add a mapping to the selected table");
+            text.setLength(0);
+            assertThat(client.propose(settings, List.of(first, history, second), Map.of(), text::append))
+                    .hasValueSatisfying(value -> assertThat(value.get("root")).isEqualTo(Map.of("table", "orders")));
+            assertThat(text.toString()).isEqualTo("Map the order fields.");
+            assertThat(requests.get(1).get("messages").toString()).contains("Orders.", "Add a mapping");
+            assertThat(requests.get(1).get("reasoning_effort")).isEqualTo("low");
+            assertThat(requests.get(1).get("max_completion_tokens")).isEqualTo(4096L);
+            assertThat(requests.get(1).get("tools")).isNotNull();
+
+            assertThatThrownBy(() -> client.propose(settings, List.of(second), Map.of(), ignored -> { }))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(auth).containsExactly("signed-test", "signed-test", "signed-test");
+            assertThatThrownBy(() -> client.propose(settings, List.of(second), Map.of(), ignored -> { }))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_RATE_LIMITED));
+            assertThat(requests).hasSize(3);
+        } finally { server.stop(0); }
+    }
+
     @Test void streamsOnlyTheTopLevelExplanationAndDecodesSplitEscapes() throws Exception {
         String arguments = "{\"candidateWizard\":{\"description\":\"not visible\",\"explanation\":\"nested decoy\"},"
                 + "\"explanation\":\"Quote: \\\"field\\\"\\n\\uD83D\\uDE80 sk-test\"}";

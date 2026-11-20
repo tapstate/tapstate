@@ -13,7 +13,22 @@ public final class AiProviderService {
         this.store = java.util.Objects.requireNonNull(store);
         this.audit = java.util.Objects.requireNonNull(audit);
     }
-    public Optional<AiProviderSettings> get(String caller) { return store.get(caller).map(value -> new AiProviderSettings(value.providerId(), value.baseUrl(), value.model(), value.apiKey())); }
+    public record SavedProvider(AiProviderSettings settings, boolean managedSelected) { }
+
+    public Optional<SavedProvider> saved(String owner) {
+        return store.get(owner).map(value -> new SavedProvider(
+                new AiProviderSettings(value.providerId(), value.baseUrl(), value.model(), value.apiKey()),
+                value.managedSelected()));
+    }
+
+    public Optional<AiProviderSettings> get(String caller) { return saved(caller).map(SavedProvider::settings); }
+
+    public void select(String owner, String actor, boolean managed) {
+        audit.dispatch(ControlOperations.AI_PROVIDER_SELECT, new AuditContext(actor, "ai-provider-settings"), () -> {
+            if (!store.selectManaged(owner, managed) && !managed) throw error(ControlError.AI_NOT_CONFIGURED);
+            return null;
+        });
+    }
     public AiProviderSettings require(String caller) {
         return validated(get(caller).orElseThrow(() -> error(ControlError.AI_NOT_CONFIGURED)));
     }

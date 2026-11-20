@@ -2,7 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AiProviderService;
 import io.tapstate.control.core.AiProviderClient;
-import io.tapstate.control.core.AiProviderSettings;
+
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.PipelineDraftError;
 import io.tapstate.control.core.PipelineDraftService;
@@ -89,7 +89,7 @@ class PipelineAssistantController {
             @RequestBody Map<String, Object> body, HttpServletRequest request, HttpServletResponse response) {
         var workspace = providers.workspace(request);
         String owner = workspace.owner();
-        var settings = providers.service().require(owner);
+        var route = providers.assistantRoute(owner, client);
         workspace.requireActive().run();
         long revision = revision(body.get("revision"));
         PipelineDraft base = current(id, revision);
@@ -120,7 +120,7 @@ class PipelineAssistantController {
                 if (!focus.isEmpty()) context.put("focus", focus);
                 streamEvents.event(Map.of("type", "text-start", "id", textId));
                 streamEvents.status("streaming");
-                Optional<Map<String, Object>> candidate = propose(settings, messages, context,
+                Optional<Map<String, Object>> candidate = propose(route, messages, context,
                         workspace.requireActive(), streamEvents, textId);
                 workspace.requireActive().run();
                 streamEvents.event(Map.of("type", "text-end", "id", textId));
@@ -137,12 +137,12 @@ class PipelineAssistantController {
                 .contentType(MediaType.TEXT_EVENT_STREAM).body(stream);
     }
 
-    private Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+    private Optional<Map<String, Object>> propose(AiProviderController.Route route, List<Map<String, String>> messages,
             Map<String, Object> context, Runnable guard, AssistantStream events, String textId) {
         try (var text = new GuardedAssistantText(guard, delta ->
                 events.event(Map.of("type", "text-delta", "id", textId, "delta", delta)),
                 part -> reasoning(events, part))) {
-            Optional<Map<String, Object>> candidate = invokeProvider(settings, messages, context, text);
+            Optional<Map<String, Object>> candidate = invokeProvider(route, messages, context, text);
             text.finish();
             return candidate;
         }
@@ -155,9 +155,9 @@ class PipelineAssistantController {
         } else events.event(Map.of("type", type, "id", part.id()));
     }
 
-    private Optional<Map<String, Object>> invokeProvider(AiProviderSettings settings, List<Map<String, String>> messages,
+    private Optional<Map<String, Object>> invokeProvider(AiProviderController.Route route, List<Map<String, String>> messages,
             Map<String, Object> context, GuardedAssistantText text) {
-        try { return client.propose(settings, messages, context, text); }
+        try { return route.client().propose(route.settings(), messages, context, text); }
         catch (RuntimeException failed) { text.throwIfFailed(); throw failed; }
     }
 

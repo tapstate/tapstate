@@ -560,6 +560,17 @@ class PipelineAssistantControllerTest {
 
     private static void verifyValidatedStream(String connector, boolean missingTransformId,
             boolean revokeDuringValidation) throws Exception {
+        verifyValidatedStream(connector, missingTransformId, revokeDuringValidation, false);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"mysql", "postgres"})
+    void managedPipelineAssistantStreamsAndValidatesAProposalAcrossTurns(String connector) throws Exception {
+        verifyValidatedStream(connector, false, false, true);
+    }
+
+    private static void verifyValidatedStream(String connector, boolean missingTransformId,
+            boolean revokeDuringValidation, boolean managed) throws Exception {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         PipelineDraft base = draft(); store.create(base);
         var artifacts = new PipelineApiTest.FakeArtifactStore();
@@ -618,6 +629,13 @@ class PipelineAssistantControllerTest {
             public void check(AiProviderSettings ignored) { }
             public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
+                if (managed) {
+                    assertThat(settings.model()).isEqualTo("global.moonshotai.kimi-k3");
+                    assertThat(settings.apiKey()).isNull();
+                    assertThat(messages.size()).isEqualTo(3);
+                    assertThat(messages.get(1)).containsEntry("role", "assistant")
+                            .containsEntry("content", "I found the orders table.");
+                }
                 providerCalls.incrementAndGet();
                 sentContext.set(context);
                 text.accept("I used the selected schema.");
@@ -625,15 +643,35 @@ class PipelineAssistantControllerTest {
                 return Optional.of(proposedCandidate.get());
             }
         };
+        var byok = managed ? org.mockito.Mockito.mock(AiProviderClient.class) : fake;
+        Runnable guard = () -> {
+            if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
+        };
+        AiProviderController providers;
+        if (managed) {
+            var managedService = org.mockito.Mockito.mock(AiProviderService.class);
+            beans.registerSingleton("mode", AuthenticationMode.CLOUD);
+            beans.registerSingleton("managed", new io.tapstate.control.core.ManagedAiProvider(new AiProviderSettings(
+                    "bedrock-managed", "https://bedrock-runtime.ap-southeast-1.amazonaws.com/openai/v1",
+                    "global.moonshotai.kimi-k3", null), fake));
+            providers = new AiProviderController(null, null, beans.getBeanProvider(AuthenticationMode.class),
+                    byok, null, beans.getBeanProvider(io.tapstate.control.core.ManagedAiProvider.class), "") {
+                @Override Workspace workspace(jakarta.servlet.http.HttpServletRequest request) {
+                    return new Workspace("workspace", guard);
+                }
+                @Override AiProviderService service() { return managedService; }
+            };
+        } else providers = providerController(fake, guard);
         var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
                 beans.getBeanProvider(SourceProjectionService.class),
                 beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
-                providerController(fake, () -> {
-                    if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
-                }), fake, mapper);
+                providers, byok, mapper);
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant");
         Map<String, Object> body = Map.of("revision", 1,
-                "messages", List.of(Map.of("role", "user", "text", "Rename the destination")));
+                "messages", managed ? List.of(Map.of("role", "user", "text", "Find the orders table"),
+                        Map.of("role", "assistant", "text", "I found the orders table."),
+                        Map.of("role", "user", "text", "Rename the destination"))
+                        : List.of(Map.of("role", "user", "text", "Rename the destination")));
         if (revokeDuringValidation) {
             for (int attempt = 0; attempt < 5; attempt++) {
                 active.set(true);

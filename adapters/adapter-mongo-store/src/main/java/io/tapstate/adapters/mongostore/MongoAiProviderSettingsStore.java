@@ -44,7 +44,8 @@ public final class MongoAiProviderSettingsStore implements AiProviderSettingsSto
         if (record == null) return Optional.empty();
         String provider = record.getString("providerId");
         String secret = decrypt(owner, context(record), record.getString("secret"));
-        return Optional.of(new Settings(provider, record.getString("baseUrl"), record.getString("model"), secret));
+        return Optional.of(new Settings(provider, record.getString("baseUrl"), record.getString("model"), secret,
+                Boolean.TRUE.equals(record.get(MongoConfigurationAiProviderSettingsStore.MANAGED))));
     }
     private String decrypt(String owner, String context, String envelope) {
         try {
@@ -62,18 +63,22 @@ public final class MongoAiProviderSettingsStore implements AiProviderSettingsSto
                     if (!keyrings.fenceActiveWriter(session, cipher.activeKeyId())) {
                         throw new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_NOT_READY, Map.of(), null);
                     }
-                    meta.replaceOne(session, new Document("_id", id(owner)),
-                            new Document("_id", id(owner)).append("kind", KIND).append("owner", owner)
+                    var row = new Document("_id", id(owner)).append("kind", KIND).append("owner", owner)
                                     .append("providerId", settings.providerId()).append("baseUrl", settings.baseUrl())
                                     .append("model", settings.model()).append("secret", cipher.providerSecrets()
-                                            .encrypt(owner, context(settings), settings.apiKey())),
-                            new ReplaceOptions().upsert(true));
+                                            .encrypt(owner, context(settings), settings.apiKey()));
+                    if (settings.managedSelected()) row.append(MongoConfigurationAiProviderSettingsStore.MANAGED, true);
+                    meta.replaceOne(session, new Document("_id", id(owner)), row, new ReplaceOptions().upsert(true));
                     return null;
                 }, TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true)).readPreference(ReadPreference.primary()).build());
             }
             return null;
         });
+    }
+    @Override public boolean selectManaged(String owner, boolean selected) {
+        return StoreIo.call(() -> meta.updateOne(new Document("_id", id(owner)),
+                MongoConfigurationAiProviderSettingsStore.selectionUpdate(selected)).getMatchedCount() == 1);
     }
     @Override public void delete(String owner) {
         StoreIo.call(() -> meta.deleteOne(new Document("_id", id(owner))));
