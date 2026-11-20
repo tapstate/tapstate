@@ -5169,9 +5169,11 @@ final class Repl {
                         target = started.targetState();
                         if (started.checks() != null) {
                             startChecks.put(id, started.checks().raw());
-                            started.checks().findings().stream()
-                                    .filter(finding -> StartChecks.WARN.equals(finding.behavior()))
-                                    .forEach(finding -> note(id, "start check: " + finding.message()));
+                            for (var finding : started.checks().findings()) {
+                                if (StartChecks.WARN.equals(finding.behavior())) {
+                                    note(id, "start check: " + finding.message());
+                                }
+                            }
                         }
                     }
                     case StartAttempt.Stopped stopped -> {

@@ -16,6 +16,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
@@ -108,13 +109,13 @@ final class PdkCaptureBatch implements CaptureBatch {
     boolean isClosed() { return closed.get(); }
     boolean isReading() { return reader.isAlive(); }
 
-    private volatile io.tapstate.core.common.FailureFact readerFailure;
-    private volatile io.tapstate.core.common.FailureFact decodeFailure;
+    private final AtomicReference<io.tapstate.core.common.FailureFact> readerFailure = new AtomicReference<>();
+    private final AtomicReference<io.tapstate.core.common.FailureFact> decodeFailure = new AtomicReference<>();
 
     @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
-        var decoded = decodeFailure;
+        var decoded = decodeFailure.get();
         if (decoded != null && decoded.cause() == failure) return decoded;
-        var read = readerFailure;
+        var read = readerFailure.get();
         return read != null && read.cause() == failure ? read : new io.tapstate.core.common.FailureFact(failure);
     }
 
@@ -185,7 +186,7 @@ final class PdkCaptureBatch implements CaptureBatch {
                 // A batch that cannot be taken ends the read as a failure of the read does: what would come
                 // after it is not the rest of the table.
                 over = true;
-                if (!(refused instanceof VirtualMachineError)) decodeFailure = connector.failureFact(refused);
+                if (!(refused instanceof VirtualMachineError)) decodeFailure.set(connector.failureFact(refused));
                 throw refused;
             }
         }
@@ -250,7 +251,7 @@ final class PdkCaptureBatch implements CaptureBatch {
         } catch (CancellationException abandoned) {
             seam.completeExceptionally(abandoned);
         } catch (Throwable failure) {
-            if (!closed.get() && !(failure instanceof VirtualMachineError)) readerFailure = connector.failureFact(failure);
+            if (!closed.get() && !(failure instanceof VirtualMachineError)) readerFailure.set(connector.failureFact(failure));
             if (!seam.completeExceptionally(failure) && !closed.get()) {
                 put(new Failure(failure));
             }

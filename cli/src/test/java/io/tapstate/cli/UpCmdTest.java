@@ -619,6 +619,26 @@ class UpCmdTest {
                 .contains("target-not-empty/warehouse/orders");
     }
 
+    @Test
+    void startedUpKeepsOnlyWarningsInTheirReportedOrder(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        var report = StartCheckReports.report("READY",
+                StartCheckReports.warning("first", "first warning"),
+                StartCheckReports.passed("orders"),
+                StartCheckReports.warning("second", "second warning"));
+        client.startResponder = decisions -> StartCheckReports.started(report, List.of(), List.of());
+
+        Run result = up(home, client, "up", "--yes", "-w", ws.toString());
+
+        assertThat(result.code()).as(result.all()).isZero();
+        assertThat(result.out()).contains("start check: first warning", "start check: second warning")
+                .doesNotContain("start check: orders on warehouse is empty.");
+        assertThat(result.out().indexOf("start check: first warning"))
+                .isLessThan(result.out().indexOf("start check: second warning"));
+    }
+
     // ---- the machine surface and the help -----------------------------------------------------------
 
     @Test
