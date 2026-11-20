@@ -497,10 +497,10 @@ public final class Cli implements Runnable {
         System.exit(runSession(launch, HttpControlPlaneClient::new));
     }
 
-    /** Checks for usage help before creating the client for an online command or interactive session. */
+    /** Checks for help before creating the client for an online command or interactive session. */
     static int runSession(LaunchOptions launch, Supplier<ControlPlaneClient> client) {
         if (launch.isOneShot()) {
-            Integer helpExit = executeUsageHelp(launch.command());
+            Integer helpExit = executeHelpRequest(launch.command());
             if (helpExit != null) {
                 return helpExit;
             }
@@ -508,7 +508,17 @@ public final class Cli implements Runnable {
         return runSession(launch, client.get(), Cli::terminalPrompter);
     }
 
-    private static Integer executeUsageHelp(List<String> words) {
+    private static Integer executeHelpRequest(List<String> words) {
+        if (words.getFirst().equals(DATA_BROWSER_VERB)) {
+            // The data-browser dispatcher joins every operand into one query. Help or version replaces it.
+            if (words.size() != 2) {
+                return null;
+            }
+            return switch (words.get(1)) {
+                case "-h", "--help", "-V", "--version" -> newCommandLine().execute(words.toArray(new String[0]));
+                default -> null;
+            };
+        }
         if (words.stream().noneMatch(word -> word.equals("-h") || word.equals("--help"))) {
             return null;
         }

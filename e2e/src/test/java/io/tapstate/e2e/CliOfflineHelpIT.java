@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
@@ -40,5 +41,27 @@ class CliOfflineHelpIT {
 
         assertThat(run.exitCode()).isEqualTo(1);
         assertThat(run.stderr()).contains("error: cli.context-not-found");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"--help", "-h"})
+    void dataBrowserFilterWithHelpLikeArgumentStillResolvesTheServer(String flag, @TempDir Path home) {
+        CliOnce.Run run = CliOnce.runWithPassword(null, List.of("-Duser.home=" + home),
+                "--context", "missing", "data-browser", "views.orders.find({note: \"before", flag, "after\"})");
+
+        assertThat(run.exitCode()).as("data-browser stdout: %s", run.stdout()).isEqualTo(1);
+        assertThat(run.stderr()).contains("error: cli.context-not-found");
+    }
+
+    @ParameterizedTest
+    @CsvSource({"--help, Usage: tapstate data-browser", "-h, Usage: tapstate data-browser",
+            "--version, 'tapstate '", "-V, 'tapstate '"})
+    void dataBrowserHelpAndVersionSkipContextResolution(String flag, String output, @TempDir Path home) {
+        CliOnce.Run run = CliOnce.runWithPassword(null, List.of("-Duser.home=" + home),
+                "--context", "missing", "data-browser", flag);
+
+        assertThat(run.exitCode()).as("data-browser %s stderr: %s", flag, run.stderr()).isZero();
+        assertThat(run.stdout()).startsWith(output);
+        assertThat(run.stderr()).isEmpty();
     }
 }
