@@ -1,7 +1,9 @@
 package io.tapstate.cli;
 
+import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Model.CommandSpec;
+import picocli.CommandLine.Model.OptionSpec;
 import picocli.CommandLine.Spec;
 import picocli.CommandLine.Unmatched;
 
@@ -17,6 +19,17 @@ import java.util.concurrent.Callable;
  */
 @Command(mixinStandardHelpOptions = true, description = "(requires a connection to a Tapstate server)")
 final class ConnectedVerb implements Callable<Integer> {
+
+    /** Preserve option value boundaries while checking for help before a session exists. */
+    static void recognizeValueOptionsForHelp(CommandLine verb) {
+        // These separate arguments are normally consumed by the session. The help parse only needs
+        // to know where they go, including paths like "--help". The regular command table stays intact.
+        verb.getCommandSpec().addOption(OptionSpec.builder(
+                        "-f", "--file", "-w", "--workdir", "-o", "--output", "--if-match", "--scope",
+                        "--decide", "--from", "--to", "--resolution", "--limit", "--cursor", "--table", "--group")
+                .arity("1").type(String[].class).hidden(true).build());
+        verb.setAllowOptionsAsOptionParameters(true);
+    }
 
     @Spec
     CommandSpec spec;
