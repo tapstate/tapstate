@@ -45,7 +45,7 @@ class BenchmarkRunIT {
     private static final String PIPELINE = "perf_copy";
     private static final String RECORDS = "records";
     private static final String HANDOFF = "copy.live.handoff.standard";
-    private static final int HANDOFF_WRITE_HOLD_MILLIS = 5_000;
+    private static final int HANDOFF_WRITE_HOLD_MILLIS = 30_000;
     private static final String DUMMY = "dummy_orders";
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -53,6 +53,7 @@ class BenchmarkRunIT {
     void executeRequestedBatch() throws Exception {
         var request = BsonDocument.parse(Files.readString(Path.of(System.getProperty("tapstate.benchmarks.request"))));
         Path output = Path.of(text(request, "output"));
+        Files.createFile(output.resolve("fixture-started"));
         Path connectors = Path.of(text(request, "connector_dir"));
         var lockPath = checkout().resolve("deploy/cloud/connectors.lock.json");
         var lock = BsonDocument.parse(Files.readString(lockPath));
@@ -499,12 +500,19 @@ class BenchmarkRunIT {
         waitFor(entry, "confirmed initial-state anchor", () -> {
             var row = target.find(key).first();
             String current = control.resumePoint(PIPELINE).get("token");
+            if (handoff) {
+                var facts = control.metricFacts(PIPELINE);
+                return row != null && anchorValue.equals(row.get("s0"))
+                        && handoffCountsMatch(initial, operationCount(facts, "in", "read"),
+                                operationCount(facts, "out", "read"), operationCount(facts, "in", "update"),
+                                operationCount(facts, "out", "update"))
+                        && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent()
+                        && current != null;
+            }
             long changes = capturedChanges(control).getOrDefault(RECORDS, 0L);
             long acknowledged = settled(control);
             return row != null && anchorValue.equals(row.get("s0"))
                     && acknowledged > preAnchorSettled && changes > 0 && acknowledged == initial + changes
-                    && (!handoff || control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == initial
-                            && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent())
                     && current != null && !current.equals(preAnchorToken);
         });
         verifySame(source, target);
@@ -635,8 +643,18 @@ class BenchmarkRunIT {
             hold.holdSnapshotWrites();
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             hold.awaitHeldWrite(Duration.ofSeconds(number(entry, "timeout_seconds")));
+            var heldOperations = hold.heldSnapshotWrites();
+            if (hold.overlappingWrites(heldOperations).isEmpty()) {
+                throw new Unverified("The snapshot write was no longer held before the source update");
+            }
             witness.put("initial_target_write_held", true);
             writeAnchor(source, key, anchorValue);
+            var overlap = hold.overlappingWrites(heldOperations);
+            if (overlap.isEmpty()) {
+                throw new Unverified("The source update acknowledgement did not overlap the same held snapshot write");
+            }
+            witness.put("overlapping_target_operation_ids", overlap);
+            witness.put("held_command_overlap_verified", true);
             witness.put("source_update_acknowledged", true);
             long visible = boundedTarget.countDocuments();
             witness.put("target_snapshot_rows_visible_after_update", visible);
@@ -936,21 +954,21 @@ class BenchmarkRunIT {
         evidence.window("warmup");
         var windowSize = new MongoWorkloadGenerator.LiveWindow(rate, Duration.ofSeconds(warmup),
                 Duration.ofSeconds(measurement));
-        Runnable afterWarmup = () -> {
+        java.util.function.Consumer<MongoWorkloadGenerator.PhaseReport> afterWarmup = verifiedWarmup -> {
             var expected = operators.expected(source);
+            var expectedInputs = expectedCapturedInputs(baseline, verifiedWarmup);
             waitFor(entry, "operator warm-up seen at both endpoints",
-                    () -> capturedChanges(control).values().stream().mapToLong(Long::longValue).sum()
-                            >= baseline.values().stream().mapToLong(Long::longValue).sum() + (long) rate * warmup
+                    () -> capturedInputsMatch(expectedInputs, capturedChanges(control))
                             && BenchmarkOperatorOracle.difference(operators, target, expected) == null);
             warmRows.putAll(expected);
-            warm.putAll(capturedChanges(control));
+            warm.putAll(expectedInputs);
             warmOutput[0] = settled(control);
             evidence.window("measurement");
         };
         Runnable afterWrites = () -> evidence.window("drain");
         var run = operators.scenario.equals("join-lifecycle-release")
-                ? prepared.injectSteadyCycle(windowSize, afterWarmup, afterWrites)
-                : prepared.inject(windowSize, mix, hot, afterWarmup, afterWrites);
+                ? prepared.injectSteadyCycleWithWarmupReport(windowSize, afterWarmup, afterWrites)
+                : prepared.injectWithWarmupReport(windowSize, mix, hot, afterWarmup, afterWrites);
         evidence.result.put("warmup", phase(run.warmup()));
         evidence.result.put("source_window", phase(run.measured()));
         if (!run.measured().complete()) {
@@ -985,9 +1003,7 @@ class BenchmarkRunIT {
     private static void awaitOperatorPhase(BsonDocument entry, ControlPlane control, MongoDatabase target,
             BenchmarkOperators operators, Map<String, BsonDocument> expected, Map<String, Long> before,
             MongoWorkloadGenerator.PhaseReport phase, long minimumTargetExclusive) {
-        var expectedInputs = new LinkedHashMap<String, Long>();
-        phase.streams().forEach((name, stream) -> expectedInputs.put(name,
-                before.getOrDefault(name, 0L) + stream.observed().total()));
+        var expectedInputs = expectedCapturedInputs(before, phase);
         try {
             waitFor(entry, "per-input operator phase and independent target rows", () ->
                     capturedInputsMatch(expectedInputs, capturedChanges(control))
@@ -997,6 +1013,23 @@ class BenchmarkRunIT {
             throw new Limit(failure.getMessage() + ": input " + capturedChanges(control)
                     + ": " + BenchmarkOperatorOracle.difference(operators, target, expected));
         }
+    }
+
+    static Map<String, Long> expectedCapturedInputs(Map<String, Long> before,
+            MongoWorkloadGenerator.PhaseReport phase) {
+        if (!phase.complete()) throw new Unverified("The source phase is incomplete");
+        var expected = new LinkedHashMap<String, Long>();
+        phase.streams().forEach((name, stream) -> expected.put(name,
+                Math.addExact(before.getOrDefault(name, 0L), stream.observed().total())));
+        return expected;
+    }
+
+    static boolean handoffCountsMatch(long initial, long sourceReads, long targetReads,
+            long sourceUpdates, long targetUpdates) {
+        if (sourceReads > initial || targetReads > initial || sourceUpdates > 1 || targetUpdates > 1) {
+            throw new Unverified("The handoff captured or acknowledged extra snapshot or update events");
+        }
+        return sourceReads == initial && targetReads == initial && sourceUpdates == 1 && targetUpdates == 1;
     }
 
     static boolean capturedInputsMatch(Map<String, Long> expected, Map<String, Long> current) {
@@ -1050,6 +1083,22 @@ class BenchmarkRunIT {
             }
         }
         return result;
+    }
+
+    private static long operationCount(List<Map<String, Object>> facts, String direction, String operation) {
+        long total = 0;
+        for (var fact : facts) {
+            if (!"tapstate.pipeline.records".equals(fact.get("name"))) continue;
+            for (var value : (List<?>) fact.get("points")) {
+                var point = (Map<?, ?>) value;
+                var attributes = (Map<?, ?>) point.get("attributes");
+                if (direction.equals(attributes.get("direction")) && operation.equals(attributes.get("op"))
+                        && RECORDS.equals(attributes.get("tapstate.table.id")) && point.get("value") instanceof Number count) {
+                    total = Math.addExact(total, count.longValue());
+                }
+            }
+        }
+        return total;
     }
 
     private static void awaitContent(BsonDocument entry, BenchmarkOperators operators, MongoDatabase target,

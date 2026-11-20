@@ -33,6 +33,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 import org.bson.BsonBoolean;
@@ -247,12 +248,25 @@ public final class MongoWorkloadGenerator {
 
         /** The end callback runs after writes finish, before independent history verification. */
         public Live inject(LiveWindow window, Mix override, HotKeys hotKeys, Runnable afterWarmup, Runnable afterWrites) {
+            Objects.requireNonNull(afterWarmup);
+            return injectWithWarmupReport(window, override, hotKeys, report -> afterWarmup.run(), afterWrites);
+        }
+
+        /** Supplies the independently verified warm-up report before the measurement stream opens. */
+        public Live injectWithWarmupReport(LiveWindow window, Mix override, HotKeys hotKeys,
+                Consumer<PhaseReport> afterWarmup, Runnable afterWrites) {
             return inject(window, mix(override, hotKeys), hotKeys, afterWarmup, afterWrites,
                     new WorkloadChanges(recipe, hotKeys), false);
         }
 
         /** Retains the deterministic mutation sequence across restarts of an update-only workload. */
         public synchronized Live injectSteadyCycle(LiveWindow window, Runnable afterWarmup, Runnable afterWrites) {
+            Objects.requireNonNull(afterWarmup);
+            return injectSteadyCycleWithWarmupReport(window, report -> afterWarmup.run(), afterWrites);
+        }
+
+        public synchronized Live injectSteadyCycleWithWarmupReport(LiveWindow window,
+                Consumer<PhaseReport> afterWarmup, Runnable afterWrites) {
             if (recipe.changeMode != WorkloadRecipe.Changes.STEADY) {
                 throw new IllegalArgumentException("Repeated cycles require an update-only workload");
             }
@@ -263,7 +277,7 @@ public final class MongoWorkloadGenerator {
             return inject(window, recipe.mix, null, afterWarmup, afterWrites, steadyChanges, true);
         }
 
-        private Live inject(LiveWindow window, Mix mix, HotKeys hotKeys, Runnable afterWarmup, Runnable afterWrites,
+        private Live inject(LiveWindow window, Mix mix, HotKeys hotKeys, Consumer<PhaseReport> afterWarmup, Runnable afterWrites,
                             WorkloadChanges changes, boolean continuing) {
             Objects.requireNonNull(afterWarmup);
             Objects.requireNonNull(afterWrites);
@@ -282,7 +296,7 @@ public final class MongoWorkloadGenerator {
             String blocked = null;
             if (warm.complete()) {
                 try {
-                    afterWarmup.run();
+                    afterWarmup.accept(warm);
                 } catch (RuntimeException | AssertionError failure) {
                     blocked = "Warm-up readiness check failed: " + failure;
                 }
@@ -339,8 +353,20 @@ public final class MongoWorkloadGenerator {
                                  Duration liveDuration, Map<String, Integer> lengths, Runnable afterWrites) {
         var states = new ArrayList<StreamState>();
         try {
-            for (var stream : streams) {
-                states.add(new StreamState(stream, collection(stream.input.name()), database));
+            try {
+                for (var stream : streams) {
+                    states.add(new StreamState(stream, collection(stream.input.name()), database));
+                }
+            } catch (MongoException | IllegalStateException setupFailure) {
+                for (var state : states) {
+                    try {
+                        state.close();
+                    } catch (RuntimeException cleanup) {
+                        if (cleanup != setupFailure) setupFailure.addSuppressed(cleanup);
+                    }
+                }
+                states.clear();
+                return notRun(name, streams, rate, "Source history setup failed: " + setupFailure);
             }
             var delays = new Delays();
             Long cpu = cpuNanos();
@@ -423,6 +449,10 @@ public final class MongoWorkloadGenerator {
                 if (!state.write(List.of(write(state.name(), event, lengths.get(state.name()))), List.of(event), delays)) {
                     return;
                 }
+                if (nanoClock.getAsLong() > deadline) {
+                    state.recordError("The final write acknowledgement exceeded the scheduled window");
+                    return;
+                }
                 sent++;
                 next = now - next >= interval ? now + interval : next + interval;
             }
@@ -462,13 +492,17 @@ public final class MongoWorkloadGenerator {
     }
 
     private static PhaseReport notRun(List<WorkloadChanges.Stream> streams, int rate, String reason) {
+        return notRun("measurement", streams, rate, reason);
+    }
+
+    private static PhaseReport notRun(String name, List<WorkloadChanges.Stream> streams, Integer rate, String reason) {
         Map<String, StreamReport> result = new LinkedHashMap<>();
         var zero = new Operations(0, 0, 0);
         for (var stream : streams) {
             result.put(stream.input.name(), new StreamReport(new Operations(stream.requested), zero, zero,
                     null, null, null, null, 0, 0, null, reason));
         }
-        return new PhaseReport("measurement", null, null, 0, 0, null, rate, 0, 0, new Delays().report(), Map.copyOf(result), false);
+        return new PhaseReport(name, null, null, 0, 0, null, rate, 0, 0, new Delays().report(), Map.copyOf(result), false);
     }
 
     private static Long cpuNanos() {

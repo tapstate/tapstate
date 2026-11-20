@@ -150,6 +150,35 @@ class PerfRunnerTest(unittest.TestCase):
             self.assertTrue(runner.stop_process(process))
         self.assertEqual([(123, signal.SIGTERM), (123, 0)], [call.args for call in kill.call_args_list])
 
+    def test_replay_reserves_build_time_and_bounds_both_phases(self):
+        self.wait_for_script(0.4, 0.8, {"reserve_seconds": 1})
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.wait_for_script(1.2, 0, {"reserve_seconds": 1})
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.wait_for_script(0, 1.2, {"reserve_seconds": 1})
+
+    def test_replay_without_a_reserve_preserves_the_combined_limit(self):
+        for manifest in (None, {}, {"reserve_seconds": 0}):
+            with self.subTest(manifest=manifest):
+                self.wait_for_script(0.05, 0.05, manifest)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.wait_for_script(0.4, 0.8, {"reserve_seconds": 0})
+
+    def wait_for_script(self, build_seconds, fixture_seconds, manifest):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            script = ("import pathlib,sys,time\n"
+                      "time.sleep(float(sys.argv[2]))\n"
+                      "pathlib.Path(sys.argv[1], 'fixture-started').touch()\n"
+                      "time.sleep(float(sys.argv[3]))\n")
+            with subprocess.Popen([sys.executable, "-c", script, str(output), str(build_seconds),
+                                   str(fixture_seconds)], start_new_session=True) as process:
+                try:
+                    self.assertEqual(0, runner.wait_for_fixture(process, output, 1, manifest))
+                finally:
+                    process.kill()
+                    process.wait(timeout=2)
+
     def test_operator_suite_lists_executable_definitions_and_preserves_scope(self):
         cases = runner.select(self.cases, [], [], "operators")
         ids = {case["id"] for case in cases}

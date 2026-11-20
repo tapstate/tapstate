@@ -293,10 +293,14 @@ class ScopedTargetPreparationTest {
             var waiting = workers.submit(() -> org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
                     deferredPreparation(functions(calls), store, () -> {})
                             .prepareForWrite(DEFERRED, TargetTapTable.build(DEFERRED))));
-            assertThat(waitingReads.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-            assertThat(waiting).isNotDone();
-            store.complete(new Receipts.Original(store.held), new SinkPreparationStore.Result(false));
-            waiting.get(3, java.util.concurrent.TimeUnit.SECONDS);
+            try {
+                assertThat(waitingReads.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(waiting).isNotDone();
+                store.complete(new Receipts.Original(store.held), new SinkPreparationStore.Result(false));
+                waiting.get(3, java.util.concurrent.TimeUnit.SECONDS);
+            } finally {
+                waiting.cancel(true);
+            }
         }
         assertThat(calls).containsExactly("ready", "index");
     }

@@ -236,7 +236,7 @@ def run_entries(entries, binding, args, manifest=None):
         sampler.start()
         code = 1
         try:
-            code = process.wait(timeout=upper_bound)
+            code = wait_for_fixture(process, output, upper_bound, manifest, started)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             code = 124
         finally:
@@ -274,6 +274,39 @@ def run_entries(entries, binding, args, manifest=None):
     print(json.dumps({"run_id": run_id, "results": str(output / "summary.json"),
                       "statuses": [result["status"] for result in results]}))
     return 1 if code or any(result["status"] != "completed" for result in results) else 0
+
+
+def wait_for_fixture(process, output, fixture_limit, manifest, started=None):
+    reserve = manifest.get("reserve_seconds", 0) if manifest else 0
+    if type(reserve) is not int or reserve < 0:
+        raise ValueError("Manifest reserve must be a nonnegative integer")
+    if not reserve:
+        return process.wait(timeout=fixture_limit)
+    if started is None:
+        started = time.monotonic()
+    build_deadline = started + reserve
+    total_deadline = build_deadline + fixture_limit
+    marker = output / "fixture-started"
+    fixture_start_floor = started
+    while True:
+        observed_at = time.monotonic()
+        if marker.is_file():
+            if time.monotonic() > build_deadline:
+                raise subprocess.TimeoutExpired(process.args, reserve)
+            break
+        fixture_start_floor = observed_at
+        remaining = build_deadline - observed_at
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, reserve)
+        try:
+            return process.wait(timeout=min(0.1, remaining))
+        except subprocess.TimeoutExpired:
+            pass
+    # The fixture may start between polls. Use the last observation before its marker.
+    remaining = min(fixture_start_floor + fixture_limit, total_deadline) - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(process.args, fixture_limit + reserve)
+    return process.wait(timeout=remaining)
 
 
 def sample_database(done, owner, destination, interval):

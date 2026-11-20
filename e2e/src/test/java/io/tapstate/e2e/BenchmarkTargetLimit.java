@@ -9,8 +9,10 @@ import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import java.time.Duration;
+import java.util.HashSet;
 import java.util.List;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.bson.BsonDocument;
 import org.bson.BsonInt32;
@@ -26,6 +28,7 @@ final class BenchmarkTargetLimit implements AutoCloseable {
     private final int blockMillis;
     private boolean armed;
     private Long firstEntry;
+    private long armedAtNanos;
 
     BenchmarkTargetLimit(MongoDatabase admin, String application, String namespace, int blockMillis) {
         this.admin = admin.withTimeout(3, TimeUnit.SECONDS);
@@ -56,6 +59,7 @@ final class BenchmarkTargetLimit implements AutoCloseable {
         var data = new Document("failCommands", commands)
                 .append("appName", application).append("namespace", namespace)
                 .append("blockConnection", true).append("blockTimeMS", blockMillis);
+        armedAtNanos = System.nanoTime();
         armed = true;
         var response = admin.runCommand(new Document("configureFailPoint", "failCommand")
                 .append("mode", "alwaysOn").append("data", data));
@@ -66,6 +70,34 @@ final class BenchmarkTargetLimit implements AutoCloseable {
         // The driver's client operation timeout supplies maxTimeMS to the server.
         admin.withTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS)
                 .runCommand(new Document("waitForFailPoint", "failCommand").append("timesEntered", firstEntry + 1));
+    }
+
+    Set<String> heldSnapshotWrites() {
+        var answer = admin.runCommand(new Document("currentOp", 1).append("active", true)
+                .append("appName", application));
+        var result = new HashSet<String>();
+        int separator = namespace.indexOf('.');
+        String database = namespace.substring(0, separator);
+        String collection = namespace.substring(separator + 1);
+        for (Document operation : answer.getList("inprog", Document.class, List.of())) {
+            var command = operation.get("command", Document.class);
+            if (command != null && database.equals(command.getString("$db"))
+                    && (collection.equals(command.getString("insert")) || collection.equals(command.getString("update")))
+                    && operation.get("opid") != null) {
+                result.add(operation.get("opid").toString());
+            }
+        }
+        return Set.copyOf(result);
+    }
+
+    Set<String> overlappingWrites(Set<String> originalOperations) {
+        if (originalOperations.isEmpty()) return Set.of();
+        var current = heldSnapshotWrites();
+        // A write cannot enter this hold before the fixture arms it.
+        if (System.nanoTime() - armedAtNanos >= TimeUnit.MILLISECONDS.toNanos(blockMillis)) return Set.of();
+        var overlap = new HashSet<>(originalOperations);
+        overlap.retainAll(current);
+        return Set.copyOf(overlap);
     }
 
     long release() {

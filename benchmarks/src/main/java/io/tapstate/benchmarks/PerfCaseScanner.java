@@ -8,6 +8,7 @@ import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewArrayTree;
+import com.sun.source.tree.VariableTree;
 import com.sun.source.util.JavacTask;
 import com.sun.source.util.SourcePositions;
 import com.sun.source.util.TreeScanner;
@@ -93,26 +94,36 @@ public final class PerfCaseScanner {
             }
             var positions = Trees.instance(task).getSourcePositions();
             Map<String, Set<String>> packageTypes = new LinkedHashMap<>();
+            Set<String> staticValues = new HashSet<>();
             for (CompilationUnitTree unit : units) {
                 var types = packageTypes.computeIfAbsent(String.valueOf(unit.getPackageName()), key -> new HashSet<>());
                 unit.getTypeDecls().stream().filter(ClassTree.class::isInstance).map(ClassTree.class::cast)
                         .forEach(type -> types.add(type.getSimpleName().toString()));
+                String packageName = unit.getPackageName() == null ? "" : unit.getPackageName() + ".";
+                unit.getTypeDecls().stream().filter(ClassTree.class::isInstance).map(ClassTree.class::cast)
+                        .forEach(type -> collectStaticValues(type, packageName, staticValues));
             }
             for (CompilationUnitTree unit : units) {
-                scanUnit(root, unit, positions, cases, packageTypes.get(String.valueOf(unit.getPackageName())));
+                scanUnit(root, unit, positions, cases, packageTypes.get(String.valueOf(unit.getPackageName())), staticValues);
             }
         }
     }
 
     private static void scanUnit(Path root, CompilationUnitTree unit,
-            SourcePositions positions, Map<String, Map<String, Object>> cases, Set<String> packageTypes) {
+            SourcePositions positions, Map<String, Map<String, Object>> cases, Set<String> packageTypes,
+            Set<String> staticValues) {
         Path source = Path.of(unit.getSourceFile().toUri());
         String relativeSource = relativePath(root, source);
         List<String> imports = unit.getImports().stream()
+                .filter(item -> !item.isStatic())
+                .map(item -> item.getQualifiedIdentifier().toString()).toList();
+        List<String> staticImports = unit.getImports().stream()
+                .filter(item -> item.isStatic())
                 .map(item -> item.getQualifiedIdentifier().toString()).toList();
         boolean shortName = resolvesShortName(imports, ANNOTATION, BENCHMARK_PACKAGE,
                 BENCHMARK_PACKAGE.equals(String.valueOf(unit.getPackageName())), packageTypes);
-        boolean shortContainer = resolvesShortName(imports, ANNOTATION + ".Cases", ANNOTATION, false, packageTypes);
+        boolean shortContainer = resolvesShortName(imports, ANNOTATION + ".Cases", ANNOTATION, false, packageTypes)
+                || staticImports.contains(ANNOTATION + ".Cases") || staticImports.contains(ANNOTATION + ".*");
         new TreeScanner<Void, Void>() {
             private boolean shadowsCase;
             private boolean shadowsContainer;
@@ -140,6 +151,12 @@ public final class PerfCaseScanner {
 
             private void read(AnnotationTree annotation) {
                 String name = annotation.getAnnotationType().toString();
+                if (name.equals("PerfCase.Cases")) {
+                    requireUnambiguous(annotation, "PerfCase", ANNOTATION, shortName && !shadowsCase);
+                } else if (name.equals("Cases")) {
+                    requireUnambiguous(annotation, "Cases", ANNOTATION + ".Cases",
+                            shortContainer && !shadowsContainer);
+                }
                 if (isCaseAnnotation(annotation)) {
                     add(annotation);
                 } else if (name.equals(ANNOTATION + ".Cases") || shortName && !shadowsCase && name.equals("PerfCase.Cases")
@@ -148,8 +165,22 @@ public final class PerfCaseScanner {
                 }
             }
 
+            private void requireUnambiguous(AnnotationTree annotation, String name, String qualified,
+                    boolean imported) {
+                if (imported && !imports.contains(qualified) && !staticImports.contains(qualified)
+                        && staticImports.stream().filter(item -> !staticValues.contains(item))
+                                .filter(item -> !item.equals(ANNOTATION + ".*"))
+                                .anyMatch(item -> item.endsWith("." + name) || item.endsWith(".*"))) {
+                    throw invalid(location(annotation), "Ambiguous static import for " + name
+                            + "; use an explicit type import or a qualified annotation");
+                }
+            }
+
             private boolean isCaseAnnotation(AnnotationTree annotation) {
                 String type = annotation.getAnnotationType().toString();
+                if (type.equals("PerfCase")) {
+                    requireUnambiguous(annotation, "PerfCase", ANNOTATION, shortName && !shadowsCase);
+                }
                 return type.equals(ANNOTATION) || shortName && !shadowsCase && type.equals("PerfCase");
             }
 
@@ -194,6 +225,19 @@ public final class PerfCaseScanner {
                 return relativeSource + ":" + line(annotation);
             }
         }.scan(unit, null);
+    }
+
+    private static void collectStaticValues(ClassTree type, String owner, Set<String> values) {
+        String qualified = owner + type.getSimpleName() + ".";
+        Set<String> nestedTypes = type.getMembers().stream().filter(ClassTree.class::isInstance)
+                .map(ClassTree.class::cast).map(nested -> nested.getSimpleName().toString()).collect(Collectors.toSet());
+        for (var member : type.getMembers()) {
+            if (member instanceof VariableTree field && !nestedTypes.contains(field.getName().toString())) {
+                values.add(qualified + field.getName());
+            } else if (member instanceof ClassTree nested) {
+                collectStaticValues(nested, qualified, values);
+            }
+        }
     }
 
     private static boolean declaresMemberType(ClassTree node, String name) {

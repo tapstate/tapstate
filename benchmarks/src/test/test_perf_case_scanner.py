@@ -135,6 +135,38 @@ class PerfCaseScannerTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(["sample.qualified"], [row["id"] for row in json.loads(result.stdout)["cases"]])
 
+    def test_static_field_import_cannot_hide_the_benchmark_type(self):
+        self.write("sample/Names.java", "package sample; class Names { public static final int PerfCase = 1; }")
+        source = self.write("sample/Sample.java", "package sample;\nimport io.tapstate.benchmarks.*;\n"
+                            "import static sample.Names.PerfCase;\n"
+                            f"{declaration('sample.static-field')} class Sample {{}}")
+        result = self.scan()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sample.static-field"], [row["id"] for row in json.loads(result.stdout)["cases"]])
+        compiled = subprocess.run(["javac", "-proc:none", "-d", str(self.root / "classes"), str(ANNOTATION),
+                                  str(self.root / "sample/Names.java"), str(source)],
+                                 text=True, capture_output=True, check=False)
+        self.assertEqual(0, compiled.returncode, compiled.stderr)
+
+    def test_unknown_static_import_requires_an_explicit_annotation_type(self):
+        source = self.write("Sample.java", "import io.tapstate.benchmarks.*;\n"
+                            "import static missing.Names.PerfCase;\n"
+                            f"{declaration('sample.ambiguous')} class Sample {{}}")
+        self.assert_rejected("Sample.java:3: Ambiguous static import for PerfCase")
+        source.write_text(source.read_text().replace("import io.tapstate.benchmarks.*;",
+                          "import io.tapstate.benchmarks.PerfCase;"), encoding="utf-8")
+        result = self.scan()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sample.ambiguous"], [row["id"] for row in json.loads(result.stdout)["cases"]])
+
+    def test_static_container_import_is_a_known_annotation_type(self):
+        self.write("Sample.java", "import io.tapstate.benchmarks.PerfCase;\n"
+                   "import static io.tapstate.benchmarks.PerfCase.Cases;\n"
+                   f"@Cases({{{declaration('sample.static-container')}}}) class Sample {{}}")
+        result = self.scan()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sample.static-container"], [row["id"] for row in json.loads(result.stdout)["cases"]])
+
     def test_rejects_array_creation_with_an_annotation_location(self):
         invalid = declaration("sample.array").replace('operators = "nest"', "operators = new String[1]")
         self.write("Sample.java", f"import io.tapstate.benchmarks.PerfCase;\n{invalid} class Sample {{}}")

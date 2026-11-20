@@ -13,6 +13,14 @@ import org.junit.jupiter.api.Test;
 
 class BenchmarkOperatorOracleTest {
     @Test
+    void handoffRequiresExactlyOneUpdateAndOneSnapshotReadPerInitialRow() {
+        assertTrue(BenchmarkRunIT.handoffCountsMatch(32, 32, 32, 1, 1));
+        assertFalse(BenchmarkRunIT.handoffCountsMatch(32, 32, 31, 1, 0));
+        assertThrows(RuntimeException.class, () -> BenchmarkRunIT.handoffCountsMatch(32, 32, 32, 2, 2));
+        assertThrows(RuntimeException.class, () -> BenchmarkRunIT.handoffCountsMatch(32, 32, 33, 1, 1));
+    }
+
+    @Test
     void aggregateReadbackChecksGroupCountsAndSums() {
         var a = BsonDocument.parse("{'_id':1,'value':9}");
         var b = BsonDocument.parse("{'_id':9,'value':-4}");
@@ -60,6 +68,20 @@ class BenchmarkOperatorOracleTest {
                 () -> BenchmarkRunIT.capturedInputsMatch(expected, Map.of("left", 4L)));
         assertTrue(excess.getMessage().contains("Captured extra changes for left"));
         assertTrue(BenchmarkRunIT.capturedInputsMatch(expected, Map.of("left", 2L, "right", 2L)));
+    }
+
+    @Test
+    void warmupUsesVerifiedPerInputCountsBeforeMeasurementStarts() {
+        var operations = new io.tapstate.e2e.benchmark.MongoWorkloadGenerator.Operations(8, 0, 0);
+        var stream = new io.tapstate.e2e.benchmark.MongoWorkloadGenerator.StreamReport(
+                operations, operations, operations, null, null, null, null, 8, 0, "sequence", null);
+        var report = new io.tapstate.e2e.benchmark.MongoWorkloadGenerator.PhaseReport(
+                "warmup", null, null, 1, 1, null, 8, 8, 8, null, Map.of("records", stream), true);
+        var expected = BenchmarkRunIT.expectedCapturedInputs(Map.of("records", 3L), report);
+        assertEquals(Map.of("records", 11L), expected);
+        assertTrue(BenchmarkRunIT.capturedInputsMatch(expected, Map.of("records", 11L)));
+        assertThrows(RuntimeException.class,
+                () -> BenchmarkRunIT.capturedInputsMatch(expected, Map.of("records", 12L)));
     }
 
     @Test

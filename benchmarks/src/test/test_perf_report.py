@@ -49,6 +49,33 @@ class PerfReportTest(unittest.TestCase):
         self.assertEqual("invalid", result["results"][0]["status"])
         self.assertEqual("result-unavailable", result["results"][0]["comparisons"]["status"])
 
+    def test_foreign_batch_cannot_invalidate_its_owning_batchs_repeat(self):
+        other = copy.deepcopy(self.manifest["batches"][0])
+        other["index"] = 1
+        other["entries"][0]["case"]["id"] = "another.case"
+        self.manifest["batches"].append(other)
+        self.manifest["selected_ids"].append("another.case")
+        del self.manifest["manifest_sha256"]
+        self.manifest["manifest_sha256"] = catalog.digest(self.manifest)
+        self.summary["manifest_sha256"] = self.manifest["manifest_sha256"]
+        foreign = {**self.summary, "batch": 1}
+        results = [report.reconcile(self.manifest, summaries) for summaries in
+                   ([self.summary, foreign], [foreign, self.summary])]
+        self.assertEqual("completed", results[0]["results"][0]["status"])
+        self.assertEqual(results[0]["results"], results[1]["results"])
+        self.assertEqual(results[0]["statistics"], results[1]["statistics"])
+        self.assertTrue(results[0]["errors"])
+
+    def test_rss_comparisons_require_a_nonempty_matching_source(self):
+        usage = self.row["resources"]["windows"]["snapshot"]
+        reference = self.baseline["cases"][self.row["case_id"]]["resources"]["windows"]["snapshot"]
+        for source in (None, "", " "):
+            with self.subTest(source=source):
+                usage["source"] = reference["source"] = source
+                result = report.reconcile(self.manifest, [self.summary], self.baseline)
+                self.assertEqual("no-eligible-observation", result["results"][0]["comparisons"]["status"])
+                self.assertEqual({}, result["statistics"])
+
     def test_elapsed_time_cannot_be_compared_against_other_load(self):
         self.row["effective_load"] = {"rows": 64}
         result = report.reconcile(self.manifest, [self.summary], self.baseline)

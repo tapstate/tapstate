@@ -37,11 +37,13 @@ def reconcile(manifest, summaries, baseline=None):
                            "process_exit": summary.get("process_exit")})
         for row in summary["results"]:
             key = row.get("case_id"), row.get("repeat")
-            if key not in expected or key[0] not in allowed or key in rows:
+            if key not in expected or key[0] not in allowed:
+                errors.append({"case_id": key[0], "repeat": key[1], "reason": "unexpected or out-of-batch repeat"})
+                continue
+            if key in rows:
                 errors.append({"case_id": key[0], "repeat": key[1], "reason": "unexpected or duplicate repeat"})
-                if key in rows:
-                    rows[key] = {"case_id": key[0], "repeat": key[1], "status": "invalid",
-                                 "reason": "duplicate repeat"}
+                rows[key] = {"case_id": key[0], "repeat": key[1], "status": "invalid",
+                             "reason": "duplicate repeat"}
                 continue
             entry = expected[key]
             case = entry["case"]
@@ -98,7 +100,7 @@ def eligible_metrics(arm):
     resources = arm.get("resources", {})
     if resources.get("status") == "observed":
         for phase, usage in resources["windows"].items():
-            if usage.get("covered") and usage.get("source"):
+            if usage.get("covered") and identified_source(usage.get("source")):
                 yield f"{phase}.rss_peak_kib", usage.get("rss_peak_kib"), usage["source"]
 
 
@@ -139,7 +141,9 @@ def compare(row, baseline, environment):
         if memory.get("status") == ref_memory.get("status") == "observed":
             for phase, usage in memory["windows"].items():
                 other = ref_memory["windows"].get(phase, {})
-                if usage.get("source") == other.get("source") and usage.get("covered") and other.get("covered"):
+                source = usage.get("source")
+                if (identified_source(source) and source == other.get("source")
+                        and usage.get("covered") and other.get("covered")):
                     ratio(arm_result, f"{phase}.rss_peak_kib", usage.get("rss_peak_kib"), other.get("rss_peak_kib"))
         if arm_result:
             comparisons[name] = arm_result
@@ -154,6 +158,10 @@ def ratio(output, metric, observed, reference):
 
 def valid(value):
     return type(value) in (float, int) and math.isfinite(value) and value > 0
+
+
+def identified_source(value):
+    return isinstance(value, str) and bool(value.strip())
 
 
 def markdown(report):

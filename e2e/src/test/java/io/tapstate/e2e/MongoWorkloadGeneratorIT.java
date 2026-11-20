@@ -253,6 +253,78 @@ class MongoWorkloadGeneratorIT {
     }
 
     @Test
+    void measurementSetupFailureKeepsTheVerifiedWarmup() throws Exception {
+        withSource(source -> {
+            String id = "copy.live.basic.standard";
+            var watches = new AtomicInteger();
+            var clock = new AtomicLong();
+            var observed = observingPhases(source, () -> {
+                if (watches.incrementAndGet() == 2) throw new com.mongodb.MongoException("measurement watch unavailable");
+            }, () -> {});
+            var generator = new MongoWorkloadGenerator(observed, WorkloadRecipe.fromCatalog(definition(id),
+                    Map.of("records", 10), null), id, 17, clock::get, clock::addAndGet);
+            var prepared = generator.prepare(generator.calibrateStringLengths());
+            var result = prepared.inject(new LiveWindow(1, Duration.ofSeconds(2), Duration.ofSeconds(2)),
+                    new Mix(100, 0, 0), null, () -> {});
+
+            assertTrue(result.warmup().complete(), result::toString);
+            assertEquals(new Operations(2, 0, 0), result.warmup().streams().get("records").observed());
+            assertFalse(result.measured().complete());
+            var measured = result.measured().streams().get("records");
+            assertEquals(0, measured.submittedOperations());
+            assertEquals(0, measured.observed().total());
+            assertTrue(measured.error().contains("measurement watch unavailable"));
+            assertEquals(12, source.getCollection("records").countDocuments());
+        });
+    }
+
+    @Test
+    void aFinalAcknowledgementPastTheWindowKeepsHistoryButCannotQualify() throws Exception {
+        withSource(source -> {
+            String id = "copy.live.basic.standard";
+            var writes = new AtomicInteger();
+            var clock = new AtomicLong();
+            var observed = observingPhases(source, () -> {}, () -> {
+                if (writes.incrementAndGet() == 3) clock.addAndGet(TimeUnit.SECONDS.toNanos(5));
+            });
+            var generator = new MongoWorkloadGenerator(observed, WorkloadRecipe.fromCatalog(definition(id),
+                    Map.of("records", 10), null), id, 17, clock::get, clock::addAndGet);
+            var prepared = generator.prepare(generator.calibrateStringLengths());
+            var result = prepared.inject(new LiveWindow(1, Duration.ofSeconds(1), Duration.ofSeconds(2)),
+                    new Mix(100, 0, 0), null, () -> {});
+
+            assertTrue(result.warmup().complete(), result::toString);
+            assertFalse(result.measured().complete());
+            assertEquals(TimeUnit.SECONDS.toNanos(6), result.measured().writeNanos());
+            var measured = result.measured().streams().get("records");
+            assertEquals(new Operations(2, 0, 0), measured.acknowledged());
+            assertEquals(measured.acknowledged(), measured.observed());
+            assertTrue(measured.error().contains("acknowledgement exceeded"));
+            assertNotNull(measured.sourceSequenceSha256());
+        });
+    }
+
+    private static MongoDatabase observingPhases(MongoDatabase database, Runnable beforeWatch, Runnable afterWrite) {
+        return (MongoDatabase) Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(),
+                new Class<?>[] {MongoDatabase.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("watch")) beforeWatch.run();
+                    Object result = invoke(database, method, args);
+                    if (result instanceof MongoDatabase configured) {
+                        return observingPhases(configured, beforeWatch, afterWrite);
+                    }
+                    if (result instanceof MongoCollection<?> collection) {
+                        return Proxy.newProxyInstance(MongoCollection.class.getClassLoader(),
+                                new Class<?>[] {MongoCollection.class}, (ignored, operation, parameters) -> {
+                                    Object reply = invoke(collection, operation, parameters);
+                                    if (operation.getName().equals("bulkWrite")) afterWrite.run();
+                                    return reply;
+                                });
+                    }
+                    return result;
+                });
+    }
+
+    @Test
     void aTwoStreamBatchCanAllocateOneUpdateAndOneDelete() throws Exception {
         withSource(source -> {
             var generator = generator(source, "union.backlog.basic.standard", Map.of("left", 1, "right", 1));

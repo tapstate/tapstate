@@ -524,6 +524,44 @@ class SinkProcessorTest {
     }
 
     @Test
+    void an_assembled_output_recovers_previously_landed_inputs_on_restart() throws Exception {
+        var calls = new ArrayList<String>();
+        SinkAck ack = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                throw new AssertionError("the empty output has no position to advance");
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                calls.add("bounded=" + chain);
+            }
+        };
+        var processor = init(new SinkProcessor(new RecordingSnapshotWriter(calls), ack,
+                new ContiguousPrefix(AXES), 1, 1)
+                .withAssembledOutputs(Map.of("nested", List.of("orders", "lines")))
+                .withCompletedSnapshotInputs(java.util.Set.of("orders")));
+        assertThat(calls).isEmpty();
+
+        processor.tryProcessWatermark(snapshotBoundOn("lines"));
+
+        assertThat(calls).containsExactly("prepared=lines", "prepared=nested", "bounded=lines");
+    }
+
+    @Test
+    void an_assembled_output_with_all_inputs_recovered_is_notified_without_another_bound() throws Exception {
+        var calls = new ArrayList<String>();
+        var processor = new SinkProcessor(new RecordingSnapshotWriter(calls), new RecordingAck(),
+                new ContiguousPrefix(AXES), 1, 1)
+                .withAssembledOutputs(Map.of("nested", List.of("orders", "lines")))
+                .withCompletedSnapshotInputs(java.util.Set.of("orders", "lines"));
+
+        init(processor);
+
+        assertThat(calls).containsExactly("prepared=nested");
+    }
+
+    @Test
     void failed_snapshot_preparation_keeps_the_empty_snapshot_unacknowledged() throws Exception {
         var calls = new ArrayList<String>();
         var failure = new IllegalStateException("target schema could not be prepared");

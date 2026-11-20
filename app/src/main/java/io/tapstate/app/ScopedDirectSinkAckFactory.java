@@ -60,6 +60,18 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
             }).toList();
         };
     }
+
+    @Override
+    public Set<String> completedSnapshotInputs(HazelcastInstance member, Set<String> streams) {
+        var read = new HashMap<DirectSourceRun, DirectChannelProgress>();
+        var completed = new LinkedHashSet<String>();
+        for (String stream : streams) {
+            var source = source(stream);
+            var progress = read.computeIfAbsent(source.run(), run -> bind(member, run).progress());
+            if (progress.cursor().snapshotCompletedTables().contains(source.table())) completed.add(stream);
+        }
+        return Set.copyOf(completed);
+    }
     private Map<DirectSourceRun,Bound> bindings(HazelcastInstance member) {
         var bound = new HashMap<DirectSourceRun,Bound>();
         sources.values().forEach(source -> bound.computeIfAbsent(source.run(),run -> bind(member,run))); return bound;

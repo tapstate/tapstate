@@ -413,6 +413,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         this.failureRegistry = JobFailureRegistry.forProcessor(instance, context);
         configureJobGauges(instance);
         if (ack != null) ack.started(context.jobId(), context.executionId());
+        notifyReadyAssembledSnapshots();
     }
 
     private void configureJobGauges(HazelcastInstance member) {
@@ -694,16 +695,24 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     }
 
     private void notifySnapshotDelivered(String chain, SourceOrder order) {
+        if (deliveredSnapshots.getOrDefault(chain, Long.MIN_VALUE) < order.epoch()) {
+            notifyWriterSnapshotDelivered(chain);
+            deliveredSnapshots.put(chain, order.epoch());
+        }
+        notifyReadyAssembledSnapshots();
+    }
+
+    private void notifyReadyAssembledSnapshots() {
+        pendingAssembledSnapshots.entrySet().removeIf(output -> {
+            if (!deliveredSnapshots.keySet().containsAll(output.getValue())) return false;
+            notifyWriterSnapshotDelivered(output.getKey());
+            return true;
+        });
+    }
+
+    private void notifyWriterSnapshotDelivered(String stream) {
         try {
-            if (deliveredSnapshots.getOrDefault(chain, Long.MIN_VALUE) < order.epoch()) {
-                writer.snapshotDelivered(chain);
-                deliveredSnapshots.put(chain, order.epoch());
-            }
-            pendingAssembledSnapshots.entrySet().removeIf(output -> {
-                if (!deliveredSnapshots.keySet().containsAll(output.getValue())) return false;
-                writer.snapshotDelivered(output.getKey());
-                return true;
-            });
+            writer.snapshotDelivered(stream);
         } catch (RuntimeException | Error failure) {
             if (failureRegistry != null) failureRegistry.record(failure);
             throw failure;
@@ -716,6 +725,12 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     SinkProcessor withAssembledOutputs(Map<String, List<String>> assembledOutputs) {
         pendingAssembledSnapshots.putAll(assembledOutputs);
+        return this;
+    }
+
+    SinkProcessor withCompletedSnapshotInputs(Set<String> completedInputs) {
+        // Recovered inputs already satisfy the fan-in. A later bound can still carry a new epoch.
+        completedInputs.forEach(stream -> deliveredSnapshots.putIfAbsent(stream, Long.MIN_VALUE));
         return this;
     }
 
@@ -1008,6 +1023,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         private final Map<String, List<String>> assembledOutputs;
         private transient SinkAck sinkAck;
         private transient int memberIndex;
+        private transient Set<String> completedSnapshotInputs;
 
         AckSinkSupplier(SupplierEx<? extends SinkWriter> writerFactory,
                 SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
@@ -1027,7 +1043,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         @Override
         public void init(Context context) {
             memberIndex=context.memberIndex();
-            sinkAck = sinkAckFactory==null?null:sinkAckFactory.resolve(context.hazelcastInstance());
+            HazelcastInstance member = context.hazelcastInstance();
+            sinkAck = sinkAckFactory==null?null:sinkAckFactory.resolve(member);
+            completedSnapshotInputs = Set.of();
+            if (sinkAckFactory != null && !assembledOutputs.isEmpty()) {
+                var streams = new java.util.LinkedHashSet<String>();
+                assembledOutputs.values().forEach(streams::addAll);
+                completedSnapshotInputs = sinkAckFactory.completedSnapshotInputs(member, streams);
+            }
         }
 
         @Override
@@ -1041,7 +1064,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                     DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
                     new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
                     edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime)
-                    .withAssembledOutputs(assembledOutputs));
+                    .withAssembledOutputs(assembledOutputs).withCompletedSnapshotInputs(completedSnapshotInputs));
         }
     }
 

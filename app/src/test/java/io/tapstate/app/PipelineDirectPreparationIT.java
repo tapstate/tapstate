@@ -863,7 +863,11 @@ class PipelineDirectPreparationIT {
                 assertThat(second.snapshotProgress("flow").byTable().get("orders").rowsDone()).isOne();assertThat(second.snapshotProgress("flow").byTable().get("quiet").rowsDone()).isZero();
                 var secondFactory=copied(new ScopedSrsSinkAckFactory(Map.of(),Map.of("orders",new ScopedDirectSinkAckFactory.Source(two,"orders"),"quiet",new ScopedDirectSinkAckFactory.Source(two,"quiet")),"second-snapshot"));
                 secondFactory.beginRun(member,Map.of("orders",List.of("writer"),"quiet",List.of("writer")),next);
+                assertThat(secondFactory.completedSnapshotInputs(member, Set.of("orders", "quiet")))
+                        .containsExactly("orders");
                 assertThat(second.loadDelivered("flow")).isFalse();secondFactory.resolve(member).forWriter("writer").bounded("quiet",SourceOrder.snapshotRow(1),next);
+                assertThat(secondFactory.completedSnapshotInputs(member, Set.of("orders", "quiet")))
+                        .containsExactlyInAnyOrder("orders", "quiet");
                 assertThat(second.loadDelivered("flow")).isTrue();second.stopCapture("flow",false);
             }
             assertThat(f.cacheDatabase.getCollection("srs_chains").countDocuments()).isZero();

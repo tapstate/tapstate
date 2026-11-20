@@ -262,3 +262,8 @@ preparation, measurement, verification and cleanup for both arms of any pair.
 Allocate with a reserve for build, shared setup and report generation. Review
 the longest estimated batch plus reserve against the suite deadline. Keep the
 sizing and evidence for scaled estimates explicit when the inputs were bounded.
+
+During manifest replay with a positive reserve, Maven must start the benchmark
+fixture within the reserve. The fixture then has the manifest execution limit,
+and the entire Maven process has at most reserve plus execution limit. A missing
+or zero reserve retains the combined process limit used by earlier manifests.
