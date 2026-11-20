@@ -516,11 +516,9 @@ public final class SnapshotPhase {
             } catch (RuntimeException | Error failure) {
                 try {
                     recordReadFailure(batch, failure);
-                } catch (RuntimeException | Error projectionFailure) {
+                } finally {
                     closeReadBatch(batch, failure);
-                    throw projectionFailure;
                 }
-                closeReadBatch(batch, failure);
                 throw failure;
             }
             closeReadBatch(batch, null);

@@ -187,8 +187,15 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
     private static boolean connectionSelectionTimedOut(Throwable failure) {
         Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         for (Throwable cause = failure; cause != null && seen.size() < 32 && seen.add(cause); cause = cause.getCause()) {
-            // The connector loads its own driver. Match its exception type across class loaders.
-            if ("com.mongodb.MongoTimeoutException".equals(cause.getClass().getName())) return true;
+            Class<?> actual = cause.getClass();
+            ClassLoader loader = actual.getClassLoader();
+            if (loader == null) continue;
+            try {
+                // A connector can carry its own driver. Resolve its exact timeout type without initialization.
+                if (actual == Class.forName("com.mongodb.MongoTimeoutException", false, loader)) return true;
+            } catch (ClassNotFoundException | LinkageError | SecurityException unavailable) {
+                // A different driver or a partially available connector cannot identify this cause.
+            }
         }
         return false;
     }
