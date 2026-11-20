@@ -396,7 +396,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             ack = sinkAck.forWriter(writerId(writerOf, totalOne ? 0 : context.globalProcessorIndex()));
         }
         HazelcastInstance instance = context.hazelcastInstance();
-        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forJob(context.jobId(), context.jobConfig()) : null;
+        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forProcessor(context) : null;
         // A gauge that writes into a job's statistics can only do so from that job's own threads, and a
         // sink is also driven by hand - which is how its behaviour is pinned at all. Outside a job there
         // is nothing to write into and asking for a handle fails outright, taking the sink down with it,

@@ -100,7 +100,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
         this.timer = StageTimer.of(stage(), context);
         this.pipelineId = context.jobConfig().getName();
         HazelcastInstance instance = context.hazelcastInstance();
-        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forJob(context.jobId(), context.jobConfig()) : null;
+        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forProcessor(context) : null;
     }
 
     @Override

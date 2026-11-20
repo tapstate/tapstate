@@ -40,7 +40,7 @@ final class NestFailureRecording {
                 ? null
                 : context.jobConfig().getName();
         return new NestFailureRecording(
-                instance == null ? null : JobFailureRegistry.of(instance).forJob(context.jobId(), context.jobConfig()), pipelineId);
+                instance == null ? null : JobFailureRegistry.of(instance).forProcessor(context), pipelineId);
     }
 
     /**
