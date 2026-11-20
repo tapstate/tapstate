@@ -212,7 +212,7 @@ class OpenAiCompatibleClientTest {
             assertThatThrownBy(() -> client.propose(settings, List.of(), context, discard))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL));
-            var tooLong = List.of(Map.of("role", "user", "content", "中".repeat(48 * 1024)));
+            var tooLong = List.of(Map.of("role", "user", "content", "\u4e2d".repeat(48 * 1024)));
             assertThatThrownBy(() -> client.propose(settings, tooLong, context, discard))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_MANAGED_PROVIDER_INPUT_LIMIT));
