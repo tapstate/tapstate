@@ -647,6 +647,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 active.run();
                 var setup = owner.original.binding().setup();
                 var scope=alertScope(owner,cloud);
+                // An already bound Cloud cluster can retry preparation with the alert worker.
+                CloudConfigurationInitialization.resumeAlertStorage(owner.configuration, setup, cloud);
                 var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
                         : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
                 var catalog=types.catalog();var retention=retentions.resolve(deployment);
