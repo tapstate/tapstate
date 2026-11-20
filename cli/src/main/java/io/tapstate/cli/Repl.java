@@ -4849,6 +4849,7 @@ final class Repl {
     private final class UpRun {
         private final Path workspace;
         private final OutputFormat format;
+        private final List<URI> originalSeeds;
         /** Whether this run made the connection, in which case the connect's probe was the reachability check. */
         private final boolean connectedHere;
         private List<UpDraft> drafts = List.of();
@@ -4867,6 +4868,7 @@ final class Repl {
         UpRun(Path workspace, OutputFormat format, boolean connectedHere, boolean yes) {
             this.workspace = workspace;
             this.format = format;
+            this.originalSeeds = List.copyOf(session.seeds());
             this.connectedHere = connectedHere;
             this.yes = yes;
         }
@@ -4906,8 +4908,8 @@ final class Repl {
                 return read;
             }
             if (!connectedHere && !landingAnswers()) {
-                return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()), CliError.CONNECT_FAILED,
-                        Map.of(SEEDS_PARAM, hostPort(session.landingNode())));
+                return failure(UpCmd.STAGE_PREFLIGHT, failureTarget(session.landingNode()), CliError.CONNECT_FAILED,
+                        Map.of(SEEDS_PARAM, failureTarget(session.landingNode())));
             }
             Set<String> local = sources().stream().map(UpDraft::id).collect(Collectors.toSet());
             for (UpDraft pipeline : pipelines()) {
@@ -4924,11 +4926,11 @@ final class Repl {
                         .filter(connector -> "registered".equals(connector.origin()))
                         .map(CatalogConnector::id).collect(Collectors.toSet());
                 case ConnectorListOutcome.Rejected rejected -> {
-                    return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()),
+                    return failure(UpCmd.STAGE_PREFLIGHT, failureTarget(session.landingNode()),
                             rejected.code(), rejected.message(), Map.of());
                 }
                 case ConnectorListOutcome.Unreachable ignored -> {
-                    return unreachable(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()));
+                    return unreachable(UpCmd.STAGE_PREFLIGHT, failureTarget(session.landingNode()));
                 }
             }
             for (UpDraft source : sources()) {
@@ -4993,7 +4995,7 @@ final class Repl {
                 }
                 case ConnectionTestOutcome.TimedOut ignored -> {
                     return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CliError.REQUEST_TIMED_OUT,
-                            Map.of(SERVER_PARAM, hostPort(session.landingNode())));
+                            Map.of(SERVER_PARAM, failureTarget(session.landingNode())));
                 }
                 case ConnectionTestOutcome.Unreachable ignored -> {
                     return unreachable(UpCmd.STAGE_PREFLIGHT, source.id());
@@ -5135,7 +5137,7 @@ final class Repl {
                     }
                     case ConnectionDiscoverSchemaOutcome.TimedOut ignored -> {
                         return failure(UpCmd.STAGE_DISCOVER, id, CliError.REQUEST_TIMED_OUT,
-                                Map.of(SERVER_PARAM, hostPort(session.landingNode())));
+                                Map.of(SERVER_PARAM, failureTarget(session.landingNode())));
                     }
                     case ConnectionDiscoverSchemaOutcome.Unreachable ignored -> {
                         return unreachable(UpCmd.STAGE_DISCOVER, id);
@@ -5163,7 +5165,9 @@ final class Repl {
                     continue;
                 }
                 String target;
+                URI attemptedEndpoint = session.landingNode();
                 StartFlow.Result result = flow.start(id, new StartFlow.Answering(yes, List.of(), format, true));
+                URI resultingEndpoint = session.landingNode();
                 switch (result.attempt()) {
                     case StartAttempt.Started started -> {
                         target = started.targetState();
@@ -5190,9 +5194,10 @@ final class Repl {
                     case StartAttempt.Unreachable unreachable -> {
                         if (unreachable.sent()) {
                             return failure(UpCmd.STAGE_START, id, CliError.START_MAY_HAVE_GONE_AHEAD,
-                                    Map.of("pipeline", id, "server", hostPort(session.landingNode())));
+                                    Map.of("pipeline", id, "server", failureTarget(
+                                            resultingEndpoint == null ? attemptedEndpoint : resultingEndpoint)));
                         }
-                        return unreachable(UpCmd.STAGE_START, id);
+                        return unreachable(UpCmd.STAGE_START, id, resultingEndpoint);
                     }
                     case null -> {
                         return Cli.EXIT_DIAGNOSTIC;
@@ -5236,7 +5241,17 @@ final class Repl {
 
         /** A stage that could not reach the server, after failover had its say. */
         private int unreachable(String stage, String on) {
-            return failure(stage, on, CliError.CONNECT_FAILED, Map.of(SEEDS_PARAM, hostPort(session.landingNode())));
+            return unreachable(stage, on, session.landingNode());
+        }
+
+        private int unreachable(String stage, String on, URI attemptedEndpoint) {
+            return failure(stage, on, CliError.CONNECT_FAILED, Map.of(SEEDS_PARAM, failureTarget(attemptedEndpoint)));
+        }
+
+        /** A failed request may have cleared the live session before its diagnostic is rendered. */
+        private String failureTarget(URI attemptedEndpoint) {
+            return attemptedEndpoint != null ? hostPort(attemptedEndpoint)
+                    : originalSeeds.stream().map(Repl::hostPort).collect(Collectors.joining(", "));
         }
 
         /** A stage failed on a code raised on this side, rendered from the catalog. */
