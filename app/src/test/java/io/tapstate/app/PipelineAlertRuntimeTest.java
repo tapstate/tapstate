@@ -20,6 +20,12 @@ class PipelineAlertRuntimeTest {
     final ConcurrentMap<String, PipelineIntentSnapshot> intents = new ConcurrentHashMap<>();
     final PipelineIntentStore intentStore = mock(PipelineIntentStore.class);
     PipelineAlertRuntimeTest() {
+        when(fixture.store.evaluationSnapshot(any(),anyInt())).thenAnswer(c->{
+            var all=new ArrayList<AlertConfiguration.Definition>();var unavailable=new HashMap<String,AlertStore.RuleCapability>();String cursor=null;
+            do{var page=fixture.store.evaluationRules(cursor,100);all.addAll(page.rows());unavailable.putAll(page.unavailableRules());cursor=page.nextId();}
+            while(cursor!=null&&all.size()+unavailable.size()<1000);
+            return new AlertStore.EvaluationSnapshot(new AlertStore.DefinitionPage(all,cursor,unavailable),fixture.store.evaluationStates(c.getArgument(0),c.getArgument(1)));
+        });
         when(intentStore.loadForActuation(anyString())).thenAnswer(c -> Optional.ofNullable(intents.get(c.getArgument(0))));
         when(fixture.store.state(any(), any())).thenAnswer(c -> Optional.ofNullable(rows.get(c.getArgument(0))));
         var definition = AlertEvaluationHostTest.definition("pipeline.failed");

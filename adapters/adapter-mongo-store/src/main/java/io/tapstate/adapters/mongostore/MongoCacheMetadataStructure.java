@@ -106,6 +106,21 @@ final class MongoCacheMetadataStructure {
         verify(tables);
     }
 
+    static boolean simpleCollations(MongoDatabase database, List<SystemCollections> tables) {
+        var names = tables.stream().map(SystemCollections::collectionName).toList();
+        var found = database.listCollections().filter(new Document("name", new Document("$in", names))).into(new java.util.ArrayList<>());
+        // An absent optional collection has no collation and contributes no rows.
+        return found.stream().allMatch(row -> {
+            var options = row.get("options", Document.class);
+            return options == null || !options.containsKey("collation")
+                    || "simple".equals(options.get("collation", Document.class).get("locale"));
+        });
+    }
+
+    void verifyObservation() {
+        verify(List.of(SystemCollections.CACHE_SNAPSHOT_COUNTS, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_SOURCE_SCHEMAS));
+    }
+
     void verifyDirect() {
         verify(List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS,SystemCollections.DIRECT_CHANNEL_OFFSETS,SystemCollections.DIRECT_BATCHES));
     }

@@ -17,6 +17,7 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.InitialLoad;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
@@ -866,10 +867,29 @@ public final class ObservationPublisher {
                 Objects.requireNonNull(scopedObservations, "scopedObservations"), true);
     }
 
+    /** Capture facts obtained together for the current execution and checked against its checkpoint. */
+    public record CaptureSample(SnapshotReading loaded, SnapshotReading run, Map<String, String> positions,
+            InitialLoad initialLoad) {
+        public CaptureSample {
+            Objects.requireNonNull(loaded); Objects.requireNonNull(run); positions = Map.copyOf(positions);
+        }
+    }
+
+    public Optional<Observation> publishRunning(PipelineIntentScope scope, CheckpointDoc checkpoint,
+            ObservationStore store, CaptureSample capture) {
+        if (!scope.pipelineId().equals(checkpoint.pipelineId()) || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING)
+            throw new IllegalArgumentException("a combined observation requires its running checkpoint");
+        return publish(scope.pipelineId(), null, Optional.of(checkpoint), store, true, Objects.requireNonNull(capture));
+    }
+
     private Optional<Observation> publish(String pipelineId, ObservationFailure failure, StateStore state,
             ObservationStore observations, boolean requirePreparedState) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        var current = state.read(pipelineId);
+        return publish(pipelineId, failure, state.read(pipelineId), observations, requirePreparedState, null);
+    }
+
+    private Optional<Observation> publish(String pipelineId, ObservationFailure failure, Optional<CheckpointDoc> current,
+            ObservationStore observations, boolean requirePreparedState, CaptureSample capture) {
         if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
         return current.map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
@@ -913,15 +933,17 @@ public final class ObservationPublisher {
                 readings = nestStateReadings.apply(pipelineId);
                 gaps = frontierGaps.apply(pipelineId);
                 pinned = frontierStalls.apply(pipelineId);
-                SnapshotReading loaded = snapshots.apply(pipelineId);
-                SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
+                SnapshotReading loaded = capture == null ? snapshots.apply(pipelineId) : capture.loaded();
+                SnapshotReading readThisRun = capture == null ? runSnapshots.apply(pipelineId) : capture.run();
                 List<MetricFact> measured = new ArrayList<>(facts(pipelineId, actual, at, readings, gaps, pinned,
                         nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
                         joinRecomputeExpected.apply(pipelineId), loaded, readThisRun));
                 measured.addAll(aggregateFacts(pipelineId, at, aggregateReadings.get().apply(pipelineId)));
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                        loaded.byTable(), positions.apply(pipelineId), carried, at, measured, initialLoadAt(pipelineId, at));
+                        loaded.byTable(), capture == null ? positions.apply(pipelineId) : capture.positions(), carried, at, measured,
+                        capture == null ? initialLoadAt(pipelineId, at)
+                                : capture.initialLoad() == null ? null : capture.initialLoad().at(at));
                 measuredSuccessfully = true;
             } catch (TapstateException unavailable) {
                 if (actual != PipelineState.FAILED) throw unavailable;
