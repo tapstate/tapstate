@@ -25,8 +25,9 @@ class PeriodicObservationIsolationIT {
     private static final String STORE = "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore";
     private static final String OBSERVATION_WRITE = "(Lio/tapstate/core/lifecycle/Observation;JZ)Z";
     private static final String DRIVER = "io.tapstate.app.ConvergenceDriver";
+    private static final String CLAIMS = "io.tapstate.app.ClusterWorkloadClaims";
     private static final Duration START = Duration.ofSeconds(120), DELIVERY = Duration.ofSeconds(12);
-    private enum Mode { NATIVE_METRICS, OBSERVATION_WRITE }
+    private enum Mode { EXECUTION_ADVANCE, NATIVE_METRICS, OBSERVATION_WRITE }
     private record Reading(long amount, long recordsOut, Instant observedAt) {
         boolean follows(Reading prior, long value) {
             return amount == value && recordsOut > prior.recordsOut && observedAt.isAfter(prior.observedAt);
@@ -102,10 +103,16 @@ class PeriodicObservationIsolationIT {
             control.apply(all);
             control.discoverSchema(A + "_source", "mysql", sa);
             control.discoverSchema(B + "_source", "mysql", sb);
-            control.lifecycle(A, LifecycleVerb.START);
-            control.lifecycle(B, LifecycleVerb.START);
             MongoDatabase dbA = ca.getDatabase(new ConnectionString(ta).getDatabase());
             MongoDatabase dbB = cb.getDatabase(new ConnectionString(tb).getDatabase());
+            var startupVm = attach(server.output());
+            try (var held = hold(startupVm, Mode.EXECUTION_ADVANCE, () -> control.lifecycle(A, LifecycleVerb.START))) {
+                control.lifecycle(B, LifecycleVerb.START);
+                Await.until("B delivers its snapshot while A's execution advance is held", DELIVERY,
+                        () -> amount(dbB) == 0, () -> "B=" + amount(dbB) + "; A held at " + held.stack);
+            } finally {
+                startupVm.dispose();
+            }
             Await.until("both snapshot rows and published status", START,
                     () -> amount(dbA) == 0 && amount(dbB) == 0
                             && control.observedAt(A).isPresent() && control.observedAt(B).isPresent(),
@@ -126,7 +133,7 @@ class PeriodicObservationIsolationIT {
                     System.out.println("CONTROL " + mode + " before=" + beforeControl + " fresh=" + positive);
                     Reading beforeHold;
                     Reading endHold;
-                    try (var held = hold(vm, mode)) {
+                    try (var held = hold(vm, mode, () -> {})) {
                         beforeHold = read.get();
                         System.out.println("HOLD " + mode + " baseline=" + beforeHold + " stack=" + held.stack);
                         update(sb);
@@ -184,19 +191,26 @@ class PeriodicObservationIsolationIT {
         return connector.attach(args);
     }
 
-    private static Held hold(VirtualMachine vm, Mode mode) throws Exception {
-        String name = mode == Mode.NATIVE_METRICS ? PROXY : STORE;
+    private static Held hold(VirtualMachine vm, Mode mode, Runnable trigger) throws Exception {
+        String name = switch (mode) {
+            case EXECUTION_ADVANCE -> CLAIMS;
+            case NATIVE_METRICS -> PROXY;
+            case OBSERVATION_WRITE -> STORE;
+        };
         var type = vm.classesByName(name);
         if (type.size() != 1) throw new AssertionError("Unexpected class identity " + name + ": " + type.size());
-        Location site = mode == Mode.NATIVE_METRICS
-                ? type.getFirst().methodsByName("getMetrics", "()Lcom/hazelcast/jet/core/metrics/JobMetrics;").getFirst().location()
-                : type.getFirst().methodsByName("write", OBSERVATION_WRITE).getFirst().location();
+        Location site = switch (mode) {
+            case EXECUTION_ADVANCE -> type.getFirst().methodsByName("advanceExecution").getFirst().location();
+            case NATIVE_METRICS -> type.getFirst().methodsByName("getMetrics", "()Lcom/hazelcast/jet/core/metrics/JobMetrics;").getFirst().location();
+            case OBSERVATION_WRITE -> type.getFirst().methodsByName("write", OBSERVATION_WRITE).getFirst().location();
+        };
         var manager = vm.eventRequestManager();
         var request = manager.createBreakpointRequest(site);
         request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
         request.enable();
         long deadline = System.nanoTime() + Duration.ofSeconds(14).toNanos();
         try {
+            trigger.run();
             while (System.nanoTime() < deadline) {
                 var set = vm.eventQueue().remove(1000);
                 if (set == null) continue;
@@ -208,15 +222,21 @@ class PeriodicObservationIsolationIT {
                         if (frames.stream().noneMatch(f -> frameIs(f, DRIVER, "reconcile")
                                 || frameIs(f, DRIVER, "reconcilePipeline")
                                 || frameIs(f, DRIVER, "publishPeriodicObservation"))) continue;
-                        var scope = frames.stream().filter(f -> mode == Mode.NATIVE_METRICS
-                                        ? frameIs(f, ENGINE, "nestStateReadings")
-                                        : frameIs(f, STORE, "write") && OBSERVATION_WRITE.equals(f.location().method().signature()))
-                                .findFirst().orElse(null);
+                        var scope = frames.stream().filter(f -> switch (mode) {
+                            case EXECUTION_ADVANCE -> frameIs(f, CLAIMS, "advanceExecution");
+                            case NATIVE_METRICS -> frameIs(f, ENGINE, "nestStateReadings");
+                            case OBSERVATION_WRITE -> frameIs(f, STORE, "write")
+                                    && OBSERVATION_WRITE.equals(f.location().method().signature());
+                        }).findFirst().orElse(null);
                         if (scope == null) continue;
                         Value arg = scope.getArgumentValues().getFirst();
                         if (mode == Mode.OBSERVATION_WRITE) {
-                            var obj = (ObjectReference) arg;
-                            arg = obj.getValue(obj.referenceType().fieldByName("pipelineId"));
+                            var observation = (ObjectReference) arg;
+                            arg = observation.getValue(observation.referenceType().fieldByName("pipelineId"));
+                        } else if (mode == Mode.EXECUTION_ADVANCE) {
+                            var claim = (ObjectReference) arg;
+                            var key = (ObjectReference) claim.getValue(claim.referenceType().fieldByName("key"));
+                            arg = key.getValue(key.referenceType().fieldByName("resourceId"));
                         }
                         if (!(arg instanceof StringReference id) || !id.value().equals(A)) continue;
                         String stack = frames.stream().limit(24).map(f -> f.location().declaringType().name()

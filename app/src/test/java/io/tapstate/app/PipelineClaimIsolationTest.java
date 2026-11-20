@@ -74,7 +74,7 @@ class PipelineClaimIsolationTest {
     }
 
     @Test
-    void advancingAClaimDoesNotDelayAnotherPipelinesObservationProof() throws Exception {
+    void advancingAClaimDoesNotDelayAnotherPipelinesAdmissionOrObservationProof() throws Exception {
         var owner = owner();
         var originalA = WorkloadClaimFence.from(owner.permit(A).claim());
         var originalB = WorkloadClaimFence.from(owner.permit(B).claim());
@@ -92,7 +92,13 @@ class PipelineClaimIsolationTest {
                 var other = executor.submit(() -> {
                     owner.retain(List.of(A.pipelineId(), B.pipelineId()));
                     assertThat(owner.proveObservationClaim(A, originalA)).isFalse();
-                    return owner.proveObservationClaim(B, originalB);
+                    assertThat(owner.proveObservationClaim(B, originalB)).isTrue();
+                    assertThat(owner.permit(B).granted()).isTrue();
+                    assertThat(owner.permit(A).granted()).isFalse();
+                    assertThat(owner.beginExecution(A, originalA).allowed()).isFalse();
+                    org.assertj.core.api.Assertions.assertThatThrownBy(() -> owner.control(A))
+                            .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                    return owner.beginExecution(B, originalB).allowed();
                 });
                 assertThat(other.get(1, TimeUnit.SECONDS)).isTrue();
                 release.countDown();
@@ -176,6 +182,26 @@ class PipelineClaimIsolationTest {
                 release.countDown();
             }
         }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void aGrantRefusedAfterATopologyChangeIsReleasedEvenWithALocalPlaceholder(boolean nodeBacked) {
+        var owner = nodeBacked ? nodeBackedOwner() : owner();
+        org.mockito.stubbing.Answer<Object> acquire = call -> {
+            var heldBy = nodeBacked ? call.<WorkloadClaimFence>getArgument(1).owner()
+                    : call.<WorkloadOwner>getArgument(1);
+            var ttl = nodeBacked ? Duration.ofDays(1) : call.<Duration>getArgument(3);
+            var granted = claims.acquire(key(A), heldBy, call.getArgument(2), ttl);
+            assertThat(granted.acquired()).isTrue();
+            when(membership.committed()).thenReturn(new ClusterMembership("cluster", 8, Set.of("node", "joined")));
+            return granted;
+        };
+        if (nodeBacked) org.mockito.Mockito.doAnswer(acquire).when(boundary).acquireNodeBackedPipeline(any(), any(), anyLong());
+        else org.mockito.Mockito.doAnswer(acquire).when(boundary).acquirePipeline(any(), any(), anyLong(), any());
+
+        assertThat(owner.permit(A).granted()).isFalse();
+        assertThat(claims.read(key(A)).orElseThrow().leased()).isFalse();
     }
 
     @Test

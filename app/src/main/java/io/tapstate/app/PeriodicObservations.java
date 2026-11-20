@@ -217,10 +217,16 @@ final class PeriodicObservations implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+        if (closed) return;
         closed = true;
         slots.clear();
         pendingHealth.clear();
         workers.shutdownNow();
         healthReporter.shutdownNow();
+    }
+
+    void awaitStopped(long deadline) {
+        ShutdownAwait.executor(workers, deadline);
+        ShutdownAwait.executor(healthReporter, deadline);
     }
 }

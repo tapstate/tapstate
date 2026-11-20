@@ -417,6 +417,8 @@ class PipelineAlertRuntimeTest {
             intents.put("orders", nextIntent);
             runtime.expecting(successor);
             runtime.publishedPeriodic(original, observation("orders", T, PipelineState.RUNNING), () -> true);
+            drained(runtime);
+            assertThat(runtime.health().rejected()).isZero();
             runtime.publishedPeriodic(successor, observation("orders", T, PipelineState.FAILED), () -> true);
             await().atMost(Duration.ofSeconds(3)).until(() -> rows.values().stream().anyMatch(
                     row -> row.value().snapshot().status() == AlertSnapshot.Status.FIRING));

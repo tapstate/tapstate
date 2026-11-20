@@ -39,4 +39,8 @@ final class PipelineConvergences implements AutoCloseable {
     public void close() {
         work.close();
     }
+
+    void awaitStopped(long deadline) {
+        work.awaitStopped(deadline);
+    }
 }

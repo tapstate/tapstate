@@ -298,9 +298,16 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         active.set(false); handlers = List.of();
         Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
+        var beans = context == null ? null : context.getBeanFactory();
+        var periodic = beans == null ? null : (PeriodicObservations) beans.getSingleton("periodicObservations");
+        var convergence = beans == null ? null : (PipelineConvergences) beans.getSingleton("pipelineConvergences");
+        if (convergence != null) convergence.close();
+        if (periodic != null) periodic.close();
         var alerts = alertRuntime.get();
         if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
+        if (convergence != null) convergence.awaitStopped(deadline);
+        if (periodic != null) periodic.awaitStopped(deadline);
         var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
         Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
         Throwable failure = null;
