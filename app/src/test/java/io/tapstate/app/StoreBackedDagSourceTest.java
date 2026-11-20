@@ -253,7 +253,7 @@ class StoreBackedDagSourceTest {
         if (overwritten) {
             assertThatThrownBy(() -> source.transformBinding(pipeline, expand))
                     .isInstanceOf(TapstateException.class)
-                    .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+                    .hasMessageContaining("TS0360008");
         } else {
             List<Map<String, String>> items = List.of(Map.of("sku", "same"));
             Map<String, Object> before = new LinkedHashMap<>(Map.of("o_id", 1L, "items", items));
@@ -314,7 +314,7 @@ class StoreBackedDagSourceTest {
             } else {
                 assertThatThrownBy(() -> renamePort.transform(relayed))
                         .isInstanceOf(TapstateException.class)
-                        .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+                        .hasMessageContaining("TS0360008");
             }
         }
     }
