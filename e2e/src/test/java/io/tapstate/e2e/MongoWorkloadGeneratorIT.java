@@ -8,7 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Sorts;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import io.tapstate.e2e.benchmark.MongoWorkloadGenerator;
@@ -19,6 +21,9 @@ import io.tapstate.e2e.benchmark.WorkloadRecipe;
 import io.tapstate.e2e.benchmark.WorkloadRecipe.Mix;
 import io.tapstate.testsupport.RequiresDocker;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -29,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.bson.BsonDocument;
 import org.bson.BsonType;
@@ -73,7 +79,7 @@ class MongoWorkloadGeneratorIT {
             for (var entry : widths.entrySet()) {
                 var generator = generator(source, "copy.snapshot.basic." + entry.getKey(), Map.of("records", 500));
                 var preparation = generator.prepare(generator.calibrateStringLengths()).preparation();
-                var row = source.getCollection("records", BsonDocument.class).find().first();
+                var row = source.getCollection("records", BsonDocument.class).find().sort(Sorts.ascending("_id")).first();
                 assertNotNull(row);
                 assertEquals(BsonType.INT64, row.get("_id").getBsonType());
                 assertEquals(1, row.getInt64("_id").getValue());
@@ -200,16 +206,100 @@ class MongoWorkloadGeneratorIT {
         withSource(source -> {
             var generator = generator(source, "copy.live.basic.standard", Map.of("records", 10));
             var prepared = generator.prepare(generator.calibrateStringLengths());
-            var result = prepared.inject(new LiveWindow(5, Duration.ofMillis(400), Duration.ofSeconds(1)),
-                    new Mix(100, 0, 0), null, () -> { throw new IllegalStateException("reader not ready"); });
+            var called = new AtomicBoolean();
+            var result = prepared.inject(new LiveWindow(1, Duration.ofMillis(1900), Duration.ofSeconds(5)),
+                    new Mix(100, 0, 0), null, () -> {
+                        called.set(true);
+                        throw new IllegalStateException("reader not ready");
+                    });
+            assertTrue(called.get());
             assertTrue(result.warmup().complete(), result::toString);
             assertFalse(result.measured().complete());
-            assertEquals(12, source.getCollection("records").countDocuments());
+            assertEquals(11, source.getCollection("records").countDocuments());
             var scoring = result.measured().streams().get("records");
             assertEquals(5, scoring.planned().total());
             assertEquals(0, scoring.submittedOperations());
             assertTrue(scoring.error().contains("reader not ready"));
         });
+    }
+
+    @Test
+    void aFailedTargetBoundaryKeepsObservedSourceHistory() throws Exception {
+        withSource(source -> {
+            var generator = generator(source, "copy.live.basic.standard", Map.of("records", 10));
+            var prepared = generator.prepare(generator.calibrateStringLengths());
+            var result = prepared.inject(new LiveWindow(1, Duration.ofMillis(1900), Duration.ofMillis(1900)),
+                    new Mix(100, 0, 0), null, () -> {}, () -> {
+                        throw new IllegalStateException("target frontier unavailable");
+                    });
+            assertTrue(result.warmup().complete(), result::toString);
+            assertFalse(result.measured().complete());
+            var measured = result.measured().streams().get("records");
+            assertEquals(1, measured.submittedOperations());
+            assertEquals(new Operations(1, 0, 0), measured.acknowledged());
+            assertEquals(measured.acknowledged(), measured.observed());
+            assertNotNull(measured.sourceSequenceSha256());
+            assertTrue(measured.error().contains("target frontier unavailable"));
+        });
+    }
+
+    @Test
+    void aTwoStreamBatchCanAllocateOneUpdateAndOneDelete() throws Exception {
+        withSource(source -> {
+            var generator = generator(source, "union.backlog.basic.standard", Map.of("left", 1, "right", 1));
+            var prepared = generator.prepare(generator.calibrateStringLengths());
+            var result = prepared.prewrite(2, new Mix(0, 50, 50), null);
+            assertTrue(result.batch().complete(), result::toString);
+            assertEquals(new Operations(0, 1, 0), result.batch().streams().get("left").observed());
+            assertEquals(new Operations(0, 0, 1), result.batch().streams().get("right").observed());
+        });
+    }
+
+    @Test
+    void aLostWriteAcknowledgementStillShowsTheCommittedSourceEvent() throws Exception {
+        withSource(source -> {
+            var generator = generator(withLostWriteAcknowledgement(source), "copy.backlog.fixed-iud.standard",
+                    Map.of("records", 10));
+            var prepared = generator.prepare(generator.calibrateStringLengths());
+            var result = prepared.prewrite(1, new Mix(100, 0, 0), null);
+            var stream = result.batch().streams().get("records");
+            assertFalse(result.batch().complete());
+            assertEquals(1, stream.submittedOperations());
+            assertEquals(0, stream.acknowledged().total());
+            assertEquals(new Operations(1, 0, 0), stream.observed());
+            assertNotNull(stream.historyBoundary());
+            assertTrue(stream.error().contains("acknowledgement lost after commit"));
+            assertEquals(11, source.getCollection("records").countDocuments());
+        });
+    }
+
+    private static MongoDatabase withLostWriteAcknowledgement(MongoDatabase database) {
+        return (MongoDatabase) Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(),
+                new Class<?>[] {MongoDatabase.class}, (proxy, method, args) -> {
+                    Object result = invoke(database, method, args);
+                    if (result instanceof MongoDatabase configured) {
+                        return withLostWriteAcknowledgement(configured);
+                    }
+                    if (result instanceof MongoCollection<?> collection && args != null && "records".equals(args[0])) {
+                        return Proxy.newProxyInstance(MongoCollection.class.getClassLoader(),
+                                new Class<?>[] {MongoCollection.class}, (ignored, operation, parameters) -> {
+                                    Object reply = invoke(collection, operation, parameters);
+                                    if (operation.getName().equals("bulkWrite")) {
+                                        throw new com.mongodb.MongoException("acknowledgement lost after commit");
+                                    }
+                                    return reply;
+                                });
+                    }
+                    return result;
+                });
+    }
+
+    private static Object invoke(Object target, Method method, Object[] args) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (InvocationTargetException failure) {
+            throw failure.getCause();
+        }
     }
 
     @Test

@@ -110,6 +110,20 @@ class PerfCaseScannerTest(unittest.TestCase):
         self.assertEqual(row["group"], "mixed")
         self.assertEqual(row["operators"], ["map", "nest"])
 
+    def test_wildcard_and_explicit_imports_produce_the_same_inventory(self):
+        direct = declaration("sample.direct")
+        repeated = declaration("sample.repeated")
+        body = f"{direct}\n@Cases({{ {repeated} }}) class Sample {{}}"
+        path = self.write("Sample.java", f"import io.tapstate.benchmarks.PerfCase;\n"
+                          f"import io.tapstate.benchmarks.PerfCase.Cases;\n{body}")
+        explicit = self.scan()
+        self.assertEqual(0, explicit.returncode, explicit.stderr)
+        path.write_text(f"import io.tapstate.benchmarks.*;\n"
+                        f"import io.tapstate.benchmarks.PerfCase.*;\n{body}", encoding="utf-8")
+        wildcard = self.scan()
+        self.assertEqual(0, wildcard.returncode, wildcard.stderr)
+        self.assertEqual(explicit.stdout, wildcard.stdout)
+
     def test_reports_duplicate_ids_from_two_sources(self):
         for name in ("First", "Second"):
             self.write(

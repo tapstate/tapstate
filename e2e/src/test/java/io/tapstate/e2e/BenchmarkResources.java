@@ -32,6 +32,7 @@ final class BenchmarkResources implements AutoCloseable {
     private final long started = System.currentTimeMillis();
     private String phase = "startup";
     private long phaseStarted = started;
+    private long phaseStartedNanos = System.nanoTime();
     private int missing;
     private Long lifetimeRssPeak;
 
@@ -52,9 +53,11 @@ final class BenchmarkResources implements AutoCloseable {
     synchronized void phase(String name) {
         if (!phase.equals(name)) {
             long now = System.currentTimeMillis();
-            windows.add(new Window(phase, phaseStarted, now));
+            long nanos = System.nanoTime();
+            windows.add(new Window(phase, phaseStarted, now, phaseStartedNanos, nanos));
             phase = name;
             phaseStarted = now;
+            phaseStartedNanos = nanos;
         }
     }
 
@@ -64,6 +67,7 @@ final class BenchmarkResources implements AutoCloseable {
 
     private void sample() {
         long timestamp = System.currentTimeMillis();
+        long readStarted = System.nanoTime();
         try {
             long rss;
             long highWater;
@@ -83,12 +87,14 @@ final class BenchmarkResources implements AutoCloseable {
                         java.nio.charset.StandardCharsets.UTF_8).trim());
                 highWater = rss;
             }
+            long readFinished = System.nanoTime();
+            long finishedTimestamp = System.currentTimeMillis();
             synchronized (this) {
                 lifetimeRssPeak = lifetimeRssPeak == null ? highWater : Math.max(highWater, lifetimeRssPeak);
                 if (output == null) {
                     return;
                 }
-                var sample = new Sample(timestamp, rss, threads);
+                var sample = new Sample(timestamp, finishedTimestamp, readStarted, readFinished, rss, threads);
                 Files.writeString(output, JSON.writeValueAsString(sample) + "\n",
                         StandardOpenOption.CREATE, StandardOpenOption.APPEND);
                 samples.add(sample);
@@ -111,16 +117,19 @@ final class BenchmarkResources implements AutoCloseable {
     synchronized Map<String, Object> report(int steadyWindows) {
         var gc = readGc();
         var completed = new ArrayList<>(windows);
-        completed.add(new Window(phase, phaseStarted, System.currentTimeMillis()));
+        completed.add(new Window(phase, phaseStarted, System.currentTimeMillis(), phaseStartedNanos, System.nanoTime()));
         var observations = new LinkedHashMap<String, Map<String, Object>>();
         for (Window window : completed) {
             observations.put(window.name(), summarize(window, gc));
             if (steadyWindows > 0 && window.name().equals("measurement")) {
                 long duration = window.end() - window.start();
+                long nanos = window.endNanos() - window.startNanos();
                 for (int i = 0; i < steadyWindows; i++) {
                     observations.put("steady-" + (i + 1), summarize(new Window("steady",
                             window.start() + i * duration / steadyWindows,
-                            window.start() + (i + 1) * duration / steadyWindows), gc));
+                            window.start() + (i + 1) * duration / steadyWindows,
+                            window.startNanos() + i * nanos / steadyWindows,
+                            window.startNanos() + (i + 1) * nanos / steadyWindows), gc));
                 }
             }
         }
@@ -148,8 +157,8 @@ final class BenchmarkResources implements AutoCloseable {
     }
 
     private Map<String, Object> summarize(Window window, List<GcSample> gc) {
-        var inWindow = samples.stream().filter(s -> s.epochMillis() >= window.start()
-                && s.epochMillis() < window.end()).toList();
+        var inWindow = samples.stream().filter(s -> s.readStartedNanos() >= window.startNanos()
+                && s.readFinishedNanos() < window.endNanos()).toList();
         long expected = Math.max(1, (window.end() - window.start()) / intervalMillis);
         var sorted = inWindow.stream().map(Sample::rssKiB).sorted().toList();
         var result = new LinkedHashMap<String, Object>();
@@ -207,7 +216,8 @@ final class BenchmarkResources implements AutoCloseable {
         timer.shutdownNow();
     }
 
-    record Sample(long epochMillis, long rssKiB, Long threads) {}
+    record Sample(long epochMillis, long readFinishedEpochMillis, long readStartedNanos, long readFinishedNanos,
+                  long rssKiB, Long threads) {}
     private record GcSample(long epochMillis, String kind, long postHeapKiB) {}
-    private record Window(String name, long start, long end) {}
+    private record Window(String name, long start, long end, long startNanos, long endNanos) {}
 }

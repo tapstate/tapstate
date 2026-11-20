@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import com.mongodb.WriteConcern;
+import com.mongodb.MongoOperationTimeoutException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoChangeStreamCursor;
 import com.mongodb.client.MongoDatabase;
@@ -22,10 +23,11 @@ final class BenchmarkTargetLimit implements AutoCloseable {
     private final String application;
     private final String namespace;
     private final int blockMillis;
+    private boolean armed;
     private Long firstEntry;
 
     BenchmarkTargetLimit(MongoDatabase admin, String application, String namespace, int blockMillis) {
-        this.admin = admin;
+        this.admin = admin.withTimeout(3, TimeUnit.SECONDS);
         this.application = application;
         this.namespace = namespace;
         this.blockMillis = blockMillis;
@@ -45,16 +47,20 @@ final class BenchmarkTargetLimit implements AutoCloseable {
         var data = new Document("failCommands", List.of("insert", "update", "delete"))
                 .append("appName", application).append("namespace", namespace)
                 .append("blockConnection", true).append("blockTimeMS", blockMillis);
+        armed = true;
         var response = admin.runCommand(new Document("configureFailPoint", "failCommand")
                 .append("mode", "alwaysOn").append("data", data));
         firstEntry = count(response);
     }
 
     long release() {
+        return disarm() - firstEntry;
+    }
+
+    private long disarm() {
         var response = admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
-        long delayed = count(response) - firstEntry;
-        firstEntry = null;
-        return delayed;
+        armed = false;
+        return count(response);
     }
 
     private static long count(Document response) {
@@ -64,34 +70,40 @@ final class BenchmarkTargetLimit implements AutoCloseable {
     /** Counts majority-visible target writes at a server-side boundary before the limit is released. */
     static final class TargetWindow implements AutoCloseable {
         private static final String FRONTIER = "benchmark_target_frontier";
+        private static final int ITERATION_MILLIS = 500;
         private final MongoDatabase database;
         private final String target;
         private MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor;
 
         TargetWindow(MongoDatabase database, MongoCollection<BsonDocument> target) {
-            this.database = database;
+            this.database = database.withTimeout(3, TimeUnit.SECONDS);
             this.target = target.getNamespace().getCollectionName();
         }
 
         void begin() {
             database.createCollection(FRONTIER);
-            cursor = database.watch(List.of(Aggregates.match(Filters.in("ns.coll", target, FRONTIER))),
+            cursor = database.withTimeout(ITERATION_MILLIS, TimeUnit.MILLISECONDS)
+                    .watch(List.of(Aggregates.match(Filters.in("ns.coll", target, FRONTIER))),
                     BsonDocument.class).maxAwaitTime(200, TimeUnit.MILLISECONDS).batchSize(128).cursor();
         }
 
         OptionalLong countThroughBoundary() {
-            database.getCollection(FRONTIER, BsonDocument.class).withWriteConcern(WriteConcern.MAJORITY)
-                    .insertOne(new BsonDocument("_id", new BsonInt32(1)));
             long count = 0;
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
-            while (System.nanoTime() < deadline) {
-                var event = cursor.tryNext();
-                if (event != null) {
-                    if (event.getNamespace().getCollectionName().equals(FRONTIER)) {
-                        return OptionalLong.of(count);
+            try {
+                database.getCollection(FRONTIER, BsonDocument.class).withWriteConcern(WriteConcern.MAJORITY)
+                        .insertOne(new BsonDocument("_id", new BsonInt32(1)));
+                while (System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ITERATION_MILLIS) < deadline) {
+                    var event = cursor.tryNext();
+                    if (event != null) {
+                        if (event.getNamespace().getCollectionName().equals(FRONTIER)) {
+                            return OptionalLong.of(count);
+                        }
+                        count++;
                     }
-                    count++;
                 }
+            } catch (MongoOperationTimeoutException deadlineExpired) {
+                return OptionalLong.empty();
             }
             return OptionalLong.empty();
         }
@@ -106,8 +118,8 @@ final class BenchmarkTargetLimit implements AutoCloseable {
 
     @Override
     public void close() {
-        if (firstEntry != null) {
-            release();
+        if (armed) {
+            disarm();
         }
     }
 }

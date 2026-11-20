@@ -30,6 +30,16 @@ DIMENSIONS = {
     "group", "operators", "phase", "mode", "profile", "source", "target",
     "environments", "purposes", "workload", "data_features", "tags", "execution",
 }
+LOAD_DEFAULTS = {
+    "repeats": 3,
+    "rows": 32,
+    "backlog_events": 20,
+    "rate": 10,
+    "warmup_seconds": 1,
+    "measurement_seconds": 2,
+    "timeout_seconds": 45,
+    "mix": None,
+}
 
 
 def select(cases, explicit, where, suite, *, allow_empty=False):
@@ -96,21 +106,8 @@ def identity(catalog):
 
 
 def make_entries(cases, args):
-    return [
-        {
-            "case": case,
-            "repeats": args.repeats,
-            "scale": "qualification",
-            "rows": args.rows,
-            "backlog_events": args.backlog_events,
-            "rate": args.rate,
-            "warmup_seconds": args.warmup_seconds,
-            "measurement_seconds": args.measurement_seconds,
-            "timeout_seconds": args.timeout_seconds,
-            "mix": args.mix,
-        }
-        for case in cases
-    ]
+    load = {name: getattr(args, name, default) for name, default in LOAD_DEFAULTS.items()}
+    return [{"case": case, "scale": "qualification", **load} for case in cases]
 
 
 def allocate(entries, estimates, slots, limit, deadline, reserve):
@@ -161,6 +158,7 @@ def checked_entries(entries):
 
 
 def replay(catalog, manifest, index):
+    require_clean_manifest_checkout(catalog)
     if manifest.get("manifest_sha256") != definitions.digest(
             {key: value for key, value in manifest.items() if key != "manifest_sha256"}):
         raise ValueError("Manifest digest does not match its contents")
@@ -179,6 +177,11 @@ def replay(catalog, manifest, index):
     if any(current.get(entry["case"]["id"]) != entry["case"] for entry in entries):
         raise ValueError("Batch includes a mismatched case definition")
     return checked_entries(entries)
+
+
+def require_clean_manifest_checkout(catalog):
+    if catalog["source_dirty"]:
+        raise ValueError("Manifest allocation and replay require a clean checkout")
 
 
 def run_entries(entries, binding, args, manifest=None):
@@ -226,14 +229,19 @@ def run_entries(entries, binding, args, manifest=None):
                                    args=(done, run_id, output / "mongo-resource.jsonl", min(memory_intervals or {2})),
                                    daemon=True)
         sampler.start()
+        code = 1
         try:
             code = process.wait(timeout=upper_bound)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            stop_process(process)
             code = 124
         finally:
-            done.set()
-            sampler.join(timeout=8)
+            try:
+                if not stop_process(process):
+                    code = code or 1
+                    print("Benchmark process group still exists after forced teardown", file=log)
+            finally:
+                done.set()
+                sampler.join(timeout=8)
     results = []
     for entry in entries:
         case = entry["case"]
@@ -292,13 +300,25 @@ def sample_database(done, owner, destination, interval):
 
 
 def stop_process(process):
-    if process.poll() is None:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+    for sig, grace in ((signal.SIGTERM, 15), (signal.SIGKILL, 2)):
+        process.poll()
+        if not signal_group(process.pid, sig):
+            return True
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            process.poll()
+            if not signal_group(process.pid, 0):
+                return True
+            time.sleep(0.05)
+    return False
+
+
+def signal_group(group, sig):
+    try:
+        os.killpg(group, sig)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def write_json(path, result):
@@ -329,14 +349,12 @@ def add_selection(parser):
 
 
 def add_load(parser):
-    parser.add_argument("--repeats", type=positive, default=3)
-    parser.add_argument("--rows", type=positive, default=32)
-    parser.add_argument("--backlog-events", type=positive, default=20)
-    parser.add_argument("--rate", type=positive, default=10)
-    parser.add_argument("--warmup-seconds", type=positive, default=1)
-    parser.add_argument("--measurement-seconds", type=positive, default=2)
-    parser.add_argument("--timeout-seconds", type=positive, default=45)
-    parser.add_argument("--mix", type=mix, help="Override the allowed CDC mix, e.g. 100/0/0.")
+    for name in LOAD_DEFAULTS:
+        if name == "mix":
+            continue
+        parser.add_argument("--" + name.replace("_", "-"), type=positive, default=argparse.SUPPRESS)
+    parser.add_argument("--mix", type=mix, default=argparse.SUPPRESS,
+                        help="Override the allowed CDC mix, e.g. 100/0/0.")
 
 
 def main():
@@ -397,6 +415,9 @@ def main():
                 raise ValueError("Select in the manifest or on the command line")
             manifest = definitions.read_json(args.manifest)
             entries = replay(catalog, manifest, args.batch)
+            for name in LOAD_DEFAULTS:
+                if hasattr(args, name) and any(entry[name] != getattr(args, name) for entry in entries):
+                    raise ValueError(f"--{name.replace('_', '-')} conflicts with the manifest batch")
             return run_entries(entries, binding, args, manifest)
         cases = select(catalog["cases"], args.id, args.where, args.suite, allow_empty=args.command == "list")
         if args.command == "list":
@@ -410,6 +431,8 @@ def main():
         entries = make_entries(cases, args)
         if args.command == "run":
             return run_entries(entries, binding, args)
+        require_clean_manifest_checkout(catalog)
+        checked_entries(entries)
         estimates = definitions.read_json(args.estimates)
         if estimates["environment"] != args.environment:
             raise ValueError("Timing estimates were recorded for a different environment")

@@ -13,6 +13,14 @@ import org.junit.jupiter.api.Test;
 
 class BenchmarkOperatorOracleTest {
     @Test
+    void numeric_readback_preserves_decimal128_but_allows_integer_width_changes() {
+        var decimal = new org.bson.BsonDecimal128(new org.bson.types.Decimal128(new java.math.BigDecimal("12.50")));
+        assertFalse(BenchmarkOperatorOracle.equivalent(decimal, new org.bson.BsonDouble(12.5)));
+        assertTrue(BenchmarkOperatorOracle.equivalent(decimal, decimal));
+        assertTrue(BenchmarkOperatorOracle.equivalent(new org.bson.BsonInt32(12), new org.bson.BsonInt64(12)));
+    }
+
+    @Test
     void filteringAndProjectionCheckKeysAndValuesRatherThanCount() {
         var odd = BsonDocument.parse("{'_id':1,'label':'odd','payload':'left','value':2}");
         var even = BsonDocument.parse("{'_id':2,'label':'even','payload':'right','value':7}");

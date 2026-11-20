@@ -95,9 +95,8 @@ def build_catalog():
     if unused:
         raise ValueError(f"Unreferenced specifications: {', '.join(sorted(unused))}")
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=BENCHMARKS, text=True).strip()
-    dirty = subprocess.check_output(
-        ["git", "status", "--porcelain", "--", "."], cwd=BENCHMARKS, text=True
-    ).strip()
+    dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"],
+                                    cwd=BENCHMARKS, text=True).strip()
     return {"schema_version": inventory["schema_version"], "code_sha": sha,
             "source_dirty": bool(dirty), "catalog_sha256": digest([case["definition_sha256"] for case in cases]),
             "cases": cases}
@@ -108,7 +107,7 @@ def render_markdown(catalog, selected=None):
              f"Catalog digest `{catalog['catalog_sha256']}`.",
              "These definitions describe calibration candidates. Execution and qualified measurements are recorded separately.", ""]
     if catalog["source_dirty"]:
-        lines.extend(["The benchmark sources have local changes.", ""])
+        lines.extend(["The checkout has local changes.", ""])
     if selected is None:
         lines.extend([f"{len(catalog['cases'])} registered cases.", ""])
     lines.extend([

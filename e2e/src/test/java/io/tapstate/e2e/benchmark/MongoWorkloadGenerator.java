@@ -8,7 +8,9 @@ import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.MongoChangeStreamCursor;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.DeleteOneModel;
+import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.InsertOneModel;
 import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.WriteModel;
@@ -27,17 +29,20 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import org.bson.BsonBoolean;
 import org.bson.BsonDocument;
 import org.bson.BsonInt64;
+import org.bson.BsonString;
 import org.bson.BsonTimestamp;
 
 /** Generates source data only. The caller owns the isolated source database and its cleanup. */
 public final class MongoWorkloadGenerator {
     private static final Duration IO_TIMEOUT = Duration.ofSeconds(10);
+    private static final String HISTORY_MARKERS = "benchmark_source_history";
 
     public record HotKeys(int keyPercent, int eventPercent) {
         public HotKeys {
@@ -73,7 +78,7 @@ public final class MongoWorkloadGenerator {
     }
 
     public record StreamReport(Operations planned, Operations acknowledged, Operations observed,
-                               Position startExclusive, Position first, Position last,
+                               Position startExclusive, Position first, Position last, Position historyBoundary,
                                int submittedOperations, long hotKeySelections, String sourceSequenceSha256, String error) {
     }
 
@@ -324,7 +329,7 @@ public final class MongoWorkloadGenerator {
         var states = new ArrayList<StreamState>();
         try {
             for (var stream : streams) {
-                states.add(new StreamState(stream, collection(stream.input.name())));
+                states.add(new StreamState(stream, collection(stream.input.name()), database));
             }
             var delays = new Delays();
             Long cpu = cpuNanos();
@@ -338,10 +343,16 @@ public final class MongoWorkloadGenerator {
             long duration = System.nanoTime() - start;
             Instant writesFinishedAt = Instant.now();
             Long writerCpu = cpuElapsed(cpu);
-            afterWrites.run();
+            String callbackError = null;
+            try {
+                afterWrites.run();
+            } catch (RuntimeException | AssertionError failure) {
+                callbackError = "After-writes boundary check failed: " + failure;
+            }
             long historyStarted = System.nanoTime();
             for (var state : states) {
                 state.readHistory();
+                if (callbackError != null) state.recordError(callbackError);
             }
             return report(name, states, rate, startedAt, writesFinishedAt, duration, System.nanoTime() - historyStarted, writerCpu, delays);
         } finally {
@@ -440,7 +451,7 @@ public final class MongoWorkloadGenerator {
         var zero = new Operations(0, 0, 0);
         for (var stream : streams) {
             result.put(stream.input.name(), new StreamReport(new Operations(stream.requested), zero, zero,
-                    null, null, null, 0, 0, null, reason));
+                    null, null, null, null, 0, 0, null, reason));
         }
         return new PhaseReport("measurement", null, null, 0, 0, null, rate, 0, 0, new Delays().report(), Map.copyOf(result), false);
     }
@@ -475,11 +486,14 @@ public final class MongoWorkloadGenerator {
     private static final class StreamState {
         final WorkloadChanges.Stream stream;
         private final MongoCollection<BsonDocument> collection;
+        private final MongoCollection<BsonDocument> markers;
+        private final BsonString markerId = new BsonString(UUID.randomUUID().toString());
         private final MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor;
         private final Position start;
         private final long startingHotKeys;
         private Position first;
         private Position last;
+        private Position historyBoundary;
         private Counts acknowledged = new Counts(0, 0, 0);
         private Counts observed = new Counts(0, 0, 0);
         private final ByteBuffer eventBytes = ByteBuffer.allocate(9);
@@ -487,13 +501,18 @@ public final class MongoWorkloadGenerator {
         private final MessageDigest observedSequence = SourceInspector.sha256();
         private String sourceSequenceSha256;
         private int submitted;
+        private boolean unknownAcknowledgement;
         private String error;
 
-        StreamState(WorkloadChanges.Stream stream, MongoCollection<BsonDocument> collection) {
+        StreamState(WorkloadChanges.Stream stream, MongoCollection<BsonDocument> collection, MongoDatabase database) {
             this.stream = stream;
             this.collection = collection;
+            this.markers = database.getCollection(HISTORY_MARKERS, BsonDocument.class);
             startingHotKeys = stream.keys.hotSelections;
-            cursor = collection.watch(BsonDocument.class).maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor();
+            cursor = database.watch(List.of(Aggregates.match(Filters.or(
+                            Filters.eq("ns.coll", name()),
+                            Filters.and(Filters.eq("ns.coll", HISTORY_MARKERS), Filters.eq("documentKey._id", markerId))))),
+                    BsonDocument.class).maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor();
             try {
                 // The sync driver exposes the post-batch resume token after the first cursor poll.
                 if (cursor.tryNext() != null || cursor.getResumeToken() == null) {
@@ -524,9 +543,12 @@ public final class MongoWorkloadGenerator {
             } catch (MongoBulkWriteException failure) {
                 if (failure.getWriteConcernError() == null) {
                     acknowledged = acknowledged.plus(counts(failure.getWriteResult()));
+                } else {
+                    unknownAcknowledgement = true;
                 }
                 error = failure.toString();
             } catch (MongoException failure) {
+                unknownAcknowledgement = true;
                 error = failure.toString();
             } finally {
                 delays.record(System.nanoTime() - startNanos);
@@ -535,13 +557,26 @@ public final class MongoWorkloadGenerator {
         }
 
         void readHistory() {
-            int maximum = acknowledged.total();
+            if (unknownAcknowledgement) {
+                try {
+                    // Observe a majority-ordered prefix without altering the workload collection.
+                    // A timed-out write can still arrive later, so the phase keeps the original failure.
+                    markers.insertOne(new BsonDocument("_id", markerId));
+                } catch (MongoException failure) {
+                    recordError("Could not write the source history marker: " + failure);
+                }
+            }
             long idleDeadline = System.nanoTime() + IO_TIMEOUT.toNanos();
             try {
-                while (observed.total() < maximum && System.nanoTime() < idleDeadline) {
+                while ((unknownAcknowledgement || observed.total() < acknowledged.total())
+                        && System.nanoTime() < idleDeadline) {
                     var event = cursor.tryNext();
                     if (event == null) {
                         continue;
+                    }
+                    if (HISTORY_MARKERS.equals(event.getNamespace().getCollectionName())) {
+                        historyBoundary = new Position(event.getResumeToken(), event.getClusterTime());
+                        break;
                     }
                     var kind = switch (event.getOperationType()) {
                         case INSERT -> WorkloadChanges.Kind.INSERT;
@@ -563,20 +598,26 @@ public final class MongoWorkloadGenerator {
                 }
                 var history = observedSequence.digest();
                 sourceSequenceSha256 = HexFormat.of().formatHex(history);
+                if (unknownAcknowledgement && historyBoundary == null) {
+                    recordError("Source history incomplete: the majority boundary was not observed");
+                }
                 if (error == null && (!observed.equals(acknowledged)
                         || !MessageDigest.isEqual(history, submittedSequence.digest()))) {
                     error = "Change stream observations differ from the submitted operation sequence";
                 }
             } catch (RuntimeException failure) {
-                if (error == null) {
-                    error = failure.toString();
-                }
+                recordError("Could not read source history: " + failure);
             }
+        }
+
+        void recordError(String detail) {
+            error = error == null ? detail : error + " | " + detail;
         }
 
         StreamReport report() {
             return new StreamReport(new Operations(stream.requested), new Operations(acknowledged), new Operations(observed),
-                    start, first, last, submitted, stream.keys.hotSelections - startingHotKeys, sourceSequenceSha256, error);
+                    start, first, last, historyBoundary, submitted, stream.keys.hotSelections - startingHotKeys,
+                    sourceSequenceSha256, error);
         }
 
         void close() {

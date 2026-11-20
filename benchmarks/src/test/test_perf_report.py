@@ -58,3 +58,21 @@ class PerfReportTest(unittest.TestCase):
         self.baseline["cases"][self.row["case_id"]]["effective_load"] = {"rows": 64}
         result = report.reconcile(self.manifest, [self.summary], self.baseline)
         self.assertEqual("incompatible", result["results"][0]["comparisons"]["status"])
+
+    def test_summarizes_comparable_covered_repeats_and_keeps_raw_values(self):
+        second = copy.deepcopy(self.row)
+        second["repeat"] = 2
+        second["resources"]["windows"]["snapshot"]["rss_peak_kib"] = 140
+        self.summary["results"].append(second)
+        result = report.reconcile(self.manifest, [self.summary])
+        case = self.row["case_id"]
+        self.assertEqual(2, len(result["results"]))
+        metrics = result["statistics"][case]["single"]
+        self.assertEqual({"snapshot.rss_peak_kib"}, set(metrics))
+        observed, = metrics["snapshot.rss_peak_kib"]
+        self.assertEqual(2, observed["count"])
+        self.assertEqual(130, observed["median"])
+        self.assertEqual(20, observed["range"])
+        second["environment"] = {"os": "other"}
+        cohorts = report.reconcile(self.manifest, [self.summary])["statistics"][case]["single"]["snapshot.rss_peak_kib"]
+        self.assertEqual([1, 1], [cohort["count"] for cohort in cohorts])

@@ -78,6 +78,12 @@ final class BenchmarkOperatorOracle {
     }
 
     static String difference(BenchmarkOperators operators, MongoDatabase database, Map<String, BsonDocument> expected) {
+        for (String table : database.listCollectionNames()) {
+            if (!operators.targets().contains(table)
+                    && database.getCollection(table, BsonDocument.class).find().first() != null) {
+                return "Unexpected nonempty target collection " + table;
+            }
+        }
         var seen = new java.util.HashSet<String>();
         for (String table : operators.targets()) {
             try (var cursor = database.getCollection(table, BsonDocument.class).find().cursor()) {
@@ -144,6 +150,9 @@ final class BenchmarkOperatorOracle {
     static boolean equivalent(BsonValue expected, BsonValue actual) {
         if (expected == null || actual == null) {
             return expected == actual;
+        }
+        if (expected.isDecimal128() != actual.isDecimal128()) {
+            return false;
         }
         if (expected.isNumber() && actual.isNumber()) {
             return expected.asNumber().decimal128Value().bigDecimalValue()

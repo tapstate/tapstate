@@ -97,11 +97,11 @@ public final class PerfCaseScanner {
             SourcePositions positions, Map<String, Map<String, Object>> cases) {
         Path source = Path.of(unit.getSourceFile().toUri());
         String relativeSource = relativePath(root, source);
+        List<String> imports = unit.getImports().stream()
+                .map(item -> item.getQualifiedIdentifier().toString()).toList();
         boolean shortName = "io.tapstate.benchmarks".equals(String.valueOf(unit.getPackageName()))
-                || unit.getImports().stream().anyMatch(item -> item.getQualifiedIdentifier()
-                        .toString().equals(ANNOTATION));
-        boolean shortContainer = unit.getImports().stream().anyMatch(item -> item.getQualifiedIdentifier()
-                .toString().equals(ANNOTATION + ".Cases"));
+                || imports.contains(ANNOTATION) || imports.contains("io.tapstate.benchmarks.*");
+        boolean shortContainer = imports.contains(ANNOTATION + ".Cases") || imports.contains(ANNOTATION + ".*");
         new TreeScanner<Void, Void>() {
             @Override
             public Void visitClass(ClassTree node, Void unused) {

@@ -1,8 +1,13 @@
 """Reconcile batch results and compare compatible benchmark observations."""
 
 import math
+from statistics import median
 
 import catalog
+
+CASE_CONDITIONS = ("case_version", "definition_sha256", "mode", "scale", "effective_load",
+                   "connector_sha256", "environment")
+ARM_CONDITIONS = ("effective_input_rows", "mongo_topology", "target_delay_millis", "database_conditions")
 
 
 def reconcile(manifest, summaries, baseline=None):
@@ -57,7 +62,44 @@ def reconcile(manifest, summaries, baseline=None):
     ]
     return {"manifest_sha256": manifest["manifest_sha256"], "identity": manifest["identity"],
             "environment": manifest["environment"], "baseline_id": baseline["id"] if baseline else None,
-            "baseline_kind": baseline["kind"] if baseline else None, "errors": errors, "results": results}
+            "baseline_kind": baseline["kind"] if baseline else None, "errors": errors, "results": results,
+            "statistics": summarize_repeats(results)}
+
+
+def summarize_repeats(results):
+    observed = {}
+    for row in results:
+        if row["status"] != "completed" or any(key not in row for key in CASE_CONDITIONS):
+            continue
+        for name, arm in row.get("paired_arms", {"single": row}).items():
+            if arm.get("status") != "completed" or arm.get("mongo_topology") and not arm.get("database_conditions"):
+                continue
+            conditions = {key: row[key] for key in (*CASE_CONDITIONS, "run_id")}
+            conditions["op_boot_sha256"] = arm.get("op_boot_sha256")
+            conditions.update({key: arm.get(key) for key in ARM_CONDITIONS})
+            for metric, value, source in eligible_metrics(arm):
+                if valid(value):
+                    binding = {**conditions, "metric_source": source}
+                    key = row["case_id"], name, metric, catalog.digest(binding)
+                    cohort = observed.setdefault(key, (binding, []))
+                    cohort[1].append(value)
+    statistics = {}
+    for (case, arm, metric, _), (binding, values) in observed.items():
+        minimum, maximum = min(values), max(values)
+        row = {"conditions": binding, "count": len(values), "median": median(values),
+               "min": minimum, "max": maximum, "range": maximum - minimum}
+        statistics.setdefault(case, {}).setdefault(arm, {}).setdefault(metric, []).append(row)
+    return statistics
+
+
+def eligible_metrics(arm):
+    if arm.get("measurement_status") == "eligible":
+        yield "completion_nanos", arm.get("phase_nanos", {}).get("completion_observed"), "completion observation"
+    resources = arm.get("resources", {})
+    if resources.get("status") == "observed":
+        for phase, usage in resources["windows"].items():
+            if usage.get("covered") and usage.get("source"):
+                yield f"{phase}.rss_peak_kib", usage.get("rss_peak_kib"), usage["source"]
 
 
 def compare(row, baseline, environment):
@@ -69,11 +111,9 @@ def compare(row, baseline, environment):
         return {"status": "result-unavailable"}
     if baseline["environment"] != environment:
         return {"status": "environment-mismatch"}
-    compatible = ("case_version", "definition_sha256", "mode", "scale", "effective_load",
-                  "connector_sha256", "environment")
     reference = baseline["cases"].get(row["case_id"])
     if not reference or any(key not in row or key not in reference or row[key] != reference[key]
-                            for key in compatible):
+                            for key in CASE_CONDITIONS):
         return {"status": "incompatible"}
     arms = row.get("paired_arms", {"single": row})
     reference_arms = reference.get("paired_arms", {"single": reference})
@@ -85,10 +125,9 @@ def compare(row, baseline, environment):
         arm_result = {}
         if arm.get("status") != "completed" or ref.get("status") != "completed":
             continue
-        arm_conditions = ("effective_input_rows", "mongo_topology", "target_delay_millis", "database_conditions")
         if arm.get("mongo_topology") and not arm.get("database_conditions"):
             continue
-        if any(arm.get(key) != ref.get(key) for key in arm_conditions):
+        if any(arm.get(key) != ref.get(key) for key in ARM_CONDITIONS):
             continue
         if arm.get("measurement_status") == ref.get("measurement_status") == "eligible":
             ratio(arm_result, "completion_nanos", arm.get("phase_nanos", {}).get("completion_observed"),
@@ -107,9 +146,12 @@ def compare(row, baseline, environment):
 
 
 def ratio(output, metric, observed, reference):
-    if all(type(value) in (float, int) and math.isfinite(value) and value > 0
-           for value in (observed, reference)):
+    if valid(observed) and valid(reference):
         output[metric] = {"observed": observed, "baseline": reference, "change_ratio": observed / reference - 1}
+
+
+def valid(value):
+    return type(value) in (float, int) and math.isfinite(value) and value > 0
 
 
 def markdown(report):

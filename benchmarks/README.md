@@ -72,6 +72,11 @@ The production latency histogram is retained as diagnostic evidence. Qualified
 window latency requires independently correlated source events and target
 acknowledgements on a comparable clock.
 
+The snapshot handoff case updates a key already visible at the target while
+the snapshot is still landing. A repeat requires evidence of the original
+snapshot row, one captured update, one additional target acknowledgement, and
+exact final readback. A repeat without an observed handoff remains incomplete.
+
 For deterministic allocation, provide whole-case estimates (including preparation,
 all repeats, verification, and cleanup) measured in the declared environment.
 
@@ -92,7 +97,8 @@ estimate or case that does not fit is recorded in the allocation and blocks repl
 
 ## Walk through a delivery candidate on local OP
 
-Use a clean checkout of the candidate with JDK 21, Maven, Python 3 and a running
+Allocation and manifest replay require a clean candidate checkout, including the
+fixture source outside the benchmark directory. Use JDK 21, Maven, Python 3 and a running
 Docker daemon. The runner starts a fresh single-node OP and its MongoDB test
 replica set. Use a host with enough memory for Docker and an OP JVM with a
 768 MiB heap. Check Docker access before building or running the walkthrough.
@@ -222,7 +228,9 @@ Keep the normal backend and MongoDB topology fixed within a pair.
 ## Reconcile and compare a batch run
 
 Use one allocated manifest and include one summary per completed batch. JSON
-contains raw repeat results and comparisons. The optional Markdown view shows
+contains raw repeat results, comparisons, and per-case and per-arm statistics
+for eligible metrics. Each comparable set reports the median, minimum,
+maximum, and range (maximum minus minimum). The optional Markdown view shows
 correctness, missing runs, measurement eligibility and resource evidence.
 
 ```sh

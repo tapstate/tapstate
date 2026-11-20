@@ -41,16 +41,46 @@ final class WorkloadChanges {
         }
         int[] operation = allocate(events, new int[] {mix.insert(), mix.update(), mix.delete()});
         int[] weights = inputs.stream().mapToInt(WorkloadRecipe.Input::share).toArray();
-        int[] inserted = allocate(operation[0], weights);
-        int[] updated = allocate(operation[1], weights);
-        int[] deleted = allocate(operation[2], weights);
+        int[][] counts = allocateByInput(operation, weights);
         var result = new ArrayList<Counts>();
         for (int index = 0; index < inputs.size(); index++) {
-            result.add(new Counts(inserted[index], updated[index], deleted[index]));
+            result.add(new Counts(counts[0][index], counts[1][index], counts[2][index]));
         }
         return result;
     }
 
+    private static int[][] allocateByInput(int[] operations, int[] weights) {
+        int[] capacity = allocate(Arrays.stream(operations).sum(), weights);
+        int weightSum = Arrays.stream(weights).sum();
+        int[][] counts = new int[operations.length][weights.length];
+        int[] remaining = operations.clone();
+        // Reserve the floor of each cell before any operation may claim a shared input remainder.
+        for (int operation = 0; operation < operations.length; operation++) {
+            for (int input = 0; input < weights.length; input++) {
+                int floor = (int) ((long) operations[operation] * weights[input] / weightSum);
+                counts[operation][input] = floor;
+                remaining[operation] -= floor;
+                capacity[input] -= floor;
+            }
+        }
+        for (int operation = 0; operation < operations.length; operation++) {
+            for (int extra = 0; extra < remaining[operation]; extra++) {
+                int best = -1;
+                long bestDeficit = Long.MIN_VALUE;
+                for (int input = 0; input < weights.length; input++) {
+                    long deficit = (long) operations[operation] * weights[input]
+                            - (long) counts[operation][input] * weightSum;
+                    if (capacity[input] > 0 && deficit > bestDeficit) {
+                        best = input;
+                        bestDeficit = deficit;
+                    }
+                }
+                counts[operation][best]++;
+                capacity[best]--;
+            }
+        }
+        return counts;
+    }
     private static int[] allocate(int total, int[] weights) {
         int sum = Arrays.stream(weights).sum();
         if (sum <= 0) {

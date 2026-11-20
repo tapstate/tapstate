@@ -177,6 +177,10 @@ class BenchmarkRunIT {
             evidence.result.put("status", "failed");
         }
         evidence.result.put("reason", failure.toString());
+        if (failure.getSuppressed().length > 0) {
+            evidence.result.put("secondary_failures", java.util.Arrays.stream(failure.getSuppressed())
+                    .map(Throwable::toString).toList());
+        }
     }
 
     private static void runDummy(BsonDocument entry, Path artifact, Path folder, Evidence evidence, boolean diagnostic)
@@ -289,7 +293,7 @@ class BenchmarkRunIT {
         boolean memory = memoryProfile != null;
         boolean steady = operators != null && operators.scenario.equals("join-steady-state");
         boolean lifecycle = operators != null && operators.scenario.equals("join-lifecycle-release");
-        try {
+        try (java.io.Closeable cleanup = () -> dropBenchmarkDatabases(sourceDb, targetDb, evidence)) {
             evidence.stage = "prepare";
             long preparing = System.nanoTime();
             var rowCounts = operators == null ? Map.of(RECORDS, number(entry, "rows")) : operators.rows;
@@ -319,7 +323,10 @@ class BenchmarkRunIT {
             try (var storage = PreparedNativeStore.create()) {
                 var server = RealProcessServer.startPreparedInJvm(storage.configurationUri(), jvmOptions,
                         ignored -> List.of("--tapstate.connectors.seed-dir=" + seeds));
-                try (server) {
+                var log = folder.resolve("op.log");
+                try (java.io.Closeable observeExit = () -> observeTeardown(server, log, memory, evidence);
+                        java.io.Closeable copyLog = () -> saveProcess(server, log);
+                        server) {
                     server.awaitReady();
                     var control = new ControlPlane(server.baseUrl());
                     storage.loginAndAwaitBusiness(control);
@@ -390,12 +397,6 @@ class BenchmarkRunIT {
                                     }
                                     return sizes;
                                 });
-                                boolean alive = ProcessHandle.of(server.pid()).map(ProcessHandle::isAlive).orElse(false);
-                                evidence.result.put("op_alive_before_teardown", alive);
-                                if (!alive) {
-                                    evidence.result.put("exit_attribution", "unattributed-process-exit");
-                                    throw new Unverified("OP exited before teardown");
-                                }
                             }
                             evidence.diagnostic("runtime_metrics", () -> control.metrics(PIPELINE));
                             evidence.diagnostic("runtime_position", () -> control.positionReading(PIPELINE));
@@ -404,34 +405,40 @@ class BenchmarkRunIT {
                                     sourceDb.runCommand(new org.bson.Document("serverStatus", 1))
                                             .get("mem", org.bson.Document.class).getInteger("resident"));
                         }
-                    } finally {
-                        saveProcess(server, folder.resolve("op.log"));
-                    }
-                } finally {
-                    if (memory) {
-                        evidence.diagnostic("op_exit_code", server::exitValue);
-                        var log = folder.resolve("op.log");
-                        if (Files.isRegularFile(log)) {
-                            try (var lines = Files.lines(log)) {
-                                if (lines.anyMatch(line -> line.stripLeading().startsWith("java.lang.OutOfMemoryError:")
-                                        || line.contains("Caused by: java.lang.OutOfMemoryError:"))) {
-                                    evidence.result.put("exit_attribution", "observed-java-out-of-memory");
-                                    throw new AssertionError("OP reported OutOfMemoryError");
-                                }
-                            }
-                        }
                     }
                 }
             }
-        } finally {
-            evidence.stageBeforeCleanup();
-            long cleanup = System.nanoTime();
-            try {
-                sourceDb.drop();
-            } finally {
-                targetDb.drop();
-                evidence.phase("cleanup", cleanup);
+        }
+    }
+
+    private static void observeTeardown(RealProcessServer server, Path log, boolean memory, Evidence evidence)
+            throws IOException {
+        boolean unexpected = server.exitedBeforeCloseRequest();
+        evidence.result.put("op_alive_before_teardown", !unexpected);
+        evidence.diagnostic("op_exit_code", server::exitValue);
+        if (memory && Files.isRegularFile(log)) {
+            try (var lines = Files.lines(log)) {
+                if (lines.anyMatch(line -> line.stripLeading().startsWith("java.lang.OutOfMemoryError:")
+                        || line.contains("Caused by: java.lang.OutOfMemoryError:"))) {
+                    evidence.result.put("exit_attribution", "observed-java-out-of-memory");
+                    throw new AssertionError("OP reported OutOfMemoryError");
+                }
             }
+        }
+        if (unexpected) {
+            evidence.result.put("exit_attribution", "unattributed-process-exit");
+            throw new Unverified("OP exited before teardown");
+        }
+    }
+
+    private static void dropBenchmarkDatabases(MongoDatabase source, MongoDatabase target, Evidence evidence)
+            throws IOException {
+        evidence.stageBeforeCleanup();
+        long cleanup = System.nanoTime();
+        try (java.io.Closeable dropTarget = () -> target.withTimeout(10, java.util.concurrent.TimeUnit.SECONDS).drop()) {
+            source.withTimeout(10, java.util.concurrent.TimeUnit.SECONDS).drop();
+        } finally {
+            evidence.phase("cleanup", cleanup);
         }
     }
 
@@ -462,23 +469,36 @@ class BenchmarkRunIT {
         evidence.window("load");
         int initial = number(entry, "rows");
         long prepareState = System.nanoTime();
+        boolean handoff = text(entry.getDocument("case"), "id").equals("copy.live.handoff.standard");
+        if (handoff && initial < 2) throw new IllegalArgumentException("The handoff requires at least two initial rows");
         control.lifecycle(PIPELINE, LifecycleVerb.START);
-        waitFor(entry, "settled snapshot state at the target", () -> target.countDocuments() == initial
-                && control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == initial
-                && settled(control) >= initial && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
-        verifySame(source, target);
-        // Updating an existing key establishes a normal runtime frontier before either CDC measurement.
-        String preAnchorToken = control.resumePoint(PIPELINE).get("token");
-        long preAnchorSettled = settled(control);
-        var key = new BsonDocument("_id", new BsonInt64(1));
-        source.updateOne(key, new BsonDocument("$set", new BsonDocument("s0", new BsonString("perf-anchor"))));
+        String preAnchorToken;
+        long preAnchorSettled;
+        var anchorValue = new BsonString(handoff ? "perf-handoff" : "perf-anchor");
+        BsonDocument key;
+        if (handoff) {
+            key = changeAtSnapshotHandoff(entry, source, target, initial, anchorValue, evidence);
+            preAnchorToken = null;
+            preAnchorSettled = initial;
+        } else {
+            waitFor(entry, "settled snapshot state at the target", () -> target.countDocuments() == initial
+                    && control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == initial
+                    && settled(control) >= initial && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
+            verifySame(source, target);
+            preAnchorToken = control.resumePoint(PIPELINE).get("token");
+            preAnchorSettled = settled(control);
+            key = new BsonDocument("_id", new BsonInt64(1));
+            writeAnchor(source, key, anchorValue);
+        }
         waitFor(entry, "confirmed initial-state anchor", () -> {
             var row = target.find(key).first();
             String current = control.resumePoint(PIPELINE).get("token");
             long changes = capturedChanges(control).getOrDefault(RECORDS, 0L);
             long acknowledged = settled(control);
-            return row != null && new BsonString("perf-anchor").equals(row.get("s0"))
+            return row != null && anchorValue.equals(row.get("s0"))
                     && acknowledged > preAnchorSettled && changes > 0 && acknowledged == initial + changes
+                    && (!handoff || changes == 1 && control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == initial
+                            && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent())
                     && current != null && !current.equals(preAnchorToken);
         });
         verifySame(source, target);
@@ -546,16 +566,18 @@ class BenchmarkRunIT {
                     }, () -> {
                         evidence.window(targetWindow == null ? "drain" : "target-frontier");
                         observedBeforeDrain[0] = settled(control) - observedWarm[0];
-                        if (targetWindow != null) {
-                            evidence.result.put("target_frontier_requested_epoch_ms", System.currentTimeMillis());
-                            var observed = targetWindow.countThroughBoundary().orElseThrow(() ->
-                                    new Unverified("Target change stream did not reach its majority-visible frontier"));
-                            evidence.result.put("target_majority_visible_before_drain", observed);
-                        }
-                        if (limit != null) {
-                            evidence.result.put("target_delay_millis", delay);
-                            evidence.result.put("target_commands_delayed", limit.release());
-                            evidence.result.put("target_limit_released_epoch_ms", System.currentTimeMillis());
+                        try (BenchmarkTargetLimit cleanup = limit) {
+                            if (targetWindow != null) {
+                                evidence.result.put("target_frontier_requested_epoch_ms", System.currentTimeMillis());
+                                var observed = targetWindow.countThroughBoundary().orElseThrow(() ->
+                                        new Unverified("Target change stream did not reach its majority-visible frontier"));
+                                evidence.result.put("target_majority_visible_before_drain", observed);
+                            }
+                            if (limit != null) {
+                                evidence.result.put("target_delay_millis", delay);
+                                evidence.result.put("target_commands_delayed", limit.release());
+                                evidence.result.put("target_limit_released_epoch_ms", System.currentTimeMillis());
+                            }
                         }
                         evidence.window("drain");
                     });
@@ -570,7 +592,7 @@ class BenchmarkRunIT {
             if (limit != null) {
                 long delayed = (long) evidence.result.get("target_commands_delayed");
                 long majorityVisible = (long) evidence.result.get("target_majority_visible_before_drain");
-                evidence.result.put("source_minus_target_at_release", measured - majorityVisible);
+                evidence.result.put("source_minus_target_at_frontier_marker", measured - majorityVisible);
                 if (delayed <= 0 || majorityVisible >= measured) {
                     throw new Unverified("The target-only delay did not prove an acknowledgement deficit");
                 }
@@ -587,6 +609,44 @@ class BenchmarkRunIT {
             evidence.result.put("diagnostic_delivery", "The aggregate histogram includes events outside the measured window.");
             evidence.result.put("window_source_events", measured);
             evidence.result.put("window_settled_delta", settled(control) - observedWarm[0]);
+        }
+    }
+
+    private static BsonDocument changeAtSnapshotHandoff(BsonDocument entry,
+            MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, int initial,
+            BsonString anchorValue, Evidence evidence) {
+        evidence.stage = "snapshot-handoff";
+        long end = System.nanoTime() + Duration.ofSeconds(number(entry, "timeout_seconds")).toNanos();
+        BsonDocument landed = null;
+        while (landed == null && System.nanoTime() < end) {
+            landed = target.find().sort(Sorts.ascending("_id")).first();
+            if (landed == null) {
+                try {
+                    Await.pauseBeforeNextPoll(Duration.ofMillis(5));
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    throw new Unverified("Interrupted while waiting for the first snapshot row");
+                }
+            }
+        }
+        if (landed == null) throw new Unverified("No target snapshot row was observed for the handoff witness");
+        var key = new BsonDocument("_id", landed.get("_id"));
+        if (!BenchmarkOperatorOracle.equivalent(source.find(key).first(), landed)) {
+            throw new Unverified("The handoff key did not first land with its snapshot value");
+        }
+        writeAnchor(source, key, anchorValue);
+        long visible = target.countDocuments();
+        if (visible >= initial) {
+            throw new Unverified("Snapshot had already landed before the handoff update could be witnessed");
+        }
+        evidence.result.put("snapshot_handoff", Map.of("repeated_key", key.toJson(),
+                "target_snapshot_rows_visible_after_update", visible, "expected_snapshot_rows", initial));
+        return key;
+    }
+
+    private static void writeAnchor(MongoCollection<BsonDocument> source, BsonDocument key, BsonString value) {
+        if (source.updateOne(key, new BsonDocument("$set", new BsonDocument("s0", value))).getModifiedCount() != 1) {
+            throw new Unverified("The readiness key did not change: " + key);
         }
     }
 
@@ -659,6 +719,7 @@ class BenchmarkRunIT {
                 "idle_seconds");
         var observations = new ArrayList<Map<String, Object>>();
         evidence.result.put("lifecycle_cycles", observations);
+        Map<String, String> previousPositions = Map.of();
         for (int cycle = 1; cycle <= cycles; cycle++) {
             evidence.stage = "lifecycle-cycle-" + cycle;
             evidence.windowPrefix = evidence.stage + "/";
@@ -666,11 +727,13 @@ class BenchmarkRunIT {
                 evidence.window("start");
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
                 waitFor(entry, "Join resumed", () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
+                recordLifecycleResume(control, operators, observations.getLast(), previousPositions);
             }
             operatorLive(entry, prepared, control, source, target, operators, evidence, null, null);
             var warmup = evidence.result.get("warmup");
             var measurement = evidence.result.get("source_window");
             evidence.window("stop");
+            previousPositions = readDurablePositions(control, operators.mutableInputs());
             control.stop(PIPELINE, false);
             waitFor(entry, "Join stopped", () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent());
             var output = target.getCollection("facts", BsonDocument.class);
@@ -684,12 +747,44 @@ class BenchmarkRunIT {
                 }
             }
             verifyOperator(operators, target, operators.expected(source), evidence);
-            observations.add(Map.of("cycle", cycle, "state", "STOPPED", "target_changes_while_idle", 0,
-                    "idle_seconds", idle, "target_readback", "verified", "durable_state", "retained",
+            observations.add(new LinkedHashMap<>(Map.of("cycle", cycle, "state", "STOPPED", "target_changes_while_idle", 0,
+                    "idle_seconds", idle, "target_readback", "verified", "durable_state", "restart-not-observed",
+                    "durable_positions_before_stop", previousPositions,
                     "queue_release", "unavailable from runtime read face",
-                    "warmup", warmup, "measurement", measurement));
+                    "warmup", warmup, "measurement", measurement)));
         }
         evidence.windowPrefix = "";
+    }
+
+    private static void recordLifecycleResume(ControlPlane control, BenchmarkOperators operators,
+            Map<String, Object> observation, Map<String, String> before) {
+        Map<String, Long> snapshot;
+        try {
+            snapshot = control.awaitSnapshotRowsRead(PIPELINE, java.util.Set.copyOf(operators.sources()));
+        } catch (AssertionError missing) {
+            observation.put("durable_state", "snapshot-observation-unavailable");
+            observation.put("snapshot_observation_error", missing.toString());
+            return;
+        }
+        observation.put("snapshot_rows_after_restart", snapshot);
+        var after = readDurablePositions(control, operators.mutableInputs());
+        observation.put("durable_positions_after_restart", after);
+        if (operators.sources().stream().anyMatch(name -> snapshot.get(name) != 0)) {
+            observation.put("durable_state", "snapshot-read-observed");
+        } else if (!before.keySet().containsAll(operators.mutableInputs())
+                || !after.keySet().containsAll(operators.mutableInputs())) {
+            observation.put("durable_state", "position-unavailable");
+        } else {
+            observation.put("durable_state", before.equals(after) ? "retained" : "position-changed");
+        }
+    }
+
+    private static Map<String, String> readDurablePositions(ControlPlane control, List<String> inputs) {
+        var positions = new LinkedHashMap<String, String>();
+        for (String input : inputs) {
+            control.durablePosition(PIPELINE, input).ifPresent(position -> positions.put(input, position));
+        }
+        return positions;
     }
 
     private static void observeIdleWindow(RealProcessServer server, int seconds) {
@@ -794,9 +889,9 @@ class BenchmarkRunIT {
         awaitOperatorPhase(entry, control, target, operators, expected, Map.of(), backlog.batch(),
                 initial.equals(expected) ? -1 : 0);
         evidence.phase("catch_up_observed", start);
-        var snapshot = control.snapshotRowsRead(PIPELINE);
-        if (!operators.sources().stream().allMatch(name -> Long.valueOf(0).equals(snapshot.get(name)))) {
-            throw new Unverified("Missing zero-snapshot evidence for the resumed operator inputs");
+        var snapshot = control.awaitSnapshotRowsRead(PIPELINE, java.util.Set.copyOf(operators.sources()));
+        if (operators.sources().stream().anyMatch(name -> snapshot.get(name) != 0)) {
+            throw new Unverified("A resumed operator input read a snapshot: " + snapshot);
         }
         evidence.result.put("retained_initial_state", true);
         evidence.result.put("measurement_status", "insufficient-source-end-evidence");
@@ -971,11 +1066,13 @@ class BenchmarkRunIT {
         report.streams().forEach((name, stream) -> {
             var reading = new LinkedHashMap<String, Object>();
             reading.put("planned", stream.planned());
+            reading.put("submitted", stream.submittedOperations());
             reading.put("observed", stream.observed());
             reading.put("acknowledged", stream.acknowledged());
             reading.put("start_exclusive", token(stream.startExclusive()));
             reading.put("first", token(stream.first()));
             reading.put("last", token(stream.last()));
+            reading.put("history_boundary", token(stream.historyBoundary()));
             reading.put("sequence_sha256", stream.sourceSequenceSha256());
             reading.put("hot_key_selections", stream.hotKeySelections());
             reading.put("error", stream.error());
