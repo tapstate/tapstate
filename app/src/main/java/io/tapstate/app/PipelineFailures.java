@@ -68,6 +68,12 @@ final class PipelineFailures {
             return of(pipelineId, failure, diagnostic.isEmpty() ? unavailable.diagnostic() : diagnostic,
                     unavailable.publicFailure());
         }
+        if (publicFailure != null && publicFailure.code().isEmpty() && firstCoded == null) {
+            String safeCause = diagnostic.get("message") instanceof String message && !message.isBlank()
+                    ? bound(message) : "[diagnostic unavailable]";
+            return new ObservationFailure(EngineError.JOB_FAILED.code(),
+                    Map.of("pipeline", pipelineId, "cause", safeCause), diagnostic);
+        }
         if (publicFailure == null) {
             var primary = of(pipelineId, failure);
             return new ObservationFailure(primary.code(), primary.params(), diagnostic);

@@ -54,7 +54,7 @@ public final class AlarmTypeText {
     public Description describe(AlarmTypeCatalog.Type type, Locale locale) {
         Objects.requireNonNull(type, "type");
         String language = "zh".equals(locale.getLanguage())
-                ? ("TW".equals(locale.getCountry()) || "HK".equals(locale.getCountry())
+                ? (java.util.Set.of("HK", "MO", "TW").contains(locale.getCountry())
                         || "Hant".equals(locale.getScript()) ? "zh-TW" : "zh-CN") : "en";
         Map<String, String> localized = translations.getOrDefault(language, Map.of());
         return new Description(required(type.conditionTextKey(), localized),

@@ -32,6 +32,33 @@ class PipelineFailuresTest {
     }
 
     @Test
+    void anUncodedOwnerKeepsTheKnownPipelineAndItsSafeBoundedCause() {
+        var raw = new RuntimeException("private driver value");
+        String safe = "safe owner failure" + "x".repeat(250) + "\nprivate stack";
+        var fact = new io.tapstate.core.common.FailureFact(raw, Map.of("message", safe),
+                new io.tapstate.core.common.FailureFact.PublicFailure("", Map.of()));
+        var failure = PipelineFailures.of("orders", raw, fact.diagnostic(), fact.publicFailure());
+        assertThat(failure.code()).isEqualTo(EngineError.JOB_FAILED.code());
+        assertThat(failure.params()).containsEntry("pipeline", "orders");
+        assertThat(failure.params().get("cause")).isEqualTo(safe.substring(0, 200) + " …")
+                .doesNotContain("private driver value", "private stack");
+        assertThat(failure.diagnostic()).isEqualTo(fact.diagnostic());
+    }
+
+    @Test
+    void anUnavailableUncodedOwnerStillKeepsTheKnownPipelineWithoutReadingRawDetails() {
+        var raw = new RuntimeException("private driver value") {
+            @Override public String getMessage() { throw new AssertionError("raw owner message accessed"); }
+        };
+        var fact = io.tapstate.core.common.FailureFact.unavailable(raw);
+        var failure = PipelineFailures.of("orders", raw, fact.diagnostic(), fact.publicFailure());
+        assertThat(failure.code()).isEqualTo(EngineError.JOB_FAILED.code());
+        assertThat(failure.params()).containsOnly(entry("pipeline", "orders"),
+                entry("cause", "[diagnostic unavailable]"));
+        assertThat(failure.diagnostic()).containsEntry("truncated", true);
+    }
+
+    @Test
     void sinkClassificationDoesNotStringifyDriverParameters() {
         var raw = new Object() { public String toString() { throw new AssertionError("raw connector parameter accessed"); } };
         var cause = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED,

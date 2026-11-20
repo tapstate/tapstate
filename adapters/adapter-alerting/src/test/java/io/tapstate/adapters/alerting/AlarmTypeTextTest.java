@@ -30,6 +30,7 @@ class AlarmTypeTextTest {
             assertThat(Set.of(english.recovery(), simplified.recovery(), traditional.recovery())).hasSize(3);
             assertThat(Set.of(english.guidance(), simplified.guidance(), traditional.guidance())).hasSize(3);
             assertThat(text.describe(type, java.util.Locale.forLanguageTag("zh-Hant-HK"))).isEqualTo(traditional);
+            assertThat(text.describe(type, java.util.Locale.forLanguageTag("zh-MO"))).isEqualTo(traditional);
             assertThat(text.describe(type, java.util.Locale.FRENCH)).isEqualTo(english);
         }
     }

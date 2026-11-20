@@ -47,6 +47,24 @@ class StreamFramesTest {
     }
 
     @Test
+    void statusFrameKeepsTheSameCapturedDetailsAndSolutionAsThePolledFailure() {
+        var diagnostic = Map.<String, Object>of("message", "captured owner",
+                "cause", Map.of("message", "safe cause", "stackTrace", "safe frame"));
+        var failure = new ObservationFailure("TS0060027",
+                Map.of("connector", "demo", "detail", "safe detail"), diagnostic);
+        var polled = ApiError.from(failure, CATALOG, java.util.Locale.ENGLISH);
+        var parsed = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(
+                StreamFrames.status(new PipelineStatus("orders", PipelineState.FAILED, failure), CATALOG));
+        var streamed = (Map<?, ?>) parsed.get("failure");
+        assertThat(streamed.get("code")).isEqualTo(polled.code());
+        assertThat(streamed.get("params")).isEqualTo(polled.params());
+        assertThat(streamed.get("message")).isEqualTo(polled.message());
+        assertThat(polled.solution()).isNotBlank();
+        assertThat(streamed.get("solution")).isEqualTo(polled.solution());
+        assertThat(streamed.get("diagnostic")).isEqualTo(diagnostic).isEqualTo(polled.diagnostic());
+    }
+
+    @Test
     void statusFrameOfAHealthyPipelineOmitsFailureEntirely() {
         String frame = StreamFrames.status(new PipelineStatus("orders", PipelineState.RUNNING), CATALOG);
         assertThat(frame).doesNotContain("failure");
