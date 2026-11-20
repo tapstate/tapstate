@@ -192,6 +192,7 @@ class PipelineSourceNodeSettingsIT {
                       sync: [{ id: sink, source: output }]
                     """.formatted(mode)));
             control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", input.toString()));
+            String originalSource = control.contentHash(SOURCE);
             control.lifecycle(pipeline, LifecycleVerb.START);
             var target = EndpointAddress.uri(output.toString());
             Await.until("both aliased node snapshots to reach the sink", TIMEOUT,
@@ -207,6 +208,7 @@ class PipelineSourceNodeSettingsIT {
                         () -> files.fetch(target, "items", Map.of("id", 3L)).isPresent(),
                         () -> control.pipelineStatus(pipeline).toString());
             }
+            assertThat(control.contentHash(SOURCE)).isEqualTo(originalSource);
         }
     }
 
