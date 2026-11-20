@@ -27,6 +27,8 @@ import org.bson.Document;
 /** Actual task and session ownership survives a bounded claim caller. */
 final class MongoClaimOperations {
     private final MongoClient client;
+    volatile boolean checkpointSimpleCollations;
+    final MongoStructureProof structures = new MongoStructureProof();
     private final ThreadPoolExecutor workers = new ThreadPoolExecutor(4, 4, 100, TimeUnit.MILLISECONDS,
             new LinkedBlockingQueue<>(), action -> {
                 var thread = new Thread(action, "mongo-claim-io");
@@ -50,11 +52,12 @@ final class MongoClaimOperations {
     private volatile boolean replicaSet;
     private volatile boolean routed;
 
-    MongoClaimOperations(MongoClient client) {
+    MongoClaimOperations(MongoClient client){this(client,false);}
+    MongoClaimOperations(MongoClient client,boolean retainedByDomain) {
         this.client = client;
         observeTopology();
-        workers.allowCoreThreadTimeOut(true);
-        renewals.allowCoreThreadTimeOut(true);
+        workers.allowCoreThreadTimeOut(!retainedByDomain);
+        renewals.allowCoreThreadTimeOut(!retainedByDomain);
     }
 
     MongoReadBudget budget() { return current.get(); }

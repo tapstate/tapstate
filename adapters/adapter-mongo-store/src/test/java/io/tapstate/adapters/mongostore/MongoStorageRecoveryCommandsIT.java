@@ -6,6 +6,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.*;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.*;
+import io.tapstate.spi.store.StorageRecoveryCommands;
 import io.tapstate.spi.store.StorageRecoveryCommands.*;
 import io.tapstate.testsupport.RequiresDocker;
 import java.time.Duration;
@@ -193,6 +194,61 @@ class MongoStorageRecoveryCommandsIT {
             assertThat(table.find().first()).isEqualTo(before);assertThat(f.domain.configurationRevision()).isEqualTo(revision);
         });
     }
+    @Test void completionPollUsesOneFindAndSeesTheNextCommittedRecovery() {
+        withConfiguration(f -> {
+            var original = f.domain.bindings().cachePreparation().orElseThrow();
+            var auth = original.authScope();
+            var commands = f.domain.recoveryCommands();
+            assertThat(completionPollCommands(commands, original)).containsExactly("find:storage_recovery");
+
+            var manifest = f.manifest(new Selection(Extent.PIPELINE, Set.of("a")), Set.of("a"), "a".repeat(64));
+            var planned = commands.plan(auth, manifest, null, null);
+            var running = commands.start(commands.confirm(planned));
+            assertThat(commands.currentForCompletion(original)).contains(running);
+            var other = new CacheAuthScope(auth.clusterId(), auth.bindingVersion(), auth.mode(),
+                    auth.cacheIncarnation(), auth.authGeneration() + 1);
+            assertThatThrownBy(() -> commands.currentForCompletion(new CachePreparation(original.operationId(), other))).isInstanceOf(TapstateException.class);
+
+            assertThat(commands.complete(running).phase()).isEqualTo(Phase.COMPLETE);
+            assertThat(completionPollCommands(commands, original)).containsExactly("find:storage_recovery");
+            var next = commands.plan(auth, f.manifest(manifest.selection(), Set.of("a"), "b".repeat(64)), null, planned.operationId());
+            assertThat(commands.currentForCompletion(original)).contains(next);
+        });
+    }
+
+    @Test void completionPollDoesNotSkipMalformedPlansOrMissingRoots() {
+        withConfiguration(f -> {
+            var original = f.domain.bindings().cachePreparation().orElseThrow();
+            var commands = f.domain.recoveryCommands();
+            var recovery = SystemCollections.STORAGE_RECOVERY.on(f.database);
+            var id = new Document("_id", "cluster");
+            recovery.updateOne(id, new Document("$set", new Document("pendingRecovery", new Document("phase", "COMPLETE"))));
+            assertThatThrownBy(() -> commands.currentForCompletion(original)).isInstanceOf(TapstateException.class);
+            recovery.updateOne(id, new Document("$set", new Document("pendingRecovery", null)));
+            assertThatThrownBy(() -> commands.currentForCompletion(original)).isInstanceOf(TapstateException.class);
+            recovery.updateOne(id, new Document("$unset", new Document("pendingRecovery", 1))
+                    .append("$set", new Document("revision", "invalid")));
+            assertThatThrownBy(() -> commands.currentForCompletion(original)).isInstanceOf(TapstateException.class);
+            recovery.updateOne(id, new Document("$set", new Document("revision", 0L)));
+            recovery.insertOne(new Document("_id", "extra"));
+            assertThatThrownBy(() -> commands.currentForCompletion(original)).isInstanceOf(TapstateException.class);
+            recovery.deleteOne(new Document("_id", "extra"));
+            recovery.deleteOne(id);
+            assertThatThrownBy(() -> commands.currentForCompletion(original)).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    private static List<String> completionPollCommands(StorageRecoveryCommands commands, CachePreparation original) {
+        var calls = new java.util.ArrayList<String>();
+        MongoCommandObservation.COLLECTIONS.set((command, collection) -> calls.add(command + ":" + collection));
+        try {
+            assertThat(commands.currentForCompletion(original)).isEmpty();
+        } finally {
+            MongoCommandObservation.COLLECTIONS.remove();
+        }
+        return calls;
+    }
+
     private static void withConfiguration(Scenario scenario) {
         try (var admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var db = admin.getDatabase("recovery_commands_" + UUID.randomUUID().toString().replace("-", ""));

@@ -29,6 +29,7 @@ import java.util.HashSet;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 /** Actual structural models are immutable and published under their original cache and capture context. */
@@ -43,6 +44,9 @@ public final class MongoSrsModelStore implements SrsModelStore {
     private final Runnable requireStructure;
     private final MongoSrsModelContexts contexts;
     private final MongoSrsLease lease;
+    private final BooleanSupplier batchReclaimRelations;
+    private final BooleanSupplier batchReclaimReadiness;
+    private final BooleanSupplier batchReclaimReferences;
 
     public MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope) {
         this(client, database, scope, () -> {});
@@ -56,15 +60,23 @@ public final class MongoSrsModelStore implements SrsModelStore {
     /** The capture assembly's store: a model change here invalidates the append proof. */
     MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure,
                        MongoSrsLease lease) {
+        this(client, database, scope, requireActive, requireStructure, lease, () -> false, () -> false, () -> false);
+    }
+    MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure,
+            MongoSrsLease lease, BooleanSupplier batchReclaimRelations, BooleanSupplier batchReclaimReadiness, BooleanSupplier batchReclaimReferences) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
         this.lease = Objects.requireNonNull(lease, "lease");
+        this.batchReclaimRelations = Objects.requireNonNull(batchReclaimRelations, "batchReclaimRelations");
+        this.batchReclaimReadiness = Objects.requireNonNull(batchReclaimReadiness, "batchReclaimReadiness");
+        this.batchReclaimReferences = Objects.requireNonNull(batchReclaimReferences, "batchReclaimReferences");
         this.contexts = new MongoSrsModelContexts(database, scope);
     }
     @Override public MongoSrsModelStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, lease);
+        return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); },
+                requireStructure, lease, batchReclaimRelations, batchReclaimReadiness, batchReclaimReferences);
     }
     @Override public long reclaim(String chainId,WorkloadClaimFence fence) {
         if(chainId==null || chainId.isBlank())throw new IllegalArgumentException("blank mining chain");
@@ -79,16 +91,22 @@ public final class MongoSrsModelStore implements SrsModelStore {
         } finally { if (changed) lease.drop(); }
     }
     private long reclaimInSession(ClientSession session, String chainId, WorkloadClaimFence fence) {
-            requireBusiness(session);
+            boolean batchRelations = batchReclaimRelations.getAsBoolean();
+            boolean batchReferences = batchRelations && batchReclaimReferences.getAsBoolean();
+            if (batchRelations && batchReclaimReadiness.getAsBoolean())
+                new MongoCacheBusinessIdentity(database, scope).requireReadyCombined(session);
+            else
+                requireBusiness(session);
             // Checkpoints take the same claim before the chain; retain that write order during cleanup.
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
             var consumers=new MongoSrsConsumerStore(client,database,scope,requireActive,requireStructure);
-            var pinned=consumers.retainedModels(session,chainId);
-            var chain=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chainId)).first();
-            if(chain==null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation")) || !fence.key().resourceId().equals(chain.get("captureId")))throw claimFenced();
-            var state=MongoSrsChainStore.decode(chain,scope,contexts);
-            var checkpoint=state.checkpoint();
-            var protectedKeys=new java.util.HashSet<>(pinned);
+            var retained = consumers.fenceRetainedModels(session, chainId, batchRelations, batchReferences);
+            // The chain write changes only its fence. Its decoded topology is still the one held by this transaction.
+            var chain = retained.chain();
+            if (!fence.key().resourceId().equals(chain.get("captureId"))) throw claimFenced();
+            var state = retained.state();
+            var checkpoint = state.checkpoint();
+            var protectedKeys = new java.util.HashSet<>(retained.pinned());
             if(state.pendingFreshFull()!=null)protectedKeys.addAll(state.pendingFreshFull().models().values());
             if(checkpoint!=null)checkpoint.tables().values().forEach(value -> protectedKeys.add(value.model()));
             long deleted=0;
@@ -224,14 +242,17 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 contexts.requireAnchor(session, chain, previous); requirePublishedHead(session, previous);
                 if (!previous.ring().equals(model.ringName()) || previous.key().captureEpoch() >= model.key().captureEpoch()) throw unavailable(model.key());
             }
+            if(previous==null){MongoStructureProof.invalidate(requireStructure);requireStructure.run();}
             SrsLogBounds observed = requireRing(session, model, previous == null);
             if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
             var initial = contexts.initial(model, fence, captured.getString("contentHash"));
             if (previous != null) contexts.replace(session, previous, contexts.close(previous, initial));
+            MongoStructureProof.invalidate(requireStructure);requireStructure.run();
             contexts.insert(session, initial);
             contexts.setHead(session, chain, initial);
         }
         requireBudget(session,model,captured);
+        MongoStructureProof.invalidate(requireStructure);requireStructure.run();
         models.insertOne(session, captured);
         return model;
     }
@@ -461,9 +482,14 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** Snapshot pins need exact structural bodies and bounds, without adopting newer models or event ranges. */
     void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys) {
+        requireSnapshotReferences(session, keys, null);
+    }
+
+    void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys, Document verifiedChain) {
         if (keys.size() < 2) { for (var key : keys) requireSnapshotReference(session, key); return; }
         var first = keys.iterator().next();
-        var current = currentReferences(session, requireChain(session, first), keys);
+        var chain = verifiedChain == null ? requireChain(session, first) : verifiedChain;
+        var current = currentReferences(session, chain, keys, verifiedChain != null);
         if (current.isEmpty()) { for (var key : keys) requireSnapshotReference(session, key); return; }
         var byId = current.orElseThrow().values().stream().collect(java.util.stream.Collectors.toMap(
                 reference -> MongoSrsLogStore.boundsId(reference.model().ringName()), reference -> reference.model().key()));
@@ -495,6 +521,11 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     Optional<Map<SrsModelKey, ModelReference>> currentReferences(ClientSession session, Document chain, Set<SrsModelKey> keys,
             boolean businessChecked) {
+        return currentReferences(session, chain, keys, businessChecked, null);
+    }
+
+    Optional<Map<SrsModelKey, ModelReference>> currentReferences(ClientSession session, Document chain, Set<SrsModelKey> keys,
+            boolean businessChecked, Map<String, SrsLogBounds> collectedBounds) {
         if (keys.size() < 2) return Optional.empty();
         if (!businessChecked) requireBusiness(session);
         for (var key : keys) {
@@ -502,22 +533,25 @@ public final class MongoSrsModelStore implements SrsModelStore {
             var head = contexts.head(chain, key.table());
             if (head == null || !MongoSrsModelContexts.contextId(key).equals(head.get("contextId"))) return Optional.empty();
         }
-        var selected = new java.util.HashMap<SrsModelKey, SrsModel>();
         var ids = keys.stream().map(MongoSrsModelStore::key).toList();
-        try (var rows = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", new Document("$in", ids)))
-                .batchSize(64).iterator()) {
-            while (rows.hasNext()) {
-                requireActive.run(); var model = decode(rows.next());
-                if (!keys.contains(model.key()) || selected.put(model.key(), model) != null) throw unreadable();
+        var batched = collectedBounds == null ? null : checkpointReferenceRows(session, ids);
+        if (collectedBounds != null && batched == null) return Optional.empty();
+        Map<SrsModelKey, SrsModel> selected;
+        if (batched == null) {
+            try (var rows = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", new Document("$in", ids)))
+                    .batchSize(64).iterator()) {
+                selected = referenceModels(rows, keys);
             }
+        } else {
+            selected = referenceModels(batched.models().iterator(), keys);
         }
         if (selected.size() != keys.size()) return Optional.empty();
         var rings = selected.values().stream().map(SrsModel::ringName).collect(java.util.stream.Collectors.toSet());
         if (rings.size() != keys.size()) return Optional.empty();
         // Historical or ambiguous rings use the full reference walk. No proof survives this transaction.
-        var rows = SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session,
+        var rows = batched == null ? SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session,
                 new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", new Document("$in", rings)))
-                .limit(keys.size() + 1).batchSize(64).into(new java.util.ArrayList<>());
+                .limit(keys.size() + 1).batchSize(64).into(new java.util.ArrayList<>()) : batched.contexts();
         if (rows.size() != keys.size()) return Optional.empty();
         var controls = new java.util.HashMap<Document, MongoSrsModelContexts.Context>();
         for (var row : rows) {
@@ -531,7 +565,60 @@ public final class MongoSrsModelStore implements SrsModelStore {
             contexts.requireAnchor(chain, control, control); requirePublished(control, model);
             result.put(model.key(), new ModelReference(model, control.fence(), new EventModelRange(model.ddlSequence(), null)));
         }
+        if (collectedBounds != null) {
+            var boundIds = rings.stream().collect(java.util.stream.Collectors.toMap(MongoSrsLogStore::boundsId, ring -> ring));
+            for (var row : batched.bounds()) {
+                String ring = boundIds.get(row.get("_id"));
+                if (ring == null || collectedBounds.put(ring, MongoSrsLogStore.decodeSplitBounds(row)) != null) throw unreadable();
+            }
+            if (!collectedBounds.keySet().equals(rings)) return Optional.empty();
+        }
         return Optional.of(Map.copyOf(result));
+    }
+
+    private Map<SrsModelKey, SrsModel> referenceModels(java.util.Iterator<Document> rows, Set<SrsModelKey> keys) {
+        var selected = new java.util.HashMap<SrsModelKey, SrsModel>();
+        while (rows.hasNext()) {
+            requireActive.run(); var model = decode(rows.next());
+            if (!keys.contains(model.key()) || selected.put(model.key(), model) != null) throw unreadable();
+        }
+        return selected;
+    }
+
+    private record CheckpointReferenceRows(List<Document> models, List<Document> contexts, List<Document> bounds) {}
+
+    private CheckpointReferenceRows checkpointReferenceRows(ClientSession session, List<Document> ids) {
+        if (ids.size() > 256) return null;
+        var context = MongoPipelineObservationRead.lookup(SystemCollections.SRS_MODEL_CONTEXTS, "contexts", List.of(
+                new Document("$match", new Document("cacheIncarnation", scope.cacheIncarnation())
+                        .append("$expr", new Document("$eq", List.of("$ringName", "$$ring")))),
+                new Document("$limit", 2), MongoPipelineObservationRead.boundedRow()));
+        context.get("$lookup", Document.class).append("let", new Document("ring", "$body.ringName"));
+        var bound = MongoPipelineObservationRead.lookup(SystemCollections.SRS_LOG_BOUNDS, "bounds", List.of(
+                new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", "$$id")))),
+                new Document("$limit", 2), MongoPipelineObservationRead.boundedRow()));
+        var boundId = new Document("$cond", java.util.Arrays.asList(
+                new Document("$eq", List.of(new Document("$type", "$body.ringName"), "string")),
+                new Document("$concat", List.of(MongoSrsLogStore.boundsId(""), "$body.ringName")), null));
+        bound.get("$lookup", Document.class).append("let", new Document("id", boundId));
+        var query = List.of(new Document("$match", new Document("_id", new Document("$in", ids))),
+                new Document("$limit", ids.size() + 1), MongoPipelineObservationRead.boundedRow(),
+                MongoPipelineObservationRead.originalRow(), context, bound);
+        var models = new java.util.ArrayList<Document>();
+        var contexts = new java.util.ArrayList<Document>();
+        var bounds = new java.util.ArrayList<Document>();
+        try (var cursor = SystemCollections.SRS_MODELS.on(database).aggregate(session, query).batchSize(64).iterator()) {
+            while (cursor.hasNext()) {
+                requireActive.run(); var row = cursor.next(); var model = row.get("body", Document.class);
+                if (!model.containsKey("_id") || MongoPipelineObservationRead.overflow(row, "contexts", 1)
+                        || MongoPipelineObservationRead.overflow(row, "bounds", 1)
+                        || MongoPipelineObservationRead.rows(row, "contexts").size() != 1
+                        || MongoPipelineObservationRead.rows(row, "bounds").size() != 1) return null;
+                models.add(model); contexts.addAll(MongoPipelineObservationRead.rows(row, "contexts"));
+                bounds.addAll(MongoPipelineObservationRead.rows(row, "bounds"));
+            }
+        }
+        return new CheckpointReferenceRows(models, contexts, bounds);
     }
 
     private SrsModel requirePublishedHead(ClientSession session, MongoSrsModelContexts.Context control) {
@@ -546,7 +633,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
         var key = control.key();
         return new SrsModelKey(key.miningChainId(), key.table(), key.cacheIncarnation(), key.captureEpoch(), version);
     }
-    private void requirePublished(MongoSrsModelContexts.Context control, SrsModel model) {
+    void requirePublished(MongoSrsModelContexts.Context control, SrsModel model) {
         if (!MongoSrsModelContexts.contextId(model.key()).equals(control.id()) || !model.ringName().equals(control.ring())
                 || model.key().modelVersion() > control.publishedVersion() || model.ddlSequence() < control.firstSequence()
                 || (model.key().modelVersion() == 0 && model.ddlSequence() != control.firstSequence())
@@ -827,7 +914,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 .append("ringName", model.ringName()).append("ddlSequence", model.ddlSequence()).append("schema", table);
         return row.append("contentHash", CanonicalHash.ofText(row.toJson()));
     }
-    private SrsModel decode(Document row) {
+    SrsModel decode(Document row) {
         try {
             if (!row.keySet().equals(Set.of("_id", "formatVersion", "cacheIncarnation", "ringName", "ddlSequence", "schema", "contentHash"))
                     || !Integer.valueOf(1).equals(row.get("formatVersion")) || !(row.get("ddlSequence") instanceof Long sequence)) throw unreadable();
@@ -866,7 +953,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> { requireActive.run(); requireStructure.run(); requireActive.run(); T result = action.apply(session); requireActive.run(); return result; }, TRANSACTION);
                 }
-            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+            } catch (RuntimeException failure) { MongoStructureProof.invalidate(requireStructure); requireActive.run(); throw failure; }
         });
     }
     private static TapstateException unavailable(SrsModelKey key) { return modelError(IoError.SRS_MODEL_UNAVAILABLE, key); }
