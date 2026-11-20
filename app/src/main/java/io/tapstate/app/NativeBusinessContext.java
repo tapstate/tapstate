@@ -57,7 +57,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     }
 
     java.util.Optional<PipelineStateMappings.LogWindow> pipelineLogWindow(String id) {
-        original.requireBusiness();
+        original.requireActive();
         return configuration.pipelineStates().logWindow(id);
     }
 

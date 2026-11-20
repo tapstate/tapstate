@@ -92,6 +92,11 @@ final class ClusterWorkloadClaims {
         return membership.businessEligible() ? call(()->store.readPipeline(scope)) : Optional.empty();
     }
 
+    /** Reads the fixed cleanup scope without turning local ineligibility into a missing store row. */
+    Optional<WorkloadClaimReading> readPipelineForRelease(PipelineIntentScope scope) {
+        return call(() -> store.readPipeline(scope));
+    }
+
     /**
      * Renews a claim this member holds, while the cluster still lets it.
      *

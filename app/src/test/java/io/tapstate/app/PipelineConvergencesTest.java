@@ -103,8 +103,9 @@ class PipelineConvergencesTest {
             observations.offer("a", () -> {});
             assertThat(observations.health().coalescedRequests()).isEqualTo(2);
             assertThat(observations.health().retainedPipelines()).isEqualTo(1);
-            assertThat(events.stream().filter(event -> event.getLevel() == ch.qos.logback.classic.Level.WARN))
-                    .hasSize(1);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5)).untilAsserted(() ->
+                    assertThat(events.stream().filter(event -> event.getLevel() == ch.qos.logback.classic.Level.WARN))
+                            .hasSize(1));
             release.countDown();
             org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5)).until(() ->
                     events.stream().anyMatch(event -> event.getFormattedMessage().startsWith("Lifecycle convergence backpressure cleared")));
@@ -146,11 +147,12 @@ class PipelineConvergencesTest {
     }
 
     @Test
-    void aDelayedPressureLogCannotArriveAfterRecoveryOrHoldTheSlotLock() throws Exception {
+    void aDelayedPressureLogDoesNotBlockOffersOrCompletionAndReportsRecoveryInOrder() throws Exception {
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         var warningEntered = new CountDownLatch(1);
         var warningRelease = new CountDownLatch(1);
+        var independent = new CountDownLatch(1);
         var events = new java.util.concurrent.CopyOnWriteArrayList<ch.qos.logback.classic.spi.ILoggingEvent>();
         var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(PipelineConvergences.class);
         var previous = logger.getLevel();
@@ -174,14 +176,17 @@ class PipelineConvergencesTest {
             observations.offer("a", () -> {});
             var offered = caller.submit(() -> observations.offer("a", () -> {}));
             assertThat(warningEntered.await(5, TimeUnit.SECONDS)).isTrue();
-            release.countDown();
-            // A slow logging backend must not hold the slot monitor used for health and invalidation.
+            assertThat(offered.get(2, TimeUnit.SECONDS)).isEqualTo(COALESCED);
             observations.retain(java.util.List.of());
             assertThat(observations.health().coalescedRequests()).isEqualTo(1);
-            org.awaitility.Awaitility.await().during(java.time.Duration.ofMillis(100))
-                    .atMost(java.time.Duration.ofSeconds(1)).until(events::isEmpty);
+            assertThat(caller.submit(() -> observations.offer("b", independent::countDown)).get(2, TimeUnit.SECONDS))
+                    .isEqualTo(ACCEPTED);
+            release.countDown();
+            assertThat(independent.await(2, TimeUnit.SECONDS)).isTrue();
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2))
+                    .until(() -> observations.pipelineIds().isEmpty());
+            assertThat(events).isEmpty();
             warningRelease.countDown();
-            assertThat(offered.get(5, TimeUnit.SECONDS)).isEqualTo(COALESCED);
             org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5)).until(() -> events.size() == 2);
             assertThat(events.get(0).getLevel()).isEqualTo(ch.qos.logback.classic.Level.WARN);
             assertThat(events.get(0).getFormattedMessage()).contains("backpressured=true");

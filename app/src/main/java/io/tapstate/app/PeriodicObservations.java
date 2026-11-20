@@ -1,10 +1,13 @@
 package io.tapstate.app;
 
+import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -24,7 +27,9 @@ final class PeriodicObservations implements AutoCloseable {
     private final String workName;
     private final ThreadPoolExecutor workers;
     private final Map<String, Slot> slots = new HashMap<>();
-    private final Object healthReports = new Object();
+    private final ExecutorService healthReporter;
+    private final ArrayDeque<Health> pendingHealth = new ArrayDeque<>(2);
+    private boolean reportingHealth;
     private volatile boolean closed;
     private boolean backpressured;
     private long coalesced;
@@ -38,31 +43,58 @@ final class PeriodicObservations implements AutoCloseable {
                 coalesced, rejected, backpressured);
     }
 
-    Offer offer(String pipelineId, Object version, Consumer<BooleanSupplier> task) {
-        synchronized (healthReports) {
-            Offer result;
-            Health report = null;
-            synchronized (this) {
-                result = offerLocked(pipelineId, version, task);
-                if (!closed && (result == Offer.COALESCED || result == Offer.REJECTED)) {
-                    if (result == Offer.COALESCED) coalesced++;
-                    else rejected++;
-                    report = enterBackpressure();
-                }
-            }
-            reportHealth(report);
-            return result;
+    synchronized Offer offer(String pipelineId, Object version, Consumer<BooleanSupplier> task) {
+        Offer result = offerLocked(pipelineId, version, task);
+        if (!closed && (result == Offer.COALESCED || result == Offer.REJECTED)) {
+            if (result == Offer.COALESCED) coalesced++;
+            else rejected++;
+            enterBackpressure();
+        }
+        return result;
+    }
+
+    private void enterBackpressure() {
+        if (backpressured) return;
+        backpressured = true;
+        queueHealthReport();
+    }
+
+    // Edges alternate. While the logger is stalled, replace a superseded pair with its latest edge.
+    private void queueHealthReport() {
+        if (pendingHealth.size() == 2) pendingHealth.clear();
+        pendingHealth.addLast(health());
+        if (!reportingHealth) {
+            reportingHealth = true;
+            healthReporter.execute(this::drainHealthReports);
         }
     }
 
-    private Health enterBackpressure() {
-        if (backpressured) return null;
-        backpressured = true;
-        return health();
+    private void drainHealthReports() {
+        try {
+            for (;;) {
+                Health snapshot;
+                synchronized (this) {
+                    snapshot = pendingHealth.pollFirst();
+                    if (snapshot == null) {
+                        reportingHealth = false;
+                        return;
+                    }
+                }
+                reportHealth(snapshot);
+            }
+        } catch (RuntimeException loggingFailure) {
+            synchronized (this) {
+                reportingHealth = false;
+                if (!closed && !pendingHealth.isEmpty()) {
+                    reportingHealth = true;
+                    healthReporter.execute(this::drainHealthReports);
+                }
+            }
+            throw loggingFailure;
+        }
     }
 
     private void reportHealth(Health snapshot) {
-        if (snapshot == null) return;
         if (snapshot.backpressured()) {
             log.warn("{} backpressure: requests are being coalesced or dropped; {}", workName, snapshot);
         } else {
@@ -95,12 +127,14 @@ final class PeriodicObservations implements AutoCloseable {
     PeriodicObservations(int concurrency, int capacity, Class<?> loggerType, String workName, String threadPrefix) {
         this.log = LoggerFactory.getLogger(loggerType);
         this.workName = workName;
+        healthReporter = Executors.newSingleThreadExecutor(Thread.ofPlatform().daemon(true)
+                .name(threadPrefix + "health").factory());
         workers = new ThreadPoolExecutor(concurrency, concurrency, 0, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(capacity), Thread.ofPlatform().daemon(true)
                         .name(threadPrefix, 1).factory());
     }
 
-    private synchronized Offer offerLocked(String pipelineId, Object version, Consumer<BooleanSupplier> task) {
+    private Offer offerLocked(String pipelineId, Object version, Consumer<BooleanSupplier> task) {
         if (closed) {
             return Offer.REJECTED;
         }
@@ -165,25 +199,18 @@ final class PeriodicObservations implements AutoCloseable {
                 task.run();
             }
         } finally {
-            // Sequence edge reports without holding the slot monitor during logging.
-            synchronized (healthReports) {
-                Health report = null;
-                synchronized (this) {
-                    if (closed || slot.pending == null) {
-                        slots.remove(pipelineId);
-                    } else {
-                        // A busy pipeline goes to the back of the queue rather than occupying a worker indefinitely.
-                        if (!enqueue(pipelineId, slot)) {
-                            rejected++;
-                            report = enterBackpressure();
-                        }
-                    }
-                    if (!closed && backpressured && slots.isEmpty()) {
-                        backpressured = false;
-                        report = health();
-                    }
+            synchronized (this) {
+                if (closed || slot.pending == null) {
+                    slots.remove(pipelineId);
+                } else if (!enqueue(pipelineId, slot)) {
+                    // A busy pipeline goes to the back of the queue rather than occupying a worker indefinitely.
+                    rejected++;
+                    enterBackpressure();
                 }
-                reportHealth(report);
+                if (!closed && backpressured && slots.isEmpty()) {
+                    backpressured = false;
+                    queueHealthReport();
+                }
             }
         }
     }
@@ -192,6 +219,8 @@ final class PeriodicObservations implements AutoCloseable {
     public synchronized void close() {
         closed = true;
         slots.clear();
+        pendingHealth.clear();
         workers.shutdownNow();
+        healthReporter.shutdownNow();
     }
 }

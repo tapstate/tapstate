@@ -38,6 +38,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.BooleanSupplier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -74,6 +75,7 @@ class ScopedConvergenceDriverTest {
     private PipelineAlertFeed alertFeed = PipelineAlertFeed.none();
     private MetricsExport metricsExport = MetricsExport.none();
     private PipelineConvergences pipelineConvergences;
+    private PeriodicObservations periodicObservations;
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -125,7 +127,7 @@ class ScopedConvergenceDriverTest {
                             Map.of("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true)),T0)
                             : io.tapstate.core.lifecycle.SnapshotReading.NONE;
                 }),
-                sampler, metricsExport, eligible::get, ownership, bindings, null, pipelineConvergences);
+                sampler, metricsExport, eligible::get, ownership, bindings, periodicObservations, pipelineConvergences);
     }
 
     @Test void originalScopedPublicationReachesAlertsBeforeARefusingExporter() {
@@ -279,7 +281,7 @@ class ScopedConvergenceDriverTest {
         carrying.set(true);
     }
 
-    @Test void aRejectedTailPipelineGetsAnAdmissionBeforeCompletedFrontPipelinesRefillTheQueue() throws Exception {
+    @Test void theFirstRejectedPipelineKeepsPriorityAcrossQueueFullTicks() throws Exception {
         var firstEntered = new java.util.concurrent.CountDownLatch(1);
         var firstRelease = new java.util.concurrent.CountDownLatch(1);
         var secondEntered = new java.util.concurrent.CountDownLatch(1);
@@ -302,14 +304,45 @@ class ScopedConvergenceDriverTest {
             try {
                 driver.reconcile();
                 assertThat(firstEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(work.pipelineIds()).containsExactlyInAnyOrder("a", "b");
+                driver.reconcile();
                 driver.reconcile();
                 assertThat(work.health().rejectedRequests()).isPositive();
                 firstRelease.countDown();
                 assertThat(secondEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(work.health().queuedPipelines()).isZero();
                 driver.reconcile();
+                assertThat(work.pipelineIds()).containsExactlyInAnyOrder("b", "c");
                 secondRelease.countDown();
                 assertThat(tailEntered.await(2, TimeUnit.SECONDS)).isTrue();
             } finally { firstRelease.countDown(); secondRelease.countDown(); }
+        }
+    }
+
+    @Test void aQueuedPeriodicAlertIsCurrentUntilItsOriginalCheckpointChanges() throws Exception {
+        var guard = new CompletableFuture<BooleanSupplier>();
+        alertFeed = mock(PipelineAlertFeed.class);
+        org.mockito.Mockito.doAnswer(call -> {
+            guard.complete(call.getArgument(2));
+            return null;
+        }).when(alertFeed).publishedPeriodic(any(), any(), any());
+        when(ownership.proveObservationClaim(any(), any())).thenReturn(true);
+        try (var observations = new PeriodicObservations(1, 1)) {
+            periodicObservations = observations;
+            var driver = driver();
+            driver.reconcile();
+            driver.reconcile();
+
+            var queued = guard.get(5, TimeUnit.SECONDS);
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> observations.pipelineIds().isEmpty());
+            assertThat(queued.getAsBoolean()).isTrue();
+
+            observations.discard("orders");
+            var state = views.state(FIRST);
+            var running = state.read("orders").orElseThrow();
+            assertThat(state.compareAndSwap("orders", running.epoch(), StateJson.of(PipelineState.COMPLETED), T0))
+                    .isInstanceOf(CasOutcome.Applied.class);
+            assertThat(queued.getAsBoolean()).isFalse();
         }
     }
 

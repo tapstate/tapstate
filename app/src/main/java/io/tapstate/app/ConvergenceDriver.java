@@ -56,6 +56,7 @@ final class ConvergenceDriver {
     private final PeriodicObservations periodicObservations;
     private final PipelineConvergences pipelineConvergences;
     private int nextPipeline;
+    private String nextRejectedPipeline;
     private final java.util.Set<String> unavailableObservations = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** The fixed store root and per-pass bindings; no current-scope or current-claim lookup is supplied. */
@@ -179,21 +180,16 @@ final class ConvergenceDriver {
             return;
         }
         List<String> listed = scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds();
-        int first = pipelineConvergences == null || listed.isEmpty() ? 0 : nextPipeline % listed.size();
-        if (!listed.isEmpty()) nextPipeline = (first + 1) % listed.size();
-        for (int offset = 0; offset < listed.size(); offset++) {
-            String pipelineId = listed.get((first + offset) % listed.size());
-            if (pipelineConvergences == null) reconcilePipeline(pipelineId);
-            else pipelineConvergences.offer(pipelineId, () -> reconcilePipeline(pipelineId));
-        }
         List<String> pipelineIds;
         if (pipelineConvergences != null) {
+            dispatchConvergences(listed);
             pipelineConvergences.retain(listed);
             // A deleted Pipeline keeps its claim and budgets until its original local pass has ended.
             var retained = new java.util.HashSet<>(listed);
             retained.addAll(pipelineConvergences.pipelineIds());
             pipelineIds = List.copyOf(retained);
         } else {
+            listed.forEach(this::reconcilePipeline);
             pipelineIds = listed;
         }
         // Forget what is kept per pipeline for pipelines that are no longer desired, so a
@@ -224,6 +220,33 @@ final class ConvergenceDriver {
             periodicObservations.retain(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    private void dispatchConvergences(List<String> listed) {
+        if (listed.isEmpty()) {
+            nextRejectedPipeline = null;
+            return;
+        }
+        int first = nextPipeline % listed.size();
+        nextPipeline = (first + 1) % listed.size();
+        int priority = nextRejectedPipeline == null ? -1 : listed.indexOf(nextRejectedPipeline);
+        if (priority >= 0 && !offerConvergence(nextRejectedPipeline)) return;
+
+        nextRejectedPipeline = null;
+        for (int offset = 0; offset < listed.size(); offset++) {
+            int index = (first + offset) % listed.size();
+            if (index == priority) continue;
+            String id = listed.get(index);
+            if (!offerConvergence(id)) {
+                nextRejectedPipeline = id;
+                return;
+            }
+        }
+    }
+
+    private boolean offerConvergence(String pipelineId) {
+        return pipelineConvergences.offer(pipelineId, () -> reconcilePipeline(pipelineId))
+                != PipelineConvergences.Offer.REJECTED;
     }
 
     private void reconcilePipeline(String pipelineId) {
@@ -396,7 +419,12 @@ final class ConvergenceDriver {
                 if (unavailableObservations.remove(pipelineId)) {
                     LOG.info("Periodic observation publication recovered for pipeline {}", pipelineId);
                 }
-                alert(() -> scoped.alerts().publishedPeriodic(pass, published, admitted));
+                // The dispatcher may have removed the worker's slot before another thread evaluates this input.
+                // The original checkpoint still distinguishes completion from a RUNNING frame of the same claim.
+                BooleanSupplier alertCurrent = () -> admitted.getAsBoolean()
+                        && pass.state().read(pipelineId).filter(checkpoint::equals).isPresent()
+                        && admitted.getAsBoolean();
+                alert(() -> scoped.alerts().publishedPeriodic(pass, published, alertCurrent));
                 sample(published, pass);
                 if (current.getAsBoolean()) {
                     export(published, admitted);
