@@ -98,6 +98,16 @@ class MongoAlertStorageSchemaIT {
             assertThat(schema(f)).isEqualTo(retained);
             assertThat(names(f)).doesNotContain("alert_node_lifecycles");
 
+            for (String field : List.of("alerting.authorityPreparationOperationId", "alerting.queryPreparation.operationId")) {
+                var config = new Document("_id", "config");
+                schemas.updateOne(config, new Document("$set", new Document(field, "separate-maintenance")));
+                var beforeResume = schema(f);
+                f.domain().resumeInitialAlertStorage("setup-a");
+                assertThat(schema(f)).isEqualTo(beforeResume);
+                assertThat(names(f)).doesNotContain("alert_node_lifecycles");
+                schemas.updateOne(config, new Document("$set", new Document(field, "setup-a")));
+            }
+
             f.client().getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
                     .append("mode", new Document("times", 1))
                     .append("data", new Document("failCommands", List.of("createIndexes")).append("errorCode", 8)));
@@ -315,6 +325,7 @@ class MongoAlertStorageSchemaIT {
             try (var reopened = MongoConfigurationDomain.open(f.settings(), "cluster-a")) {
                 assertThat(reopened.alertSchemaVersion()).isEqualTo(1);
             }
+            f.domain().resumeInitialAlertStorage("setup-a");
             assertThat(schema(f)).isEqualTo(before);
             assertThat(versions(f).find().first()).doesNotContainKey(ConfigurationVersion.ALERT_FENCE);
             assertThat(f.domain().prepareAlertStorage("authority-upgrade-a")).isEqualTo(MongoAlertStorageSchema.VERSION);

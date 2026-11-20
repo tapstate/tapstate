@@ -8,15 +8,19 @@ import io.tapstate.adapters.mongostore.MongoConfigurationBootstrap;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.StoreError;
+import io.tapstate.core.alerting.AlarmKey;
+import io.tapstate.core.alerting.AlertChannelPolicy;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StorageSetupScope;
 import io.tapstate.spi.store.StorageSetupStateStore;
 import java.time.Duration;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -26,6 +30,37 @@ import static org.mockito.Mockito.*;
 
 class CloudConfigurationInitializationDiagnosticsTest {
     private static final String OPERATION = "a9c7faf0-c2a4-437a-a698-767c515e37ec";
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aSuccessfulBootstrapConfirmsTheOriginalOperationWithoutRepeatingAlertPreparation(boolean creationGranted) {
+        var fixture = retainedConfiguration(StorageSetupStateStore.Phase.CONFIG_PREPARED);
+        var bridge = fixture.bridge();
+        var alertScope = new AlarmKey.Scope("organization", "cluster");
+        when(bridge.claimConfiguration(anyString(), anyString())).thenAnswer(call ->
+                new CloudSdkBridge.ConfigurationInitialization("cluster", OPERATION, "CLAIMED",
+                        call.getArgument(1), creationGranted));
+        when(bridge.alertScope()).thenReturn(Optional.of(alertScope));
+
+        try (var domains = mockStatic(MongoConfigurationDomain.class);
+             var bootstrap = mockStatic(MongoConfigurationBootstrap.class);
+             var initialization = fixture.initialization()) {
+            domains.when(() -> MongoConfigurationDomain.open(fixture.settings(), "cluster"))
+                    .thenThrow(new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null));
+            if (creationGranted) {
+                bootstrap.when(() -> MongoConfigurationBootstrap.prepareWithAlerts(fixture.settings(), "cluster",
+                        "cloud-cluster", OPERATION, 1, alertScope, AlertChannelPolicy.Deployment.CLOUD_MANAGED))
+                        .thenReturn(fixture.domain());
+            } else {
+                bootstrap.when(() -> MongoConfigurationBootstrap.resume(fixture.settings(), "cluster",
+                        "cloud-cluster", OPERATION, 1)).thenReturn(fixture.domain());
+            }
+
+            assertThat(initialization.open()).isSameAs(fixture.domain());
+            verify(bridge).completeConfiguration(eq(OPERATION), anyString());
+            verify(fixture.domain(), never()).resumeInitialAlertStorage(anyString());
+        }
+    }
 
     @ParameterizedTest
     @EnumSource(value = StorageSetupStateStore.Phase.class, names = {"CONFIG_PREPARED", "COMPLETE"})
