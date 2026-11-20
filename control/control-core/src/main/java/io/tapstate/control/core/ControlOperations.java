@@ -33,6 +33,8 @@ public final class ControlOperations {
 
     public static final Operation AI_PROVIDER_GET = new Operation("ai-provider.get", Scope.READ, false, null, "Read the current caller provider metadata without a credential.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_REPLACE = new Operation("ai-provider.replace", Scope.WRITE, true, null, "Replace the current caller encrypted provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_SELECT = new Operation("ai-provider.select", Scope.WRITE, true, null,
+            "Select the existing workspace provider or Tapstate-managed AI.", REST_ONLY);
     public static final Operation AI_PROVIDER_DELETE = new Operation("ai-provider.delete", Scope.WRITE, true, null, "Delete the current caller provider credential.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_MODELS = new Operation("ai-provider.models", Scope.WRITE, false, null, "Discover provider model identifiers without persisting credentials.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_CHECK = new Operation("ai-provider.check", Scope.WRITE, false, null, "Test an ephemeral provider credential without persisting it.", CLI_AND_REST);
@@ -442,6 +444,7 @@ public final class ControlOperations {
             ALERT_RULE_PREVIEW, ALERT_ROUTE_PREVIEW, ALERT_RESOURCES, ALERT_CATALOG, ALERT_CENTER, ALERT_DETAIL, ALERT_DELIVERIES, ALERT_HEALTH, ALERT_CONFIGURATION_LIST, ALERT_CONFIGURATION_SAVE, ALERT_CONFIGURATION_RETIRE, ALERT_PREVIEW, ALERT_TEST, ALERT_TEST_RESULT, ALERT_RETRY,
             AI_PROVIDER_GET,
             AI_PROVIDER_REPLACE,
+            AI_PROVIDER_SELECT,
             AI_PROVIDER_DELETE,
             AI_PROVIDER_CHECK,
             AI_PROVIDER_MODELS,

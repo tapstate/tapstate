@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.core.catalog.ConnectorForm;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.JsonReader;
 import io.tapdata.entity.codec.TapCodecsRegistry;
@@ -476,7 +477,8 @@ final class PdkConnector implements AutoCloseable {
         if (settings == null || settings.isEmpty()) {
             return nodeConfig;
         }
-        Map<String, Map<?, ?>> declared = ConnectorForm.NODE.items(spec);
+        Map<String, Map<?, ?>> declared = spec != null && JsonReader.parse(spec) instanceof Map<?, ?> root
+                ? ConnectorForm.NODE.itemsIn(root) : Map.of();
         settings.forEach((name, value) -> {
             if (declared.containsKey(name)) {
                 nodeConfig.put(name, value);

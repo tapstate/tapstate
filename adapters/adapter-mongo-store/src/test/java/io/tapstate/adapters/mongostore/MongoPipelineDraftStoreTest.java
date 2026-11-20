@@ -19,7 +19,7 @@ class MongoPipelineDraftStoreTest {
                 "Orders", "draft", new PipelineDraft.Graph(
                         List.of(new PipelineDraft.Node("source", "source", "crm", "orders",
                                 Map.of("selected", true), Map.of("label", "Orders"))),
-                        List.of(), new PipelineDraft.Viewport(1, 2, 0.75)), null,
+                        List.of(), new PipelineDraft.Viewport(1, 2, 0.75), Map.of("crm", Map.of("preImage", false))), null,
                 "hash-1", 2L, "hash-1", Instant.parse("2026-09-21T00:00:00Z"),
                 Instant.parse("2026-09-21T01:00:00Z"), "author");
 
@@ -61,7 +61,8 @@ class MongoPipelineDraftStoreTest {
                                         PipelineDraft.Shape.ARRAY, "items", List.of("item_id"), List.of("item_id")),
                                 List.of(new PipelineDraft.Transform("keep-items", "filter",
                                         Map.of("expr", "active == true"))))),
-                        List.of(new PipelineDraft.Transform("post-map", "map", Map.of("count", 1))), null),
+                        List.of(new PipelineDraft.Transform("post-map", "map", Map.of("count", 1))), null,
+                        Map.of("mysql", Map.of("preImage", false))),
                 null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
 
         PipelineDraft restored = MongoPipelineDraftStore.fromDocument(MongoPipelineDraftStore.toDocument(draft));

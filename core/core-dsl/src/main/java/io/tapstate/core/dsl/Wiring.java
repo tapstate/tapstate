@@ -55,7 +55,7 @@ final class Wiring {
         if (inspection != null) {
             for (var source : pipeline.sources()) inspection.charge(128L + 2L * source.id().length());
         }
-        this.allSources = new LinkedHashSet<>(pipeline.sourceIds());
+        this.allSources = new LinkedHashSet<>(pipeline.sourceBindings());
         if (pipeline.transforms() != null) {
             for (Step step : pipeline.transforms()) {
                 if (inspection != null) inspection.nodeDeclaration(step.id(), nodeFrom.containsKey(step.id()) || allSources.contains(step.id()));
@@ -84,12 +84,13 @@ final class Wiring {
 
     private void indexSource(String sourceId) {
         if (!indexedSources.add(sourceId)) return;
+        String artifactId = pipeline.sourceReference(sourceId).id();
         if (inspection != null) {
-            inspection.sourceDeclarations.add(sourceId); inspection.charge(128L + 2L * sourceId.length());
-            if (!(byId.get(sourceId) instanceof SourceResource source) || !sourceId.equals(source.id())) throw missing("source", sourceId);
+            inspection.sourceDeclarations.add(artifactId); inspection.charge(128L + 2L * sourceId.length());
+            if (!(byId.get(artifactId) instanceof SourceResource source) || !artifactId.equals(source.id())) throw missing("source", sourceId);
         }
         Set<String> tables = new LinkedHashSet<>();
-        if (!(byId.get(sourceId) instanceof SourceResource source) || source.tables() == null) {
+        if (!(byId.get(artifactId) instanceof SourceResource source) || source.tables() == null) {
             openSources.add(sourceId);      // no table selector: the whole source is in play
             tablesBySelector.put(sourceId, tables);
             return;
@@ -132,7 +133,7 @@ final class Wiring {
         collect(from, new LinkedHashSet<>(), new HashSet<>(), routes, new ArrayList<>());
         if (routes.isEmpty() && inspection == null) {
             for (Upstream upstream : whole(allSources)) {
-                routes.add(new Route(upstream, List.of()));
+                routes.add(new Route(physicalUpstream(upstream), List.of()));
             }
         }
         return List.copyOf(routes);
@@ -208,7 +209,8 @@ final class Wiring {
      * unattributable name gets.
      */
     private Set<Upstream> attributed(Set<Upstream> reached) {
-        return reached.isEmpty() ? whole(allSources) : reached;
+        return (reached.isEmpty() ? whole(allSources) : reached).stream()
+                .map(this::physicalUpstream).collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
     }
 
     private void collect(FromClause from, Set<Upstream> reached, Set<String> visiting,
@@ -336,10 +338,15 @@ final class Wiring {
         if (routes != null) {
             List<Step> ordered = List.copyOf(steps.reversed());
             for (Upstream up : upstream) {
-                if (inspection != null) inspection.route(up, selector, ordered);
-                routes.add(new Route(up, ordered));
+                Upstream physical = physicalUpstream(up);
+                if (inspection != null) inspection.route(physical, selector, ordered);
+                routes.add(new Route(physical, ordered));
             }
         }
+    }
+
+    private Upstream physicalUpstream(Upstream input) {
+        return new Upstream(pipeline.sourceReference(input.source()).id(), input.table());
     }
 
     /** Every table of each named source — the answer where the wiring names no single one. */

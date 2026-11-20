@@ -1151,6 +1151,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return bindings;
     }
 
+    public record ObservationCapture(String sourceId, String captureId) {
+        public ObservationCapture {
+            Objects.requireNonNull(sourceId, "sourceId");
+            Objects.requireNonNull(captureId, "captureId");
+        }
+    }
+
     public record ObservationConfiguration(io.tapstate.core.model.PipelineResource pipeline,
             Map<String, io.tapstate.core.model.SourceResource> sources,
             Map<String, io.tapstate.spi.store.CapturePreparation> captures) {
@@ -1165,7 +1172,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoStructureProof observationStructures = new MongoStructureProof();
     private volatile boolean observationCollations;
     public ObservationCheck observationConfiguration(io.tapstate.spi.store.PipelineIntentStore.ActuationReading before,
-            String defaultSource, Map<String, String> sources) {
+            String defaultSource, Map<String, ObservationCapture> sources) {
         requireOpen();
         if (before.configurationRevision().isEmpty() || sources.isEmpty() || sources.size() > 4
                 || !MongoReadBudget.supportsSnapshotReads(connection.client())) return ObservationCheck.fallback();

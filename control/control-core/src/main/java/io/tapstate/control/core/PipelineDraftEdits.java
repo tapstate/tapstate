@@ -77,7 +77,7 @@ final class PipelineDraftEdits {
                 nodes.add(node);
             }
         }
-        return found ? new PipelineDraft.Graph(nodes, graph.edges(), graph.viewport()) : null;
+        return found ? new PipelineDraft.Graph(nodes, graph.edges(), graph.viewport(), graph.sourceNodeConfigs()) : null;
     }
 
     /** The wizard with the policy set on its output when the output publishes {@code element}; null if not. */
@@ -87,7 +87,8 @@ final class PipelineDraftEdits {
             return null;
         }
         return new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(),
-                new PipelineDraft.Output(wizard.output().kind(), with(wizard.output().config(), policy)));
+                new PipelineDraft.Output(wizard.output().kind(), with(wizard.output().config(), policy)),
+                wizard.sourceNodeConfigs());
     }
 
     private static Map<String, Object> with(Map<String, Object> config, String policy) {

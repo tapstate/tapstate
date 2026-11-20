@@ -770,8 +770,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     private volatile boolean observationCollations;
 
-    public record ObservationSource(long snapshotEpoch, Set<String> tables) {
-        public ObservationSource { tables = Set.copyOf(tables); }
+    public record ObservationSource(String sourceId, long snapshotEpoch, Set<String> tables) {
+        public ObservationSource {
+            Objects.requireNonNull(sourceId, "sourceId");
+            tables = Set.copyOf(tables);
+        }
     }
 
     public record ObservationFacts(io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
