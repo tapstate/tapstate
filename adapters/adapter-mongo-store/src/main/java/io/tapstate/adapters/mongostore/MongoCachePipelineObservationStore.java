@@ -215,8 +215,7 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     private boolean write(Observation observation, long checkpointEpoch, boolean create) {
         var update = prepare(observation, checkpointEpoch, create);
         var result = StoreIo.call(() -> {
-            access.requireObservationActive();
-            if (create) access.verifyObservationStructure();
+            requireWriteActive(create);
             return collection().updateOne(update.getFilter(), update.getUpdatePipeline(), update.getOptions());
         });
         if (!create && result.getMatchedCount() != 1) return false;
@@ -236,11 +235,9 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             var store = write.store();
             try {
                 var update = store.prepare(write.observation(), write.checkpointEpoch(), true);
-                store.access.requireObservationActive();
-                if (!verified) {
-                    store.access.verifyObservationStructure();
-                    verified = true;
-                }
+                boolean verifyStructure = !verified;
+                StoreIo.run(() -> store.requireWriteActive(verifyStructure));
+                verified = true;
                 prepared.add(new PreparedWrite(i, write, update));
             } catch (RuntimeException failure) {
                 failures.set(i, failure);
@@ -271,6 +268,11 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             if (failures.get(entry.index()) == null) entry.write().store().written(entry.write().checkpointEpoch());
         }
         return Collections.unmodifiableList(failures);
+    }
+
+    private void requireWriteActive(boolean verifyStructure) {
+        access.requireObservationActive();
+        if (verifyStructure) access.verifyObservationStructure();
     }
 
     private UpdateOneModel<Document> prepare(Observation observation, long checkpointEpoch, boolean create) {

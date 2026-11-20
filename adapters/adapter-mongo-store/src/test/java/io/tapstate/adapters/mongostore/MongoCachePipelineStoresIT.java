@@ -158,6 +158,31 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void bulkObservationRetainsTheStorageDiagnosticWhenStructureVerificationFails() {
+        withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE)
+                    .compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var sample = observation(PipelineState.RUNNING);
+            var entry = new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), ACTIVE, sample, 1);
+            var admin = f.admin().getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
+                    .append("data", new Document("failCommands", List.of("listCollections")).append("errorCode", 2)));
+            try {
+                assertThatThrownBy(() -> f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(sample, 1))
+                        .isInstanceOfSatisfying(TapstateException.class, failure ->
+                                assertThat(failure.code().code()).isEqualTo("TS0480001"));
+                assertThat(f.domain().writeObservations(List.of(entry)).getFirst())
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code().code()).isEqualTo("TS0480001");
+                            assertThat(failure.args()).containsExactly(Map.entry("detail", "MongoCommandException code=2"));
+                            assertThat(failure.getCause()).isNull();
+                        });
+            } finally {
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+        });
+    }
+
     @Test void checkpointsAndProjectionsUseTheOriginalScopeAndLiveClaimInOneCacheDomain() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
