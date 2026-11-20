@@ -189,7 +189,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     T result=read.apply(new PipelineReading(state,claim,includeNode?observedRow(observed,"node"):null));
                     requireActive.run();requireValidationAuthority();if(budget!=null)operations.check();return result;
                 } catch (TapstateException failure) {
-                    if (includeNode || failure.code() != IoError.DOCUMENT_TOO_LARGE) throw failure;
+                    if (failure.code() != IoError.DOCUMENT_TOO_LARGE) throw failure;
                 }
                 requireActive.run();
                 requireValidationAuthority();

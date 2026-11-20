@@ -81,12 +81,13 @@ class IdlePipelineObservationIT {
                 Await.until("the checkpoint to reach STOPPED",
                         () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
                         () -> "pipeline state=" + control.state(PIPELINE));
-                assertStartCanReadAWideCheckpoint(client.getDatabase(storage.cacheDatabase()), control);
+                assertRestartDeliversCdcWithAWideCheckpoint(client.getDatabase(storage.cacheDatabase()), control, source, target);
             }
         }
     }
 
-    private static void assertStartCanReadAWideCheckpoint(MongoDatabase cache, ControlPlane control) {
+    private static void assertRestartDeliversCdcWithAWideCheckpoint(MongoDatabase cache, ControlPlane control,
+            MongoCollection<Document> source, MongoCollection<Document> target) {
         var checkpoints = cache.getCollection("pipeline_state");
         var stateId = new Document("_id", PIPELINE);
         var claims = cache.getCollection("workload_claims");
@@ -100,6 +101,9 @@ class IdlePipelineObservationIT {
 
             var answer = control.start(PIPELINE, List.of(), null);
             assertThat(answer.status()).as("START reads the individually legal checkpoint and claim: %s", answer.body()).isEqualTo(200);
+            source.insertOne(new Document("_id", 3L).append("customer", "after restart while wide"));
+            Await.answered("CDC after restart while both rows are still wide", Duration.ofSeconds(30),
+                    () -> Optional.ofNullable(target.find(new Document("_id", 3L)).first()));
         } finally {
             var clear = new Document("$unset", new Document(extra, ""));
             checkpoints.updateOne(stateId, clear);
