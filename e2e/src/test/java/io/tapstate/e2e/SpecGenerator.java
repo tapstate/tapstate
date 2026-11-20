@@ -176,9 +176,24 @@ final class SpecGenerator {
 
     /** The two scalars every store in this vocabulary spells the same way. */
     private static Map<String, Object> scalarValue() {
+        return valueOf(List.of("integer", "string"),
+                "An integer or a string; wider value types are a widening of the vocabulary.");
+    }
+
+    /**
+     * A value a document is held to: the two scalars, or a boolean. Only a doc expectation takes a
+     * boolean, since a flag a pipeline writes is read back from the document while seeds, cdc settings
+     * and locators stay on the two scalars every store spells the same way.
+     */
+    private static Map<String, Object> expectedValue() {
+        return valueOf(List.of("integer", "string", "boolean"),
+                "An integer, a string or a boolean; wider value types are a widening of the vocabulary.");
+    }
+
+    private static Map<String, Object> valueOf(List<String> types, String description) {
         Map<String, Object> value = new LinkedHashMap<>();
-        value.put("type", List.of("integer", "string"));
-        value.put("description", "An integer or a string; wider value types are a widening of the vocabulary.");
+        value.put("type", types);
+        value.put("description", description);
         return value;
     }
 
@@ -364,7 +379,7 @@ final class SpecGenerator {
         expect.put("type", "object");
         expect.put("description", "Scalar values by path: a.b for a field of a field, items[0].sku for a "
                 + "field of a list element.");
-        expect.put("additionalProperties", scalarValue());
+        expect.put("additionalProperties", expectedValue());
 
         Map<String, Object> length = scalar("integer", "How many elements the list at this path holds.");
         length.put("minimum", 0);

@@ -65,7 +65,10 @@ class CorpusSmokeTest {
             // key of the row it came from
             "unwind-needs-an-element-key",
             // an unwind whose rows reach a sync that appends, where a delete is another row
-            "unwind-needs-an-upsert-target");
+            "unwind-needs-an-upsert-target",
+            "rollup-function-unknown",      // a rollup field names no known function, or several
+            "rollup-on-single-row-embed",   // rollup: on an object or flat embed, which holds one row
+            "rollup-level-without-fields"); // as: rollup with nothing to roll up
 
     private static final Set<String> KINDS = Set.of("source", "pipeline", "transform", "view", "serve");
 

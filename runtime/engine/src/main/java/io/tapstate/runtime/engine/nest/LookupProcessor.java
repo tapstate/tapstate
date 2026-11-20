@@ -73,6 +73,15 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      */
     static final int DEPARTED_REGISTRATIONS = 2;
 
+    /**
+     * The rows this namespace holds a second time, keyed by the value they held <em>before</em>, drawn only
+     * for a lookup made for an {@code orOn} alternative. There the key is an ordinary column rather than
+     * what identifies the row, so it can be edited, and the entry under the value it left would otherwise
+     * go on answering for a row that no longer carries it. Only an update with an earlier row can say
+     * where it was; anything else is passed over.
+     */
+    static final int DEPARTED_ROWS = 3;
+
     private final NestLookup lookup;
     private final NestStore<Map<String, Object>> store;
     private final NestStore<Set<Object>> references;
@@ -145,6 +154,19 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             processRows(inbox);
             return;
         }
+        if (ordinal == DEPARTED_ROWS) {
+            for (Object item; (item = inbox.peek()) != null; ) {
+                if (!(item instanceof SettledPositions)) {
+                    depart((Envelope) item);
+                }
+                inbox.remove();
+                if (!flush()) {
+                    return;
+                }
+            }
+            flush();
+            return;
+        }
         Set<Object> filed = ordinal == REGISTRATIONS
                 ? filedKeysIn(inbox, lookup.referenceFields()) : new LinkedHashSet<>();
         for (Object item; (item = inbox.peek()) != null; ) {
@@ -192,6 +214,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             long weight = PayloadBytes.of(event);
             if (!registrations.isEmpty() && weight > ROW_BATCH_BYTES - bytes) return registrations;
             List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields(), lookup.mapName());
+            if (matchesNothing(referenced)) return registrations;
             registrations.add(new Registration(event, referenced, referrer,
                     NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer))));
             referrers.add(referrer);
@@ -244,6 +267,11 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         List<RowArrival> arrivals = nextRows(inbox);
         Map<Object, Map<String, Object>> states = new LinkedHashMap<>();
         for (RowArrival arrival : arrivals) {
+            if (matchesNothing(arrival.key())) {
+                // Filed nowhere: no document can ask for it, and filed under a key of nulls it would be the
+                // one entry every row lacking that column overwrites and every such edit wakes.
+                continue;
+            }
             states.put(arrival.key(), NestKeys.isDeletion(arrival.event())
                     ? NestLookup.gone() : NestKeys.rowOf(arrival.event()));
         }
@@ -281,7 +309,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
 
     private Map<Object, Set<Object>> referencesFor(Collection<FiledRow> rows) {
         Set<Object> keys = new LinkedHashSet<>();
-        for (FiledRow row : rows) keys.addAll(bucketsOf(row.key()));
+        for (FiledRow row : rows) if (!matchesNothing(row.key())) keys.addAll(bucketsOf(row.key()));
         return references.loadAll(keys);
     }
 
@@ -360,6 +388,10 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             return;
         }
         List<Object> key = NestKeys.valuesOf(row, lookup.partitionKey(), lookup.mapName());
+        if (matchesNothing(key)) {
+            SettledPositions.fold(owingNothing, event.positions());
+            return;
+        }
         // Left standing as an empty row rather than taken out. A document pointing at a row that is not
         // here has to know which kind of not-here it is: one that has not arrived is worth waiting for and
         // one that has been deleted never will be, and an absent entry cannot say which. And never taken
@@ -462,6 +494,11 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      */
     private void register(Envelope event, Map<String, Object> row, Set<Object> filed) {
         List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields(), lookup.mapName());
+        if (matchesNothing(referenced)) {
+            // Points at nothing under this alternative, so nothing is recorded: a record under a key of nulls
+            // would be woken by every row lacking that column, and could only fail the job on its fanout.
+            return;
+        }
         List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity(), lookup.mapName());
         Object bucket = NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer));
         if (NestKeys.isDeletion(event)) {
@@ -547,12 +584,62 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             return;
         }
         List<Object> left = NestKeys.valuesOf(was, lookup.referenceFields(), lookup.mapName());
+        if (matchesNothing(left)) {
+            // Nothing was recorded for a reference that named nothing, so there is nothing to take out.
+            return;
+        }
         List<Object> referrer = NestKeys.valuesOf(was, lookup.referrerIdentity(), lookup.mapName());
         if (left.equals(NestKeys.valuesOf(row, lookup.referenceFields(), lookup.mapName()))
                 && referrer.equals(NestKeys.valuesOf(row, lookup.referrerIdentity(), lookup.mapName()))) {
             return;
         }
         references.remove(NestLookup.bucketKey(left, NestLookup.bucketOf(referrer)), referrer);
+    }
+
+    /**
+     * Whether {@code key} can match nothing here, so is neither filed, recorded nor woken. Only a lookup made
+     * for an {@code orOn} alternative asks: its key is an ordinary column, null on any row the alternative
+     * does not apply to. Every other lookup keeps exactly the handling it always had.
+     */
+    private boolean matchesNothing(List<Object> key) {
+        return lookup.alternative() && key.contains(null);
+    }
+
+    /**
+     * Takes a row out from under the alternative key it held before an update, where the update moved it to
+     * another value. Only while the entry there is still that same row: another row may have been filed
+     * under the value since, and the two deliveries of these edges reach this vertex in no fixed order. The
+     * documents naming the value it left are woken, so they fall through to their next alternative.
+     */
+    private void depart(Envelope event) {
+        if (event.op() != io.tapstate.core.event.Op.UPDATE) {
+            return;
+        }
+        Map<String, Object> was = event.before();
+        if (was == null || !was.keySet().containsAll(lookup.partitionKey())) {
+            return;
+        }
+        List<Object> left = NestKeys.valuesOf(was, lookup.partitionKey(), lookup.mapName());
+        if (left.contains(null)
+                || left.equals(NestKeys.valuesOf(NestKeys.rowOf(event), lookup.partitionKey(), lookup.mapName()))) {
+            return;
+        }
+        Map<String, Object> filed = store.load(left);
+        if (filed == null || filed.isEmpty() || !sameRow(filed, was)) {
+            return;
+        }
+        store.save(left, NestLookup.gone(), false);
+        wake(left, event, false);
+    }
+
+    /** Whether a filed entry is the row an earlier image describes, by what identifies it where that is known. */
+    private boolean sameRow(Map<String, Object> filed, Map<String, Object> was) {
+        List<String> identity = lookup.rowIdentity();
+        if (!identity.isEmpty() && was.keySet().containsAll(identity)) {
+            return NestKeys.valuesOf(filed, identity, lookup.mapName())
+                    .equals(NestKeys.valuesOf(was, identity, lookup.mapName()));
+        }
+        return filed.equals(was);
     }
 
     /**

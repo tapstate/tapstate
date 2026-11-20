@@ -201,10 +201,21 @@ final class NestKeys {
      *
      * <p>A column that is genuinely null is left alone, which is why this asks for the key and never for
      * the value: the column is present, so the key built from it is the key the entry was written under.
+     *
+     * <p><b>A whole earlier row may leave a column out.</b> A document store keeps no field for a value it
+     * never had, so its earlier row of a document that never named anything there has no such field at all,
+     * and the entry written for that document was written under the null the absent field reads as. What
+     * tells that row from one sent with no pre-image is the rest of it: a change stream with none sends
+     * nothing, or the identity of the row and nothing else, while a whole row carries its other columns too.
+     * So an earlier row holding the identity and at least one column beyond it answers for the reference
+     * columns it leaves out, as null.
      */
     private static boolean saysWhereItPointed(Map<String, Object> was, NestLookup lookup) {
-        return was != null && was.keySet().containsAll(lookup.referenceFields())
-                && was.keySet().containsAll(lookup.referrerIdentity());
+        if (was == null || !was.keySet().containsAll(lookup.referrerIdentity())) {
+            return false;
+        }
+        return was.keySet().containsAll(lookup.referenceFields())
+                || !lookup.referrerIdentity().containsAll(was.keySet());
     }
 
     /**

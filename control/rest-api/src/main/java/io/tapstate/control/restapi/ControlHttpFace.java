@@ -63,6 +63,7 @@ import java.util.Map;
         PipelinePreviewController.class, ValidationConfigurationController.class, ValidationReportController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,
+        AggregateStepController.class,
         ApiExceptionHandler.class})
 public class ControlHttpFace {
 

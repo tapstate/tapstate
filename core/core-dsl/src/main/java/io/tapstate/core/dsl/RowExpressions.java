@@ -25,8 +25,10 @@ import dev.cel.parser.CelStandardMacro;
 import dev.cel.parser.Operator;
 import io.tapstate.core.common.TapstateType;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -44,7 +46,8 @@ import java.util.Set;
  * <p>Expressions bind the event envelope as their root: {@code op} / {@code ts} / {@code src} are
  * scalars, {@code before} / {@code after} / {@code schema} are maps. The function environment is the
  * CEL standard library (with the standard macros {@code has} / {@code exists} / {@code all} /
- * {@code map} / {@code filter}) plus the one builtin the grammar commits ({@code now()}). Two shapes:
+ * {@code map} / {@code filter}) plus the clock functions ({@code now()}, {@code today(zone)}, and the
+ * calendar arithmetic {@link RowClock} describes). Two shapes:
  * a predicate must compile to {@code bool}; a computed value may compile to any type.
  *
  * <p>The row's columns are typed in one of two ways, and the difference is the whole point of the
@@ -65,7 +68,8 @@ import java.util.Set;
  * comparisons (ordering and equality across decimals, integers, unsigned integers, and floating-point
  * values) are declared, while arithmetic and computed decimal results without declared bounds remain
  * refused. Other opaque types (temporal shapes, JSON, and unknown) match no operator overloads, so
- * computing on them is refused and the diagnostic names the type.
+ * computing on them is refused and the diagnostic names the type. The one exception among those is
+ * ordering two values of the same temporal type, which is exact without a zone.
  *
  * <p>A column the source model does not carry stays {@code dyn} and compiles. For a source whose
  * model comes from sampling, a column missing from the model is a normal state rather than an error,
@@ -76,9 +80,46 @@ public final class RowExpressions {
     private RowExpressions() {
     }
 
-    /** {@code now()} — current event time; the one builtin beyond the CEL standard library. */
+    /** {@code now()}: the moment the row is processed, as a timestamp. */
     private static final CelFunctionDecl NOW = CelFunctionDecl.newFunctionDeclaration(
-            "now", CelOverloadDecl.newGlobalOverload("now_timestamp", SimpleType.TIMESTAMP));
+            "now", CelOverloadDecl.newGlobalOverload(RowClock.NOW_OVERLOAD, SimpleType.TIMESTAMP));
+
+    /**
+     * The calendar functions beside {@code now()}: {@code today(zone)}, date arithmetic and the day a date and
+     * time falls on. Each returns a tapstate date, so its result orders against a DATE column like another
+     * DATE does. {@link RowClock} says what each computes.
+     */
+    private static List<CelFunctionDecl> calendarFunctions() {
+        CelType date = opaqueTypeOf(TapstateType.DATE);
+        CelType datetime = opaqueTypeOf(TapstateType.DATETIME);
+        return List.of(
+                CelFunctionDecl.newFunctionDeclaration(RowClock.TODAY,
+                        CelOverloadDecl.newGlobalOverload(RowClock.TODAY_OVERLOAD, date, SimpleType.STRING)),
+                CelFunctionDecl.newFunctionDeclaration(RowClock.ADD_DAYS,
+                        CelOverloadDecl.newMemberOverload(RowClock.ADD_DAYS_OVERLOAD, date, date, SimpleType.INT)),
+                CelFunctionDecl.newFunctionDeclaration(RowClock.ADD_MONTHS,
+                        CelOverloadDecl.newMemberOverload(RowClock.ADD_MONTHS_OVERLOAD, date, date,
+                                SimpleType.INT)),
+                CelFunctionDecl.newFunctionDeclaration(RowClock.ADD_YEARS,
+                        CelOverloadDecl.newMemberOverload(RowClock.ADD_YEARS_OVERLOAD, date, date,
+                                SimpleType.INT)),
+                CelFunctionDecl.newFunctionDeclaration(RowClock.TO_DATE,
+                        CelOverloadDecl.newMemberOverload(RowClock.TO_DATE_OVERLOAD, date, datetime,
+                                SimpleType.STRING)));
+    }
+
+    /**
+     * The temporal types two values of which may be ordered against each other. Comparing two values
+     * of one of these types needs no zone - both sides are read on the same clock - so it is exact,
+     * unlike converting either to an instant. Mixing two of them, or one with a string or a number,
+     * still matches no overload and stays refused.
+     */
+    private static final List<TapstateType> ORDERED_OPAQUE = List.of(
+            TapstateType.DATE, TapstateType.TIME, TapstateType.DATETIME);
+
+    /** The ordering operators declared for {@link #ORDERED_OPAQUE}, by CEL function name. */
+    private static final List<Operator> ORDERING = List.of(
+            Operator.LESS, Operator.LESS_EQUALS, Operator.GREATER, Operator.GREATER_EQUALS);
 
     /** The name the typed row carries in the compiler's type namespace. */
     private static final String ROW_TYPE = "tapstate.Row";
@@ -105,7 +146,44 @@ public final class RowExpressions {
                 .addVar("src", SimpleType.STRING)
                 .addVar("schema", MapType.create(SimpleType.STRING, SimpleType.DYN))
                 .addFunctionDeclarations(NOW)
+                .addFunctionDeclarations(calendarFunctions())
+                .addFunctionDeclarations(sameTypeComparisons())
                 .addFunctionDeclarations(DecimalComparisonFunctions.orderingDeclarations());
+    }
+
+    /**
+     * One declared same-type comparison: the CEL operator function, the overload id it is bound under
+     * at runtime, and the column type both operands carry.
+     */
+    public record SameTypeComparison(String function, String overloadId, TapstateType type) {
+    }
+
+    /** Every same-type comparison the typed environment declares, for the runtime to bind. */
+    public static List<SameTypeComparison> sameTypeComparisonOverloads() {
+        List<SameTypeComparison> all = new ArrayList<>();
+        for (Operator operator : ORDERING) {
+            for (TapstateType type : ORDERED_OPAQUE) {
+                all.add(new SameTypeComparison(operator.getFunction(),
+                        "tapstate_" + operator.name().toLowerCase(Locale.ROOT) + "_"
+                                + type.name().toLowerCase(Locale.ROOT),
+                        type));
+            }
+        }
+        return List.copyOf(all);
+    }
+
+    private static List<CelFunctionDecl> sameTypeComparisons() {
+        Map<String, List<CelOverloadDecl>> byFunction = new LinkedHashMap<>();
+        for (SameTypeComparison comparison : sameTypeComparisonOverloads()) {
+            CelType operand = opaqueTypeOf(comparison.type());
+            byFunction.computeIfAbsent(comparison.function(), f -> new ArrayList<>())
+                    .add(CelOverloadDecl.newGlobalOverload(
+                            comparison.overloadId(), SimpleType.BOOL, operand, operand));
+        }
+        List<CelFunctionDecl> declarations = new ArrayList<>();
+        byFunction.forEach((function, overloads) ->
+                declarations.add(CelFunctionDecl.newFunctionDeclaration(function, overloads)));
+        return declarations;
     }
 
     /** A compiler over the envelope root with an untyped row, and no result-type constraint. */
@@ -302,6 +380,11 @@ public final class RowExpressions {
      */
     private static final Map<CelType, TapstateType> FROM_CEL_TYPE = fromCelType();
 
+    /** The tapstate type a CEL result type came from, or {@code UNKNOWN} when no column type maps to it. */
+    static TapstateType tapstateTypeOf(CelType type) {
+        return FROM_CEL_TYPE.getOrDefault(type, TapstateType.UNKNOWN);
+    }
+
     private static Map<CelType, TapstateType> fromCelType() {
         Map<CelType, TapstateType> byCelType = new LinkedHashMap<>();
         for (TapstateType type : TapstateType.values()) {
@@ -311,7 +394,7 @@ public final class RowExpressions {
     }
 
     /** A tapstate type as CEL sees it, or a named opaque type where CEL has no exact counterpart. */
-    private static CelType celTypeOf(TapstateType type) {
+    static CelType celTypeOf(TapstateType type) {
         return switch (type) {
             case STRING -> SimpleType.STRING;
             case INT64 -> SimpleType.INT;
@@ -320,6 +403,11 @@ public final class RowExpressions {
             case BINARY -> SimpleType.BYTES;
             case MAP -> MapType.create(SimpleType.STRING, SimpleType.DYN);
             case ARRAY -> ListType.create(SimpleType.DYN);
+            // No exact counterpart: an exact fixed-point number loses its scale in any binary
+            // floating point type, a temporal value without a zone cannot become an instant without
+            // assuming one, and a JSON value is not known to be any single shape. Each stays a named
+            // opaque type that carries through and matches only the overloads declared for it: exact
+            // comparisons for a decimal, and the same-type ordering for the temporal ones.
             case DECIMAL, DATE, TIME, DATETIME, YEAR, JSON, UNKNOWN -> opaqueTypeOf(type);
         };
     }
@@ -360,7 +448,28 @@ public final class RowExpressions {
 
     private static String checkedExpressionError(CelAbstractSyntaxTree ast) {
         String diagnostic = indexedRow(ast);
+        if (diagnostic == null) {
+            diagnostic = zoneError(ast);
+        }
         return diagnostic == null ? DecimalComparisonFunctions.validationError(ast) : diagnostic;
+    }
+
+    /**
+     * The diagnostic for a time zone written as a literal that is not one, or null when every literal zone
+     * given to a calendar function is a real one. A zone computed from the row is judged when it is read.
+     */
+    static String zoneError(CelAbstractSyntaxTree ast) {
+        return CelNavigableAst.fromAst(ast).getRoot().allNodes()
+                .filter(node -> node.getKind() == CelExpr.ExprKind.Kind.CALL)
+                .map(node -> node.expr().call())
+                .filter(call -> call.function().equals(RowClock.TODAY) || call.function().equals(RowClock.TO_DATE))
+                .flatMap(call -> call.args().stream())
+                .filter(arg -> arg.getKind() == CelExpr.ExprKind.Kind.CONSTANT
+                        && arg.constant().getKind() == dev.cel.common.ast.CelConstant.Kind.STRING_VALUE)
+                .map(arg -> RowClock.zoneError(arg.constant().stringValue()))
+                .filter(java.util.Objects::nonNull)
+                .findFirst()
+                .orElse(null);
     }
 
     /**
@@ -373,7 +482,7 @@ public final class RowExpressions {
      * <p>Only the row root is refused. Indexing envelope metadata reaches no source column, and
      * indexing a value read out of the row leaves the column itself named.
      */
-    private static String indexedRow(CelAbstractSyntaxTree ast) {
+    static String indexedRow(CelAbstractSyntaxTree ast) {
         return CelNavigableAst.fromAst(ast).getRoot().allNodes()
                 .filter(node -> node.getKind() == CelExpr.ExprKind.Kind.CALL)
                 .map(node -> node.expr().call())

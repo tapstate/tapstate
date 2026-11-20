@@ -2,7 +2,9 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.StateCommitReading;
+import io.tapstate.core.lifecycle.StateWeightReading;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -59,6 +61,22 @@ public final class NestStateMetricNames {
     /** The deepest one key has been seen holding for something that has not arrived. */
     public static final String PENDING_HIGH_WATER = "pendingHighWater";
     public static final String READ_KEYS = "readKeys";
+    /**
+     * How heavy the namespace's state is to keep: per written key (a document, at a root level) and per commit
+     * group, a count, a byte sum and - with the bucket index appended - the bucket counts; the largest key; and
+     * the rollup folds a rendering level ran, with their nanoseconds. All from {@link #WEIGHT_SINCE}.
+     */
+    public static final String DOCUMENT_COUNT = "writtenKeys";
+    public static final String DOCUMENT_BYTES_SUM = "writtenKeyBytes";
+    public static final String DOCUMENT_BYTES_BUCKET = "writtenKeyBytesBucket";
+    public static final String LARGEST_DOCUMENT_BYTES = "largestKeyBytes";
+    public static final String COMMIT_BYTES_COUNT = "writtenGroups";
+    public static final String COMMIT_BYTES_SUM = "writtenGroupBytes";
+    public static final String COMMIT_BYTES_BUCKET = "writtenGroupBytesBucket";
+    public static final String FOLD_COUNT = "rollupFolds";
+    public static final String FOLD_NANOS_SUM = "rollupFoldNanos";
+    public static final String FOLD_NANOS_BUCKET = "rollupFoldNanosBucket";
+    public static final String WEIGHT_SINCE = "weightSince";
     public static final String WRITE_KEYS = "writeKeys";
     public static final String COLD_KEYS = "coldKeys";
 
@@ -110,6 +128,41 @@ public final class NestStateMetricNames {
                 HistogramBounds.STATE_COMMIT_ROUND_TRIPS.value(groups, tripSum, trips),
                 HistogramBounds.STATE_COMMIT_DURATION.value(groups, nanos / 1_000_000_000.0, took),
                 kinds.getOrDefault(EVICTIONS, 0L), Instant.ofEpochMilli(since));
+    }
+
+    /**
+     * The weight reading the kinds carry, or null when any part of it is missing; the folds may be absent, at a
+     * level that renders no rollup fields, and are then left out rather than read as none.
+     */
+    static StateWeightReading weightFrom(Map<String, Long> kinds) {
+        Long documents = kinds.get(DOCUMENT_COUNT);
+        Long documentBytes = kinds.get(DOCUMENT_BYTES_SUM);
+        Long largest = kinds.get(LARGEST_DOCUMENT_BYTES);
+        Long groups = kinds.get(COMMIT_BYTES_COUNT);
+        Long groupBytes = kinds.get(COMMIT_BYTES_SUM);
+        Long since = kinds.get(WEIGHT_SINCE);
+        if (documents == null || documentBytes == null || largest == null || groups == null || groupBytes == null
+                || since == null) {
+            return null;
+        }
+        List<Long> perDocument = buckets(kinds, DOCUMENT_BYTES_BUCKET, HistogramBounds.STATE_DOCUMENT_BYTES);
+        List<Long> perGroup = buckets(kinds, COMMIT_BYTES_BUCKET, HistogramBounds.STATE_COMMIT_BYTES);
+        if (!complete(perDocument, documents) || !complete(perGroup, groups)) {
+            return null;
+        }
+        HistogramValue folds = null;
+        Long foldCount = kinds.get(FOLD_COUNT);
+        Long foldNanos = kinds.get(FOLD_NANOS_SUM);
+        if (foldCount != null && foldNanos != null && foldCount > 0) {
+            List<Long> perFold = buckets(kinds, FOLD_NANOS_BUCKET, HistogramBounds.ROLLUP_FOLD_DURATION);
+            if (complete(perFold, foldCount)) {
+                folds = HistogramBounds.ROLLUP_FOLD_DURATION.value(foldCount, foldNanos / 1_000_000_000.0, perFold);
+            }
+        }
+        return new StateWeightReading(
+                HistogramBounds.STATE_DOCUMENT_BYTES.value(documents, documentBytes, perDocument), largest,
+                HistogramBounds.STATE_COMMIT_BYTES.value(groups, groupBytes, perGroup), folds,
+                Instant.ofEpochMilli(since));
     }
 
     private static boolean complete(List<Long> counts, long groups) {
