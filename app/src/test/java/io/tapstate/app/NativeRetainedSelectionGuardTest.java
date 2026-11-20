@@ -45,7 +45,7 @@ class NativeRetainedSelectionGuardTest {
         var captures = mock(PipelineCaptureCoordinator.class);
         var connectors = mock(ConnectorProvisioner.class);
         var store = mock(StorePort.class);
-        var recovery = new NativePipelineRecovery(configuration,auth,store,preparer,connectors,engine,captures,
+        var recovery = new NativePipelineRecovery(configuration,new CachePreparation("operation",auth),store,preparer,connectors,engine,captures,
                 mock(ExecutionAuthorization.class),() -> {},() -> true,mock(PipelineStoreViews.class));
         var pass = mock(PipelineConvergencePass.class);
         when(pass.scope()).thenReturn(scope);

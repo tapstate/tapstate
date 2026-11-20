@@ -31,6 +31,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -39,6 +40,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -52,8 +54,39 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.clearInvocations;
 
 class BoundedPipelinePreviewExecutorTest {
+
+    @Test
+    void expiredRequestEmitsOneDeadlineFailureWithoutSubmittingWorkOrAcquiringALease() throws Exception {
+        Instant deadline = Instant.parse("2026-01-01T00:00:01Z");
+        HazelcastInstance member = mock(HazelcastInstance.class);
+        IMap<String, String> leases = mock(IMap.class);
+        when(member.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP)).thenReturn(leases);
+        ExecutorService workers = mock(ExecutorService.class);
+        BoundedPipelinePreviewExecutor executor = new BoundedPipelinePreviewExecutor(
+                unusedStore(), connectorId -> null, member, NestSettings.defaults(),
+                Clock.fixed(deadline, ZoneOffset.UTC), workers);
+        clearInvocations(member);
+        try {
+            var stream = executor.preview(new PipelinePreviewRequest(
+                    "run-expired", "author", "pipeline", "output", 3, "sample", "candidate-hash",
+                    List.of("not: a tapstate resource"), deadline));
+
+            PipelinePreviewEvent failed = stream.next();
+            assertThat(failed.kind()).isEqualTo("run.failed");
+            assertThat(failed.payload()).containsEntry("code", ActuationError.PREVIEW_REFUSED.code())
+                    .containsEntry("reason", "the preview exceeded its 45 second execution deadline");
+            assertThat(stream.next()).isNull();
+            stream.cancel();
+            assertThat(stream.next()).isNull();
+            verifyNoInteractions(workers, member, leases);
+        } finally {
+            executor.close();
+        }
+    }
 
     @Test
     void preservesACodedFailureUnderANonConcurrentCauseWrapper() {
@@ -210,9 +243,13 @@ class BoundedPipelinePreviewExecutorTest {
             }
         };
         Instant deadline = Instant.parse("2026-01-01T00:00:01Z");
+        AtomicBoolean admitted = new AtomicBoolean();
         AtomicBoolean consumerRead = new AtomicBoolean();
         Clock clock = mock(Clock.class);
         when(clock.instant()).thenAnswer(ignored -> {
+            if (admitted.compareAndSet(false, true)) {
+                return deadline.minusSeconds(1);
+            }
             if (consumerRead.compareAndSet(false, true)) {
                 // next() has passed its initial finished check. Finish the worker before the empty poll.
                 startWorker.countDown();

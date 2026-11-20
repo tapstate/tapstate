@@ -475,6 +475,70 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void steadySharedMaintenanceUsesOneRetentionSnapshotForTheTailCheck() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var chain = stores.chains().load(held.chain()).orElseThrow();
+            var topology = stores.consumers().attached(held.chain());
+            var snapshot = new SrsConsumerStore.RetentionSnapshot(chain, topology.consumers().stream()
+                    .map(member -> new SrsConsumerStore.RetentionConsumer(member, Map.of())).toList());
+            when(stores.consumers().supportsControlSnapshot()).thenReturn(true);
+            when(stores.consumers().controlSnapshot(held.chain()))
+                    .thenReturn(Optional.of(new SrsConsumerStore.ControlSnapshot(topology, chain, List.of())));
+            when(stores.consumers().retentionSnapshot(held.chain())).thenReturn(Optional.of(snapshot));
+
+            verify(f.runtime, timeout(4000)).retain(eq(BUSINESS), eq(held.chain()),
+                    eq(WorkloadClaimFence.from(held.claim())), any(), same(snapshot));
+            verify(stores.consumers(), never()).controlSnapshot(held.chain());
+            verify(f.runtime, times(1)).startTail(any(), any(), any(), any(), any(), any(), any(), anyBoolean());
+        }
+    }
+
+    @Test void openingANewSharedEpochDiscardsTheMaintenanceRetentionSnapshot() throws InterruptedException {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var fence = WorkloadClaimFence.from(held.claim());
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var currentMember = stores.consumers().attached(held.chain()).consumers().getFirst();
+            var peerClaim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "peer"),
+                    OWNER, 1, 1, 1);
+            var peer = new SrsConsumerMembership(new SrsConsumerContext(new SrsConsumerKey(held.chain(), "peer", "input"), 1),
+                    1, false, Set.of("lines"), peerClaim);
+            var tables = Set.of("orders", "lines");
+            var model = new SrsModelKey(held.chain(), "orders", "cache", 1, 0);
+            var checkpoint = new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 0), "cut"),
+                    Map.of("orders", new SrsTableCheckpoint(model, 0)));
+            var old = new SrsChainState(held.chain(), held.preparation().captureId(), "1h", 1, tables, Set.of("orders"),
+                    1, checkpoint, Instant.EPOCH, 2, 2);
+            var opened = new SrsChainState(held.chain(), held.preparation().captureId(), "1h", 2, tables, tables,
+                    1, checkpoint, Instant.EPOCH, 2, 2);
+            var chain = new AtomicReference<>(old);
+            when(stores.chains().load(held.chain())).thenAnswer(call -> Optional.of(chain.get()));
+            when(stores.chains().requestTables(held.chain(), tables, fence)).thenReturn(old);
+            when(stores.chains().openEpoch(held.chain(), 1, fence)).thenAnswer(call -> {
+                chain.set(opened);
+                return OptionalLong.of(2);
+            });
+            when(stores.chains().publishServingTables(held.chain(), 2, tables, fence)).thenReturn(true);
+            var members = List.of(new SrsConsumerStore.RetentionConsumer(currentMember, Map.of("orders", 0L)),
+                    new SrsConsumerStore.RetentionConsumer(peer, Map.of()));
+            var oldSnapshot = new SrsConsumerStore.RetentionSnapshot(old, members);
+            var newSnapshot = new SrsConsumerStore.RetentionSnapshot(opened, members);
+            when(stores.consumers().retentionSnapshot(held.chain()))
+                    .thenAnswer(call -> Optional.of(chain.get() == old ? oldSnapshot : newSnapshot));
+            var refreshed = new CountDownLatch(1);
+            doAnswer(call -> {
+                if (chain.get() == opened) refreshed.countDown();
+                return null;
+            }).when(f.runtime).retain(eq(BUSINESS), eq(held.chain()), eq(fence), any());
+
+            assertThat(refreshed.await(5, TimeUnit.SECONDS)).isTrue();
+            verify(f.runtime).startTail(eq(BUSINESS), eq(opened), eq(fence), any(), any(), any(), any(), anyBoolean());
+            verify(f.runtime, never()).retain(eq(BUSINESS), eq(held.chain()), eq(fence), any(), same(oldSnapshot));
+        }
+    }
+
     @Test void unavailableRetentionRetriesWithoutEndingTheOriginalCapture() {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var held = ownedShared(f);
@@ -648,6 +712,47 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void anExpiredLocalProofFallsBackWhileFullAuthorityStillStands() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            assertThat(f.coordinator.observationSelection(ORIGINAL)).isPresent();
+            var pass = mock(PipelineConvergencePass.class);
+            when(pass.scope()).thenReturn(SCOPE);
+            when(pass.claim()).thenReturn(PIPELINE);
+            var state = mock(StateStore.class);
+            var observations = mock(ObservationStore.class);
+            when(pass.state()).thenReturn(state);
+            when(pass.observationSample()).thenReturn(observations);
+            var result = mock(io.tapstate.runtime.scheduler.ConvergeResult.class);
+            when(result.checkpoint()).thenReturn(Optional.of(CheckpointDoc.initial("flow", "RUNNING", Instant.now())));
+            var observation = mock(Observation.class);
+            when(observation.state()).thenReturn(PipelineState.RUNNING);
+            var publisher = mock(io.tapstate.runtime.scheduler.ObservationPublisher.class);
+            when(publisher.publishScoped(SCOPE, state, observations, null)).thenAnswer(call -> {
+                f.authorization.require(ORIGINAL);
+                return Optional.of(observation);
+            });
+            var cache = mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class);
+            var sampling = new NativeObservationSampling(
+                    mock(io.tapstate.adapters.mongostore.MongoConfigurationDomain.class), cache, f.coordinator,
+                    id -> Optional.of(ORIGINAL), id -> null, "views", Clock.systemUTC());
+            var config = new PipelineIntentStore.ActuationReading(null, OptionalLong.of(1));
+            assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            when(f.authorization.requireLocal(ORIGINAL)).thenThrow(new TapstateException(
+                    io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "flow"), null));
+            assertThat(f.authorization.require(ORIGINAL)).isEqualTo(PIPELINE);
+            assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            verify(publisher, times(2)).publishScoped(SCOPE, state, observations, null);
+            verifyNoInteractions(cache);
+            assertThat(f.coordinator.observationSelection(ORIGINAL)).isEmpty();
+            var fenced = new TapstateException(io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED,
+                    Map.of("pipeline", "flow"), null);
+            when(f.authorization.require(ORIGINAL)).thenThrow(fenced);
+            assertThatThrownBy(() -> sampling.publish(publisher, pass, result, config, null)).isSameAs(fenced);
+            assertThatThrownBy(() -> run.snapshotProgress("flow")).isSameAs(fenced);
+        }
+    }
     private static OwnedShared ownedShared(Fixture f) {
         return ownedShared(f,false);
     }

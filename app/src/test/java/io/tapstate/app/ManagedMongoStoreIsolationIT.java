@@ -2219,17 +2219,32 @@ class ManagedMongoStoreIsolationIT {
                         .preparationInputs(reusedScope, (io.tapstate.core.model.PipelineResource)originalModelFlow,
                                 (io.tapstate.core.model.PipelineResource)originalModelFlow, Map.of(modelSource.id(), modelSource));
                 child.getBean(PipelineFirstStatePreparer.class).prepare(reusedScope, inputs);
-                var driving=child.getBean(PipelineActuationOwnership.class);
-                var permitted=driving.permit(reusedScope);
-                assertThat(permitted.granted()).isTrue();
-                var execution=driving.beginExecution(reusedScope,io.tapstate.spi.store.WorkloadClaimFence.from(permitted.claim()));
-                assertThat(execution.allowed()).isTrue();
-                var completedDag=new com.hazelcast.jet.core.DAG();
-                completedDag.newVertex("done",com.hazelcast.jet.core.ProcessorMetaSupplier.forceTotalParallelismOne(
-                        com.hazelcast.jet.core.ProcessorSupplier.of((com.hazelcast.function.SupplierEx<com.hazelcast.jet.core.Processor>) FinishedPipelineProcessor::new)));
-                var retainedRun=child.getBean(io.tapstate.runtime.engine.Engine.class).submitRun("model_flow",completedDag,Map.of(),
-                        io.tapstate.runtime.engine.nest.NestSettings.defaults(),new io.tapstate.runtime.engine.OperatorRunManifest("model_flow",execution.fence(),List.of()));
-                assertThat(retainedRun.awaitTerminal(Duration.ofSeconds(15))).isTrue();
+                var driving = child.getBean(PipelineActuationOwnership.class);
+                assertThat(configuration.intents().pipelineIds()).doesNotContain(reusedScope.pipelineId());
+                PipelineActuationOwnership.Execution execution;
+                PipelineActuationOwnership.Control seedControl;
+                // Keep the manually seeded run under control while convergence scans desired intents.
+                var fixtureAdmission = (java.util.concurrent.locks.ReentrantLock)
+                        org.springframework.test.util.ReflectionTestUtils.getField(driving, "ioAdmission");
+                fixtureAdmission.lock();
+                try {
+                    var permitted = driving.permit(reusedScope);
+                    assertThat(permitted.granted()).isTrue();
+                    execution = driving.beginExecution(reusedScope, io.tapstate.spi.store.WorkloadClaimFence.from(permitted.claim()));
+                    assertThat(execution.allowed()).isTrue();
+                    seedControl = driving.control(reusedScope);
+                } finally {
+                    fixtureAdmission.unlock();
+                }
+                io.tapstate.runtime.engine.Engine.Run retainedRun;
+                try (seedControl) {
+                    var completedDag=new com.hazelcast.jet.core.DAG();
+                    completedDag.newVertex("done",com.hazelcast.jet.core.ProcessorMetaSupplier.forceTotalParallelismOne(
+                            com.hazelcast.jet.core.ProcessorSupplier.of((com.hazelcast.function.SupplierEx<com.hazelcast.jet.core.Processor>) FinishedPipelineProcessor::new)));
+                    retainedRun=child.getBean(io.tapstate.runtime.engine.Engine.class).submitRun("model_flow",completedDag,Map.of(),
+                            io.tapstate.runtime.engine.nest.NestSettings.defaults(),new io.tapstate.runtime.engine.OperatorRunManifest("model_flow",execution.fence(),List.of()));
+                    assertThat(retainedRun.awaitTerminal(Duration.ofSeconds(15))).isTrue();
+                }
                 String role = "retire_until_commit_" + suffix;
                 admin.getDatabase("admin").runCommand(new Document("createRole", role).append("privileges", List.of(
                         new Document("resource", new Document("db", configDb).append("collection", ""))
