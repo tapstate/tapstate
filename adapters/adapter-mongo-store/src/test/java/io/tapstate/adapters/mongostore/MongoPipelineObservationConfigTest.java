@@ -25,6 +25,21 @@ class MongoPipelineObservationConfigTest {
         verify(f.session).close();
     }
 
+    @Test void twoAliasedCapturesShareOnePhysicalSourceRead() {
+        var f = new Fixture();
+        var aliased = new PipelineResource("flow", null, List.of(
+                SourceRef.of("input", true, Map.of(), "left"),
+                SourceRef.of("input", true, Map.of(), "right")), null, null, null, null, null);
+        when(f.artifacts.decode(f.pipelineRow)).thenReturn(aliased);
+        var capture = new MongoConfigurationDomain.ObservationCapture("input", "capture");
+
+        var result = f.read(Map.of("left", capture, "right", capture)).configuration().orElseThrow();
+
+        assertThat(result.sources()).containsExactlyInAnyOrderEntriesOf(Map.of("left", f.source, "right", f.source));
+        assertThat(result.captures()).containsOnlyKeys("capture");
+        verify(f.artifacts).decode(f.sourceRow);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"missing-mapping", "missing-intent", "shared-recovery", "missing-source", "wrong-kind", "duplicate",
             "foreign-id", "wide-artifact", "missing-cluster", "missing-setup", "missing-binding",
@@ -148,8 +163,11 @@ class MongoPipelineObservationConfigTest {
             when(artifacts.decode(sourceRow)).thenReturn(source);
         }
         MongoConfigurationDomain.ObservationCheck read() {
+            return read(Map.of("input", new MongoConfigurationDomain.ObservationCapture("input", "capture")));
+        }
+        MongoConfigurationDomain.ObservationCheck read(Map<String, MongoConfigurationDomain.ObservationCapture> inputs) {
             var original = new PipelineIntentStore.ActuationReading(new PipelineIntentSnapshot(scope,1,null),OptionalLong.of(11));
-            return new MongoPipelineObservationConfig(client,db,bindings,artifacts).read(original,"views",Map.of("input","capture"));
+            return new MongoPipelineObservationConfig(client,db,bindings,artifacts).read(original,"views",inputs);
         }
     }
 }

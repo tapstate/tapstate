@@ -37,6 +37,27 @@ class NativeSourcePositionEditsTest {
         assertThatThrownBy(command::run).isInstanceOf(TapstateException.class);
         verifyNoInteractions(f.owners); verifyNoInteractions(f.writes); verifyNoInteractions(f.captures);
     }
+    @Test void positionPreparationDoesNotFenceAnUnattachedReaderWithDifferentLocalSettings() {
+        var f = new Fixture(true);
+        assertThatCode(() -> f.edits.prepare("flow", f.current, f.moves)).doesNotThrowAnyException();
+        verify(f.port, never()).scope("other");
+        verifyNoInteractions(f.owners, f.writes, f.captures);
+    }
+
+    @Test
+    void anUnmaterializedSwitchOnAnotherPipelineDoesNotBreakTheReaderScan() {
+        var f = new Fixture();
+        ArtifactStore artifacts = f.configuration.artifacts();
+        var inventory = new ArrayList<>(artifacts.list());
+        inventory.add(new PipelineResource("unmaterialized", null,
+                List.of(SourceRef.of("source-a", null, Map.of(), "input")),
+                null, null, null, null, null));
+        when(artifacts.list()).thenReturn(inventory);
+
+        assertThatCode(() -> f.edits.prepare("flow", f.current, f.moves)).doesNotThrowAnyException();
+        verify(f.port, never()).scope("unmaterialized");
+    }
+
     private static final class Fixture {
         final MongoConfigurationDomain configuration = mock(MongoConfigurationDomain.class);
         final ThreeLayerStorePort port = mock(ThreeLayerStorePort.class);
@@ -48,21 +69,25 @@ class NativeSourcePositionEditsTest {
         final PipelinePosition current;
         final Map<String,String> moves;
         final NativeSourcePositionEdits edits;
-        Fixture() {
+        Fixture() { this(false); }
+        Fixture(boolean localOverride) {
             var business = new CacheBusinessScope("cluster", 1, "cache"); var scope = new PipelineIntentScope("cluster", 1, "cache", "flow", 1);
             var cache = mock(MongoCacheDomain.class);
             var reading = mock(PipelinePositionService.class); var artifacts = mock(ArtifactStore.class);
-            var sourceA = new SourceResource("source-a", null, "fixture", Map.of("database", "a"), null, null, null, null);
+            var sourceA = new SourceResource("source-a", null, "fixture", Map.of("database", "a", "preImage", true), null, null, new Srs("shared-key", null, null, null, null), null);
             var sourceB = new SourceResource("source-b", null, "fixture", Map.of("database", "b"), null, null, null, null);
-            var pipeline = new PipelineResource("flow", null, List.of(SourceRef.spec("source-a", true), SourceRef.spec("source-b", true)), null, null, null, null, null);
-            String a = SourceCaptureIdentity.resolve("fixture", sourceA.config(), null), b = SourceCaptureIdentity.resolve("fixture", sourceB.config(), null);
+            var pipeline = new PipelineResource("flow", null, List.of(new SourceRef.Spec("source-a", true, localOverride ? Map.of("preImage", false) : Map.of()), SourceRef.spec("source-b", true)), null, null, null, null, null);
+            String a = PipelineSourceConfig.chain(pipeline, sourceA), b = PipelineSourceConfig.chain(pipeline, sourceB);
             var captureNames = new ArrayList<>(List.of(SourceCaptureIdentity.sharedCapture(a), SourceCaptureIdentity.sharedCapture(b))); Collections.sort(captureNames);
             first = capture(captureNames.getFirst()); second = capture(captureNames.getLast());
             current = new PipelinePosition("flow", List.of(new PipelinePosition.Chain(a, "source-a", List.of("orders"), null, null, null, List.of()),
                     new PipelinePosition.Chain(b, "source-b", List.of("orders"), null, null, null, List.of())));
             moves = new LinkedHashMap<>(); moves.put(a, "requested-a"); moves.put(b, "requested-b");
             when(configuration.configurationRevision()).thenReturn(1L); when(configuration.artifacts()).thenReturn(artifacts);
-            when(artifacts.list()).thenReturn(List.of(pipeline, sourceA, sourceB));
+            var inventory = new ArrayList<io.tapstate.core.model.Resource>(List.of(pipeline, sourceA, sourceB));
+            if (localOverride) inventory.add(new PipelineResource("other", null,
+                    List.of(SourceRef.spec("source-a", true)), null, null, null, null, null));
+            when(artifacts.list()).thenReturn(inventory);
             when(artifacts.get("flow")).thenReturn(Optional.of(pipeline)); when(artifacts.get("source-a")).thenReturn(Optional.of(sourceA)); when(artifacts.get("source-b")).thenReturn(Optional.of(sourceB));
             var preparations = mock(PipelineStatePreparations.class); when(configuration.preparations()).thenReturn(preparations);
             when(preparations.read("flow")).thenReturn(Optional.of(new PipelinePreparation("flow", 1, PipelinePreparation.Phase.UNASSIGNED, null, null, null)));

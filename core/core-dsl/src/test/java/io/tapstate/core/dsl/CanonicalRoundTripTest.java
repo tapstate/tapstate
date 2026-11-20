@@ -245,19 +245,7 @@ class CanonicalRoundTripTest {
     }
 
     /**
-     * A source reference written as an object but carrying no srs switch says exactly what the bare id
-     * says, so it canonicalizes to the bare id -- one state, one spelling.
-     *
-     * <p>Leaving both spellings alive would let the same pipeline canonicalize two ways, and the switch
-     * is registered as never-omitted precisely because reading it back as absent means "take the
-     * source's value" -- the link the field exists to cut. An object with the key absent must therefore
-     * not survive into canonical output as an object.
-     *
-     * <p><b>Known divergence, deliberately pinned here rather than left implicit:</b> the generated JSON
-     * schema marks both keys required on the object form, so an editor flags this input while the parser
-     * accepts it. The parser is the permissive side, so nothing schema-valid is refused; which of the two
-     * should move is an authoring-surface question, not one this test decides. It exists so the answer is
-     * chosen rather than discovered.
+     * An object carrying no local settings canonicalizes to a bare Source id.
      */
     @Test
     void aSourceObjectCarryingNoSwitchCanonicalizesToTheBareId() {
@@ -279,6 +267,31 @@ class CanonicalRoundTripTest {
         assertThat(canonical).contains("source: src_a");
         assertThat(canonical).doesNotContain("srs:");
         assertThat(writer.write(parser.parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void aSourceNodeOverrideRoundTripsAndAffectsAssemblyIdentity() {
+        String raw = """
+                version: tapstate/v1
+                kind: pipeline
+                id: pl_a
+                source:
+                  - { id: src_a, nodeConfig: { preImage: false } }
+                view:
+                  id: pl_a
+                  from: orders
+                  primary_key: id
+                  storage: { warm: { collection: pl_a } }
+                """;
+
+        var pipeline = (io.tapstate.core.model.PipelineResource) parser.parse(raw);
+        var reference = pipeline.sources().getFirst();
+        assertThat(reference.nodeConfig()).containsEntry("preImage", false);
+        String canonical = writer.write(pipeline);
+        assertThat(writer.write(parser.parse(canonical))).isEqualTo(canonical);
+        var inherit = parser.parse(raw.replace(", nodeConfig: { preImage: false }", ""));
+        assertThat(io.tapstate.core.model.canonical.AssemblyIdentity.of(pipeline))
+                .isNotEqualTo(io.tapstate.core.model.canonical.AssemblyIdentity.of(inherit));
     }
 
     @Test

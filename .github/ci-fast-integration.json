@@ -13,6 +13,7 @@
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoAiProviderSettingsStoreIT", "method": "encryptedCredentialsSurviveRotationAndCannotCrossWorkspaceOrEndpoint"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoConfigurationAiProviderSettingsIT", "method": "encryptedConfigurationSurvivesReopenAndExplicitDeletionWithoutAnyCache"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoPipelineIntentStoreIT"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCapturePreparationsIT", "method": "sharedNoteLookupsRespectPipelineNodeSettingsAndTheCurrentArtifactHash"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoSrsLogStoreIT"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoSrsConsumerStoreIT", "method": "nodeBackedWriterUsesTheNodeLeaseAndRejectsBothOldExecutionsAndOldBoots"},
   {"module": "e2e", "class": "io.tapstate.e2e.InitialClusterLifecycleIT"},
