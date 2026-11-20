@@ -12,7 +12,7 @@ class NestDiagnosticContractTest {
     @Test void remainingDefinitionsKeepParametersSeverityAndHistoricalRecovery() {
         var codes = new ArrayList<TapstateErrorCode>();
         codes.addAll(List.of(NestError.values()));
-        assertThat(codes).hasSize(27);
+        assertThat(codes).hasSize(28);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String legacy = "nest." + ((Enum<?>) code).name().toLowerCase(Locale.ROOT).replace('_', '-');

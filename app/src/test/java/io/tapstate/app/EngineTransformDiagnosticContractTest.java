@@ -16,7 +16,7 @@ class EngineTransformDiagnosticContractTest {
         codes.addAll(List.of(EngineError.values()));
         codes.addAll(List.of(TransformError.values()));
         codes.addAll(List.of(NestSizingError.values()));
-        assertThat(codes).hasSize(25);
+        assertThat(codes).hasSize(26);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String domain = code instanceof EngineError ? "engine" : code instanceof TransformError ? "transform" : "nest";
