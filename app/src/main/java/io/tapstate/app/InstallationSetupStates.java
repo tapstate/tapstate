@@ -36,6 +36,17 @@ final class InstallationSetupStates implements StorageSetupStateStore {
         }
         return files.locked(() -> { var stage = files.stage(); requireLocal(stage); active.run(); return new Status(stage.scope(), Phase.LOCAL_SETUP, 0); });
     }
+    @Override public View loadView() {
+        active.run(); var store = configuration.get();
+        if (store.isPresent()) {
+            var result = store.orElseThrow().guardedBy(active).loadView();
+            requireRetainedGeneration(result.status().scope()); active.run(); return result;
+        }
+        return files.locked(() -> {
+            var stage = files.stage(); requireLocal(stage); active.run();
+            return new View(new Status(stage.scope(), Phase.LOCAL_SETUP, 0), Optional.empty(), Optional.empty());
+        });
+    }
     @Override public Status rotate(StorageSetupScope expected, Purpose purpose) {
         active.run(); var store = configuration.get();
         if (store.isPresent()) {
@@ -62,22 +73,25 @@ final class InstallationSetupStates implements StorageSetupStateStore {
         });
     }
     @Override public void requireCurrent(StorageSetupScope expected, Purpose purpose) {
+        requireCurrentView(expected, purpose);
+    }
+    @Override public View requireCurrentView(StorageSetupScope expected, Purpose purpose) {
         active.run(); var store = configuration.get();
         if (store.isPresent()) {
             requireRetainedGeneration(expected);
             var selected = store.orElseThrow().guardedBy(active);
             var mapped = continuationPurpose(selected, purpose);
-            selected.requireCurrent(expected, mapped);
+            var result = selected.requireCurrentView(expected, mapped);
             if (mapped != purpose && !completedActivationAllowed.getAsBoolean()) throw InstallationFiles.refused();
-            requireRetainedGeneration(expected); active.run(); return;
+            requireRetainedGeneration(expected); active.run(); return result;
         }
-        files.locked(() -> {
+        return files.locked(() -> {
             active.run(); var stage = files.stage();
             requireOriginal(stage.scope(), expected);
             requireGenerationFloor(stage.scope(), expected);
             requireLocal(stage);
             if (purpose != Purpose.SETUP || !stage.scope().equals(expected)) throw InstallationFiles.refused();
-            active.run(); return null;
+            active.run(); return new View(new Status(stage.scope(), Phase.LOCAL_SETUP, 0), Optional.empty(), Optional.empty());
         });
     }
     private StorageSetupStateStore.Purpose continuationPurpose(StorageSetupStateStore store, Purpose requested) {

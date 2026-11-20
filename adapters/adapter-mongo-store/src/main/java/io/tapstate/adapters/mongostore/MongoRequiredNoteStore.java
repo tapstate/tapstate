@@ -158,12 +158,24 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         Document existing = scopes.find(session, byScope(owner)).first();
         if (existing == null) {
             refuseRetainedFacts(session, owner);
-            existing = new Document("_id", scopeId(owner)).append("ownerKind", owner.kind().name())
-                    .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
-                    .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L);
+            existing = newScope(owner);
             scopes.insertOne(session, existing);
         }
         return scopeOf(owner, existing);
+    }
+
+    private static Document newScope(RequiredNoteOwner owner) {
+        return new Document("_id", scopeId(owner)).append("ownerKind", owner.kind().name())
+                .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
+                .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L);
+    }
+
+    void reserveSharedCapture(ClientSession session, RequiredNoteOwner owner, boolean known) {
+        inspectSharedOrigin(session, owner, known);
+        if (!known) {
+            cipherForWrite(session);
+            scopes.insertOne(session, newScope(owner));
+        }
     }
 
     /** CONFIG authoring may preserve or reserve a name, but this method never exposes its old values or origin. */
@@ -173,6 +185,67 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             checkOwner(session,owner,false,true);
             scopeOf(owner,scopes.find(session,byScope(owner)).first());
         } else initialize(session,owner,true);
+    }
+
+    /** All owners were derived from the publication's original CONFIG transaction. */
+    void reservePublication(ClientSession session, Document cluster, Document operator, RequiredNoteOwner global,
+            List<RequiredNoteOwner> known, List<RequiredNoteOwner> added) {
+        requireOrdinary();
+        var description = database.listCollections()
+                .filter(new Document("name", SystemCollections.PDK_NOTE_SCOPES.collectionName())).first();
+        var options = description == null ? null : description.get("options", Document.class);
+        if (known.size() + added.size() > 128 || options != null && options.containsKey("collation")) {
+            open(session, global);
+            for (var owner : known) reserveAuthoring(session, owner, true);
+            for (var owner : added) reserveAuthoring(session, owner, false);
+            return;
+        }
+        checkBinding(cluster, global);
+        var owners = new java.util.LinkedHashMap<Document, RequiredNoteOwner>();
+        owners.put(scopeId(global), global);
+        for (var owner : known) owners.put(scopeId(owner), owner);
+        for (var owner : added) owners.putIfAbsent(scopeId(owner), owner);
+        var rows = new java.util.HashMap<Document, Document>();
+        for (var row : scopes.find(session, new Document("_id", new Document("$in", List.copyOf(owners.keySet()))))) {
+            if (!(row.get("_id") instanceof Document key) || !owners.containsKey(key) || rows.put(key, row) != null)
+                throw unavailable();
+        }
+        scopeOf(global, rows.get(scopeId(global)));
+        for (var owner : known) scopeOf(owner, rows.get(scopeId(owner)));
+        MongoCacheRecoveryFacts.read(operator);
+        if (added.isEmpty()) return;
+        cipherForWrite(session);
+        var fresh = new java.util.LinkedHashMap<Document, Document>();
+        for (var owner : added) {
+            var key = scopeId(owner);
+            var existing = rows.get(key);
+            if (existing != null) scopeOf(owner, existing);
+            else fresh.putIfAbsent(key, new Document("_id", key).append("ownerKind", owner.kind().name())
+                    .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
+                    .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L));
+        }
+        if (!fresh.isEmpty()) refusePublicationRetainedFacts(session, global.bindingVersion(), fresh.keySet().stream()
+                .map(key -> key.getString("namespace")).toList());
+        var owner = added.getFirst();
+        var fence = operator.getLong("noteWriteFence");
+        var filter = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
+                .append("phase", "ACTIVE").append("noteWriteFence", fence);
+        if (operators.updateOne(session, filter, new Document("$inc", new Document("noteWriteFence", (long) added.size())))
+                .getMatchedCount() != 1) throw unavailable();
+        if (!fresh.isEmpty()) scopes.insertMany(session, List.copyOf(fresh.values()));
+    }
+
+    private void refusePublicationRetainedFacts(ClientSession session, long binding, List<String> namespaces) {
+        var names = new Document("$in", namespaces);
+        var prefix = new Document("_id.bindingVersion", binding).append("_id.namespace", names);
+        var projection = new Document("_id", 1);
+        if (notes.find(session, prefix).projection(projection).first() != null
+                || origins.find(session, prefix).projection(projection).first() != null
+                || migrations.find(session, prefix).projection(projection).first() != null
+                || carryRows.find(session, new Document("$or", List.of(
+                        new Document("_id.sourceBindingVersion", binding).append("_id.sourceNamespace", names),
+                        new Document("_id.sharedBindingVersion", binding).append("_id.sharedNamespace", names))))
+                        .projection(projection).first() != null) throw unavailable();
     }
 
     private void refuseRetainedFacts(ClientSession session, RequiredNoteOwner owner) {
@@ -200,6 +273,20 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     public RequiredNoteScope open(RequiredNoteOwner owner) {
         Objects.requireNonNull(owner, "owner");
         return StoreIo.call(() -> transaction(session -> open(session, owner)));
+    }
+
+    @Override
+    public CaptureScopes openCaptureScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {
+        if (retirement != null || primary.kind() != RequiredNoteOwner.Kind.CHAIN || global.kind() != RequiredNoteOwner.Kind.GLOBAL)
+            return RequiredNoteStore.super.openCaptureScopes(primary, global);
+        return StoreIo.call(() -> transaction(session -> {
+            Document cluster = identity.find(session, new Document("_id", "cluster")).first();
+            checkBinding(cluster, primary);
+            checkBinding(cluster, global);
+            // Exact per-owner lookups keep each namespace's existing collation behavior.
+            return new CaptureScopes(scopeOf(primary, scopes.find(session, byScope(primary)).first()),
+                    scopeOf(global, scopes.find(session, byScope(global)).first()));
+        }));
     }
 
     @Override
@@ -232,6 +319,33 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             if (scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation())
                             .append("originGeneration", 0L),
                     new Document("$set", new Document("originGeneration", scope.generation()))).getMatchedCount() != 1) throw unavailable();
+            return origin;
+        }));
+    }
+
+    @Override
+    public RequiredNoteOrigin prepareSharedOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin) {
+        requireOrdinary();
+        requireShared(scope);
+        Objects.requireNonNull(origin, "origin");
+        return withOriginIndexes(() -> transaction(session -> {
+            SourceConfigCipher cipher = cipherForWrite(session);
+            Document metadata = verifyScope(session, scope, false);
+            long writeFence = metadata.getLong("writeFence");
+            if (writeFence >= Long.MAX_VALUE - 1) throw unreadable("writeFence");
+            RequiredNoteOrigin retained = retainedOrigin(session, scope, metadata);
+            if (retained != null && !retained.equals(origin)) throw originMismatch();
+            var filter = byScope(scope.owner()).append("generation", scope.generation()).append("writeFence", writeFence);
+            var update = new Document("$inc", new Document("writeFence", 1L));
+            if (retained == null) {
+                if (notes.find(session, new Document("_id.bindingVersion", scope.owner().bindingVersion())
+                        .append("_id.namespace", scope.owner().namespace()).append("_id.generation", scope.generation())).first() != null)
+                    throw unavailable();
+                origins.insertOne(session, originDocument(scope, origin, cipher));
+                filter.append("originGeneration", 0L);
+                update.append("$set", new Document("originGeneration", scope.generation()));
+            }
+            if (scopes.updateOne(session, filter, update).getMatchedCount() != 1) throw unavailable();
             return origin;
         }));
     }
@@ -374,16 +488,33 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         requireShared(shared);
         return withCarryIndexes(() -> transaction(session -> {
             Document metadata = verifyScope(session, shared, false);
-            List<RequiredNoteCarry> retained = outgoing(session, shared.owner(), metadata);
-            if (retained.stream().anyMatch(carry -> carry.shared().generation() > shared.generation())) throw unavailable();
-            List<RequiredNoteCarry> current = retained.stream().filter(carry -> carry.shared().equals(shared)).toList();
-            for (RequiredNoteCarry carry : current) {
-                Document source = verifyCarrySource(session, carry.source(), false);
-                compatibleOrigins(session, shared, metadata, carry.source(), source);
-                if (!incoming(session, carry.source().owner(), source).contains(carry)) throw unavailable();
-            }
-            return current;
+            return verifiedCarries(session, shared, metadata);
         }));
+    }
+
+    @Override
+    public SharedStartup sharedStartup(RequiredNoteScope shared) {
+        requireShared(shared);
+        return withCarryIndexes(() -> withOriginIndexes(() -> transaction(session -> {
+            Document metadata = verifyScope(session, shared, false);
+            var dependencies = verifiedCarries(session, shared, metadata);
+            var blocked = blocked(session, shared.owner(), ALL_KEYS);
+            var origin = retainedOrigin(session, shared, metadata);
+            if (origin == null) throw unavailable();
+            return new SharedStartup(dependencies, blocked, origin);
+        })));
+    }
+
+    private List<RequiredNoteCarry> verifiedCarries(ClientSession session, RequiredNoteScope shared, Document metadata) {
+        List<RequiredNoteCarry> retained = outgoing(session, shared.owner(), metadata);
+        if (retained.stream().anyMatch(carry -> carry.shared().generation() > shared.generation())) throw unavailable();
+        List<RequiredNoteCarry> current = retained.stream().filter(carry -> carry.shared().equals(shared)).toList();
+        for (RequiredNoteCarry carry : current) {
+            Document source = verifyCarrySource(session, carry.source(), false);
+            compatibleOrigins(session, shared, metadata, carry.source(), source);
+            if (!incoming(session, carry.source().owner(), source).contains(carry)) throw unavailable();
+        }
+        return current;
     }
 
     @Override
@@ -903,6 +1034,10 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     private void checkBinding(ClientSession session, RequiredNoteOwner owner) {
         Document cluster = identity.find(session, new Document("_id", "cluster")).first();
+        checkBinding(cluster, owner);
+    }
+
+    private void checkBinding(Document cluster, RequiredNoteOwner owner) {
         if (cluster == null || !MongoConfigurationDomain.LAYOUT.equals(cluster.get("layoutId"))
                 || !Long.valueOf(owner.bindingVersion()).equals(cluster.get("bindingVersion"))) throw unavailable();
         if (owner.kind() == RequiredNoteOwner.Kind.GLOBAL && !owner.ownerId().equals(cluster.get("clusterId"))) {

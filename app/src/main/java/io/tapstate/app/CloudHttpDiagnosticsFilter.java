@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.control.core.CloudAuthenticationObserver;
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope;
+import io.tapstate.core.common.JsonWriter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.Cookie;
@@ -28,6 +30,7 @@ final class CloudHttpDiagnosticsFilter extends OncePerRequestFilter {
     static final String ERROR_CODE_MDC = CloudAuthenticationObserver.ERROR_CODE_CONTEXT_KEY;
 
     private static final Logger LOG = LoggerFactory.getLogger(CloudHttpDiagnosticsFilter.class);
+    private static final Logger PERFORMANCE = LoggerFactory.getLogger("io.tapstate.diagnostics.http");
     private static final String SESSION_COOKIE_NAME = "__Host-tapstate-cloud-session";
     private static final int PATH_LIMIT = 256;
     private static final int FIELD_LIMIT = 96;
@@ -49,6 +52,7 @@ final class CloudHttpDiagnosticsFilter extends OncePerRequestFilter {
         boolean cookiePresent = cloudSessionCookiePresent(request);
         long started = System.nanoTime();
         Throwable thrown = null;
+        MongoHttpDiagnosticsScope performance = PERFORMANCE.isDebugEnabled() ? MongoHttpDiagnosticsScope.open() : null;
 
         try {
             MDC.remove(REQUEST_ID_MDC);
@@ -90,7 +94,18 @@ final class CloudHttpDiagnosticsFilter extends OncePerRequestFilter {
                             requestId, method, path, responseStatus, elapsedMs,
                             diagnostic(STAGE_MDC), diagnostic(REASON_MDC), diagnostic(ERROR_CODE_MDC));
                 }
+                if (performance != null) {
+                    var details = new java.util.LinkedHashMap<String, Object>();
+                    details.put("event", "http_diag"); details.put("request_id", requestId);
+                    details.put("method", method); details.put("path", path);
+                    details.put("status", thrown != null && responseStatus < 400 ? 500 : responseStatus);
+                    details.put("response_status", responseStatus); details.put("app_dispatch_ms", elapsedMs);
+                    details.put("async_started", request.isAsyncStarted());
+                    details.put("unhandled", thrown != null); details.putAll(performance.snapshot());
+                    PERFORMANCE.debug("{}", JsonWriter.write(details));
+                }
             } finally {
+                if (performance != null) performance.close();
                 if (previous == null) {
                     MDC.clear();
                 } else {

@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.adapters.pdk.ConnectorIntrospector;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapabilityDeriver;
@@ -119,6 +120,7 @@ import io.tapstate.spi.store.DataBrowser;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.messages.ExplanationCatalog;
 import io.tapstate.messages.MessageCatalog;
+import io.tapstate.messages.ConnectionDiagnosticCatalog;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -509,8 +511,9 @@ class ControlPlaneConfiguration {
     // The PDK types stay inside the adapter-pdk beans; the runtime and control rings see only ports.
 
     @Bean
-    ConnectorRegistry connectorRegistry(StorePort storePort) {
-        return storePort.connectors();
+    ConnectorRegistry connectorRegistry(StorePort storePort, ConnectorCatalogStore catalog,
+                                        ConnectorPluginProperties properties, CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? new BundledConnectorRegistry(catalog, properties.getSeedDir()) : storePort.connectors();
     }
 
     @Bean
@@ -524,18 +527,18 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    CapabilityDeriver capabilityDeriver(ConnectorProvisioner provisioner) {
+    PdkCapabilityDeriver capabilityDeriver(ConnectorProvisioner provisioner) {
         return new PdkCapabilityDeriver(provisioner);
     }
 
     @Bean
     ConnectorCatalogView connectorCatalogView(
             ConnectorCatalogStore connectorCatalogStore, ConnectorSpecStore connectorSpecStore,
-            ConnectorRegistry connectorRegistry) {
+            ConnectorRegistry connectorRegistry, CloudRuntimeSettings cloud) {
         // The online catalog view = the bundled snapshot overlaid with the rows derived for registered
         // connectors, read live; the offline native CLI keeps reading only the bundled snapshot.
         return new ConnectorCatalogView(
-                TapstateCatalog.load(), connectorCatalogStore, connectorSpecStore, connectorRegistry);
+                TapstateCatalog.load(), connectorCatalogStore, connectorSpecStore, connectorRegistry, cloud.cloud());
     }
 
     @Bean
@@ -550,8 +553,10 @@ class ControlPlaneConfiguration {
 
     @Bean
     ConnectorProvisioner connectorProvisioner(
-            ConnectorRegistry registry, ConnectorIntrospector introspector, ConnectorPluginProperties properties) {
-        return new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir(), properties.getSeedDir());
+            ConnectorRegistry registry, ConnectorIntrospector introspector, ConnectorPluginProperties properties,
+            CloudRuntimeSettings cloud) {
+        return new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir(),
+                properties.getSeedDir(), cloud.cloud());
     }
 
     // The startup seed sweep: the release's connectors/ directory goes through the same
@@ -568,8 +573,11 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SeedConnectorSweep seedConnectorSweep(ConnectorArtifactRegistrar registrar) {
-        return new SeedConnectorSweep(registrar, Math.max(1, Runtime.getRuntime().availableProcessors()));
+    SeedConnectorSweep seedConnectorSweep(ConnectorArtifactRegistrar registrar, PdkCapabilityDeriver deriver,
+                                         CloudRuntimeSettings cloud) {
+        int workers = Math.max(1, Runtime.getRuntime().availableProcessors());
+        return cloud.cloud() ? new SeedConnectorSweep(artifact -> registrar.registerBundled(artifact, deriver), workers)
+                : new SeedConnectorSweep(registrar, workers);
     }
 
     @Bean
@@ -579,7 +587,7 @@ class ControlPlaneConfiguration {
             org.springframework.core.env.Environment environment) {
         var readiness = cloud.cloud()
                 ? CloudConnectorSeedReadiness.checkedRelease(
-                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver,
+                        properties.getSeedDir(), registry, catalog, specs, deriver,
                         "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY)))
                 : null;
         return new SeedSweepRunner(sweep, properties.getSeedDir(), readiness);
@@ -600,20 +608,26 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    ConnectorRegisterService connectorRegisterService(ConnectorArtifactRegistrar registrar, AuditGate auditGate) {
-        // The register verb reaches the distribution store through the same registrar the seed sweep uses; it
-        // implements the spi ingestion port, so control-core drives it without depending on the adapters ring.
-        return new ConnectorRegisterService(registrar, auditGate);
+    ConnectorRegisterService connectorRegisterService(ConnectorArtifactRegistrar registrar, AuditGate auditGate,
+                                                       CloudRuntimeSettings cloud) {
+        return new ConnectorRegisterService(cloud.cloud() ? (artifact, source) -> {
+            throw new io.tapstate.core.common.TapstateException(ConnectorError.CLOUD_UPLOAD_DISABLED, java.util.Map.of(), null);
+        } : registrar, auditGate);
     }
 
     @Bean
     ConnectionTester connectionTester(ConnectorProvisioner provisioner, Clock clock,
             org.springframework.beans.factory.ObjectProvider<DefaultSourceVerification> verification,
-            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots) {
+            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots,
+            org.springframework.beans.factory.ObjectProvider<IsolatedConnectionDiagnostics.Active> diagnostics) {
         java.util.function.Predicate<io.tapstate.spi.store.ConnectionConfig> managed = config -> {
             var current = verification.getIfAvailable(); return current != null && current.manages(config);
         };
         var slot = slots.getIfAvailable();
+        if (diagnostics.getIfAvailable() != null) {
+            return new PdkConnectionTester(provisioner, clock, managed, java.util.Objects.requireNonNull(slot),
+                    org.springframework.context.i18n.LocaleContextHolder::getLocale);
+        }
         return slot == null ? new PdkConnectionTester(provisioner, clock, managed) : new PdkConnectionTester(provisioner, clock, managed, slot);
     }
 
@@ -631,7 +645,8 @@ class ControlPlaneConfiguration {
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections,
-            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers, ConnectionTester tester) {
+            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers, ConnectionTester tester,
+            org.springframework.beans.factory.ObjectProvider<IsolatedConnectionDiagnostics.Active> diagnostics) {
         var observer = observers.getIfAvailable(() -> ignored -> ConnectionTestService.Attempt.NONE);
         var guarded = new ConnectionTestService.Observer() {
             @Override public boolean manages(io.tapstate.spi.store.ConnectionConfig config) { return observer.manages(config); }
@@ -642,7 +657,15 @@ class ControlPlaneConfiguration {
                 return observer.begin(config);
             }
         };
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections, guarded);
+        var catalog = MessageCatalog.bundled();
+        boolean candidate = diagnostics.getIfAvailable() != null;
+        java.util.function.UnaryOperator<String> testText = candidate
+                ? text -> catalog.renderConnectorTestText(text, org.springframework.context.i18n.LocaleContextHolder.getLocale())
+                : catalog::renderConnectorTestText;
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections,
+                guarded, testText, !candidate ? ignored -> java.util.Map.of()
+                        : failure -> ConnectionDiagnosticCatalog.bundled().snapshot(failure,
+                                org.springframework.context.i18n.LocaleContextHolder.getLocale()));
     }
 
     @Bean
@@ -771,7 +794,7 @@ class ControlPlaneConfiguration {
             PipelineObservationQueryService observations,
             StorePort storePort) {
         return new PipelineCatalogService(
-                artifacts, pipelineDrafts, storePort.desired(), observations,storePort::pipelineRecoveryRequired);
+                artifacts, pipelineDrafts, observations, storePort);
     }
 
     @Bean
@@ -840,9 +863,15 @@ class ControlPlaneConfiguration {
             PipelineWriteTargets pipelineWriteTargets, StorePort storePort, DataBrowserService dataBrowserService,
             ApplyService applyService, AuditGate auditGate, Clock clock, ConnectorProvisioner connectorProvisioner) {
         MessageCatalog catalog = MessageCatalog.bundled();
+        var meta = storePort.meta();
+        var planner = storePort instanceof ThreeLayerStorePort nativeStore
+                && pipelineChains instanceof StoreBackedPipelineChains chains
+                && pipelineWriteTargets instanceof StoreBackedPipelineWriteTargets targets
+                ? new StartPlanner((pipeline, scope) -> targets.capture(nativeStore, chains, pipeline, scope))
+                : new StartPlanner(pipelineChains, meta, pipelineWriteTargets);
         StartCheckEvaluator evaluator = new StartCheckEvaluator(StartChecks.registered(
                 new StoreBackedTargetIdentities(storePort, connectorProvisioner)),
-                new StartPlanner(pipelineChains, storePort.meta(), pipelineWriteTargets),
+                planner,
                 new DataBrowserTargetProbe(dataBrowserService),
                 (code, params) -> catalog.render(code, params).message(),
                 Executors.newVirtualThreadPerTaskExecutor(), clock);

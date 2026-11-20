@@ -99,11 +99,14 @@ class InstallationSetupStatesTest {
         try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
             doAnswer(call -> {
                 assertThat(executor.submit(files::stage).get(2, java.util.concurrent.TimeUnit.SECONDS).scope()).isEqualTo(scope);
-                return null;
-            }).when(configuration).requireCurrent(scope, StorageSetupStateStore.Purpose.SETUP);
+                return new StorageSetupStateStore.View(
+                        new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.CONFIG_PREPARED, 0),
+                        Optional.empty(), Optional.empty());
+            }).when(configuration).requireCurrentView(scope, StorageSetupStateStore.Purpose.SETUP);
             when(configuration.load()).thenReturn(new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.CONFIG_PREPARED, 0));
             var states = new InstallationSetupStates(files, () -> Optional.of(configuration));
             states.requireCurrent(scope, StorageSetupStateStore.Purpose.SETUP);
+            verify(configuration).requireCurrentView(scope, StorageSetupStateStore.Purpose.SETUP);
         }
     }
 }

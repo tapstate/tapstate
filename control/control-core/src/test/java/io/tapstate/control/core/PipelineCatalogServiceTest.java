@@ -84,7 +84,7 @@ class PipelineCatalogServiceTest {
                 new PipelineObservationQueryService(artifacts,observations),id -> id.equals("recover"));
         var item=service.find("recover").orElseThrow();
         assertThat(item.status().displayState()).isEqualTo(PipelineCatalogItem.UiState.RECOVERY_REQUIRED);
-        assertThat(item.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.UNAVAILABLE);
+        assertThat(item.status().state()).isNull();
         assertThat(item.status().desiredState()).isEqualTo(PipelineState.STOPPED);
         assertThat(item.status().observedState()).isNull();assertThat(item.status().observedAt()).isNull();
     }

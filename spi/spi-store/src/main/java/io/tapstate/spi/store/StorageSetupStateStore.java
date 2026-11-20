@@ -1,6 +1,7 @@
 package io.tapstate.spi.store;
 
 import java.util.Objects;
+import java.util.Optional;
 
 /** The original installation phase and capability generation, kept in the configuration authority. */
 public interface StorageSetupStateStore {
@@ -13,11 +14,22 @@ public interface StorageSetupStateStore {
                 throw new IllegalArgumentException("setup phase and binding version disagree");
         }
     }
+    /** Setup and binding facts validated together by the authority that owns them. */
+    record View(Status status, Optional<StorageBinding> binding, Optional<CachePreparation> cachePreparation) {
+        public View {
+            Objects.requireNonNull(status, "status");
+            Objects.requireNonNull(binding, "binding");
+            Objects.requireNonNull(cachePreparation, "cachePreparation");
+        }
+    }
     StorageSetupStateStore guardedBy(Runnable requireActive);
     /** Load only; missing or inconsistent facts never authorize a fresh installation. */
     Status load();
+    View loadView();
     /** Trusted deployment-owner issuance only. Rotates the original generation, never the operation or binding. */
     Status rotate(StorageSetupScope expected, Purpose purpose);
     /** Recheck the current purpose and generation; final writes additionally compete in their CONFIG transaction. */
     void requireCurrent(StorageSetupScope expected, Purpose purpose);
+    /** Validates the requested scope and returns the facts from that same read. */
+    View requireCurrentView(StorageSetupScope expected, Purpose purpose);
 }

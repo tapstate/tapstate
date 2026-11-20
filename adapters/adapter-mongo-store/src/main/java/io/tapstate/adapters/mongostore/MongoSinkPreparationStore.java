@@ -459,6 +459,38 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
     }
 
     @Override
+    public List<Snapshot> loadMany(List<Input> originals) {
+        var inputs = List.copyOf(originals);
+        inputs.forEach(this::requireScope);
+        if (inputs.isEmpty()) return List.of();
+        return access.metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, false, session -> {
+            var control = marker(claim(session));
+            if (!(control.get(TARGETS) instanceof List<?> targets)) throw rebuild(access.scope);
+            var manifest = new HashSet<>(targets);
+            var requested = new LinkedHashMap<Key, Input>();
+            for (var expected : inputs) {
+                if (!manifest.contains(input(expected))) throw rebuild(access.scope);
+                var previous = requested.put(expected.key(), expected);
+                if (previous != null && !previous.equals(expected)) throw rebuild(access.scope);
+            }
+            var found = new HashMap<Key, Snapshot>();
+            var query = new Document("_id", new Document("$in", requested.keySet().stream().map(MongoSinkPreparationStore::id).toList()));
+            try (var cursor = SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database).find(session, query).batchSize(32).iterator()) {
+                while (cursor.hasNext()) {
+                    var raw = cursor.next();
+                    var held = decode(raw);
+                    if (!held.input().equals(requested.get(held.input().key()))
+                            || !held.operationId().equals(control.getString(PREPARATION_ID))) throw rebuild(access.scope);
+                    if (storedModel(raw).isPresent()) requireRowBudget(raw, held.input().key().target());
+                    if (found.put(held.input().key(), held) != null) throw rebuild(access.scope);
+                }
+            }
+            if (found.size() != requested.size()) throw rebuild(access.scope);
+            return inputs.stream().map(input -> found.get(input.key())).toList();
+        });
+    }
+
+    @Override
     public Attempt begin(Input original) {
         requireScope(original);
         requireWriter();

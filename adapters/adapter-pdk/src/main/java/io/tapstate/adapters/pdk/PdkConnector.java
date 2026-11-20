@@ -190,8 +190,10 @@ final class PdkConnector implements AutoCloseable {
                 }
             });
             var primary = captured.open(stateNamespace);
-            List<RequiredNoteCarry> prepared = notes == null ? List.of() : captured.store().carries(primary);
-            boolean blocked = notes != null && captured.store().allCarryBlocked(primary);
+            var startup = notes != null && captured.batchSharedStartup() ? captured.store().sharedStartup(primary) : null;
+            List<RequiredNoteCarry> prepared = startup != null ? startup.carries()
+                    : notes == null ? List.of() : captured.store().carries(primary);
+            boolean blocked = startup != null ? startup.blocked() : notes != null && captured.store().allCarryBlocked(primary);
             if (prepared.stream().anyMatch(carry -> !carry.shared().equals(primary))
                     || prepared.stream().map(carry -> carry.source().owner().namespace()).distinct().count() != prepared.size()
                     || (!blocked && carriedFrom.stream().anyMatch(namespace -> prepared.stream()
@@ -200,7 +202,8 @@ final class PdkConnector implements AutoCloseable {
             }
             var earlier = blocked ? List.<io.tapstate.spi.store.RequiredNoteScope>of()
                     : prepared.stream().map(RequiredNoteCarry::source).toList();
-            var origin = captured.store().origin(primary);
+            // Opening a connector must revalidate the fixed scope even after sink preflight.
+            var origin = startup != null ? startup.origin() : captured.store().origin(primary);
             var requestedOrigin = ConnectorNoteOrigin.capture(connectorId, ref.contentHash(), settings);
             if (!origin.equals(requestedOrigin)) {
                 throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);

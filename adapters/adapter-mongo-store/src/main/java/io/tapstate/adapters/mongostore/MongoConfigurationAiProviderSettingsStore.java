@@ -134,6 +134,9 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
     }
 
     private void requireOwner(String owner) {
+        if (ON_PREM_OWNER.equals(owner)) {
+            return;
+        }
         try {
             if (owner == null || owner.getBytes(StandardCharsets.UTF_8).length > 4096
                     || !(JsonReader.parse(owner) instanceof List<?> values) || values.size() != 3
@@ -142,7 +145,7 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw invalid("owner"); }
     }
     private static void fields(String provider, String endpoint, String model) {
-        if (!"openai-compatible".equals(provider) || endpoint == null || endpoint.isBlank()
+        if (!io.tapstate.spi.store.AiProviderSettingsStore.supportsProvider(provider) || endpoint == null || endpoint.isBlank()
                 || endpoint.getBytes(StandardCharsets.UTF_8).length > 4096 || model == null || model.isBlank() || model.length() > 200)
             throw invalid("settings");
     }

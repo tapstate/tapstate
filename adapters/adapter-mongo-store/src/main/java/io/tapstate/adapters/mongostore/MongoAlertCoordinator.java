@@ -90,15 +90,16 @@ final class MongoAlertCoordinator implements AlertStore {
     }
     private <T>T tx(Access access,boolean write,boolean authoring,Function<ClientSession,T> action) {
         if(access!=null){access.revalidate().run();access.locallyActive().run();}
-        host.locallyActive().run(); if(domain.alertSchemaVersion()!=MongoAlertStorageSchema.VERSION)throw unreadable("schema-capability");
+        host.locallyActive().run(); var verifiedSchema=domain.currentAlertSchema();
         return StoreIo.call(()->domain.alertTransaction(new MongoReadBudget(Duration.ofSeconds(10)),session->{
-            currentHost(session);if(access!=null){currentActor(session,access.actor(),access);if(write&&access.actor()==null&&!Set.of("WRITE","ADMIN").contains(access.cloudGrantedScope()))throw stale("cloud-write-permission");}
+            domain.requireVerifiedAlertSchema(currentHost(session));if(access!=null){currentActor(session,access.actor(),access);if(write&&access.actor()==null&&!Set.of("WRITE","ADMIN").contains(access.cloudGrantedScope()))throw stale("cloud-write-permission");}
             if(write){
                 if(!keys.fenceWrite(new SourceConfigWriteScope(session),keys.currentForWrite().activeKeyId()))throw stale("configuration-key");
                 if(authoring)ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(db), db);
                 else ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db));
             }
-            T result=action.apply(session);host.locallyActive().run();if(access!=null)access.locallyActive().run();return result;
+            T result=action.apply(session);domain.requireVerifiedAlertSchema(verifiedSchema);
+            host.locallyActive().run();if(access!=null)access.locallyActive().run();return result;
         }));
     }
     private <T>T maintenanceTx(boolean write,Duration remaining,Function<ClientSession,T> action) {
@@ -109,7 +110,7 @@ final class MongoAlertCoordinator implements AlertStore {
             T result=action.apply(session);host.locallyActive().run();return result;
         }));
     }
-    private void currentHost(ClientSession session) {
+    private Document currentHost(ClientSession session) {
         host.locallyActive().run();var scope=host.setup();
         Document setup=SystemCollections.STORAGE_SETUP.on(db).find(session,new Document("_id","cluster")).first();
         var binding=bindings.loadForTransaction(session);
@@ -117,8 +118,9 @@ final class MongoAlertCoordinator implements AlertStore {
         if(binding.isPresent()&&(binding.get().mode()==StorageBinding.Mode.OP)!=(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM))throw stale("deployment");
         Document schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
         Document version=SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first();
-        MongoAlertStorageSchema.verifyAuthorityState(schema,version,scope.clusterId(),keys.currentForWrite().activeKeyId());
-        if(!Integer.valueOf(MongoAlertStorageSchema.VERSION).equals(schema.get("alerting",Document.class).get("installedVersion")))throw unreadable("schema-capability");
+        var marker=MongoAlertStorageSchema.verifyAuthorityState(schema,version,scope.clusterId(),keys.currentForWrite().activeKeyId());
+        if(marker==null||!Integer.valueOf(MongoAlertStorageSchema.VERSION).equals(marker.get("installedVersion")))throw unreadable("schema-capability");
+        return marker;
     }
     private void currentActor(ClientSession session,AlertTestAuthority actor,Access access) {
         if(access.actor()==null){

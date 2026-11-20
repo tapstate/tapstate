@@ -26,7 +26,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
     }
     @Override public PipelineRetirementReceipt retire(PipelineRetirementPreparation original,WorkloadClaimFence currentNode,Optional<PipelineRetirementRequest.CacheOriginal> isolated) {
         MongoPipelineRetirements.requireOriginalPending(original);Objects.requireNonNull(isolated);requireScope(original.request().scope());Objects.requireNonNull(currentNode);
-        return transaction(original,session -> {
+        var receipt = transaction(original,session -> {
             MongoCachePipelinePreparations.proveNode(session,database,business,currentNode);
             if(original.request().cache().isEmpty()) {
                 if(original.previousPreparation().phase()!=PipelinePreparation.Phase.UNASSIGNED)throw fenced();
@@ -70,14 +70,11 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
             if(SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session,new Document("_id",scope.pipelineId()).append("scope",state.get("scope"))
                             .append("epoch",state.get("epoch")).append("runtimeWriteFence",state.get("runtimeWriteFence")),
                     new Document("$set",new Document("stateJson",StateJson.of(PipelineState.STOPPED)).append("epoch",epoch).append("runtimeWriteFence",write))).getMatchedCount()!=1)throw fenced();
-            var observation=SystemCollections.CACHE_PIPELINE_OBSERVATION.on(database);var previous=observation.find(session,new Document("_id",scope.pipelineId())).first();
-            if(previous!=null) {
-                if(!MongoPipelinePreparationFacts.scope(scope).equals(previous.get("scope")))throw rebuild(scope);
-                observation.deleteOne(session,new Document("_id",scope.pipelineId()).append("scope",previous.get("scope")));
-            }
             models(scope).retireInTransaction(session, false);
             return new Receipt(this,original,Optional.of(retired));
         });
+        MongoCachePipelineObservationStore.reap(database, MongoCachePipelineObservationStore.scopeFilter(original.request().scope()));
+        return receipt;
     }
     @Override public Optional<PipelineRetirementReceipt> completed(PipelineRetirementPreparation original, WorkloadClaimFence node) {
         MongoPipelineRetirements.requireOriginalPending(original); requireScope(original.request().scope()); Objects.requireNonNull(node);
@@ -140,7 +137,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
             return session.withTransaction(() -> {
                 check(original);new MongoCacheBusinessIdentity(database,business).admitMetadataWrite(session);
                 var structure=new MongoCacheMetadataStructure(database,MongoRateHistoryStore.DEFAULT_RETENTION);structure.verifyDirect();structure.verifySrs();
-                for(var table:List.of(SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_PIPELINE_STATE,SystemCollections.CACHE_PIPELINE_OBSERVATION,
+                for(var table:List.of(SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_PIPELINE_STATE,
                         SystemCollections.CACHE_DERIVED_SCHEMAS))structure.verifyFacet(table);
                 T result=action.apply(session);check(original);return result;
             },TRANSACTION);

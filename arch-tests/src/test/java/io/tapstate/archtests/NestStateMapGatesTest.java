@@ -193,7 +193,8 @@ class NestStateMapGatesTest {
                 .filter(access -> access.getName().equals("saveAll")
                         && access.getTargetOwner().getName().equals(NEST + "NestStore"))
                 .map(access -> access.getOriginOwner().getName()).toList())
-                .isNotEmpty().containsOnly(NEST + "LookupProcessor", NEST + "AssemblerProcessor$RootWrites");
+                .isNotEmpty().containsOnly(NEST + "LookupProcessor", NEST + "AssemblerProcessor$RootWrites",
+                        NEST + "AssemblerProcessor$ChildWrites");
         assertThat(productionClasses.stream().flatMap(type -> type.getAccessesFromSelf().stream())
                 .filter(access -> access.getName().equals("addAll")
                         && access.getTargetOwner().getName().equals(NEST + "NestStore"))

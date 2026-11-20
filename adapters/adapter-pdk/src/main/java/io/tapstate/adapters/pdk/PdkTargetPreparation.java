@@ -42,6 +42,7 @@ final class PdkTargetPreparation {
     private final boolean mongoTarget;
     private final Runnable requireActive;
     private final Set<String> prepared = new HashSet<>();
+    private final Set<TargetTable> verifiedReady = new HashSet<>();
     private final PdkSinkPreparations receipts;
 
     private SourceOperationObserver observer=SourceOperationObserver.NONE;
@@ -112,11 +113,22 @@ final class PdkTargetPreparation {
         this.mongoTarget = connectorId != null && MONGO_TARGETS.contains(connectorId);
     }
 
+    void prepareForWrite(TargetTable target, TapTable table) throws Throwable {
+        if (!verifiedReady.contains(target)) prepare(target, table);
+    }
+
     void prepare(TargetTable target, TapTable table) throws Throwable {
         requireActive.run();
-        if (receipts!=null) {
-            if(target==null || preparedAhead || prepared.contains(target.name())){PdkSinkPreparations.host(() -> {receipts.requireReady(target);return null;});return;}
-            prepareScoped(target,table);return;
+        if (receipts != null) {
+            if (target == null || preparedAhead || prepared.contains(target.name())) {
+                PdkSinkPreparations.host(() -> { receipts.requireReady(target); return null; });
+                // A prepared writer carries the frozen model and never issues preparation mutations.
+                // The caller still checks the exact execution immediately before writeRecord.
+                if (preparedAhead) verifiedReady.add(target);
+                return;
+            }
+            prepareScoped(target, table);
+            return;
         }
         if (target == null || prepared.contains(target.name())) {
             return;

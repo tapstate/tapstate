@@ -16,7 +16,8 @@ import java.util.TreeMap;
 
 /**
  * The wire shape of a Pipeline status read. {@code state}, failure, and observation time describe runtime
- * facts; before the first runtime observation, state is {@code NEW} and {@code observedState} is absent.
+ * facts. A current, fenced engine job can supply state before monitoring publishes; observation fields
+ * remain absent until an observation exists. An unproved transition does not invent a runtime state.
  * {@code desiredState} and {@code displayState} separately describe lifecycle intent and its UI projection.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -76,13 +77,30 @@ record PipelineStatusResponse(
     /** Builds a catalog status without inventing a runtime observation when none has been published yet. */
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock) {
         PipelineCatalogItem.Status status = item.status();
-        PipelineState state = status.observedState() == null ? PipelineState.NEW : status.observedState();
+        PipelineState state = status.observedState();
+        if (state == null && status.state() != null) {
+            state = switch (status.state()) {
+                case NEW, RUNNING, PAUSED, STOPPED, COMPLETED, FAILED -> PipelineState.valueOf(status.state().name());
+                default -> null;
+            };
+        }
+        if (state == null && item.hasArtifact() && !knownTransition(status.displayState())) {
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", item.id(), "field", "checkpoint"), null);
+        }
         Instant observedAt = status.observedAt();
         return new PipelineStatusResponse(item.id(), state, status.displayState(),
                 failure(status.failure(), catalog), observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 status.desiredState(), status.observedState(), item.hasArtifact(), null, null,
                 intentReadFailure(status.intentReadFailure(), catalog));
+    }
+
+    private static boolean knownTransition(PipelineCatalogItem.UiState state) {
+        return state != null && switch (state) {
+            case STARTING, STOPPING, PAUSING, RESUMING, RECOVERY_REQUIRED -> true;
+            default -> false;
+        };
     }
 
     private static Failure intentReadFailure(

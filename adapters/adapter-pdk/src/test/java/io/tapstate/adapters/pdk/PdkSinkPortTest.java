@@ -1,5 +1,8 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapdata.entity.codec.TapCodecsRegistry;
+import io.tapdata.entity.event.dml.TapInsertRecordEvent;
+import io.tapdata.entity.schema.value.TapStringValue;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.sink.DdlPolicy;
@@ -64,6 +67,39 @@ class PdkSinkPortTest {
 
         assertThat(writtenTable).hasValue("k2");
         assertThat(recordTables).hasValue(List.of("k2", "k2", "k2"));
+    }
+
+    @Test
+    void writesPreferV2WithTheTargetFieldThenV1ThenTheDefault(@TempDir Path dir) throws Throwable {
+        Path jar = Synthetic.countingSink(dir);
+        var connector = PdkConnector.open("demo", provisioner(jar, "synthetic.CountingSink").resolve("demo"), Map.of());
+        var target = new TargetTable("renamed", List.of(new TargetField("reading", "varchar(30)", false)));
+        var loader = connector.underLoader(() -> Thread.currentThread().getContextClassLoader());
+        var codecs = connector.codecs();
+        codecs.registerFromTapValue(TapStringValue.class, value -> "v1");
+        codecs.registerFromTapValueV2(TapStringValue.class, (value, field) -> {
+            assertThat(Thread.currentThread().getContextClassLoader()).isSameAs(loader);
+            assertThat(field).isNotNull();
+            assertThat(field.getName()).isEqualTo("reading");
+            assertThat(field.getDataType()).isEqualTo("varchar(30)");
+            return "v2";
+        });
+        var written = new java.util.ArrayList<Object>();
+        var row = TapEventCodec.decodeChange(TapInsertRecordEvent.create().table("input")
+                .after(Map.of("reading", new TapStringValue("portable"))), new TapCodecsRegistry(), Map.of());
+        try (SinkWriter writer = new PdkSinkWriter(connector, (context, events, table, result) -> {
+            written.add(((TapInsertRecordEvent) events.getFirst()).getAfter().get("reading"));
+            result.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>(1L, 0L, 0L));
+        }, configWithTarget(target), Map.of("input", target), null)) {
+            assertThat(await(writer, List.of(row)).written()).isEqualTo(1);
+            codecs.registerFromTapValueV2(TapStringValue.class, (value, field) -> null);
+            assertThat(await(writer, List.of(row)).written()).isEqualTo(1);
+            codecs.unregisterFromTapValueV2(TapStringValue.class);
+            assertThat(await(writer, List.of(row)).written()).isEqualTo(1);
+            codecs.unregisterFromTapValue(TapStringValue.class);
+            assertThat(await(writer, List.of(row)).written()).isEqualTo(1);
+        }
+        assertThat(written).containsExactly("v2", "portable", "v1", "portable");
     }
 
     @Test

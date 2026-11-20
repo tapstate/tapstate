@@ -1,0 +1,6 @@
+{
+  "TS0060001": {
+    "message": "Connector '{connector}' could not complete its connection test: {detail}",
+    "solution": "Review the cause and check the connector configuration before trying again."
+  }
+}

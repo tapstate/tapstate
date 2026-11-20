@@ -18,7 +18,6 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -51,7 +50,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NestSaysWhenItIsServedFromTheColdLayerIT {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(180);
-    private static final Duration POLL = Duration.ofMillis(250);
     private static final String PARENT_TABLE = "orders";
     private static final String CHILD_TABLE = "order_items";
     private static final String PIPELINE_ID = "alerting_orders";
@@ -108,8 +106,12 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
 
                 control.lifecycle(pipelineId, LifecycleVerb.START);
 
-                await(() -> mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE).size() == ROOTS);
-                await(() -> control.logs(pipelineId).contains(EXPECTED_CODE));
+                Await.until("every root to reach the view", TIMEOUT,
+                        () -> mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE).size() == ROOTS,
+                        () -> control.metrics(pipelineId));
+                Await.until("the cold-layer warning to be published", TIMEOUT,
+                        () -> control.logs(pipelineId).contains(EXPECTED_CODE),
+                        () -> control.metrics(pipelineId));
 
                 assertThat(control.logs(pipelineId))
                         .as("the pipeline's own logs face, where an operator would look. A run under this "
@@ -130,17 +132,7 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
         }
     }
 
-    private static void await(BooleanSupplier reached) {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (System.nanoTime() - deadline < 0) {
-            if (reached.getAsBoolean()) {
-                return;
-            }
-            sleep();
-        }
-    }
-
-    /** More roots than the budget, one child each, so every root is worth reading back. */
+    /** Each root is a first touch. Child arrivals would revisit hot roots and dilute the cold share. */
     private static void seedMysql(MySQLContainer<?> mysql) throws Exception {
         try (Connection connection =
                 DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword())) {
@@ -155,16 +147,6 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
                 for (long id = 1; id <= ROOTS; id++) {
                     insert.setLong(1, id);
                     insert.setString(2, "order-" + id);
-                    insert.addBatch();
-                }
-                insert.executeBatch();
-            }
-            try (PreparedStatement insert = connection.prepareStatement(
-                    "INSERT INTO " + CHILD_TABLE + " (id, order_id, sku) VALUES (?, ?, ?)")) {
-                for (long id = 1; id <= ROOTS; id++) {
-                    insert.setLong(1, id);
-                    insert.setLong(2, id);
-                    insert.setString(3, "sku-" + id);
                     insert.addBatch();
                 }
                 insert.executeBatch();
@@ -247,12 +229,4 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
                 .formatted(pipelineId, MEMORY_BUDGET);
     }
 
-    private static void sleep() {
-        try {
-            Thread.sleep(POLL.toMillis());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted while waiting for the condition to be reported", e);
-        }
-    }
 }

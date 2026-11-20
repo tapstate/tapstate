@@ -33,8 +33,8 @@ class NativeValidationFullJobIT {
             var plan=new Plan(identity,f.comparison.mappings().getFirst());
             runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
             await(()->f.tasks.read("flow","task").orElseThrow().full().permission()!=null&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
-            var actual=access.control().read(identity.owner(),original).orElseThrow();
-            assertThat(actual.state()).isEqualTo(ValidationRunState.COMPLETED);assertThat(actual.retired()).isTrue();
+            await(() -> access.control().read(identity.owner(), original)
+                    .filter(value -> value.state() == ValidationRunState.COMPLETED && value.retired()).isPresent());
             await(()->f.resources.snapshot().metadataFrames()==0);assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();
             assertThat(plan.checked).hasValue(5);assertThat(plan.borrowed).hasValue(0);assertThat(plan.drained()).isTrue();
             var reports=f.raw.getDatabase(f.configName).getCollection("validation_reports");
@@ -91,6 +91,7 @@ class NativeValidationFullJobIT {
             assertThat(report.terminal()).isEqualTo(ValidationRunState.STOPPED);
             if(cleanup==null)assertThat(report.failure()).isNull();
             else assertThat(report.failure()).isNotNull().satisfies(failure->{assertThat(failure.technical()).contains("original publication payload cleanup failed");assertThat(failure.fatal()).isEqualTo(cleanup instanceof Error);});
+            await(()->f.resources.snapshot().metadataFrames()==0);
             assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();assertThat(f.resources.snapshot().metadataFrames()).isZero();
         }finally{checkRelease.countDown();controlsRelease.forEach(java.util.concurrent.CountDownLatch::countDown);}
     }

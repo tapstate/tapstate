@@ -138,6 +138,25 @@ class SrsRingReaderTest {
     }
 
     @Test
+    void aRejectedBatchEmitsNothingAndLeavesTheCursorAtItsOriginalSequence() {
+        var published = new ArrayList<Long>();
+        var reader = new SrsRingReader(filled("srs.chain.batch-rejected", 3), 0, published::add);
+        var emitted = new ArrayList<Long>();
+        SrsEventModelVerifier.Batch reject = (items, first) -> {
+            assertThat(first).isZero();
+            assertThat(items).hasSize(2);
+            throw new IllegalStateException("second event rejected");
+        };
+        assertThatThrownBy(() -> reader.fill(reject, (item, sequence) -> emitted.add(sequence), 2))
+                .hasMessage("second event rejected");
+        assertThat(emitted).isEmpty();
+        assertThat(published).isEmpty();
+        assertThat(reader.fill((item, sequence) -> emitted.add(sequence), 2)).isEqualTo(2);
+        assertThat(emitted).containsExactly(0L, 1L);
+        assertThat(published).containsExactly(1L);
+    }
+
+    @Test
     void stopsAtTheTailWithoutBlockingForUnwrittenChanges() {
         SrsRingReader reader = new SrsRingReader(filled("srs.chain.tail", 2), 0);
         List<SrsItem> out = new ArrayList<>();

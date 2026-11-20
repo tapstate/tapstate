@@ -29,6 +29,719 @@ class RootStateWriteBatchingTest {
     private static final NestTopology TREE = NestTopology.compile("p", "doc",
             nest("order", List.of("order_id"), embed("customer", "customer_id", "cust_ref",
                     EmbedAs.OBJECT, "customer", null)), tables());
+    private static final NestTopology ARRAY_TREE = NestTopology.compile("p", "doc",
+            nest("order", List.of("order_id"),
+                    embed("item", "order_id", "order_id", EmbedAs.ARRAY, "lines", List.of("line_no")),
+                    embed("customer", "customer_id", "cust_ref", EmbedAs.OBJECT, "customer", null)), tables());
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void arrayChildrenBeforeRootsUseBoundedReadsAndWrites(boolean folding) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        TestInbox lines = lineRows(32);
+        f.assembler.process(1, lines);
+        assertThat(lines).isEmpty();
+        assertThat(f.drainRaw()).isEmpty();
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isEqualTo(2);
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16, 16);
+        f.feed(32, false);
+        assertArrayDocuments(f.drain(), 32);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void arrayRootReadsPersistExistingStatesInBoundedBatches(boolean folding) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        f.assembler.process(1, lineRows(32));
+        f.roots.singleReads = 0;
+        f.roots.batchReads = 0;
+        f.roots.singleWrites = 0;
+        f.roots.batches.clear();
+        f.feed(32, false);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isEqualTo(2);
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16, 16);
+        assertArrayDocuments(f.drain(), 32);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "false,1", "true,1", "false,15", "true,15",
+            "false,16", "true,16", "false,64", "true,64"})
+    void knownAbsentRootsRemainInTheBoundedWriteWave(boolean folding, int absentCount) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        wakeAbsent(f, absentCount);
+        // Exclude the guarded-touch preparation from root READ measurements.
+        f.roots.batchReads = 0; f.roots.batchReadKeys.clear();
+        f.roots.singleReads = 0;
+        f.feed(64, false);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isEqualTo(4 - absentCount / 16);
+        assertThat(f.roots.batchReadKeys).allSatisfy(keys -> {
+            assertThat(keys.size()).isLessThanOrEqualTo(16);
+            assertThat(keys).allSatisfy(key -> assertThat((Integer) ((List<?>) key).getFirst())
+                    .isGreaterThanOrEqualTo(absentCount));
+        });
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16, 16, 16, 16);
+        assertEmptyArrayDocuments(f.drain(), 64);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void knownAbsenceAndExistingChildStateShareOneWave(boolean folding) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        TestInbox children = new TestInbox();
+        for (Object item : lineRows(16)) {
+            if ((Integer) ((Envelope) item).after().get("order_id") % 2 == 1) children.add(item);
+        }
+        f.assembler.process(1, children);
+        TestInbox wakes = new TestInbox();
+        for (int id = 0; id < 16; id += 2) wakes.add(new NestTouch(List.of(id), 0, Map.of(), true, false));
+        f.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(), wakes);
+        f.roots.singleReads = 0; f.roots.batchReadKeys.clear();
+        f.roots.singleWrites = 0; f.roots.batches.clear();
+        f.feed(16, false);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReadKeys).hasSize(1).first().asList().hasSize(8);
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16);
+        assertThat(f.drain()).hasSize(16).allSatisfy(document -> {
+            int id = (Integer) document.after().get("order_id");
+            assertThat((List<?>) document.after().get("lines")).hasSize(id % 2 == 1 ? 2 : 0);
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C1", "name", "Ada"));
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void knownAbsentWaveFailureRetainsInputsAndReplaysBeforeTheWatermark(boolean folding) throws Exception {
+        RecordingStore durable = new RecordingStore();
+        var policy = folding ? NestSendPolicy.within(0) : NestSendPolicy.everyChange();
+        Fixture failed = new Fixture(ARRAY_TREE, policy, 128, durable, true, NestClock.SYSTEM);
+        wakeAbsent(failed, 16);
+        durable.failuresLeft = 1;
+        TestInbox inbox = failed.inbox(16, false);
+        assertThatThrownBy(() -> failed.assembler.process(0, inbox))
+                .isInstanceOf(IllegalStateException.class).hasMessage("state batch failed");
+        assertThat(inbox.size()).isEqualTo(16);
+        assertThat(failed.drainRaw()).isEmpty();
+        Fixture replay = new Fixture(ARRAY_TREE, policy, 1, durable, true, NestClock.SYSTEM);
+        replay.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        Watermark frontier = new Watermark(FrontierOrders.pack("order", at(16)), replay.axes.axisOf("order"));
+        List<Envelope> documents = new ArrayList<>();
+        boolean accepted = false;
+        for (int attempt = 0; attempt < 20 && !accepted; attempt++) {
+            List<Object> downstream = replay.drainRaw();
+            assertThat(downstream).noneMatch(Watermark.class::isInstance);
+            downstream.stream().filter(Envelope.class::isInstance).map(Envelope.class::cast).forEach(documents::add);
+            accepted = replay.assembler.tryProcessWatermark(0, frontier);
+        }
+        assertThat(accepted).isTrue();
+        List<Object> last = replay.drainRaw();
+        assertThat(last.getLast()).isEqualTo(frontier);
+        last.stream().filter(Envelope.class::isInstance).map(Envelope.class::cast).forEach(documents::add);
+        assertEmptyArrayDocuments(documents, 16);
+    }
+
+    @Test void knownAbsentInputsStillRespectTheWaveByteBudget() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        wakeAbsent(f, 2);
+        f.roots.batchReads = 0; f.roots.batchReadKeys.clear();
+        f.roots.singleReads = 0;
+        String wide = "x".repeat(5 * 1024 * 1024);
+        TestInbox inbox = new TestInbox();
+        for (int id = 0; id < 2; id++) inbox.add(Envelope.read(id, "order",
+                row("order_id", id, "cust_ref", "C1", "wide", wide), null).withOrder(at(id + 1)));
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isZero();
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.roots.singleWrites).isEqualTo(2);
+        assertThat(f.drain()).hasSize(2);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void knownAbsenceDoesNotChangeRepeatedRootVersionSemantics(boolean folding) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        wakeAbsent(f, 1);
+        TestInbox inbox = f.inbox(32, false);
+        inbox.add(Envelope.read(99, "order", row("order_id", 0, "cust_ref", "C1", "version", 99), null)
+                .withOrder(at(100)));
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        List<Envelope> documents = f.drain();
+        assertThat(documents).hasSize(folding ? 32 : 33);
+        assertThat(documents.stream().filter(e -> e.after().get("order_id").equals(0))
+                .map(e -> e.after().get("version")).toList())
+                .containsExactlyElementsOf(folding ? List.of(99) : List.of(0, 99));
+    }
+
+    private static void wakeAbsent(Fixture f, int count) {
+        TestInbox wakes = new TestInbox();
+        for (int id = 0; id < count; id++) wakes.add(new NestTouch(List.of(id), 0, Map.of(), false, true));
+        f.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(), wakes);
+        assertThat(wakes).isEmpty();
+        assertThat(f.drainRaw()).isEmpty();
+    }
+
+    private static void assertEmptyArrayDocuments(List<Envelope> documents, int count) {
+        assertThat(documents).hasSize(count);
+        assertThat(documents).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
+        assertThat(documents).allSatisfy(document -> {
+            assertThat((List<?>) document.after().get("lines")).isEmpty();
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C1", "name", "Ada"));
+        });
+    }
+
+    @Test void rootPrefetchFailureKeepsEveryInputAndMakesNoWrites() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(16));
+        f.roots.singleWrites = 0;
+        f.roots.batches.clear();
+        f.roots.failReadBatch = true;
+        TestInbox inbox = f.inbox(16, false);
+        assertThatThrownBy(() -> f.assembler.process(0, inbox))
+                .isInstanceOf(IllegalStateException.class).hasMessage("state read batch failed");
+        assertThat(inbox.size()).isEqualTo(16);
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.drain()).isEmpty();
+        f.roots.failReadBatch = false;
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        assertArrayDocuments(f.drain(), 16);
+    }
+
+    @Test void prefetchedArrayRootsKeepRepeatedVersionsOnAppend() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(2));
+        TestInbox inbox = f.inbox(2, false);
+        inbox.add(Envelope.read(3, "order", row("order_id", 0, "cust_ref", "C1", "version", 99), null)
+                .withOrder(at(100)));
+        f.assembler.process(0, inbox);
+        List<Envelope> documents = f.drain();
+        assertThat(documents).extracting(e -> e.after().get("version")).containsExactly(0, 1, 99);
+        assertThat(documents).allSatisfy(e -> assertThat((List<?>) e.after().get("lines")).hasSize(2));
+    }
+
+    @Test void prefetchedArrayRootsKeepSameDrainFoldingBeyondTheReadAhead() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), true);
+        f.assembler.process(1, lineRows(32));
+        f.roots.singleWrites = 0;
+        TestInbox inbox = f.inbox(32, false);
+        inbox.add(Envelope.read(99, "order", row("order_id", 0, "cust_ref", "C1", "version", 99), null)
+                .withOrder(at(100)));
+        f.assembler.process(0, inbox);
+        List<Envelope> documents = f.drain();
+        assertThat(documents).hasSize(32);
+        assertThat(documents.getFirst().after()).containsEntry("order_id", 0).containsEntry("version", 99);
+        assertThat(f.roots.singleWrites).isEqualTo(32);
+    }
+
+    @Test void rootReadAheadStopsBeforeCdcAndDoesNotCacheItsKey() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(4));
+        f.roots.batchReadKeys.clear();
+        TestInbox inbox = f.inbox(2, false);
+        inbox.add(Envelope.insert(3, "order", row("order_id", 2, "cust_ref", "C1"), null).withOrder(at(3)));
+        inbox.add(Envelope.read(4, "order", row("order_id", 3, "cust_ref", "C1"), null).withOrder(at(4)));
+        f.assembler.process(0, inbox);
+        assertThat(f.roots.batchReadKeys).containsExactly(List.of(List.of(0), List.of(1)));
+        assertArrayDocuments(f.drain(), 4);
+    }
+
+    @Test void absentArrayRootsAreNotFetchedAgainAfterPrefetch() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.feed(32, false);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isEqualTo(2);
+        assertThat(f.roots.batchReadKeys).allSatisfy(keys -> assertThat(keys).hasSize(16));
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16, 16);
+        assertThat(f.drain()).hasSize(32).allSatisfy(e -> assertThat((List<?>) e.after().get("lines")).isEmpty());
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void arrayRootBackpressureKeepsTheNextWaveFresh(boolean knownAbsent) throws Exception {
+        Fixture f = new Fixture(ARRAY_TREE, NestSendPolicy.everyChange(), 1, new RecordingStore(), false, NestClock.SYSTEM);
+        if (knownAbsent) wakeAbsent(f, 32);
+        else f.assembler.process(1, lineRows(32));
+        f.roots.batches.clear();
+        TestInbox inbox = f.inbox(32, false);
+        f.assembler.process(0, inbox);
+        assertThat(inbox.size()).isEqualTo(16);
+        assertThat(f.roots.batches).containsExactly(16);
+        List<Envelope> documents = new ArrayList<>();
+        for (int attempt = 0; attempt < 20; attempt++) {
+            documents.addAll(f.drain());
+            f.assembler.tryProcess();
+        }
+        TestInbox changedChild = new TestInbox();
+        changedChild.add(Envelope.read(100, "item", row("item_id", 37L, "order_id", 18, "line_no", 1, "value", 99), null)
+                .withOrder(at(100)));
+        f.assembler.process(1, changedChild);
+        assertThat(changedChild).isEmpty();
+        for (int attempt = 0; attempt < 40; attempt++) {
+            f.assembler.process(0, inbox);
+            documents.addAll(f.drain());
+        }
+        assertThat(inbox).isEmpty();
+        assertThat(documents).hasSize(32).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
+        Envelope changed = documents.stream().filter(e -> e.after().get("order_id").equals(18)).findFirst().orElseThrow();
+        assertThat((List<?>) changed.after().get("lines")).anySatisfy(line ->
+                assertThat(((Map<?, ?>) line).get("value")).isEqualTo(99));
+    }
+
+    @Test void wideRootStateStopsFurtherReadAheadProbesInTheDrain() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        String wide = "x".repeat(5 * 1024 * 1024);
+        for (int id = 0; id < 4; id++) {
+            TestInbox line = new TestInbox();
+            line.add(Envelope.read(id, "item", row("item_id", id, "order_id", id, "line_no", 1, "wide", wide), null)
+                    .withOrder(at(id + 1)));
+            f.assembler.process(1, line);
+        }
+        f.roots.singleReads = 0;
+        f.roots.batchReads = 0;
+        f.feed(4, false);
+        assertThat(f.roots.batchReads).isEqualTo(1);
+        // Only one complete 5 MiB assembly fits the retained 8 MiB prefetch budget.
+        assertThat(f.roots.singleReads).isEqualTo(3);
+        assertThat(f.drain()).hasSize(4).allSatisfy(e -> assertThat((List<?>) e.after().get("lines")).hasSize(1));
+    }
+
+    @Test void rootReadAheadDoesNotReportALaterMissingRowBeforeEarlierRows() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(2));
+        f.roots.singleWrites = 0;
+        TestInbox inbox = f.inbox(2, false);
+        inbox.add(Envelope.read(3, "order", null, null).withOrder(at(3)));
+        assertThatThrownBy(() -> f.assembler.process(0, inbox))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(inbox.size()).isEqualTo(1);
+        assertThat(f.roots.singleWrites).isZero();
+        assertArrayDocuments(f.drain(), 2);
+    }
+
+    @Test void rootReadAheadPreservesTheExistingFoldingDrainLimit() throws Exception {
+        int count = DrainFolding.MAX_KEYS_HELD * 2 + 1;
+        Fixture f = new Fixture(ARRAY_TREE, NestSendPolicy.within(0), count * 2,
+                new RecordingStore(), false, NestClock.SYSTEM);
+        f.feed(count, false);
+        assertThat(f.roots.batchReadKeys).allSatisfy(keys -> assertThat(keys.size()).isLessThanOrEqualTo(16));
+        assertThat(f.roots.singleWrites).isEqualTo(1);
+        assertThat(f.roots.batches).hasSize(32).allMatch(size -> size == 16);
+        assertThat(f.drain()).hasSize(count).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
+    }
+
+    @Test void wideRootInputsUseOrdinaryReadsRatherThanExceedingTheInputBudget() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        String wide = "x".repeat(5 * 1024 * 1024);
+        TestInbox inbox = new TestInbox();
+        for (int id = 0; id < 2; id++) inbox.add(Envelope.read(id, "order",
+                row("order_id", id, "cust_ref", "C1", "wide", wide), null).withOrder(at(id + 1)));
+        f.assembler.process(0, inbox);
+        assertThat(f.roots.batchReads).isZero();
+        assertThat(f.roots.singleReads).isEqualTo(2);
+        assertThat(f.drain()).hasSize(2);
+    }
+
+    @Test void prefetchedPersistedRootsStillRejectAnOlderSourceEpoch() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(2));
+        TestInbox current = new TestInbox();
+        var newer = new io.tapstate.core.event.SourceOrder(2, 1);
+        for (int id = 0; id < 2; id++) current.add(Envelope.read(id, "order",
+                row("order_id", id, "cust_ref", "C1", "version", 42), null)
+                .withPositions(Map.of("order", new ChainPosition(newer, "newest-" + id))));
+        f.assembler.process(0, current);
+        assertThat(f.drain()).hasSize(2).allSatisfy(document -> {
+            int id = (Integer) document.after().get("order_id");
+            assertThat(document.positions()).containsEntry("order", new ChainPosition(newer, "newest-" + id));
+        });
+        f.roots.singleReads = 0;
+        f.roots.batchReads = 0;
+        f.feed(2, false);
+        assertThat(f.roots.batchReads).isEqualTo(1);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.drain()).hasSize(2).allSatisfy(document -> {
+            assertThat(document.after()).containsEntry("version", 42);
+            // Already delivered positions are not reintroduced by an older replay.
+            assertThat(document.positions()).doesNotContainKey("order");
+        });
+    }
+
+    @Test void partialChildWaveFailureKeepsInputsAndReplaysEveryLine() throws Exception {
+        var durable = new RecordingStore(); durable.failuresLeft = 1;
+        Fixture failed = arrayFixture(durable, false);
+        TestInbox lines = lineRows(16);
+        assertThatThrownBy(() -> failed.assembler.process(1, lines))
+                .isInstanceOf(IllegalStateException.class).hasMessage("state batch failed");
+        assertThat(lines.size()).isEqualTo(32);
+        assertThat(failed.drainRaw()).isEmpty();
+        Fixture replay = arrayFixture(durable, false);
+        replay.assembler.process(1, lines);
+        assertThat(lines).isEmpty();
+        assertThat(replay.drainRaw()).isEmpty();
+        replay.feed(16, false);
+        assertArrayDocuments(replay.drain(), 16);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void partialOwnedRootWriteFailureKeepsTheWaveForReplay(boolean folding) throws Exception {
+        RecordingStore durable = new RecordingStore();
+        Fixture failed = new Fixture(ARRAY_TREE, folding ? NestSendPolicy.within(0) : NestSendPolicy.everyChange(),
+                128, durable, true, NestClock.SYSTEM);
+        failed.assembler.process(1, lineRows(16));
+        durable.failuresLeft = 1;
+        TestInbox inbox = failed.inbox(16, false);
+        assertThatThrownBy(() -> failed.assembler.process(0, inbox))
+                .isInstanceOf(IllegalStateException.class).hasMessage("state batch failed");
+        assertThat(inbox.size()).isEqualTo(16);
+        assertThat(failed.drainRaw()).isEmpty();
+        Fixture replay = new Fixture(ARRAY_TREE, folding ? NestSendPolicy.within(0) : NestSendPolicy.everyChange(),
+                1, durable, true, NestClock.SYSTEM);
+        replay.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        Watermark frontier = new Watermark(FrontierOrders.pack("order", at(16)), replay.axes.axisOf("order"));
+        List<Envelope> documents = new ArrayList<>();
+        boolean accepted = false;
+        for (int attempt = 0; attempt < 20 && !accepted; attempt++) {
+            List<Object> downstream = replay.drainRaw();
+            assertThat(downstream).noneMatch(Watermark.class::isInstance);
+            downstream.stream().filter(Envelope.class::isInstance).map(Envelope.class::cast).forEach(documents::add);
+            accepted = replay.assembler.tryProcessWatermark(0, frontier);
+        }
+        assertThat(accepted).isTrue();
+        List<Object> finalItems = replay.drainRaw();
+        assertThat(finalItems.getLast()).isEqualTo(frontier);
+        finalItems.stream().filter(Envelope.class::isInstance).map(Envelope.class::cast).forEach(documents::add);
+        assertThat(documents).hasSize(16).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
+        assertThat(documents).allSatisfy(document -> {
+            assertThat((List<?>) document.after().get("lines")).hasSize(2);
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C1", "name", "Ada"));
+        });
+        for (Envelope document : documents) {
+            int id = (Integer) document.after().get("order_id");
+            if (id > 0) assertThat(document.positions())
+                    .containsEntry("order", new ChainPosition(at(id + 1), "offset-" + id))
+                    .containsEntry("item", new ChainPosition(at(id * 2L + 2), "line-" + (id * 2L + 2)));
+        }
+        Watermark childFrontier = new Watermark(FrontierOrders.pack("item", at(32)), replay.axes.axisOf("item"));
+        assertThat(replay.assembler.tryProcessWatermark(1, childFrontier)).isTrue();
+        assertThat(replay.drainRaw()).containsExactly(childFrontier);
+    }
+
+    @Test void ownedRootFoldingWavesStillReadReferencesInBatches() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), true);
+        f.assembler.process(1, lineRows(32));
+        TestInbox inbox = new TestInbox();
+        for (int i = 0; i < 32; i++) {
+            f.customers.save(List.of("C" + i), row("customer_id", "C" + i, "name", "customer-" + i));
+            inbox.add(Envelope.read(i, "order", row("order_id", i, "cust_ref", "C" + i), null).withOrder(at(i + 1)));
+        }
+        f.customers.batchReads = 0;
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(f.customers.batchReads).isEqualTo(2);
+        assertThat(f.drain()).hasSize(32).allSatisfy(document -> {
+            int id = (Integer) document.after().get("order_id");
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C" + id, "name", "customer-" + id));
+        });
+    }
+
+    @Test void ownedRootWavesCountHiddenPersistentFieldsAndSplitBeforeWriting() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(4));
+        f.roots.batches.clear(); f.roots.batchBytes.clear(); f.roots.singleWrites = 0;
+        String wide = "x".repeat(3 * 1024 * 1024);
+        TestInbox inbox = new TestInbox();
+        for (int i = 0; i < 4; i++) inbox.add(Envelope.read(i, "order",
+                row("order_id", i, "cust_ref", "C1", "lines", wide), null).withOrder(at(i + 1)));
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        assertArrayDocuments(f.drain(), 4);
+        assertThat(f.roots.batches).containsExactly(2, 2);
+        assertThat(f.roots.batchBytes).allMatch(bytes -> bytes <= 8L * 1024 * 1024);
+    }
+
+    @Test void anOwnedStateGrowingBeyondTheBudgetIsSavedAlone() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        String wide = "x".repeat(5 * 1024 * 1024);
+        TestInbox children = new TestInbox();
+        children.add(Envelope.read(1, "item", row("item_id", 1, "order_id", 0, "line_no", 1, "wide", wide), null)
+                .withOrder(at(1)));
+        f.assembler.process(1, children);
+        f.roots.batches.clear(); f.roots.singleWrites = 0;
+        TestInbox inbox = new TestInbox();
+        inbox.add(Envelope.read(1, "order", row("order_id", 0, "cust_ref", "C1", "lines", wide), null).withOrder(at(1)));
+        inbox.add(Envelope.read(2, "order", row("order_id", 1, "cust_ref", "C1"), null).withOrder(at(2)));
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.roots.singleWrites).isEqualTo(2);
+        assertThat(StateWaveSize.of(f.roots.read(List.of(0)))).isGreaterThan(8L * 1024 * 1024);
+        assertThat(f.drain()).hasSize(2);
+    }
+
+    @Test void staleOwnedRootReplayResolvesTheHeldReference() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), true);
+        f.assembler.process(1, lineRows(2));
+        f.feed(2, false); f.drain();
+        TestInbox older = new TestInbox();
+        for (int id = 0; id < 2; id++) older.add(Envelope.read(id, "order",
+                row("order_id", id, "cust_ref", "absent", "version", -1), null).withOrder(at(0)));
+        f.assembler.process(0, older);
+        assertThat(older).isEmpty();
+        assertThat(f.drain()).hasSize(2).allSatisfy(document -> assertThat(document.after())
+                .containsEntry("customer", row("customer_id", "C1", "name", "Ada")));
+    }
+
+    @Test void wideOwnedReferencesStopTheOutputWaveAndUseSingletonWrites() throws Exception {
+        Fixture f = new Fixture(ARRAY_TREE, NestSendPolicy.everyChange(), 1, new RecordingStore(), false, NestClock.SYSTEM);
+        f.assembler.process(1, lineRows(16));
+        f.roots.batches.clear(); f.roots.singleWrites = 0;
+        f.customers.save(List.of("C1"), row("customer_id", "C1", "name", "x".repeat(5 * 1024 * 1024)));
+        TestInbox inbox = f.inbox(16, false);
+        f.assembler.process(0, inbox);
+        assertThat(inbox.size()).isEqualTo(14);
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.roots.singleWrites).isEqualTo(2);
+    }
+
+    @Test void ownedRootCdcKeepsOrdinarySingleWrites() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(4));
+        f.feed(4, false); f.drain();
+        f.roots.batches.clear(); f.roots.singleWrites = 0;
+        TestInbox inbox = new TestInbox();
+        for (int i = 0; i < 4; i++) inbox.add(Envelope.update(i, "order",
+                row("order_id", i, "cust_ref", "C1"), row("order_id", i, "cust_ref", "C1", "version", 99), null)
+                .withOrder(at(i + 100)));
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.roots.singleWrites).isEqualTo(4);
+        assertThat(f.drain()).hasSize(4).allSatisfy(e -> assertThat(e.after()).containsEntry("version", 99));
+    }
+
+    private static Fixture arrayFixture(RecordingStore store, boolean folding) throws Exception {
+        return new Fixture(ARRAY_TREE, folding ? NestSendPolicy.within(0) : NestSendPolicy.everyChange(),
+                128, store, false, NestClock.SYSTEM);
+    }
+
+    @Test void existingRootChildSnapshotsUseBoundedPersistenceWithoutLosingLines() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), true);
+        f.feed(32, false); f.drain();
+        f.roots.singleWrites = 0; f.roots.batches.clear();
+        TestInbox lines = lineRows(32);
+        f.assembler.process(1, lines);
+        assertThat(lines).isEmpty();
+        assertArrayDocuments(f.drain(), 32);
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16, 16);
+    }
+
+    @Test void existingChildBatchFailureReplaysFromOriginalPositionsAndPreservesTheFrontier() throws Exception {
+        RecordingStore durable = new RecordingStore();
+        Fixture f = new Fixture(ARRAY_TREE, NestSendPolicy.within(0), 1, durable, true, NestClock.SYSTEM);
+        TestInbox roots = f.inbox(32, false);
+        for (int i = 0; i < 40; i++) { f.assembler.process(0, roots); f.drainRaw(); }
+        assertThat(roots).isEmpty();
+        durable.batches.clear(); durable.singleWrites = 0; durable.failuresLeft = 1;
+        assertThatThrownBy(() -> f.assembler.process(1, lineRows(32))).isInstanceOf(IllegalStateException.class);
+        assertThat(f.drainRaw()).isEmpty();
+        durable.failuresLeft = 0;
+        Fixture replay = new Fixture(ARRAY_TREE, NestSendPolicy.within(0), 1, durable, true, NestClock.SYSTEM);
+        TestInbox original = lineRows(32);
+        List<Envelope> docs = new ArrayList<>();
+        for (int i = 0; i < 80; i++) {
+            if (original.isEmpty()) replay.assembler.tryProcess(); else replay.assembler.process(1, original);
+            docs.addAll(replay.drain());
+        }
+        assertThat(original).isEmpty();
+        assertThat(docs).hasSize(32).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
+        for (Envelope doc : docs) {
+            int id = (Integer) doc.after().get("order_id");
+            assertThat(doc.after().get("lines")).isEqualTo(List.of(
+                    row("item_id", id * 2L + 1, "order_id", id, "line_no", 1),
+                    row("item_id", id * 2L + 2, "order_id", id, "line_no", 2)));
+            assertThat(doc.after().get("customer")).isEqualTo(row("customer_id", "C1", "name", "Ada"));
+            // The durable prefix has already cleared its held positions; replay still emits its content.
+            if (id > 0) assertThat(doc.positions()).containsEntry("item", new ChainPosition(at(id * 2L + 2), "line-" + (id * 2L + 2)));
+        }
+        Watermark bound = new Watermark(FrontierOrders.pack("item", at(64)), replay.axes.axisOf("item"));
+        assertThat(replay.assembler.tryProcessWatermark(1, bound)).isTrue();
+        assertThat(replay.drainRaw()).containsExactly(bound);
+    }
+
+    @Test void mixedChildReadAndCdcDrainKeepsTheOrdinaryWritePath() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), true);
+        f.feed(4, false); f.drain(); f.roots.singleWrites = 0; f.roots.batches.clear();
+        TestInbox lines = lineRows(4);
+        lines.add(Envelope.update(100, "item", row("item_id", 1L, "order_id", 0, "line_no", 1),
+                row("item_id", 1L, "order_id", 0, "line_no", 1, "value", 99), null).withOrder(at(100)));
+        f.assembler.process(1, lines);
+        assertThat(lines).isEmpty(); assertThat(f.roots.batches).isEmpty();
+        assertThat(f.roots.singleWrites).isEqualTo(4);
+        assertThat(f.drain()).hasSize(4);
+    }
+
+    @Test void guardedTouchBatchFailureKeepsInputsAndALaterRealEditStillRedraws() throws Exception {
+        RecordingStore durable = new RecordingStore(); Fixture before = arrayFixture(durable, true);
+        before.feed(32, false); before.drain();
+        Fixture replay = arrayFixture(durable, true); durable.failReadBatch = true;
+        TestInbox words = new TestInbox();
+        for (int i=0;i<32;i++) words.add(new NestTouch(List.of(i),1,Map.of(),true,false));
+        assertThatThrownBy(()->replay.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(),words))
+                .isInstanceOf(IllegalStateException.class).hasMessage("state read batch failed");
+        assertThat(words.size()).isEqualTo(32);assertThat(replay.drain()).isEmpty();
+        durable.failReadBatch=false;replay.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(),words);
+        assertThat(words).isEmpty(); assertThat(replay.drain()).isEmpty();
+        replay.customers.save(List.of("C1"),row("customer_id","C1","name","Updated"));
+        TestInbox edit = new TestInbox();edit.add(new NestTouch(List.of(0),2,Map.of(),false,false));
+        replay.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(),edit);
+        assertThat(replay.drain()).singleElement().satisfies(e->assertThat(((Map<?,?>)e.after().get("customer")).get("name")).isEqualTo("Updated"));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void existingChildWritesRespectWideStateAndWideReferenceOutput(boolean wideReference) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), true);
+        f.feed(2, false); f.drain();
+        String wide = "x".repeat(5 * 1024 * 1024);
+        if (wideReference) f.customers.save(List.of("C1"), row("customer_id", "C1", "name", wide));
+        TestInbox lines = new TestInbox();
+        for (int id=0;id<2;id++) lines.add(Envelope.read(id,"item",
+                wideReference ? row("item_id",id,"order_id",id,"line_no",1)
+                        : row("item_id",id,"order_id",id,"line_no",1,"payload",wide),null).withOrder(at(100+id)));
+        f.roots.singleWrites=0;f.roots.batches.clear();f.assembler.process(1,lines);
+        assertThat(lines).isEmpty();assertThat(f.roots.batches).isEmpty();assertThat(f.roots.singleWrites).isEqualTo(2);
+        assertThat(f.drain()).hasSize(2).allSatisfy(e->assertThat((List<?>)e.after().get("lines")).hasSize(1));
+    }
+
+    @Test void wideGuardedReadAheadFallsBackWithoutRereadingItsRetainedPrefix() throws Exception {
+        RecordingStore durable=new RecordingStore();Fixture original=arrayFixture(durable,true);
+        original.feed(2,false);original.drain();
+        TestInbox lines=new TestInbox();String wide="x".repeat(5*1024*1024);
+        for(int id=0;id<2;id++)lines.add(Envelope.read(id,"item",row("item_id",id,"order_id",id,"line_no",1,"payload",wide),null).withOrder(at(100+id)));
+        original.assembler.process(1,lines);original.drain();
+        Fixture replay=arrayFixture(durable,true);durable.singleReads=0;durable.batchReads=0;durable.singleWrites=0;durable.batches.clear();
+        TestInbox words=new TestInbox();for(int id=0;id<2;id++)words.add(new NestTouch(List.of(id),1,Map.of(),true,false));
+        replay.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(),words);
+        assertThat(words).isEmpty();assertThat(replay.drain()).isEmpty();
+        assertThat(durable.batchReads).isEqualTo(1);assertThat(durable.singleReads).isEqualTo(1);
+        assertThat(durable.singleWrites).isZero();assertThat(durable.batches).isEmpty();
+    }
+
+    @Test void guardedTouchesAfterRestartReadRootStatesInBoundedBatches() throws Exception {
+        RecordingStore durable = new RecordingStore();
+        Fixture before = arrayFixture(durable, true);
+        before.feed(32, false); before.drain();
+        Fixture resumed = arrayFixture(durable, true);
+        durable.singleReads = 0; durable.batchReads = 0;
+        durable.singleWrites = 0; durable.batches.clear();
+        TestInbox words = new TestInbox();
+        for (int id = 0; id < 32; id++) words.add(new NestTouch(List.of(id), 1, Map.of(), true, false));
+        resumed.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(), words);
+        assertThat(words).isEmpty();
+        assertThat(resumed.drain()).isEmpty();
+        assertThat(durable.singleReads).isZero();
+        assertThat(durable.batchReads).isEqualTo(2);
+        assertThat(durable.singleWrites).isZero();
+        assertThat(durable.batches).isEmpty();
+    }
+
+    @Test void existingRootsDoNotCauseOneWaveProbeForEveryAppendRow() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.feed(32, false); f.drain(); f.roots.batchReads = 0;
+        f.assembler.process(1, lineRows(32));
+        assertThat(f.roots.batchReads).isLessThanOrEqualTo(1);
+        assertThat(f.drain()).hasSize(64);
+    }
+
+    @Test void aSingleParentDrainIsScannedForBatchingOnlyOnce() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        int[] scans = {0};
+        TestInbox inbox = new TestInbox();
+        var observed = (com.hazelcast.jet.core.Inbox) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{com.hazelcast.jet.core.Inbox.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("iterator")) scans[0]++;
+                    return method.invoke(inbox, args);
+                });
+        for (int i = 0; i < 100; i++) inbox.add(Envelope.read(i, "item",
+                row("item_id", i, "order_id", 1, "line_no", i), null).withOrder(at(i + 1)));
+        f.assembler.process(1, observed);
+        assertThat(inbox).isEmpty();
+        assertThat(scans[0]).isEqualTo(1);
+    }
+
+    @Test void childWaveRetainsTheLatestVersionOfARepeatedLine() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        TestInbox lines = lineRows(2);
+        lines.add(Envelope.read(100, "item", row("item_id", 1L, "order_id", 0, "line_no", 1, "value", 99), null)
+                .withOrder(at(100)));
+        lines.add(Envelope.read(1, "item", row("item_id", 1L, "order_id", 0, "line_no", 1, "value", -1), null)
+                .withOrder(at(1)));
+        f.assembler.process(1, lines);
+        assertThat(f.drain()).isEmpty();
+        f.feed(2, false);
+        var documents = f.drain();
+        var first = documents.stream().filter(value -> value.after().get("order_id").equals(0)).findFirst().orElseThrow();
+        var children = (List<?>) first.after().get("lines");
+        assertThat(children).hasSize(2);
+        assertThat(((Map<?, ?>) children.getFirst()).get("value")).isEqualTo(99);
+    }
+
+    @Test void retainedChildStateCountsAgainstTheWholeWriteWaveBudget() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        String wide = "x".repeat(5 * 1024 * 1024);
+        for (int id = 0; id < 2; id++) {
+            var initial = new TestInbox();
+            initial.add(Envelope.read(id, "item", row("item_id", id, "order_id", id, "line_no", 1, "wide", wide), null)
+                    .withOrder(at(id + 1)));
+            f.assembler.process(1, initial);
+        }
+        f.roots.batches.clear();
+        var additions = new TestInbox();
+        for (int id = 0; id < 2; id++) additions.add(Envelope.read(id, "item",
+                row("item_id", id + 2, "order_id", id, "line_no", 2), null).withOrder(at(id + 3)));
+        f.assembler.process(1, additions);
+        assertThat(additions).isEmpty();
+        assertThat(f.roots.batches).containsExactly(1, 1);
+        assertThat(f.drain()).isEmpty();
+    }
+
+    private static TestInbox lineRows(int orders) {
+        TestInbox rows = new TestInbox();
+        for (int id = 0; id < orders; id++) for (int line = 1; line <= 2; line++) {
+            long offset = id * 2L + line;
+            rows.add(Envelope.read(offset, "item", row("item_id", offset, "order_id", id, "line_no", line), null)
+                    .withOrder(at(offset)).withPositions(Map.of("item", new ChainPosition(at(offset), "line-" + offset))));
+        }
+        return rows;
+    }
+
+    private static void assertArrayDocuments(List<Envelope> documents, int count) {
+        assertThat(documents).hasSize(count);
+        for (Envelope document : documents) {
+            int id = (Integer) document.after().get("order_id");
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C1", "name", "Ada"));
+            assertThat(document.after().get("lines")).isEqualTo(List.of(
+                    row("item_id", id * 2L + 1, "order_id", id, "line_no", 1),
+                    row("item_id", id * 2L + 2, "order_id", id, "line_no", 2)));
+            assertThat(document.positions()).containsEntry("item", new ChainPosition(at(id * 2L + 2), "line-" + (id * 2L + 2)));
+        }
+    }
 
     @Test void independentFreshRootsPersistInBoundedGroupsBeforeTheirOutputs() throws Exception {
         Fixture f = new Fixture(NestSendPolicy.everyChange(), 128);
@@ -325,7 +1038,7 @@ class RootStateWriteBatchingTest {
     private static final class Fixture {
         final RecordingStore roots;
         final Rows customers = new Rows();
-        final ChainAxes axes = ChainAxes.assign(List.of("order", "customer"));
+        final ChainAxes axes;
         final TestOutbox out;
         final AssemblerProcessor assembler;
         Fixture(NestSendPolicy policy, int capacity) throws Exception {
@@ -335,13 +1048,21 @@ class RootStateWriteBatchingTest {
             this(policy, capacity, durable, bounded, NestClock.SYSTEM);
         }
         Fixture(NestSendPolicy policy, int capacity, RecordingStore durable, boolean bounded, NestClock clock) throws Exception {
+            this(TREE, policy, capacity, durable, bounded, clock);
+        }
+        Fixture(NestTopology tree, NestSendPolicy policy, int capacity, RecordingStore durable, boolean bounded, NestClock clock) throws Exception {
             roots = durable;
+            axes = ChainAxes.assign(tree == ARRAY_TREE ? List.of("order", "item", "customer") : List.of("order", "customer"));
+            Map<Integer, List<String>> inbound = new LinkedHashMap<>();
+            inbound.put(0, List.of("order"));
+            if (tree == ARRAY_TREE) inbound.put(1, List.of("item"));
+            inbound.put(tree.lookups().getFirst().touchOrdinal(), List.of("customer"));
             out = new TestOutbox(capacity);
             customers.save(List.of("C1"), row("customer_id", "C1", "name", "Ada"));
-            assembler = new AssemblerProcessor(TREE.assembler(), TREE.slots(), roots, "doc", bounded ? axes : null,
-                    bounded ? Map.of(0, List.of("order"), TREE.lookups().getFirst().touchOrdinal(), List.of("customer")) : null,
+            assembler = new AssemblerProcessor(tree.assembler(), tree.slots(), roots, "doc", bounded ? axes : null,
+                    bounded ? inbound : null,
                     ReplayFloor.NONE, NestSettings.defaults(), clock, policy,
-                    new HeapNestStore<>(), (from, released) -> {}, Map.of(TREE.lookups().getFirst().mapName(), customers));
+                    new HeapNestStore<>(), (from, released) -> {}, Map.of(tree.lookups().getFirst().mapName(), customers));
             assembler.init(out, new TestProcessorContext());
         }
         TestInbox inbox(int count, boolean sameKey) {
@@ -380,6 +1101,9 @@ class RootStateWriteBatchingTest {
     private static final class RecordingStore implements NestStore<RootAssembly> {
         final Map<Object, byte[]> durable = new LinkedHashMap<>();
         final List<Integer> batches = new ArrayList<>();
+        final List<Long> batchBytes = new ArrayList<>();
+        final List<List<Object>> batchReadKeys = new ArrayList<>();
+        boolean failReadBatch;
         int singleWrites;
         int singleReads;
         int batchReads;
@@ -388,6 +1112,8 @@ class RootStateWriteBatchingTest {
         @Override public RootAssembly load(Object key) { singleReads++; return read(key); }
         @Override public Map<Object, RootAssembly> loadAll(java.util.Collection<Object> keys) {
             batchReads++;
+            batchReadKeys.add(new ArrayList<>(keys));
+            if (failReadBatch) throw new IllegalStateException("state read batch failed");
             Map<Object, RootAssembly> result = new LinkedHashMap<>();
             for (Object key : keys) { RootAssembly value = read(key); if (value != null) result.put(key, value); }
             return result;
@@ -407,6 +1133,7 @@ class RootStateWriteBatchingTest {
         @Override public void save(Object key, RootAssembly state) { singleWrites++; persist(key, state); }
         @Override public void saveAll(Map<Object, RootAssembly> states, Set<Object> firstFilings) {
             batches.add(states.size());
+            batchBytes.add(states.values().stream().mapToLong(StateWaveSize::of).sum());
             if (failBatch || failuresLeft > 0) {
                 if (failuresLeft > 0) failuresLeft--;
                 var first = states.entrySet().iterator().next();

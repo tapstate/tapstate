@@ -132,7 +132,7 @@ public final class MongoStateStore implements StateStore {
                 return session.withTransaction(() -> {
                     // Reuse the existing fence-proof counter. A write makes a takeover conflict with
                     // this transaction; a read of the claim alone would only prove an old snapshot.
-                    boolean owned = workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence),
+                    boolean owned = workloadClaims.updateOne(session, WorkloadClaimDocuments.livePipeline(session, workloadClaims, fence),
                             new Document("$inc", new Document("fencedSinkEffects", 1L))).getMatchedCount() == 1;
                     if (owned) {
                         Document applied = collection.findOneAndUpdate(session,
@@ -185,6 +185,18 @@ public final class MongoStateStore implements StateStore {
                     Map.of("id", String.valueOf(id),
                             "field", stateJson == null ? "stateJson" : epoch == null ? "epoch" : "touchMillis"), null);
         }
-        return new CheckpointDoc(id, stateJson, epoch, Instant.ofEpochMilli(touchMillis));
+        return new CheckpointDoc(id, stateJson, epoch, Instant.ofEpochMilli(touchMillis), leaseRecovery(document));
+    }
+
+    static CheckpointDoc.LeaseRecovery leaseRecovery(Document document) {
+        if (document.get("leaseRecovery") == null) return null;
+        try {
+            var raw = document.get("leaseRecovery", Document.class);
+            return new CheckpointDoc.LeaseRecovery(raw.getLong("intentRevision"), raw.getLong("failedExecution"),
+                    raw.getInteger("attempts"), Instant.ofEpochMilli(raw.getLong("retryAfter")));
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(document.get("_id")), "field", "leaseRecovery"), null);
+        }
     }
 }

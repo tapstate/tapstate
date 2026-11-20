@@ -88,10 +88,7 @@ class PipelineStartServiceTest {
         assertThat(changed).isNotEqualTo(before);
         assertThat(outcome.desired().revision()).isEqualTo(changed);
         assertThat(outcome.report().contentHash()).isEqualTo(changed);
-        assertThat(outcome.report().findings()).singleElement().satisfies(finding -> {
-            assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.PASS);
-            assertThat(finding.code()).isEqualTo("start-check.target-set-to-clear");
-        });
+        assertThat(outcome.report().findings()).isEmpty();
         assertThat(outcome.decisionsApplied()).singleElement().satisfies(applied -> {
             assertThat(applied.action()).isEqualTo("clear");
             assertThat(applied.changes()).containsExactly(new StartAction.Change("out", "on_full_load", "append", "clear"));

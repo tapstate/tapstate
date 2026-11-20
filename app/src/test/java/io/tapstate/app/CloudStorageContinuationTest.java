@@ -54,6 +54,8 @@ class CloudStorageContinuationTest {
             when(bindings.load()).thenReturn(Optional.of(CONNECTION)); when(bindings.cachePreparation()).thenReturn(Optional.of(PREPARATION));
             when(bindings.guardedBy(any())).thenReturn(bindings);
             when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(SETUP, phase.get(), 1));
+            when(states.loadView()).thenAnswer(ignored -> new StorageSetupStateStore.View(
+                    states.load(), bindings.load(), bindings.cachePreparation()));
             when(bindings.complete(SETUP)).thenAnswer(ignored -> { phase.set(StorageSetupStateStore.Phase.COMPLETE); return CONNECTION; });
             var artifacts = mock(ArtifactStore.class); when(configuration.artifacts()).thenReturn(artifacts);
             when(artifacts.get("atlas-store")).thenReturn(Optional.of(SOURCE));
@@ -272,8 +274,8 @@ class CloudStorageContinuationTest {
                     .when(f.configuration).prepareAuthenticationRecovery(eq(f.cache), any());
             f.root.managedAuthentication();
             assertThat(f.root.runtime().current().orElseThrow().preparation().authScope()).isEqualTo(next.authScope());
-            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireAuthenticationPublished(eq(next), any(MongoReadBudget.class));
-            assertThatThrownBy(() -> f.root.authenticateCredentials("unverified-cookie"))
+            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireRequestAuthenticationPublished(eq(next), any(MongoReadBudget.class));
+            assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
                     .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
             verify(f.cache, times(1)).prepareFirstAuth(f.grant);
             verify(f.bindings, times(1)).complete(SETUP);
@@ -304,7 +306,7 @@ class CloudStorageContinuationTest {
             var business = f.business();
             assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
             when(f.states.load()).thenThrow(StorageRuntime.unavailable());
-            assertThatThrownBy(() -> f.root.authenticateCredentials("unverified-cookie"))
+            assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
                     .isInstanceOfSatisfying(TapstateException.class, failure -> {
                         assertThat(failure.code()).isEqualTo(ControlError.STORAGE_QUOTA_EXCEEDED);
                         assertThat(failure.args()).isEmpty(); assertThat(failure.getCause()).isNull();
@@ -317,7 +319,7 @@ class CloudStorageContinuationTest {
     @Test void aGenericFailureWithoutQuotaEvidenceAndARecoveredRuntimeDoNotClaimQuota() {
         try (var f = new Fixture()) {
             when(f.states.load()).thenThrow(StorageRuntime.unavailable());
-            assertThatThrownBy(() -> f.root.authenticateCredentials("unverified-cookie"))
+            assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
         }
@@ -327,8 +329,8 @@ class CloudStorageContinuationTest {
             assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
             f.continueWith(business);
             assertThat(f.root.initializationProgress().quotaExceeded()).isFalse();
-            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireAuthenticationPublished(eq(PREPARATION), any(MongoReadBudget.class));
-            assertThatThrownBy(() -> f.root.authenticateCredentials("unverified-cookie"))
+            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireRequestAuthenticationPublished(eq(PREPARATION), any(MongoReadBudget.class));
+            assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
             verify(f.cache, times(1)).prepareFirstAuth(f.grant); verify(business, times(1)).start();

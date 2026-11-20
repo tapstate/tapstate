@@ -83,16 +83,16 @@ class StorageAuthenticationTest {
             }));
             assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue(); start.countDown();
             for (var request : requests) assertThat(request.get(5, TimeUnit.SECONDS).organizationId()).contains("organization");
-            verify(sessions, times(2)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            verify(sessions, times(1)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             var checks = new ArrayList<Future<?>>();
             for (var request : requests) checks.add(executor.submit(() -> { request.get().requireActive().run(); return null; }));
             for (var check : checks) check.get(5, TimeUnit.SECONDS);
-            verify(sessions, times(4)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            verify(sessions, times(2)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             var mixed = new ArrayList<Future<?>>();
             for (int i = 0; i < 3; i++) mixed.add(executor.submit(() -> authentication.credentials().authenticateContext(cookie).orElseThrow()));
             for (int i = 0; i < 3; i++) mixed.add(executor.submit(() -> { requests.getFirst().get().requireActive().run(); return null; }));
             for (var check : mixed) check.get(5, TimeUnit.SECONDS);
-            verify(sessions, times(6)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            verify(sessions, times(3)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any()))
                     .thenReturn(Optional.of(new CloudSessionRecord(identity, "jti", "hash", "different-user", "WRITE", false,
                             clock.instant(), clock.instant(), clock.instant().plusSeconds(600), context)));
@@ -101,18 +101,18 @@ class StorageAuthenticationTest {
             for (var check : changed) assertThatThrownBy(() -> check.get(5, TimeUnit.SECONDS))
                     .isInstanceOf(ExecutionException.class).cause().isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
-            verify(sessions, times(8)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            verify(sessions, times(4)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             // A subsequent request must observe durable revocation, even for the identical cookie.
             when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any())).thenReturn(Optional.empty());
             // Fill a new cohort without relying on scheduler timing or a completed result cache.
             var revoked = new ArrayList<Future<java.util.Optional<CredentialAuthentication>>>();
             for (int i = 0; i < 6; i++) revoked.add(executor.submit(() -> authentication.credentials().authenticateContext(cookie)));
             for (var request : revoked) assertThat(request.get(5, TimeUnit.SECONDS)).isEmpty();
-            verify(sessions, times(9)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            verify(sessions, times(5)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
         }
     }
 
-    @Test void formalCloudIdentityAndOrganizationUseTheSameInitialAndFinalValidation() {
+    @Test void formalCloudIdentityAndOrganizationUseOneCommittedValidation() {
         var properties = new CloudProperties();
         properties.setBaseUrl("https://cloud.example"); properties.setClusterId("cluster");
         properties.setAtlasUri("mongodb://localhost/config"); properties.setToken("test-runtime-token");
@@ -143,11 +143,11 @@ class StorageAuthenticationTest {
             var proof = authentication.credentials().authenticateContext(cookie).orElseThrow();
             assertThat(proof.organizationId()).contains("organization");
             assertThat(proof.storageScope()).contains(scope);
-            verify(sessions, times(2)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            verify(sessions, times(1)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             var budgets = org.mockito.ArgumentCaptor.forClass(io.tapstate.adapters.mongostore.MongoReadBudget.class);
-            verify(cache, times(2)).cloudSessions(eq(scope), budgets.capture());
-            assertThat(budgets.getAllValues().get(0)).isSameAs(budgets.getAllValues().get(1));
-            verify(configuration, times(2)).requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
+            verify(cache, times(1)).cloudSessions(eq(scope), budgets.capture());
+            assertThat(budgets.getAllValues()).hasSize(1);
+            verify(configuration, times(1)).requireRequestAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
             var evidence = proof.evidence().orElseThrow();
             assertThat(evidence.type()).isEqualTo(CredentialType.CLOUD_SESSION);
             assertThat(evidence.configurationTokenBinding()).isEmpty();
@@ -159,8 +159,8 @@ class StorageAuthenticationTest {
             assertThatThrownBy(proof.requireActive()::run).isInstanceOfSatisfying(TapstateException.class,
                     failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
             when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any())).thenReturn(Optional.empty());
-            doNothing().doThrow(StorageRuntime.unavailable()).when(configuration)
-                    .requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
+            doThrow(StorageRuntime.unavailable()).when(configuration)
+                    .requireRequestAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
             assertThatThrownBy(proof.requireActive()::run).isInstanceOfSatisfying(TapstateException.class,
                     failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
         }
@@ -193,6 +193,7 @@ class StorageAuthenticationTest {
         when(configuration.bindings()).thenReturn(mock(StorageBindingStore.class));
         when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(scope, phase.get(),
                 phase.get() == StorageSetupStateStore.Phase.CONFIG_PREPARED ? 0 : 1));
+        when(states.loadView()).thenAnswer(ignored -> new StorageSetupStateStore.View(states.load(), Optional.empty(), Optional.empty()));
         try (var authentication = new StorageAuthentication(configuration, cloud, new CloudSdkBridge(cloud, sdk),
                 new RandomTokenSecrets(), clock, new byte[32])) {
             var original = authentication.managed();
@@ -203,13 +204,36 @@ class StorageAuthenticationTest {
             var counted = spy(temporary);
             var service = (io.tapstate.control.core.CloudSessionService)org.springframework.test.util.ReflectionTestUtils.getField(original.service(), "sessions");
             org.springframework.test.util.ReflectionTestUtils.setField(service, "sessions", counted);
+            clearInvocations(states);
+            assertThat(authentication.credentials().authenticateContext("malformed-cookie")).isEmpty();
+            verifyNoInteractions(states);
             var proof = authentication.credentials().authenticateContext(created.token()).orElseThrow();
+            verify(states, times(1)).loadView();
+            assertThat(proof.setupScope()).contains(scope);
             assertThat(proof.storageScope()).isEmpty();
             assertThat(proof.organizationId()).contains("organization");
             verify(counted, times(1)).authenticate(any(), anyString(), anyString(), any(), any());
+            var evidence = proof.evidence().orElseThrow();
+            clearInvocations(configuration, states);
+            evidence.requireLocallyActive().run();
+            verifyNoInteractions(configuration, states);
             clearInvocations(counted);
             proof.requireActive().run();
             verify(counted, times(1)).authenticate(any(), anyString(), anyString(), any(), any());
+            var recovered = new CachePreparation(scope.operationId(),
+                    new CacheAuthScope(scope.clusterId(), 1, StorageBinding.Mode.CLOUD, "recovered-incarnation", 2));
+            doReturn(new StorageSetupStateStore.View(
+                    new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.STORAGE_BOUND, 1),
+                    Optional.empty(), Optional.of(recovered))).when(states).loadView();
+            assertThatThrownBy(() -> authentication.credentials().authenticateContext(created.token()))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            doThrow(StorageRuntime.unavailable()).when(states).loadView();
+            assertThatThrownBy(() -> authentication.credentials().authenticateContext(created.token()))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            doAnswer(ignored -> new StorageSetupStateStore.View(states.load(), Optional.empty(), Optional.empty()))
+                    .when(states).loadView();
             phase.set(StorageSetupStateStore.Phase.COMPLETE);
             assertThatThrownBy(proof.requireActive()::run).isInstanceOf(TapstateException.class);
             assertThatThrownBy(authentication::managed).isInstanceOf(TapstateException.class);
@@ -217,6 +241,8 @@ class StorageAuthenticationTest {
             assertThatThrownBy(() -> original.service().invalidateJwt("jti")).isInstanceOf(TapstateException.class);
             verify(configuration, never()).users();
             verify(configuration, never()).tokens();
+            temporary.close();
+            assertThatThrownBy(evidence.requireLocallyActive()::run).isInstanceOf(TapstateException.class);
         }
     }
 

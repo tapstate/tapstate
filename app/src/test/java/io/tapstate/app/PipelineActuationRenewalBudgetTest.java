@@ -1,18 +1,22 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -46,7 +50,7 @@ class PipelineActuationRenewalBudgetTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void aQueuedFastPathPermitSpendsItsDeadlineWhileWaitingForIo(boolean scoped) throws Exception {
+    void onlyLegacyPermitWaitsForAnInFlightRenewal(boolean scoped) throws Exception {
         try (var io = new ControlledIo(); var callers = Executors.newFixedThreadPool(2)) {
             var owner = io.owner(scoped);
             var original = scoped ? seedOne(io, owner, IDS.getFirst()) : owner.permit(IDS.getFirst()).claim();
@@ -61,7 +65,7 @@ class PipelineActuationRenewalBudgetTest {
                             ? owner.permit(scope(IDS.getFirst())).granted() : owner.permit(IDS.getFirst()).granted()));
                     return granted.get();
                 });
-                assertThat(queued.get(1, TimeUnit.SECONDS)).isFalse();
+                assertThat(queued.get(1, TimeUnit.SECONDS)).isEqualTo(scoped);
                 assertThat(renewal.isDone()).isFalse();
                 assertThat(io.attempts).containsExactly(IDS.getFirst());
             } finally {
@@ -71,16 +75,41 @@ class PipelineActuationRenewalBudgetTest {
         }
     }
 
+    @Test void unconfirmedRenewalReadsBackTheCommittedLeaseBeforeWritingAgain() throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner();
+            var id = IDS.getFirst();
+            var original = seedOne(io, owner, id);
+            doAnswer(call -> {
+                io.attempts.add(id);
+                io.raw.clockAt(original.leaseUntil().minus(TTL).plus(RENEW));
+                assertThat(io.raw.renew(call.getArgument(0), call.getArgument(1))).isPresent();
+                throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                        "commit reply lost");
+            }).when(io.store).renew(any(), any());
+            when(io.store.readPipeline(scope(id))).thenAnswer(call -> io.raw.read(original.key()));
+            io.makeDue();
+            owner.renewDue();
+            io.localOffset.addAndGet(Duration.ofSeconds(2).toNanos());
+            owner.renewDue();
+
+            var current = owner.permit(scope(id)).claim();
+            assertThat(WorkloadClaimFence.from(current)).isEqualTo(WorkloadClaimFence.from(original));
+            assertThat(current.leaseUntil()).isAfter(original.leaseUntil());
+            assertThat(io.attempts).containsExactly(id);
+        }
+    }
+
     @Test void independentRenewalsDoNotSpendTheUncontactedTailsBudget() throws Exception {
         try (var io = new ControlledIo()) {
             var owner = io.owner();
             var originals = seed(io, owner, 5);
             io.makeDue();
-            io.delayMillis = 3000;
+            io.delayMillis = 1000;
             owner.renewDue();
             io.awaitQuiescence(deadline(5000));
             assertThat(io.attempts).containsExactlyElementsOf(IDS.subList(0, 5));
-            assertThat(io.allowances).allSatisfy(remaining -> assertThat(remaining).isGreaterThan(Duration.ofSeconds(9).toNanos()));
+            assertThat(io.allowances).allSatisfy(remaining -> assertThat(remaining).isBetween(Duration.ofSeconds(1).toNanos(), RENEW.dividedBy(2).toNanos()));
             io.delayMillis = 0;
             io.makeDue();owner.renewDue();
             io.makeDue();owner.renewDue();
@@ -96,19 +125,19 @@ class PipelineActuationRenewalBudgetTest {
             var interval = Duration.ofSeconds(intervalSeconds);
             var owner = io.owner(true, interval);
             var originals = seed(io, owner, oldCount);
-            io.localOffset.addAndGet(interval.toNanos());io.delayMillis = 4000;
+            io.localOffset.addAndGet(interval.toNanos());io.delayMillis = 1000;
             io.release = new CountDownLatch(1);
             var renewal = callers.submit(owner::renewDue);
             try {
                 assertThat(io.entered.await(2, TimeUnit.SECONDS)).isTrue();
                 String newcomer = IDS.get(oldCount);
                 var admitting = callers.submit(() -> seedOne(io, owner, newcomer));
-                awaitQueuedAdmission(owner);
+                originals.add(admitting.get(3, TimeUnit.SECONDS));
+                assertThat(renewal.isDone()).isFalse();
                 io.release.countDown();
-                originals.add(admitting.get(15, TimeUnit.SECONDS));
                 renewal.get(40, TimeUnit.SECONDS);
                 assertThat(io.attempts).containsExactlyElementsOf(IDS.subList(0, oldCount));
-                Thread.sleep(1000);
+                io.localOffset.addAndGet(interval.toNanos());
                 owner.renewDue();
                 // The newcomer's acquire reply precedes later tail renewals, so it gets an earlier turn.
                 assertThat(io.attempts.subList(oldCount, oldCount + 2)).contains(newcomer);
@@ -130,12 +159,11 @@ class PipelineActuationRenewalBudgetTest {
             var renewal = callers.submit(owner::renewDue);
             try {
                 assertThat(io.entered.await(2, TimeUnit.SECONDS)).isTrue();
-                var queued = callers.submit(() -> owner.permit(scope(IDS.get(6))));
-                awaitQueuedAdmission(owner);
                 owner.stopForShutdown();
+                var queued = callers.submit(() -> owner.permit(scope(IDS.get(6))));
                 assertThatThrownBy(() -> owner.awaitStopped(deadline(50)))
                         .isInstanceOf(io.tapstate.core.common.TapstateException.class);
-                assertThat(renewal.isDone()).isFalse();assertThat(queued.isDone()).isFalse();
+                assertThat(renewal.isDone()).isFalse();
                 assertThat(io.tasks).anyMatch(task -> !task.isDone());
                 io.release.countDown();
                 renewal.get(2, TimeUnit.SECONDS);
@@ -152,6 +180,41 @@ class PipelineActuationRenewalBudgetTest {
                 io.release.countDown();owner.stopForShutdown();
                 renewal.get(12, TimeUnit.SECONDS);owner.awaitStopped(deadline(5000));
             }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void confirmedRefusalDoesNotRetryAndConflictsHaveABoundedBudget(boolean conflict) throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner();
+            var id = IDS.getFirst();
+            var original = seedOne(io, owner, id);
+            if (conflict) {
+                io.renewalFailure = new TapstateException(
+                        IoError.STORE_UNAVAILABLE, Map.of("detail", "MongoCommandException code=112"), null);
+            } else {
+                assertThat(io.raw.release(original)).isTrue();
+            }
+            io.makeDue();
+            for (int second = 0; second < 8; second++) {
+                owner.renewDue();
+                io.localOffset.addAndGet(Duration.ofSeconds(1).toNanos());
+            }
+            assertThat(io.attempts).hasSize(conflict ? 8 : 1);
+            if (conflict) {
+                io.localOffset.addAndGet(TTL.toNanos());
+                owner.renewDue();
+                assertThat(io.attempts).hasSize(8);
+            }
+            assertThat(owner.permit(scope(id)).granted()).isFalse();
+            if (conflict) assertThat(io.raw.release(original)).isTrue();
+            io.makeDue();
+            var successor = owner.permit(scope(id));
+            assertThat(successor.granted()).isTrue();
+            var failure = owner.renewalFailure(scope(id), successor.claim()).orElseThrow();
+            assertThat(failure.code().code()).isEqualTo(conflict
+                    ? "engine.execution-renewal-failed" : "engine.execution-lease-lost");
         }
     }
 
@@ -179,14 +242,6 @@ class PipelineActuationRenewalBudgetTest {
         }
     }
 
-    private static void awaitQueuedAdmission(PipelineActuationOwnership owner) throws Exception {
-        var field = PipelineActuationOwnership.class.getDeclaredField("ioAdmission");field.setAccessible(true);
-        var gate = (java.util.concurrent.locks.ReentrantLock) field.get(owner);
-        long limit = deadline(2000);
-        while (!gate.hasQueuedThreads() && System.nanoTime() < limit) Thread.sleep(1);
-        assertThat(gate.hasQueuedThreads()).isTrue();
-    }
-
     private static PipelineIntentScope scope(String id) {
         return new PipelineIntentScope("cluster-a", 3, "cache-a", id, 1);
     }
@@ -198,6 +253,7 @@ class PipelineActuationRenewalBudgetTest {
         private final InMemoryWorkloadClaimStore raw = new InMemoryWorkloadClaimStore();
         private final DeadlineWorkloadClaimStore store = mock(DeadlineWorkloadClaimStore.class);
         private final java.util.concurrent.ExecutorService worker = Executors.newSingleThreadExecutor();
+        private final java.util.concurrent.ExecutorService renewalWorker = Executors.newSingleThreadExecutor();
         private final List<Future<?>> tasks = new CopyOnWriteArrayList<>();
         private final List<String> attempts = new CopyOnWriteArrayList<>();
         private final List<Long> allowances = new CopyOnWriteArrayList<>();
@@ -208,10 +264,13 @@ class PipelineActuationRenewalBudgetTest {
         private final CountDownLatch entered = new CountDownLatch(1);
         private volatile CountDownLatch release = new CountDownLatch(0);
         private volatile long delayMillis;
+        private volatile RuntimeException renewalFailure;
 
         private ControlledIo() {
-            doAnswer(call -> bounded(call.getArgument(0), call.getArgument(1), call.getArgument(2)))
+            doAnswer(call -> bounded(worker, call.getArgument(0), call.getArgument(1), call.getArgument(2)))
                     .when(store).withDeadline(anyLong(), any(), any());
+            doAnswer(call -> bounded(renewalWorker, call.getArgument(0), call.getArgument(1), call.getArgument(2)))
+                    .when(store).withRenewalDeadline(anyLong(), any(), any());
             doAnswer(call -> { awaitQuiescence(call.getArgument(0));return null; })
                     .when(store).awaitQuiescence(anyLong());
             when(store.acquirePipeline(any(), any(), anyLong(), any())).thenAnswer(call -> {
@@ -231,6 +290,7 @@ class PipelineActuationRenewalBudgetTest {
                 entered.countDown();
                 if (!release.await(20, TimeUnit.SECONDS)) throw new AssertionError("IO was not released");
                 Thread.sleep(delayMillis);
+                if (renewalFailure != null) throw renewalFailure;
                 syncClock();return raw.renew(original, call.getArgument(1));
             });
         }
@@ -256,8 +316,8 @@ class PipelineActuationRenewalBudgetTest {
         private void makeDue() { localOffset.addAndGet(RENEW.toNanos()); }
         private void syncClock() { raw.clockAt(epoch.plusNanos(System.nanoTime() - started)); }
 
-        private Object bounded(long deadline, Runnable guard, Supplier<?> action) {
-            Future<?> task = worker.submit(() -> {
+        private Object bounded(java.util.concurrent.ExecutorService lane, long deadline, Runnable guard, Supplier<?> action) {
+            Future<?> task = lane.submit(() -> {
                 budget.set(deadline);
                 try { guard.run();var value = action.get();guard.run();return value; }
                 finally { budget.remove(); }
@@ -284,7 +344,9 @@ class PipelineActuationRenewalBudgetTest {
 
         @Override public void close() throws Exception {
             release.countDown();worker.shutdown();
+            renewalWorker.shutdown();
             assertThat(worker.awaitTermination(20, TimeUnit.SECONDS)).isTrue();
+            assertThat(renewalWorker.awaitTermination(20, TimeUnit.SECONDS)).isTrue();
         }
     }
 }

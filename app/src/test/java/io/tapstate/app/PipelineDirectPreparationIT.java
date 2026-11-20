@@ -120,6 +120,7 @@ class PipelineDirectPreparationIT {
                 stream.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("before-loss")));
                 if(mode.equals("ring-reopen"))stream.listener.get().onBatch(List.of(Envelope.insert(2,"orders",Map.of("id",3),null),
                         Envelope.insert(3,"orders",Map.of("id",4),null)),Optional.of(new SourcePosition("retained-old-high-watermark")));
+                if (mode.equals("ring-reopen")) awaitCheckpoint(stores, chain, "retained-old-high-watermark");
                 String oldRing=SrsRingbuffer.ringName(chain,"orders");long oldHigh=stores.log().largestSequence(oldRing);
                 status(f,f.scope,fence,"STOPPED");
                 assertThat(f.configuration.intents().compareAndSet(f.scope,0,new io.tapstate.core.lifecycle.DesiredState("flow",
@@ -350,8 +351,9 @@ class PipelineDirectPreparationIT {
                 assertThat(binding.recoveryAfter()).containsEntry("orders",-1L).containsEntry("quiet",-1L);
                 physical.started();
                 physical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("after-delayed-start")));
+                awaitCheckpoint(stores, binding.run().miningChainId(), "after-delayed-start");
                 var after=stores.chains().load(binding.run().miningChainId()).orElseThrow();
-                assertThat(after.epoch()).isOne();assertThat(after.checkpoint().position().token()).isEqualTo("after-delayed-start");
+                assertThat(after.epoch()).isOne();
                 assertThat(run.captureFailure("flow")).isEmpty();
                 if(snapshot)awaitSharedCounts(run,"flow");
                 run.stopCapture("flow",false);assertThat(physical.closed).hasValue(1);
@@ -528,8 +530,19 @@ class PipelineDirectPreparationIT {
         assertThat(states.compareAndSwap(scope.pipelineId(),prior.epoch(),status,CLOCK.instant())).isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
     }
     private static void awaitNative(java.util.function.BooleanSupplier ready) throws InterruptedException {
-        long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();while(!ready.getAsBoolean() && System.nanoTime()<deadline)Thread.sleep(10);
+        awaitNative(Duration.ofSeconds(10), ready);
+    }
+
+    private static void awaitNative(Duration timeout, java.util.function.BooleanSupplier ready) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (!ready.getAsBoolean() && System.nanoTime() < deadline) Thread.sleep(10);
         assertThat(ready.getAsBoolean()).isTrue();
+    }
+
+    private static void awaitCheckpoint(SrsStores stores, String chain, String token) throws InterruptedException {
+        awaitNative(Duration.ofSeconds(20), () -> stores.chains().load(chain)
+                .map(SrsChainState::checkpoint).map(checkpoint -> checkpoint.position().token())
+                .filter(token::equals).isPresent());
     }
     private static CaptureOwnership cacheOwnership(Fixture f,WorkloadOwner owner) {
         return cacheOwnership(f, owner, () -> true);
@@ -640,8 +653,9 @@ class PipelineDirectPreparationIT {
                 }
                 var oldPhysical=ports.stream().filter(port -> port.stream!=null).findFirst().orElseThrow();
                 oldPhysical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("before-change")));
-                var oldCheckpoint=stores.chains().load(original.run().miningChainId()).orElseThrow().checkpoint();
                 first.stopCapture("flow",false);assertThat(oldPhysical.closed).hasValue(1);
+                var oldCheckpoint=stores.chains().load(original.run().miningChainId()).orElseThrow().checkpoint();
+                assertThat(oldCheckpoint.position().token()).isEqualTo("before-change");
                 var intent=f.configuration.intents().load("flow").orElseThrow();
                 assertThat(f.configuration.intents().compareAndSet(f.scope,intent.intentRevision(),new io.tapstate.core.lifecycle.DesiredState(
                         "flow",io.tapstate.core.lifecycle.PipelineState.STOPPED,intent.desired().revision(),true))).isTrue();
@@ -1525,11 +1539,28 @@ class PipelineDirectPreparationIT {
                 var business = committed.preparation().businessScope(); cache.prepareFirstAuth(committed.firstCreation().orElseThrow()); cache.prepareInitialBusiness(committed.preparation(),ACTIVE);
                 configuration.artifacts().create(source("input","x",null)); configuration.artifacts().create(pipeline("input",false,ReadMode.CDC_ONLY,"latest",null));
                 var scope = new PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),"flow",1);
-                var node = WorkloadClaimFence.from(cache.workloadClaims(business).acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,OWNER.nodeId()),OWNER,1,TTL).claim());
-                scenario.run(new Fixture(configuration,cache,configDb,cacheDb,cacheConnection,scope,node));
+                var claims = (DeadlineWorkloadClaimStore) cache.workloadClaims(business);
+                var node = WorkloadClaimFence.from(claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,OWNER.nodeId()),OWNER,1,TTL).claim());
+                try (var claimDrain = (AutoCloseable) () -> closeCacheClaims(cache, claims)) {
+                    scenario.run(new Fixture(configuration,cache,configDb,cacheDb,cacheConnection,scope,node));
+                }
             } finally { configDb.drop(); cacheDb.drop(); }
         } catch (RuntimeException | Error failure) { throw failure; }
         catch (Exception failure) { throw new AssertionError(failure); }
+    }
+    static void closeCacheClaims(MongoCacheDomain cache, DeadlineWorkloadClaimStore claims) {
+        try { cache.close(); }
+        catch (TapstateException busy) {
+            if (busy.code() != IoError.WORKLOAD_CLAIM_FENCED) throw busy;
+            // The refused close stops new admission; original I/O and transaction cleanup must finish.
+            try {
+                claims.awaitQuiescence(System.nanoTime() + Duration.ofSeconds(5).toNanos());
+                cache.close();
+            } catch (RuntimeException | Error unresolved) {
+                if (unresolved != busy) unresolved.addSuppressed(busy);
+                throw unresolved;
+            }
+        }
     }
     private record Fixture(MongoConfigurationDomain configuration,MongoCacheDomain cache,MongoDatabase configDatabase,MongoDatabase cacheDatabase,
             StorageBinding.Connection cacheConnection,PipelineIntentScope scope,WorkloadClaimFence node) {

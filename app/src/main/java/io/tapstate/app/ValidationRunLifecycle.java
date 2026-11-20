@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 final class ValidationRunLifecycle {
     enum Readiness { WAITING_FOR_INITIAL_LOAD, UNKNOWN, READY }
-    enum ReadPhase { PENDING,READING,READ_COMPLETE }
+    enum ReadPhase { PENDING,READING,READ_COMPLETE,READ_FAILED }
     /** Logical read/publication progress only; READ_COMPLETE does not claim physical drain or a successful run. */
     record Table(String mappingId,ReadPhase phase) implements java.io.Serializable {
         Table{ValidationError.fieldName(mappingId,"run.tableProgress");Objects.requireNonNull(phase);}
@@ -73,7 +73,7 @@ final class ValidationRunLifecycle {
     private boolean desiredComplete;
     private ValidationRunState terminalChoice;
     private ValidationControlStore.Transition pendingTransition;
-    private boolean admissionRejected, joinRejected;
+    private boolean admissionRejected, joinRejected, atomicBirth;
     // Publishes the execution for concurrent stop; synchronized transitions and cancel own its state.
     @SuppressWarnings("java:S3077")
     private volatile Execution execution;
@@ -96,6 +96,20 @@ final class ValidationRunLifecycle {
         return scheduledDue == null ? admissions.reserve(original.admission()) : admissions.reserveScheduled(original.admission(), scheduledDue, new ValidationScheduleCalculator());
     }
 
+    private ValidationReportAdmission.Reservation reserveForActivation() {
+        if (scheduledDue == null && original.snapshot().method() == ValidationMethod.COUNT
+                && !stopping.get() && activation.readiness() == Readiness.READY) {
+            var opened = admissions.reserveAndOpen(new ValidationReportAdmission.Open(original.admission(), original.snapshot()));
+            if (opened.isPresent()) {
+                var answer = opened.orElseThrow();
+                born = answer == ValidationReportAdmission.Reservation.RESERVED || answer == ValidationReportAdmission.Reservation.DUPLICATE;
+                atomicBirth = born;
+                return answer;
+            }
+        }
+        return reserveOriginal();
+    }
+
     /** Deadline/owner-loss safe: local fences and cancellation signal do not perform durable I/O. */
     void stop() { stopping.set(true); local.sealPublication(); var current = execution; if (current != null) current.cancel(); }
     void fail(Throwable reported) { failure.record(Objects.requireNonNull(reported)); stop(); }
@@ -112,7 +126,7 @@ final class ValidationRunLifecycle {
                 local.requireOwner();
                 reconcileTransition();
                 if (!reserved) {
-                    var answer = reserveOriginal();
+                    var answer = reserveForActivation();
                     if (answer == ValidationReportAdmission.Reservation.RESERVED || answer == ValidationReportAdmission.Reservation.DUPLICATE) reserved = true;
                     else { admissionRejected = true; fail(invalid("run.originalAdmission")); }
                 }
@@ -120,7 +134,11 @@ final class ValidationRunLifecycle {
                     if (stopping.get()) joinRejected = true;
                     else {
                         ValidationControlStore.Join answer;
-                        try { answer = control.join(original); }
+                        try {
+                            var direct = joinReadyCount();
+                            if (waiting) return settled();
+                            answer = direct.isPresent() ? direct.orElseThrow() : control.join(original);
+                        }
                         catch (TapstateException uncertain) {
                             var permission = reserveOriginal();
                             if (permission != ValidationReportAdmission.Reservation.CLOSED) throw uncertain;
@@ -204,6 +222,32 @@ final class ValidationRunLifecycle {
             observeDrain();
         }
         return status();
+    }
+
+    private java.util.Optional<ValidationControlStore.Join> joinReadyCount() {
+        if (!atomicBirth) return java.util.Optional.empty();
+        try {
+            var readiness = activation.prepare();
+            waiting = readiness != Readiness.READY;
+            if (readiness == Readiness.UNKNOWN) {
+                unknown = true;
+                controlFailure = invalid("run.initialEvidenceUnknown");
+            }
+            if (waiting) return java.util.Optional.empty();
+            if (execution == null) {
+                execution = Objects.requireNonNull(activation.create());
+                if (!execution.identity().equals(original.identity())) throw invalid("run.executionIdentity");
+                activation.prepared(execution);
+            }
+        } catch (TapstateException refused) {
+            fail(refused);
+            return java.util.Optional.of(ValidationControlStore.Join.GENERATION_CLOSED);
+        }
+        if (stopping.get()) return java.util.Optional.of(ValidationControlStore.Join.GENERATION_CLOSED);
+        var result = control.joinRunning(original);
+        if (result.filter(answer -> answer == ValidationControlStore.Join.JOINED
+                || answer == ValidationControlStore.Join.ALREADY_JOINED).isPresent()) state = ValidationRunState.RUNNING;
+        return result;
     }
 
     private void finish() {

@@ -1,5 +1,8 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -29,6 +32,15 @@ final class WorkloadClaimDocuments {
                 .append("executionGeneration", fence.executionGeneration())
                 .append("topologyRevision", fence.topologyRevision())
                 .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+    }
+
+    static Document livePipeline(ClientSession session, MongoDatabase database, WorkloadClaimFence fence) {
+        return livePipeline(session, SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), fence);
+    }
+
+    static Document livePipeline(ClientSession session, MongoCollection<Document> claims, WorkloadClaimFence fence) {
+        return new MongoWorkloadClaimStore(claims).inStrictSession(session).nodeBackedFilter(fence)
+                .orElseGet(() -> live(fence));
     }
 
     static WorkloadClaimFence readNode(Document stored) {

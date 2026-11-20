@@ -2,9 +2,12 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.spi.store.StartLoad;
+import io.tapstate.spi.store.DesiredStore;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * What a start would do to each target its pipeline writes: load it afresh, carry on from where the
@@ -17,11 +20,22 @@ import java.util.Objects;
  *                judgement reads the pipeline's records rather than any one target's
  * @param entries one per target table, in the order the pipeline declares its write elements
  */
-public record StartPlan(StartLoad load, List<Entry> entries) {
+public record StartPlan(StartLoad load, List<Entry> entries, Supplier<Optional<DesiredStore.StartPreparation>> preparation,
+        java.util.function.Function<String, Optional<io.tapstate.core.model.SourceResource>> targetConnections) {
+
+    public StartPlan(StartLoad load, List<Entry> entries) {
+        this(load, entries, Optional::empty);
+    }
+
+    public StartPlan(StartLoad load, List<Entry> entries, Supplier<Optional<DesiredStore.StartPreparation>> preparation) {
+        this(load, entries, preparation, ignored -> Optional.empty());
+    }
 
     public StartPlan {
         Objects.requireNonNull(load, "load");
         entries = List.copyOf(entries);
+        Objects.requireNonNull(preparation, "preparation");
+        Objects.requireNonNull(targetConnections, "targetConnections");
     }
 
     /**

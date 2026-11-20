@@ -10,7 +10,7 @@ import java.util.Objects;
 import java.util.function.Consumer;
 
 /**
- * Receives one native exact count, never rows or codec values. The caller must establish exact count
+ * Receives one native count, never rows or codec values. The caller must establish count
  * semantics, predicate equivalence and table existence, and supply an independent context/loader and
  * admitted cancellable I/O call. An optional schema-discovery estimate is not an admissible input.
  * Authorization guards must be nonblocking; cancellation belongs on separate admitted I/O. These

@@ -13,6 +13,24 @@ public interface RequiredNoteStore {
     /** Opens an existing scope for the captured persistent owner; missing or inconsistent facts refuse. */
     RequiredNoteScope open(RequiredNoteOwner owner);
 
+    record CaptureScopes(RequiredNoteScope primary, RequiredNoteScope global) {}
+
+    default CaptureScopes openCaptureScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {
+        return new CaptureScopes(open(primary), open(global));
+    }
+
+    record SharedStartup(List<RequiredNoteCarry> carries, boolean blocked, RequiredNoteOrigin origin) {
+        public SharedStartup { carries = List.copyOf(carries); }
+    }
+
+    default SharedStartup sharedStartup(RequiredNoteScope scope) {
+        return new SharedStartup(carries(scope), allCarryBlocked(scope), origin(scope));
+    }
+
+    default RequiredNoteOrigin prepareSharedOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin) {
+        return prepareOrigin(scope, origin);
+    }
+
     RequiredNoteValue read(RequiredNoteScope scope, String key);
 
     /** Explicit preparation before plugin code; a retained or missing published origin is never overwritten. */

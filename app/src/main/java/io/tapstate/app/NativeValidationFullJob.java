@@ -22,6 +22,7 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
         default List<ValidationCountScan.Mapping> counts(){return List.of();}
         /** Actual native/callback/row drain, including cancellation and failed opening. */
         boolean drained();
+        default void finishMapping(Runnable requireCurrent) {}
         /** Late native/cleanup failures remain observable until every original handle has drained. */
         default Throwable failure(){return null;}
         /** Idempotently close original resources on admitted I/O, including concurrent cancellation. This call alone does not prove drain. */
@@ -114,6 +115,7 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
         @SuppressWarnings("java:S3077")
         volatile ValidationLocalBudget.Reservation planLease;
         volatile boolean workerOutstanding,finished,cleanupExited;
+        private final java.util.Set<String> failedMappings = java.util.concurrent.ConcurrentHashMap.newKeySet();
         Work(ValidationRunIdentity identity,ValidationRunSpec spec,ValidationMemberResources.Run allocation) {
             this.identity=identity;this.spec=spec;this.allocation=allocation;
         }
@@ -141,10 +143,11 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
                         var result=original.access().results().publishCount(new ValidationResultStore.CountWrite(
                                 new ValidationResultStore.Report(identity,original.request.startSequence()),spec,check));
                         if(result!=ValidationResultStore.Publication.APPLIED&&result!=ValidationResultStore.Publication.DUPLICATE)throw invalid("countPublicationClosed");
-                    });
+                    }, this::publishTableFailure);
                     require();counts.run();
                 }else{
-                    scan=new ValidationFullScan(identity,spec,plan.mappings(),this::require,this::publishRoot);
+                    scan=new ValidationFullScan(identity,spec,plan.mappings(),this::require,this::publishRoot,
+                            this::publishTableFailure, () -> plan.finishMapping(this::require));
                     require();scan.run();
                 }
             }
@@ -155,6 +158,25 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
         void require(){
             throwFailure();if(cancelled.get())throw new NativeValidationCancellation(identity.owner().nodeId());
             original.requireReserved();
+        }
+        private void publishTableFailure(String mapping, ValidationPairException failure) {
+            require();
+            var diagnosis = runs.tableDiagnosis(failure.diagnosis());
+            var message = new StringBuilder();
+            int bytes = 0;
+            for (var characters = diagnosis.message().codePoints().iterator(); characters.hasNext();) {
+                int point = characters.nextInt();
+                int width = point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+                if (bytes + width > 256) break;
+                message.appendCodePoint(point);
+                bytes += width;
+            }
+            var summary = new ValidationTableFailure(mapping, failure.side(), diagnosis.code(), message.toString());
+            var report = new ValidationResultStore.Report(identity, original.request.startSequence());
+            var result = original.access().results().publishTableFailure(new ValidationResultStore.TableFailureWrite(report, spec, summary));
+            if (result != ValidationResultStore.Publication.APPLIED && result != ValidationResultStore.Publication.DUPLICATE)
+                throw invalid("tableFailurePublicationClosed");
+            failedMappings.add(mapping);
         }
         void publishRoot(ValidationRootCheck check){
             if(check.observedAgreement())return;
@@ -188,7 +210,8 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
             String reading=row!=null?row.readingMapping():scalar!=null?scalar.readingMapping():null;
             var result=new ArrayList<ValidationRunLifecycle.Table>();
             for(int index=0;index<spec.task().mappings().size();index++){
-                var id=spec.task().mappings().get(index).mappingId();result.add(new ValidationRunLifecycle.Table(id,index<completed?ValidationRunLifecycle.ReadPhase.READ_COMPLETE:
+                var id=spec.task().mappings().get(index).mappingId();result.add(new ValidationRunLifecycle.Table(id,failedMappings.contains(id)?ValidationRunLifecycle.ReadPhase.READ_FAILED:
+                        index<completed?ValidationRunLifecycle.ReadPhase.READ_COMPLETE:
                         id.equals(reading)?ValidationRunLifecycle.ReadPhase.READING:ValidationRunLifecycle.ReadPhase.PENDING));
             }
             return List.copyOf(result);

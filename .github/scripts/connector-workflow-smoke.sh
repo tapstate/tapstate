@@ -7,7 +7,8 @@ export CONNECTOR_WORKFLOW_ROOT
 python3 - <<'PY'
 import os,pathlib,re
 root=pathlib.Path(os.environ['CONNECTOR_WORKFLOW_ROOT'])
-workflow=(root/'.github/workflows/nightly-real-connectors.yml').read_text()
+workflow=(root/'.github/workflows/real-connectors.yml').read_text()
+nightly=(root/'.github/workflows/nightly-test.yml').read_text()
 release=(root/'.github/workflows/release.yml').read_text()
 def check(text):
     # Conventional top-level job blocks; comments cannot supply an executable gate.
@@ -66,7 +67,10 @@ def check(text):
     for line in jars.splitlines():
         if 'connector-cache.sh prepare ' in line or 'connector-cache.sh seal ' in line or 'scripts/build-real-connectors.sh --modules ' in line:
             assert '--checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source"' in line
-    assert "options: [upstream, release]" in text and "default: upstream" in text
+    assert "workflow_call:" in text and "workflow_dispatch:" not in text and "schedule:" not in text
+    assert 'SOURCE_SHA: ${{ inputs.source-sha }}' in text
+    assert text.count('ref: ${{ inputs.source-sha }}') == 4
+    assert jars.count('--source-sha "$SOURCE_SHA"') == 3
     assert "name: ${{ inputs.connector-inputs == 'release' && 'real-connectors-release' || 'real-connectors' }}" in aggregate
     assert 'name: connector-input-identity' in jars and 'name: connector-input-identity' in aggregate
     assert '_connector-inputs.py prepare-release' in jars and '_connector-inputs.py verify' in jars
@@ -80,13 +84,10 @@ def check(text):
         if 'actions/checkout@' not in block:
             assert "if: env.CONNECTOR_INPUT_MODE == 'upstream'" in block, 'upstream build step can run in Release mode'
     assert '-Dit.test=' not in text  # No second selector list can drift from source inventory.
-assert "group: real-connectors-sharded-${{ github.ref }}-${{ inputs.connector-inputs || 'upstream' }}" in workflow
-assert 'cancel-in-progress: true' in workflow
 check(workflow)
-assert '-f connector-inputs=release' not in release
-assert '--required real-connectors && break' in release
-assert '--required real-connectors-release && break' not in release
-assert release.count('sleep 20')==2 and 'sleep 60' not in release
+assert 'options: [upstream, release]' in nightly and 'default: upstream' in nightly
+assert 'connector-inputs: upstream' in release
+assert 'gh workflow run real-connectors.yml' not in release
 for before,after in [
     ('  real-connectors:', '  real-connectors-renamed:'),
     ('real-connectors-release', 'unbound-release-verdict'),

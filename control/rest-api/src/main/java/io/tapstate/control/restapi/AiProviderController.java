@@ -7,7 +7,7 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.ManagedAuthenticationContext;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.core.common.JsonWriter;
-import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.AiProviderSettingsStore;
 import io.tapstate.control.core.AiProviderSettings;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
@@ -78,10 +78,26 @@ class AiProviderController {
             CHECK_CAPACITY.release();
         }
     }
+    @Verb("ai-provider.models") @PostMapping("/ai-provider-settings:models")
+    ResponseEntity<Map<String, Object>> models(HttpServletRequest request, @RequestBody AiProviderSettings settings) {
+        var workspace = workspace(request);
+        if (!CHECK_CAPACITY.tryAcquire()) throw AiProviderService.error(ControlError.AI_OVERLOADED);
+        try {
+            var models = client.models(service().resolveModels(workspace.owner(), settings));
+            workspace.requireActive().run();
+            return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Map.of("models", models));
+        } finally {
+            CHECK_CAPACITY.release();
+        }
+    }
     record Workspace(String owner, Runnable requireActive) { }
     String owner(HttpServletRequest request) { return workspace(request).owner(); }
     Workspace workspace(HttpServletRequest request) {
-        if (mode != AuthenticationMode.CLOUD) throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "on-prem"), null);
+        if (mode == AuthenticationMode.ON_PREM) {
+            Runnable active = AuthenticatedCaller.requestGuard();
+            active.run();
+            return new Workspace(AiProviderSettingsStore.ON_PREM_OWNER, active);
+        }
         var provider = contexts == null ? null : contexts.getIfAvailable();
         var selected = provider == null ? null : provider.current();
         CloudAuthenticationService authentication = selected == null ? cloud.getIfAvailable() : selected.service();

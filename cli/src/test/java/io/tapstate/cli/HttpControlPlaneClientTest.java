@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.JsonReader;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -12,9 +13,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 /**
  * The production HTTP reachability probe against a tiny in-JVM server: {@code GET /healthz} returning
@@ -881,6 +885,69 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    @Timeout(12)
+    void applyUsesTheHeavyBudgetWithoutRetryingTheWrite() throws Exception {
+        Duration probeBudget = Duration.ofMillis(500);
+        Duration heavyBudget = Duration.ofSeconds(3);
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        var executor = Executors.newVirtualThreadPerTaskExecutor();
+        server.setExecutor(executor);
+        server.createContext("/healthz", exchange -> {
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+        });
+        server.createContext("/api/artifacts:apply", exchange -> {
+            try (exchange) {
+                int request = requests.incrementAndGet();
+                exchange.getRequestBody().readAllBytes();
+                try {
+                    // The first response fits only the heavy budget; the second exceeds it too.
+                    Thread.sleep(request == 1 ? 1000 : 6000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                byte[] response = ("{\"outcomes\":[{\"id\":\"src_kfk\",\"kind\":\"source\","
+                        + "\"change\":\"CREATED\",\"contentHash\":\"h1\"}]}")
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, response.length);
+                exchange.getResponseBody().write(response);
+            }
+        });
+        server.start();
+        try (var client = new HttpControlPlaneClient(probeBudget, heavyBudget)) {
+            // Establish the connection before measuring server work against the read budgets.
+            assertThat(client.isHealthy(baseOf(server))).isTrue();
+            List<LocalDraft> drafts = List.of(new LocalDraft("src_kfk.tap.yml",
+                    "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
+            ApplyOutcome withinHeavyBudget = client.apply(baseOf(server), "tok", drafts);
+            int requestsAfterFirstApply = requests.get();
+            long started = System.nanoTime();
+            ApplyOutcome beyondHeavyBudget = client.apply(baseOf(server), "tok", drafts);
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
+
+            assertAll(
+                    () -> assertThat(withinHeavyBudget)
+                            .as("a valid apply response after the probe deadline but within the heavy budget")
+                            .isInstanceOfSatisfying(ApplyOutcome.Applied.class, applied ->
+                                    assertThat(applied.items()).containsExactly(
+                                            new ApplyOutcome.Item("src_kfk", "source", "CREATED"))),
+                    () -> assertThat(requestsAfterFirstApply).as("one request for the completed write").isEqualTo(1),
+                    () -> assertThat(beyondHeavyBudget).isInstanceOf(ApplyOutcome.Unreachable.class),
+                    () -> assertThat(elapsed).as("the ambiguous write waits for the heavy deadline")
+                            .isGreaterThanOrEqualTo(heavyBudget.minusMillis(500)),
+                    () -> assertThat(elapsed).as("the heavy deadline remains bounded")
+                            .isLessThan(heavyBudget.plusSeconds(2)),
+                    () -> assertThat(requests.get()).as("neither write is automatically retried").isEqualTo(2));
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            executor.close();
+        }
+    }
+
+    @Test
     void applyDecodesTheServerWarningsApartFromTheOutcomes() throws Exception {
         // The server carries an advisory finding as its code plus named params — the same shape the
         // validation diagnostics travel in — and the CLI renders it from its own bundled catalog.
@@ -1497,6 +1564,45 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void testAndLatestReadTheSameOptionalDiagnosticWithoutChangingLegacyChecks() throws Exception {
+        HttpServer server = apiServer("/api/connections", 200, """
+                {
+                  "connectionId": "orders",
+                  "connectorId": "mysql",
+                  "outcome": "FAILED",
+                  "testedAt": 1752000000000,
+                  "checks": [
+                    {"name": "Connect", "status": "FAILED", "message": "Try again",
+                     "diagnostic": {"code": "TS0060001", "causes": [
+                       {"code": "MYSQL43001", "arguments": ["orders", "primary"]},
+                       {"message": "Second cause", "references": [{"type": "connection", "id": "orders"}]}
+                     ], "futureField": "ignored"}},
+                    {"name": "Read log", "status": "WARNING", "reason": "Legacy reason",
+                     "diagnostic": {"cause": {"code": "DRIVER"}, "causes": [], "truncated": true}}
+                  ]
+                }
+                """, new AtomicReference<>());
+        try {
+            HttpControlPlaneClient client = new HttpControlPlaneClient();
+            ConnectionTestOutcome.Tested immediate = (ConnectionTestOutcome.Tested)
+                    client.test(baseOf(server), "tok", "orders", "mysql", Map.of());
+            ConnectionTestResultOutcome.Found latest = (ConnectionTestResultOutcome.Found)
+                    client.testResult(baseOf(server), "tok", "orders");
+
+            assertThat(latest.report()).isEqualTo(immediate.report());
+            assertThat(latest.report().checks()).containsExactly(
+                    new ConnectionReport.Check("Connect", "FAILED", "Try again", null, null, null,
+                            Map.of("code", "TS0060001", "causes", List.of(
+                                    Map.of("code", "MYSQL43001", "arguments", List.of("orders", "primary")),
+                                    Map.of("message", "Second cause", "references",
+                                            List.of(Map.of("type", "connection", "id", "orders")))))),
+                    new ConnectionReport.Check("Read log", "WARNING", null, "Legacy reason", null, null));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void testResultReturnsRejectedWithTheServerCodeAndMessageOnACodedErrorStatus() throws Exception {
         HttpServer server = apiServer("/api/connections/", 403,
                 "{\"code\":\"control.forbidden\",\"params\":{},\"message\":\"You lack the grade.\"}",
@@ -1516,6 +1622,29 @@ class HttpControlPlaneClientTest {
         assertThat(new HttpControlPlaneClient()
                 .testResult(unreachableBase(), "tok", "c"))
                 .isInstanceOf(ConnectionTestResultOutcome.Unreachable.class);
+    }
+
+    @Test
+    void preservesTheDiagnosticOfARefusedConnectionRequestInBothPaths() throws Exception {
+        HttpServer server = apiServer("/api/connections", 500, """
+                {"code":"connector.test-failed","message":"Unable to run the test",
+                 "params":{"connector":"postgres"},
+                 "diagnostic":{"causes":[{"code":"DRIVER"}],"truncated":true}}
+                """, new AtomicReference<>());
+        try {
+            var client = new HttpControlPlaneClient();
+            var params = Map.<String, Object>of("connector", "postgres");
+            var diagnostic = Map.<String, Object>of(
+                    "causes", List.of(Map.of("code", "DRIVER")), "truncated", true);
+            assertThat(client.test(baseOf(server), "tok", "orders", "postgres", Map.of()))
+                    .isEqualTo(new ConnectionTestOutcome.Rejected(
+                            "connector.test-failed", "Unable to run the test", params, diagnostic));
+            assertThat(client.testResult(baseOf(server), "tok", "orders"))
+                    .isEqualTo(new ConnectionTestResultOutcome.Rejected(
+                            "connector.test-failed", "Unable to run the test", params, diagnostic));
+        } finally {
+            server.stop(0);
+        }
     }
 
     // --- schema discovery: POST /api/connections:discover-schema, decodes the discovered model ---------
@@ -1716,6 +1845,17 @@ class HttpControlPlaneClientTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void anUnobservedTransitionCanOmitRuntimeState() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
+                "{\"pipelineId\":\"pl1\",\"displayState\":\"STARTING\","
+                        + "\"desiredState\":\"RUNNING\",\"hasArtifact\":true}", new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new StatusOutcome.NoObservation());
+        } finally { server.stop(0); }
     }
 
     @Test

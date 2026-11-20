@@ -162,6 +162,14 @@ public final class OperatorMapBindings implements AutoCloseable {
                 || (configuredDatabase != null && !configuredDatabase.equals(original.binding.placement().database()))) throw fenced();
         return original.store;
     }
+    /** Classifies the published coordinate without changing map configuration or authorizing backend I/O. */
+    public synchronized boolean isRootNestState(String namespace) {
+        OperatorPlacement placement = require(namespace).binding.placement();
+        return placement.resource() == OperatorPlacement.Resource.NEST_STATE
+                && placement.pathId().equals(OperatorMapCoordinates.path(List.of()))
+                && placement.namespace().equals(OperatorMapCoordinates.nestNamespace(
+                        OperatorMapCoordinates.NestMap.STATE, null));
+    }
     public synchronized KeyedStateStore join(String namespace) {
         Bound original = require(namespace);
         boolean join = switch (original.binding.placement().resource()) {

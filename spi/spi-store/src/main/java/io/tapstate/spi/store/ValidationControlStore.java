@@ -134,6 +134,8 @@ public interface ValidationControlStore {
      * owner/boot/fence is a coded refusal, not a successful join or proof the old worker exited.
      */
     Join join(Run run);
+    /** Joins a ready original with an already born report directly in RUNNING where supported. */
+    default java.util.Optional<Join> joinRunning(Run run) { return java.util.Optional.empty(); }
 
     /**
      * After known original CONFIG closure, fence an unsuccessful join against a late join commit.

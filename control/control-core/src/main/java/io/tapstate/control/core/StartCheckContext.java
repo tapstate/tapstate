@@ -102,11 +102,23 @@ public final class StartCheckContext {
      * back as the reason, never as an empty target.
      */
     public Map<String, Probed> probe(List<StartPlan.Entry> targets) {
+        var connections = new LinkedHashMap<String, java.util.Optional<io.tapstate.core.model.SourceResource>>();
+        for (StartPlan.Entry entry : targets)
+            connections.computeIfAbsent(entry.target().connection(), plan().targetConnections());
+        var tracking = connections.values().stream().anyMatch(java.util.Optional::isPresent)
+                ? probe.resolvedSourceTracking() : null;
         Map<String, Future<TargetProbe.TargetRows>> pending = new LinkedHashMap<>();
         for (StartPlan.Entry entry : targets) {
             String connection = entry.target().connection();
             String table = entry.target().table();
-            pending.putIfAbsent(entry.coordinate(), executor.submit(() -> probe.rows(connection, table)));
+            var resolved = connections.get(connection);
+            pending.putIfAbsent(entry.coordinate(), executor.submit(() -> {
+                if (resolved.isEmpty()) return probe.rows(connection, table);
+                var source = resolved.orElseThrow();
+                var cleanup = tracking.apply(source);
+                try { return probe.rows(source, table); }
+                finally { cleanup.run(); }
+            }));
         }
         Map<String, Probed> probed = new LinkedHashMap<>();
         List<Future<?>> abandoned = new ArrayList<>();

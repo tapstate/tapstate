@@ -122,84 +122,46 @@ services:
     # tree adds the build back through docker-compose.dev.yml, which only exists inside the repository.
     # The tag is pinned rather than floating, so a demo brought up months apart runs the same server
     # both times; the quickstart smoke fails the build if it drifts from the version being built.
-    image: ghcr.io/tapstate/tapstate:0.7.0
+    image: ghcr.io/tapstate/tapstate:0.8.0
     depends_on:
       mongo:
         condition: service_healthy
     environment:
-      # The set member advertises itself under the address the host reaches it by, which is not
-      # resolvable from inside this network. Addressing the member directly bypasses topology
-      # discovery entirely, so the advertised address is never consulted and the member is reached
-      # under its service name. This is sound only because the set has exactly one member: a direct
-      # connection gives up election and failover awareness, which is why it belongs here in the
-      # single-node stack's configuration and not in the server's own defaults.
-      TAPSTATE_STORE_MONGO_URI: mongodb://mongo:27017/tapstate?directConnection=true
-      # Durable operator state stays separate from control data. A second deployment sharing this
-      # MongoDB service must choose another name to keep equal pipeline namespaces isolated.
-      TAPSTATE_STORE_MONGO_OPERATOR_STATE_DATABASE: tapstate_nest
-      # Pin the connector seed directory to an absolute path. The setting defaults to a path relative to
-      # the image's working directory, so it would shift silently if that directory ever moved; naming it
-      # in full keeps it fixed to the mount target below, whatever the image's working directory is. This
-      # is only a scan location for optional pre-seeding (see the volume) -- a registered connector's
-      # bytes live in the store, in Mongo, not here.
+      TAPSTATE_INSTALLATION_DIRECTORY: /var/lib/tapstate/installation
       TAPSTATE_CONNECTORS_SEED_DIR: /var/lib/tapstate/connectors
+      TAPSTATE_BROWSER_AUTH_ALLOW_INSECURE_LOOPBACK: "true"
     volumes:
-      # Optional bulk pre-seeding, and nothing more. Any *.jar left in ./connectors before the stack
-      # starts is registered once at boot, through the very same register-if-absent path that `tapstate
-      # register` uploads to -- staging a jar here is a convenience, never a precondition for registering
-      # one. Registration needs no mount at all: the CLI uploads the jar's bytes over HTTP and the server
-      # never reads this directory for it. Leaving ./connectors empty is the normal case. Read-only,
-      # because the sweep only ever reads it.
+      - tapstate-quickstart-installation:/var/lib/tapstate
       - ./connectors:/var/lib/tapstate/connectors:ro
     ports:
       # Bound to the loopback interface: an unauthenticated first run must not be reachable from
       # other machines on the network.
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8080:18080"
     # The orderly stop closes the cluster member and the store client before halting. Docker's
     # default 10s grace can cut that short and turn a clean exit into a kill, so the window is set
     # wider than the stop has been observed to need.
     stop_grace_period: 30s
 
-  # Creates the first administrator, then exits. The endpoint that creates it accepts only loopback
-  # callers -- a safeguard against an unauthenticated first run being seized over the network -- and
-  # this container reaches it by sharing the server's network namespace, so its own loopback is the
-  # server's. Sharing the namespace is also why it declares no ports of its own: they would belong to
-  # the server. A throwaway image with nothing but curl keeps this out of the server image, so the
-  # server never has to carry a shell to be bootstrapped.
-  bootstrap:
-    image: curlimages/curl:8.11.1
+  # Docker forwards host traffic from the bridge gateway, not from loopback.
+  # Share the server namespace so the upstream connection is really loopback;
+  # reject other bridge peers before they can reach that local-only entry.
+  browser-gateway:
+    image: nginx:1.27.5-alpine
+    network_mode: "service:server"
     depends_on:
       server:
         condition: service_healthy
-    network_mode: "service:server"
-    # One shot: it runs once and is not brought back. Re-running the stack runs it again, and it is
-    # written to succeed the second time (see below), so that is safe.
-    restart: "no"
-    environment:
-      # The demo's first-admin credentials. They fall back to a known default so the stack runs with
-      # no prompting, and read from the environment (an adjacent .env file, or the quickstart script's
-      # generated password) when set. A real deployment must override the default.
-      TAPSTATE_ADMIN_USER: ${TAPSTATE_ADMIN_USER:-admin}
-      TAPSTATE_ADMIN_PASSWORD: ${TAPSTATE_ADMIN_PASSWORD:-admin}
-    entrypoint: ["/bin/sh", "-c"]
-    # The doubled $$ keeps the values out of Compose interpolation so the container's own shell reads
-    # them from its environment. A fresh store answers 204 and a bootstrapped one answers 409; both
-    # mean "an admin now exists", so both exit 0 and re-running the stack never fails here. Any other
-    # status -- including the 403 a non-loopback caller would draw -- is a real failure.
+    entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
-        set -eu
-        code=$$(curl -s -o /dev/null -w '%{http_code}' \
-          -X POST http://127.0.0.1:8080/auth/bootstrap \
-          -H 'Content-Type: application/json' \
-          -d "{\"username\":\"$${TAPSTATE_ADMIN_USER}\",\"password\":\"$${TAPSTATE_ADMIN_PASSWORD}\"}")
-        case "$$code" in
-          204) echo "bootstrap: first admin created" ;;
-          409) echo "bootstrap: an admin already exists, nothing to do" ;;
-          *)   echo "bootstrap: failed with HTTP $$code" >&2; exit 1 ;;
-        esac
+        hex=$$(awk '$$2 == "00000000" && $$4 ~ /0003/ {print $$3; exit}' /proc/net/route)
+        [ "$${#hex}" -eq 8 ] || { echo 'Cannot identify Docker bridge gateway' >&2; exit 1; }
+        gateway=$$(printf '%d.%d.%d.%d' "0x$$(printf %s "$$hex" | cut -c7-8)" "0x$$(printf %s "$$hex" | cut -c5-6)" "0x$$(printf %s "$$hex" | cut -c3-4)" "0x$$(printf %s "$$hex" | cut -c1-2)")
+        printf '%s\n' 'events { worker_connections 128; }' 'http {' 'client_max_body_size 512m;' 'map $$http_upgrade $$connection_upgrade { default upgrade; "" close; }' 'server {' 'listen 18080;' "allow $$gateway;" 'allow 127.0.0.1;' 'deny all;' 'location / {' 'proxy_pass http://127.0.0.1:8080;' 'proxy_http_version 1.1;' 'proxy_set_header Host $$http_host;' 'proxy_set_header Origin $$http_origin;' 'proxy_set_header Upgrade $$http_upgrade;' 'proxy_set_header Connection $$connection_upgrade;' 'proxy_request_buffering off;' 'proxy_buffering off;' '}' '}' '}' > /tmp/demo-nginx.conf
+        exec nginx -c /tmp/demo-nginx.conf -g 'daemon off;'
 
 volumes:
   tapstate-quickstart-mongo:
   tapstate-quickstart-mysql:
   tapstate-quickstart-postgres:
+  tapstate-quickstart-installation:

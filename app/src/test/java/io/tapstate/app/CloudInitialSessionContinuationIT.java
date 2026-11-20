@@ -87,10 +87,13 @@ class CloudInitialSessionContinuationIT {
             assertThat(test.status()).isEqualTo(200);
             var commit = request(client, oldCookie, "/api/storage/setup/commit", Map.of("operationId", scope.operationId(),
                     "generation", scope.generation(), "candidate", candidate, "testStamps", Map.of("CACHE", test.body().get("testStamp"))),
-                    "commit-before-activation", repetition);
+                    "commit-with-authentication-publication", repetition);
             assertThat(commit.status()).isEqualTo(200);
-            assertThat(commit.body().get("setupPhase")).isEqualTo("STORAGE_BOUND");
-            assertThat(request(client, oldCookie, "/api/storage/status", Map.of(), "old-cookie-before-switch", repetition).status()).isEqualTo(200);
+            assertThat(commit.body().get("setupPhase")).isEqualTo("COMPLETE");
+            assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+            var beforeBusiness = request(client, oldCookie, "/api/storage/status", Map.of(), "original-cookie-before-business", repetition);
+            assertThat(beforeBusiness.status()).isEqualTo(200);
+            assertThat(beforeBusiness.body().get("businessPhase")).isEqualTo("AUTH_READY");
 
             inputs.activate.countDown();
             assertThat(inputs.businessEntered.await(20, TimeUnit.SECONDS)).as("real CACHE/auth publication must finish").isTrue();
@@ -203,13 +206,10 @@ class CloudInitialSessionContinuationIT {
             };
             return new StorageSetupService(root.mode(), config.bindings(), config.setupStates(), new MongoStorageConnectionProbe(Duration.ofSeconds(5)),
                     target, root::configurationEndpoint, new AuditGate(config.audit(), clock), clock, root::requireActive,
-                    committed -> root.handoffActivation(committed, () -> {
-                        await(inputs.activate);
-                        root.continueCloudSetup(committed, target, ignored -> new StorageRuntime.Business() {
-                            @Override public void start() { inputs.businessEntered.countDown(); await(inputs.ready); }
+                    committed -> root.handoffCloudSetup(committed, target, ignored -> new StorageRuntime.Business() {
+                            @Override public void start() { await(inputs.activate); inputs.businessEntered.countDown(); await(inputs.ready); }
                             @Override public void close() {}
-                        });
-                    }), root::coordinateSetup, (expected, tested, active) -> {}, root.initializationProgress());
+                        }), root::coordinateSetup, (expected, tested, active) -> {}, root.initializationProgress());
         }
         @Bean StorageControlDispatcher dispatcher(OperationRegistry operations, StorageSetupService setup, StorageRoot root) {
             return StorageControlDispatcher.staged(operations, () -> setup, () -> null, () -> null,

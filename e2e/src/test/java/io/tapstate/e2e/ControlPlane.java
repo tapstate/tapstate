@@ -111,6 +111,20 @@ final class ControlPlane {
         if(!(parsed instanceof Map<?,?> map))throw new AssertionError("alert response is not an object");
         var value=new LinkedHashMap<String,Object>();map.forEach((key,item)->value.put(String.valueOf(key),item));return value;
     }
+    boolean alertCenterAvailable() {
+        var response = send(authed("/api/alerts/center", "{\"limit\":1}"));
+        String code = codeOf(response.body());
+        if ("control.storage-unavailable".equals(code)) return false;
+        if ("io.document-unreadable".equals(code)) {
+            var params = paramsOf(response.body());
+            if ("alert-store".equals(params.get("id")) && "schema-capability".equals(params.get("field"))) {
+                return false;
+            }
+        }
+        expect(response, 200, "read alert center");
+        return true;
+    }
+
     void awaitInitialAlertMaintenance(){
         Await.until("the initial bounded alert cleanup to finish",Duration.ofSeconds(30),()->{
             var value=alert("health",Map.of()).get("maintenance");
@@ -2446,8 +2460,22 @@ final class ControlPlane {
 
     /** Leaves an explicitly tested alternative outcome to the calling witness's own assertions. */
     HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag) {
-        HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(TIMEOUT))
+        return sourceResponse(method, path, body, etag, TIMEOUT, null);
+    }
+
+    HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag,Duration timeout) {
+        return sourceResponse(method, path, body, etag, timeout, null);
+    }
+
+    HttpResponse<String> sourceResponse(String method, String path, Map<String, ?> body, String etag, String language) {
+        return sourceResponse(method, path, body, etag, TIMEOUT, language);
+    }
+
+    private HttpResponse<String> sourceResponse(String method, String path, Map<String, ?> body, String etag,
+                                              Duration timeout, String language) {
+        HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(timeout))
                 .header("Content-Type", "application/json");
+        if (language != null) request.header("Accept-Language", language);
         if (etag != null) request.header("If-Match", etag);
         request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8));

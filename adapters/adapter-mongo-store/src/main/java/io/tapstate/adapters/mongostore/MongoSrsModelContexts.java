@@ -45,6 +45,16 @@ final class MongoSrsModelContexts {
         Document row = SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session, new Document("_id", id)).first();
         return row == null ? null : decode(row);
     }
+
+    Map<Document, Context> findAll(ClientSession session, Set<Document> ids) {
+        var rows = new java.util.HashMap<Document, Context>();
+        for (var row : SystemCollections.SRS_MODEL_CONTEXTS.on(database)
+                .find(session, new Document("_id", new Document("$in", ids))).limit(ids.size())) {
+            var context = decode(row);
+            if (!ids.contains(context.id()) || rows.putIfAbsent(context.id(), context) != null) throw unreadable();
+        }
+        return rows;
+    }
     Context require(ClientSession session, Document id) {
         Context context = find(session, id);
         if (context == null) throw unavailable(identity(id));

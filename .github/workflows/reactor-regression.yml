@@ -1,0 +1,207 @@
+name: Full reactor regression
+
+on:
+  workflow_call:
+    inputs:
+      source-sha:
+        description: Exact application commit to test
+        required: true
+        type: string
+      full-ci-already-verified:
+        description: Release has verified the required full main CI on this pre-fast commit
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: ${{ !inputs.full-ci-already-verified }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha }}
+          persist-credentials: false
+      - name: Plan every test in the source reactor
+        id: plan
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ && "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          .github/scripts/ci-shard.sh plan --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
+          matrix="$(.github/scripts/ci-shard.sh matrix --plan "$RUNNER_TEMP/shards.json")"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reactor-regression-plan
+          path: ${{ runner.temp }}/shards.json
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Prepare pinned MongoDB and Dummy fixtures
+        run: python3 deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy --output "$RUNNER_TEMP/managed-mongo"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reactor-regression-mongo-dummy
+          path: ${{ runner.temp }}/managed-mongo/
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
+  snapshot-lock:
+    if: ${{ !inputs.full-ci-already-verified }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+          cache: maven
+      - name: Resolve the reactor's snapshot inputs
+        run: |
+          java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
+          .github/scripts/ci-maven-cache.sh seed-stable "$HOME/.m2/repository" "$RUNNER_TEMP/snapshot-m2"
+          mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/snapshot-m2" -DskipTests install
+          python3 .github/scripts/ci-snapshot-lock.py capture "$RUNNER_TEMP/snapshot-m2" "$RUNNER_TEMP/ci-snapshot-lock"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reactor-regression-snapshot-lock
+          path: ${{ runner.temp }}/ci-snapshot-lock/
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
+  test-shards:
+    if: ${{ !inputs.full-ci-already-verified }}
+    name: test-shards (${{ matrix.shard }})
+    needs: [plan, snapshot-lock]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+          cache: maven
+      - uses: actions/download-artifact@v4
+        with:
+          name: reactor-regression-plan
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: reactor-regression-snapshot-lock
+          path: ${{ runner.temp }}/ci-snapshot-lock
+      - uses: actions/download-artifact@v4
+        if: startsWith(matrix.shard, 'e2e-')
+        with:
+          name: reactor-regression-mongo-dummy
+          path: ${{ runner.temp }}/managed-mongo
+      - name: Prepare pinned Cloud startup fixtures
+        if: matrix.prepare_cloud_inputs
+        run: |
+          python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
+          echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
+      - name: Build using frozen snapshot dependencies
+        run: |
+          java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
+          .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+          python3 .github/scripts/ci-snapshot-lock.py restore "$RUNNER_TEMP/ci-snapshot-lock" "$RUNNER_TEMP/m2"
+          mvn -B -T 2 -nsu -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Execute this full reactor shard
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          export MAVEN_ARGS="-nsu -Dapi.version=1.44"
+          case "$SHARD" in
+            app-1|app-2|rest)
+              export MAVEN_ARGS="$MAVEN_ARGS -DforkCount=2"
+              ;;
+          esac
+          if [[ "$SHARD" == e2e-* ]]; then
+            export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.e2e.managed-mongo-jar=$RUNNER_TEMP/managed-mongo/mongodb-connector.jar"
+            if jq -e --arg shard "$SHARD" '.shards[] | select(.id == $shard) | any(.tests[]; .class == "io.tapstate.e2e.RealDummyPipelineIT")' "$RUNNER_TEMP/shards.json" >/dev/null; then
+              test -f "$RUNNER_TEMP/managed-mongo/dummy-connector.jar"
+              export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.dummy.jar=$RUNNER_TEMP/managed-mongo/dummy-connector.jar"
+            fi
+          fi
+          if [[ "$SHARD" == app-* ]]; then
+            connectors="$TAPSTATE_TEST_CLOUD_RELEASE_DIR/connectors"
+            for connector in mongodb mysql postgres; do
+              test -f "$connectors/$connector-connector.jar"
+              export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.pdk.it.$connector-jar=$connectors/$connector-connector.jar"
+            done
+          fi
+          .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+      - name: Package the reports and coverage
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: .github/scripts/ci-aggregate.sh pack --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/regression-results/$SHARD"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reactor-regression-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/regression-results/
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve failed test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reactor-regression-failure-${{ matrix.shard }}
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+            e2e/target/failure-scenes/
+          retention-days: 7
+
+  verify-regression:
+    if: ${{ !inputs.full-ci-already-verified }}
+    needs: [plan, test-shards]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: reactor-regression-plan
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reactor-regression-results-*
+          path: ${{ runner.temp }}/regression-results
+          merge-multiple: true
+      - name: Admit all source-selected reports
+        run: |
+          jq -e '.selection == "default-reactor"' "$RUNNER_TEMP/shards.json"
+          .github/scripts/ci-aggregate.sh verify --plan "$RUNNER_TEMP/shards.json" --artifacts "$RUNNER_TEMP/regression-results" --restore "$RUNNER_TEMP/admitted"
+
+  existing-full-ci:
+    if: inputs.full-ci-already-verified
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_SHA: ${{ inputs.source-sha }}
+    steps:
+      - name: Record the release prerequisite
+        run: echo "Required main CI in the release pin already verified the full reactor at $SOURCE_SHA."

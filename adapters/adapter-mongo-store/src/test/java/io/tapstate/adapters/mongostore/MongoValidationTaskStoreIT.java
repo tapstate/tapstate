@@ -243,10 +243,15 @@ class MongoValidationTaskStoreIT {
             var pending = java.util.concurrent.ConcurrentHashMap.<Integer>newKeySet();
             var listener = new com.mongodb.event.CommandListener() {
                 @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
-                    if (!event.getCommandName().equals("find") || !event.getDatabaseName().equals(f.configDb.getName())) return;
-                    var command = event.getCommand(); var projection = command.getDocument("projection", new org.bson.BsonDocument());
-                    if (command.getString("find").getValue().equals(SystemCollections.SOURCES.collectionName()) && projection.containsKey("contentHash")
-                            && once.compareAndSet(true, false)) pending.add(event.getRequestId());
+                    if (!event.getCommandName().equals("aggregate") || !event.getDatabaseName().equals(f.configDb.getName())) return;
+                    var command = event.getCommand();
+                    if (!command.getString("aggregate").getValue().equals(SystemCollections.CONFIGURATION_VERSION.collectionName())) return;
+                    boolean dependencyHeaders = command.getArray("pipeline").stream().map(org.bson.BsonValue::asDocument)
+                            .filter(stage -> stage.containsKey("$lookup")).map(stage -> stage.getDocument("$lookup"))
+                            .anyMatch(lookup -> lookup.getString("from").getValue().equals(SystemCollections.SOURCES.collectionName())
+                                    && lookup.getArray("pipeline").stream().map(org.bson.BsonValue::asDocument)
+                                            .anyMatch(step -> step.containsKey("$project") && step.getDocument("$project").containsKey("bytes")));
+                    if (dependencyHeaders && once.compareAndSet(true, false)) pending.add(event.getRequestId());
                 }
                 @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
                     if (!pending.remove(event.getRequestId())) return;
@@ -575,6 +580,135 @@ class MongoValidationTaskStoreIT {
             var two = workers.submit(() -> { gate.await(); return capacityCreate(other.validationTasks(() -> {}), b, "validation.clusterTaskBytes"); }); gate.countDown();
             assertThat(List.of(one.get(30, TimeUnit.SECONDS), two.get(30, TimeUnit.SECONDS))).containsExactlyInAnyOrder(true, false);
             assertThat(f.collection().countDocuments()).isEqualTo(perCluster); assertThat(f.configuration.configurationRevision()).isEqualTo(before + 1);
+        }
+    }
+
+    @Test void firstCountClaimIsUsableOnlyAfterConfigCompletion() {
+        try (var f = new Fixture()) {
+            var node = f.cache.workloadClaims(f.scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),
+                    new WorkloadOwner("node", "boot"), 1, TTL).claim();
+            var config = f.configuration.validationPreparations();
+            var issued = config.issue("flow", f.scope);
+            var proof = f.cache.validationPreparations(f.scope).prepare(issued, WorkloadClaimFence.from(node),
+                    new MongoValidationCachePreparations.InitialCountLease(1, TTL));
+            var claim = proof.initialClaim(issued.subject());
+            assertThat(claim.claimGeneration()).isOne();
+            assertThat(claim.executionGeneration()).isOne();
+            assertThatThrownBy(() -> f.configuration.loadValidationAccess("flow", f.scope, f.cache, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+
+            config.complete(issued, proof);
+            var access = f.configuration.loadValidationAccess("flow", f.scope, f.cache, () -> {});
+            assertThat(access.claims().read(claim.key())).hasValueSatisfying(value -> {
+                assertThat(value.leased()).isTrue();
+                assertThat(value.claim()).isEqualTo(claim);
+            });
+            var epoch = SystemCollections.OPERATOR_GENERATIONS.on(f.configDb).find(new Document("_id", "flow")).first()
+                    .get("validationCountOwner", Document.class);
+            assertThat(epoch).containsEntry("claimGeneration", 1L).containsEntry("executionGeneration", 1L);
+        }
+    }
+
+    @Test void committedCountClaimCannotCompleteAClosingPreparation() {
+        try (var f = new Fixture()) {
+            var node = f.cache.workloadClaims(f.scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),
+                    new WorkloadOwner("node", "boot"), 1, TTL).claim();
+            var config = f.configuration.validationPreparations();
+            var issued = config.issue("flow", f.scope);
+            var proof = f.cache.validationPreparations(f.scope).prepare(issued, WorkloadClaimFence.from(node),
+                    new MongoValidationCachePreparations.InitialCountLease(1, TTL));
+            assertThat(proof.initialClaim(issued.subject())).isNotNull();
+            config.beginClose("flow", issued.subject().generation(), UUID.randomUUID());
+            assertThatThrownBy(() -> config.complete(issued, proof)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.configuration.loadValidationAccess("flow", f.scope, f.cache, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void oldManualCountOwnerCannotOpenOrPublishAfterConfigEpochChanges() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow");
+            assertThat(f.tasks.create(create)).isEqualTo(Write.APPLIED);
+            var saved = f.read(create.task());
+            var node = f.cache.workloadClaims(f.scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),
+                    new WorkloadOwner("node", "boot"), 1, TTL).claim();
+            var access = f.configuration.prepareCountValidationAccess("flow", f.scope, f.cache, WorkloadClaimFence.from(node), 1, TTL, () -> {});
+            var first = access.takeInitialCountClaim().orElseThrow();
+            assertThat(access.takeInitialCountClaim()).isEmpty();
+            var owner = ValidationClaims.owner("flow", first);
+            var scoped = access.forManualCount(owner);
+            assertThat(scoped.observeClosedCountLedger(owner)).hasValueSatisfying(ledger ->
+                    assertThat(ledger.countingGeneration()).isZero());
+            assertThat(scoped.countPermissionsCurrent(owner)).isTrue();
+            var spec = new ValidationRunSpec(saved.comparison(), ValidationMode.FULL, ValidationMethod.COUNT);
+            var id = new ValidationRunIdentity(owner, saved.task().taskId(), "old-count", spec.mode(), spec.fingerprint(),
+                    spec.task().mappingRevision(), spec.task().comparisonRulesVersion());
+            var start = new ValidationReportAdmission.Start(saved.task(), saved.revision(), 1, UUID.randomUUID().toString(), id);
+            var open = new ValidationReportAdmission.Open(start, spec);
+            assertThat(scoped.admissions().reserveAndOpen(open)).contains(ValidationReportAdmission.Reservation.RESERVED);
+            var run = new ValidationControlStore.Run(id, 1, start, spec);
+            var reports = SystemCollections.VALIDATION_REPORTS.on(f.configDb);
+            var report = new Document("_id", MongoValidationAdmissionStore.reportId(id));
+            reports.updateOne(report, new Document("$set", new Document("closed", true)));
+            assertThatThrownBy(() -> scoped.control().joinRunning(run)).isInstanceOf(TapstateException.class);
+            assertThat(scoped.control().read(owner, run)).isEmpty();
+            reports.updateOne(report, new Document("$set", new Document("closed", false)));
+            var control = scoped.countHandles().orElseThrow().control();
+            var schema = SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb);
+            schema.updateOne(new Document("_id", "config"), new Document("$set", new Document("validation.phase", "PREPARING")));
+            assertThatThrownBy(() -> control.joinRunning(run)).isInstanceOf(TapstateException.class);
+            schema.updateOne(new Document("_id", "config"), new Document("$set", new Document("validation.phase", "READY")));
+            assertThat(control.read(owner, run)).isEmpty();
+            assertThat(control.joinRunning(run)).contains(ValidationControlStore.Join.JOINED);
+            assertThat(scoped.control().joinRunning(run)).contains(ValidationControlStore.Join.ALREADY_JOINED);
+            assertThat(scoped.observeClosedCountLedger(owner)).isEmpty();
+            var now = java.time.Instant.now();
+            var read = new ValidationCheckEvent.ReadBoundary("read", "count-v1", now, now);
+            var write = new ValidationResultStore.CountWrite(start.report(), spec,
+                    new ValidationCountCheck(id, "mapping", "out", 1, 1, read, read));
+            assertThat(scoped.results().publishCount(write)).isEqualTo(ValidationResultStore.Publication.APPLIED);
+
+            var next = access.acquireCountTenure(WorkloadClaimFence.from(node), 1, TTL).orElseThrow();
+            assertThat(next.claim().claimGeneration()).isEqualTo(first.claimGeneration() + 1);
+            assertThat(next.access().countPermissionsCurrent(ValidationClaims.owner("flow", next.claim()))).isFalse();
+            assertThatThrownBy(() -> scoped.countPermissionsCurrent(owner)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> scoped.observeClosedCountLedger(owner)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> scoped.admissions().reserveAndOpen(open)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> scoped.results().publishCount(write)).isInstanceOf(TapstateException.class);
+            var staleRun = new ValidationControlStore.Run(id, 1, start, spec);
+            assertThatThrownBy(() -> scoped.control().joinRunning(staleRun)).isInstanceOf(TapstateException.class);
+            assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).countDocuments()).isEqualTo(1);
+        }
+    }
+
+    @Test void reservingAndOpeningPublishesOneReportBeforeJoiningCache() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow");
+            assertThat(f.tasks.create(create)).isEqualTo(Write.APPLIED);
+            var saved = f.tasks.read("flow", create.task().taskId()).orElseThrow();
+            var initial = f.reserve(saved, "first");
+            var admissions = initial.access().admissions();
+            assertThat(admissions.close(initial.start())).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+            var snapshot = new ValidationRunSpec(saved.comparison(), ValidationMode.FULL, ValidationMethod.COUNT);
+            var first = initial.start().run();
+            var identity = new ValidationRunIdentity(first.owner(), first.taskId(), "next", snapshot.mode(),
+                    snapshot.fingerprint(), snapshot.task().mappingRevision(), snapshot.task().comparisonRulesVersion());
+            var next = new ValidationReportAdmission.Start(saved.task(), saved.revision(), 2, UUID.randomUUID().toString(), identity);
+            var open = new ValidationReportAdmission.Open(next, snapshot);
+            assertThat(admissions.reserveAndOpen(open)).contains(ValidationReportAdmission.Reservation.RESERVED);
+            var run = new ValidationControlStore.Run(identity, 1, next, snapshot);
+            assertThat(initial.access().control().read(first.owner(), run)).isEmpty();
+            var reports = SystemCollections.VALIDATION_REPORTS.on(f.configDb);
+            assertThat(reports.countDocuments()).isEqualTo(1);
+            assertThat(reports.find(new Document("_id", MongoValidationAdmissionStore.reportId(identity))).first())
+                    .containsEntry("closed", false);
+            assertThat(admissions.reserveAndOpen(open)).contains(ValidationReportAdmission.Reservation.DUPLICATE);
+            assertThat(reports.countDocuments()).isEqualTo(1);
+            assertThat(f.tasks.read("flow", saved.task().taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(3);
+            var control = initial.access().control();
+            assertThat(control.joinRunning(run)).contains(ValidationControlStore.Join.JOINED);
+            assertThat(control.joinRunning(run)).contains(ValidationControlStore.Join.ALREADY_JOINED);
+            assertThat(control.read(first.owner(), run).orElseThrow().state()).isEqualTo(ValidationRunState.RUNNING);
         }
     }
 

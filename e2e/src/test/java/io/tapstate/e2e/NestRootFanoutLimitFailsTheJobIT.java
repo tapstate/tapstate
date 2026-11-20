@@ -119,11 +119,11 @@ class NestRootFanoutLimitFailsTheJobIT {
                                 + "  documents: %s%n  metrics: %s", CHILDREN, ELEMENT_LIMIT,
                                 mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE), control.metrics(pipelineId))
                         .contains(PipelineState.FAILED);
+                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.errorCount(pipelineId))
                         .as("the failure is counted, not only entered")
                         .contains(1L);
 
-                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.failureCode(pipelineId))
                         .as("what killed the run, read from the status face rather than from a log.%n"
                                 + "  logs: %s", control.logs(pipelineId))

@@ -321,40 +321,66 @@ public final class SrsRingReader {
      */
     public int fill(ObjLongConsumer<SrsItem> out, int max) {
         Objects.requireNonNull(out, "out");
+        int emitted = drain((item, sequence) -> {
+            out.accept(item, sequence);
+            cursor++;
+        }, max, ring.tailSequence());
+        if (emitted > 0) onAdvance.accept(cursor - 1);
+        return emitted;
+    }
+
+    int fill(SrsEventModelVerifier verifier, ObjLongConsumer<SrsItem> out, int max) {
+        if (!(verifier instanceof SrsEventModelVerifier.Batch batch)) {
+            return fill((item, sequence) -> {
+                verifier.verify(item, sequence);
+                out.accept(item, sequence);
+            }, max);
+        }
         long tail = ring.tailSequence();
-        long head = log == null || cursor > tail || max < 1 ? 0L : ring.headSequence();
+        if (cursor > tail || max < 1) return 0;
+        var items = new java.util.ArrayList<SrsItem>();
+        int emitted = drain((item, sequence) -> items.add(item), max, tail);
+        batch.verifyBatch(items, cursor);
+        for (SrsItem item : items) {
+            out.accept(item, cursor);
+            cursor++;
+        }
+        onAdvance.accept(cursor - 1);
+        return emitted;
+    }
+
+    private int drain(ObjLongConsumer<SrsItem> out, int max, long tail) {
+        long sequence = cursor;
+        long head = log == null || sequence > tail || max < 1 ? 0L : ring.headSequence();
         int emitted = 0;
-        while (cursor <= tail && emitted < max) {
-            if (log != null && cursor < head) {
-                int size = (int) Math.min((long) max - emitted, Math.min(tail - cursor + 1L,
-                        head - cursor));
-                SrsLogBatch batch = readDurable(cursor, size);
+        while (sequence <= tail && emitted < max) {
+            if (log != null && sequence < head) {
+                int size = (int) Math.min((long) max - emitted, Math.min(tail - sequence + 1L,
+                        head - sequence));
+                SrsLogBatch batch = readDurable(sequence, size);
                 for (int i = 0; i < size; i++) {
-                    out.accept(itemOf(batch.records().get(cursor)), cursor);
-                    cursor++;
+                    out.accept(itemOf(batch.records().get(sequence)), sequence);
+                    sequence++;
                     emitted++;
                 }
             } else {
                 SrsItem item;
                 try {
-                    item = ring.readOne(cursor);
+                    item = ring.readOne(sequence);
                 } catch (StaleSequenceException missing) {
                     if (log == null) {
                         throw missing;
                     }
-                    throw gap(cursor, "the hot ring lost the required record and the durable log could not serve it");
+                    throw gap(sequence, "the hot ring lost the required record and the durable log could not serve it");
                 }
                 if (log != null && (item == null || item.epoch() < 1L)) {
-                    throw gap(cursor, item == null ? "the required ring record is missing"
+                    throw gap(sequence, item == null ? "the required ring record is missing"
                             : "the retained record has no verified original capture generation");
                 }
-                out.accept(item, cursor);
-                cursor++;
+                out.accept(item, sequence);
+                sequence++;
                 emitted++;
             }
-        }
-        if (emitted > 0) {
-            onAdvance.accept(cursor - 1);
         }
         return emitted;
     }

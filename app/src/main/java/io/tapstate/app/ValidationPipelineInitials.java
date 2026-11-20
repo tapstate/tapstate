@@ -309,6 +309,10 @@ final class ValidationPipelineInitials implements SourceInitialLoadObserver, Aut
         volatile String failed;
         Entry(Original original) { this.original = original; }
     }
+    static SinkAckFactory underlying(SinkAckFactory factory) {
+        return factory instanceof ObservedFactory observed ? observed.actual : factory;
+    }
+
     private static final class ObservedFactory implements SinkAckFactory {
         private static final long serialVersionUID = 1L;
         private final SinkAckFactory actual; private final Original original;

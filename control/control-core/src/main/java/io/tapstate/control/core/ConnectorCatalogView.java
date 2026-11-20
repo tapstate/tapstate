@@ -40,6 +40,7 @@ public final class ConnectorCatalogView {
     private final ConnectorCatalogStore store;
     private final ConnectorSpecStore specStore;
     private final ConnectorRegistry registry;
+    private final boolean bundledArtifacts;
     private final Map<IconCacheKey, Optional<ConnectorIcon>> icons = Collections.synchronizedMap(
             new LinkedHashMap<>(16, 0.75f, true) {
                 @Override
@@ -51,10 +52,16 @@ public final class ConnectorCatalogView {
     public ConnectorCatalogView(
             TapstateCatalog bundled, ConnectorCatalogStore store, ConnectorSpecStore specStore,
             ConnectorRegistry registry) {
+        this(bundled, store, specStore, registry, false);
+    }
+
+    public ConnectorCatalogView(TapstateCatalog bundled, ConnectorCatalogStore store, ConnectorSpecStore specStore,
+                                ConnectorRegistry registry, boolean bundledArtifacts) {
         this.bundled = Objects.requireNonNull(bundled, "bundled");
         this.store = Objects.requireNonNull(store, "store");
         this.specStore = Objects.requireNonNull(specStore, "specStore");
         this.registry = Objects.requireNonNull(registry, "registry");
+        this.bundledArtifacts = bundledArtifacts;
     }
 
     /** The live capability catalog = the bundled snapshot with registered rows overlaid (registered shadows). */
@@ -94,6 +101,10 @@ public final class ConnectorCatalogView {
             return Optional.empty();
         }
         IconCacheKey key = new IconCacheKey(registrations.get(0).contentHash(), icon);
+        if (bundledArtifacts) {
+            return store.bundledIcon(id, key.contentHash())
+                    .map(iconData -> new ConnectorIcon(iconData.bytes(), iconData.mediaType()));
+        }
         synchronized (icons) {
             return icons.computeIfAbsent(key, cacheKey -> registry.artifact(cacheKey.contentHash())
                     .flatMap(artifact -> iconFrom(artifact, cacheKey.declaredPath())));

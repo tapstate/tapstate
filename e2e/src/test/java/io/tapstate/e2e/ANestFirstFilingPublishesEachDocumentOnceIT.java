@@ -2,6 +2,22 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.sun.jdi.Bootstrap;
+import com.sun.jdi.ClassNotLoadedException;
+import com.sun.jdi.IncompatibleThreadStateException;
+import com.sun.jdi.InvalidTypeException;
+import com.sun.jdi.InvocationException;
+import com.sun.jdi.LongValue;
+import com.sun.jdi.ObjectReference;
+import com.sun.jdi.ReferenceType;
+import com.sun.jdi.StringReference;
+import com.sun.jdi.ThreadReference;
+import com.sun.jdi.event.BreakpointEvent;
+import com.sun.jdi.event.ClassPrepareEvent;
+import com.sun.jdi.event.EventSet;
+import com.sun.jdi.request.BreakpointRequest;
+import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.EventRequestManager;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
@@ -16,12 +32,15 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -171,9 +190,17 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
                 () -> String.valueOf(mongo.fetch(target, ORDERS, Map.of("id", 1))));
     }
 
-    @ParameterizedTest
-    @EnumSource(Tiers.class)
-    void aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgain(Tiers tier) throws Exception {
+    @Test
+    void aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgain() throws Exception {
+        checkFirstFilingWrites(Tiers.IN_PROCESS);
+    }
+
+    @Test
+    void aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgainInTheBootJar() throws Exception {
+        checkFirstFilingWrites(Tiers.REAL_PROCESS);
+    }
+
+    private void checkFirstFilingWrites(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> mysql = SharedMySql.settings("nest_first_filing_" + suffix);
         seed(mysql);
@@ -183,7 +210,7 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
         Path witness = directory.resolve("writes-" + suffix + ".tsv");
 
         try (PreparedNativeStore storage = PreparedNativeStore.create();
-                ServerHandle server = tier.launch(storage);
+                ServerHandle server = launchFirstFiling(tier, storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
@@ -199,7 +226,11 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
             control.apply(resources);
             control.discoverSchema("src_orders", "mysql", mysql);
             control.discoverSchema("src_customers", "mysql", mysql);
-            control.lifecycle(pipelineId, LifecycleVerb.START);
+            if (server instanceof RealProcessServer process) {
+                finishJetBetweenStatusReads(process, control, pipelineId);
+            } else {
+                control.lifecycle(pipelineId, LifecycleVerb.START);
+            }
 
             EndpointAddress target = EndpointAddress.uri(targetUri);
             Await.until("every completed order to reach the target",
@@ -208,13 +239,181 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
             assertCompleted(mongo, target, 1);
             assertCompleted(mongo, target, ROWS);
 
+            var liveMetrics = tier == Tiers.REAL_PROCESS ? control.metricsNamed(pipelineId, "") : Map.of();
             Await.until("the bounded nest run to complete before its write ledger is read",
                     () -> control.state(pipelineId).filter(PipelineState.COMPLETED::equals).isPresent(),
                     () -> String.valueOf(control.state(pipelineId)));
 
-            assertThat(recordsWritten(witness))
+            WriteLedger ledger = readWriteLedger(witness);
+            if (server instanceof RealProcessServer process) {
+                var metrics = control.metricsNamed(pipelineId, "");
+                try (var log = Files.lines(process.output())) {
+                    var executions = log.filter(line -> line.contains("Execution plan for jobId=")
+                                    && line.contains("jobName='" + pipelineId + "'"))
+                            .map(line -> line.substring(line.indexOf("Execution plan for jobId=")))
+                            .toList();
+                    System.out.printf("Mongo write callbacks=%d, records offered=%d, sink items=%s/%s, "
+                                    + "sink records delivered=%s/%s (at target count / at completion), executions=%s%n",
+                            ledger.calls(), ledger.records(), liveMetrics.get("recordCount"), metrics.get("recordCount"),
+                            liveMetrics.get("records.out"), metrics.get("records.out"), executions);
+                }
+            }
+            assertThat(ledger.records())
                     .as("physical Mongo records written for %d independently completed orders", ROWS)
                     .isEqualTo(ROWS);
+        }
+    }
+
+    private static ServerHandle launchFirstFiling(Tiers tier, PreparedNativeStore storage) {
+        if (tier == Tiers.IN_PROCESS) return tier.launch(storage);
+        return RealProcessServer.startPreparedInJvm(storage.configurationUri(),
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2",
+                        "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:0"),
+                port -> List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                        "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+    }
+
+    private static void finishJetBetweenStatusReads(RealProcessServer process, ControlPlane control, String pipelineId)
+            throws Exception {
+        String listener = "Listening for transport dt_socket at address: ";
+        String port = Files.readAllLines(process.output()).stream().filter(line -> line.startsWith(listener))
+                .findFirst().orElseThrow().substring(listener.length());
+        var connector = Bootstrap.virtualMachineManager().attachingConnectors().stream()
+                .filter(candidate -> candidate.name().equals("com.sun.jdi.SocketAttach")).findFirst().orElseThrow();
+        var arguments = connector.defaultArguments();
+        arguments.get("hostname").setValue("127.0.0.1");
+        arguments.get("port").setValue(port);
+        var vm = connector.attach(arguments);
+        try {
+            var converger = vm.classesByName("io.tapstate.runtime.scheduler.PipelineConverger").getFirst();
+            var running = converger.methodsByName("convergeRunning").getFirst();
+            var requests = vm.eventRequestManager();
+            var convergenceBreakpoints = new ArrayList<BreakpointRequest>();
+            for (var location : running.allLineLocations()) {
+                var breakpoint = requests.createBreakpointRequest(location);
+                breakpoint.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                convergenceBreakpoints.add(breakpoint);
+            }
+            String jetContext = "com.hazelcast.jet.impl.MasterJobContext";
+            var preparing = requests.createClassPrepareRequest();
+            preparing.addClassFilter(jetContext);
+            preparing.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+            preparing.enable();
+            var finishing = vm.classesByName(jetContext).stream().filter(ReferenceType::isPrepared).findFirst()
+                    .map(type -> jetFinalizerBreakpoint(requests, type)).orElse(null);
+            if (finishing != null) preparing.disable();
+            var started = CompletableFuture.runAsync(() -> control.lifecycle(pipelineId, LifecycleVerb.START));
+
+            // Keep convergence running while Jet processes the load. Once Jet is ready to finalize,
+            // hold it until a convergence pass reads an empty completion for this job.
+            EventSet jetPaused = null;
+            LongValue finalizingJob = null;
+            EventSet convergencePaused = null;
+            ThreadReference convergenceThread = null;
+            ObjectReference run = null;
+            Duration waitBound = Duration.ofSeconds(60);
+            long deadline = System.nanoTime() + waitBound.toNanos();
+            while ((jetPaused == null || convergencePaused == null) && System.nanoTime() < deadline) {
+                if (started.isCompletedExceptionally()) started.join();
+                var events = vm.eventQueue().remove(250);
+                if (events == null) continue;
+                try {
+                    for (var event : events) {
+                        if (event instanceof ClassPrepareEvent prepared && finishing == null) {
+                            finishing = jetFinalizerBreakpoint(requests, prepared.referenceType());
+                            preparing.disable();
+                        } else if (event instanceof BreakpointEvent stopped) {
+                            if (stopped.request() == finishing) {
+                                var jobId = finalizingJobId(stopped, pipelineId);
+                                if (jobId != null) {
+                                    finalizingJob = jobId;
+                                    jetPaused = events;
+                                    requests.deleteEventRequest(finishing);
+                                    convergenceBreakpoints.forEach(BreakpointRequest::enable);
+                                    deadline = System.nanoTime() + waitBound.toNanos();
+                                }
+                                continue;
+                            }
+                            var observed = originalRunAfterIncompleteRead(stopped, pipelineId);
+                            if (observed == null) continue;
+                            run = observed;
+                            convergenceThread = stopped.thread();
+                            convergencePaused = events;
+                            // Start the completion budget at the empty read.
+                            deadline = System.nanoTime() + waitBound.toNanos();
+                            requests.deleteEventRequests(convergenceBreakpoints);
+                        }
+                    }
+                } finally {
+                    if (events != jetPaused && events != convergencePaused) events.resume();
+                }
+            }
+            if (jetPaused == null || convergencePaused == null) {
+                throw new AssertionError("timed out arranging Jet completion between convergence reads: "
+                        + "Jet at finalizer=" + (jetPaused != null)
+                        + ", convergence read empty=" + (convergencePaused != null) + ", server log=" + process.output());
+            }
+            var originalRun = run;
+            var stoppedThread = convergenceThread;
+            try {
+                var originalJob = (LongValue) originalRun.invokeMethod(stoppedThread,
+                        originalRun.referenceType().methodsByName("jobId").getFirst(),
+                        List.of(), ObjectReference.INVOKE_SINGLE_THREADED);
+                assertThat(finalizingJob.longValue()).as("Jet job held before convergence checks for a live run")
+                        .isEqualTo(originalJob.longValue());
+                jetPaused.resume();
+                // Jet can log success before publishing its terminal job status.
+                var remaining = Duration.ofNanos(Math.max(0, deadline - System.nanoTime()));
+                Await.until("the original Jet execution to report COMPLETED while convergence is paused",
+                        remaining, () -> jetCompleted(originalRun, stoppedThread), () -> process.output().toString());
+            } finally {
+                convergencePaused.resume();
+            }
+            started.join();
+        } finally {
+            vm.dispose();
+        }
+    }
+
+    private static BreakpointRequest jetFinalizerBreakpoint(EventRequestManager requests, ReferenceType context) {
+        var location = context.methodsByName("completeVertices").getFirst().location();
+        var breakpoint = requests.createBreakpointRequest(location);
+        breakpoint.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+        breakpoint.enable();
+        return breakpoint;
+    }
+
+    private static LongValue finalizingJobId(BreakpointEvent stopped, String pipelineId) throws Exception {
+        var finalizer = stopped.thread().frame(0).thisObject();
+        var context = (ObjectReference) finalizer.getValue(finalizer.referenceType().fieldByName("mc"));
+        var contextType = context.referenceType();
+        var jobName = (StringReference) context.getValue(contextType.fieldByName("jobName"));
+        return jobName != null && pipelineId.equals(jobName.value())
+                ? (LongValue) context.getValue(contextType.fieldByName("jobId")) : null;
+    }
+
+    private static ObjectReference originalRunAfterIncompleteRead(BreakpointEvent stopped, String pipelineId)
+            throws Exception {
+        var frame = stopped.thread().frame(0);
+        var observedPipeline = (StringReference) frame.getArgumentValues().getFirst();
+        if (!pipelineId.equals(observedPipeline.value())) return null;
+        var completion = frame.visibleVariableByName("completion");
+        if (completion == null || !(frame.getValue(completion) instanceof ObjectReference result)
+                || result.getValue(result.referenceType().fieldByName("value")) != null) return null;
+        var converger = frame.thisObject();
+        var actuator = (ObjectReference) converger.getValue(converger.referenceType().fieldByName("actuator"));
+        return (ObjectReference) actuator.getValue(actuator.referenceType().fieldByName("run"));
+    }
+
+    private static boolean jetCompleted(ObjectReference run, ThreadReference thread) {
+        try {
+            var status = (ObjectReference) run.invokeMethod(thread, run.referenceType().methodsByName("status").getFirst(),
+                    List.of(), ObjectReference.INVOKE_SINGLE_THREADED);
+            var statusType = status.referenceType();
+            return status.equals(statusType.getValue(statusType.fieldByName("COMPLETED")));
+        } catch (InvalidTypeException | ClassNotLoadedException | IncompatibleThreadStateException
+                | InvocationException failure) {
+            throw new AssertionError("could not read the original Jet job status", failure);
         }
     }
 
@@ -227,17 +426,20 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
                         .containsEntry("name", "customer-" + id));
     }
 
-    private static long recordsWritten(Path witness) throws Exception {
+    private static WriteLedger readWriteLedger(Path witness) throws Exception {
         assertThat(witness).as("the real Mongo connector's write ledger").isRegularFile();
+        List<String> calls = Files.readAllLines(witness);
         long records = 0;
-        for (String call : Files.readAllLines(witness)) {
+        for (String call : calls) {
             String[] fields = call.split("\\t", -1);
             assertThat(fields).as("one observed Mongo write callback").hasSize(3);
             assertThat(fields[0]).as("the table handed to the Mongo connector").isEqualTo(ORDERS);
             records += Long.parseLong(fields[1]);
         }
-        return records;
+        return new WriteLedger(calls.size(), records);
     }
+
+    private record WriteLedger(int calls, long records) {}
 
     private static void seed(Map<String, Object> settings) throws Exception {
         try (Connection connection = SharedMySql.connect(settings)) {

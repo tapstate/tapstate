@@ -22,10 +22,25 @@ final class MongoCacheBusinessIdentity {
 
     private Document readyIdentity(ClientSession session, String maintenance) {
         Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+        requireReadyIdentity(identity, scope);
+        Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+        requireReadySchema(identity, schema, scope, maintenance);
+        return identity;
+    }
+
+    static void requireObservedAdmission(Document identity, Document schema, CacheBusinessScope scope) {
+        requireReadyIdentity(identity, scope);
+        requireReadySchema(identity, schema, scope, null);
+        admissionRevision(identity);
+    }
+
+    private static void requireReadyIdentity(Document identity, CacheBusinessScope scope) {
         if (identity == null || !scope.clusterId().equals(identity.get("clusterId")) || !Long.valueOf(scope.bindingVersion()).equals(identity.get("bindingVersion"))
                 || !scope.cacheIncarnation().equals(identity.get("cacheIncarnation")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
                 || !MongoCacheIdentity.READY.equals(identity.get("businessPhase"))) throw businessFenced();
-        Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+    }
+
+    private static void requireReadySchema(Document identity, Document schema, CacheBusinessScope scope, String maintenance) {
         if (schema == null || !(schema.get("installedVersion") instanceof Integer version)) throw unreadable();
         if (version > MongoValidationSchema.VERSION) throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY,
                 Map.of("installed", String.valueOf(version), "supported", String.valueOf(MongoValidationSchema.VERSION)), null);
@@ -38,7 +53,6 @@ final class MongoCacheBusinessIdentity {
         }
         if (!(identity.get("businessPreparationId") instanceof String operation) || operation.isBlank()
                 || !operation.equals(schema.get("operationId")) || !(schema.get("epoch") instanceof Long epoch) || epoch < 1) throw unreadable();
-        return identity;
     }
 
     /** Claim admission is infrequent; protected event writes continue to contend on their own claim. */

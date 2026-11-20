@@ -1,5 +1,6 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.common.DiagnosticProjection;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.control.client.ControlResponse;
 import io.tapstate.control.client.HttpControlClient;
@@ -493,7 +494,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     @Override
     public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/artifacts:apply", credential)
+            HttpRequest request = authed(baseUrl, "/api/artifacts:apply", credential, heavyTimeout)
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(applyBody(drafts), StandardCharsets.UTF_8))
                     .build();
@@ -659,8 +660,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         ? new ConnectionTestOutcome.Unreachable()
                         : new ConnectionTestOutcome.Tested(report);
             }
-            Rejection r = rejection(response.body(), "The server refused the connection test.");
-            return new ConnectionTestOutcome.Rejected(r.code(), r.message());
+            Rejection r = rejection(response.body(), "The server refused the connection test.", true);
+            return new ConnectionTestOutcome.Rejected(r.code(), r.message(), r.params(), r.diagnostic());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new ConnectionTestOutcome.Unreachable();
@@ -691,8 +692,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             if (status == 404) {
                 return new ConnectionTestResultOutcome.Absent();
             }
-            Rejection r = rejection(response.body(), "The server refused the read.");
-            return new ConnectionTestResultOutcome.Rejected(r.code(), r.message());
+            Rejection r = rejection(response.body(), "The server refused the read.", true);
+            return new ConnectionTestResultOutcome.Rejected(r.code(), r.message(), r.params(), r.diagnostic());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new ConnectionTestResultOutcome.Unreachable();
@@ -1082,7 +1083,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                             && c.get("status") instanceof String status) {
                         checks.add(new ConnectionReport.Check(name, status,
                                 stringOrNull(c.get("message")), stringOrNull(c.get("reason")),
-                                stringOrNull(c.get("solution")), stringOrNull(c.get("connectorErrorCode"))));
+                                stringOrNull(c.get("solution")), stringOrNull(c.get("connectorErrorCode")),
+                                DiagnosticProjection.read(c.get("diagnostic"))));
                     }
                 }
             }
@@ -1749,7 +1751,13 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * when that field is absent. A malformed failure block is a contract error, not a healthy pipeline.
      */
     private static StatusOutcome statusFound(String body) {
-        if (JsonReader.parse(body) instanceof Map<?, ?> m
+        Object parsed = JsonReader.parse(body);
+        if (parsed instanceof Map<?, ?> pending && pending.get("pipelineId") instanceof String
+                && pending.get("state") == null && pending.get("observedState") == null
+                && (pending.containsKey("displayState") || pending.containsKey("desiredState"))) {
+            return new StatusOutcome.NoObservation();
+        }
+        if (parsed instanceof Map<?, ?> m
                 && m.get("pipelineId") instanceof String id
                 && m.get("state") instanceof String state) {
             boolean aggregate = m.containsKey("observedState")
@@ -2467,7 +2475,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     /** A parsed coded refusal: the server's code and message, or a fixed generic message if not coded. */
-    private record Rejection(String code, String message, Map<String, Object> params) {
+    private record Rejection(
+            String code, String message, Map<String, Object> params, Map<String, Object> diagnostic) {
     }
 
     /**
@@ -2476,6 +2485,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * (e.g. a container 500 page) is still a refusal, never a crash and never leaked raw to the user.
      */
     private static Rejection rejection(String body, String genericMessage) {
+        return rejection(body, genericMessage, false);
+    }
+
+    private static Rejection rejection(String body, String genericMessage, boolean readDiagnostic) {
         try {
             if (JsonReader.parse(body) instanceof Map<?, ?> map && map.get("code") instanceof String code) {
                 String message = map.get("message") instanceof String m ? m : code;
@@ -2485,12 +2498,14 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 if (map.get("params") instanceof Map<?, ?> raw) {
                     raw.forEach((key, value) -> params.put(String.valueOf(key), value));
                 }
-                return new Rejection(code, message, Collections.unmodifiableMap(params));
+                Map<String, Object> diagnostic = readDiagnostic
+                        ? DiagnosticProjection.read(map.get("diagnostic")) : Map.of();
+                return new Rejection(code, message, Collections.unmodifiableMap(params), diagnostic);
             }
         } catch (RuntimeException malformed) {
             // fall through: a non-coded / unparseable error body is still a refusal, not a crash
         }
-        return new Rejection("", genericMessage, Map.of());
+        return new Rejection("", genericMessage, Map.of(), Map.of());
     }
 
     private static RemoteCreatedToken createdToken(Object body) {

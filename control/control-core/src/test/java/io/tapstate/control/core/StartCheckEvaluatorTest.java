@@ -43,6 +43,22 @@ class StartCheckEvaluatorTest {
     }
 
     @Test
+    void cdcOnlyPlanningDoesNotConsultProgressForFullLoadClassification() {
+        var pipeline = (io.tapstate.core.model.PipelineResource) new io.tapstate.core.dsl.DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: cdc
+                source: [src]
+                settings: {read_mode: cdc_only}
+                """);
+        var planner = new StartPlanner(id -> { throw new AssertionError("progress should not be needed"); },
+                noRecords(), definition -> List.of());
+
+        assertThat(planner.plan(pipeline, Optional.empty(), StartIntent.START).load())
+                .isEqualTo(io.tapstate.spi.store.StartLoad.CDC_ONLY);
+    }
+
+    @Test
     void aCheckThatCannotTellIsAFindingOfItsOwnAndTheOthersStillStand() {
         bench.artifacts.put(StartChecksBench.pipeline(null));
         bench.holding("warehouse/orders", new TargetProbe.TargetRows(false, 4L, false));

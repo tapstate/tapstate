@@ -14,6 +14,7 @@ import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -436,6 +437,42 @@ class MongoCacheWorkloadClaimStoreIT {
                     assertThat(c.getNumber("txnNumber").longValue()).isEqualTo(commits.getFirst().getNumber("txnNumber").longValue());
                 });
                 assertThat(commands.stream().filter(c->c.containsKey("findAndModify")).count()).isOne();
+                ownership.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void unknownRenewalCommitRetriesTheSameCommitAndKeepsTheOriginalFence() {
+        withBusiness(f -> {
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommand().containsKey("txnNumber")) commands.add(event.getCommand().clone());
+                }
+            };
+            try (var observed = client(listener)) {
+                var ownership = new MongoClaimOperations(observed);
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()),
+                        SCOPE, ACTIVE, null, ownership);
+                var original = claims.withDeadline(deadline(), () -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).claim();
+                commands.clear();
+                failCommand(f, new Document("failCommands", List.of("commitTransaction"))
+                        .append("writeConcernError", new Document("code", 64).append("errmsg", "test commit receipt lost"))
+                        .append("errorLabels", List.of("UnknownTransactionCommitResult")), new Document("times", 1));
+                try {
+                    var renewed = claims.withRenewalDeadline(deadline(), ACTIVE, () -> claims.renew(original, TTL)).orElseThrow();
+                    assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(WorkloadClaimFence.from(original));
+                    assertThat(renewed.leaseUntil()).isAfter(original.leaseUntil());
+                } finally {
+                    failCommand(f, new Document(), "off");
+                    claims.awaitQuiescence(deadline());
+                }
+                var commits = commands.stream().filter(c -> c.containsKey("commitTransaction")).toList();
+                assertThat(commits).hasSize(2).allSatisfy(c -> {
+                    assertThat(c.getDocument("lsid")).isEqualTo(commits.getFirst().getDocument("lsid"));
+                    assertThat(c.getNumber("txnNumber")).isEqualTo(commits.getFirst().getNumber("txnNumber"));
+                });
+                assertThat(commands.stream().filter(c -> c.containsKey("findAndModify")).count()).isOne();
                 ownership.closeIfIdle();
             }
         });
@@ -921,11 +958,19 @@ class MongoCacheWorkloadClaimStoreIT {
                     error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
             assertThatThrownBy(() -> claims.renew(held, TTL)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
             assertThatThrownBy(() -> claims.advanceExecution(held, 1, Set.of("node-a"))).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            assertThatThrownBy(() -> claims.release(held)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
             assertThat(snapshot(f.database())).isEqualTo(before);
             assertThat(claimScope(f.database())).isEqualTo(header(PIPELINE));
+
+            // Restore the deliberately split scope before performing the legitimate release and replacement.
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document("scope", header(next)),
+                    new Document("$set", new Document("scope", header(PIPELINE))));
             assertThat(claims.release(held)).isTrue();
             replacePreparedScope(f, next);
-            assertThat(claims.acquirePipeline(next, OWNER, 1, TTL).claim().claimGeneration()).isEqualTo(held.claimGeneration() + 1);
+            var successor = claims.acquirePipeline(next, OWNER, 1, TTL).claim();
+            assertThat(successor.claimGeneration()).isEqualTo(held.claimGeneration() + 1);
+            assertThat(claims.release(held)).isFalse();
+            assertThat(claims.readPipeline(next).orElseThrow().claim()).isEqualTo(successor);
         });
     }
 

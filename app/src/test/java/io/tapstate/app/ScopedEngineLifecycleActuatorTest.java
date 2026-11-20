@@ -60,6 +60,7 @@ class ScopedEngineLifecycleActuatorTest {
             onDatabasePrepare.run(); ((Runnable)call.getArgument(4)).run(); return null;
         }).when(views).prepareOperatorDatabase(eq(SCOPE),anyString(),any(),anyString(),any());
         when(ownership.proveClaim(eq(SCOPE),any())).thenAnswer(call -> active.get() && held.get().equals(call.getArgument(1)));
+        when(ownership.proveStartClaim(eq(SCOPE),any())).thenAnswer(call -> active.get() && held.get().equals(call.getArgument(1)));
         when(engine.captureRun("p")).thenReturn(Optional.of(previous));
         when(previous.operatorManifest()).thenReturn(manifest(1));
         when(previous.awaitTerminal(any())).thenReturn(true); when(previous.isCarryingAJob()).thenReturn(true);
@@ -132,6 +133,29 @@ class ScopedEngineLifecycleActuatorTest {
         assertThat(actuator().completed("p")).isFalse();
         verify(previous,never()).cancel();
         verify(fixedCapture,never()).stopCapture(anyString(),anyBoolean());
+    }
+
+    @Test void aSuccessfulBoundedJobStillCarriesThePipelineWhileItsReceiptsArrive() {
+        boundedCapture();
+        var actor = actuator();
+        assertThat(actor.completion("p")).isEmpty();
+
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(fixedCapture.loadDelivered("p")).thenReturn(false);
+        assertThat(actor.isCarryingAJob("p")).isTrue();
+        assertThat(actor.completion("p")).isEmpty();
+
+        when(fixedCapture.loadDelivered("p")).thenReturn(true);
+        assertThat(actor.completion("p")).contains(new LifecycleActuator.Completion("71", claim(1)));
+    }
+
+    @Test void aTerminalJobWithNoBoundedCaptureDoesNotCarryThePipeline() {
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(fixedCapture.isCapturing("p")).thenReturn(true);
+
+        assertThat(actuator().isCarryingAJob("p")).isFalse();
     }
 
     private void boundedCapture() {

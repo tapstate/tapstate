@@ -220,6 +220,21 @@ class PipelineViewServiceTest {
     }
 
     @Test
+    void editorLayoutDoesNotReadRuntimeObservations() {
+        var artifacts = new ReadOnlyArtifactStore();
+        artifacts.seed(pipeline("daily", List.of()));
+        var observations = new InMemoryObservationStore();
+        var query = new ArtifactQueryService(artifacts);
+        var view = new PipelineViewService(query, new PipelineRepresentation(),
+                new PipelineObservationQueryService(query, observations));
+        var layouts = new PipelineLayoutService(view, new InMemoryPipelineLayoutStore());
+
+        assertThat(layouts.get("daily").nodes()).isEmpty();
+        layouts.save("daily", Map.of(), null);
+        assertThat(observations.reads).isZero();
+    }
+
+    @Test
     void savesEditorLayoutWithoutChangingThePipelineArtifactOrAcceptingAnUnknownPipeline() {
         ReadOnlyArtifactStore artifacts = new ReadOnlyArtifactStore();
         artifacts.seed(source("orders", "Orders", "mysql"));
@@ -450,6 +465,7 @@ class PipelineViewServiceTest {
     private static final class InMemoryObservationStore implements ObservationStore {
 
         private final Map<String, Observation> observations = new LinkedHashMap<>();
+        private int reads;
 
         @Override
         public void save(Observation observation) {
@@ -458,6 +474,7 @@ class PipelineViewServiceTest {
 
         @Override
         public Optional<Observation> read(String pipelineId) {
+            reads++;
             return Optional.ofNullable(observations.get(pipelineId));
         }
 

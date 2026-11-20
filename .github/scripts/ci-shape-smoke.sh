@@ -54,12 +54,42 @@ def check(workflows, contexts, inputs):
         'matrix IDs must come from the actual emitted plan'
     build = ci.get('build', '')
     assert build, 'required check build must exist'
-    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('test-shards', 'build', 'image-smoke')]
+    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('snapshot-lock', 'test-shards', 'build', 'image-smoke')]
     assert all(len(value) == 1 for value in versions) and len({value[0] for value in versions}) == 1, \
         'test, build and image jobs must use the same Java version'
-    for role in ('test-shards', 'build'):
+    maven_setup = 'run: bash .github/scripts/setup-ci-maven.sh'
+    first_maven_steps = {
+        'snapshot-lock': 'name: Resolve the reactor',
+        'test-shards': 'name: Build the reactor without running tests',
+        'build': 'name: Prepare local artifacts for report generation',
+        'image-smoke': 'bash deploy/docker/image-smoke.sh --build',
+    }
+    for role, first_step in first_maven_steps.items():
+        text = ci[role]
+        assert text.count(maven_setup) == 1, f'{role} must use the same pinned Maven setup'
+        assert 0 <= text.find('Verify exact Java build') < text.index(maven_setup) < text.find(first_step), \
+            f'{role} must set up pinned Maven before running Maven'
+    for role in ('snapshot-lock', 'test-shards', 'build'):
         assert 'Verify exact Java build' in ci[role] and 'java.runtime.version' in ci[role], \
             'each receipt producer must verify the resolved Java build'
+    assert 'mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/snapshot-m2" -DskipTests install' in ci['snapshot-lock'], \
+        'snapshot inputs must come from a complete reactor preparation'
+    lock = ci['snapshot-lock']
+    assert 'ci-maven-cache.sh seed-stable' in lock and 'ci-snapshot-lock.py capture' in lock, \
+        'one fresh dependency resolution must be captured before the workers'
+    assert 'needs: [shard-plan, snapshot-lock]' in ci['test-shards'], \
+        'workers must wait for the frozen snapshots'
+    for role in ('test-shards', 'build'):
+        block = ci[role]
+        assert 'name: ci-snapshot-lock' in block and 'ci-snapshot-lock.py restore' in block, \
+            'every producer must restore the same snapshot artifact'
+        assert "echo 'MAVEN_ARGS=-nsu'" in block, 'snapshot updates must be suppressed after restore'
+        assert 0 <= block.find('ci-snapshot-lock.py restore') < block.find('ci-build-observation.sh'), \
+            'the lock must be restored before each producer builds'
+    assert 'export MAVEN_ARGS="$MAVEN_ARGS -nsu"' in ci['test-shards'], \
+        'the test step must retain the snapshot lock when it sets test arguments'
+    assert 'python3 .github/scripts/ci-snapshot-lock-smoke.py' in ci['catalog-scripts'], \
+        'snapshot lock controls must run in CI'
     assert not re.search(r'^\s+matrix:', build, re.M), 'build must not be a matrix'
     assert not re.search(r'^    name:', build, re.M), 'build must retain its check name'
     assert re.search(r'^    needs:.*test-shards', build, re.M), 'build must wait for all shards'
@@ -178,7 +208,7 @@ def check(workflows, contexts, inputs):
     assert 'ref: ${{ inputs.source-sha || github.ref }}' in cloud_dev \
         and 'ref: ${{ inputs.web-sha || github.ref_name }}' in cloud_dev, \
         'release calls must build their frozen source commits'
-    assert cloud_dev.count('RELEASE_VERSION: ${{ inputs.version }}') == 2 \
+    assert cloud_dev.count('RELEASE_VERSION: ${{ inputs.version }}') == 1 \
         and 'echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"' in cloud_dev, \
         'release calls must retain the selected release version'
     assert 'environment: cloud-ghcr-dev' in cloud_dev \
@@ -189,13 +219,18 @@ def check(workflows, contexts, inputs):
         and "github.ref_type == 'branch'" in cloud_dev, 'Cloud dev image dispatch must exclude tag refs'
     assert '.github/scripts/next-version.sh "$BUMP" origin/main' in cloud_dev, \
         'Cloud dev version calculation must use the tagged main history'
-    assert '--dev-source-sha "$SOURCE_SHA"' in cloud_dev, \
-        'feature builds must publish under a source-specific dev tag'
-    assert cloud_dev.count("if: inputs.version != '' || github.ref == 'refs/heads/main'") == 2 \
-        and 'DEV_BRANCH: main' in cloud_dev, \
-        'only main builds and pinned release candidates may register in the dev catalog'
-    assert 'if [[ -z "$RELEASE_VERSION" && "$GITHUB_REF" != refs/heads/main ]]; then' in cloud_dev, \
-        'pinned releases retain the canonical dev tag even when dispatched from an allowed branch'
+    assert '--dev-source-sha' not in cloud_dev, \
+        'all branches must publish the canonical dev tag without a source suffix'
+    assert 'bash deploy/cloud/ghcr-publish.sh publish-dev' in cloud_dev, \
+        'all branches must use dev publication mode'
+    for step_name in ('validate the dev version registration configuration',
+                      'register the checked image in the dev Cloud version catalog'):
+        step = next(step for step in re.split(r'(?m)(?=^      - )', cloud_dev)
+                    if f'- name: {step_name}' in step)
+        assert not re.search(r'^        (?:if|continue-on-error):', step, re.M), \
+            'all branch builds must validate and register their checked dev image'
+    assert "DEV_BRANCH: ${{ inputs.version != '' && 'main' || github.ref_name }}" in cloud_dev, \
+        'standalone builds must register their actual branch; pinned releases retain main provenance'
     sonar = ci.get('sonarqube', '')
     sonar_name = '    name: sonarqube'
     assert sonar_name in sonar.splitlines(), 'sonarqube must keep its exact name on analysis events'
@@ -224,8 +259,16 @@ assert contexts, 'required context list is empty'
 check(workflows, contexts, inputs)
 mutations = 0
 for original, replacement in [
+    ('ci-maven-cache.sh seed-stable', 'ci-maven-cache.sh seed'),
+    ('ci-snapshot-lock.py capture', 'echo capture-removed'),
+    ('needs: [shard-plan, snapshot-lock]', 'needs: [shard-plan]'),
+    ('ci-snapshot-lock.py restore', 'echo restore-removed'),
+    ("echo 'MAVEN_ARGS=-nsu'", 'echo updates-not-suppressed'),
+    ('export MAVEN_ARGS="$MAVEN_ARGS -nsu"', 'echo test-updates-not-suppressed'),
+    ('python3 .github/scripts/ci-snapshot-lock-smoke.py', 'echo snapshot-smoke-removed'),
     ("java-version: '21.0.13+9.0.LTS'", "java-version: '21.0.12+8.0.LTS'"),
     ('Verify exact Java build', 'Missing exact Java build'),
+    ('bash .github/scripts/setup-ci-maven.sh', 'echo missing-maven-setup'),
     (MAVEN_ARGS, ''),
     (MAVEN_ARGS, MAVEN_ARGS.replace('1.44', '1.32')),
     (MAVEN_ARGS, '    env:\n' + '\n'.join('      ' + line[10:] for line in MAVEN_ARGS.splitlines())),
@@ -334,11 +377,15 @@ for original, replacement in [
     ('RELEASE_VERSION: ${{ inputs.version }}', 'RELEASE_VERSION: ""'),
     ('environment: cloud-ghcr-dev', 'environment: cloud-ghcr-release'),
     ('secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV', 'secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD'),
-    ("inputs.version != '' || github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/main'"),
-    ('-z "$RELEASE_VERSION" && "$GITHUB_REF"', '"$GITHUB_REF"'),
+    ('- name: validate the dev version registration configuration',
+     "- name: validate the dev version registration configuration\n        if: github.ref == 'refs/heads/main'"),
+    ('- name: register the checked image in the dev Cloud version catalog',
+     "- name: register the checked image in the dev Cloud version catalog\n        if: github.ref == 'refs/heads/main'"),
     ('.github/scripts/next-version.sh "$BUMP" origin/main', '.github/scripts/next-version.sh "$BUMP" HEAD'),
-    ('--dev-source-sha "$SOURCE_SHA"', ''),
-    ('DEV_BRANCH: main', 'DEV_BRANCH: ${{ github.ref_name }}'),
+    ('bash deploy/cloud/ghcr-publish.sh publish-dev', 'bash deploy/cloud/ghcr-publish.sh publish'),
+    ('--version "$VERSION" --expected-digest "$DIGEST"',
+     '--version "$VERSION" --expected-digest "$DIGEST" --dev-source-sha "${{ steps.source.outputs.sha }}"'),
+    ("DEV_BRANCH: ${{ inputs.version != '' && 'main' || github.ref_name }}", 'DEV_BRANCH: main'),
 ]:
     assert original in workflows['cloud-cluster-dev.yml'], f'Cloud dev mutation target absent: {original}'
     mutated_workflows = {**workflows,

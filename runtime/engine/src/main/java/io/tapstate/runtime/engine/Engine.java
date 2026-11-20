@@ -159,13 +159,24 @@ public final class Engine {
         Objects.requireNonNull(originalIdentity, "originalIdentity");
         refuseIfLost(pipelineId);
         Job previous = jobNamed(pipelineId);
-        if (previous != null && !previous.getStatus().isTerminal() && previous.getStatus() != JobStatus.COMPLETING
-                && (!originalIdentity.equals(previous.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
-                || !Objects.equals(manifest, previous.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT)))) throw runRefused(pipelineId);
+        try {
+            if (previous != null && !previous.getStatus().isTerminal() && previous.getStatus() != JobStatus.COMPLETING) {
+                JobConfig config = previous.getConfig();
+                if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))
+                        || !Objects.equals(manifest, config.getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
+            }
+        } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
+            throw runRefused(pipelineId);
+        }
         configureNestState(stateDatabases, settings);
         Job submitted = submitJob(pipelineId, dag, originalIdentity, manifest);
-        if (!originalIdentity.equals(submitted.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
-                || !Objects.equals(manifest, submitted.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
+        try {
+            JobConfig config = submitted.getConfig();
+            if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))
+                    || !Objects.equals(manifest, config.getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
+        } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
+            throw runRefused(pipelineId);
+        }
         JobFailureRegistry.of(member).attach(pipelineId, submitted.getId(), originalIdentity);
         return new Run(pipelineId, originalIdentity, submitted, manifest);
     }
@@ -192,21 +203,29 @@ public final class Engine {
     /** The returned handle never resolves the Pipeline name again, even after another run replaces it. */
     public Optional<Run> findRun(String pipelineId, java.io.Serializable originalIdentity) {
         Objects.requireNonNull(originalIdentity, "originalIdentity");
-        Job job = jobNamed(pipelineId);
-        if (job == null) return Optional.empty();
-        JobConfig config = job.getConfig();
-        if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))) return Optional.empty();
-        OperatorRunManifest manifest = config.getArgument(OPERATOR_MANIFEST_ARGUMENT) == null
-                ? null : requireOperatorManifest(job, config);
-        return Optional.of(new Run(pipelineId, originalIdentity, job, manifest));
+        try {
+            Job job = jobNamed(pipelineId);
+            if (job == null) return Optional.empty();
+            JobConfig config = job.getConfig();
+            if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))) return Optional.empty();
+            OperatorRunManifest manifest = config.getArgument(OPERATOR_MANIFEST_ARGUMENT) == null
+                    ? null : requireOperatorManifest(job, config);
+            return Optional.of(new Run(pipelineId, originalIdentity, job, manifest));
+        } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
+            return Optional.empty();
+        }
     }
 
     /** Captures one marked job and its original placements; later operations never resolve its name again. */
     public Optional<Run> captureRun(String pipelineId) {
-        Job job = jobNamed(pipelineId);
-        if (job == null) return Optional.empty();
-        OperatorRunManifest original = requireOperatorManifest(job, job.getConfig());
-        return Optional.of(new Run(pipelineId, original.executionIdentity(), job, original));
+        try {
+            Job job = jobNamed(pipelineId);
+            if (job == null) return Optional.empty();
+            OperatorRunManifest original = requireOperatorManifest(job, job.getConfig());
+            return Optional.of(new Run(pipelineId, original.executionIdentity(), job, original));
+        } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
+            return Optional.empty();
+        }
     }
 
     /** A local, non-serializable handle for the one concrete job whose configuration was verified. */
@@ -939,9 +958,19 @@ public final class Engine {
         OperatorMapBindings bindings = member.getUserContext() == null ? null
                 : OperatorMapBindings.resolve(member, false);
         Map<String, NestStateReading> readings = new HashMap<>();
-        byNamespace.forEach((namespace, kinds) -> readings.put(namespace,
-                NestStateMetricNames.readingFrom(kinds, stored(namespace))
-                        .withOrigin(originOf(bindings, namespace))));
+        var dataMembers = member.getCluster().getMembers().stream().filter(value -> !value.isLiteMember())
+                .map(value -> value.getUuid().toString()).collect(java.util.stream.Collectors.toSet());
+        var keySamples = io.tapstate.runtime.engine.nest.NestStateSamples.keyAccess(collected, dataMembers);
+        var diagnostics = io.tapstate.runtime.engine.nest.NestStateSamples.diagnostics(collected);
+        byNamespace.forEach((namespace, kinds) -> {
+            var reading = NestStateMetricNames.readingFrom(kinds, stored(namespace));
+            var measured = diagnostics.get(namespace);
+            if (measured != null) {
+                if (measured.rootsSince() != null) reading = reading.withRootsRendered(measured.rootsRendered(), measured.rootsSince());
+                if (measured.commits() != null) reading = reading.withCommits(measured.commits());
+            }
+            readings.put(namespace, reading.withContext(keySamples.get(namespace), originOf(bindings, namespace)));
+        });
         return readings;
     }
 

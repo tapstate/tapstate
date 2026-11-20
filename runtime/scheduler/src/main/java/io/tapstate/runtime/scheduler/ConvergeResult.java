@@ -28,6 +28,10 @@ public record ConvergeResult(
         return new ConvergeResult(ConvergeStatus.NOTHING_TO_DO, Optional.empty(), Optional.empty());
     }
 
+    static ConvergeResult recovering(CheckpointDoc checkpoint) {
+        return new ConvergeResult(ConvergeStatus.RECOVERING, Optional.of(checkpoint), Optional.empty());
+    }
+
     static ConvergeResult superseded() {
         return new ConvergeResult(ConvergeStatus.SUPERSEDED, Optional.empty(), Optional.empty());
     }

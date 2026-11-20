@@ -12,8 +12,10 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
@@ -81,6 +83,40 @@ class AtlasPdkSourcePermissionsIT {
             Await.until("the authenticated source primary", Duration.ofSeconds(30),
                     () -> Boolean.TRUE.equals(admin.getDatabase("admin").runCommand(new Document("hello", 1))
                             .getBoolean("isWritablePrimary")), () -> "the source has not elected its primary");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rejectedCredentialsAreHiddenInImmediateAndLatestReports(boolean diagnostics) throws Exception {
+        String username = "p2-atlas-witness-user";
+        String id = "atlas_wrong_user";
+        try (var prepared = PreparedNativeStore.create();
+             var runtime = new AtlasRuntime(AtlasRuntime.Mode.ON_PREM, prepared);
+             var server = diagnostics ? InProcessServer.startWithConnectionDiagnostics(prepared) : runtime.launch(Tiers.IN_PROCESS)) {
+            var control = runtime.control(server, true);
+            runtime.register(control, CONNECTOR);
+            assertThat(control.testConnection("atlas_valid_user", CONNECTOR, settings(uri("root", "admin")))
+                    .outcome()).isEqualTo("PASSED");
+            var immediate = control.sourceRequest("POST", "/api/connections:test",
+                    Map.of("id", id, "connectorId", CONNECTOR, "settings", settings(uri(username, "admin"))),
+                    null, 200);
+            var latest = control.sourceRequest("GET", "/api/connections/" + id + "/test-result",
+                    null, null, 200);
+
+            assertThat(immediate.body()).doesNotContain(username, PASSWORD);
+            assertThat(latest.body()).doesNotContain(username, PASSWORD);
+            var report = (Map<?, ?>) JsonReader.parse(immediate.body());
+            assertThat(report.get("outcome")).isEqualTo("FAILED");
+            assertThat(report.get("checks").toString()).contains("Exception authenticating", "MongoCredential<redacted>");
+            if (diagnostics) {
+                assertThat((List<?>) report.get("checks")).anySatisfy(value ->
+                        assertThat(((Map<?, ?>) value).get("diagnostic")).isInstanceOf(Map.class));
+            } else {
+                assertThat(immediate.body()).doesNotContain("\"diagnostic\":");
+            }
+            assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
+            runtime.assertAuthenticationBoundary();
         }
     }
 
@@ -211,6 +247,8 @@ class AtlasPdkSourcePermissionsIT {
     private static void assertSafeCaptureFailure(ControlPlane control, String pipeline, String sourceUri,
             String expectedDetail) {
         awaitState(control, pipeline, PipelineState.FAILED);
+        Await.until(pipeline + " to publish its connector failure", TIMEOUT,
+                () -> control.failureCode(pipeline).isPresent(), () -> control.logs(pipeline));
         assertThat(control.failureCode(pipeline)).contains(ConnectorError.CAPTURE_FAILED.code());
         String body = control.sourceRequest("GET", "/api/pipelines/" + pipeline + "/status", null, null, 200).body();
         assertThat(body).doesNotContain(PASSWORD, sourceUri);
@@ -235,11 +273,13 @@ class AtlasPdkSourcePermissionsIT {
     }
 
     private static void awaitSnapshotProgress(ControlPlane control, String pipeline) {
-        Await.until("the explicit confirmed two-row snapshot progress", TIMEOUT,
-                () -> control.snapshotTable(pipeline, TABLE)
-                        .filter(progress -> progress.rowsDone() == 2 && Integer.valueOf(100).equals(progress.donePct()))
-                        .isPresent(),
-                () -> "snapshot=" + control.snapshotTable(pipeline, TABLE));
+        var load = Await.answered("the completed snapshot progress", TIMEOUT,
+                () -> control.initialLoad(pipeline).filter(progress -> "COMPLETED".equals(progress.get("phase"))));
+        assertThat(load.get("runKey")).asString().startsWith("execution:" + pipeline + ":");
+        var tables = (Map<?, ?>) load.get("tables");
+        var progress = (Map<?, ?>) tables.get(TABLE);
+        assertThat(progress.get("stage")).isEqualTo("LANDED");
+        assertThat(((Number) progress.get("rowsRead")).longValue()).isEqualTo(2L);
         assertThat(control.state(pipeline)).as("the successful snapshot has a healthy current observation")
                 .hasValueSatisfying(state -> assertThat(state).isNotEqualTo(PipelineState.FAILED));
     }

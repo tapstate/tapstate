@@ -2108,7 +2108,8 @@ final class Repl {
             LocalDraft only = drafts.get(0);
             drafts = List.of(new LocalDraft(only.source(), only.content(), ifMatch));
         }
-        ApplyOutcome outcome = applyDrafts(drafts);
+        URI requestTarget = session.landingNode();
+        ApplyOutcome outcome = applyDrafts(requestTarget, drafts);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case ApplyOutcome.Applied applied -> {
@@ -2121,7 +2122,7 @@ final class Repl {
             }
             case ApplyOutcome.Rejected rejected ->
                     renderRejection(rejected.code(), rejected.message(), rejected.params());
-            case ApplyOutcome.Unreachable ignored -> reportRequestFailed();
+            case ApplyOutcome.Unreachable ignored -> reportRequestFailed(requestTarget);
         };
     }
 
@@ -2469,7 +2470,8 @@ final class Repl {
                 renderReport(tested.report(), chosen);
                 yield reportStatus(tested.report());
             }
-            case ConnectionTestOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ConnectionTestOutcome.Rejected rejected -> renderConnectionRejection(
+                    rejected.code(), rejected.message(), rejected.params(), rejected.diagnostic(), chosen);
             case ConnectionTestOutcome.TimedOut ignored -> reportRequestTimedOut();
             case ConnectionTestOutcome.Unreachable ignored -> reportRequestFailed();
         };
@@ -2660,7 +2662,8 @@ final class Repl {
                 err.flush();
                 yield Cli.EXIT_DIAGNOSTIC;
             }
-            case ConnectionTestResultOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ConnectionTestResultOutcome.Rejected rejected -> renderConnectionRejection(
+                    rejected.code(), rejected.message(), rejected.params(), rejected.diagnostic(), parsed.format());
             case ConnectionTestResultOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
@@ -3565,6 +3568,9 @@ final class Repl {
             if (solution != null) {
                 out.println("          " + solution);
             }
+            if (!check.diagnostic().isEmpty()) {
+                renderConnectionDiagnostic(out, check.diagnostic(), "          ");
+            }
         }
         if (changeCaptureUnavailable(report)) {
             out.println();
@@ -3572,6 +3578,56 @@ final class Repl {
                     + CHANGE_STREAM_CHECK + " check passes.");
             out.println("  A snapshot will; a pipeline reading changes will start and never see any.");
         }
+    }
+
+    private static void renderConnectionDiagnostic(PrintWriter out, Map<?, ?> node, String indent) {
+        String code = node.get("code") instanceof String text ? text : "";
+        String message = node.get("message") instanceof String text ? text : "";
+        if (!code.isEmpty() || !message.isEmpty()) {
+            out.println(indent + (code + " " + message).strip());
+        }
+        if (node.get("solution") instanceof String solution) {
+            out.println(indent + solution);
+        }
+        if (node.get("references") instanceof List<?> references) {
+            for (Object value : references) {
+                if (value instanceof Map<?, ?> reference) {
+                    String parent = reference.get("pipelineId") instanceof String id ? id + "/" : "";
+                    out.println(indent + reference.get("type") + ": " + parent + reference.get("id"));
+                }
+            }
+        }
+        if (node.get("cause") instanceof Map<?, ?> cause) {
+            renderConnectionDiagnostic(out, cause, indent + "  ");
+        }
+        if (node.get("causes") instanceof List<?> causes) {
+            for (Object value : causes) {
+                if (value instanceof Map<?, ?> cause) {
+                    renderConnectionDiagnostic(out, cause, indent + "  ");
+                }
+            }
+        }
+        if (Boolean.TRUE.equals(node.get("truncated"))) {
+            out.println(indent + "[Diagnostic truncated]");
+        }
+    }
+
+    private int renderConnectionRejection(
+            String code, String message, Map<String, Object> params, Map<String, Object> diagnostic,
+            OutputFormat format) {
+        if (diagnostic.isEmpty()) {
+            return renderRejection(code, message);
+        }
+        PrintWriter err = commandLine.getErr();
+        if (format == OutputFormat.TEXT) {
+            renderRejection(code, message, params);
+            renderConnectionDiagnostic(err, diagnostic, "  ");
+        } else {
+            var body = Map.of("code", code, "message", message, "params", params, "diagnostic", diagnostic);
+            err.println(format == OutputFormat.JSON ? JsonOut.write(body) : YamlOut.write(body));
+        }
+        err.flush();
+        return Cli.EXIT_DIAGNOSTIC;
     }
 
     /**
@@ -3630,16 +3686,8 @@ final class Repl {
         if (!present(value)) {
             return null;
         }
-        String trimmed = value.trim();
-        String key = PDK_TEST_ITEM_PREFIX + trimmed;
-        String rendered = MessageCatalog.bundled().render(key, Map.of()).message();
-        // The catalog answers an unknown code with the code itself. The original is returned in that
-        // case rather than the lookup's answer, so a value carrying braces cannot come back mangled.
-        return rendered.equals(key) ? trimmed : rendered;
+        return MessageCatalog.bundled().renderConnectorTestText(value.trim());
     }
-
-    /** The reserved catalog namespace the connector API's test-item keys are given wording under. */
-    private static final String PDK_TEST_ITEM_PREFIX = "pdk.testitem.";
 
     /** The report as an ordered tree for the machine surfaces, omitting the optional check fields left null. */
     private static Map<String, Object> reportMap(ConnectionReport report) {
@@ -3656,6 +3704,9 @@ final class Repl {
             putIfPresent(entry, REASON_PARAM, check.reason());
             putIfPresent(entry, "solution", check.solution());
             putIfPresent(entry, "connectorErrorCode", check.connectorErrorCode());
+            if (!check.diagnostic().isEmpty()) {
+                entry.put("diagnostic", check.diagnostic());
+            }
             checks.add(entry);
         }
         map.put("checks", checks);
@@ -5001,7 +5052,7 @@ final class Repl {
                 return Cli.EXIT_OK;
             }
             List<String> ids = subjects.stream().map(UpDraft::id).toList();
-            switch (applyDrafts(batch.stream().map(UpDraft::draft).toList())) {
+            switch (applyDrafts(session.landingNode(), batch.stream().map(UpDraft::draft).toList())) {
                 case ApplyOutcome.Applied applied -> {
                     for (ApplyOutcome.Item item : applied.items()) {
                         // A resource an earlier stage already applied keeps that stage's verdict: it is
@@ -5256,10 +5307,14 @@ final class Repl {
     // composite verb chains them. There is one way to apply, discover, start or read a pipeline from
     // here, whichever verb asked.
 
-    /** Applies one batch of drafts. */
-    private ApplyOutcome applyDrafts(List<LocalDraft> drafts) {
-        return withFailover(() -> controlPlane.apply(session.landingNode(), session.credential(), drafts),
-                o -> o instanceof ApplyOutcome.Unreachable);
+    /** Applies one batch without replaying a write whose result is unknown. */
+    private ApplyOutcome applyDrafts(URI requestTarget, List<LocalDraft> drafts) {
+        ApplyOutcome outcome = controlPlane.apply(requestTarget, session.credential(), drafts);
+        if (outcome instanceof ApplyOutcome.Unreachable) {
+            // Restore the session for subsequent calls; the server may have committed this write.
+            failover();
+        }
+        return outcome;
     }
 
     /** Runs a schema discovery for a connection with the connector and settings it declares. */
@@ -5651,17 +5706,21 @@ final class Repl {
         out.flush();
     }
 
-    /**
-     * Reports that a request could not be completed after failover. Only reached when the retry itself was
-     * unreachable while a landing node is still held; a total loss of the cluster has already been reported
-     * by {@link #failover} (which then took the session offline), so this stays silent in that case.
-     */
     private int reportRequestFailed() {
+        return reportRequestFailed(session.landingNode());
+    }
+
+    /**
+     * Reports that a request could not be completed while a landing node is still held. A total loss of
+     * the cluster has already been reported by {@link #failover} (which then took the session offline),
+     * so this stays silent in that case.
+     */
+    private int reportRequestFailed(URI requestTarget) {
         if (!session.isConnected()) {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
         PrintWriter err = commandLine.getErr();
-        err.println("request failed: " + hostPort(session.landingNode()) + " is unreachable");
+        err.println("request failed: " + hostPort(requestTarget) + " is unreachable");
         err.flush();
         return Cli.EXIT_DIAGNOSTIC;
     }

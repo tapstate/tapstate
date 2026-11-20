@@ -2,8 +2,10 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineStatus;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
+import io.tapstate.spi.store.IoError;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
@@ -11,6 +13,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * How the status face answers "how current is this?". The projection reads now from the server's own clock,
@@ -136,6 +139,47 @@ class PipelineStatusResponseTest {
         assertThat(response.observedState()).isNull();
         assertThat(response.observedAt()).isNull();
         assertThat(response.observedAgeMillis()).isNull();
+    }
+
+    @Test
+    void usesAuthoritativeRunningWithoutInventingAnObservation() {
+        var status = new PipelineCatalogItem.Status(PipelineCatalogItem.DisplayState.RUNNING,
+                PipelineCatalogItem.UiState.RUNNING, PipelineState.RUNNING, null, null, null);
+        var item = new PipelineCatalogItem("orders", "Orders", null, "cdc", null, OBSERVED_AT,
+                "content-hash", true, status);
+
+        var response = PipelineStatusResponse.of(item, catalog);
+
+        assertThat(response.state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(response.displayState()).isEqualTo(PipelineCatalogItem.UiState.RUNNING);
+        assertThat(response.observedState()).isNull();
+        assertThat(response.observedAt()).isNull();
+    }
+
+    @Test
+    void knownStopTransitionCanBeReportedWithoutAnAuthoritativeState() {
+        var status = new PipelineCatalogItem.Status(PipelineCatalogItem.DisplayState.STOPPING,
+                PipelineCatalogItem.UiState.STOPPING, PipelineState.STOPPED, null, null, null);
+        var item = new PipelineCatalogItem("orders", "Orders", null, "cdc", null, OBSERVED_AT,
+                "content-hash", true, status);
+
+        var response = PipelineStatusResponse.of(item, catalog);
+
+        assertThat(response.displayState()).isEqualTo(PipelineCatalogItem.UiState.STOPPING);
+        assertThat(response.desiredState()).isEqualTo(PipelineState.STOPPED);
+        assertThat(response.state()).isNull();
+        assertThat(response.observedState()).isNull();
+    }
+
+    @Test
+    void aPublishedPipelineWithNoStateOrKnownTransitionStillReportsAReadFailure() {
+        var status = new PipelineCatalogItem.Status(null, null, null, null, null, null);
+        var item = new PipelineCatalogItem("orders", "Orders", null, "cdc", null, OBSERVED_AT,
+                "content-hash", true, status);
+
+        assertThatThrownBy(() -> PipelineStatusResponse.of(item, catalog))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
     @Test

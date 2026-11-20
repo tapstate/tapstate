@@ -112,7 +112,9 @@ class ARunThatLosesAMemberIsPlannedAgainForTheMembersLeftIT {
                         () -> "rows at the target = " + files.count(targetAddress, TABLE) + ", was " + rowsAtTheKill
                                 + " when " + victim + " was killed; the pipeline is " + survivor.state(PIPELINE));
 
-                assertThat(survivor.state(PIPELINE)).contains(PipelineState.RUNNING);
+                Await.until("the replacement RUNNING observation to publish", TAKEOVER,
+                        () -> survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> "last observed state " + survivor.state(PIPELINE));
                 assertThat(survivor.pipelineControllerOf(PIPELINE))
                         .as("the pipeline did not change hands").contains(driver);
                 assertThat(survivor.executionGenerationOf(PIPELINE))

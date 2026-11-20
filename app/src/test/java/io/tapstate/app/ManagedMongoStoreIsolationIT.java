@@ -1324,8 +1324,11 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
                 String cookie = exchangeCookie(application, "fresh");
                 assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(2);
-                assertThat(cloudPost(application, cookie, "/api/storage/status", Map.of()))
-                        .containsEntry("businessPhase", "AWAITING_REBUILD_CONFIRMATION");
+                var recoveryCookie = cookie;
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(12)).untilAsserted(() -> {
+                    assertThat(cloudPost(application, recoveryCookie, "/api/storage/status", Map.of()))
+                            .containsEntry("businessPhase", "AWAITING_REBUILD_CONFIRMATION");
+                });
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>()))
                         .containsExactlyInAnyOrder("cache_identity", "schema_migrations", "cloud_sessions", "cloud_revocations");
                 var orphan = admin.getDatabase(configDb).getCollection("pdk_note_migrations");
@@ -1613,8 +1616,9 @@ class ManagedMongoStoreIsolationIT {
                 var request = Map.<String,Object>of("operationId", original.operationId(), "generation", original.generation(),
                         "candidate", candidate, "testStamps", stamps);
                 if (failAfterCompletion) {
-                    var accepted = cloudPost(application, temporary, "/api/storage/setup/commit", request);
-                    assertThat(accepted.get("setupPhase")).isIn("STORAGE_BOUND", "COMPLETE");
+                    assertThatThrownBy(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request))
+                            .isInstanceOfSatisfying(org.springframework.web.client.HttpServerErrorException.ServiceUnavailable.class,
+                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("\"code\":\"control.storage-unavailable\""));
                     org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> injected.get() != null && !root.initialActivationPending());
                 }
                 else try (var callers = java.util.concurrent.Executors.newFixedThreadPool(2)) {

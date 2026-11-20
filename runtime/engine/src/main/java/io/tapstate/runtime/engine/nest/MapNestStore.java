@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.map.EntryProcessor;
 import com.hazelcast.map.IMap;
+import com.hazelcast.map.LocalMapStats;
 import io.tapstate.runtime.engine.ProtectedMap;
 import java.io.Serializable;
 import java.util.Collection;
@@ -50,6 +51,9 @@ final class MapNestStore<S> implements NestStore<S> {
     private final ProtectedMap<Object, S> map;
     private final NestStateStats stats;
     private final NestStateGauge gauge;
+    private boolean keyPublisherBound;
+    private long publishedGroups;
+    private long publishedEvictions;
 
     MapNestStore(IMap<Object, S> map) {
         this(map, null, NestStateGauge.NONE);
@@ -64,6 +68,7 @@ final class MapNestStore<S> implements NestStore<S> {
     @Override
     public S load(Object key) {
         countAccess();
+        if (stats != null) stats.readKeys(map.getName(), 1);
         S state = map.get(key);
         publishReading();
         return state;
@@ -84,8 +89,9 @@ final class MapNestStore<S> implements NestStore<S> {
         if (keys.isEmpty()) {
             return Map.of();
         }
+        countAccess();
         Set<Object> distinct = new LinkedHashSet<>(keys);
-        countAccess(distinct.size());
+        if (stats != null) stats.readKeys(map.getName(), distinct.size());
         Map<Object, S> loaded = map.getAll(distinct);
         publishReading();
         return loaded;
@@ -108,9 +114,37 @@ final class MapNestStore<S> implements NestStore<S> {
         }
         String namespace = map.getName();
         NestStateStats.Counted counted = stats.counted(namespace);
-        gauge.reading(namespace, count(), counted.accesses(), counted.backfills(),
+        LocalMapStats local = map.getLocalMapStats();
+        gauge.reading(namespace, local.getOwnedEntryCount(), counted.accesses(), counted.backfills(),
                 counted.backfillNanos() / 1_000_000L, counted.pendingHighWater());
-        gauge.keyReading(namespace, counted.keyAccesses(), counted.coldKeys());
+        if (!keyPublisherBound) {
+            stats.publishKeys(namespace, gauge.keyPublisher(namespace));
+            keyPublisherBound = true;
+        } else stats.refreshKeys(namespace);
+        long evictions = local.getEvictionCount();
+        if (stats.commitGroups(namespace) != publishedGroups || evictions != publishedEvictions) {
+            var commits = stats.commits(namespace);
+            if (commits != null) {
+                gauge.commitReading(namespace, commits, evictions);
+                publishedGroups = commits.groups();
+                publishedEvictions = evictions;
+            }
+        }
+    }
+
+    /**
+     * Counts documents this level sent, per namespace rather than per store for the reason {@link #holding}
+     * gives, and leaves the reading at once: the count changes only here, and a document is the moment a
+     * reader watching a load wants it to move.
+     */
+    @Override
+    public void rendered(long documents) {
+        if (stats != null && documents > 0) {
+            String namespace = map.getName();
+            stats.rendered(namespace, documents);
+            var counted = stats.counted(namespace);
+            gauge.rootsReading(namespace, counted.rootsRendered(), counted.countingSinceMillis());
+        }
     }
 
     /**
@@ -127,7 +161,7 @@ final class MapNestStore<S> implements NestStore<S> {
 
     @Override
     public void save(Object key, S state) {
-        countAccess();
+        countWrite();
         map.executeOnKey(key, new Carried<>(state));
         publishReading();
     }
@@ -157,7 +191,7 @@ final class MapNestStore<S> implements NestStore<S> {
             save(key, state);
             return;
         }
-        countAccess();
+        countWrite();
         map.set(key, state);
         publishReading();
     }
@@ -171,7 +205,7 @@ final class MapNestStore<S> implements NestStore<S> {
             save(only.getKey(), only.getValue(), firstFilings.contains(only.getKey()));
             return;
         }
-        states.keySet().forEach(ignored -> countAccess());
+        states.keySet().forEach(ignored -> countWrite());
         map.setAll(states);
         publishReading();
     }
@@ -183,7 +217,7 @@ final class MapNestStore<S> implements NestStore<S> {
      */
     @Override
     public void add(Object key, Object element) {
-        countAccess();
+        countWrite();
         map.executeOnKey(key, new Grown<>(element));
         publishReading();
     }
@@ -194,10 +228,12 @@ final class MapNestStore<S> implements NestStore<S> {
         Map<Object, Set<Object>> snapshot = new LinkedHashMap<>();
         additions.forEach((key, elements) -> snapshot.put(key,
                 Collections.unmodifiableSet(new LinkedHashSet<>(elements))));
-        snapshot.keySet().forEach(ignored -> countAccess());
+        snapshot.keySet().forEach(ignored -> countWrite());
         // ADD-only union is idempotent across a partial protected retry. The lookup owns these keys
         // and cannot handle a later removal while this synchronous operation is still in progress.
-        map.executeOnKeys(snapshot.keySet(), new GrownBatch<>(snapshot));
+        Map<Object, EntryProcessor<Object, S, Void>> mutations = new LinkedHashMap<>();
+        snapshot.forEach((key, elements) -> mutations.put(key, new GrownBatch<>(Map.of(key, elements))));
+        map.executeOnKeys(mutations);
         publishReading();
     }
 
@@ -208,14 +244,14 @@ final class MapNestStore<S> implements NestStore<S> {
      */
     @Override
     public void remove(Object key, Object element) {
-        countAccess();
+        countWrite();
         map.executeOnKey(key, new Shrunk<>(element));
         publishReading();
     }
 
     @Override
     public void remove(Object key) {
-        countAccess();
+        countWrite();
         map.delete(key);
         publishReading();
     }
@@ -245,15 +281,13 @@ final class MapNestStore<S> implements NestStore<S> {
      * stopped being true of is the write onto a key a read has just found nothing under, which is put across
      * the map for exactly this reason and makes no trip at all.
      */
-    private void countAccess() {
-        countAccess(1);
+    private void countWrite() {
+        countAccess();
+        if (stats != null) stats.writeKeys(map.getName(), 1);
     }
 
-    private void countAccess(long keys) {
-        if (stats != null) {
-            stats.access(map.getName());
-            stats.accessKeys(map.getName(), keys);
-        }
+    private void countAccess() {
+        if (stats != null) stats.access(map.getName());
     }
 
     /**

@@ -122,11 +122,9 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
         Map<String, Object> mysql = SharedMySql.settings(DATABASE);
         seed(mysql);
 
-        String targetUri = SharedMongo.replicaSetUrl("recompute_target");
-        EndpointAddress target = EndpointAddress.uri(targetUri);
-
         try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
                 ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            EndpointAddress target = EndpointAddress.uri(storage.masterUri());
             ControlPlane control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
@@ -134,7 +132,6 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
 
             Map<String, String> resources = new LinkedHashMap<>();
             resources.put("shop_db.tap.yml", sourceYaml(mysql));
-            resources.put("views.tap.yml", targetYaml(targetUri));
             resources.put("join_pipeline.tap.yml", pipelineYaml());
             control.apply(resources);
             control.discoverSchema("shop_db", "mysql", mysql);
@@ -335,17 +332,6 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
                 """
                 .formatted(config.get("host"), config.get("port"), config.get("database"),
                         config.get("username"), config.get("password"));
-    }
-
-    private static String targetYaml(String targetUri) {
-        return """
-                version: tapstate/v1
-                kind: source
-                id: views
-                connector: mongodb
-                config: { uri: "%s" }
-                """
-                .formatted(targetUri);
     }
 
     private static String pipelineYaml() {

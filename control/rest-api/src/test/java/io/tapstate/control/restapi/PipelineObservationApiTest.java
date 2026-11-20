@@ -104,8 +104,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * server prints, and a document sent back with most of it left out still binds. Every other case for that
  * face constructs the record in memory, where both of those are true by construction.
  *
- * <p>Status returns a catalog projection for a known authoring draft or applied pipeline, with {@code state}
- * remaining the observed runtime state (or {@code NEW} before the first observation). Metrics, snapshot, and
+ * <p>Status returns a catalog projection for a known authoring draft or applied pipeline. A known
+ * transition can report a display state before it has a runtime state to report. Metrics, snapshot, and
  * explanation still return {@code monitor.no-observation} when runtime data is not yet available. The tests
  * prove the reads round-trip through the real query service, that an unknown id returns the permanent coded
  * error, that the interceptor guards a read like any other verb, and that read endpoints derive from the registry.
@@ -599,11 +599,10 @@ class PipelineObservationApiTest {
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .retrieve().body(new ParameterizedTypeReference<>() {});
 
-        assertThat(body).containsEntry("state", "NEW")
-                .containsEntry("displayState", "STARTING")
+        assertThat(body).containsEntry("displayState", "STARTING")
                 .containsEntry("desiredState", "RUNNING")
                 .containsEntry("hasArtifact", true)
-                .doesNotContainKey("observedState");
+                .doesNotContainKeys("state", "observedState", "observedAt", "observedAgeMillis");
     }
 
     @Test
@@ -639,19 +638,19 @@ class PipelineObservationApiTest {
     }
 
     @Test
-    void unreadableIntentWithoutObservationReturnsASeparateCodedFailure() {
+    void unreadableIntentWithoutRuntimeStateReturnsACodedCheckpointFailure() {
         context.getBean(FakeObservationStore.class).clear();
         context.getBean(FakeStoppedPipelines.class).unreadableIntent("pl1");
 
-        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+        ApiError body = client().get().uri("/api/pipelines/pl1/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
-                .retrieve().body(new ParameterizedTypeReference<>() {});
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+                    return response.bodyTo(ApiError.class);
+                });
 
-        assertThat(body).containsEntry("state", "NEW").containsEntry("hasArtifact", true)
-                .doesNotContainKey("displayState");
-        Object intentReadFailure = body.get("intentReadFailure");
-        assertThat(intentReadFailure).isInstanceOf(Map.class);
-        assertThat(((Map<?, ?>) intentReadFailure).get("code")).isEqualTo("io.document-unreadable");
+        assertThat(body.code()).isEqualTo("io.document-unreadable");
+        assertThat(body.params()).isEqualTo(Map.of("id", "pl1", "field", "checkpoint"));
     }
 
     @Test

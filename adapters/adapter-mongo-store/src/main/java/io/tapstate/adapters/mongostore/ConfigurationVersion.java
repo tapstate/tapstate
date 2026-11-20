@@ -19,7 +19,10 @@ final class ConfigurationVersion {
     private ConfigurationVersion() {}
 
     static long read(ClientSession session, MongoCollection<Document> versions) {
-        Document current = versions.find(session, new Document("_id", ID)).first();
+        return revision(versions.find(session, new Document("_id", ID)).first());
+    }
+
+    private static long revision(Document current) {
         if (current == null || !(current.get("revision") instanceof Long revision)
                 || revision < 0 || revision == Long.MAX_VALUE) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
@@ -33,18 +36,34 @@ final class ConfigurationVersion {
     }
 
     static void advance(ClientSession session, MongoCollection<Document> versions, com.mongodb.client.MongoDatabase originalDatabase) {
-        requireNoValidationMaintenance(session, versions, null, originalDatabase);
-        advanceRaw(session, versions);
+        long revision = requireNoValidationMaintenance(session, versions, null, originalDatabase);
+        advanceRaw(session, versions, revision);
+    }
+
+    /** Claims the ordering document before publication reads its dependency snapshot. */
+    static void advanceForPublication(ClientSession session, MongoCollection<Document> versions,
+            com.mongodb.client.MongoClient originalClient) {
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("publication requires an active transaction");
+        var legalRevision = new Document("$gte", 0L).append("$lt", Long.MAX_VALUE - 1);
+        var filter = new Document("_id", ID).append("revision", legalRevision)
+                .append("$expr", new Document("$eq", java.util.List.of(new Document("$type", "$revision"), "long")));
+        var previous = versions.findOneAndUpdate(session, filter,
+                new Document("$inc", new Document("revision", 1L)));
+        if (previous == null) throw unreadable("revision");
+        // The provisional increment rolls back with every refusal. Maintenance is still checked
+        // against this same snapshot before any artifact, draft marker or note reservation commits.
+        requireNoValidationMaintenance(session, versions, null,
+                originalClient.getDatabase(versions.getNamespace().getDatabaseName()));
     }
 
     static void advanceValidationPreparation(ClientSession session, MongoCollection<Document> versions, String operation,
             com.mongodb.client.MongoClient originalClient) {
-        requireNoValidationMaintenance(session, versions, java.util.Objects.requireNonNull(operation),
+        long revision = requireNoValidationMaintenance(session, versions, java.util.Objects.requireNonNull(operation),
                 originalClient.getDatabase(versions.getNamespace().getDatabaseName()));
-        advanceRaw(session, versions);
+        advanceRaw(session, versions, revision);
     }
 
-    private static void requireNoValidationMaintenance(ClientSession session, MongoCollection<Document> versions, String operation,
+    private static long requireNoValidationMaintenance(ClientSession session, MongoCollection<Document> versions, String operation,
             com.mongodb.client.MongoDatabase originalDatabase) {
         // This read uses the original collection's database and the SAME session. No second client
         // or guessed endpoint can certify the migration gate that protects this revision write.
@@ -57,14 +76,19 @@ final class ConfigurationVersion {
                         .append("pipeline", java.util.List.of(new Document("$match", new Document("_id", "cluster")),
                                 new Document("$project", new Document("clusterId", 1).append("layoutId", 1))))
                         .append("as", "identity")))).first();
-        if (row == null) throw MongoValidationSchema.unreadable("configuration-version");
+        long revision = revision(row);
         var schemas = row.getList("schema", Document.class);
-        if (schemas.isEmpty()) { if (operation != null) throw MongoValidationSchema.refused(); return; }
+        if (schemas.isEmpty()) { if (operation != null) throw MongoValidationSchema.refused(); return revision; }
         var schema = schemas.getFirst();
         // Metadata probes use the SAME original client and namespace, never an independently opened endpoint.
         if (!versions.getNamespace().getDatabaseName().equals(originalDatabase.getName()))
             throw new IllegalArgumentException("configuration version database mismatch");
-        if (MongoValidationSchema.configurationHasValidation(originalDatabase, schema)) {
+        // Ordinary writes contend with maintenance through the live marker and the revision CAS.
+        // Controlled preparation still verifies the physical schema.
+        boolean hasValidation = operation != null
+                ? MongoValidationSchema.configurationHasValidation(originalDatabase, schema)
+                : MongoValidationSchema.configurationDeclaresValidation(schema);
+        if (hasValidation) {
             var marker = MongoValidationSchema.configurationMarker(schema);
             var identities = row.getList("identity", Document.class);
             if (identities.size() != 1 || !MongoValidationSchema.scope(marker).clusterId().equals(identities.getFirst().get("clusterId"))
@@ -74,6 +98,7 @@ final class ConfigurationVersion {
             } else if (!"READY".equals(marker.get("phase")) || Integer.valueOf(2).equals(marker.get("formatVersion"))
                     && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw MongoValidationSchema.refused();
         } else if (operation != null) throw MongoValidationSchema.refused();
+        return revision;
     }
 
     static void advanceScheduledPreparation(ClientSession session, com.mongodb.client.MongoDatabase database, String operation) {
@@ -86,7 +111,10 @@ final class ConfigurationVersion {
     }
 
     private static void advanceRaw(ClientSession session, MongoCollection<Document> versions) {
-        long revision = read(session, versions);
+        advanceRaw(session, versions, read(session, versions));
+    }
+
+    private static void advanceRaw(ClientSession session, MongoCollection<Document> versions, long revision) {
         if (revision >= Long.MAX_VALUE - 1) throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                 Map.of("id", ID, "field", "revision"), null);
         long modified = versions.updateOne(session, new Document("_id", ID).append("revision", revision),

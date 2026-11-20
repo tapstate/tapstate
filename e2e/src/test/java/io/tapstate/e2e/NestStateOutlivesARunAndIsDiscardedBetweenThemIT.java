@@ -5,6 +5,7 @@ import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
@@ -15,6 +16,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.NestDeadLetterRecord;
 import io.tapstate.spi.store.OperatorPlacement;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.RequiredDeadLetterContext;
 import io.tapstate.spi.store.RequiredDeadLetterFact;
 import io.tapstate.testsupport.DockerGate;
@@ -241,7 +243,25 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                 assertThat(retained.fact()).isEqualTo(fact);
                 assertNoCachedDeadLetters(storage);
                 // Retirement uses the control plane; the test never fabricates a retirement permit.
-                control.deleteArtifact(PIPELINE, control.contentHash(PIPELINE));
+                String originalHash = control.contentHash(PIPELINE);
+                Await.until("the original pipeline to retire", () -> {
+                    var artifact = control.artifact(PIPELINE);
+                    if (artifact.isEmpty()) return true;
+                    assertThat(artifact.orElseThrow().contentHash()).isEqualTo(originalHash);
+                    var response = control.sourceResponse("DELETE", "/api/artifacts/" + PIPELINE, null,
+                            "\"" + originalHash + "\"");
+                    if (response.statusCode() == 204) return true;
+                    assertThat(response.statusCode()).as("pipeline deletion: %s", response.body()).isEqualTo(500);
+                    var error = (Map<?, ?>) JsonReader.parse(response.body());
+                    assertThat(error.get("code")).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED.code());
+                    return false;
+                }, () -> String.valueOf(configuration.pipelineStates().read(PIPELINE)));
+                var retired = configuration.pipelineStates().read(PIPELINE).orElseThrow();
+                assertThat(retired.phase()).isEqualTo(PipelineStateMapping.Phase.RETIRED);
+                var receipt = configuration.retirements().completed(PIPELINE, retired.operationId()).orElseThrow();
+                assertThat(receipt.definitionHash()).isEqualTo(originalHash);
+                assertThat(receipt.scope().stateGeneration()).isEqualTo(context.stateGeneration());
+                assertThat(control.artifact(PIPELINE)).isEmpty();
                 Await.until("the retired pipeline's required diagnostics and native payload to be reclaimed",
                         () -> deadLetterRows(storage).isEmpty() && stateRows(storage).isEmpty() && shapeRows(storage).isEmpty(),
                         () -> "diagnostics=" + deadLetterRows(storage) + ", state=" + stateRows(storage));

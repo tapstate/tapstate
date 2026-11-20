@@ -8,6 +8,8 @@ import java.util.Set;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
 
 /** Read-only names of configured outputs, without requiring a runnable write model. */
 @FunctionalInterface
@@ -29,20 +31,33 @@ public interface PipelineOutputNames {
         }
     }
 
+    /** A null key means the Nest event age cannot be attributed to this output alone. */
+    record NestMeasurement(String key) { }
+
     /** Request-local lineage is kept separate from the output-name wire projection. */
-    record Description(Result names, Map<String, Set<PipelineInputs.Input>> inputs, Set<String> qualifiedTables) {
+    record Description(Result names, Map<String, Set<PipelineInputs.Input>> inputs, Set<String> qualifiedTables,
+            Map<String, NestMeasurement> nestMeasurements) {
         public Description(Result names, Map<String, Set<PipelineInputs.Input>> inputs) { this(names, inputs, Set.of()); }
+        public Description(Result names, Map<String, Set<PipelineInputs.Input>> inputs, Set<String> qualifiedTables) {
+            this(names, inputs, qualifiedTables, Map.of());
+        }
         public Description {
             var copy = new LinkedHashMap<String, Set<PipelineInputs.Input>>();
             inputs.forEach((key, value) -> copy.put(key, Set.copyOf(value)));
             inputs = Map.copyOf(copy);
             qualifiedTables = Set.copyOf(qualifiedTables);
+            nestMeasurements = Map.copyOf(nestMeasurements);
         }
     }
 
     /** Providers without physical input metadata leave freshness explicitly unavailable. */
     default Description describe(PipelineResource pipeline, Map<String, Resource> resources) {
         return new Description(resolve(pipeline), Map.of());
+    }
+
+    default Function<PipelineResource, Description> forCatalog(Map<String, Resource> resources,
+            Function<String, Optional<Resource>> lookup) {
+        return pipeline -> describe(pipeline, resources);
     }
 
     default Result resolve(PipelineResource pipeline) {

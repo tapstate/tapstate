@@ -152,6 +152,32 @@ class ARunningNestReportsWhatItsStateCostsTest {
     }
 
     @Test
+    void aRunningRootReportsRenderedDocumentsAndCompleteCommitHistograms() throws InterruptedException {
+        Engine engine = new Engine(member);
+        engine.submit(PIPELINE, ordersWithItems());
+        try {
+            long stop = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            NestStateReading reading;
+            do {
+                reading = engine.nestStateReadings(PIPELINE).get(ROOT_NAMESPACE);
+                if (reading != null && reading.rootsRendered().orElse(0L) >= 3
+                        && reading.commits() != null && reading.commits().keys().sum() >= 3) break;
+                Thread.sleep(25);
+            } while (System.nanoTime() - stop < 0);
+            assertThat(reading).isNotNull();
+            assertThat(reading.rootsRendered().orElse(0L)).isGreaterThanOrEqualTo(3);
+            var commits = reading.commits();
+            assertThat(commits).isNotNull();
+            assertThat(commits.groups()).isPositive();
+            assertThat(commits.keys().count()).isEqualTo(commits.groups());
+            assertThat(commits.keys().bucketCounts().stream().mapToLong(Long::longValue).sum()).isEqualTo(commits.groups());
+            assertThat(commits.keys().sum()).isGreaterThanOrEqualTo(3);
+        } finally {
+            engine.cancel(PIPELINE);
+        }
+    }
+
+    @Test
     @DisplayName("the rows the documents point at are reported as a namespace of their own")
     void whatTheDocumentsPointAtIsVisibleFromOutsideTheRun() {
         Engine engine = new Engine(member);

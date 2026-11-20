@@ -1,6 +1,11 @@
 package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.lifecycle.NestStateReading;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.StateCommitReading;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 
@@ -24,17 +29,38 @@ public final class NestStateMetricNames {
     /** Completed cold loader callbacks, independent of the number of keys in each callback. */
     public static final String BACKFILLS = "backfills";
 
+    /** Whole documents the root level has sent since the run began; only a rendering level has it. */
+    public static final String ROOTS_RENDERED = "rootsRendered";
+
+    /** When that count began, in epoch milliseconds, so it can travel as an accumulating count. */
+    public static final String ROOTS_RENDERED_SINCE = "rootsRenderedSince";
+
+    /**
+     * How the namespace's state was made durable: commit groups, the sums behind the three distributions,
+     * when the counting began, and - with the bucket index appended - each distribution's bucket counts.
+     * Entries memory let go of travel beside them.
+     */
+    public static final String COMMIT_GROUPS = "commitGroups";
+    public static final String COMMIT_KEYS_SUM = "commitKeys";
+    public static final String COMMIT_ROUND_TRIPS_SUM = "commitRoundTrips";
+    public static final String COMMIT_NANOS_SUM = "commitNanos";
+    public static final String COMMIT_SINCE = "commitSince";
+    public static final String COMMIT_KEYS_BUCKET = "commitKeysBucket";
+    public static final String COMMIT_ROUND_TRIPS_BUCKET = "commitRoundTripsBucket";
+    public static final String COMMIT_NANOS_BUCKET = "commitNanosBucket";
+    public static final String EVICTIONS = "evictions";
     /** Requested key accesses, distinct within each logical operation. */
     public static final String KEY_ACCESSES = "keyAccesses";
 
-    /** Keys requested by completed cold loader callbacks, including absent stored values. */
-    public static final String COLD_KEYS = "coldKeys";
 
     /** How long those took in total. */
     public static final String BACKFILL_MILLIS = "backfillMillis";
 
     /** The deepest one key has been seen holding for something that has not arrived. */
     public static final String PENDING_HIGH_WATER = "pendingHighWater";
+    public static final String READ_KEYS = "readKeys";
+    public static final String WRITE_KEYS = "writeKeys";
+    public static final String COLD_KEYS = "coldKeys";
 
     private NestStateMetricNames() {
     }
@@ -58,6 +84,48 @@ public final class NestStateMetricNames {
                 stored);
         return kinds.containsKey(KEY_ACCESSES) && kinds.containsKey(COLD_KEYS)
                 ? reading.withKeyCounts(kinds.get(KEY_ACCESSES), kinds.get(COLD_KEYS)) : reading;
+    }
+
+    /**
+     * The commit reading the kinds carry, or null when any part of it is missing: a distribution short a
+     * bucket is not a distribution short one bucket, it is a collection that has not finished arriving.
+     */
+    static StateCommitReading commitsFrom(Map<String, Long> kinds) {
+        Long groups = kinds.get(COMMIT_GROUPS);
+        Long since = kinds.get(COMMIT_SINCE);
+        Long keySum = kinds.get(COMMIT_KEYS_SUM);
+        Long tripSum = kinds.get(COMMIT_ROUND_TRIPS_SUM);
+        Long nanos = kinds.get(COMMIT_NANOS_SUM);
+        if (groups == null || since == null || keySum == null || tripSum == null || nanos == null) {
+            return null;
+        }
+        List<Long> keys = buckets(kinds, COMMIT_KEYS_BUCKET, HistogramBounds.STATE_COMMIT_KEYS);
+        List<Long> trips = buckets(kinds, COMMIT_ROUND_TRIPS_BUCKET, HistogramBounds.STATE_COMMIT_ROUND_TRIPS);
+        List<Long> took = buckets(kinds, COMMIT_NANOS_BUCKET, HistogramBounds.STATE_COMMIT_DURATION);
+        if (!complete(keys, groups) || !complete(trips, groups) || !complete(took, groups)) {
+            return null;
+        }
+        return new StateCommitReading(groups,
+                HistogramBounds.STATE_COMMIT_KEYS.value(groups, keySum, keys),
+                HistogramBounds.STATE_COMMIT_ROUND_TRIPS.value(groups, tripSum, trips),
+                HistogramBounds.STATE_COMMIT_DURATION.value(groups, nanos / 1_000_000_000.0, took),
+                kinds.getOrDefault(EVICTIONS, 0L), Instant.ofEpochMilli(since));
+    }
+
+    private static boolean complete(List<Long> counts, long groups) {
+        return counts != null && counts.stream().mapToLong(Long::longValue).sum() == groups;
+    }
+
+    private static List<Long> buckets(Map<String, Long> kinds, String kind, HistogramBounds bounds) {
+        List<Long> counts = new ArrayList<>(bounds.buckets());
+        for (int i = 0; i < bounds.buckets(); i++) {
+            Long count = kinds.get(kind + i);
+            if (count == null) {
+                return null;
+            }
+            counts.add(count);
+        }
+        return counts;
     }
 
     /** The name a reading of {@code kind} about {@code namespace} is left under. */

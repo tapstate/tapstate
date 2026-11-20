@@ -43,7 +43,7 @@ class StorageAuthenticationLatencyIT {
 
     @ParameterizedTest
     @EnumSource(Damage.class)
-    void damagedAuthenticationStructuresCannotPublishEitherAValidOrMissingSession(Damage damage) {
+    void dailyAdmissionDoesNotAuditDdlButExplicitDomainValidationStillDoes(Damage damage) {
         withCloud(Change.NONE, fixture -> {
             if (damage == Damage.MISSING_REVOCATIONS) {
                 SystemCollections.CLOUD_REVOCATIONS.on(fixture.raw.getDatabase(fixture.cacheDatabase)).drop();
@@ -52,11 +52,11 @@ class StorageAuthenticationLatencyIT {
                         new Document("unexpectedExpiry", 1), new com.mongodb.client.model.IndexOptions()
                                 .expireAfter(1L, java.util.concurrent.TimeUnit.SECONDS));
             }
-            for (String cookie : List.of(fixture.cookie, "tcs_anRp.not-a-real-secret")) {
-                assertThatThrownBy(() -> fixture.authentication.credentials().authenticateContext(cookie))
-                        .isInstanceOfSatisfying(TapstateException.class,
-                                failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
-            }
+            assertThat(fixture.authentication.credentials().authenticateContext(fixture.cookie)).isPresent();
+            assertThat(fixture.authentication.credentials().authenticateContext("tcs_anRp.not-a-real-secret")).isEmpty();
+            assertThatThrownBy(() -> fixture.authentication.managed())
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
         });
     }
 
@@ -113,7 +113,7 @@ class StorageAuthenticationLatencyIT {
             var admin = fixture.raw.getDatabase("admin");
             String namespace = fixture.cacheDatabase + "." + SystemCollections.CACHE_IDENTITY.collectionName();
             admin.runCommand(new Document("configureFailPoint", "failCommand")
-                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("findAndModify"))
                             .append("namespace", namespace).append("blockConnection", true).append("blockTimeMS", 2300)));
             try {
                 var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
@@ -131,7 +131,7 @@ class StorageAuthenticationLatencyIT {
             var admin = fixture.raw.getDatabase("admin");
             String namespace = fixture.cacheDatabase + "." + SystemCollections.CACHE_IDENTITY.collectionName();
             admin.runCommand(new Document("configureFailPoint", "failCommand")
-                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("findAndModify"))
                             .append("namespace", namespace).append("blockConnection", true).append("blockTimeMS", 2300)));
             try {
                 proof.requireActive().run();
@@ -182,7 +182,7 @@ class StorageAuthenticationLatencyIT {
             var admin = fixture.raw.getDatabase("admin");
             String namespace = fixture.cacheDatabase + "." + SystemCollections.CACHE_IDENTITY.collectionName();
             long before = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
-                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("findAndModify"))
                             .append("namespace", namespace).append("blockConnection", true).append("blockTimeMS", 1300)))
                     .get("count")).longValue();
             try {
@@ -205,11 +205,13 @@ class StorageAuthenticationLatencyIT {
     void anIssuedProofCannotRevalidateAfterItsAuthorityChanges(Change change) {
         withCloud(change, fixture -> {
             var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
-            fixture.arm();
+            if (change == Change.AUTH_GENERATION)
+                SystemCollections.CACHE_IDENTITY.on(fixture.raw.getDatabase(fixture.cacheDatabase)).updateOne(
+                        new Document("_id", "cluster"), new Document("$set", new Document("authGeneration", fixture.scope.authGeneration() + 1)));
+            else fixture.authentication.invalidateFormal();
             assertThatThrownBy(() -> proof.requireActive().run())
                     .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(
                             change == Change.AUTH_GENERATION ? ControlError.STORAGE_UNAVAILABLE : ControlError.UNAUTHENTICATED));
-            assertThat(fixture.changed).isTrue();
         });
     }
 
@@ -227,22 +229,27 @@ class StorageAuthenticationLatencyIT {
     }
 
     @ParameterizedTest
-    @EnumSource(value = Change.class, names = {"AUTH_GENERATION", "REVOCATION", "EPOCH"})
-    void aChangeAfterTheRealSessionReadCannotAuthorizeTheOriginalCredential(Change change) {
+    @EnumSource(value = Change.class, names = {"AUTH_GENERATION", "REVOCATION"})
+    void aChangeAfterCommittedAdmissionIsObservedByTheNextRequest(Change change) {
         withCloud(change, fixture -> {
             fixture.arm();
-            if (change == Change.REVOCATION) {
-                assertThat(fixture.authentication.credentials().authenticateContext(fixture.cookie)).isEmpty();
-                assertThat(SystemCollections.CLOUD_REVOCATIONS.on(fixture.raw.getDatabase(fixture.cacheDatabase))
-                        .countDocuments()).isEqualTo(1);
-            } else {
-                assertThatThrownBy(() -> fixture.authentication.credentials().authenticateContext(fixture.cookie))
-                        .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(
-                                change == Change.AUTH_GENERATION ? ControlError.STORAGE_UNAVAILABLE : ControlError.UNAUTHENTICATED));
-            }
+            assertThat(fixture.authentication.credentials().authenticateContext(fixture.cookie)).isPresent();
             assertThat(fixture.changed).isTrue();
-            if (change == Change.AUTH_GENERATION)
-                assertThat(fixture.identity().getLong("authGeneration")).isEqualTo(fixture.scope.authGeneration() + 1);
+            if (change == Change.REVOCATION)
+                assertThat(fixture.authentication.credentials().authenticateContext(fixture.cookie)).isEmpty();
+            else assertThatThrownBy(() -> fixture.authentication.credentials().authenticateContext(fixture.cookie))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+        });
+    }
+
+    @Test void localEpochReplacementStillPreventsPublishingTheOriginalCredential() {
+        withCloud(Change.EPOCH, fixture -> {
+            fixture.arm();
+            assertThatThrownBy(() -> fixture.authentication.credentials().authenticateContext(fixture.cookie))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            assertThat(fixture.changed).isTrue();
         });
     }
 

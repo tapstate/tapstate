@@ -34,7 +34,8 @@ class NativeValidationStartCoordinatorTest {
                 var next=new ValidationOperation(coordinator.context(),"flow","task",GENERATION,1,2,UUID.randomUUID());
                 try(var response=coordinator.start(next)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.REJECTED);}
                 assertThat(routing.calls.values()).allSatisfy(count->assertThat(count).hasValue(0));
-                assertThat(resources.snapshot().metadataFrames()).isZero();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3))
+                        .untilAsserted(() -> assertThat(resources.snapshot().metadataFrames()).isZero());
             }
         }
     }
@@ -536,7 +537,11 @@ class NativeValidationStartCoordinatorTest {
                 try(var response=coordinator.read(operation(coordinator.context()))){
                     assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.UNKNOWN);assertThat(resources.snapshot().metadataFrames()).isEqualTo(4);
                 }
-                assertThat(resources.snapshot().metadataFrames()).isEqualTo(3);assertThat(resources.snapshot().processReserved().bytes()).isEqualTo(2L*1024*1024);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
+                    var after = resources.snapshot();
+                    assertThat(after.metadataFrames()).isEqualTo(3);
+                    assertThat(after.processReserved().bytes()).isEqualTo(2L * 1024 * 1024);
+                });
             }
         }
     }

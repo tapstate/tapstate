@@ -11,11 +11,17 @@ public interface ConnectorNoteScopes {
     RequiredNoteStore store();
     RequiredNoteScope open(String namespace);
     void requireActive();
+    default boolean batchSharedStartup() { return false; }
 
     /** The opener loads previously prepared scopes; it must not initialize or repair scopes on a restart. */
     static ConnectorNoteScopes of(RequiredNoteStore store, Function<String, RequiredNoteScope> opener,
             Runnable requireActive) {
         return new BoundConnectorNoteScopes(store, opener, requireActive);
+    }
+
+    static ConnectorNoteScopes forSharedStartup(RequiredNoteStore store, Function<String, RequiredNoteScope> opener,
+            Runnable requireActive) {
+        return new BoundConnectorNoteScopes(store, opener, requireActive, true);
     }
 
     default ConnectorNoteScopes guardedBy(Runnable additionalGuard) {

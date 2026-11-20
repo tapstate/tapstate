@@ -56,6 +56,8 @@ import java.util.Optional;
  */
 public final class MongoSrsLogStore implements SrsLogStore {
 
+    private final MongoSrsLease lease;
+    private final java.util.concurrent.atomic.AtomicReference<ProvenModels> provenModels = new java.util.concurrent.atomic.AtomicReference<>();
     private static final String RING = "ring";
     private static final String SEQ = "seq";
     private static final String LARGEST_SEQUENCE = "largestSequence";
@@ -89,21 +91,27 @@ public final class MongoSrsLogStore implements SrsLogStore {
             MongoClient client,
             MongoCollection<Document> collection,
             MongoCollection<Document> workloadClaims) {
-        this(client, collection, collection, workloadClaims, false, null);
+        this(client, collection, collection, workloadClaims, false, null, MongoSrsLease.perTransaction());
     }
 
     /** Events and bounds are independent resources committed on this exact cache client. */
     public MongoSrsLogStore(MongoClient client, MongoCollection<Document> events,
             MongoCollection<Document> bounds, MongoCollection<Document> workloadClaims) {
         this(Objects.requireNonNull(client, "client"), events, bounds,
-                Objects.requireNonNull(workloadClaims, "workloadClaims"), true, null);
+                Objects.requireNonNull(workloadClaims, "workloadClaims"), true, null, MongoSrsLease.perTransaction());
     }
 
     /** The business assembly supplies the same client's fixed actual-model view. */
     public MongoSrsLogStore(MongoClient client, MongoCollection<Document> events,
             MongoCollection<Document> bounds, MongoCollection<Document> workloadClaims, MongoSrsModelStore models) {
+        this(client, events, bounds, workloadClaims, models, MongoSrsLease.perTransaction());
+    }
+
+    /** As above, with the fenced append's validation proved once per {@code lease} rather than on every transaction. */
+    MongoSrsLogStore(MongoClient client, MongoCollection<Document> events, MongoCollection<Document> bounds,
+            MongoCollection<Document> workloadClaims, MongoSrsModelStore models, MongoSrsLease lease) {
         this(Objects.requireNonNull(client, "client"), events, bounds, Objects.requireNonNull(workloadClaims, "workloadClaims"),
-                true, Objects.requireNonNull(models, "models"));
+                true, Objects.requireNonNull(models, "models"), Objects.requireNonNull(lease, "lease"));
         String database = events.getNamespace().getDatabaseName();
         if (!models.belongsTo(client, database) || !bounds.getNamespace().getDatabaseName().equals(database)
                 || !workloadClaims.getNamespace().getDatabaseName().equals(database)) {
@@ -112,10 +120,12 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     private MongoSrsLogStore(MongoClient client, MongoCollection<Document> collection,
-            MongoCollection<Document> bounds, MongoCollection<Document> workloadClaims, boolean split, MongoSrsModelStore models) {
+            MongoCollection<Document> bounds, MongoCollection<Document> workloadClaims, boolean split, MongoSrsModelStore models,
+            MongoSrsLease lease) {
         this.client = client;
         this.split = split;
         this.models = models;
+        this.lease = lease;
         if (split && collection.getNamespace().equals(bounds.getNamespace())) {
             throw new IllegalArgumentException("SRS events and bounds require independent collections");
         }
@@ -161,20 +171,43 @@ public final class MongoSrsLogStore implements SrsLogStore {
                     new UpdateOptions().upsert(true)));
         }
         if (split) {
-            transaction(fence, session -> {
-                splitBounds(session, ring);
-                if (models != null) {
-                    var ranges = new java.util.HashMap<ModelIdentity, MongoSrsModelStore.EventModelRange>();
-                    long at = firstSeq;
-                    for (SrsLogRecord record : original) {
-                        var identity = new ModelIdentity(record.epoch(), record.schemaVer(), record.captureFence());
-                        var range = ranges.computeIfAbsent(identity, ignored -> models.requireEvent(session, ring, record, true));
-                        range.requireAt(at++, ring, record);
+            // The ring, bounds and model checks are the append's proof: run on the first fenced append after its
+            // lease ran out, and on any append naming a model the standing lease has not proved; skipped
+            // otherwise, where the claim compare-and-set alone fences the write and every event is still held
+            // to the model range the proof established for it.
+            var named = new java.util.LinkedHashSet<ProvenModel>();
+            for (SrsLogRecord record : original) named.add(new ProvenModel(ring, identity(record)));
+            ProvenModels[] standing = {null};
+            var proven = new java.util.HashMap<ProvenModel, MongoSrsModelStore.EventModelRange>();
+            transaction(fence, true, before -> {
+                var known = provenModels.get();
+                if (known == null || known.lease() != before || !Objects.equals(known.fence(), fence)) return false;
+                standing[0] = known;
+                return known.ranges().keySet().containsAll(named);
+            }, (session, proving) -> {
+                if (proving) {
+                    splitBounds(session, ring);
+                    proven.clear();
+                    if (models != null) for (SrsLogRecord record : original) {
+                        proven.computeIfAbsent(new ProvenModel(ring, identity(record)), ignored -> models.requireEvent(session, ring, record, true));
                     }
+                }
+                if (models != null) {
+                    var ranges = proving ? proven : standing[0].ranges();
+                    long at = firstSeq;
+                    for (SrsLogRecord record : original) ranges.get(new ProvenModel(ring, identity(record))).requireAt(at++, ring, record);
                 }
                 collection.bulkWrite(session, writes, new BulkWriteOptions().ordered(true));
                 boundsCollection.bulkWrite(session, List.of(appendBounds(ring, lastSeq)));
                 return null;
+            }, (before, published) -> {
+                if (published == null || models == null) return;
+                // The ranges proved under the lease that still stood carry over: an owner's change would have
+                // ended that lease, and a lease that ran out starts from only what this proof read.
+                var ranges = new java.util.HashMap<ProvenModel, MongoSrsModelStore.EventModelRange>();
+                if (standing[0] != null && standing[0].lease() == before) ranges.putAll(standing[0].ranges());
+                ranges.putAll(proven);
+                provenModels.set(new ProvenModels(fence, published, Map.copyOf(ranges)));
             });
             return;
         }
@@ -235,6 +268,35 @@ public final class MongoSrsLogStore implements SrsLogStore {
         // Older logs have no independent bounds record. Their surviving highest sequence is known,
         // while nothing proves a retired prefix or the original generation of those records.
         return new SrsLogBounds(largestRetainedSequence(ring), -1L);
+    }
+
+    @Override public Optional<Map<String, SrsLogBounds>> publishedBounds(String chain, java.util.Set<String> rings) {
+        if (models == null || rings.size() < 2 || rings.size() > 32) return Optional.empty();
+        var selected = java.util.Set.copyOf(rings);
+        return transaction(null, session -> publishedBounds(session, chain, selected, null));
+    }
+
+    Optional<Map<String, SrsLogBounds>> publishedBounds(ClientSession session, String chain,
+            java.util.Set<String> rings, Document heldRoot) {
+        if (rings.size() < 2 || rings.size() > 32) return Optional.empty();
+        boolean proved = heldRoot == null ? models.provePublishedRings(session, chain, rings)
+                : models.provePublishedRings(session, heldRoot, chain, rings);
+        if (!proved) return Optional.empty();
+        var ids = rings.stream().collect(java.util.stream.Collectors.toMap(MongoSrsLogStore::boundsId, ring -> ring));
+        var keys = List.copyOf(ids.keySet());
+        var bounds = new java.util.HashMap<String, SrsLogBounds>();
+        for (var found : boundsCollection.aggregate(session, List.of(
+                new Document("$match", new Document("_id", new Document("$in", keys))),
+                new Document("$limit", ids.size() + 1),
+                new Document("$project", new Document("row", "$$ROOT")
+                        .append("matches", MongoSrsModelStore.exactMatches(keys, "$_id")))))) {
+            var row = found.get("row", Document.class);
+            String id = row.getString("_id");
+            String ring = ids.get(id);
+            if (ring == null || !List.of(id).equals(found.get("matches"))
+                    || bounds.putIfAbsent(ring, decodeSplitBounds(row)) != null) return Optional.empty();
+        }
+        return bounds.size() == rings.size() ? Optional.of(Map.copyOf(bounds)) : Optional.empty();
     }
 
     private long largestRetainedSequence(String ring) {
@@ -393,6 +455,11 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     private record ModelIdentity(long epoch, long version, WorkloadClaimFence fence) {}
+    private static ModelIdentity identity(SrsLogRecord record) { return new ModelIdentity(record.epoch(), record.schemaVer(), record.captureFence()); }
+    /** One model as an append names it: the ring it writes and the epoch, version and fence its events carry. */
+    private record ProvenModel(String ring, ModelIdentity identity) {}
+    /** The model ranges the append proofs established under one lease; trusted only while that exact lease stands. */
+    private record ProvenModels(WorkloadClaimFence fence, MongoSrsLease.Lease lease, Map<ProvenModel, MongoSrsModelStore.EventModelRange> ranges) {}
 
     private SrsLogRecord checkedRecord(ClientSession session, String ring, Document stored) {
         SrsLogRecord event = splitRecord(stored);
@@ -421,24 +488,59 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     private <T> T transaction(WorkloadClaimFence fence, java.util.function.Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
-            try {
-                if (models != null) models.beforeSession();
-                try (var session = client.startSession()) {
-                    return session.withTransaction(() -> {
-                        if (models != null) models.beforeAttempt(session);
-                        if (fence != null) {
-                            if (workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM).getMatchedCount() != 1) {
-                                throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        return transaction(fence, false, before -> false, (session, proving) -> action.apply(session), (before, published) -> {});
+    }
+
+    /**
+     * One transaction of this store. It proves (structure, identity, the action's own checks, identity again)
+     * unless it is a {@code leasable} fenced write under a standing append lease, which carries the claim
+     * compare-and-set and its payload alone. A proving leasable write publishes the lease once it has
+     * committed; whatever a leasable write throws ends the lease, so the next one proves again.
+     */
+    private <T> T transaction(WorkloadClaimFence fence, boolean leasable, java.util.function.Predicate<MongoSrsLease.Lease> covers,
+            java.util.function.BiFunction<ClientSession, Boolean, T> action,
+            java.util.function.BiConsumer<MongoSrsLease.Lease, MongoSrsLease.Lease> proved) {
+        boolean leased = leasable && fence != null && models != null && lease.enabled();
+        MongoSrsLease.Lease before = leased ? lease.observe() : null;
+        long startedNanos = System.nanoTime();
+        try {
+            return StoreIo.call(() -> {
+                try {
+                    if (models != null) models.beforeSession();
+                    try (var session = client.startSession()) {
+                        long[] claimRemaining = {0L};
+                        boolean[] validated = {false};
+                        T result = session.withTransaction(() -> {
+                            if (models != null) {
+                                if (leased) models.checkActive();
+                                else models.beforeAttempt(session);
                             }
-                        }
-                        T result = action.apply(session);
-                        if (models != null) models.checkDomain(session);
+                            if (fence != null) {
+                                if (workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM).getMatchedCount() != 1) {
+                                    throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                                }
+                            }
+                            // A retry or an intervening model publication must not use an invalidated proof.
+                            boolean proving = !leased || !lease.stands(before) || !covers.test(before);
+                            validated[0] = proving;
+                            if (leased && proving) models.beforeAttempt(session);
+                            if (leased && proving) claimRemaining[0] = MongoSrsLease.remainingMillis(workloadClaims, session, fence);
+                            T value = action.apply(session, proving);
+                            if (models != null) {
+                                if (proving) models.checkDomain(session);
+                                else models.checkActive();
+                            }
+                            return value;
+                        }, DURABLE_APPEND);
+                        if (leased && validated[0]) proved.accept(before, lease.proved(before, startedNanos, claimRemaining[0]));
                         return result;
-                    }, DURABLE_APPEND);
-                }
-            } catch (RuntimeException failure) { if (models != null) models.checkActive(); throw failure; }
-        });
+                    }
+                } catch (RuntimeException failure) { if (models != null) models.checkActive(); throw failure; }
+            });
+        } catch (RuntimeException failure) {
+            if (leased) lease.drop();
+            throw failure;
+        }
     }
     private static TapstateException unreadableSplit(String field) {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "srs-log", "field", field), null);

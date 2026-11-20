@@ -46,6 +46,15 @@ final class PipelineConvergencePass {
         @Override public java.time.Duration retention() { requirePipeline(scope().pipelineId()); return views.pipelineRateHistory(scope()).retention(); }
     };
     private final io.tapstate.spi.store.DerivedSchemaStore derivedSchemas = new io.tapstate.spi.store.DerivedSchemaStore() {
+        @Override public boolean supportsStartupBatch() { return true; }
+        @Override public Map<String, io.tapstate.spi.store.DerivedSchema> latestMany(String id, java.util.Set<String> steps) {
+            requirePipeline(id); return views.pipelineDerivedSchemas(scope()).latestMany(id, steps);
+        }
+        @Override public void recordAndPinMany(String id, java.util.List<Change> changes) {
+            WorkloadClaimFence original = claim.get();
+            requirePipeline(id);
+            views.pipelineDerivedSchemas(scope(), original, requireActive).recordAndPinMany(id, changes);
+        }
         @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String id, String step) {
             requirePipeline(id); return views.pipelineDerivedSchemas(scope()).latest(id, step);
         }
@@ -77,6 +86,26 @@ final class PipelineConvergencePass {
         @Override public void delete(String pipelineId) { throw fenced(); }
     };
 
+    private long displacedExecution;
+    private TapstateException renewalFailure;
+
+    void renewalFailed(TapstateException failure) { renewalFailure = Objects.requireNonNull(failure); }
+    Optional<TapstateException> renewalFailure() { return Optional.ofNullable(renewalFailure); }
+
+    PipelineConvergencePass(PipelineIntentSnapshot intent, io.tapstate.spi.store.WorkloadClaim persisted,
+            PipelineStoreViews views, Runnable requireActive,
+            java.util.function.Consumer<PipelineConvergencePass> advancedObserver) {
+        this(intent, WorkloadClaimFence.from(persisted), views, requireActive, advancedObserver);
+        if (persisted.executionGeneration() > 0
+                && persisted.contextExecutionGeneration() == persisted.executionGeneration()
+                && persisted.executionClaimGeneration() > 0
+                && persisted.executionClaimGeneration() < persisted.claimGeneration()) {
+            displacedExecution = persisted.executionGeneration();
+        }
+    }
+
+    long displacedExecution() { return displacedExecution; }
+
     PipelineConvergencePass(PipelineIntentSnapshot intent, WorkloadClaimFence original,
             PipelineStoreViews views, Runnable requireActive) {
         this(intent,original,views,requireActive,ignored->{});
@@ -102,6 +131,9 @@ final class PipelineConvergencePass {
     WorkloadClaimFence claim() { return claim.get(); }
     StateStore state() { return state; }
     ObservationStore observations() { return observations; }
+    ObservationStore observationSample() {
+        return views.pipelineObservations(scope(), claim(), requireActive);
+    }
     io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() { return derivedSchemas; }
     io.tapstate.spi.store.RateHistoryStore rateHistory() { return rateHistory; }
 
