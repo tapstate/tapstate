@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 import org.bson.BsonDocument;
@@ -55,6 +56,7 @@ class BenchmarkRunIT {
         Path output = Path.of(text(request, "output"));
         Files.createFile(output.resolve("fixture-started"));
         Path connectors = Path.of(text(request, "connector_dir"));
+        Path stagedConnectors = Files.createDirectory(output.resolve("verified-connectors"));
         var lockPath = checkout().resolve("deploy/cloud/connectors.lock.json");
         var lock = BsonDocument.parse(Files.readString(lockPath));
         Map<String, Path> artifacts = new HashMap<>();
@@ -63,7 +65,7 @@ class BenchmarkRunIT {
             var entry = value.asDocument();
             String connector = text(entry.getDocument("case"), "source");
             if (!artifacts.containsKey(connector)) {
-                artifacts.put(connector, verified(lock, connectors, connector));
+                artifacts.put(connector, stageConnector(lock, connectors, stagedConnectors, connector));
             }
         }
         for (var value : request.getArray("entries")) {
@@ -1240,10 +1242,18 @@ class BenchmarkRunIT {
     }
 
     private static void waitFor(BsonDocument entry, String stage, BooleanSupplier condition) {
-        long end = System.nanoTime() + Duration.ofSeconds(number(entry, "timeout_seconds")).toNanos();
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() >= end) {
-                throw new Limit("Timed out waiting for " + stage);
+        waitFor(Duration.ofSeconds(number(entry, "timeout_seconds")), stage, condition, System::nanoTime);
+    }
+
+    static void waitFor(Duration timeout, String stage, BooleanSupplier condition, LongSupplier clock) {
+        long end = clock.getAsLong() + timeout.toNanos();
+        while (clock.getAsLong() - end < 0) {
+            boolean matched = condition.getAsBoolean();
+            if (clock.getAsLong() - end >= 0) {
+                break;
+            }
+            if (matched) {
+                return;
             }
             try {
                 Await.pauseBeforeNextPoll(Duration.ofMillis(200));
@@ -1252,6 +1262,7 @@ class BenchmarkRunIT {
                 throw new Limit("Interrupted waiting for " + stage);
             }
         }
+        throw new Limit("Timed out waiting for " + stage);
     }
 
     private static WorkloadRecipe.Mix mix(BsonDocument entry) {
@@ -1282,10 +1293,11 @@ class BenchmarkRunIT {
         return root;
     }
 
-    private static Path verified(BsonDocument lock, Path folder, String id) throws Exception {
+    static Path stageConnector(BsonDocument lock, Path source, Path staging, String id) throws Exception {
         var entry = lock.getArray("connectors").stream().map(BsonValue::asDocument)
                 .filter(row -> id.equals(text(row, "id"))).findFirst().orElseThrow();
-        Path artifact = folder.resolve(id + "-connector.jar");
+        String fileName = id + "-connector.jar";
+        Path artifact = Files.copy(source.resolve(fileName), staging.resolve(fileName));
         if (Files.size(artifact) != number(entry, "bytes") || !digest(artifact).equals(text(entry, "sha256"))) {
             throw new IllegalArgumentException("Connector does not match the lock: " + id);
         }
@@ -1348,6 +1360,10 @@ class BenchmarkRunIT {
             result.put("effective_load", JSON.readTree(effective.toJson()));
             result.put("connector_sha256", digest(artifact));
             result.put("op_boot_sha256", digest(Path.of(System.getProperty("tapstate.e2e.boot-jar"))));
+            BsonValue environmentProfile = request.get("environment");
+            if (environmentProfile != null && environmentProfile.isString()) {
+                result.put("environment_profile", environmentProfile.asString().getValue());
+            }
             result.put("environment", Map.of("os", System.getProperty("os.name"), "arch", System.getProperty("os.arch"),
                     "jdk", System.getProperty("java.runtime.version"), "cpu_count", Runtime.getRuntime().availableProcessors()));
             result.put("phase_nanos", phases);

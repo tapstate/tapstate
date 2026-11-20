@@ -175,8 +175,10 @@ for each input and settled target evidence separately.
 
 The row option controls bounded fixture sizing. Union divides the input across its
 two streams. Nest takes a child count that is divisible by four. The paired Join
-case uses the row option for dimensions and seeds ten times as many facts. Both
-paired cases report selected hotspot keys against a separately seeded uniform arm.
+case uses the row option for dimensions and seeds ten times as many facts.
+The Join hot-update and Nest child-update cases compare hotspot selections with
+separately seeded uniform arms. The Nest fanout snapshot holds the root count
+fixed and compares ordinary and high children-per-root counts.
 
 The operator suite covers supported pipeline shapes. The JS and double-map cases
 check that MongoDB preserves untouched Decimal128 values alongside script output.
@@ -236,7 +238,9 @@ Keep the normal backend and MongoDB topology fixed within a pair.
 
 ## Reconcile and compare a batch run
 
-Use one allocated manifest and include one summary per completed batch. JSON
+Use one allocated manifest and include every available batch summary, including
+summaries from runs that exited nonzero. A partial summary preserves completed
+repeats and records repeats that did not run. JSON
 contains raw repeat results, comparisons, and per-case and per-arm statistics
 for eligible metrics. Each comparable set reports the median, minimum,
 maximum, and range (maximum minus minimum). The optional Markdown view shows
@@ -253,8 +257,12 @@ baseline object has `id`, `kind` (`fixture` or `accepted`), `environment`
 and `cases` keyed by Case ID. Case records carry the same condition and
 measurement fields as the report rows, including paired arm records when
 applicable. Fixture deltas exercise the report without implying accepted
-performance. Changes in workload, definition, environment, connector artifact
-or resource source can make observations incompatible. The report emits
+performance. Completed repeats and their paired arms must carry the manifest's
+environment profile to qualify for statistics or comparison. Machine attributes
+remain separate comparison conditions. Raw summaries produced before profile
+binding can be read with the report tool from their own checkout. Changes in
+workload, definition, environment, connector artifact or resource source can
+make observations incompatible. The report emits
 unavailable results and exits nonzero for failed, invalid or missing repeats.
 
 Provide whole-case duration estimates for all three repeats including startup,
@@ -264,6 +272,8 @@ the longest estimated batch plus reserve against the suite deadline. Keep the
 sizing and evidence for scaled estimates explicit when the inputs were bounded.
 
 During manifest replay with a positive reserve, Maven must start the benchmark
-fixture within the reserve. The fixture then has the manifest execution limit,
-and the entire Maven process has at most reserve plus execution limit. A missing
+fixture within the reserve. The fixture then has the manifest execution limit.
+Timeout handling starts by reserve plus execution limit. Process-group teardown
+can then wait up to 15 seconds after SIGTERM and another two seconds after
+SIGKILL, followed by the resource sampler join and summary writing. A missing
 or zero reserve retains the combined process limit used by earlier manifests.

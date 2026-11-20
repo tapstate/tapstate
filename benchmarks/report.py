@@ -52,7 +52,8 @@ def reconcile(manifest, summaries, baseline=None):
                     (row.get("status") == "completed" and
                      (row.get("definition_sha256") != case["definition_sha256"] or
                       row.get("effective_load") != effective or
-                      row.get("code_sha") != manifest["identity"]["code_sha"]))):
+                      row.get("code_sha") != manifest["identity"]["code_sha"] or
+                      not matches_environment(row, manifest["environment"])))):
                 rows[key] = {"case_id": key[0], "repeat": key[1], "status": "invalid",
                              "reason": "repeat binding mismatch"}
             else:
@@ -66,6 +67,11 @@ def reconcile(manifest, summaries, baseline=None):
             "environment": manifest["environment"], "baseline_id": baseline["id"] if baseline else None,
             "baseline_kind": baseline["kind"] if baseline else None, "errors": errors, "results": results,
             "statistics": summarize_repeats(results)}
+
+
+def matches_environment(row, profile):
+    return (row.get("environment_profile") == profile
+            and all(arm.get("environment_profile") == profile for arm in row.get("paired_arms", {}).values()))
 
 
 def summarize_repeats(results):

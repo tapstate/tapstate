@@ -123,7 +123,9 @@ public final class PerfCaseScanner {
         boolean shortName = resolvesShortName(imports, ANNOTATION, BENCHMARK_PACKAGE,
                 BENCHMARK_PACKAGE.equals(String.valueOf(unit.getPackageName())), packageTypes);
         boolean shortContainer = resolvesShortName(imports, ANNOTATION + ".Cases", ANNOTATION, false, packageTypes)
-                || staticImports.contains(ANNOTATION + ".Cases") || staticImports.contains(ANNOTATION + ".*");
+                || staticImports.contains(ANNOTATION + ".Cases")
+                || staticImports.contains(ANNOTATION + ".*") && !packageTypes.contains("Cases")
+                        && imports.stream().noneMatch(item -> item.endsWith(".Cases"));
         new TreeScanner<Void, Void>() {
             private boolean shadowsCase;
             private boolean shadowsContainer;

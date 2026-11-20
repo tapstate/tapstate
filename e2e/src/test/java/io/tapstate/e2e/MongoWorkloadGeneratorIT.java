@@ -304,13 +304,42 @@ class MongoWorkloadGeneratorIT {
         });
     }
 
+    @Test
+    void aFailedHistoryCloseKeepsBothStreamReportsAndClosesTheOtherCursor() throws Exception {
+        withSource(source -> {
+            String id = "union.backlog.basic.standard";
+            var closed = new AtomicInteger();
+            var observed = observingPhases(source, () -> {}, () -> {}, () -> {
+                if (closed.incrementAndGet() == 1) throw new com.mongodb.MongoException("first cursor close failed");
+            });
+            var generator = generator(observed, id, Map.of("left", 30, "right", 30));
+            var batch = generator.prepare(generator.calibrateStringLengths()).prewrite(20, null, null).batch();
+
+            assertEquals(2, closed.get());
+            assertFalse(batch.complete());
+            assertEquals(2, batch.streams().size());
+            assertEquals(20, batch.streams().values().stream().mapToLong(stream -> stream.observed().total()).sum());
+            assertTrue(batch.streams().values().stream().allMatch(stream -> stream.observed().equals(stream.acknowledged())));
+            assertEquals(1, batch.streams().values().stream().filter(stream -> stream.error() != null
+                    && stream.error().contains("first cursor close failed")).count());
+        });
+    }
+
     private static MongoDatabase observingPhases(MongoDatabase database, Runnable beforeWatch, Runnable afterWrite) {
+        return observingPhases(database, beforeWatch, afterWrite, () -> {});
+    }
+
+    private static MongoDatabase observingPhases(MongoDatabase database, Runnable beforeWatch, Runnable afterWrite,
+            Runnable afterClose) {
         return (MongoDatabase) Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(),
                 new Class<?>[] {MongoDatabase.class}, (proxy, method, args) -> {
                     if (method.getName().equals("watch")) beforeWatch.run();
                     Object result = invoke(database, method, args);
                     if (result instanceof MongoDatabase configured) {
-                        return observingPhases(configured, beforeWatch, afterWrite);
+                        return observingPhases(configured, beforeWatch, afterWrite, afterClose);
+                    }
+                    if (result instanceof com.mongodb.client.ChangeStreamIterable<?> watch) {
+                        return observingClose(watch, afterClose);
                     }
                     if (result instanceof MongoCollection<?> collection) {
                         return Proxy.newProxyInstance(MongoCollection.class.getClassLoader(),
@@ -321,6 +350,27 @@ class MongoWorkloadGeneratorIT {
                                 });
                     }
                     return result;
+                });
+    }
+
+    private static Object observingClose(com.mongodb.client.ChangeStreamIterable<?> watch, Runnable afterClose) {
+        var changeStream = com.mongodb.client.ChangeStreamIterable.class;
+        var cursorType = com.mongodb.client.MongoChangeStreamCursor.class;
+        return Proxy.newProxyInstance(changeStream.getClassLoader(), new Class<?>[] {changeStream},
+                (ignored, operation, parameters) -> {
+                    Object reply = invoke(watch, operation, parameters);
+                    if (reply instanceof com.mongodb.client.ChangeStreamIterable<?> configured) {
+                        return observingClose(configured, afterClose);
+                    }
+                    if (cursorType.isInstance(reply)) {
+                        return Proxy.newProxyInstance(cursorType.getClassLoader(), new Class<?>[] {cursorType},
+                                (cursor, method, args) -> {
+                                    Object value = invoke(reply, method, args);
+                                    if (method.getName().equals("close")) afterClose.run();
+                                    return value;
+                                });
+                    }
+                    return reply;
                 });
     }
 

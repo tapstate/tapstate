@@ -353,37 +353,38 @@ public final class MongoWorkloadGenerator {
                                  Duration liveDuration, Map<String, Integer> lengths, Runnable afterWrites) {
         var states = new ArrayList<StreamState>();
         try {
-            try {
-                for (var stream : streams) {
-                    states.add(new StreamState(stream, collection(stream.input.name()), database));
-                }
-            } catch (MongoException | IllegalStateException setupFailure) {
-                for (var state : states) {
-                    try {
-                        state.close();
-                    } catch (RuntimeException cleanup) {
-                        if (cleanup != setupFailure) setupFailure.addSuppressed(cleanup);
-                    }
-                }
-                states.clear();
-                return notRun(name, streams, rate, "Source history setup failed: " + setupFailure);
+            for (var stream : streams) {
+                states.add(new StreamState(stream, collection(stream.input.name()), database));
             }
-            var delays = new Delays();
+        } catch (MongoException | IllegalStateException setupFailure) {
+            closeStreams(states, setupFailure);
+            return notRun(name, streams, rate, "Source history setup failed: " + setupFailure);
+        } catch (RuntimeException | Error failure) {
+            closeStreams(states, failure);
+            throw failure;
+        }
+        var delays = new Delays();
+        Instant startedAt = Instant.now();
+        Instant writesFinishedAt;
+        long duration;
+        long historyNanos;
+        Long writerCpu;
+        Throwable primary = null;
+        try {
             Long cpu = cpuNanos();
-            Instant startedAt = Instant.now();
             long start = nanoClock.getAsLong();
             if (rate == null) {
                 prewriteBatches(states, lengths, delays);
             } else {
                 injectPaced(states, lengths, rate, liveDuration, delays, start);
             }
-            long duration = nanoClock.getAsLong() - start;
+            duration = nanoClock.getAsLong() - start;
             if (liveDuration != null && (duration < liveDuration.toNanos()
                     || Thread.currentThread().isInterrupted())) {
                 for (var state : states) state.recordError("The live write window ended before its scheduled boundary");
             }
-            Instant writesFinishedAt = Instant.now();
-            Long writerCpu = cpuElapsed(cpu);
+            writesFinishedAt = Instant.now();
+            writerCpu = cpuElapsed(cpu);
             String callbackError = null;
             try {
                 afterWrites.run();
@@ -395,9 +396,26 @@ public final class MongoWorkloadGenerator {
                 state.readHistory();
                 if (callbackError != null) state.recordError(callbackError);
             }
-            return report(name, states, rate, startedAt, writesFinishedAt, duration, System.nanoTime() - historyStarted, writerCpu, delays);
+            historyNanos = System.nanoTime() - historyStarted;
+        } catch (RuntimeException | Error failure) {
+            primary = failure;
+            throw failure;
         } finally {
-            states.forEach(StreamState::close);
+            closeStreams(states, primary);
+        }
+        return report(name, states, rate, startedAt, writesFinishedAt, duration, historyNanos, writerCpu, delays);
+    }
+
+    private static void closeStreams(List<StreamState> states, Throwable primary) {
+        for (var state : states) {
+            try {
+                state.close();
+            } catch (RuntimeException cleanup) {
+                state.recordError("Could not close source history cursor: " + cleanup);
+                if (primary != null && primary != cleanup) {
+                    primary.addSuppressed(cleanup);
+                }
+            }
         }
     }
 
@@ -569,7 +587,13 @@ public final class MongoWorkloadGenerator {
                 }
                 start = new Position(cursor.getResumeToken(), null);
             } catch (RuntimeException failure) {
-                cursor.close();
+                try {
+                    cursor.close();
+                } catch (RuntimeException cleanup) {
+                    if (cleanup != failure) {
+                        failure.addSuppressed(cleanup);
+                    }
+                }
                 throw failure;
             }
         }

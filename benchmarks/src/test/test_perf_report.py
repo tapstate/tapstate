@@ -23,7 +23,8 @@ class PerfReportTest(unittest.TestCase):
             "case_version": 1, "code_sha": "candidate", "definition_sha256": "definition",
             "mode": "snapshot", "scale": "qualification", "effective_load": {"rows": 32},
             "effective_input_rows": {"records": 32}, "connector_sha256": "lock",
-            "environment": {"os": "example"}, "measurement_status": "bounded-observation",
+            "environment": {"os": "example"}, "environment_profile": "fixture-env",
+            "measurement_status": "bounded-observation",
             "phase_nanos": {"completion_observed": 10},
             "resources": {"status": "observed", "windows": {
                 "snapshot": {"source": "fixture", "covered": True, "rss_peak_kib": 120},
@@ -48,6 +49,20 @@ class PerfReportTest(unittest.TestCase):
         result = report.reconcile(self.manifest, [self.summary, self.summary], self.baseline)
         self.assertEqual("invalid", result["results"][0]["status"])
         self.assertEqual("result-unavailable", result["results"][0]["comparisons"]["status"])
+
+    def test_mismatched_or_missing_environment_profile_never_qualifies(self):
+        variants = [
+            dict(self.row, environment_profile="other-env"),
+            {key: value for key, value in self.row.items() if key != "environment_profile"},
+            dict(self.row, paired_arms={"hot": dict(self.row, environment_profile="other-env")}),
+        ]
+        for row in variants:
+            with self.subTest(row=row):
+                result = report.reconcile(self.manifest, [dict(self.summary, results=[row])], self.baseline)
+                first = result["results"][0]
+                self.assertEqual("invalid", first["status"])
+                self.assertEqual("result-unavailable", first["comparisons"]["status"])
+                self.assertEqual({}, result["statistics"])
 
     def test_foreign_batch_cannot_invalidate_its_owning_batchs_repeat(self):
         other = copy.deepcopy(self.manifest["batches"][0])
@@ -102,6 +117,8 @@ class PerfReportTest(unittest.TestCase):
         result = report.reconcile(self.manifest, [self.summary])
         case = self.row["case_id"]
         self.assertEqual(2, len(result["results"]))
+        self.assertEqual([120, 140], [row["resources"]["windows"]["snapshot"]["rss_peak_kib"]
+                                     for row in result["results"]])
         metrics = result["statistics"][case]["single"]
         self.assertEqual({"snapshot.rss_peak_kib"}, set(metrics))
         observed, = metrics["snapshot.rss_peak_kib"]

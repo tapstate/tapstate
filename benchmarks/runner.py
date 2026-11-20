@@ -223,6 +223,7 @@ def run_entries(entries, binding, args, manifest=None):
     if manifest:
         upper_bound = min(upper_bound, manifest.get("execution_limit_seconds", upper_bound))
     started = time.monotonic()
+    started_wall_ns = time.time_ns()
     with (output / "maven.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         done = threading.Event()
@@ -236,7 +237,7 @@ def run_entries(entries, binding, args, manifest=None):
         sampler.start()
         code = 1
         try:
-            code = wait_for_fixture(process, output, upper_bound, manifest, started)
+            code = wait_for_fixture(process, output, upper_bound, manifest, started, started_wall_ns)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             code = 124
         finally:
@@ -276,34 +277,35 @@ def run_entries(entries, binding, args, manifest=None):
     return 1 if code or any(result["status"] != "completed" for result in results) else 0
 
 
-def wait_for_fixture(process, output, fixture_limit, manifest, started=None):
+def wait_for_fixture(process, output, fixture_limit, manifest, started, started_wall_ns):
     reserve = manifest.get("reserve_seconds", 0) if manifest else 0
     if type(reserve) is not int or reserve < 0:
         raise ValueError("Manifest reserve must be a nonnegative integer")
     if not reserve:
         return process.wait(timeout=fixture_limit)
-    if started is None:
-        started = time.monotonic()
     build_deadline = started + reserve
     total_deadline = build_deadline + fixture_limit
     marker = output / "fixture-started"
-    fixture_start_floor = started
     while True:
         observed_at = time.monotonic()
-        if marker.is_file():
-            if time.monotonic() > build_deadline:
-                raise subprocess.TimeoutExpired(process.args, reserve)
-            break
-        fixture_start_floor = observed_at
-        remaining = build_deadline - observed_at
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(process.args, reserve)
         try:
-            return process.wait(timeout=min(0.1, remaining))
-        except subprocess.TimeoutExpired:
-            pass
-    # The fixture may start between polls. Use the last observation before its marker.
-    remaining = min(fixture_start_floor + fixture_limit, total_deadline) - time.monotonic()
+            marker_wall_ns = marker.stat().st_mtime_ns
+        except FileNotFoundError:
+            remaining = build_deadline - observed_at
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, reserve)
+            try:
+                return process.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+        # Java creates this file in the private run directory at fixture entry.
+        # Its filesystem timestamp and the launch timestamp share the host clock.
+        marker_offset_ns = marker_wall_ns - started_wall_ns
+        if not 0 <= marker_offset_ns <= reserve * 1_000_000_000:
+            raise subprocess.TimeoutExpired(process.args, reserve)
+        fixture_start = min(observed_at, started + marker_offset_ns / 1_000_000_000)
+        break
+    remaining = min(fixture_start + fixture_limit, total_deadline) - time.monotonic()
     if remaining <= 0:
         raise subprocess.TimeoutExpired(process.args, fixture_limit + reserve)
     return process.wait(timeout=remaining)

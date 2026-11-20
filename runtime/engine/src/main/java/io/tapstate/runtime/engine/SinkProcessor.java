@@ -648,9 +648,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * after the events beneath it, and a word travels behind the records it must not overtake, so each covers
      * exactly the rows taken in before it; once every one of those has landed, so has everything it speaks for.
      *
-     * <p>Words go before bounds. For bounds, every axis with one due, and the newest due on each: they are
-     * bounds on different chains, and a chain whose bound was dropped here has no second one coming while it
-     * stays quiet.
+     * <p>Words go before bounds. Each axis advances through its newest due bound. Earlier snapshot bounds
+     * also reach the acknowledgement so observers can record initial landing before the CDC boundary.
      */
     private void releaseHeld() {
         long landedBelow = firstUnlanded();
@@ -660,29 +659,25 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             frontier.settled(entries, frontierAck);
         }
         for (ArrayDeque<Held<Watermark>> held : heldBounds.values()) {
-            Watermark due = null;
             while (!held.isEmpty() && held.peek().before() <= landedBelow) {
-                due = held.poll().value();
-                notifySnapshotDelivered(due);
-            }
-            if (due == null) {
-                continue;
-            }
-            String chain = frontier.chainOf(due);
-            SourceOrder through = chain == null ? null : FrontierOrders.unpack(due.timestamp());
-            frontier.bound(due, frontierAck);
-            // Every change this writer was given at or below the bound has landed, whatever the frontier made
-            // of it: a writer given none of a chain's rows says so here and holds no chain back by having
-            // nothing to write for it.
-            if (chain != null) {
-                ack.bounded(chain, through);
+                Watermark due = held.poll().value();
+                if (isSnapshotBound(due) || held.isEmpty() || held.peek().before() > landedBelow) {
+                    releaseBound(due);
+                }
             }
         }
     }
 
-    private void notifySnapshotDelivered(Watermark bound) {
-        if (isSnapshotBound(bound)) {
-            notifySnapshotDelivered(frontier.chainOf(bound), FrontierOrders.unpack(bound.timestamp()));
+    private void releaseBound(Watermark bound) {
+        String chain = frontier.chainOf(bound);
+        SourceOrder through = chain == null ? null : FrontierOrders.unpack(bound.timestamp());
+        if (through != null && through.seq() == SourceOrder.SNAPSHOT_SEQ) {
+            notifySnapshotDelivered(chain, through);
+        }
+        frontier.bound(bound, frontierAck);
+        // A writer can acknowledge coverage through a bound even when it received none of the chain's rows.
+        if (chain != null) {
+            ack.bounded(chain, through);
         }
     }
 

@@ -135,6 +135,18 @@ class PerfCaseScannerTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(["sample.qualified"], [row["id"] for row in json.loads(result.stdout)["cases"]])
 
+    def test_static_container_wildcard_does_not_override_an_explicit_type_import(self):
+        other = self.write("other/Cases.java", "package other; public @interface Cases {}")
+        canonical = declaration("sample.canonical", annotation="io.tapstate.benchmarks.PerfCase")
+        source = self.write("Sample.java", "import other.Cases;\nimport static io.tapstate.benchmarks.PerfCase.*;\n"
+                            f"@Cases class Local {{}} {canonical} class Canonical {{}}")
+        compiled = subprocess.run(["javac", "-proc:none", "-d", str(self.root / "classes"), str(ANNOTATION),
+                                  str(other), str(source)], text=True, capture_output=True, check=False)
+        self.assertEqual(0, compiled.returncode, compiled.stderr)
+        result = self.scan()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sample.canonical"], [row["id"] for row in json.loads(result.stdout)["cases"]])
+
     def test_static_field_import_cannot_hide_the_benchmark_type(self):
         self.write("sample/Names.java", "package sample; class Names { public static final int PerfCase = 1; }")
         source = self.write("sample/Sample.java", "package sample;\nimport io.tapstate.benchmarks.*;\n"

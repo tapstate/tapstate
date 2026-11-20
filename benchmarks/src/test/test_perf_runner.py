@@ -2,6 +2,7 @@ from argparse import ArgumentTypeError, Namespace
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+import os
 import signal
 import subprocess
 import sys
@@ -75,9 +76,12 @@ class PerfRunnerTest(unittest.TestCase):
             (root / "benchmarks").mkdir()
             fixture = root / "BenchmarkRunIT.java"
             fixture.write_text("class BenchmarkRunIT {}")
+            hooks = root / "empty-hooks"
+            hooks.mkdir()
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(["git", "-C", str(root), "add", fixture.name], check=True)
             subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c",
+                            f"core.hooksPath={hooks}", "-c",
                             "user.email=fixture@example.org", "commit", "--no-gpg-sign", "-qm", "Initial fixture"], check=True)
             with patch.object(catalog, "BENCHMARKS", root / "benchmarks"):
                 clean = catalog.build_catalog()
@@ -151,33 +155,43 @@ class PerfRunnerTest(unittest.TestCase):
         self.assertEqual([(123, signal.SIGTERM), (123, 0)], [call.args for call in kill.call_args_list])
 
     def test_replay_reserves_build_time_and_bounds_both_phases(self):
-        self.wait_for_script(0.4, 0.8, {"reserve_seconds": 1})
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.wait_for_script(1.2, 0, {"reserve_seconds": 1})
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.wait_for_script(0, 1.2, {"reserve_seconds": 1})
+        launch = 10
+        wall = 1_700_000_000_000_000_000
+        manifest = {"reserve_seconds": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            process = Mock(args=["mvn"])
+            with patch.object(runner.time, "monotonic", return_value=11.01):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.wait_for_fixture(process, output, 1, manifest, launch, wall)
+            marker = output / "fixture-started"
+            marker.touch()
+            for offset in (990_000_000, 1_000_000_000):
+                with self.subTest(marker_offset=offset):
+                    os.utime(marker, ns=(wall + offset, wall + offset))
+                    with patch.object(runner.time, "monotonic", return_value=11.01):
+                        process.wait.return_value = 0
+                        self.assertEqual(0, runner.wait_for_fixture(process, output, 1, manifest, launch, wall))
+                    process.wait.assert_called_once()
+                    self.assertAlmostEqual(offset / 1_000_000_000 - 0.01, process.wait.call_args.kwargs["timeout"])
+                    process.wait.reset_mock()
+            with patch.object(runner.time, "monotonic", return_value=12.01):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.wait_for_fixture(process, output, 1, manifest, launch, wall)
+            os.utime(marker, ns=(wall + 1_020_000_000, wall + 1_020_000_000))
+            with patch.object(runner.time, "monotonic", return_value=11.03):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.wait_for_fixture(process, output, 1, manifest, launch, wall)
+            process.wait.assert_not_called()
 
     def test_replay_without_a_reserve_preserves_the_combined_limit(self):
         for manifest in (None, {}, {"reserve_seconds": 0}):
             with self.subTest(manifest=manifest):
-                self.wait_for_script(0.05, 0.05, manifest)
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.wait_for_script(0.4, 0.8, {"reserve_seconds": 0})
-
-    def wait_for_script(self, build_seconds, fixture_seconds, manifest):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            script = ("import pathlib,sys,time\n"
-                      "time.sleep(float(sys.argv[2]))\n"
-                      "pathlib.Path(sys.argv[1], 'fixture-started').touch()\n"
-                      "time.sleep(float(sys.argv[3]))\n")
-            with subprocess.Popen([sys.executable, "-c", script, str(output), str(build_seconds),
-                                   str(fixture_seconds)], start_new_session=True) as process:
-                try:
-                    self.assertEqual(0, runner.wait_for_fixture(process, output, 1, manifest))
-                finally:
-                    process.kill()
-                    process.wait(timeout=2)
+                process = Mock(args=["mvn"])
+                process.wait.side_effect = subprocess.TimeoutExpired(process.args, 1)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.wait_for_fixture(process, Path("unused"), 1, manifest, 10, 0)
+                process.wait.assert_called_once_with(timeout=1)
 
     def test_operator_suite_lists_executable_definitions_and_preserves_scope(self):
         cases = runner.select(self.cases, [], [], "operators")

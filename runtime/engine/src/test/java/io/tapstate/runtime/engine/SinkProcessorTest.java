@@ -461,6 +461,7 @@ class SinkProcessorTest {
     @Test
     void a_later_cdc_bound_does_not_displace_a_held_empty_snapshot_notification() throws Exception {
         var calls = new ArrayList<String>();
+        var bounds = new ArrayList<SourceOrder>();
         var pending = new CompletableFuture<WriteResult>();
         var writer = new RecordingSnapshotWriter(calls) {
             @Override
@@ -476,6 +477,7 @@ class SinkProcessorTest {
             @Override
             public void bounded(String chain, SourceOrder through) {
                 calls.add("bounded=" + chain);
+                bounds.add(through);
             }
         };
         var processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1));
@@ -490,7 +492,8 @@ class SinkProcessorTest {
         pending.complete(new WriteResult(1));
         drain(processor);
 
-        assertThat(calls).containsExactly("prepared=orders", "bounded=orders");
+        assertThat(calls).containsExactly("prepared=orders", "bounded=orders", "bounded=orders");
+        assertThat(bounds).containsExactly(SourceOrder.snapshotRow(1), new SourceOrder(1, 2));
     }
 
     @Test
