@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -273,6 +274,22 @@ class MongoWorkloadGeneratorIT {
         });
     }
 
+    @Test
+    void operatorReadbackRejectsRowsInUnexpectedCollections() throws Exception {
+        withSource(database -> {
+            var operators = new BenchmarkOperators(definition("filter.snapshot.basic.standard"), 1, false);
+            var row = BsonDocument.parse("{'_id': 2, 'value': 1}");
+            var expected = BenchmarkOperatorOracle.expected("filter-basic", Map.of("records", List.of(row)));
+            database.getCollection("records", BsonDocument.class).insertOne(row);
+            assertNull(BenchmarkOperatorOracle.difference(operators, database, expected));
+            database.createCollection("unexpected");
+            assertNull(BenchmarkOperatorOracle.difference(operators, database, expected));
+            database.getCollection("unexpected", BsonDocument.class).insertOne(row);
+            assertEquals("Unexpected nonempty target collection unexpected",
+                    BenchmarkOperatorOracle.difference(operators, database, expected));
+        });
+    }
+
     private static MongoDatabase withLostWriteAcknowledgement(MongoDatabase database) {
         return (MongoDatabase) Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(),
                 new Class<?>[] {MongoDatabase.class}, (proxy, method, args) -> {
@@ -414,9 +431,12 @@ class MongoWorkloadGeneratorIT {
     }
 
     private static MongoWorkloadGenerator generator(MongoDatabase source, String id, Map<String, Integer> rows) {
-        var selected = catalog.getArray("cases").stream().map(value -> value.asDocument())
+        return new MongoWorkloadGenerator(source, WorkloadRecipe.fromCatalog(definition(id), rows, null), id, 17);
+    }
+
+    private static BsonDocument definition(String id) {
+        return catalog.getArray("cases").stream().map(value -> value.asDocument())
                 .filter(entry -> id.equals(entry.getString("id").getValue())).findFirst().orElseThrow();
-        return new MongoWorkloadGenerator(source, WorkloadRecipe.fromCatalog(selected, rows, null), id, 17);
     }
 
     @FunctionalInterface

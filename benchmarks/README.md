@@ -72,10 +72,12 @@ The production latency histogram is retained as diagnostic evidence. Qualified
 window latency requires independently correlated source events and target
 acknowledgements on a comparable clock.
 
-The snapshot handoff case updates a key already visible at the target while
-the snapshot is still landing. A repeat requires evidence of the original
-snapshot row, one captured update, one additional target acknowledgement, and
-exact final readback. A repeat without an observed handoff remains incomplete.
+The snapshot handoff case uses an owned replica set shared by its source and
+target. It holds target snapshot writes while updating an existing source key,
+then disables the hold before the live workload. Its target change stream must
+show the original snapshot row and the subsequent write for that key. The repeat
+also requires one captured update, one additional target acknowledgement, and
+exact final readback. Missing handoff evidence leaves the repeat incomplete.
 
 For deterministic allocation, provide whole-case estimates (including preparation,
 all repeats, verification, and cleanup) measured in the declared environment.
@@ -200,17 +202,21 @@ python3 -B benchmarks/runner.py run --suite memory --repeats 3 --rows 96 \
   the actual hotspot selections after the distinct-key constraint.
 - Slow-target Copy uses an owned test replica set for each arm with the same
   topology. Only the target connector's write commands have an application and
-  namespace filter. Check matched source histories, target confirmations at
-  release, delayed commands, eventual acknowledgements and target readback.
+  namespace filter. The source-minus-target deficit compares the measured source
+  events with target events visible at the majority frontier marker. The
+  failpoint release, delayed commands, eventual acknowledgements, and target
+  readback are recorded separately.
 - Steady Join updates existing keys and reports three equal measurement
   subwindows and logical cardinality. Lifecycle Join stops three times within
-  one JVM, observes the target collection during each stopped window, and
-  retains durable state for resume. Independent repeats start new JVMs.
+  one JVM and observes the target collection during each stopped window. It
+  reports durable positions before stop and after any observed restart, along
+  with snapshot rows read by that run. Independent repeats start new JVMs.
 
 The repeat results name each resource window with start, end, scope and coverage.
 The OP samples use process RSS from procfs on Linux and ps on macOS. Natural JVM
 GC pauses are retained in `gc.log`, with identifiable post-pause heap samples
-listed by pause type. The generator's CPU time, actual write rates and history
+listed by pause type. RSS reads that cross a phase boundary remain in the raw
+samples and are excluded from per-phase statistics. The generator's CPU time, actual write rates and history
 verification are separate. The outer run writes timestamped, owner-filtered
 Docker samples to `mongo-resource.jsonl` for the shared MongoDB containers.
 Use the repeat and phase timestamps when inspecting this file. MongoDB resources

@@ -44,6 +44,8 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 class BenchmarkRunIT {
     private static final String PIPELINE = "perf_copy";
     private static final String RECORDS = "records";
+    private static final String HANDOFF = "copy.live.handoff.standard";
+    private static final int HANDOFF_WRITE_HOLD_MILLIS = 5_000;
     private static final String DUMMY = "dummy_orders";
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -268,13 +270,14 @@ class BenchmarkRunIT {
         String targetName = namespace + "_tgt";
         Path seeds = Files.createDirectory(folder.resolve("runtime-input"));
         Files.copy(artifact, seeds.resolve("mongodb-connector.jar"));
-        try (var owned = slowTarget ? BenchmarkTargetLimit.newReplicaSet() : null) {
+        boolean requiresTestCommands = slowTarget || text(definition, "id").equals(HANDOFF);
+        try (var owned = requiresTestCommands ? BenchmarkTargetLimit.newReplicaSet() : null) {
             if (owned != null) {
                 owned.start();
             }
             String sourceUri = owned == null ? SharedMongo.replicaSetUrl(sourceName) : owned.getReplicaSetUrl(sourceName);
             String targetUri = owned == null ? SharedMongo.replicaSetUrl(targetName) : owned.getReplicaSetUrl(targetName);
-            evidence.result.put("mongo_topology", slowTarget ? "owned shared replica set with test commands"
+            evidence.result.put("mongo_topology", requiresTestCommands ? "owned shared replica set with test commands"
                     : "shared replica set");
             try (var client = MongoClients.create(sourceUri)) {
                 var sourceDb = client.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY);
@@ -365,11 +368,15 @@ class BenchmarkRunIT {
                                             .getDocument("scenario").getDocument("parameters"),
                                             "trial_target_command_delay_ms") : 0;
                                     boolean slowTarget = definition.getString("spec").getValue().equals("specs/copy-slow-target.json");
-                                    try (var limit = limited ? new BenchmarkTargetLimit(admin, targetApplication,
+                                    var handoff = text(definition, "id").equals(HANDOFF)
+                                            ? new BenchmarkTargetLimit(admin, targetApplication,
+                                                    target.getNamespace().getFullName(), HANDOFF_WRITE_HOLD_MILLIS)
+                                            : null;
+                                    try (handoff; var limit = limited ? new BenchmarkTargetLimit(admin, targetApplication,
                                             target.getNamespace().getFullName(), delay) : null;
                                             var window = slowTarget ? new BenchmarkTargetLimit.TargetWindow(targetDb, target) : null) {
                                         mongoCdc(entry, prepared, control, source, target, evidence, text(definition, "mode"),
-                                                limit, delay, window);
+                                                limit, delay, window, handoff);
                                     }
                                 }
                                 evidence.stage = "readback";
@@ -464,30 +471,29 @@ class BenchmarkRunIT {
 
     private static void mongoCdc(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, Evidence evidence, String mode,
-            BenchmarkTargetLimit limit, int delay, BenchmarkTargetLimit.TargetWindow targetWindow) {
+            BenchmarkTargetLimit limit, int delay, BenchmarkTargetLimit.TargetWindow targetWindow,
+            BenchmarkTargetLimit handoffLimit) {
         evidence.stage = "initial-state";
         evidence.window("load");
         int initial = number(entry, "rows");
         long prepareState = System.nanoTime();
-        boolean handoff = text(entry.getDocument("case"), "id").equals("copy.live.handoff.standard");
-        if (handoff && initial < 2) throw new IllegalArgumentException("The handoff requires at least two initial rows");
-        control.lifecycle(PIPELINE, LifecycleVerb.START);
+        boolean handoff = handoffLimit != null;
         String preAnchorToken;
         long preAnchorSettled;
         var anchorValue = new BsonString(handoff ? "perf-handoff" : "perf-anchor");
-        BsonDocument key;
+        var key = new BsonDocument("_id", new BsonInt64(1));
         if (handoff) {
-            key = changeAtSnapshotHandoff(entry, source, target, initial, anchorValue, evidence);
+            changeAtSnapshotHandoff(entry, source, target, control, handoffLimit, initial, key, anchorValue, evidence);
             preAnchorToken = null;
             preAnchorSettled = initial;
         } else {
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
             waitFor(entry, "settled snapshot state at the target", () -> target.countDocuments() == initial
                     && control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == initial
                     && settled(control) >= initial && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
             verifySame(source, target);
             preAnchorToken = control.resumePoint(PIPELINE).get("token");
             preAnchorSettled = settled(control);
-            key = new BsonDocument("_id", new BsonInt64(1));
             writeAnchor(source, key, anchorValue);
         }
         waitFor(entry, "confirmed initial-state anchor", () -> {
@@ -612,36 +618,47 @@ class BenchmarkRunIT {
         }
     }
 
-    private static BsonDocument changeAtSnapshotHandoff(BsonDocument entry,
-            MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, int initial,
-            BsonString anchorValue, Evidence evidence) {
+    private static void changeAtSnapshotHandoff(BsonDocument entry,
+            MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, ControlPlane control,
+            BenchmarkTargetLimit hold, int initial, BsonDocument key, BsonString anchorValue, Evidence evidence) {
         evidence.stage = "snapshot-handoff";
-        long end = System.nanoTime() + Duration.ofSeconds(number(entry, "timeout_seconds")).toNanos();
-        BsonDocument landed = null;
-        while (landed == null && System.nanoTime() < end) {
-            landed = target.find().sort(Sorts.ascending("_id")).first();
-            if (landed == null) {
-                try {
-                    Await.pauseBeforeNextPoll(Duration.ofMillis(5));
-                } catch (InterruptedException failure) {
-                    Thread.currentThread().interrupt();
-                    throw new Unverified("Interrupted while waiting for the first snapshot row");
-                }
+        BsonDocument original = source.find(key).first();
+        var match = new BsonDocument("$match", new BsonDocument("documentKey._id", key.get("_id")));
+        var boundedTarget = target.withTimeout(2, java.util.concurrent.TimeUnit.SECONDS);
+        var witness = new LinkedHashMap<String, Object>();
+        witness.put("repeated_key", key.toJson());
+        witness.put("expected_snapshot_rows", initial);
+        evidence.result.put("snapshot_handoff", witness);
+        try (var history = boundedTarget.watch(List.of(match))
+                .maxAwaitTime(100, java.util.concurrent.TimeUnit.MILLISECONDS).cursor()) {
+            hold.holdSnapshotWrites();
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
+            hold.awaitHeldWrite(Duration.ofSeconds(number(entry, "timeout_seconds")));
+            witness.put("initial_target_write_held", true);
+            writeAnchor(source, key, anchorValue);
+            witness.put("source_update_acknowledged", true);
+            long visible = boundedTarget.countDocuments();
+            witness.put("target_snapshot_rows_visible_after_update", visible);
+            long held = hold.release();
+            witness.put("target_snapshot_commands_held", held);
+            if (visible >= initial || held < 1) {
+                throw new Unverified("A target snapshot write was not held across the handoff update");
             }
+            waitFor(entry, "the handoff update to land", () -> {
+                var row = boundedTarget.find(key).first();
+                return row != null && anchorValue.equals(row.get("s0"));
+            });
+            var writes = new ArrayList<com.mongodb.client.model.changestream.ChangeStreamDocument<BsonDocument>>();
+            waitFor(entry, "the repeated key's snapshot and CDC writes", () -> {
+                var change = history.tryNext();
+                if (change != null) writes.add(change);
+                return writes.size() == 2;
+            });
+            if (!BenchmarkOperatorOracle.equivalent(original, writes.getFirst().getFullDocument())) {
+                throw new Unverified("The first target write of the handoff key did not carry its snapshot value");
+            }
+            witness.put("repeated_key_target_writes", writes.size());
         }
-        if (landed == null) throw new Unverified("No target snapshot row was observed for the handoff witness");
-        var key = new BsonDocument("_id", landed.get("_id"));
-        if (!BenchmarkOperatorOracle.equivalent(source.find(key).first(), landed)) {
-            throw new Unverified("The handoff key did not first land with its snapshot value");
-        }
-        writeAnchor(source, key, anchorValue);
-        long visible = target.countDocuments();
-        if (visible >= initial) {
-            throw new Unverified("Snapshot had already landed before the handoff update could be witnessed");
-        }
-        evidence.result.put("snapshot_handoff", Map.of("repeated_key", key.toJson(),
-                "target_snapshot_rows_visible_after_update", visible, "expected_snapshot_rows", initial));
-        return key;
     }
 
     private static void writeAnchor(MongoCollection<BsonDocument> source, BsonDocument key, BsonString value) {

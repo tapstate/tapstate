@@ -8,6 +8,7 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
+import java.time.Duration;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
@@ -44,7 +45,15 @@ final class BenchmarkTargetLimit implements AutoCloseable {
     }
 
     void arm() {
-        var data = new Document("failCommands", List.of("insert", "update", "delete"))
+        arm(List.of("insert", "update", "delete"));
+    }
+
+    void holdSnapshotWrites() {
+        arm(List.of("insert", "update"));
+    }
+
+    private void arm(List<String> commands) {
+        var data = new Document("failCommands", commands)
                 .append("appName", application).append("namespace", namespace)
                 .append("blockConnection", true).append("blockTimeMS", blockMillis);
         armed = true;
@@ -53,12 +62,20 @@ final class BenchmarkTargetLimit implements AutoCloseable {
         firstEntry = count(response);
     }
 
+    void awaitHeldWrite(Duration timeout) {
+        // The driver's client operation timeout supplies maxTimeMS to the server.
+        admin.withTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS)
+                .runCommand(new Document("waitForFailPoint", "failCommand").append("timesEntered", firstEntry + 1));
+    }
+
     long release() {
         return disarm() - firstEntry;
     }
 
     private long disarm() {
-        var response = admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+        // The server can await commands already inside the failpoint before updating its mode.
+        var response = admin.withTimeout(blockMillis + 3_000L, TimeUnit.MILLISECONDS)
+                .runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
         armed = false;
         return count(response);
     }
