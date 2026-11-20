@@ -57,7 +57,30 @@ public enum HistogramBounds {
      * just under.
      */
     STATE_COMMIT_ROUND_TRIPS("tapstate.pipeline.state.commit.round_trips", "{round_trip}", List.of(
-            1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0, 48.0, 64.0));
+            1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0, 48.0, 64.0)),
+
+    /**
+     * How many bytes one key's state took when it was written. At a nest's root level a key is one document,
+     * so this is how heavy documents are - the quantity every change to one rewrites. Finest around a
+     * megabyte, where a document stops keeping up with its changes, and ending at the sixteen a stored
+     * document may not exceed.
+     */
+    STATE_DOCUMENT_BYTES("tapstate.pipeline.state.document.bytes", "By", List.of(
+            1_024.0, 4_096.0, 16_384.0, 65_536.0, 262_144.0, 524_288.0, 1_048_576.0, 2_097_152.0, 4_194_304.0,
+            8_388_608.0, 16_777_216.0)),
+
+    /** How many bytes one commit group wrote: the store traffic that writing the state costs. */
+    STATE_COMMIT_BYTES("tapstate.pipeline.state.commit.bytes", "By", List.of(
+            1_024.0, 4_096.0, 16_384.0, 65_536.0, 262_144.0, 1_048_576.0, 4_194_304.0, 16_777_216.0,
+            67_108_864.0)),
+
+    /**
+     * How long folding one document's rollup fields took, on its own: the part of a render that recomputes
+     * values over its levels' elements, apart from writing the state the change touched.
+     */
+    ROLLUP_FOLD_DURATION("tapstate.pipeline.nest.rollup.fold.duration", List.of(
+            0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+            0.25, 1.0));
 
     /** The unit every duration histogram here is measured in; their bounds are in it. */
     public static final String UNIT = "s";

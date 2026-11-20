@@ -44,13 +44,22 @@ class ValidationNestRelationsTest {
     }
 
     @Test void aOneToOneKeyOnBothSidesKeepsGatheringForEveryShape() {
-        for (EmbedAs shape : EmbedAs.values()) {
+        for (EmbedAs shape : List.of(EmbedAs.ARRAY, EmbedAs.OBJECT, EmbedAs.FLAT)) {
             var child = embed("profiles", Map.of("id", "id"), shape, shape == EmbedAs.FLAT ? null : "profile", List.of("id"), null, List.of());
             var relation = compile("nest", root(List.of("id"), List.of(child)), Set.of("orders", "profiles"), Map.of(), LIMITS).children().getFirst();
             assertThat(relation.direction()).isEqualTo(Direction.GATHER);
             assertThat(relation.outputPath().isPresent()).isEqualTo(shape != EmbedAs.FLAT);
             if (shape == EmbedAs.FLAT) assertThat(relation.treePath()).containsExactly("$flat[profiles]");
         }
+    }
+
+    @Test void aTreeWithRollupFieldsIsRefusedRatherThanComparedAsIfTheyWereColumns() {
+        var rollup = new Embed("profiles", Map.of("id", "id"), EmbedAs.ROLLUP, null, List.of("id"), null, true, true,
+                List.of(), Map.of("n", io.tapstate.core.model.RollupField.of(
+                        io.tapstate.core.model.RollupFunction.COUNT, true, null, null, null)));
+        assertThatThrownBy(() -> compile("nest", root(List.of("id"), List.of(rollup)), Set.of("orders", "profiles"),
+                Map.of(), LIMITS)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.args()).containsEntry("rule", "nest.rollupFields"));
     }
 
     @Test void unavailableParentIdentityKeepsGatheringEvenWhenTheChildSideIsItsOwnKey() {

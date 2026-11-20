@@ -31,6 +31,14 @@
       <artifactId>core-model</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The aggregate-function library and the rollup fold a nest renders its rollup fields with;
+         core ring. The engine reaches it only through core-dsl's own types, never the expression
+         language behind it (rule R4). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-dsl</artifactId>
+      <version>${revision}</version>
+    </dependency>
 
     <!-- The carrier-agnostic plan a join declaration compiles to, and the evaluation of the
          expressions its output columns are written from. Core ring, so rule R4 admits it.

@@ -231,7 +231,7 @@ public final class RowExpressionTypeRules {
                         ? definition.body() : null;
             };
             if (body instanceof TransformBody.MapProjection projection) {
-                columns = projectedTypes(projection.fields(), columns);
+                columns = projectedTypes(projection.outputFields(), columns);
             }
         }
         return new DiscoveredTable(table.name(), columns);
