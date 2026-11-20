@@ -5187,11 +5187,11 @@ final class Repl {
                     case StartAttempt.Rejected rejected -> {
                         return failure(UpCmd.STAGE_START, id, rejected.code(), rejected.message(), rejected.params());
                     }
-                    case StartAttempt.Unreachable unreachable when unreachable.sent() -> {
-                        return failure(UpCmd.STAGE_START, id, CliError.START_MAY_HAVE_GONE_AHEAD,
-                                Map.of("pipeline", id, "server", hostPort(session.landingNode())));
-                    }
-                    case StartAttempt.Unreachable ignored -> {
+                    case StartAttempt.Unreachable unreachable -> {
+                        if (unreachable.sent()) {
+                            return failure(UpCmd.STAGE_START, id, CliError.START_MAY_HAVE_GONE_AHEAD,
+                                    Map.of("pipeline", id, "server", hostPort(session.landingNode())));
+                        }
                         return unreachable(UpCmd.STAGE_START, id);
                     }
                     case null -> {

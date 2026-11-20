@@ -619,6 +619,25 @@ class UpCmdTest {
                 .contains("target-not-empty/warehouse/orders");
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void anUnreachableStartRetainsWhetherTheRequestWasSent(boolean sent, @TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.startResponder = decisions -> new StartAttempt.Unreachable(sent);
+
+        Run result = up(home, client, "up", "--yes", "-w", ws.toString(), "-o", "json");
+
+        assertThat(result.code()).as(result.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(result.out()).contains("\"stage\": \"start\"");
+        assertThat(result.out()).contains((sent ? CliError.START_MAY_HAVE_GONE_AHEAD : CliError.CONNECT_FAILED).code());
+        assertThat(client.calls).filteredOn(call -> call.startsWith("start "))
+                .containsExactlyElementsOf(sent ? List.of("start orders_sync []")
+                        : List.of("start orders_sync []", "start orders_sync []"));
+        assertThat(client.calls).doesNotContain("status orders_sync");
+    }
+
     @Test
     void startedUpKeepsOnlyWarningsInTheirReportedOrder(@TempDir Path home, @TempDir Path ws) {
         scaffold(home, ws);
