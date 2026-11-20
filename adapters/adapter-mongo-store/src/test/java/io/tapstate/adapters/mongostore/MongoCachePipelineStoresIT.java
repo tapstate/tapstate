@@ -31,6 +31,7 @@ import org.testcontainers.utility.DockerImageName;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -100,6 +101,33 @@ class MongoCachePipelineStoresIT {
             table.drop();
             assertThat(observations.updateExisting(later, 1)).isFalse();
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
+        });
+    }
+
+    @Test void aBulkObservationPreservesTheSuccessfulEntryAndReportsBothFailuresInOrder() {
+        withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE)
+                    .compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var accepted = observation(PipelineState.RUNNING);
+            var rejected = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null,
+                    AT.plusSeconds(1), List.of());
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            f.database().runCommand(new Document("collMod", collection.getNamespace().getCollectionName())
+                    .append("validator", new Document("observedAt", new Document("$ne", Date.from(rejected.observedAt())))));
+            var lostClaim = MongoCachePipelineAccess.fenced();
+
+            var failures = f.domain().writeObservations(List.of(
+                    new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), () -> { throw lostClaim; }, accepted, 1),
+                    new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), ACTIVE, accepted, 1),
+                    new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), ACTIVE, rejected, 1)));
+
+            assertThat(failures).hasSize(3);
+            assertThat(failures.get(0)).isSameAs(lostClaim);
+            assertThat(failures.get(1)).isNull();
+            assertThat(failures.get(2)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(accepted);
+            assertThat(collection.countDocuments()).isOne();
         });
     }
 

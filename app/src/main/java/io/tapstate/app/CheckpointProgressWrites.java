@@ -69,31 +69,7 @@ final class CheckpointProgressWrites implements AutoCloseable {
 
     private boolean submit(Request request) {
         request.verify();
-        Receipt receipt;
-        synchronized (this) {
-            if (Thread.currentThread() == writing) throw new IllegalStateException("a progress write cannot wait on its own worker");
-            if (2 * request.bytes() + REQUEST_OVERHEAD > maximumBytes) throw StorageRuntime.unavailable();
-            for (;;) {
-                if (closed) throw StorageRuntime.unavailable();
-                Pending entry = pending.get(request.key());
-                Request merged = entry == null ? request : entry.request.merge(request);
-                long callerBytes = request.bytes() + REQUEST_OVERHEAD;
-                long increase = merged.bytes() - (entry == null ? 0 : entry.request.bytes()) + callerBytes;
-                if (callers < maximumEntries && retainedBytes + increase <= maximumBytes) {
-                    receipt = new Receipt(callerBytes);
-                    if (entry == null) {
-                        entry = new Pending(merged);
-                        pending.put(request.key(), entry);
-                    } else entry.request = merged;
-                    entry.completions.add(receipt);
-                    retainedBytes += increase;
-                    callers++;
-                    break;
-                }
-                merged = null;
-                awaitCapacity(callerBytes);
-            }
-        }
+        Receipt receipt = admit(request);
         try {
             boolean result = receipt.completion.get();
             request.verify();
@@ -114,20 +90,52 @@ final class CheckpointProgressWrites implements AutoCloseable {
         }
     }
 
-    private void awaitCapacity(long bytes) {
+    private synchronized Receipt admit(Request request) {
+        if (Thread.currentThread() == writing) throw new IllegalStateException("a progress write cannot wait on its own worker");
+        long callerBytes = request.bytes() + REQUEST_OVERHEAD;
+        if (request.bytes() + callerBytes > maximumBytes) throw StorageRuntime.unavailable();
+        Receipt receipt = tryAdmit(request, callerBytes);
+        if (receipt != null) return receipt;
+
         // Callers applying backpressure retain their original request on their own stacks.
-        if (waitingCallers == maximumEntries || waitingBytes + bytes > maximumBytes)
+        if (waitingCallers == maximumEntries || waitingBytes + callerBytes > maximumBytes)
             throw StorageRuntime.unavailable();
         waitingCallers++;
-        waitingBytes += bytes;
-        try { wait(); }
-        catch (InterruptedException interrupted) {
+        waitingBytes += callerBytes;
+        try {
+            while (receipt == null) {
+                wait();
+                receipt = tryAdmit(request, callerBytes);
+            }
+            return receipt;
+        } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw StorageRuntime.unavailable();
         } finally {
             waitingCallers--;
-            waitingBytes -= bytes;
+            waitingBytes -= callerBytes;
         }
+    }
+
+    private Receipt tryAdmit(Request request, long callerBytes) {
+        if (closed) throw StorageRuntime.unavailable();
+        Key key = request.key();
+        Pending entry = pending.get(key);
+        Request merged = entry == null ? request : entry.request.merge(request);
+        long increase = merged.bytes() - (entry == null ? 0 : entry.request.bytes()) + callerBytes;
+        if (callers >= maximumEntries || retainedBytes + increase > maximumBytes) return null;
+
+        Receipt receipt = new Receipt(callerBytes);
+        if (entry == null) {
+            entry = new Pending(merged);
+            pending.put(key, entry);
+        } else {
+            entry.request = merged;
+        }
+        entry.completions.add(receipt);
+        retainedBytes += increase;
+        callers++;
+        return receipt;
     }
 
     void flush() {
@@ -183,7 +191,7 @@ final class CheckpointProgressWrites implements AutoCloseable {
         entry.completions.clear();
     }
 
-    private void release(Receipt receipt) {
+    private synchronized void release(Receipt receipt) {
         if (receipt.returned && receipt.retired && !receipt.released) {
             receipt.released = true;
             retainedBytes -= receipt.bytes;
