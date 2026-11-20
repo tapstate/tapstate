@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CredentialType;
+import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TapstatePrincipal;
 import io.tapstate.core.common.TapstateException;
 import java.util.Map;
@@ -20,6 +21,10 @@ final class AuthenticatedCaller {
 
     static boolean isCloudSession() {
         return principal().credentialType() == CredentialType.CLOUD_SESSION;
+    }
+
+    static boolean permits(Scope scope) {
+        return principal().permits(scope);
     }
 
     /** Captures the verified request's lifetime for work that can outlive the security context. */

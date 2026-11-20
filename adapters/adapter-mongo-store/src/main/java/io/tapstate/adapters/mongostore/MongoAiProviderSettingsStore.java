@@ -27,6 +27,9 @@ public final class MongoAiProviderSettingsStore implements AiProviderSettingsSto
     private final MongoClient client;
     private final MongoCollection<Document> meta;
     private final SourceConfigKeyringStore keyrings;
+    private static final String MODEL = "model";
+    private static final String BASE_URL = "baseUrl";
+    private static final String OWNER = "owner";
     private final SourceConfigCipherProvider cipherProvider;
     MongoAiProviderSettingsStore(MongoClient client, MongoDatabase database) {
         this(client, database, new SourceConfigKeyringHandle(new SourceConfigKeyringStore(client, database)));
@@ -44,7 +47,8 @@ public final class MongoAiProviderSettingsStore implements AiProviderSettingsSto
         if (record == null) return Optional.empty();
         String provider = record.getString("providerId");
         String secret = decrypt(owner, context(record), record.getString("secret"));
-        return Optional.of(new Settings(provider, record.getString("baseUrl"), record.getString("model"), secret));
+        return Optional.of(new Settings(provider, record.getString(BASE_URL), record.getString(MODEL), secret,
+                Boolean.TRUE.equals(record.get(MongoConfigurationAiProviderSettingsStore.MANAGED))));
     }
     private String decrypt(String owner, String context, String envelope) {
         try {
@@ -62,18 +66,22 @@ public final class MongoAiProviderSettingsStore implements AiProviderSettingsSto
                     if (!keyrings.fenceActiveWriter(session, cipher.activeKeyId())) {
                         throw new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_NOT_READY, Map.of(), null);
                     }
-                    meta.replaceOne(session, new Document("_id", id(owner)),
-                            new Document("_id", id(owner)).append("kind", KIND).append("owner", owner)
-                                    .append("providerId", settings.providerId()).append("baseUrl", settings.baseUrl())
-                                    .append("model", settings.model()).append("secret", cipher.providerSecrets()
-                                            .encrypt(owner, context(settings), settings.apiKey())),
-                            new ReplaceOptions().upsert(true));
+                    var row = new Document("_id", id(owner)).append("kind", KIND).append(OWNER, owner)
+                                    .append("providerId", settings.providerId()).append(BASE_URL, settings.baseUrl())
+                                    .append(MODEL, settings.model()).append("secret", cipher.providerSecrets()
+                                            .encrypt(owner, context(settings), settings.apiKey()));
+                    if (settings.managedSelected()) row.append(MongoConfigurationAiProviderSettingsStore.MANAGED, true);
+                    meta.replaceOne(session, new Document("_id", id(owner)), row, new ReplaceOptions().upsert(true));
                     return null;
                 }, TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true)).readPreference(ReadPreference.primary()).build());
             }
             return null;
         });
+    }
+    @Override public boolean selectManaged(String owner, boolean selected) {
+        return StoreIo.call(() -> meta.updateOne(new Document("_id", id(owner)),
+                MongoConfigurationAiProviderSettingsStore.selectionUpdate(selected)).getMatchedCount() == 1);
     }
     @Override public void delete(String owner) {
         StoreIo.call(() -> meta.deleteOne(new Document("_id", id(owner))));
@@ -84,19 +92,19 @@ public final class MongoAiProviderSettingsStore implements AiProviderSettingsSto
                 new Document("secret", new Document("$regex", "^tsai:"))));
     }
     static String context(Document record) {
-        for (String field : java.util.List.of("owner", "providerId", "baseUrl", "model", "secret")) {
+        for (String field : java.util.List.of(OWNER, "providerId", BASE_URL, MODEL, "secret")) {
             if (!(record.get(field) instanceof String value) || value.isBlank()) {
                 throw new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
                         Map.of("id", "ai-provider-settings", "field", field), null);
             }
         }
-        return io.tapstate.core.common.JsonWriter.write(java.util.List.of(record.getString("providerId"), record.getString("baseUrl"), record.getString("model")));
+        return io.tapstate.core.common.JsonWriter.write(java.util.List.of(record.getString("providerId"), record.getString(BASE_URL), record.getString(MODEL)));
     }
     private static String context(Settings settings) {
         return io.tapstate.core.common.JsonWriter.write(java.util.List.of(settings.providerId(), settings.baseUrl(), settings.model()));
     }
     static String id(String owner) {
-        Objects.requireNonNull(owner, "owner");
+        Objects.requireNonNull(owner, OWNER);
         try {
             return "ai-provider:" + HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                     .digest(owner.getBytes(StandardCharsets.UTF_8)));

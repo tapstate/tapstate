@@ -24,14 +24,15 @@ class AiProviderNativeContextTest {
         var live = new AtomicBoolean(true); var captures = new AtomicInteger();
         var context = new AtomicReference<>(new ManagedAuthenticationContext(auth, () -> active(live)));
         when(auth.clusterContextView("cookie")).thenReturn(Optional.of(view()));
-        when(service.get(OWNER)).thenAnswer(call -> {
+        when(service.saved(OWNER)).thenAnswer(call -> {
             live.set(false); context.set(new ManagedAuthenticationContext(next, () -> {}));
-            return Optional.of(new AiProviderSettings("openai-compatible", "https://api.example.com/v1", "model", "private-key"));
+            return Optional.of(new AiProviderService.SavedProvider(
+                    new AiProviderSettings("openai-compatible", "https://api.example.com/v1", "model", "private-key"), false));
         });
         var controller = controller(service, legacy, mock(AiProviderClient.class), () -> { captures.incrementAndGet(); return context.get(); });
         assertThatThrownBy(() -> controller.get(request())).isInstanceOfSatisfying(TapstateException.class,
                 error -> assertThat(error.code()).isEqualTo(ControlError.UNAUTHENTICATED));
-        assertThat(captures).hasValue(1); verify(service).get(OWNER); verifyNoInteractions(next, legacy);
+        assertThat(captures).hasValue(1); verify(service).saved(OWNER); verifyNoInteractions(next, legacy);
     }
     @Test void failedContextChecksNeverLeakProviderCheckCapacityOrPublishSuccess() {
         var service = mock(AiProviderService.class); var auth = mock(CloudAuthenticationService.class);
