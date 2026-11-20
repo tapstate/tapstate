@@ -6,10 +6,9 @@ target: https://tapstate.dev/docs/reference/error-diagnostics
 
 # Product error diagnostics
 
-The implementation verified together uses Server, CLI and MCP revision
+The initial cross-version recovery exercise used Server, CLI and MCP revision
 `56f37fab7cd56acae3f8a19679bfbb7e9c784418` and Web revision
-`522652029bb1c372468df2b8b331380b62630d35`. These revisions identify the
-candidate used for the compatibility checks. For ordinary OP and Cloud
+`522652029bb1c372468df2b8b331380b62630d35`. The revision pair identifies that exercise. For ordinary OP and Cloud
 installations, isolate incompatible writers and verify that the recovery
 build can read both diagnostic formats before switching the connection report
 writer. A historical report keeps its recorded code, language and provenance.
@@ -107,10 +106,10 @@ accepts current and historical replies. Upstream connector-authored identities
 remain source-bound; a product module number never grants an upstream identity.
 
 DSL errors use `TS0010001` through `TS0010031`, and
-execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
-their producer, consumers and behavior tests migrate together. The complete
-product contract switches with a coordinated major release; this candidate does
-not establish a supported mixed-version deployment matrix.
+execution advisories use `TS0010032` and `TS0010033`. All registered first-party typed errors delegate to product definitions.
+Historical records continue to render with their stored identities. Upstream
+connector diagnostics retain their own identities and recorded provenance.
+Coordinate Server, CLI, MCP and Web at deployment.
 
 ## Request refusal contract
 
