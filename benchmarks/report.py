@@ -4,6 +4,7 @@ import math
 from statistics import median
 
 import catalog
+import verdict
 
 CASE_CONDITIONS = ("case_version", "definition_sha256", "mode", "scale", "effective_load",
                    "connector_sha256", "environment")
@@ -72,7 +73,7 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
     result = {"manifest_sha256": manifest["manifest_sha256"], "identity": manifest["identity"],
             "environment": manifest["environment"], "baseline_id": baseline["id"] if baseline else None,
             "baseline_kind": baseline["kind"] if baseline else None, "errors": errors, "results": results,
-            "statistics": summarize_repeats(results)}
+            "statistics": summarize_repeats(results), "case_verdicts": verdict.case_verdicts(results, baseline)}
     if baseline_status is not None:
         result["baseline"] = baseline_status
     if "github_attempt" in manifest:
@@ -114,6 +115,9 @@ def summarize_repeats(results):
 def eligible_metrics(arm):
     if arm.get("measurement_status") == "eligible":
         yield "completion_nanos", arm.get("phase_nanos", {}).get("completion_observed"), "completion observation"
+    latency = arm.get("live_latency", {})
+    if latency.get("status") == "eligible" and identified_source(latency.get("source")):
+        yield "endpoint_p95_nanos", latency.get("p95Nanos"), latency["source"]
     resources = arm.get("resources", {})
     if resources.get("status") == "observed":
         for phase, usage in resources["windows"].items():
@@ -150,18 +154,9 @@ def compare(row, baseline, environment):
             continue
         if any(arm.get(key) != ref.get(key) for key in ARM_CONDITIONS):
             continue
-        if arm.get("measurement_status") == ref.get("measurement_status") == "eligible":
-            ratio(arm_result, "completion_nanos", arm.get("phase_nanos", {}).get("completion_observed"),
-                  ref.get("phase_nanos", {}).get("completion_observed"))
-        memory = arm.get("resources", {})
-        ref_memory = ref.get("resources", {})
-        if memory.get("status") == ref_memory.get("status") == "observed":
-            for phase, usage in memory["windows"].items():
-                other = ref_memory["windows"].get(phase, {})
-                source = usage.get("source")
-                if (identified_source(source) and source == other.get("source")
-                        and usage.get("covered") and other.get("covered")):
-                    ratio(arm_result, f"{phase}.rss_peak_kib", usage.get("rss_peak_kib"), other.get("rss_peak_kib"))
+        reference_metrics = {(metric, source): value for metric, value, source in eligible_metrics(ref)}
+        for metric, observed, source in eligible_metrics(arm):
+            ratio(arm_result, metric, observed, reference_metrics.get((metric, source)))
         if arm_result:
             comparisons[name] = arm_result
     status = "fixture-comparison" if baseline["kind"] == "fixture" else "compared"

@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -82,6 +84,74 @@ class PerfReportTest(unittest.TestCase):
                     self.assertEqual(["failed", "missing"], [row["status"] for row in result["results"]])
                     self.assertEqual("readback", result["results"][0]["last_stage"])
                     self.assertIn(expected, report.markdown(result))
+
+    def test_a_run_retains_the_published_baseline_pinned_at_preparation(self):
+        environment = "runner"
+        record_sha = ["a" * 40]
+        published = {"schema_version": 1, "active": {environment: "v1"}, "versions": {}}
+        published_payloads = {}
+        for version, commit in (("v1", "b" * 40), ("v2", "c" * 40)):
+            content = json.dumps({"id": version, "version": version, "code_sha": "d" * 40,
+                                  "kind": "accepted", "environment": environment, "cases": {}}).encode()
+            published_payloads[commit] = content
+            published["versions"][version] = {"id": version, "code_sha": "d" * 40, "environment": environment,
+                                              "commit": commit, "path": "baselines/report.json",
+                                              "sha256": hashlib.sha256(content).hexdigest()}
+
+        def fetch(url):
+            if url.endswith("/commits/main"):
+                return json.dumps({"sha": record_sha[0]}).encode()
+            if url.endswith("/releases.json"):
+                return json.dumps(published).encode()
+            commit = url.split("/")[-3]
+            return published_payloads[commit]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "first", root / "second"
+            first.mkdir()
+            second.mkdir()
+            receipt = baseline.pin(first, environment, fetch=fetch)
+            self.assertEqual("available", receipt["status"])
+            self.assertEqual("v1", receipt["version"])
+            self.assertEqual("b" * 40, receipt["baseline_commit"])
+            self.assertEqual("a" * 40, receipt["release_record_commit"])
+
+            record_sha[0] = "e" * 40
+            published["active"][environment] = "v2"
+            self.assertEqual("v2", baseline.pin(second, environment, fetch=fetch)["version"])
+            pinned, historical = baseline.load(first / "baseline.json", identity=receipt)
+            self.assertEqual("v1", pinned["version"])
+            self.assertEqual("a" * 40, historical["release_record_commit"])
+            (first / "baseline.json").write_bytes(published_payloads["c" * 40])
+            _, mismatch = baseline.load(first / "baseline.json", identity=receipt)
+            self.assertEqual("baseline-digest-mismatch", mismatch["reason"])
+
+    def test_endpoint_p95_suspected_regression_requires_repeat_and_noise_support(self):
+        case_id = self.row["case_id"]
+        metric = "endpoint_p95_nanos"
+        latency = {"status": "eligible", "source": "correlated-events-v1", "p95Nanos": 100}
+        self.baseline["cases"][case_id]["live_latency"] = latency
+        self.baseline["comparison_rules"] = {"version": 1, "cases": {case_id: {
+            metric: {"worse": "higher", "observe_ratio": 0.1, "suspect_ratio": 0.2,
+                     "minimum_absolute": 5, "baseline_noise": 8, "minimum_repeats": 2}
+        }}}
+        second = copy.deepcopy(self.row)
+        second["repeat"] = 2
+        self.summary["results"].append(second)
+        for values, expected in [((108, 109), "normal"), ((115, 118), "observe"),
+                                 ((120, 126), "suspected-regression"), ((116, 130), "observe")]:
+            with self.subTest(values=values):
+                for row, value in zip(self.summary["results"], values):
+                    row["live_latency"] = dict(latency, p95Nanos=value)
+                result = report.reconcile(self.manifest, [self.summary], self.baseline)
+                case = result["case_verdicts"][case_id]
+                self.assertEqual("completed", case["execution"])
+                self.assertEqual(expected, case["comparison"])
+                self.assertEqual(list(values), case["metrics"][0]["samples"])
+        second["live_latency"] = dict(latency, source="other-sampling-protocol", p95Nanos=150)
+        result = report.reconcile(self.manifest, [self.summary], self.baseline)
+        self.assertEqual("unavailable", result["case_verdicts"][case_id]["comparison"])
 
     def test_mismatched_or_missing_environment_profile_never_qualifies(self):
         variants = [

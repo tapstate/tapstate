@@ -97,6 +97,46 @@ python3 -B benchmarks/runner.py run --manifest /tmp/perf-manifest.json --batch 0
 The manifest binds the exact checkout, definitions and effective load. A missing
 estimate or case that does not fit is recorded in the allocation and blocks replay.
 
+## Formal workloads on hosted runners
+
+Pipeline Performance provides a separate manual dispatch. Select a branch or tag
+and choose all cases, one primary group, dimension filters, or exact case IDs.
+Scheduled runs select all cases after the first scheduled Nightly Test attempt
+on the default branch completes.
+
+Formal recipes live in `cases/formal-workloads.json`. Each `ID@version` entry
+contains a recipe version, the case definition SHA-256 and every effective load
+field. Pass that file as `--formal-workloads` to `run` for a local calibration
+or to `allocate` for hosted execution. Qualification commands keep their explicit
+load options. Formal workloads use the catalog's repeat count and operation mix.
+
+`cases/hosted-runner-estimates.json` binds each estimate to a formal workload
+digest and the `ubuntu-24.04-x64-op` environment. Record the observed whole-case
+duration across all repeats and arms, its evidence URL and the margin used to
+plan the batch. A full selection with missing or mismatched recipes or estimates
+publishes an incomplete allocation and leaves every measurement job skipped.
+
+The report artifact `performance-report-<attempt>` includes `report.json` and
+`report.md`. The input and batch artifact names also carry the attempt. Reproduce
+a result with its case version, tested SHA, workload, and environment profile.
+The scheduled health workflow runs only from the default branch. It uses the
+Nightly Feishu webhook and the confirmed `PERFORMANCE_FEISHU_MENTION_ID` recipient.
+
+### Released baselines
+
+At preparation, the runner reads `baselines/releases.json` from a pinned commit
+in the public `tapstate-performance` repository. The version 1 release record
+has an `active` mapping from environment profile to version and a `versions`
+mapping whose entries specify `id`, `environment`, `code_sha`, `commit`, `path`,
+and the `sha256` of the baseline file. The file at that exact commit includes
+the same ID, version, environment and measured code SHA, declares `kind: accepted`,
+and contains the `cases` mapping. A publisher advances `active` after verifying
+the published content. Manual dispatch can select an earlier published version.
+
+The preparation artifact preserves the chosen release identity and content.
+When a baseline is unavailable or invalid, the report retains coverage and
+execution results and records why comparison was unavailable.
+
 ## Walk through a delivery candidate on local OP
 
 Allocation and manifest replay require a clean candidate checkout, including the

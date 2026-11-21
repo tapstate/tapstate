@@ -534,6 +534,10 @@ def main():
         }
         if args.formal_workloads:
             manifest["scale"] = "formal"
+            manifest["selected_cases"] = [
+                {"id": case["id"], "version": case["case_version"], "description": case["description"]}
+                for case in cases
+            ]
         if args.bind_github_attempt:
             manifest["github_attempt"] = github_attempt()
         manifest["manifest_sha256"] = definitions.digest(manifest)

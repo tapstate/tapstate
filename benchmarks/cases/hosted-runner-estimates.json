@@ -1,0 +1,24 @@
+{
+  "cases": {
+    "copy.backlog.fixed-iud.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "observed_whole_case_seconds": 220.869,
+      "seconds": 337,
+      "workload_sha256": "db643bad6ddc4cffb19bd07b1b816ff408f85f6b2c215ab8aada2598a943d6f8"
+    },
+    "copy.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "observed_whole_case_seconds": 98.158,
+      "seconds": 183,
+      "workload_sha256": "28a8438ce7b0f45ba347504e491c918b26ff7177a43ea6b314ccebddb1036722"
+    },
+    "nest.snapshot.fanout.wide@2": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "observed_whole_case_seconds": 353.466,
+      "seconds": 502,
+      "workload_sha256": "046fc5497df13a309bdf398bf76ac022ade7904a622d1133665e6dca966fead5"
+    }
+  },
+  "environment": "ubuntu-24.04-x64-op",
+  "schema_version": 1
+}

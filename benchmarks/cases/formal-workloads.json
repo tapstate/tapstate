@@ -1,0 +1,47 @@
+{
+  "cases": {
+    "copy.backlog.fixed-iud.standard@1": {
+      "definition_sha256": "7f023c567c7121ce554491b3ac180aa095207d26a11f1ab970c1b2e93567fd04",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.snapshot.basic.standard@1": {
+      "definition_sha256": "cbc33ae22b4b35f89ea7636ddb66f4e4d9595bbe23082b2b928e674ce972f158",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.snapshot.fanout.wide@2": {
+      "definition_sha256": "d0d05f0dd61c87f519cde4c4fc0aca336116dbbd88d6396f9c5f9c02e644b9dc",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    }
+  },
+  "schema_version": 1
+}

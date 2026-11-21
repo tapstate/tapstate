@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 
+import baseline
 import catalog
 import runner
 
@@ -95,6 +96,8 @@ def prepare(args, event_name, event, attempt, run):
     scope = inputs.get("mode", "all")
     runner.write_json(output / "run.json", {"github_attempt": attempt, "scope": scope, "timing": timing})
     flags = selection(scope, inputs.get("group", ""), inputs.get("filters", ""), inputs.get("case_ids", ""))
+    receipt = baseline.pin(output, RUNNER_PROFILE, inputs.get("baseline_version"))
+    runner.write_json(output / "baseline-receipt.json", receipt)
     budget = remaining_seconds(timing, reserve=REPORT_RESERVE_SECONDS + TEARDOWN_RESERVE_SECONDS)
     if budget <= BUILD_RESERVE_SECONDS:
         raise ValueError("Insufficient workflow time remains to prepare a measurement batch")
