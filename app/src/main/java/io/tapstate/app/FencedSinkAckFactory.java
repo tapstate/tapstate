@@ -6,6 +6,7 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.LoadLandings;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.util.List;
 import java.util.Map;
@@ -15,8 +16,8 @@ import java.util.Set;
 /**
  * Holds one run's durable acknowledgements to that run. A position advanced by a superseded run is worse
  * than a write it makes: the write can be replayed, while a watermark moved past changes where every later
- * run resumes from. So the member's own guard is asked before each advance, on the member where the sink
- * actually runs, exactly as it is asked before the batch that earned the position.
+ * run resumes from. A synchronous report checks the guard before advancing. A buffered report carries the
+ * claim admitted when the writer resolved and checks it on the checkpoint worker before persistence.
  *
  * <p>Starting the run's accounting is held to the run the same way, on the member that starts it: a
  * superseded run starting its accounting again would take it over from the current run, whose writers would
@@ -48,8 +49,11 @@ final class FencedSinkAckFactory implements SinkAckFactory {
     @Override
     public SinkAck resolve(HazelcastInstance member) {
         ExecutionAuthorization authorization = ExecutionAuthorization.of(member);
-        SinkAck guarded = guarded(delegate.resolve(member), fence, authorization);
-        return ValidationPipelineInitials.underlying(delegate) instanceof ScopedSrsSinkAckFactory
+        boolean deferred = ValidationPipelineInitials.underlying(delegate) instanceof ScopedSrsSinkAckFactory;
+        SinkAck resolved = delegate.resolve(member);
+        WorkloadClaimFence original = deferred && CheckpointProgressWrites.of(member) != null ? authorization.require(fence) : null;
+        SinkAck guarded = new Guarded(resolved, fence, authorization, original);
+        return deferred
                 ? new DeferredSinkAck(guarded, () -> authorization.authorized(fence))
                 : guarded;
     }
@@ -87,7 +91,7 @@ final class FencedSinkAckFactory implements SinkAckFactory {
      * is every ack bound from it to a writer, which is the ack a sink actually reports through.
      */
     static SinkAck guarded(SinkAck ack, ExecutionFence fence, ExecutionAuthorization authorization) {
-        return new Guarded(ack, fence, authorization);
+        return new Guarded(ack, fence, authorization, null);
     }
 
     private static final class Guarded implements SinkAck {
@@ -97,21 +101,28 @@ final class FencedSinkAckFactory implements SinkAckFactory {
         private final SinkAck ack;
         private final ExecutionFence fence;
         private final transient ExecutionAuthorization authorization;
+        private final WorkloadClaimFence original;
 
-        Guarded(SinkAck ack, ExecutionFence fence, ExecutionAuthorization authorization) {
+        Guarded(SinkAck ack, ExecutionFence fence, ExecutionAuthorization authorization, WorkloadClaimFence original) {
             this.ack = ack;
             this.fence = fence;
             this.authorization = authorization;
+            this.original = original;
         }
 
         @Override
         public void advance(String chain, ChainPosition position) {
-            ack.advance(chain, position, authorization.require(fence));
+            ack.advance(chain, position, claim(position.order()));
         }
 
         @Override
         public void bounded(String chain, SourceOrder through) {
-            ack.bounded(chain, through, authorization.require(fence));
+            ack.bounded(chain, through, claim(through));
+        }
+        private WorkloadClaimFence claim(SourceOrder through) {
+            // The async writer rechecks this exact claim before and after persistence.
+            if (original != null && through.seq() != SourceOrder.SNAPSHOT_SEQ) return original;
+            return authorization.require(fence);
         }
         @Override public void flush(boolean complete) { ack.flush(complete); }
         @Override public void flushOnClose() { if (authorization.authorized(fence)) ack.flushOnClose(); }
@@ -122,7 +133,7 @@ final class FencedSinkAckFactory implements SinkAckFactory {
 
         @Override
         public SinkAck forWriter(String writerId) {
-            return new Guarded(ack.forWriter(writerId), fence, authorization);
+            return new Guarded(ack.forWriter(writerId), fence, authorization, original);
         }
     }
 }

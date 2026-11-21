@@ -250,6 +250,24 @@ class ScopedSrsSinkAckFactoryTest {
         verify(privateStore).advanceWriter(context,9,"mixed-run","other","writer",new WriterProgress(point.order(),point),FENCE);
         verify(privateStore).advanceWriter(context,9,"mixed-run","other","writer",new WriterProgress(new SourceOrder(9,20),null),FENCE);
         verify(f.store,never()).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+
+        try (var writes = new CheckpointProgressWrites(4, 4096, 4, Duration.ofDays(1))) {
+            f.context.put(CheckpointProgressWrites.USER_CONTEXT_KEY,writes);
+            var buffered = copy.resolve(f.member).forWriter("writer");
+            clearInvocations(f.store,privateStore);
+            buffered.advance("source.orders",point,FENCE);
+            buffered.advance("private.other",point,FENCE);
+            buffered.bounded("private.other",new SourceOrder(9,20),FENCE);
+            buffered.flush(false);
+            verifyNoInteractions(f.store,privateStore);
+
+            writes.flush();
+            buffered.flush(true);
+            verify(f.store).advanceWriter(RUN.context(),RUN.membershipRevision(),"mixed-run","orders","writer",
+                    new WriterProgress(point.order(),point),FENCE);
+            verify(privateStore).advanceWriter(context,9,"mixed-run","other","writer",
+                    new WriterProgress(new SourceOrder(9,20),point),FENCE);
+        }
     }
 
     @Test void deserializedFactoryBindsOnlyTheOriginalMembershipAndFullClaimOnItsActualMember() throws Exception {

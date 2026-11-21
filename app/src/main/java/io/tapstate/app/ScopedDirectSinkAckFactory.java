@@ -110,12 +110,14 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
         @Override public void bounded(String stream,SourceOrder through,WorkloadClaimFence claim) { report(stream,new WriterProgress(through,null),claim); }
         private void report(String stream,WriterProgress progress,WorkloadClaimFence claim) {
             if (writer == null) throw new IllegalStateException("a private acknowledgement must name its original writer");
-            var source = source(stream); var run = source.run(); var handle = bound.get(run); handle.requireClaim(claim);
+            var source = source(stream); var run = source.run(); var handle = bound.get(run);
             if (progressWrites == null) {
+                handle.requireClaim(claim);
                 if (!handle.store().advanceWriter(run.context(),run.epoch(),runId,source.table(),writer,progress,run.pipelineClaim())) throw run.refused();
                 return;
             }
             receipts.check();
+            if (claim != null && !run.pipelineClaim().equals(claim)) throw run.refused();
             if (progress.durableThrough().seq() == SourceOrder.SNAPSHOT_SEQ) {
                 receipts.await();
                 if (!progressWrites.writer(handle, claim, runId, source.table(), writer, progress)) throw run.refused();

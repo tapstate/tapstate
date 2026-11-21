@@ -135,11 +135,13 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
             var source = source(stream); var run = source.run(); var handle = bound.get(run);
             if (progressWrites != null) {
                 receipts.check();
+                if (claimed != null && !run.originalClaim().equals(claimed)) throw refused(run);
+                boolean snapshot = progress.durableThrough().seq() == SourceOrder.SNAPSHOT_SEQ;
                 if (progress.lastTokened() == null && progress.durableThrough().equals(reported.get(stream))) {
-                    handle.withWriterStore(claimed, ignored -> {});
+                    if (snapshot) handle.withWriterStore(claimed, ignored -> {});
                     return;
                 }
-                if (progress.durableThrough().seq() == SourceOrder.SNAPSHOT_SEQ) {
+                if (snapshot) {
                     receipts.await();
                     progressWrites.writer(handle, claimed, runId, source.table(), writer, progress);
                 } else {
