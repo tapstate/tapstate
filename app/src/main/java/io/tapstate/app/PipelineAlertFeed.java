@@ -2,11 +2,17 @@ package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.Observation;
 import java.util.Collection;
+import java.util.function.BooleanSupplier;
 
 /** Non-blocking assembly boundary, separate from optional telemetry export. */
 interface PipelineAlertFeed {
     void expecting(PipelineConvergencePass pass);
     void published(PipelineConvergencePass pass, Observation observation, Throwable originalFailure);
+    default void publishedPeriodic(PipelineConvergencePass pass, Observation observation, BooleanSupplier current) {
+        if (current.getAsBoolean()) {
+            published(pass, observation, null);
+        }
+    }
     void unavailable(PipelineConvergencePass pass);
     void retain(Collection<String> pipelineIds);
     static PipelineAlertFeed none() {
