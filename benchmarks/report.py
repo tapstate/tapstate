@@ -10,7 +10,7 @@ CASE_CONDITIONS = ("case_version", "definition_sha256", "mode", "scale", "effect
 ARM_CONDITIONS = ("effective_input_rows", "mongo_topology", "target_delay_millis", "database_conditions")
 
 
-def reconcile(manifest, summaries, baseline=None):
+def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
     if manifest["manifest_sha256"] != catalog.digest(
         {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     ):
@@ -28,7 +28,8 @@ def reconcile(manifest, summaries, baseline=None):
     for summary in summaries:
         batch = next((b for b in manifest["batches"] if b["index"] == summary.get("batch")), None)
         if (summary.get("identity") != manifest["identity"] or
-                summary.get("manifest_sha256") != manifest["manifest_sha256"] or batch is None):
+                summary.get("manifest_sha256") != manifest["manifest_sha256"] or batch is None or
+                summary.get("github_attempt") != manifest.get("github_attempt")):
             errors.append({"run_id": summary.get("run_id"), "reason": "summary binding mismatch"})
             continue
         allowed = {entry["case"]["id"] for entry in batch["entries"]}
@@ -58,15 +59,25 @@ def reconcile(manifest, summaries, baseline=None):
                              "reason": "repeat binding mismatch"}
             else:
                 rows[key] = row
-    results = [
-        {**rows.get(key, {"case_id": key[0], "repeat": key[1], "status": "missing"}),
-         "comparisons": compare(rows.get(key), baseline, manifest["environment"])}
-        for key in expected
-    ]
-    return {"manifest_sha256": manifest["manifest_sha256"], "identity": manifest["identity"],
+    results = []
+    for key, entry in expected.items():
+        fallback = {"case_id": key[0], "case_version": entry["case"]["case_version"],
+                    "repeat": key[1], "status": "missing"}
+        comparison = compare(rows.get(key), baseline, manifest["environment"])
+        if comparison["status"] == "baseline-not-supplied" and baseline_status:
+            reason = baseline_status.get("reason")
+            if reason and reason != "baseline-not-supplied":
+                comparison = {"status": "baseline-unavailable", "reason": reason}
+        results.append({**fallback, **rows.get(key, {}), "comparisons": comparison})
+    result = {"manifest_sha256": manifest["manifest_sha256"], "identity": manifest["identity"],
             "environment": manifest["environment"], "baseline_id": baseline["id"] if baseline else None,
             "baseline_kind": baseline["kind"] if baseline else None, "errors": errors, "results": results,
             "statistics": summarize_repeats(results)}
+    if baseline_status is not None:
+        result["baseline"] = baseline_status
+    if "github_attempt" in manifest:
+        result["github_attempt"] = manifest["github_attempt"]
+    return result
 
 
 def matches_environment(row, profile):
@@ -171,8 +182,10 @@ def identified_source(value):
 
 
 def markdown(report):
+    baseline_status = report.get("baseline", {})
+    baseline_label = report["baseline_id"] or baseline_status.get("reason", "none supplied")
     lines = ["# Benchmark batch report", "", f"Environment: {report['environment']}",
-             f"Baseline: {report['baseline_id'] or 'none supplied'}", "",
+             f"Baseline: {baseline_label}", "",
              "| Case | Repeat | Run | Measurement | Resources | Comparison |",
              "|---|---:|---|---|---|---|"]
     for row in report["results"]:

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import catalog
 import runner
+import workloads
 
 
 class PerfRunnerTest(unittest.TestCase):
@@ -123,6 +124,47 @@ class PerfRunnerTest(unittest.TestCase):
                 self.assertIn("--mix", self.invoke(replay + ["--mix", "80/15/5"], clean)[1])
                 execute.assert_not_called()
 
+    def test_formal_allocation_requires_matching_whole_case_estimates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            allocate, replay = self.manifest_commands(root)
+            clean = dict(self.catalog, source_dirty=False)
+            case = runner.select(self.cases, ["copy.snapshot.basic.standard"], [], "all")[0]
+            reference = workloads.case_reference(case)
+            registry = root / "workloads.json"
+            estimates = root / "estimates.json"
+            manifest = root / "manifest.json"
+            allocate += ["--formal-workloads", str(registry)]
+            recipe = {"definition_sha256": case["definition_sha256"], "version": 1,
+                      "load": dict(runner.LOAD_DEFAULTS, rows=10000)}
+            registry_data = {"schema_version": 1, "cases": {}}
+            runner.write_json(registry, registry_data)
+            estimates_data = {"schema_version": 1, "environment": "fixture", "cases": {}}
+            runner.write_json(estimates, estimates_data)
+            self.assertEqual(1, self.invoke(allocate, clean)[0])
+            self.assertEqual([{"id": case["id"], "reason": f"missing formal workload for {reference}"}],
+                             catalog.read_json(manifest)["unallocated"])
+
+            registry_data["cases"][reference] = recipe
+            runner.write_json(registry, registry_data)
+            self.assertEqual(1, self.invoke(allocate, clean)[0])
+            self.assertEqual("missing whole-case estimate", catalog.read_json(manifest)["unallocated"][0]["reason"])
+            entries, _ = workloads.resolve([case], registry_data, runner.LOAD_DEFAULTS.keys())
+            estimates_data["cases"][reference] = {"workload_sha256": entries[0]["workload_sha256"], "seconds": 1,
+                                                  "evidence": "fixture-calibration"}
+            runner.write_json(estimates, estimates_data)
+            self.assertEqual(0, self.invoke(allocate, clean)[0])
+            self.assertEqual("formal", catalog.read_json(manifest)["scale"])
+            with patch.object(runner, "run_entries", return_value=0) as execute:
+                self.assertEqual(0, self.invoke(replay, clean)[0])
+                self.assertEqual(entries, execute.call_args.args[0])
+            self.assertIn("load overrides", self.invoke(allocate + ["--rows", "96"], clean)[1])
+
+            recipe["load"]["rows"] = 20000
+            runner.write_json(registry, registry_data)
+            self.assertEqual(1, self.invoke(allocate, clean)[0])
+            self.assertEqual("missing whole-case estimate", catalog.read_json(manifest)["unallocated"][0]["reason"])
+
     def manifest_commands(self, root):
         estimates = root / "estimates.json"
         estimates.write_text('{"environment":"fixture","durations_seconds":{"copy.snapshot.basic.standard":1}}')
@@ -192,6 +234,26 @@ class PerfRunnerTest(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     runner.wait_for_fixture(process, Path("unused"), 1, manifest, 10, 0)
                 process.wait.assert_called_once_with(timeout=1)
+
+    def test_wall_deadline_bounds_a_late_fixture_after_its_build(self):
+        launch = 10
+        wall = 1_700_000_000
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            marker = output / "fixture-started"
+            marker.touch()
+            os.utime(marker, ns=((wall + 1) * 10**9,) * 2)
+            process = Mock(args=["mvn"])
+            with patch.object(runner.time, "monotonic", return_value=11.25):
+                runner.wait_for_fixture(process, output, 300, {"reserve_seconds": 30}, launch, wall * 10**9,
+                                        stop_at_epoch_seconds=wall + 2)
+                process.wait.assert_called_once_with(timeout=0.75)
+            process.reset_mock()
+            with patch.object(runner.time, "monotonic", return_value=12.01):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.wait_for_fixture(process, output, 300, {"reserve_seconds": 30}, launch, wall * 10**9,
+                                            stop_at_epoch_seconds=wall + 2)
+            process.wait.assert_not_called()
 
     def test_operator_suite_lists_executable_definitions_and_preserves_scope(self):
         cases = runner.select(self.cases, [], [], "operators")

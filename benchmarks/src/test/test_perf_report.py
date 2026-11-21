@@ -1,9 +1,11 @@
 import copy
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import baseline
 import catalog
 import report
 
@@ -49,6 +51,37 @@ class PerfReportTest(unittest.TestCase):
         result = report.reconcile(self.manifest, [self.summary, self.summary], self.baseline)
         self.assertEqual("invalid", result["results"][0]["status"])
         self.assertEqual("result-unavailable", result["results"][0]["comparisons"]["status"])
+
+    def test_matching_manifest_digest_does_not_admit_another_github_attempt(self):
+        current = {"run_id": 480, "attempt": 1}
+        self.manifest["github_attempt"] = current
+        del self.manifest["manifest_sha256"]
+        self.manifest["manifest_sha256"] = catalog.digest(self.manifest)
+        self.summary["manifest_sha256"] = self.manifest["manifest_sha256"]
+        self.summary["github_attempt"] = {"run_id": 480, "attempt": 2}
+        result = report.reconcile(self.manifest, [self.summary])
+        self.assertEqual("summary binding mismatch", result["errors"][0]["reason"])
+        self.assertEqual("missing", result["results"][0]["status"])
+        self.summary["github_attempt"] = current
+        result = report.reconcile(self.manifest, [self.summary])
+        self.assertEqual("completed", result["results"][0]["status"])
+        self.assertEqual([], result["errors"])
+
+    def test_unreadable_or_invalid_baseline_keeps_execution_and_partial_evidence(self):
+        self.row.update(status="failed", last_stage="readback", reason="different rows")
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "baseline.json"
+            for body, expected in ((None, "baseline-unreadable"), ("{", "baseline-invalid-json"),
+                                   ('{"kind":"accepted","id":"b1","cases":{}}', "invalid-baseline-schema")):
+                with self.subTest(expected=expected):
+                    if body is not None:
+                        file.write_text(body)
+                    reference, status = baseline.load(file)
+                    result = report.reconcile(self.manifest, [self.summary], reference, baseline_status=status)
+                    self.assertEqual(expected, result["baseline"]["reason"])
+                    self.assertEqual(["failed", "missing"], [row["status"] for row in result["results"]])
+                    self.assertEqual("readback", result["results"][0]["last_stage"])
+                    self.assertIn(expected, report.markdown(result))
 
     def test_mismatched_or_missing_environment_profile_never_qualifies(self):
         variants = [
