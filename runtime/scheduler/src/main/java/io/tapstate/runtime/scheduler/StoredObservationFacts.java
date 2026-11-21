@@ -18,9 +18,21 @@ final class StoredObservationFacts {
 
     private final Map<String, Budget> budgets = new HashMap<>();
 
-    // The lock protects only bounded in-memory folding; no collector or store call runs under it.
-    synchronized Observation project(Observation original, PipelineIntentScope scope) {
+    Observation project(Observation original, PipelineIntentScope scope) {
         String id = original.pipelineId();
+        var budget = budget(id, scope);
+        synchronized (budget) {
+            var facts = original.facts().stream().map(budget.folder()::fold).toList();
+            synchronized (this) {
+                if (budgets.get(id) != budget) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+            }
+            return facts.equals(original.facts()) ? original : new Observation(id, original.state(), original.metrics(),
+                    original.snapshot(), original.positions(), original.failure(), original.observedAt(), facts,
+                    original.initialLoad());
+        }
+    }
+
+    private synchronized Budget budget(String id, PipelineIntentScope scope) {
         Budget budget = budgets.get(id);
         if (budget != null && !Objects.equals(budget.scope(), scope)) {
             if (budget.scope() != null && scope != null
@@ -36,10 +48,7 @@ final class StoredObservationFacts {
             budget = new Budget(scope, CardinalityBudget.folder());
             budgets.put(id, budget);
         }
-        var facts = original.facts().stream().map(budget.folder()::fold).toList();
-        return facts.equals(original.facts()) ? original : new Observation(id, original.state(), original.metrics(),
-                original.snapshot(), original.positions(), original.failure(), original.observedAt(), facts,
-                original.initialLoad());
+        return budget;
     }
 
     synchronized void retain(Collection<String> live) {

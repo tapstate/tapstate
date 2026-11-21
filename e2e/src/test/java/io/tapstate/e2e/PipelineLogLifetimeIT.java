@@ -103,9 +103,11 @@ class PipelineLogLifetimeIT {
                     "fresh different-ID control already contained a connector marker");
 
             control.lifecycle(PIPELINE, LifecycleVerb.START);
-            Await.until("replacement connector marker in its public logs", WAIT, () -> tail(control, PIPELINE).count(NEW) > 0,
-                    () -> "new marker count=" + tail(control, PIPELINE).count(NEW));
-            Tail after = tail(control, PIPELINE);
+            Tail after = Await.answered("replacement connector marker in its public logs", WAIT, () -> {
+                Tail current = tail(control, PIPELINE);
+                require(current.count(OLD) == 0, "A recreated Pipeline exposed the deleted generation's log over HTTP");
+                return current.count(NEW) > 0 ? java.util.Optional.of(current) : java.util.Optional.empty();
+            });
             System.out.printf("RECREATE_PROOF trial=%d pid=%d deleted=true oldGeneration=%d retiredGeneration=%d successorGeneration=%d "
                             + "oldBefore=%d oldInFreshDifferentId=%d oldAfterApply=%d newAfterApply=%d oldAfterNewStart=%d newAfterNewStart=%d%n",
                     trial, server.pid(), original.getLong("stateGeneration"), retired.getLong("stateGeneration"),

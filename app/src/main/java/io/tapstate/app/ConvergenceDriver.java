@@ -57,7 +57,7 @@ final class ConvergenceDriver {
     private final PipelineConvergences pipelineConvergences;
     private int nextPipeline;
     private String nextRejectedPipeline;
-    private final java.util.Set<String> unavailableObservations = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Map<String, PipelineIntentScope> unavailableObservations = new ConcurrentHashMap<>();
 
     /** The fixed store root and per-pass bindings; no current-scope or current-claim lookup is supplied. */
     record ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable requireActive,
@@ -200,7 +200,7 @@ final class ConvergenceDriver {
         // pipeline: the control ring's synchronous surface into the runtime is a closed set, and this set
         // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
-        unavailableObservations.retainAll(pipelineIds);
+        unavailableObservations.keySet().retainAll(pipelineIds);
         // Same for the claims: a pipeline that is gone still has this member named as its driver until the
         // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
         actuation.retain(pipelineIds);
@@ -433,13 +433,19 @@ final class ConvergenceDriver {
                         && pass.state().read(pipelineId).filter(checkpoint::equals).isPresent()
                         && actuation.proveObservationClaim(scope, original) && admitted.getAsBoolean();
             };
-            var observation = scoped.stores().pipelineObservations(scope, original, scoped.requireActive());
+            Runnable requireCurrentTicket = () -> {
+                if (!admitted.getAsBoolean()) throw ThreeLayerStorePort.refused();
+            };
+            var observation = scoped.stores().pipelineObservations(scope, original, () -> {
+                scoped.requireActive().run();
+                requireCurrentTicket.run();
+            });
             var projection = scoped.observations() == null
                     ? publisher.publishRunningScoped(scope, checkpoint, observation, current)
                     : scoped.observations().publishRunning(publisher, pass, checkpoint, config, current,
-                            () -> publisher.publishRunningScoped(scope, checkpoint, observation, current));
+                            requireCurrentTicket, () -> publisher.publishRunningScoped(scope, checkpoint, observation, current));
             projection.ifPresent(published -> {
-                if (unavailableObservations.remove(pipelineId)) {
+                if (unavailableObservations.remove(pipelineId, scope)) {
                     LOG.info("Periodic observation publication recovered for pipeline {}", pipelineId);
                 }
                 // The dispatcher may have removed the worker's slot before another thread evaluates this input.
@@ -457,7 +463,7 @@ final class ConvergenceDriver {
             });
         } catch (RuntimeException unavailable) {
             // A failed measurement is not a new state reading. The last successful frame ages normally.
-            if (admitted.getAsBoolean() && unavailableObservations.add(pipelineId)) {
+            if (admitted.getAsBoolean() && !scope.equals(unavailableObservations.put(pipelineId, scope))) {
                 LOG.warn("Could not publish periodic observation for pipeline {}", pipelineId, unavailable);
             } else {
                 LOG.debug("Periodic observation was refused or remains unavailable for pipeline {}", pipelineId, unavailable);

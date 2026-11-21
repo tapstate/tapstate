@@ -57,7 +57,7 @@ final class NativeObservationSampling {
         String id = pass.scope().pipelineId();
         var checkpoint = result.checkpoint().orElse(null);
         if (failure == null && checkpoint != null && StateJson.parse(checkpoint.stateJson()) == PipelineState.RUNNING) {
-            return publishRunning(publisher, pass, checkpoint, config, () -> true,
+            return publishRunning(publisher, pass, checkpoint, config, () -> true, () -> {},
                     () -> publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), null));
         }
         forget(id);
@@ -65,7 +65,8 @@ final class NativeObservationSampling {
     }
 
     Optional<Observation> publishRunning(ObservationPublisher publisher, PipelineConvergencePass pass, CheckpointDoc checkpoint,
-            PipelineIntentStore.ActuationReading config, BooleanSupplier stillCurrent, Supplier<Optional<Observation>> fallback) {
+            PipelineIntentStore.ActuationReading config, BooleanSupplier stillCurrent, Runnable requireCurrentTicket,
+            Supplier<Optional<Observation>> fallback) {
         String id = pass.scope().pipelineId();
         var original = new ExecutionFence(pass.scope(), pass.claim());
         if (execution.apply(id).filter(original::equals).isEmpty()) {
@@ -74,7 +75,7 @@ final class NativeObservationSampling {
         }
         var reading = new Published(checkpoint.epoch(), original);
         if (reading.equals(published.get(id)) && config != null && config.configurationRevision().isPresent()) {
-            var fast = combined(publisher, pass, config, checkpoint, original, stillCurrent);
+            var fast = combined(publisher, pass, config, checkpoint, original, stillCurrent, requireCurrentTicket);
             if (fast.resolved()) return fast.observation();
         }
         var observation = fallback.get();
@@ -87,7 +88,7 @@ final class NativeObservationSampling {
 
     private Attempt combined(ObservationPublisher publisher, PipelineConvergencePass pass,
             PipelineIntentStore.ActuationReading config, CheckpointDoc checkpoint, ExecutionFence original,
-            BooleanSupplier stillCurrent) {
+            BooleanSupplier stillCurrent, Runnable requireCurrentTicket) {
         String id = pass.scope().pipelineId();
         var inputs = captures.observationSelection(original);
         if (inputs.isEmpty()) return Attempt.fallback();
@@ -95,6 +96,7 @@ final class NativeObservationSampling {
         Runnable current = () -> {
             pass.requirePipeline(id);
             if (!execution.apply(id).filter(original::equals).isPresent()) throw ThreeLayerStorePort.refused();
+            requireCurrentTicket.run();
         };
         var facts = cache.readObservation(pass.scope(), pass.claim(), selection.sources(), current);
         if (facts.isEmpty() || !checkpoint.equals(facts.get().checkpoint())) return Attempt.fallback();
@@ -117,7 +119,7 @@ final class NativeObservationSampling {
             @Override public void save(Observation value, long epoch) {
                 current.run();
                 if (!cache.updateObservation(pass.scope(), pass.claim(), current, value, epoch))
-                    pass.observationSample().save(value, epoch);
+                    cache.pipelineObservations(pass.scope(), pass.claim(), current).save(value, epoch);
             }
             @Override public void delete(String pipeline) { pass.observationSample().delete(pipeline); }
         };

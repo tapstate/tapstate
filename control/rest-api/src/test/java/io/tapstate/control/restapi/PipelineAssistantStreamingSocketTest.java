@@ -124,8 +124,11 @@ class PipelineAssistantStreamingSocketTest {
                 assertThat(gate.entered.await(5, TimeUnit.SECONDS)).isTrue();
                 BufferedReader early;
                 try { early = prefix.get(3, TimeUnit.SECONDS); }
-                catch (Exception failure) {
-                    throw new AssertionError("The servlet buffered SSE until provider completion", failure);
+                catch (java.util.concurrent.TimeoutException timeout) {
+                    throw new AssertionError("The servlet buffered SSE until provider completion", timeout);
+                } catch (java.util.concurrent.ExecutionException failure) {
+                    if (failure.getCause() instanceof AssertionError assertion) throw assertion;
+                    throw new AssertionError("The SSE reader failed", failure.getCause());
                 }
                 assertThat(gate.release.getCount()).as("provider completion is still blocked").isEqualTo(1);
                 gate.release.countDown();

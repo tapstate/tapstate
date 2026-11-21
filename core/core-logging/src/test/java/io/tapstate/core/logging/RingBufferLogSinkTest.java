@@ -144,4 +144,17 @@ class RingBufferLogSinkTest {
         assertThatIllegalArgumentException().isThrownBy(() -> new RingBufferLogSink(0, 8));
         assertThatIllegalArgumentException().isThrownBy(() -> new RingBufferLogSink(8, 0));
     }
+    @Test
+    void legacyLinesRemainReadableAcrossScopedLifetimeChanges() {
+        var sink = new RingBufferLogSink(2, 4);
+        var before = new LogLine(1L, "INFO", "unscoped before");
+        var scoped = new LogLine(2L, "INFO", "scoped");
+        var after = new LogLine(3L, "INFO", "unscoped after");
+        sink.append("orders", before);
+        sink.append("orders", 2L, scoped);
+        assertThat(sink.tail("orders", 2L, 2L)).containsExactly(scoped);
+        sink.append("orders", after);
+        assertThat(sink.tail("orders")).containsExactly(before, scoped, after);
+        assertThat(sink.tail("orders", 2L, 2L)).containsExactly(scoped);
+    }
 }

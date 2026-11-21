@@ -12,9 +12,10 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class PipelineDeletionGuardTest {
-    @ParameterizedTest @ValueSource(strings = {"none", "consumer-read", "consumer-detach", "receipt", "notes-list", "connector-release", "note-completion"})
+    @ParameterizedTest @ValueSource(strings = {"none", "consumer-read", "consumer-detach", "receipt", "notes-list", "receipt-after-notes", "connector-release", "note-completion"})
     void storageAndConnectorCallbacksUseLocalGuardsWhileDurableProofsRemainOutsideTransactions(String failingStage) {
         var inside = new AtomicBoolean();
+        var listed = new AtomicBoolean();
         var currentStage = new AtomicReference<String>();
         var visited = new ArrayList<String>();
         var failure = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
@@ -49,7 +50,9 @@ class PipelineDeletionGuardTest {
         when(retirement.scope()).thenReturn(new RequiredNoteScope(owner, 1));
         when(retirement.origin()).thenReturn(Optional.of(new RequiredNoteOrigin("connector", "a".repeat(64), new byte[] {1})));
         when(notes.retirements(scope, "delete")).thenAnswer(call -> {
-            callback(inside, currentStage, visited, "notes-list", noteGuard.get()); return List.of(retirement);
+            callback(inside, currentStage, visited, "notes-list", noteGuard.get());
+            listed.set(true);
+            return List.of(retirement);
         });
         doAnswer(call -> { callback(inside, currentStage, visited, "note-completion", noteGuard.get()); return null; })
                 .when(retirement).completeAfterVerifiedRelease();
@@ -64,14 +67,14 @@ class PipelineDeletionGuardTest {
                 (fixed, manifest) -> new PipelineDeletionCoordinator.Isolated(Optional.empty(), durable, local, receiptToCheck -> {
                     assertThat(receiptToCheck).isSameAs(receipt);
                     durable.run();
-                    if (failingStage.equals("receipt")) throw failure;
+                    if (failingStage.equals("receipt") || failingStage.equals("receipt-after-notes") && listed.get()) throw failure;
                     if (receiptChecked.compareAndSet(false, true)) visited.add("receipt");
                 }));
 
         var stages = List.of("consumer-read", "consumer-detach", "receipt", "notes-list", "connector-release", "note-completion");
         if (!failingStage.equals("none")) {
             assertThatThrownBy(() -> coordinator.delete(request, Optional.empty())).isSameAs(failure);
-            int failedAt = stages.indexOf(failingStage);
+            int failedAt = failingStage.equals("receipt-after-notes") ? stages.indexOf("connector-release") : stages.indexOf(failingStage);
             assertThat(visited).containsExactlyElementsOf(stages.subList(0, failedAt));
             verify(cache, times(failedAt < 2 ? 0 : 1)).retire(any(), any(), any());
             verify(configuration, never()).complete(any());
@@ -83,6 +86,28 @@ class PipelineDeletionGuardTest {
             verify(configuration, atLeastOnce()).requirePending(original);
             verify(retirement).completeAfterVerifiedRelease();
         }
+    }
+
+    @org.junit.jupiter.api.Test
+    void theExpectedStoppedSuccessorIsPassedToConfigAdmission() {
+        var configuration=mock(PipelineRetirements.class);
+        var cache=mock(PipelineCacheRetirements.class);
+        var consumers=mock(SrsConsumerStore.class);
+        var notes=new PipelinePrivateNoteRetirement(mock(RequiredNoteStore.class),mock(PipelineStateRebuilds.class),
+                (retirement,config,purpose,cluster,guard) -> Optional.empty());
+        var scope=new PipelineIntentScope("cluster",1,"cache","flow",2);
+        var request=new PipelineRetirementRequest("delete",scope,"a".repeat(64),Optional.empty());
+        var expected=new PipelineIntentSnapshot(scope,8,new io.tapstate.core.lifecycle.DesiredState(
+                "flow",io.tapstate.core.lifecycle.PipelineState.STOPPED,request.definitionHash()));
+        var fenced=new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        when(configuration.begin(request,expected)).thenThrow(fenced);
+        var coordinator=new PipelineDeletionCoordinator(configuration,cache,consumers,notes,() -> null,() -> {},
+                (original,manifest) -> new PipelineDeletionCoordinator.Isolated(Optional.empty(),() -> {},() -> {},receipt -> {}));
+
+        assertThatThrownBy(() -> coordinator.delete(request,Optional.empty(),expected)).isSameAs(fenced);
+        verify(configuration).begin(request,expected);
+        verify(configuration,never()).begin(request);
+        verifyNoInteractions(cache,consumers);
     }
 
     private static void callback(AtomicBoolean inside, AtomicReference<String> currentStage, List<String> visited, String stage, Runnable guard) {

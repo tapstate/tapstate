@@ -16,6 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -33,8 +34,8 @@ class NativePipelineLogWindowTest {
 
         assertThat(fixture.service.logs("orders").lines()).extracting(LogLine::message)
                 .containsExactly("current lifetime", "current rebuilt generation");
-        verify(fixture.original).requireActive();
-        verify(fixture.mappings).logWindow("orders");
+        verify(fixture.original, times(2)).requireActive();
+        verify(fixture.mappings, times(2)).logWindow("orders");
     }
 
     @Test

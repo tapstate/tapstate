@@ -39,6 +39,20 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
         return read(pipelineId, (state, mapping) -> Optional.of(state));
     }
 
+    Optional<PipelineStateMapping> read(String pipelineId, MongoReadBudget budget) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(budget, "budget");
+        return budget.transaction(client, session -> {
+            var bounded = budget.database(database);
+            Document pipeline = SystemCollections.PIPELINES.on(bounded).find(session,new Document("_id",pipelineId)).first();
+            Document mapping = SystemCollections.OPERATOR_GENERATIONS.on(bounded).find(session,new Document("_id",pipelineId)).first();
+            if (pipeline == null && mapping == null) return Optional.empty();
+            var state = decode(pipelineId,mapping);
+            if ((state.phase() == PipelineStateMapping.Phase.RETIRED) != (pipeline == null)) throw unreadable(pipelineId);
+            return Optional.of(state);
+        });
+    }
+
     @Override public Optional<LogWindow> logWindow(String pipelineId) {
         return read(pipelineId, (state, mapping) -> {
             if (state.phase() == PipelineStateMapping.Phase.RETIRING

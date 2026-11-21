@@ -28,7 +28,8 @@ class LifecycleObservationIsolationIT {
     private enum Mode { NATIVE_METRICS, OBSERVATION_WRITE, LIFECYCLE_STOP }
     private record Reading(long amount, long recordsOut, Instant observedAt) {
         boolean follows(Reading prior, long value) {
-            return amount == value && recordsOut > prior.recordsOut && observedAt.isAfter(prior.observedAt);
+            return amount == value && recordsOut >= value + 1 && recordsOut > prior.recordsOut
+                    && observedAt.isAfter(prior.observedAt);
         }
     }
     private record Held(EventSet set, String stack, ThreadReference thread, ObjectReference observations,
@@ -114,7 +115,7 @@ class LifecycleObservationIsolationIT {
             Await.until("A CDC target arrives", START, () -> amount(dbA) == 1, () -> "A=" + amount(dbA));
             update(sb);
             Await.until("B delivers one real CDC row and publishes outbound facts before arming", START,
-                    () -> amount(dbB) == 1 && outbound(control).isPresent(),
+                    () -> amount(dbB) == 1 && outbound(control).orElse(0) >= 2,
                     () -> "B=" + amount(dbB) + " outbound=" + outbound(control));
             Supplier<Reading> read = () -> read(control, dbB);
             var vm = attach(server.output());

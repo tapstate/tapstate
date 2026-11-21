@@ -231,10 +231,27 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         return false;
     }
 
+    private final Map<String, io.tapstate.spi.store.PipelineIntentScope> observedScopes = new ConcurrentHashMap<>();
+
+    void observeScope(io.tapstate.spi.store.PipelineIntentScope scope,
+            java.util.function.Supplier<java.util.Optional<io.tapstate.spi.store.PipelineStateMappings.LogWindow>> lifetime) {
+        String pipelineId = scope.pipelineId();
+        var previous = observedScopes.putIfAbsent(pipelineId, scope);
+        if (previous == null || previous.equals(scope)) return;
+        lifetime.get().filter(window -> window.lastGeneration() == scope.stateGeneration()).ifPresent(window -> {
+            if (previous.stateGeneration() < window.firstGeneration()) {
+                attempts.remove(pipelineId);
+                refusals.remove(pipelineId);
+            }
+            observedScopes.replace(pipelineId, previous, scope);
+        });
+    }
+
     /** Releases what pipelines no longer desired have spent, so a deleted one leaks no counter. */
     @Override
     public void retain(java.util.Collection<String> pipelineIds) {
         attempts.keySet().retainAll(pipelineIds);
         refusals.keySet().retainAll(pipelineIds);
+        observedScopes.keySet().retainAll(pipelineIds);
     }
 }

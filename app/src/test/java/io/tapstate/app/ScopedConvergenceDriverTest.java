@@ -346,6 +346,32 @@ class ScopedConvergenceDriverTest {
         }
     }
 
+    @Test void revokingAFrameBeforeTheStoreDispatchPreventsTheWrite() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        when(ownership.proveObservationClaim(any(), any())).thenReturn(true);
+        try (var observations = new PeriodicObservations(1, 1)) {
+            periodicObservations = observations;
+            var driver = driver();
+            driver.reconcile();
+            long before = views.writes.stream().filter(write -> write.kind().equals("observation")).count();
+            views.beforeObservationWrite = () -> {
+                entered.countDown();
+                try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+            };
+            try {
+                driver.reconcile();
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                observations.discard("orders");
+            } finally {
+                release.countDown();
+            }
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> observations.pipelineIds().isEmpty());
+            assertThat(views.writes.stream().filter(write -> write.kind().equals("observation")).count()).isEqualTo(before);
+        }
+    }
+
     @Test void aHeldWorkerKeepsItsClaimAndBudgetUntilTheOriginalPassEnds() throws Exception {
         var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
@@ -613,6 +639,7 @@ class ScopedConvergenceDriverTest {
         private PipelineIntentScope current = FIRST;
         private final Map<PipelineIntentScope, InMemoryStateStore> states = new HashMap<>();
         private final Map<PipelineIntentScope, InMemoryObservationStore> projections = new HashMap<>();
+        private Runnable beforeObservationWrite = () -> {};
         private final InMemoryRateHistoryStore rates = new InMemoryRateHistoryStore();
         private final List<PipelineIntentScope> requested = new ArrayList<>();
         private final List<Write> writes = new ArrayList<>();
@@ -650,6 +677,7 @@ class ScopedConvergenceDriverTest {
             return new ObservationStore() {
                 @Override public Optional<Observation> read(String id) { check(scope); return observations(scope).read(id); }
                 @Override public void save(Observation value) {
+                    beforeObservationWrite.run();
                     check(scope, original, active); writes.add(new Write("observation", scope, original)); observations(scope).save(value);
                     if(readyToComplete && !completionObserved && value.state()==PipelineState.RUNNING) {
                         completionObserved=true;completionTrace.add("final-observation");onFinalObservation.run();

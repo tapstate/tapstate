@@ -30,7 +30,8 @@ class PeriodicObservationIsolationIT {
     private enum Mode { EXECUTION_ADVANCE, NATIVE_METRICS, OBSERVATION_WRITE }
     private record Reading(long amount, long recordsOut, Instant observedAt) {
         boolean follows(Reading prior, long value) {
-            return amount == value && recordsOut > prior.recordsOut && observedAt.isAfter(prior.observedAt);
+            return amount == value && recordsOut >= value + 1 && recordsOut > prior.recordsOut
+                    && observedAt.isAfter(prior.observedAt);
         }
     }
     private record Held(EventSet set, String stack, java.util.concurrent.atomic.AtomicBoolean draining,
@@ -120,7 +121,7 @@ class PeriodicObservationIsolationIT {
                 Await.until("A CDC target arrives", START, () -> amount(dbA) == 1, () -> "A=" + amount(dbA));
                 update(sb);
                 Await.until("B delivers one real CDC row and publishes outbound facts before arming", START,
-                        () -> amount(dbB) == 1 && outbound(control).isPresent(),
+                        () -> amount(dbB) == 1 && outbound(control).orElse(0) >= 2,
                         () -> "B=" + amount(dbB) + " outbound=" + outbound(control));
                 Supplier<Reading> read = () -> read(control, dbB);
                 for (var mode : List.of(Mode.NATIVE_METRICS, Mode.OBSERVATION_WRITE, Mode.NATIVE_METRICS, Mode.OBSERVATION_WRITE)) {

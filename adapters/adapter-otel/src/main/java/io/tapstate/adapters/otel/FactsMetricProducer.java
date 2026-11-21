@@ -88,7 +88,10 @@ final class FactsMetricProducer implements MetricProducer {
     }
 
     private final Instant started;
-    private final CardinalityBudget.Folder folder = CardinalityBudget.folder();
+    private static final class PipelineFold {
+        private CardinalityBudget.Folder folder = CardinalityBudget.folder();
+    }
+    private final Map<String, PipelineFold> folds = new HashMap<>();
     private final Map<String, Offered> latest = new ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicReference<List<MetricFact>> runtimeFacts=
             new java.util.concurrent.atomic.AtomicReference<>(List.of());
@@ -115,16 +118,19 @@ final class FactsMetricProducer implements MetricProducer {
             BooleanSupplier current) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(facts, "facts");
-        List<MetricFact> folded = new ArrayList<>(facts.size());
-        // The folder remembers which values it named; one offer at a time keeps that memory whole.
-        synchronized (folder) {
-            if (!current.getAsBoolean()) {
-                return;
-            }
-            for (MetricFact fact : facts) {
-                folded.add(folder.fold(fact));
-            }
-            if (current.getAsBoolean()) {
+        PipelineFold pipeline;
+        synchronized (folds) {
+            pipeline = folds.computeIfAbsent(pipelineId, ignored -> new PipelineFold());
+        }
+        synchronized (pipeline) {
+            if (!current.getAsBoolean()) return;
+            var candidate = pipeline.folder.copy();
+            List<MetricFact> folded = new ArrayList<>(facts.size());
+            for (var fact : facts) folded.add(candidate.fold(fact));
+            if (!current.getAsBoolean()) return;
+            synchronized (folds) {
+                if (folds.get(pipelineId) != pipeline) return;
+                pipeline.folder = candidate;
                 latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded)));
             }
         }
@@ -133,11 +139,9 @@ final class FactsMetricProducer implements MetricProducer {
     /** Drops what is held for every pipeline outside {@code pipelineIds}; their series stop with the next collection. */
     void forgetPipelinesOutside(Collection<String> pipelineIds) {
         Set<String> kept = Set.copyOf(pipelineIds);
-        // The per-pipeline fold remembers which values of each open dimension it named, and that memory
-        // has the same expiry as the names below: it belongs to a pipeline, and the pipeline is gone.
-        synchronized (folder) {
+        synchronized (folds) {
             latest.keySet().retainAll(kept);
-            folder.forgetPipelinesOutside(kept);
+            folds.keySet().retainAll(kept);
         }
         // The names go with the pipelines they were held for. A name is a promise to a chart: this series
         // will not begin folding while the data behind it has not changed. A pipeline that is gone has

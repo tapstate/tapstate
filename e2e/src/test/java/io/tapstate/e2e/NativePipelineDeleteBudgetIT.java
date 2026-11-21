@@ -62,7 +62,7 @@ class NativePipelineDeleteBudgetIT {
             control.deleteArtifact(running.pipelineId(), control.contentHash(running.pipelineId()));
             var prepared = Await.answered("the prepared DELETE request's own Mongo receipt",
                     Duration.ofSeconds(5), () -> Optional.ofNullable(READINGS.poll()));
-            requireBudget(prepared, PREPARED_MAX_COMMANDS);
+            requireBudget("prepared", prepared, PREPARED_MAX_COMMANDS);
             assertThat(control.artifact(running.pipelineId())).isEmpty();
             System.out.println("DELETE_MONGO_BUDGET prepared=" + JsonWriter.write(prepared));
 
@@ -73,19 +73,20 @@ class NativePipelineDeleteBudgetIT {
             control.deleteArtifact(empty, control.contentHash(empty));
             var unprepared = Await.answered("the unprepared DELETE request's own Mongo receipt",
                     Duration.ofSeconds(5), () -> Optional.ofNullable(READINGS.poll()));
-            requireBudget(unprepared, UNPREPARED_MAX_COMMANDS);
+            requireBudget("unprepared", unprepared, UNPREPARED_MAX_COMMANDS);
             assertThat(control.artifact(empty)).isEmpty();
             assertThat(READINGS).isEmpty();
             System.out.println("DELETE_MONGO_BUDGET unprepared=" + JsonWriter.write(unprepared));
         } finally { READINGS.clear(); }
     }
-    private static void requireBudget(Map<String, Object> receipt, int maximum) {
-        assertThat(receipt).containsEntry("complete", true).containsEntry("pending_commands", 0)
+    private static void requireBudget(String fixture, Map<String, Object> receipt, int maximum) {
+        assertThat(receipt).as("%s DELETE Mongo receipt: %s",fixture,receipt).containsEntry("complete", true).containsEntry("pending_commands", 0)
                 .containsEntry("unmatched_completions", 0).containsEntry("unclosed_stages", 0);
         var driver = (Map<?, ?>) receipt.get("mongo");
         long started = ((Number) driver.get("started")).longValue();
-        assertThat(started).isBetween(1L, (long) maximum);
-        assertThat(((Number) driver.get("completed")).longValue()).isEqualTo(started);
+        assertThat(started).as("%s DELETE command budget %d; Mongo receipt: %s",fixture,maximum,receipt)
+                .isBetween(1L, (long) maximum);
+        assertThat(((Number) driver.get("completed")).longValue()).as("%s DELETE completions: %s",fixture,receipt).isEqualTo(started);
     }
 
 }

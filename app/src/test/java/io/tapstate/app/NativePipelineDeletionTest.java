@@ -16,7 +16,7 @@ import static org.mockito.Mockito.*;
 
 class NativePipelineDeletionTest {
     @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings = {"none", "operation", "owner", "intent"})
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"none", "operation", "owner", "intent", "mongo-proof", "interrupted"})
     void onlyTheConfirmedPurgeSuccessorCanBeSelectedForDeletion(String change) {
         var configuration = mock(MongoConfigurationDomain.class, RETURNS_DEEP_STUBS);
         var cache = mock(MongoCacheDomain.class, RETURNS_DEEP_STUBS);
@@ -36,16 +36,29 @@ class NativePipelineDeletionTest {
         when(configuration.preparations().read("pipeline")).thenReturn(Optional.of(
                 new PipelinePreparation("pipeline", 2, PipelinePreparation.Phase.UNASSIGNED, null, null, null)));
         when(configuration.intents().load("pipeline")).thenReturn(Optional.of(purge), Optional.of(stopped));
-        when(configuration.pipelineStates().read("pipeline")).thenReturn(
-                Optional.of(new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.REBUILDING, PipelineRebuildCoordinator.operationId(purge))),
-                Optional.of(new PipelineStateMapping("pipeline", 2, PipelineStateMapping.Phase.ACTIVE, change.equals("operation") ? "another-operation" : PipelineRebuildCoordinator.operationId(purge))));
+        when(configuration.pipelineStates().read("pipeline")).thenReturn(Optional.of(
+                new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.REBUILDING, PipelineRebuildCoordinator.operationId(purge))));
+        when(configuration.pipelineState(eq("pipeline"),any(java.time.Duration.class))).thenAnswer(call -> {
+            assertThat(call.<java.time.Duration>getArgument(1)).isPositive().isLessThanOrEqualTo(java.time.Duration.ofSeconds(12));
+            if (change.equals("interrupted")) Thread.currentThread().interrupt();
+            return Optional.of(new PipelineStateMapping("pipeline", 2, PipelineStateMapping.Phase.ACTIVE,
+                    change.equals("operation") ? "another-operation" : PipelineRebuildCoordinator.operationId(purge)));
+        });
+        if (change.equals("mongo-proof")) doThrow(ThreeLayerStorePort.refused()).when(configuration)
+                .requireCompletedStopPurge(purge,PipelineRebuildCoordinator.operationId(purge),originalNode);
         var ownership = mock(PipelineActuationOwnership.class);
         var deletion = new NativePipelineDeletion(configuration, cache, new CacheBusinessScope("cluster", 1, "cache"),
                 ownership, owner, () -> {}, mock(Engine.class), mock(EngineLifecycleActuator.class),
                 mock(HazelcastOperatorReadiness.class), mock(HazelcastExecutionPlans.class), mock(ConnectorProvisioner.class));
-        if (change.equals("none")) assertThat(deletion.prepare(original, hash)).isNotNull();
-        else assertThatThrownBy(() -> deletion.prepare(original, hash)).isInstanceOf(TapstateException.class);
-        verifyNoInteractions(ownership);
+        try {
+            if (change.equals("none")) assertThat(deletion.prepare(original, hash)).isNotNull();
+            else assertThatThrownBy(() -> deletion.prepare(original, hash)).isInstanceOf(TapstateException.class);
+            if (Set.of("none","intent","owner","mongo-proof").contains(change)) verify(configuration)
+                    .requireCompletedStopPurge(purge,PipelineRebuildCoordinator.operationId(purge),originalNode);
+            verifyNoInteractions(ownership);
+        } finally {
+            if (change.equals("interrupted")) Thread.interrupted();
+        }
     }
 
     @org.junit.jupiter.params.ParameterizedTest

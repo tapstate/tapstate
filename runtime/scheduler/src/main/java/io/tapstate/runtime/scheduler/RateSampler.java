@@ -48,7 +48,12 @@ public final class RateSampler {
     private final Duration interval;
     private record Cadence(Object scope, Instant at) {}
     private final Map<String, Cadence> lastSampledAt = new ConcurrentHashMap<>();
-    private final Set<String> appending = ConcurrentHashMap.newKeySet();
+    private record Pending(Object scope, RateSample sample, RateHistoryStore destination, long epoch) {}
+    private static final class Flight {
+        private Pending pending;
+        private long epoch;
+    }
+    private final Map<String, Flight> appending = new java.util.HashMap<>();
 
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
@@ -83,24 +88,72 @@ public final class RateSampler {
             return;
         }
         String pipelineId = observation.pipelineId();
-        if (!appending.add(pipelineId)) {
-            return;
-        }
-        try {
-            Cadence last = lastSampledAt.get(pipelineId);
-            if (last != null && key.equals(last.scope()) && observation.observedAt().isBefore(last.at().plus(interval))) {
+        Flight flight;
+        Pending next;
+        synchronized (appending) {
+            flight = appending.get(pipelineId);
+            if (flight != null) {
+                var pending = flight.pending;
+                if (pending == null || !sample.observedAt().isBefore(pending.sample().observedAt()))
+                    flight.pending = new Pending(key, sample, destination, flight.epoch);
                 return;
             }
-            destination.append(sample);
-            lastSampledAt.put(pipelineId, new Cadence(key, observation.observedAt()));
-        } finally {
-            appending.remove(pipelineId);
+            flight = new Flight();
+            appending.put(pipelineId, flight);
+            next = new Pending(key, sample, destination, flight.epoch);
+        }
+        drain(next, flight);
+    }
+
+    private void drain(Pending next, Flight flight) {
+        String pipelineId = next.sample().pipelineId();
+        Throwable failure = null;
+        while (next != null) {
+            try { append(next, flight); }
+            catch (RuntimeException | Error problem) {
+                if (failure == null) failure = problem;
+                else if (problem instanceof Error && !(failure instanceof Error)) {
+                    problem.addSuppressed(failure);
+                    failure = problem;
+                } else if (failure != problem) failure.addSuppressed(problem);
+            }
+            synchronized (appending) {
+                next = flight.pending;
+                flight.pending = null;
+                if (next == null) appending.remove(pipelineId, flight);
+            }
+        }
+        if (failure instanceof Error fatal) throw fatal;
+        if (failure instanceof RuntimeException refused) throw refused;
+    }
+
+    private void append(Pending offer, Flight flight) {
+        var sample = offer.sample();
+        var pipelineId = sample.pipelineId();
+        synchronized (appending) {
+            if (flight.epoch != offer.epoch()) return;
+            var last = lastSampledAt.get(pipelineId);
+            if (last != null && offer.scope().equals(last.scope()) && sample.observedAt().isBefore(last.at().plus(interval)))
+                return;
+        }
+        offer.destination().append(sample);
+        synchronized (appending) {
+            if (flight.epoch == offer.epoch()) lastSampledAt.put(pipelineId, new Cadence(offer.scope(), sample.observedAt()));
         }
     }
 
-    /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */
+    /** Drops cadence and pending work for deleted Pipelines without waiting for their active append. */
     public void forgetPipelinesOutside(Collection<String> live) {
-        lastSampledAt.keySet().retainAll(live);
+        var kept = Set.copyOf(live);
+        synchronized (appending) {
+            lastSampledAt.keySet().retainAll(kept);
+            appending.forEach((id, flight) -> {
+                if (!kept.contains(id)) {
+                    flight.pending = null;
+                    flight.epoch++;
+                }
+            });
+        }
     }
 
     /** The sample {@code observation} yields, or {@code null} when it carries nothing to draw a line from. */

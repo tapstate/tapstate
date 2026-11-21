@@ -62,7 +62,8 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
                     false, bound.logStateGeneration);
         }
         // A custom provider owns its own checks; preserve its public contract when it cannot be unwrapped.
-        return ConnectorNoteScopes.of(scopes.store(),
-                requested -> namespace.equals(requested) ? original : scopes.open(requested), scopes::requireActive);
+        return ConnectorNoteScopes.forCapture(scopes.store(),
+                requested -> namespace.equals(requested) ? original : scopes.open(requested), scopes::requireActive,
+                false, scopes.logStateGeneration());
     }
 }

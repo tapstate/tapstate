@@ -23,6 +23,7 @@ public final class RingBufferLogSink implements LogSink {
     private static final class Buffer {
         final Deque<Entry> lines = new ArrayDeque<>();
         long firstGeneration;
+        boolean mixed;
     }
 
     private final int maxLinesPerPipeline;
@@ -64,30 +65,36 @@ public final class RingBufferLogSink implements LogSink {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(line, "line");
         Buffer buffer = byPipeline.get(pipelineId);
-        if (buffer != null && generation < buffer.firstGeneration) {
+        if (buffer != null && generation != UNSCOPED && generation < buffer.firstGeneration) {
             return;
         }
         if (buffer == null) {
             buffer = new Buffer();
         }
         var incoming = new Entry(generation, line);
+        if (!buffer.lines.isEmpty() && buffer.lines.getFirst().generation() != generation) buffer.mixed = true;
         buffer.lines.addLast(incoming);
-        if (buffer.lines.size() > maxLinesPerPipeline) {
-            // A predecessor must not evict a newer line even before the first verified read.
-            var evicted = buffer.lines.getFirst();
-            for (var entry : buffer.lines) {
-                if (entry.generation() < evicted.generation()) {
-                    evicted = entry;
-                }
-            }
-            buffer.lines.removeFirstOccurrence(evicted);
-            if (evicted == incoming) {
-                return;
-            }
-        }
+        if (buffer.lines.size() > maxLinesPerPipeline && evictOldest(buffer) == incoming) return;
         // Reinsert only accepted writes so stale producers do not extend a pipeline's log retention.
         byPipeline.remove(pipelineId);
         byPipeline.put(pipelineId, buffer);
+    }
+
+    private static Entry evictOldest(Buffer buffer) {
+        if (!buffer.mixed) return buffer.lines.removeFirst();
+        // A predecessor must not evict a newer line even before the first verified read.
+        var oldest = buffer.lines.getFirst();
+        for (var entry : buffer.lines) {
+            if (entry.generation() < oldest.generation()) oldest = entry;
+        }
+        buffer.lines.removeFirstOccurrence(oldest);
+        refreshMixed(buffer);
+        return oldest;
+    }
+
+    private static void refreshMixed(Buffer buffer) {
+        var first = buffer.lines.peekFirst();
+        buffer.mixed = first != null && buffer.lines.stream().anyMatch(line -> line.generation() != first.generation());
     }
 
     @Override
@@ -107,11 +114,12 @@ public final class RingBufferLogSink implements LogSink {
         }
         if (firstGeneration > buffer.firstGeneration) {
             // Learning a new lifetime also keeps late predecessors from filling the bounded buffer.
-            buffer.lines.removeIf(entry -> entry.generation() < firstGeneration);
+            buffer.lines.removeIf(entry -> entry.generation() != UNSCOPED && entry.generation() < firstGeneration);
+            refreshMixed(buffer);
             buffer.firstGeneration = firstGeneration;
         }
         return buffer.lines.stream()
-                .filter(entry -> entry.generation() <= lastGeneration)
+                .filter(entry -> entry.generation() >= firstGeneration && entry.generation() <= lastGeneration)
                 .map(Entry::line)
                 .toList();
     }

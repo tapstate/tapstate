@@ -163,7 +163,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         Slot slot = slots.get(pass.scope().pipelineId());
         // Only convergence can install a producer. A delayed worker cannot reinstate its old slot.
         if (slot != null && slot.producer.equals(new Producer(pass.scope(), pass.claim(), pass.intent()))) {
-            publish(slot, observation, null, current);
+            publish(slot, observation, null, () -> current.getAsBoolean()
+                    && slots.get(pass.scope().pipelineId()) == slot);
         }
     }
 
@@ -179,26 +180,36 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 ? Optional.of(coded.code().code()) : Optional.empty()) : diagnostics.pipeline(cause,observation.failure())).orElse(null);
         var capturedRules = rules.get();
         submit(slot, bytes + 16 * 1024, () -> {
-            var proved = currentProof(slot);
             if (!current.getAsBoolean()) return;
-            long interruption = slot.interruptions.get();
-            slot.actual = original.state();
-            if (slot.publication == null || original.observedAt().isAfter(slot.publication)) slot.publication = original.observedAt();
-            for (var rule : matching(slot, capturedRules)) {
-                var binding = binding(slot, rule,proved);
-                if (rule.typeId().equals("pipeline.observation-stale")) continue;
-                if (slot.discontinuous()) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
-                AlertInput input = rule.metric() != null ? new AlertInput.Metric(original)
-                        : new AlertInput.Conditions(original.observedAt(), slot.producer.intent().desired().targetState() != PipelineState.RUNNING
-                                ? AlertSignal.Condition.UNKNOWN : original.state() == PipelineState.FAILED
-                                ? AlertSignal.Condition.BAD : original.state() == PipelineState.RUNNING
-                                && slot.producer.intent().desired().targetState() == PipelineState.RUNNING
-                                ? AlertSignal.Condition.GOOD : AlertSignal.Condition.UNKNOWN, trace);
-                accept(binding, sequence, input);
+            try {
+                publishCurrent(slot, original, trace, capturedRules, current, sequence);
+            } catch (TapstateException refused) {
+                if (current.getAsBoolean()) throw refused;
             }
-            requireCurrent(slot,proved);
-            slot.recoveredInterruption = interruption;
         });
+    }
+
+    private void publishCurrent(Slot slot, Observation original, AlarmDiagnostics.SafeTrace trace,
+            List<AlertConfiguration.Rule> capturedRules, BooleanSupplier current, long sequence) {
+        var proved = currentProof(slot);
+        if (!current.getAsBoolean()) return;
+        long interruption = slot.interruptions.get();
+        slot.actual = original.state();
+        if (slot.publication == null || original.observedAt().isAfter(slot.publication)) slot.publication = original.observedAt();
+        for (var rule : matching(slot, capturedRules)) {
+            var binding = binding(slot, rule,proved);
+            if (rule.typeId().equals("pipeline.observation-stale")) continue;
+            if (slot.discontinuous()) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
+            AlertInput input = rule.metric() != null ? new AlertInput.Metric(original)
+                    : new AlertInput.Conditions(original.observedAt(), slot.producer.intent().desired().targetState() != PipelineState.RUNNING
+                            ? AlertSignal.Condition.UNKNOWN : original.state() == PipelineState.FAILED
+                            ? AlertSignal.Condition.BAD : original.state() == PipelineState.RUNNING
+                            && slot.producer.intent().desired().targetState() == PipelineState.RUNNING
+                            ? AlertSignal.Condition.GOOD : AlertSignal.Condition.UNKNOWN, trace);
+            accept(binding, sequence, input);
+        }
+        requireCurrent(slot,proved);
+        slot.recoveredInterruption = interruption;
     }
     @Override public void unavailable(PipelineConvergencePass pass) {
         if (pass != null) reject(slots.get(pass.scope().pipelineId()), "publication-unavailable");

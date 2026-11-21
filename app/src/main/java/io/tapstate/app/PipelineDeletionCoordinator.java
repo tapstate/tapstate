@@ -34,10 +34,14 @@ final class PipelineDeletionCoordinator {
         this.validation=Objects.requireNonNull(validation);
     }
     PipelineRetirementResult delete(PipelineRetirementRequest original,Optional<OperatorRunManifest> manifest) {
+        return delete(original, manifest, null);
+    }
+    PipelineRetirementResult delete(PipelineRetirementRequest original,Optional<OperatorRunManifest> manifest,
+            PipelineIntentSnapshot expectedIntent) {
         activeNode.run();var completed=configuration.completed(original.scope().pipelineId(),original.operationId());
         if(completed.isPresent())return same(original,completed.orElseThrow());
         var retired=isolation.isolate(original,manifest);retired.requireRetired().run();activeNode.run();
-        return execute(configuration.begin(original),retired);
+        return execute(expectedIntent == null ? configuration.begin(original) : configuration.begin(original,expectedIntent),retired);
     }
     Optional<PipelineRetirementResult> resume(PipelineIntentScope scope,String operationId,Optional<OperatorRunManifest> manifest) {
         activeNode.run();var completed=configuration.completed(scope.pipelineId(),operationId);

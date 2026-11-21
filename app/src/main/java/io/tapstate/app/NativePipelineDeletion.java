@@ -73,29 +73,42 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
         if (!scope(initial).equals(purge.scope())) throw fenced();
         String operation = PipelineRebuildCoordinator.operationId(purge);
         var mapping = initial;
-        long started = System.nanoTime();
+        long deadline = System.nanoTime() + PURGE_HANDOFF_WAIT.toNanos();
         while (scope(mapping).equals(purge.scope())) {
             if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE
                     && !(mapping.phase() == PipelineStateMapping.Phase.REBUILDING && operation.equals(mapping.operationId()))) throw fenced();
-            if (System.nanoTime() - started >= PURGE_HANDOFF_WAIT.toNanos() || Thread.currentThread().isInterrupted()) throw fenced();
-            java.util.concurrent.locks.LockSupport.parkNanos(Duration.ofMillis(50).toNanos());
-            mapping = mapping(initial.pipelineId());
+            long remaining = purgeRemaining(deadline);
+            java.util.concurrent.locks.LockSupport.parkNanos(Math.min(Duration.ofMillis(50).toNanos(),remaining));
+            remaining = purgeRemaining(deadline);
+            active.run();
+            mapping = configuration.pipelineState(initial.pipelineId(),Duration.ofNanos(remaining))
+                    .orElseThrow(NativePipelineDeletion::fenced);
+            purgeRemaining(deadline);
         }
+        purgeRemaining(deadline);
         if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE || !operation.equals(mapping.operationId())
                 || mapping.stateGeneration() != initial.stateGeneration() + 1) throw fenced();
         requireHash(initial.pipelineId(), hash);
         configuration.requireCompletedStopPurge(purge, operation, handoff.node());
         requirePurgeSuccessor(scope(mapping), handoff);
+        purgeRemaining(deadline);
         return mapping;
     }
 
-    private void requirePurgeSuccessor(PipelineIntentScope target, PurgeHandoff handoff) {
-        if (handoff == null) return;
+    private static long purgeRemaining(long deadline) {
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0 || Thread.currentThread().isInterrupted()) throw fenced();
+        return remaining;
+    }
+
+    private PipelineIntentSnapshot requirePurgeSuccessor(PipelineIntentScope target, PurgeHandoff handoff) {
+        if (handoff == null) return null;
         if (!handoff.node().equals(node.get())) throw fenced();
         var purge = handoff.intent();
         var current = configuration.intents().load(target.pipelineId()).orElseThrow(NativePipelineDeletion::fenced);
         if (current.deleted() || !current.scope().equals(target) || current.intentRevision() != purge.intentRevision() + 1
                 || current.desired().purgeState() || current.desired().targetState() != PipelineState.STOPPED) throw fenced();
+        return current;
     }
 
     private void delete(PipelineResource original, String expectedHash, PipelineIntentScope scope, String operation, PurgeHandoff handoff) {
@@ -117,7 +130,7 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
             control.requireHeld(); active.run();
             // Waiting never adopts a successor scope, definition, preparation or newly running intent.
             if (!mapping.equals(mapping(original.id()))) throw fenced();
-            requirePurgeSuccessor(scope, handoff);
+            var successor = requirePurgeSuccessor(scope, handoff);
             requireHash(original.id(),expectedHash);
             if (!preparation.equals(configuration.preparations().read(original.id()).orElseThrow(NativePipelineDeletion::fenced))) throw fenced();
             if (mapping.phase()==PipelineStateMapping.Phase.ACTIVE) requireRest(scope);
@@ -203,7 +216,7 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
             },(fixed,current,local) -> configuration.retireValidation(fixed,cache,current,local));
             try {
                 if (pending.isPresent()) { if (coordinator.resume(scope,request.operationId(),manifest).isEmpty()) throw fenced(); }
-                else coordinator.delete(request,manifest);
+                else coordinator.delete(request,manifest,successor);
             } catch (TapstateException failed) {
                 var current=configuration.artifacts().get(original.id());
                 if (current.isPresent() && !CanonicalHash.of(current.orElseThrow()).equals(expectedHash)) throw conflict(original.id());

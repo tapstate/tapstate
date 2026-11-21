@@ -75,6 +75,9 @@ class PeriodicObservationsTest {
                 });
                 assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
                 observations.offer("a", "successor", current -> successor.countDown());
+                var dispatched = new CountDownLatch(1);
+                assertThat(observations.offer("b", "independent", current -> dispatched.countDown())).isEqualTo(ACCEPTED);
+                assertThat(dispatched.await(5, TimeUnit.SECONDS)).isTrue();
                 assertThat(successor.getCount()).isEqualTo(1);
             } finally {
                 release.countDown();
@@ -190,7 +193,7 @@ class PeriodicObservationsTest {
             release.countDown();
             assertThat(independent.await(2, TimeUnit.SECONDS)).isTrue();
             org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2))
-                    .until(() -> observations.pipelineIds().isEmpty());
+                    .until(() -> observations.pipelineIds().isEmpty() && !observations.health().backpressured());
             assertThat(events).isEmpty();
             warningRelease.countDown();
             org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5)).until(() -> events.size() == 2);

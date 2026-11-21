@@ -18,6 +18,22 @@ class NestColdLayerWatchTest {
 
     private final RecordingAlert alert = new RecordingAlert();
 
+    @Test
+    void attemptsEveryNoticeBeforeReportingACallbackFailure() {
+        var attempted = new java.util.ArrayList<String>();
+        var failure = new IllegalStateException("fixture callback failure");
+        var watch = new NestColdLayerWatch(PRESSURE, new NestColdLayerAlert() {
+            @Override public void crossed(String pipeline, String name, NestStateWindow value) {
+                attempted.add(name);
+                throw failure;
+            }
+            @Override public void cleared(String pipeline, String name, NestStateWindow value) {}
+        });
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> watch.saw("orders", Map.of("first", reading(200, 180), "second", reading(200, 180))))
+                .isSameAs(failure);
+        assertThat(attempted).containsExactlyInAnyOrder("first", "second");
+    }
+
     @Test void keyCountsDrivePressureWithoutChangingLegacyCounters() {
         var watch = new NestColdLayerWatch(PRESSURE, alert);
         watch.saw("p1", Map.of("ns", keyed(100, 0, 100, "first")));

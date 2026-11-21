@@ -29,9 +29,16 @@ public final class PipelineLogQueryService {
     public static PipelineLogQueryService scoped(LogSink logs, Function<String, Optional<LogWindow>> windows) {
         Objects.requireNonNull(logs, "logs");
         Objects.requireNonNull(windows, "windows");
-        return new PipelineLogQueryService(id -> windows.apply(id)
-                .map(window -> logs.tail(id, window.firstGeneration(), window.lastGeneration()))
-                .orElseGet(List::of));
+        return new PipelineLogQueryService(id -> {
+            Optional<LogWindow> window = windows.apply(id);
+            for (int attempt = 0; attempt < 2 && window.isPresent(); attempt++) {
+                var original = window.orElseThrow();
+                var lines = logs.tail(id, original.firstGeneration(), original.lastGeneration());
+                window = windows.apply(id);
+                if (window.filter(original::equals).isPresent()) return lines;
+            }
+            return List.of();
+        });
     }
 
     /** The pipeline's most recent log lines, oldest to newest; empty when it has logged nothing here. */

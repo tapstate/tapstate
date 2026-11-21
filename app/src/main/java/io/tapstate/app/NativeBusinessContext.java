@@ -751,11 +751,18 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return ConvergenceDriver.scoped(converger, observations, samples, export,
                     () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
-                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain,
+                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> {
+                                if (admission instanceof ClusterRebuildAdmission rebuildAdmission) {
+                                    rebuildAdmission.observeScope(pass.scope(), () -> owner.pipelineLogWindow(pass.scope().pipelineId()));
+                                }
+                                return admission;
+                            }, admission::retain,
                             alerts, owner.context.getBean(PipelineFirstStatePreparer.class)::prepareDeferred,
                             pipelineId -> owner.configuration.intents().load(pipelineId)
                                     .filter(intent -> !intent.deleted() && PipelineRebuildCoordinator.clearsPrivateCapture(intent.desired()))
                                     .ifPresent(intent -> {
+                                        org.slf4j.MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
+                                                Long.toString(intent.scope().stateGeneration()));
                                         // The rebuild store verifies the frozen claim and checkpoint.
                                         // Taking a fresh actuation claim here could invalidate them after restart.
                                         try (var ignored = ownership.enterPass(intent.scope())) {

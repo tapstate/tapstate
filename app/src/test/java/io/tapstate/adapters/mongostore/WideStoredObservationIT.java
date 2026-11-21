@@ -50,7 +50,7 @@ class WideStoredObservationIT {
             for(String op:OPS) ops.put(op,1L);
             rows.put(table,ops);
             bytes.put(table,500L);
-            recent.put(table,START.toEpochMilli());
+            recent.put(table, START.toEpochMilli() - (i == 0 ? 1_000_000L : i));
             histograms.put(table,distribution);
         }
         return new Inputs(new CaptureReading(rows,bytes,START), new DeliveryReading(rows,bytes,recent,START,histograms));
@@ -100,7 +100,6 @@ class WideStoredObservationIT {
                 reading.set(inputs(n));
                 for(int repeat=1;repeat<=3;repeat++){
                     at.set(at.get().plusSeconds(1));
-                    Document before=collection.find().first();
                     recording.begin();
                     String refusal="NONE";
                     Observation generated = null;
@@ -143,16 +142,12 @@ class WideStoredObservationIT {
                     assertThat(recording.commands.getOrDefault("update",0)).isLessThanOrEqualTo(1);
                     long persistedBytes=collection.aggregate(List.of(new Document("$project",new Document("bytes",new Document("$bsonSize","$$ROOT")))))
                             .first().getInteger("bytes").longValue();
-                    if(refusal.equals("NONE")){
-                        assertThat(nativeBytes).isEqualTo(persistedBytes);
-                        var decoded=MongoObservationStore.toObservation(new Document(after).append("_id",ID));
-                        assertThat(decoded).isEqualTo(stored);
-                        assertThat(recording.commands.getOrDefault("update",0)).isEqualTo(1);
-                    }else{
-                        assertThat(nativeBytes).isGreaterThan(maxBson);
-                        assertThat(refusal).isEqualTo(IoError.DOCUMENT_TOO_LARGE.code());
-                        assertThat(after).isEqualTo(before);
-                    }
+                    if (n == 6000) assertThat(rawBytes).isGreaterThan(maxBson);
+                    assertThat(nativeBytes).isLessThan(maxBson);
+                    assertThat(nativeBytes).isEqualTo(persistedBytes);
+                    var decoded=MongoObservationStore.toObservation(new Document(after).append("_id",ID));
+                    assertThat(decoded).isEqualTo(stored);
+                    assertThat(recording.commands.getOrDefault("update",0)).isEqualTo(1);
                     var folded=CardinalityBudget.folder();
                     List<MetricFact> facts=raw.facts().stream().map(folded::fold).toList();
                     verifyFold(raw.facts(),facts);
@@ -223,6 +218,13 @@ class WideStoredObservationIT {
             }else if(a.name().equals("tapstate.pipeline.lag")){
                 assertThat(b.points().stream().mapToLong(MetricPoint::value).max())
                         .isEqualTo(a.points().stream().mapToLong(MetricPoint::value).max());
+                var named = b.points().stream().filter(point -> !point.attributes().containsKey(MetricAttributes.OVERFLOW))
+                        .map(point -> point.attributes().get(MetricAttributes.TABLE_ID)).collect(java.util.stream.Collectors.toSet());
+                var excess = a.points().stream().filter(point -> !named.contains(point.attributes().get(MetricAttributes.TABLE_ID)))
+                        .mapToLong(MetricPoint::value).max();
+                if (excess.isPresent()) assertThat(b.points()).filteredOn(point ->
+                        point.attributes().containsKey(MetricAttributes.OVERFLOW)).singleElement()
+                        .satisfies(point -> assertThat(point.value()).isEqualTo(excess.getAsLong()));
             }else{
                 assertThat(b.points().stream().mapToLong(MetricPoint::value).sum())
                         .isEqualTo(a.points().stream().mapToLong(MetricPoint::value).sum());

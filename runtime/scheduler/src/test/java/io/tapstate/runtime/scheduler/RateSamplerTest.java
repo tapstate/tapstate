@@ -126,6 +126,33 @@ class RateSamplerTest {
     }
 
     @Test
+    void anEligiblePendingSampleKeepsItsOriginalDestinationAfterAnAppendFails() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var failed = new RecordingHistory() {
+            @Override public void append(RateSample sample) {
+                entered.countDown();
+                try { assertThat(release.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException stopped) { throw new AssertionError(stopped); }
+                throw new IllegalStateException("fixture append failure");
+            }
+        };
+        var current = new RecordingHistory();
+        var sampler = new RateSampler(new RecordingHistory(), Duration.ofSeconds(1));
+        try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            try {
+                var first = executor.submit(() -> sampler.offer(moving(T0, 1), scope(1), failed));
+                assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                sampler.offer(moving(T0.plusSeconds(2), 2), scope(2), current);
+                release.countDown();
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> first.get(2, java.util.concurrent.TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IllegalStateException.class);
+                assertThat(current.appended).extracting(RateSample::observedAt).containsExactly(T0.plusSeconds(2));
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test
     @DisplayName("one sample per interval, however many observations are offered")
     void oneSamplePerInterval() {
         RecordingHistory history = new RecordingHistory();

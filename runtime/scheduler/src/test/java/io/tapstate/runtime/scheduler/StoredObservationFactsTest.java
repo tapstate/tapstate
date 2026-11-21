@@ -40,6 +40,9 @@ class StoredObservationFactsTest {
         assertThat(later.facts().getFirst().points()).hasSize(2);
         assertThat(later.facts().getFirst().points()).anySatisfy(point ->
                 assertThat(point.attributes()).containsEntry(MetricAttributes.OVERFLOW, "true"));
+        assertThat(later.facts().getFirst().points()).filteredOn(point ->
+                !point.attributes().containsKey(MetricAttributes.OVERFLOW)).singleElement()
+                .satisfies(point -> assertThat(point.attributes()).containsEntry(MetricAttributes.TABLE_ID, "t0000"));
         var independent = observation("other",List.of("new_table"));
         assertThat(projection.project(independent,scope("other",1))).isSameAs(independent);
     }
@@ -55,6 +58,48 @@ class StoredObservationFactsTest {
         projection.retain(List.of());
         var recreated = observation("flow",List.of("fresh_table"));
         assertThat(projection.project(recreated,scope("flow",4))).isSameAs(recreated);
+    }
+
+    @Test void retainingOnePipelineEvictsOnlyTheOthersBudgetAtTheSameScope() {
+        var projection = new StoredObservationFacts();
+        projection.project(observation("retired", names(1000)), scope("retired", 1));
+        projection.project(observation("live", names(1000)), scope("live", 1));
+        projection.retain(List.of("live"));
+        var retired = observation("retired", List.of("new_table"));
+        assertThat(projection.project(retired, scope("retired", 1))).isSameAs(retired);
+        var live = projection.project(observation("live", List.of("new_table")), scope("live", 1));
+        assertThat(live.facts().getFirst().points()).singleElement().satisfies(point ->
+                assertThat(point.attributes()).containsEntry(MetricAttributes.OVERFLOW, "true"));
+    }
+
+    @Test void aHeldFoldDoesNotBlockAnotherPipelinesBudgetOrRetention() throws Exception {
+        var projection = new StoredObservationFacts();
+        var original = observation("flow", List.of("table"));
+        projection.project(original, scope("flow", 1));
+        var field = StoredObservationFacts.class.getDeclaredField("budgets");
+        field.setAccessible(true);
+        var budgets = (Map<?, ?>) field.get(projection);
+        var budget = budgets.get("flow");
+        var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var held = new Thread(() -> {
+            try { projection.project(original, scope("flow", 1)); }
+            catch (Throwable problem) { failure.set(problem); }
+        });
+        synchronized (budget) {
+            held.start();
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+            while (held.isAlive() && held.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) Thread.onSpinWait();
+            assertThat(held.getState()).isEqualTo(Thread.State.BLOCKED);
+            try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+                executor.submit(() -> {
+                    projection.project(observation("other", List.of("table")), scope("other", 1));
+                    projection.retain(List.of("other"));
+                }).get(1, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        }
+        held.join(2000);
+        assertThat(held.isAlive()).isFalse();
+        assertThat(failure.get()).isInstanceOf(TapstateException.class);
     }
 
     private static PipelineIntentScope scope(String id,long generation) {

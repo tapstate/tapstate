@@ -752,6 +752,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return pipelineStates;
     }
 
+    public java.util.Optional<io.tapstate.spi.store.PipelineStateMapping> pipelineState(String pipelineId, java.time.Duration budget) {
+        requireOpen();
+        return ((MongoPipelineStateMappings) pipelineStates).read(pipelineId,new MongoReadBudget(budget));
+    }
+
     public io.tapstate.spi.store.PipelineRetirements retirements() {
         requireOpen();return new MongoPipelineRetirements(connection.client(),connection.database(),clusterId,bindings,artifacts,
                 (MongoRequiredNoteStore)requiredNotes,this::requireOpen);

@@ -67,6 +67,32 @@ class PipelineLogQueryServiceTest {
     }
 
     @Test
+    void retriesWhenTheLifetimeChangesAfterTakingTheTail() {
+        var sink = new RingBufferLogSink(8, 2);
+        var scopeReads = new java.util.concurrent.atomic.AtomicInteger();
+        sink.append("orders", 1, line("predecessor"));
+        var service = PipelineLogQueryService.scoped(sink, id -> {
+            if (scopeReads.incrementAndGet() == 1) return Optional.of(new LogWindow(1, 1));
+            sink.append("orders", 2, line("successor"));
+            return Optional.of(new LogWindow(2, 2));
+        });
+
+        assertThat(service.logs("orders").lines()).extracting(LogLine::message).containsOnly("successor");
+        assertThat(scopeReads.get()).isEqualTo(3);
+    }
+
+    @Test
+    void retriesWhenARebuildAdvancesOnlyTheUpperBound() {
+        var sink = new RingBufferLogSink(8, 1);
+        sink.append("orders", 2, line("rebuilt"));
+        var scopeReads = new java.util.concurrent.atomic.AtomicInteger();
+        var service = PipelineLogQueryService.scoped(sink, id -> Optional.of(
+                scopeReads.incrementAndGet() == 1 ? new LogWindow(1, 1) : new LogWindow(1, 2)));
+
+        assertThat(service.logs("orders").lines()).extracting(LogLine::message).containsExactly("rebuilt");
+    }
+
+    @Test
     void aPipelineWithNoLinesProjectsAnEmptyTailNotAnError() {
         var service = new PipelineLogQueryService(new RingBufferLogSink(8, 8));
 

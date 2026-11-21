@@ -65,7 +65,19 @@ public final class NestColdLayerWatch {
                 byPipeline.remove(pipelineId);
             }
         }
-        notices.forEach(Runnable::run);
+        Throwable failure = null;
+        for (var notice : notices) {
+            try { notice.run(); }
+            catch (RuntimeException | Error problem) {
+                if (failure == null) failure = problem;
+                else if (problem instanceof Error && !(failure instanceof Error)) {
+                    problem.addSuppressed(failure);
+                    failure = problem;
+                } else if (failure != problem) failure.addSuppressed(problem);
+            }
+        }
+        if (failure instanceof Error fatal) throw fatal;
+        if (failure instanceof RuntimeException refused) throw refused;
     }
 
     /** Which namespaces are currently held, as pipeline and namespace together — what a caller asserts on. */

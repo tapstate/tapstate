@@ -34,9 +34,9 @@ public interface ConnectorNoteScopes {
 
     default ConnectorNoteScopes guardedBy(Runnable additionalGuard) {
         Objects.requireNonNull(additionalGuard, "additionalGuard");
-        return of(store(), this::open, () -> {
+        return forCapture(store(), this::open, () -> {
             requireActive();
             additionalGuard.run();
-        });
+        }, batchSharedStartup(), logStateGeneration());
     }
 }
