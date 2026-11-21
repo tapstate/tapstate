@@ -39,7 +39,7 @@ def assess(now, nightly_attempts, performance_runs, reports):
     start = performance.get("run_started_at")
     if not start:
         return outcome(due, "performance-start-unavailable", **identity)
-    deadline = timestamp(start) + timedelta(seconds=BUDGET_SECONDS)
+    deadline = workflow_deadline(performance)
     if performance["status"] != "completed":
         return outcome(due, "performance-running" if now < deadline else "performance-expired", **identity)
     report = reports.get(performance["id"])
@@ -48,6 +48,10 @@ def assess(now, nightly_attempts, performance_runs, reports):
     completed = timestamp(performance["updated_at"])
     status = "performance-expired" if completed > deadline else "reported"
     return outcome(due, status, report=report, **identity)
+
+
+def workflow_deadline(performance):
+    return timestamp(performance["run_started_at"]) + timedelta(seconds=BUDGET_SECONDS)
 
 
 def outcome(due, status, *, nightly=None, performance=None, report=None):

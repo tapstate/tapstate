@@ -76,7 +76,8 @@ jobs:
           retention-days: 90
 
   measure:
-    if: github.run_attempt == '1' && needs.prepare.result == 'success'
+    name: measure (${{ matrix.batch }})
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.prepare.result == 'success' }}
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 350
@@ -97,6 +98,11 @@ jobs:
             mkdir -p "$RUNNER_TEMP/performance-batch"
             printf 'No time remained for this batch when the runner started.\n' > "$RUNNER_TEMP/performance-batch/expired.txt"
           else
+            # Leave time to upload evidence before the job's 350 minute timeout.
+            job_stop=$((now + 340 * 60))
+            if (( job_stop < STOP_AT )); then
+              echo "STOP_AT=$job_stop" >> "$GITHUB_ENV"
+            fi
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@v4
@@ -117,7 +123,10 @@ jobs:
           path: ${{ runner.temp }}/performance-inputs
       - name: Set up Maven
         if: steps.budget.outputs.run == 'true'
-        run: bash .github/scripts/setup-ci-maven.sh
+        run: |
+          mkdir -p "$RUNNER_TEMP/performance-batch"
+          bash .github/scripts/performance-with-budget.sh "Maven setup" bash .github/scripts/setup-ci-maven.sh \
+            > "$RUNNER_TEMP/performance-batch/maven-setup.log" 2>&1
       - name: Build and measure the fixed batch
         if: steps.budget.outputs.run == 'true'
         shell: bash
@@ -125,29 +134,25 @@ jobs:
           set -euo pipefail
           output="$RUNNER_TEMP/performance-batch"
           mkdir -p "$output"
-          within_budget() {
-            local remaining=$((STOP_AT - $(date +%s)))
-            if (( remaining <= 0 )); then
-              printf 'The batch budget expired before measurement.\n' > "$output/expired.txt"
-              return 124
-            fi
-            timeout --kill-after=10 "$remaining" "$@"
-          }
           {
             printf 'Image %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            printf 'Measurement cutoff %s\n' "$STOP_AT"
             uname -a
             lscpu
             free -m
             df -h "$RUNNER_TEMP"
             java -version
             mvn -version
-            docker info
+            bash .github/scripts/performance-with-budget.sh "Docker inspection" docker info
             git rev-parse HEAD
           } > "$output/environment.txt" 2>&1
-          within_budget python3 -B deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy --output "$RUNNER_TEMP/connectors"
-          within_budget docker pull mongo:7.0
-          docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$output/mongo-image.json"
-          within_budget mvn -B -pl app,e2e -am -DskipTests package > "$output/build.log" 2>&1
+          budget_script=.github/scripts/performance-with-budget.sh
+          bash "$budget_script" "connector preparation" python3 -B deploy/cloud/prepare-test-inputs.py \
+            --mongodb-only --with-dummy --output "$RUNNER_TEMP/connectors" > "$output/connectors.log" 2>&1
+          bash "$budget_script" "MongoDB image pull" docker pull mongo:7.0 > "$output/mongo-pull.log" 2>&1
+          bash "$budget_script" "MongoDB image inspection" \
+            docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$output/mongo-image.json"
+          bash "$budget_script" "application build" mvn -B -pl app,e2e -am -DskipTests package > "$output/build.log" 2>&1
           sha256sum app/target/app-0.8.0-boot.jar "$RUNNER_TEMP/connectors/"*.jar > "$output/artifacts.sha256"
           if (( STOP_AT <= $(date +%s) )); then
             printf 'The batch budget expired before measurement.\n' > "$output/expired.txt"
@@ -156,7 +161,8 @@ jobs:
           python3 -B benchmarks/runner.py run \
             --manifest "$RUNNER_TEMP/performance-inputs/manifest.json" --batch "$BATCH" \
             --stop-at-epoch-seconds "$STOP_AT" --connectors "$RUNNER_TEMP/connectors" --output "$output/run"
-      - uses: actions/upload-artifact@v4
+      - name: Upload batch evidence
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: performance-batch-${{ github.run_attempt }}-${{ matrix.batch }}

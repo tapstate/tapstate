@@ -1,5 +1,5 @@
 from argparse import Namespace
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 import os
 from pathlib import Path
@@ -130,6 +130,46 @@ class ActionsRunTest(unittest.TestCase):
             self.assertIn("copy.backlog.fixed-iud.standard@2", text)
             self.assertIn("--name performance-report-1", text)
 
+    def test_missing_batch_evidence_keeps_distinct_upload_and_execution_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs_path = root / "jobs.json"
+            runner.write_json(jobs_path, {"jobs": [
+                {"name": "measure (0)", "conclusion": "failure", "steps": [
+                    {"name": "Build and measure the fixed batch", "conclusion": "failure"},
+                    {"name": "Upload batch evidence", "conclusion": "success"},
+                ]},
+                {"name": "measure (1)", "conclusion": "failure", "steps": [
+                    {"name": "Build and measure the fixed batch", "conclusion": "success"},
+                    {"name": "Upload batch evidence", "conclusion": "failure"},
+                ]},
+            ]})
+            attempt = {"run_id": 111, "attempt": 1}
+            runner.write_json(root / "run.json", {"github_attempt": attempt})
+            ids = ["copy.snapshot.basic.standard", "copy.backlog.fixed-iud.standard",
+                   "copy.live.basic.standard", "join.live.hot-update.standard"]
+            manifest = {"github_attempt": attempt, "identity": {"code_sha": "current"}, "selected_ids": ids,
+                        "unallocated": [], "environment": "runner",
+                        "batches": [{"index": index, "entries": [
+                            {"case": {"id": case_id, "case_version": 1, "group": "copy", "mode": "snapshot",
+                                      "tags": [], "spec": "specs/copy-basic.json"}, "repeats": 1}
+                        ]} for index, case_id in enumerate(ids)]}
+            manifest["manifest_sha256"] = catalog.digest(manifest)
+            runner.write_json(root / "manifest.json", manifest)
+            expired = root / "performance-batch-1-2"
+            expired.mkdir()
+            (expired / "expired.txt").touch()
+
+            result = actions_report.collect(root, root, attempt, {"measure": "failure"},
+                                            jobs=actions_report.jobs_for_report(jobs_path))
+            self.assertEqual([
+                {"batch": 0, "reason": "batch failed before writing a summary"},
+                {"batch": 1, "reason": "batch evidence upload failed"},
+                {"batch": 2, "reason": "batch expired before measurement"},
+                {"batch": 3, "reason": "batch summary missing or unreadable"},
+            ], result["errors"])
+            self.assertEqual({"missing": 4}, result["repeat_counts"])
+
     def test_independent_health_distinguishes_a_queued_handoff_from_a_missing_run(self):
         now = datetime.fromisoformat("2026-11-21T15:00:00+00:00")
         nightly = {"id": 20, "event": "schedule", "run_attempt": 1, "status": "completed",
@@ -147,6 +187,31 @@ class ActionsRunTest(unittest.TestCase):
         for nightlies, jobs, status in cases:
             with self.subTest(status=status):
                 self.assertEqual(status, actions_health.assess(now, nightlies, jobs, {})["status"])
+
+    def test_cancellation_uses_reporting_reserve_only_for_unfinished_preparation_or_batches(self):
+        performance = {"id": 21, "run_started_at": "2026-11-21T10:00:00Z"}
+        deadline = actions_health.workflow_deadline(performance)
+        waiting = {"name": "measure (0)", "status": "queued"}
+        reporting = {"name": "report", "status": "in_progress"}
+        for seconds_before, live, jobs, expected_calls in (
+            (601, {"run_attempt": 1, "status": "in_progress"}, [waiting], 0),
+            (600, {"run_attempt": 1, "status": "in_progress"}, [waiting], 1),
+            (600, {"run_attempt": 2, "status": "in_progress"}, [waiting], 0),
+            (600, {"run_attempt": 1, "status": "completed"}, [waiting], 0),
+            (600, {"run_attempt": 1, "status": "in_progress"}, [reporting], 0),
+            (0, {"run_attempt": 1, "status": "in_progress"}, [reporting], 1),
+        ):
+            with self.subTest(seconds_before=seconds_before, live=live, jobs=jobs), \
+                    patch.object(actions_watch, "api",
+                                 side_effect=lambda _, path: {"jobs": jobs} if "/jobs?" in path else live), \
+                    patch.object(actions_watch.subprocess, "run") as execute:
+                actions_watch.stop_expiring_run("example/repo", performance,
+                                               deadline - timedelta(seconds=seconds_before))
+                self.assertEqual(expected_calls, execute.call_count)
+                if expected_calls:
+                    execute.assert_called_once_with(
+                        ["gh", "api", "--method", "POST", "repos/example/repo/actions/runs/21/cancel"],
+                        check=True, timeout=30)
 
     def test_failed_allocation_accounts_for_every_selected_case_as_not_run(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -16,7 +16,17 @@ import runner
 import verdict
 
 
-def collect(inputs, artifacts, attempt, job_results):
+def missing_batch_reason(folder, job):
+    if (folder / "expired.txt").is_file():
+        return "batch expired before measurement"
+    if "Upload batch evidence" in job.get("failed_steps", []):
+        return "batch evidence upload failed"
+    if job.get("conclusion") == "failure":
+        return "batch failed before writing a summary"
+    return "batch summary missing or unreadable"
+
+
+def collect(inputs, artifacts, attempt, job_results, *, jobs=()):
     errors = []
     run = object_or_empty(inputs / "run.json")
     if run.get("github_attempt") != attempt:
@@ -31,6 +41,7 @@ def collect(inputs, artifacts, attempt, job_results):
         errors.extend(manifest["unallocated"])
     measurements = []
     accepted_artifacts = {}
+    jobs_by_name = {job["name"]: job for job in jobs}
     if manifest and not manifest["unallocated"]:
         for batch in manifest["batches"]:
             index = batch["index"]
@@ -38,8 +49,7 @@ def collect(inputs, artifacts, attempt, job_results):
             folder = artifacts / artifact_name
             payload = object_or_empty(folder / "run" / "summary.json")
             if not payload:
-                reason = ("batch expired before measurement" if (folder / "expired.txt").is_file()
-                          else "batch summary missing or unreadable")
+                reason = missing_batch_reason(folder, jobs_by_name.get(f"measure ({index})", {}))
                 errors.append({"batch": index, "reason": reason})
                 continue
             if (payload.get("batch") != index or payload.get("github_attempt") != attempt
@@ -209,7 +219,9 @@ def jobs_for_report(path):
         if started and completed:
             elapsed = (datetime.fromisoformat(completed) - datetime.fromisoformat(started)).total_seconds()
         jobs.append({"name": job["name"], "started_at": started, "completed_at": completed,
-                     "elapsed_seconds": elapsed, "conclusion": job.get("conclusion")})
+                     "elapsed_seconds": elapsed, "conclusion": job.get("conclusion"),
+                     "failed_steps": [step["name"] for step in job.get("steps", [])
+                                      if step.get("conclusion") == "failure"]})
     return jobs
 
 
@@ -223,8 +235,9 @@ def main():
     args.output.mkdir(parents=True)
     attempt = runner.github_attempt()
     jobs = json.loads(os.environ.get("PERFORMANCE_JOB_RESULTS", "{}"))
-    result = collect(args.inputs, args.artifacts, attempt, jobs)
-    result["jobs"] = jobs_for_report(args.jobs)
+    job_details = jobs_for_report(args.jobs)
+    result = collect(args.inputs, args.artifacts, attempt, jobs, jobs=job_details)
+    result["jobs"] = job_details
     runner.write_json(args.output / "report.json", result)
     markdown = summary(result, os.environ["GITHUB_REPOSITORY"])
     (args.output / "report.md").write_text(markdown, encoding="utf-8")

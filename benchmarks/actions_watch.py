@@ -12,6 +12,7 @@ import tempfile
 from urllib.request import Request, urlopen
 
 import actions_health
+from actions_run import REPORT_RESERVE_SECONDS
 import actions_report
 import notifications
 import runner
@@ -73,6 +74,25 @@ def latest_state(repository, branch, now):
     raise ValueError(f"Delivery from health run {run_id} is uncertain")
 
 
+def stop_expiring_run(repository, performance, now):
+    deadline = actions_health.workflow_deadline(performance)
+    if now < deadline - timedelta(seconds=REPORT_RESERVE_SECONDS):
+        return
+    run_id = performance["id"]
+    if now < deadline:
+        jobs = api(repository, f"runs/{run_id}/attempts/1/jobs?per_page=100")["jobs"]
+        unfinished = any(job["status"] != "completed" and
+                         (job["name"] == "prepare" or job["name"].startswith("measure ("))
+                         for job in jobs)
+        if not unfinished:
+            return
+    live = api(repository, f"runs/{run_id}")
+    if live["run_attempt"] != 1 or live["status"] == "completed":
+        return
+    subprocess.run(["gh", "api", "--method", "POST", f"repos/{repository}/actions/runs/{run_id}/cancel"],
+                   check=True, timeout=30)
+
+
 def prepare(output, repository, branch, mention_id):
     now = datetime.now(timezone.utc)
     recent = (now - timedelta(days=2)).date().isoformat()
@@ -96,11 +116,8 @@ def prepare(output, repository, branch, mention_id):
         "queue_seconds": (now - actions_health.timestamp(performance["created_at"])).total_seconds()
         if health["status"] == "performance-queued" else None,
     })
-    if health["status"] == "performance-expired" and performance["status"] != "completed":
-        live = api(repository, f"runs/{performance['id']}")
-        if live["run_attempt"] == 1 and live["status"] != "completed":
-            subprocess.run(["gh", "api", "--method", "POST",
-                            f"repos/{repository}/actions/runs/{performance['id']}/cancel"], check=True, timeout=30)
+    if health["status"] in {"performance-running", "performance-expired"} and performance["status"] != "completed":
+        stop_expiring_run(repository, performance, now)
     previous = latest_state(repository, branch, now)
     active, healthy = notifications.signals(health)
     notices, next_state = notifications.changes(previous["active"], active, healthy)
