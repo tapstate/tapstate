@@ -36,7 +36,7 @@ final class PipelineRebuildCoordinator {
         requireActiveNode.run();pass.requirePipeline(pass.scope().pipelineId());
         if(!pass.intent().desired().purgeState())throw fenced();
         var closure=closure(pass.scope());var state=pass.state().read(pass.scope().pipelineId()).orElseThrow(PipelineRebuildCoordinator::fenced);
-        String operation="full-"+CanonicalHash.ofText(pass.scope().toString()+":"+pass.intent().intentRevision());
+        String operation=operationId(pass.intent());
         var request=new PipelineRebuildRequest(operation,pass.intent(),pass.claim(),state.epoch(),closure.inputs(),closure.dependencies());
         retired.require(request,manifest);requireActiveNode.run();
         var original=stores.configuration().begin(request);
@@ -47,6 +47,9 @@ final class PipelineRebuildCoordinator {
             // path would advance the original checkpoint epoch frozen by begin().
             throw new IllegalStateException("Pending pipeline rebuild " + operation, failure);
         }
+    }
+    static String operationId(PipelineIntentSnapshot intent) {
+        return "full-" + CanonicalHash.ofText(intent.scope().toString() + ":" + intent.intentRevision());
     }
     /** Reading an existing pending operation never creates another generation or reissues first-creation authority. */
     Optional<PipelinePreparation> resume(PipelineIntentScope originalScope,Optional<OperatorRunManifest> manifest) {

@@ -19,13 +19,16 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Couples a running observation to its original control pass and current engine execution. */
 final class NativeObservationSampling {
     private record Published(long epoch, ExecutionFence execution) {}
 
-    private record Attempt(boolean superseded, Optional<Observation> observation) {
+    private record Attempt(boolean resolved, Optional<Observation> observation) {
         static Attempt fallback() { return new Attempt(false, Optional.empty()); }
     }
 
@@ -36,7 +39,7 @@ final class NativeObservationSampling {
     private final Function<String, ExecutionPlan> plans;
     private final String defaultSource;
     private final Clock clock;
-    private final Map<String, Published> published = new HashMap<>();
+    private final Map<String, Published> published = new ConcurrentHashMap<>();
 
     NativeObservationSampling(MongoConfigurationDomain configuration, MongoCacheDomain cache, ScopedPipelineCaptureCoordinator captures,
             Function<String, Optional<ExecutionFence>> execution, Function<String, ExecutionPlan> plans, String defaultSource, Clock clock) {
@@ -53,27 +56,39 @@ final class NativeObservationSampling {
             PipelineIntentStore.ActuationReading config, ObservationFailure failure) {
         String id = pass.scope().pipelineId();
         var checkpoint = result.checkpoint().orElse(null);
-        var current = execution.apply(id);
-        var running = failure == null && checkpoint != null && StateJson.parse(checkpoint.stateJson()) == PipelineState.RUNNING
-                && current.filter(original -> original.equals(new ExecutionFence(pass.scope(), pass.claim()))).isPresent();
-        if (running) {
-            var original = current.orElseThrow();
-            var reading = new Published(checkpoint.epoch(), original);
-            if (reading.equals(published.get(id)) && config != null && config.configurationRevision().isPresent()) {
-                var fast = combined(publisher, pass, config, checkpoint, original);
-                if (fast.superseded() || fast.observation().isPresent()) return fast.observation();
-            }
-            var fallback = publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
-            if (fallback.filter(value -> value.state() == PipelineState.RUNNING).isPresent() && execution.apply(id).equals(current))
-                published.put(id, reading);
-            return fallback;
+        if (failure == null && checkpoint != null && StateJson.parse(checkpoint.stateJson()) == PipelineState.RUNNING) {
+            return publishRunning(publisher, pass, checkpoint, config, () -> true, () -> {},
+                    () -> publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), null));
         }
-        published.remove(id);
+        forget(id);
         return publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
     }
 
+    Optional<Observation> publishRunning(ObservationPublisher publisher, PipelineConvergencePass pass, CheckpointDoc checkpoint,
+            PipelineIntentStore.ActuationReading config, BooleanSupplier stillCurrent, Runnable requireCurrentTicket,
+            Supplier<Optional<Observation>> fallback) {
+        String id = pass.scope().pipelineId();
+        var original = new ExecutionFence(pass.scope(), pass.claim());
+        if (execution.apply(id).filter(original::equals).isEmpty()) {
+            forget(id);
+            return fallback.get();
+        }
+        var reading = new Published(checkpoint.epoch(), original);
+        if (reading.equals(published.get(id)) && config != null && config.configurationRevision().isPresent()) {
+            var fast = combined(publisher, pass, config, checkpoint, original, stillCurrent, requireCurrentTicket);
+            if (fast.resolved()) return fast.observation();
+        }
+        var observation = fallback.get();
+        if (observation.filter(value -> value.state() == PipelineState.RUNNING).isPresent()
+                && execution.apply(id).filter(original::equals).isPresent()) {
+            published.put(id, reading);
+        }
+        return observation;
+    }
+
     private Attempt combined(ObservationPublisher publisher, PipelineConvergencePass pass,
-            PipelineIntentStore.ActuationReading config, CheckpointDoc checkpoint, ExecutionFence original) {
+            PipelineIntentStore.ActuationReading config, CheckpointDoc checkpoint, ExecutionFence original,
+            BooleanSupplier stillCurrent, Runnable requireCurrentTicket) {
         String id = pass.scope().pipelineId();
         var inputs = captures.observationSelection(original);
         if (inputs.isEmpty()) return Attempt.fallback();
@@ -81,6 +96,7 @@ final class NativeObservationSampling {
         Runnable current = () -> {
             pass.requirePipeline(id);
             if (!execution.apply(id).filter(original::equals).isPresent()) throw ThreeLayerStorePort.refused();
+            requireCurrentTicket.run();
         };
         var admitted = cache.readObservation(pass.scope(), pass.claim(), selection.sources(), current);
         if (admitted.isEmpty()) return Attempt.fallback();
@@ -105,11 +121,12 @@ final class NativeObservationSampling {
             @Override public void save(Observation value) { throw new IllegalArgumentException("observation checkpoint is required"); }
             @Override public void save(Observation value, long epoch) {
                 current.run();
-                if (!reading.updateExisting(value, epoch)) pass.observationSample().save(value, epoch);
+                if (!reading.updateExisting(value, epoch))
+                    cache.pipelineObservations(pass.scope(), pass.claim(), current).save(value, epoch);
             }
             @Override public void delete(String pipeline) { pass.observationSample().delete(pipeline); }
         };
-        return new Attempt(false, publisher.publishRunning(pass.scope(), checkpoint, sink, sample.orElseThrow()));
+        return new Attempt(true, publisher.publishRunning(pass.scope(), checkpoint, sink, sample.orElseThrow(), stillCurrent));
     }
 
     private static boolean matches(MongoConfigurationDomain.ObservationConfiguration current, MongoCacheDomain.ObservationFacts facts,
@@ -131,6 +148,8 @@ final class NativeObservationSampling {
         }
         return true;
     }
+
+    void forget(String id) { published.remove(id); }
 
     void retain(Collection<String> ids) { published.keySet().retainAll(ids); }
 }

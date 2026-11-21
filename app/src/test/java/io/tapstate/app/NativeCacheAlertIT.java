@@ -29,6 +29,12 @@ class NativeCacheAlertIT {
             .withCommand("--replSet","docker-rs","--setParameter","enableTestCommands=1");
     @TempDir Path work;
     @Test void anActualRequiredCacheCommandFailureCanBeAcceptedAfterTheDataMemberFailsClosed() throws Exception {
+        verifyFailureAndRecovery(false);
+    }
+    @Test void aQueuedControlRejectionCannotInterruptTheIndependentCacheAlert() throws Exception {
+        verifyFailureAndRecovery(true);
+    }
+    private void verifyFailureAndRecovery(boolean queuedControl) throws Exception {
         var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"native_cache_alert","cache-admin","isolated-cache-password");
         var settings=new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5));
         try(var observer=MongoClients.create(storage.configurationUri())) {
@@ -48,29 +54,74 @@ class NativeCacheAlertIT {
                     var healthy=config.getCollection("alert_instances").find(new Document("_id.resourceKind","cluster-storage").append("_id.resourceId","cache")).first();
                     assertThat(healthy).isNotNull();assertThat(healthy).containsEntry("status","CLEAR");
                 });
-                var child=NativeAppStorage.business(app);var runtime=child.getBean(PipelineAlertRuntime.class);
-                var entered=new java.util.concurrent.CountDownLatch(2);var release=new java.util.concurrent.CountDownLatch(1);
-                Runnable block=()->{entered.countDown();try{if(!release.await(10,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("bounded fixture gate expired");}
-                    catch(InterruptedException stopped){Thread.currentThread().interrupt();}};
-                org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime,"submit",null,0,block);
-                org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime,"submit",null,0,block);
-                assertThat(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-                admin.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",1))
-                        .append("data",new Document("namespace",storage.cacheDatabase()+".workload_claims").append("failCommands",List.of("findAndModify")).append("errorCode",8)));
+                var child = NativeAppStorage.business(app);
+                var runtime = child.getBean(PipelineAlertRuntime.class);
+                var controlRelease = new java.util.concurrent.CountDownLatch(queuedControl ? 1 : 0);
+                var controlExecuted = new java.util.concurrent.atomic.AtomicBoolean();
                 try {
-                    await().atMost(Duration.ofSeconds(8)).until(()->!child.getBean(NodeSessionLease.class).active());
-                    release.countDown();
-                    await().atMost(Duration.ofSeconds(15)).untilAsserted(()->{
-                        var raw=config.getCollection("alert_instances").find(new Document("_id.resourceKind","cluster-storage").append("_id.resourceId","cache")).first();
-                        assertThat(raw).isNotNull();assertThat(raw).containsEntry("status","FIRING");
-                    });
-                } finally {release.countDown();admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
-                try(var domain=MongoConfigurationDomain.open(settings,storage.clusterId())) {
-                    var setup=domain.bindings().load().orElseThrow().setup();var scope=new AlarmKey.Scope(setup.installationId(),setup.clusterId());
-                    var store=domain.alerts(new AlertStore.Host(scope,setup,AlertChannelPolicy.Deployment.ON_PREM,()->{}),BuiltinAlarmTypes.catalog(),Clock.systemUTC());
-                    var head=store.active(null,10,new AlertStore.ReadAccess(true,Set.of(),()->{})).rows().stream()
-                            .map(value->value.value()).filter(value->value.snapshot().rule().key().resource().id().equals("cache")).findFirst().orElseThrow();
-                    originalKey=head.snapshot().rule().key();assertThat(head.operationalEvidence().failedCapabilities()).isEqualTo(1<<OperationalEvidence.Capability.CACHE_WRITE.ordinal());
+                    try (var queued = queuedControl ? holdQueuedControl(child, controlRelease, controlExecuted) : null) {
+                        var entered = new java.util.concurrent.CountDownLatch(2);
+                        var release = new java.util.concurrent.CountDownLatch(1);
+                        var exited = new java.util.concurrent.CountDownLatch(2);
+                        try {
+                            Runnable block = () -> {
+                                entered.countDown();
+                                try {
+                                    if (!release.await(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                                        throw new AssertionError("bounded fixture gate expired");
+                                    }
+                                } catch (InterruptedException stopped) {
+                                    Thread.currentThread().interrupt();
+                                } finally {
+                                    exited.countDown();
+                                }
+                            };
+                            org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime, "submit", null, 0, block);
+                            org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime, "submit", null, 0, block);
+                            assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                            admin.runCommand(new Document("configureFailPoint", "failCommand")
+                                    .append("mode", new Document("times", 1))
+                                    .append("data", new Document("namespace", storage.cacheDatabase() + ".workload_claims")
+                                            .append("failCommands", List.of("findAndModify")).append("errorCode", 8)));
+                            await().atMost(Duration.ofSeconds(8)).until(() -> !child.getBean(NodeSessionLease.class).active());
+                            if (queued != null) {
+                                controlRelease.countDown();
+                                assertThatThrownBy(() -> queued.released().toCompletableFuture()
+                                        .get(5, java.util.concurrent.TimeUnit.SECONDS))
+                                        .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                                        .cause().isInstanceOfSatisfying(TapstateException.class,
+                                                failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                                assertThat(controlExecuted).isFalse();
+                                assertThat(exited.getCount()).isEqualTo(2);
+                            }
+                            release.countDown();
+                            await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+                                var raw = config.getCollection("alert_instances")
+                                        .find(new Document("_id.resourceKind", "cluster-storage").append("_id.resourceId", "cache"))
+                                        .first();
+                                assertThat(raw).isNotNull();
+                                assertThat(raw).containsEntry("status", "FIRING");
+                            });
+                        } finally {
+                            release.countDown();
+                            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                        }
+                        try (var domain = MongoConfigurationDomain.open(settings, storage.clusterId())) {
+                            var setup = domain.bindings().load().orElseThrow().setup();
+                            var scope = new AlarmKey.Scope(setup.installationId(), setup.clusterId());
+                            var store = domain.alerts(new AlertStore.Host(scope, setup, AlertChannelPolicy.Deployment.ON_PREM, () -> {}),
+                                    BuiltinAlarmTypes.catalog(), Clock.systemUTC());
+                            var head = store.active(null, 10, new AlertStore.ReadAccess(true, Set.of(), () -> {}))
+                                    .rows().stream().map(value -> value.value())
+                                    .filter(value -> value.snapshot().rule().key().resource().id().equals("cache"))
+                                    .findFirst().orElseThrow();
+                            originalKey = head.snapshot().rule().key();
+                            assertThat(head.operationalEvidence().failedCapabilities())
+                                    .isEqualTo(1 << OperationalEvidence.Capability.CACHE_WRITE.ordinal());
+                        }
+                    }
+                } finally {
+                    controlRelease.countDown();
                 }
             }
             await().atMost(Duration.ofSeconds(10)).until(()->{
@@ -89,6 +140,37 @@ class NativeCacheAlertIT {
             }
         }finally{
             try(var cleanup=MongoClients.create(storage.configurationUri())){cleanup.getDatabase(storage.configurationDatabase()).drop();cleanup.getDatabase(storage.cacheDatabase()).drop();cleanup.getDatabase(storage.masterDatabase()).drop();}
+        }
+    }
+    private static ValidationMemberResources.Control holdQueuedControl(
+            org.springframework.context.ConfigurableApplicationContext child,
+            java.util.concurrent.CountDownLatch release,
+            java.util.concurrent.atomic.AtomicBoolean executed) throws Exception {
+        var controls = (java.util.concurrent.ThreadPoolExecutor) org.springframework.test.util.ReflectionTestUtils.getField(
+                child.getBean(ValidationMemberResources.class), "controls");
+        var entered = new java.util.concurrent.CountDownLatch(4);
+        for (int index = 0; index < 4; index++) {
+            controls.execute(() -> {
+                entered.countDown();
+                try {
+                    if (!release.await(20, java.util.concurrent.TimeUnit.SECONDS)) {
+                        throw new AssertionError("bounded control gate expired");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        var queued = child.getBean(ValidationMemberResources.Member.class).admitControl();
+        try {
+            queued.execute(() -> executed.set(true));
+            assertThat(queued.released().toCompletableFuture()).isNotDone();
+            assertThat(controls.getQueue()).isNotEmpty();
+            return queued;
+        } catch (RuntimeException | Error failure) {
+            queued.close();
+            throw failure;
         }
     }
     private static Map<String,Object> post(HttpClient client,String base,String path,String token,Map<String,?> body)throws Exception {

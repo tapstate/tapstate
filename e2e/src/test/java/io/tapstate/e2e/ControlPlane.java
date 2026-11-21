@@ -972,6 +972,17 @@ final class ControlPlane {
         expect(send(authedDelete(id, expectedContentHash)), 204, "delete " + id);
     }
 
+    /** Returns false only when the current server refuses the deletion with its workload claim fence. */
+    boolean deleteArtifactWhenClaimAvailable(String id, String expectedContentHash) {
+        var response = send(authedDelete(id, expectedContentHash));
+        if (response.statusCode() == 500
+                && io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED.code().equals(codeOf(response.body()))) {
+            return false;
+        }
+        expect(response, 204, "delete " + id);
+        return true;
+    }
+
     /**
      * Attempts a removal the product is expected to refuse, and returns the refusal it answered with. A
      * null {@code expectedContentHash} sends no {@code If-Match} at all, which is the unconditional

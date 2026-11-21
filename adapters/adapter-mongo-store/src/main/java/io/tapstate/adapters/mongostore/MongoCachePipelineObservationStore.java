@@ -215,7 +215,10 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         var keepExisting = new Document("$gte", List.of("$observedAt", captured.get("observedAt")));
         var result = StoreIo.call(() -> {
             access.requireObservationActive();
-            if (create) access.verifyObservationStructure();
+            if (create) {
+                access.verifyObservationStructure();
+                access.requireObservationActive();
+            }
             return collection().withWriteConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).updateOne(new Document("_id", id),
                     List.of(new Document("$replaceWith", new Document("$cond",
                             List.of(keepExisting, "$$ROOT", new Document("$literal", captured))))),

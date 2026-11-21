@@ -348,6 +348,83 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void observationHousekeepingHasOneBoundedBatchAndCannotEraseARecreatedScope() {
+        withFixture(f -> {
+            var rows = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            for (long epoch = 1; epoch <= 64; epoch++) {
+                rows.insertOne(new Document("_id", new Document("scope", header(SCOPE)).append("epoch", epoch)));
+            }
+            replaceScope(f.database(), scope(2));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                    new Document("$set", new Document("pipelineScope", header(scope(2)))));
+            var paused = new CountDownLatch(1);
+            var proceed = new CountDownLatch(1);
+            var firstDelete = new AtomicBoolean(true);
+            var finds = new AtomicInteger();
+            var batches = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!event.getDatabaseName().equals(f.database().getName())
+                            || !Thread.currentThread().getName().equals("tapstate-observation-reap")) return;
+                    var command = event.getCommand();
+                    if (event.getCommandName().equals("find")) {
+                        assertThat(command.getNumber("limit").intValue()).isEqualTo(32);
+                        finds.incrementAndGet();
+                    } else if (event.getCommandName().equals("delete")) {
+                        batches.add(command.getArray("deletes").getFirst().asDocument().getDocument("q")
+                                .getDocument("_id").getArray("$in").size());
+                        if (firstDelete.compareAndSet(true, false)) { paused.countDown(); await(proceed); }
+                    }
+                }
+            };
+            try (var observed = client(listener)) {
+                var database = observed.getDatabase(f.database().getName());
+                var predecessor = new MongoCachePipelineObservationStore(new MongoCachePipelineAccess(observed,
+                        database, scope(2), f.fence(), ACTIVE));
+                try {
+                    // The cadence counter is process-wide. Each attempt advances a full 64-save interval.
+                    awaitCleanup(() -> {
+                        for (int i = 0; i < 64; i++) predecessor.save(observation(PipelineState.RUNNING), 1);
+                        return paused.getCount() == 0;
+                    });
+                    assertThat(finds).hasValue(1);
+                    var stale = new Document("_id.scope", header(SCOPE));
+                    for (int i = 0; i < 10; i++) MongoCachePipelineObservationStore.reap(database, stale);
+                    assertThat(finds).hasValue(1);
+                    var current = rows.find(new Document("_id.scope", header(scope(2)))).first();
+                    assertThat(current).isNotNull();
+                    var successor = Document.parse(current.toJson());
+                    successor.get("_id", Document.class).put("scope", header(scope(3)));
+                    var neighbor = Document.parse(current.toJson());
+                    neighbor.get("_id", Document.class).get("scope", Document.class).put("pipelineId", "neighbor");
+                    neighbor.put("pipelineId", "neighbor");
+                    rows.insertMany(List.of(successor, neighbor));
+                    replaceScope(f.database(), scope(3));
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                            new Document("$set", new Document("pipelineScope", header(scope(3)))));
+                    proceed.countDown();
+                    awaitCleanup(() ->
+                            rows.countDocuments(new Document("_id.scope", header(SCOPE))) == 32);
+                    assertThat(batches).containsExactly(32);
+                    assertThat(rows.find(new Document("_id", successor.get("_id"))).first()).isEqualTo(successor);
+                    assertThat(rows.find(new Document("_id", neighbor.get("_id"))).first()).isEqualTo(neighbor);
+                    var writer = new MongoCachePipelineObservationStore(new MongoCachePipelineAccess(observed,
+                            database, scope(3), f.fence(), ACTIVE));
+                    awaitCleanup(() -> {
+                        for (int i = 0; i < 64; i++) writer.save(observation(PipelineState.RUNNING), 1);
+                        return rows.countDocuments(new Document("_id.scope.pipelineId", "orders")
+                                .append("_id.scope.stateGeneration", new Document("$lt", 3))) == 0;
+                    });
+                    assertThat(batches).containsExactly(32, 32, 1);
+                    System.out.println("OBSERVATION_CLEANUP batches=" + batches + " successorKept=true neighborKept=true singleFlight=true");
+                    assertThat(rows.countDocuments()).isEqualTo(2);
+                    assertThat(rows.find(new Document("_id", successor.get("_id"))).first()).isEqualTo(successor);
+                    assertThat(rows.find(new Document("_id", neighbor.get("_id"))).first()).isEqualTo(neighbor);
+                } finally { proceed.countDown(); }
+            }
+        });
+    }
+
     @Test void anInactiveLocalOwnerCannotOpenANewObservationWrite() {
         withFixture(f -> {
             var before = snapshot(f.database());
@@ -654,6 +731,14 @@ class MongoCachePipelineStoresIT {
             assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
         });
+    }
+
+    private static void awaitCleanup(java.util.function.BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() >= deadline) throw new AssertionError("Observation cleanup did not finish within its test budget");
+            Thread.sleep(20);
+        }
     }
 
     private static String readerOutput(Process process) throws Exception {

@@ -135,7 +135,7 @@ final class PipelinePrivateNoteRetirement {
         Objects.requireNonNull(original);Objects.requireNonNull(lifecycle);Objects.requireNonNull(guard);Objects.requireNonNull(local);
         guard.run();lifecycle.requirePending(original);var request=original.request();
         for(var retirement:notes.guardedBy(local).retirements(request.scope(),request.operationId())) {
-            guard.run();lifecycle.requirePending(original);releaseOne(request.scope().clusterId(),retirement,guard,local);
+            lifecycle.requirePending(original);releaseOne(request.scope().clusterId(),retirement,guard,local);
         }
         lifecycle.requirePending(original);guard.run();
     }

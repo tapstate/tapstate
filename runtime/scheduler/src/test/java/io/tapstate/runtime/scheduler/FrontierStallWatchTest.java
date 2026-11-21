@@ -24,6 +24,39 @@ class FrontierStallWatchTest {
             new FrontierStallPressure(Duration.ofMinutes(1));
 
     @Test
+    void attemptsEveryNoticeBeforeReportingACallbackFailure() {
+        var attempted = new java.util.ArrayList<String>();
+        var failure = new IllegalStateException("fixture callback failure");
+        var watch = new FrontierStallWatch(ONE_MINUTE, new FrontierStallAlert() {
+            @Override public void crossed(String pipeline, io.tapstate.core.lifecycle.FrontierStall value) {
+                attempted.add(value.chain());
+                throw failure;
+            }
+            @Override public void cleared(String pipeline, io.tapstate.core.lifecycle.FrontierStall value) {}
+        });
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> watch.saw("orders", Map.of("first", 90_000L, "second", 90_000L), Map.of()))
+                .isSameAs(failure);
+        assertThat(attempted).containsExactlyInAnyOrder("first", "second");
+    }
+
+    @Test
+    void aLaterInvariantFailureIsNotHiddenByAnEarlierCallbackException() {
+        var refused = new IllegalStateException("refused");
+        var fatal = new AssertionError("invariant failure");
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var watch = new FrontierStallWatch(ONE_MINUTE, new FrontierStallAlert() {
+            @Override public void crossed(String pipeline, io.tapstate.core.lifecycle.FrontierStall value) {
+                if (calls.incrementAndGet() == 1) throw refused;
+                throw fatal;
+            }
+            @Override public void cleared(String pipeline, io.tapstate.core.lifecycle.FrontierStall value) {}
+        });
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> watch.saw("orders",
+                Map.of("first", 90_000L, "second", 90_000L), Map.of())).isSameAs(fatal);
+        assertThat(fatal.getSuppressed()).containsExactly(refused);
+    }
+
+    @Test
     void reports_a_chain_pinned_past_the_threshold() {
         RecordingAlert alert = new RecordingAlert();
         FrontierStallWatch watch = new FrontierStallWatch(ONE_MINUTE, alert);
