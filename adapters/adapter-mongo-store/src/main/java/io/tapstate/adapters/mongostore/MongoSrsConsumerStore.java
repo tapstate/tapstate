@@ -1037,7 +1037,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private static final class UnchangedReports extends RuntimeException {
-        private final List<WriterProgressOutcome> outcomes;
+        private final transient List<WriterProgressOutcome> outcomes;
         private UnchangedReports(List<WriterProgressOutcome> outcomes) {
             super(null, null, false, false);
             this.outcomes = List.copyOf(outcomes);

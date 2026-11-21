@@ -505,8 +505,10 @@ final class ConvergenceDriver {
             LOG.info("Periodic observation publication recovered for pipeline {}", pipelineId);
         }
         // The measurement worker can have already retired. The original checkpoint still fences this frame.
-        BooleanSupplier alertCurrent = () -> admitted.getAsBoolean()
-                && pass.state().read(pipelineId).filter(checkpoint::equals).isPresent() && admitted.getAsBoolean();
+        BooleanSupplier alertCurrent = () -> {
+            if (!admitted.getAsBoolean()) return false;
+            return pass.state().read(pipelineId).filter(checkpoint::equals).isPresent() && admitted.getAsBoolean();
+        };
         alert(() -> scoped.alerts().publishedPeriodic(pass, published, alertCurrent));
         if (scoped.writes() == null) sample(published, pass);
         if (current.getAsBoolean()) export(published, admitted);
