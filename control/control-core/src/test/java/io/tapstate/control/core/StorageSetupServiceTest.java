@@ -248,10 +248,35 @@ class StorageSetupServiceTest {
     @Test void cloudConfigurationIsServerOwnedAndNeverRequiredFromTheBrowser() {
         var f = new Fixture(); f.mode = StorageBinding.Mode.CLOUD;
         var service = f.service();
-        var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb://user:secret@customer/cache?tls=true", "cache", null);
-        var master = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb://user:secret@customer/master?tls=true", "master", null);
+        var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb+srv://user:secret@customer/cache?tls=true", "cache", null);
+        var master = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb+srv://user:secret@customer/master?tls=true", "master", null);
         assertThatCode(() -> service.test(SCOPE, () -> {}, new StorageSetupService.Candidate(null, cache, master), StorageSetupService.Layer.CACHE))
                 .doesNotThrowAnyException();
+    }
+
+    @Test void aCloudCandidateCanBindAPlainMongodbConnection() {
+        var f = new Fixture(); f.mode = StorageBinding.Mode.CLOUD;
+        var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, "mongodb://user:secret@customer/cache", "cache", null);
+        var master = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, "mongodb://user:secret@customer/master", "master", null);
+        var candidate = new StorageSetupService.Candidate(null, cache, master);
+        var service = f.service();
+        var stamps = f.tested(service, candidate);
+        assertThat(service.commit("owner", SCOPE, () -> {}, candidate, stamps).bindingVersion()).isEqualTo(1);
+        assertThat(f.binding.inserts).isEqualTo(1);
+    }
+
+    @Test void aCloudStorageKindMustFollowItsConnectionUriScheme() {
+        var f = new Fixture(); f.mode = StorageBinding.Mode.CLOUD;
+        var relabelledSrv = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                "mongodb+srv://user:secret@customer/cache", "cache", null);
+        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {},
+                new StorageSetupService.Candidate(null, relabelledSrv, connection("master")), StorageSetupService.Layer.CACHE))
+                .isInstanceOf(TapstateException.class).hasMessageStartingWith(ControlError.MALFORMED_REQUEST.code());
+        var relabelledPlain = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS,
+                "mongodb://user:secret@customer/cache", "cache", null);
+        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {},
+                new StorageSetupService.Candidate(null, relabelledPlain, connection("master")), StorageSetupService.Layer.CACHE))
+                .isInstanceOf(TapstateException.class).hasMessageStartingWith(ControlError.MALFORMED_REQUEST.code());
     }
 
     @Test void savingRetainsOnlyTheCurrentCandidatesVerifiedChecksWhileRecheckingConnections() {

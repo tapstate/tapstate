@@ -159,7 +159,7 @@ class CloudInitialSessionContinuationIT {
         return result;
     }
     private static Map<String,Object> connection(String db) {
-        return Map.of("kind", "ATLAS", "uri", uri(db, true), "database", db, "caPem", new String(TLS.ca(), StandardCharsets.UTF_8));
+        return Map.of("kind", "MONGODB", "uri", uri(db, true), "database", db, "caPem", new String(TLS.ca(), StandardCharsets.UTF_8));
     }
     private static String uri(String db, boolean tls) {
         return "mongodb://root:" + PASSWORD + "@127.0.0.1:" + MONGO.getMappedPort(27017) + "/" + db
@@ -197,8 +197,8 @@ class CloudInitialSessionContinuationIT {
                     return new StorageSetupService.ConnectorIdentity("a".repeat(64), "b".repeat(64));
                 }
                 @Override public SourceResource definition(StorageBinding.Connection master, String id) {
-                    return new SourceResource(id, null, "mongodb-atlas", Map.of("isUri", true, "uri", master.uri(),
-                            "tlsCaPem", master.caPem()), null, null, null, null);
+                    return new SourceResource(id, null, master.kind() == StorageBinding.Connection.Kind.ATLAS ? "mongodb-atlas" : "mongodb",
+                            Map.of("isUri", true, "uri", master.uri(), "tlsCaPem", master.caPem()), null, null, null, null);
                 }
                 @Override public void test(StorageBinding.Connection master, SourceResource source, StorageSetupService.ConnectorIdentity id) {
                     throw new AssertionError("default Source testing is outside initial authentication");
