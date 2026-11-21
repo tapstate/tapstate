@@ -323,6 +323,9 @@ final class ValidationPipelineInitials implements SourceInitialLoadObserver, Aut
         }
         @Override public SinkAck resolve(HazelcastInstance member) { return new ObservedAck(actual.resolve(member), of(member), original, null); }
         @Override public io.tapstate.core.lifecycle.LoadLandings loadLandings(HazelcastInstance member) { return actual.loadLandings(member); }
+        @Override public java.util.Set<String> completedSnapshotInputs(HazelcastInstance member, java.util.Set<String> streams) {
+            return actual.completedSnapshotInputs(member, streams);
+        }
     }
     private static final class ObservedAck implements SinkAck {
         private static final long serialVersionUID = 1L;

@@ -57,6 +57,26 @@ class PdkSinkPortTest {
     }
 
     @Test
+    void aDeferredTargetRequiresScopedPreparationBeforeAnyConnectorIsProvisioned() {
+        var provisions = new AtomicInteger();
+        var port = new PdkSinkPort(id -> {
+            provisions.incrementAndGet();
+            throw new AssertionError("an unsupported target must be refused before provisioning");
+        });
+        var decimal = new io.tapstate.core.common.NumericType(null, true, null, null,
+                new java.math.BigDecimal("-99.99"), new java.math.BigDecimal("99.99"), 4, 2);
+        var target = new TargetTable("orders", List.of(TargetField.deferredDecimal("amount", decimal)));
+        var config = new SinkConfig("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, target);
+        var targets = Map.of("orders", target);
+
+        assertThatThrownBy(() -> port.open(config, targets)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ConnectorError.WRITE_FAILED));
+        assertThatThrownBy(() -> port.openPrepared(config, targets)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> port.prepare(config, targets)).isInstanceOf(TapstateException.class);
+        assertThat(provisions).hasValue(0);
+    }
+
+    @Test
     void targetPreparationReportsItsActualInitializationFailure(@TempDir Path dir) throws Exception {
         var jar=Synthetic.lifecycleSinkThatFailsToStart(dir,dir.resolve("lifecycle.txt"));
         var observed=new java.util.ArrayList<Throwable>();

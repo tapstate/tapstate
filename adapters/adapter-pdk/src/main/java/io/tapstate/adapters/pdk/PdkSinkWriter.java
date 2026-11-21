@@ -25,9 +25,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Supplier;
 
 /**
  * A write session over one sink connector, opened once and held across batches. Each write encodes the
@@ -58,6 +60,7 @@ final class PdkSinkWriter implements SinkWriter {
     private Map<String, TargetIdentityPlan> identities = Map.of();
     private SinkConfig identityConfig;
     private boolean identityPrepared;
+    private final Set<String> verifiedDeferredIdentities = new HashSet<>();
     // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
@@ -74,7 +77,7 @@ final class PdkSinkWriter implements SinkWriter {
         return thread;
     });
     private final Object lifecycle = new Object();
-    private final Set<CompletableFuture<WriteResult>> pending = new HashSet<>();
+    private final Set<CompletableFuture<?>> pending = new HashSet<>();
     private boolean closed;
     private final java.util.concurrent.CountDownLatch closeFinished = new java.util.concurrent.CountDownLatch(1);
 
@@ -173,10 +176,11 @@ final class PdkSinkWriter implements SinkWriter {
         connector.underLoader(() -> {
             for (Map.Entry<String, TargetTable> entry : targets.entrySet()) {
                 TargetTable target = projectedTarget(entry.getKey(), entry.getValue());
+                if (target.hasDeferredDecimal()) continue;
                 preparation.prepare(target, tableModel(entry.getKey(), target));
             }
             if (identityConfig != null) {
-                PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities,operationObserver);
+                PdkTargetIdentityPlanner.verifyEagerTargets(connector, identityConfig, targets, identities, operationObserver);
                 identityPrepared = true;
             }
             return null;
@@ -204,18 +208,22 @@ final class PdkSinkWriter implements SinkWriter {
     }
     @Override
     public CompletionStage<WriteResult> write(List<Envelope> records) {
+        // A cancelled stage releases the caller's batch even while its interrupted callback unwinds.
+        List<Envelope> batch = List.copyOf(records);
+        return submit(() -> deliver(batch));
+    }
+
+    private <T> CompletableFuture<T> submit(Supplier<T> delivery) {
         synchronized (lifecycle) {
             if (closed) {
                 throw new IllegalStateException("write called after the sink writer was closed");
             }
-            // A cancelled stage releases the caller's batch even while its interrupted callback unwinds.
-            List<Envelope> batch = List.copyOf(records);
-            CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> {
+            CompletableFuture<T> result = CompletableFuture.supplyAsync(() -> {
                 synchronized (lifecycle) {
                     if (closed) throw new java.util.concurrent.CancellationException("the sink writer was closed");
                     delivering = true;
                 }
-                try { return deliver(batch); }
+                try { return delivery.get(); }
                 finally { delivering = false; }
             }, writes);
             pending.add(result);
@@ -238,6 +246,44 @@ final class PdkSinkWriter implements SinkWriter {
         return connector.diagnostic(failure);
     }
 
+    @Override
+    public void snapshotDelivered(String stream) {
+        TargetTable target = projectedTarget(stream, targets.get(stream));
+        if (target == null || !target.hasDeferredDecimal()) return;
+        try {
+            submit(() -> {
+                prepareSnapshotTarget(stream, target);
+                return null;
+            }).join();
+        } catch (CompletionException failure) {
+            if (failure.getCause() instanceof RuntimeException runtime) throw runtime;
+            if (failure.getCause() instanceof Error invariant) throw invariant;
+            throw failure;
+        }
+    }
+
+    private void prepareSnapshotTarget(String stream, TargetTable target) {
+        try {
+            connector.underLoader(() -> {
+                prepareDeferredTarget(stream, target, tableModel(stream, target));
+                return null;
+            });
+        } catch (TapstateException failure) {
+            throw failure;
+        } catch (Throwable failure) {
+            throw writeFailed(connector.connectorId(), failure);
+        }
+    }
+
+    private void prepareDeferredTarget(String stream, TargetTable target, TapTable table) throws Throwable {
+        preparation.prepareForWrite(target, table);
+        TargetIdentityPlan identity = identities.get(stream);
+        if (identity != null && !verifiedDeferredIdentities.contains(stream)) {
+            PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets.get(stream), identity, operationObserver);
+            verifiedDeferredIdentities.add(stream);
+        }
+    }
+
     private synchronized WriteResult deliver(List<Envelope> records) {
         try {
             return connector.underLoader(() -> {
@@ -253,6 +299,10 @@ final class PdkSinkWriter implements SinkWriter {
                 }
                 if (!batch.keys().isEmpty()) {
                     if (!identityPrepared) prepareTargets();
+                    for (String stream : batch.keys().keySet()) {
+                        TargetTable target = projectedTarget(stream, targets.get(stream));
+                        if (target.hasDeferredDecimal()) prepareDeferredTarget(stream, target, tableModel(stream, target));
+                    }
                     batch.keys().forEach((stream, keys) -> PdkMongoIdentityGuard.verify(connector, identities.get(stream), keys));
                 }
                 return writeRows(rowsByTable);
@@ -344,6 +394,11 @@ final class PdkSinkWriter implements SinkWriter {
         TargetTable target = projectedTarget(env.src(), targets.get(env.src()));
         var fields = target == null ? Map.<String, io.tapdata.entity.schema.TapField>of()
                 : tableModel(env.src(), target).getNameFieldMap();
+        if (target != null && target.hasDeferredDecimal()) {
+            return (TapRecordEvent) TapEventCodec.encode(env, connector.conversions(),
+                    PdkDeferredDecimal.fields(target, fields, env.before()),
+                    PdkDeferredDecimal.fields(target, fields, env.after()));
+        }
         return (TapRecordEvent) TapEventCodec.encode(env, connector.conversions(), fields);
     }
 
@@ -370,7 +425,7 @@ final class PdkSinkWriter implements SinkWriter {
         if (Thread.currentThread() == writeThread && delivering) {
             throw new IllegalStateException("a target callback cannot close its active writer");
         }
-        List<CompletableFuture<WriteResult>> abandoned;
+        List<CompletableFuture<?>> abandoned;
         boolean first;
         synchronized (lifecycle) {
             first = !closed;

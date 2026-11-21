@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "build-documents",
+      "operator": "nest"
+    }
+  ],
+  "inputs": {
+    "roots": {
+      "primary_key": "id",
+      "trial_rows": 2000,
+      "children_per_root": 4,
+      "incremental_initial_rows_trial_target": 75000,
+      "receives_changes": false
+    },
+    "children": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "foreign_key": "root_id",
+      "trial_rows": 8000
+    }
+  },
+  "parameters": {
+    "depth": 1,
+    "operations": [
+      "update",
+      "delete"
+    ],
+    "paired_control": {
+      "baseline": "uniform root keys",
+      "variant": "hot root keys",
+      "changed_parameter": "root-key distribution"
+    },
+    "initial_state": "Create the one-to-four root and child state through the normal pipeline.",
+    "trial_parameters": [
+      "hot-root fraction",
+      "steady injection and operation counts"
+    ]
+  },
+  "expected": {
+    "readback": [
+      "Calculate the expected child membership for affected roots and verify deleted children and all unaffected roots.",
+      "Compare output size and acknowledgements for equal operation loads across uniform and hot roots."
+    ]
+  },
+  "completion": {
+    "target_unit": "root document write group",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

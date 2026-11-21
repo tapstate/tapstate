@@ -64,6 +64,7 @@ final class RealProcessServer implements ServerHandle {
     // witness's to keep or clear.
     private final boolean ownsStagingDirectory;
     private boolean closeRequested;
+    private boolean exitedBeforeCloseRequest;
     private long closeRequestedAt;
     private ClusterLifecycleProbe.Facts lifecycle;
 
@@ -612,6 +613,10 @@ final class RealProcessServer implements ServerHandle {
         return process.isAlive();
     }
 
+    boolean exitsWithin(Duration window) throws InterruptedException {
+        return process.waitFor(window.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
     /** Waits for all startup runners, not merely the earlier Tomcat health response. */
     void awaitReady() {
         awaitReady(STARTUP_BUDGET);
@@ -670,11 +675,16 @@ final class RealProcessServer implements ServerHandle {
     /** Requests this owned process's polite exit without waiting for another member. */
     synchronized void requestClose() {
         if (closeRequested) return;
+        exitedBeforeCloseRequest = !process.isAlive();
         closeRequestedAt = System.nanoTime();
         closeRequested = true;
         process.destroy();
         observe(ClusterLifecycleProbe.Phase.QUIT_REQUESTED);
         ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.QUIT_RETURNED);
+    }
+
+    synchronized boolean exitedBeforeCloseRequest() {
+        return exitedBeforeCloseRequest;
     }
 
     /** Confirms exit under the original grace and forced-exit budgets before discarding staging. */

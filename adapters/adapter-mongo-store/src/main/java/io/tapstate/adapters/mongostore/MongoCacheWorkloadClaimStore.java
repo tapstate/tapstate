@@ -157,11 +157,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireActive.run();
         requireValidationAuthority();
         if (!MongoReadBudget.supportsSnapshotReads(client)) {
-            return transaction(false, original, (store, session) -> {
-                var retained = storedScope(session, key);
-                if (retained != null && !retained.equals(original)) throw claimFenced();
-                return store.read(key);
-            });
+            return readPipelineTransaction(original, key);
         }
         var budget = operations.budget();
         if (budget != null) operations.check();
@@ -169,7 +165,8 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         var access = new MongoCachePipelineAccess(client, database, original, null, requireActive);
         try (var session = client.startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())) {
             requirePipelineReadingStructure(db, access, budget);
-            var observed = SystemCollections.CACHE_IDENTITY.on(db).aggregate(session, pipelineReadingStages(original, key)).first();
+            var observed = StoreIo.call(() ->
+                    SystemCollections.CACHE_IDENTITY.on(db).aggregate(session, pipelineReadingStages(original, key)).first());
             MongoCacheBusinessIdentity.requireObservedAdmission(observed, observedRow(observed, "schema"), scope);
             access.validateState(observedRow(observed, "state"));
             var claim = observedRow(observed, "claim");
@@ -180,7 +177,18 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             requireValidationAuthority();
             if (budget != null) operations.check();
             return Optional.of(reading);
+        } catch (TapstateException failure) {
+            if (failure.code() != IoError.DOCUMENT_TOO_LARGE) throw failure;
         }
+        return readPipelineTransaction(original, key);
+    }
+
+    private Optional<WorkloadClaimReading> readPipelineTransaction(PipelineIntentScope original, WorkloadClaimKey key) {
+        return transaction(false, original, (store, session) -> {
+            var retained = storedScope(session, key);
+            if (retained != null && !retained.equals(original)) throw claimFenced();
+            return store.read(key);
+        });
     }
 
     private List<Document> pipelineReadingStages(PipelineIntentScope original, WorkloadClaimKey key) {

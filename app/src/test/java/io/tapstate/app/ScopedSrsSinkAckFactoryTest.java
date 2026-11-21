@@ -341,8 +341,10 @@ class ScopedSrsSinkAckFactoryTest {
         var point = new WriterProgress(SourceOrder.snapshotRow(7),null);
         var writers = new SrsConsumerWriterRun(4,FENCE,"original-run",Map.of("orders",List.of("writer","slow")),Map.of("orders",Map.of("writer",point)));
         f.held.set(progress(4,List.of(),writers)); assertThat(landings.stillLanding(List.of(awaited))).isEmpty();
+        assertThat(factory().completedSnapshotInputs(f.member, java.util.Set.of("source.orders"))).isEmpty();
         assertThat(landings.stillLanding(List.of(new AwaitedLoad("sink","source.orders",List.of("writer","slow"))))).hasSize(1);
         f.held.set(progress(4,List.of("orders"),null)); assertThat(landings.stillLanding(List.of(awaited))).isEmpty();
+        assertThat(factory().completedSnapshotInputs(f.member, java.util.Set.of("source.orders"))).containsExactly("source.orders");
         f.held.set(progress(5,List.of("orders"),null)); assertThatThrownBy(() -> landings.stillLanding(List.of(awaited))).satisfies(ScopedSrsSinkAckFactoryTest::refused);
     }
     @Test void operatorReplayFloorUsesOnlyTheSameOriginalTableSinkConfirmation() throws Exception {

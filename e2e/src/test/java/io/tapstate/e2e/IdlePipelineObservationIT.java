@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
 import java.time.Duration;
 import java.util.Date;
@@ -99,7 +101,37 @@ class IdlePipelineObservationIT {
                 assertThat(awaitObservation(observations, sampled)).isAfter(sampled);
                 Await.until("the observation to report the sink-confirmed CDC position",
                         () -> control.durablePosition(PIPELINE, TABLE).isPresent(), () -> "position is absent");
+                control.stop(PIPELINE, false);
+                Await.until("the checkpoint to reach STOPPED",
+                        () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
+                        () -> "pipeline state=" + control.state(PIPELINE));
+                assertRestartDeliversCdcWithAWideCheckpoint(client.getDatabase(storage.cacheDatabase()), control, source, target);
             }
+        }
+    }
+
+    private static void assertRestartDeliversCdcWithAWideCheckpoint(MongoDatabase cache, ControlPlane control,
+            MongoCollection<Document> source, MongoCollection<Document> target) {
+        var checkpoints = cache.getCollection("pipeline_state");
+        var stateId = new Document("_id", PIPELINE);
+        var claims = cache.getCollection("workload_claims");
+        var claimId = new Document("_id.resourceType", "PIPELINE_ACTUATION").append("_id.resourceId", PIPELINE);
+        String extra = "e2ePadding";
+        try {
+            assertThat(checkpoints.updateOne(stateId,
+                    new Document("$set", new Document(extra, "x".repeat(16 * 1024 * 1024 - 16 * 1024)))).getMatchedCount()).isOne();
+            assertThat(claims.updateOne(claimId,
+                    new Document("$set", new Document(extra, "x".repeat(64 * 1024)))).getMatchedCount()).isOne();
+
+            var answer = control.start(PIPELINE, List.of(), null);
+            assertThat(answer.status()).as("START reads the individually legal checkpoint and claim: %s", answer.body()).isEqualTo(200);
+            source.insertOne(new Document("_id", 3L).append("customer", "after restart while wide"));
+            Await.answered("CDC after restart while both rows are still wide", Duration.ofSeconds(30),
+                    () -> Optional.ofNullable(target.find(new Document("_id", 3L)).first()));
+        } finally {
+            var clear = new Document("$unset", new Document(extra, ""));
+            checkpoints.updateOne(stateId, clear);
+            claims.updateOne(claimId, clear);
         }
     }
 

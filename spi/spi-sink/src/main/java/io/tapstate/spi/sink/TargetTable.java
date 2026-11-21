@@ -26,6 +26,10 @@ public record TargetTable(String name, List<TargetField> fields, List<TargetInde
         indexes = indexes == null ? List.of() : List.copyOf(indexes);
     }
 
+    public boolean hasDeferredDecimal() {
+        return fields.stream().anyMatch(TargetField::isDeferredDecimal);
+    }
+
     public TargetTable(String name, List<TargetField> fields, List<TargetIndex> indexes) {
         this(name, fields, indexes, null);
     }
