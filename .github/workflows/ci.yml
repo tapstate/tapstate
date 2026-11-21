@@ -14,13 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - case: union.live.basic.standard@1
-            rows: 10000
-            rate: 40
-            window: 300
-          - case: union.live.basic.standard@1
-            rows: 10000
-            rate: 50
+          - case: join.live.hot-update.standard@1
+            rows: 16000
+            rate: 16
             window: 300
     steps:
       - uses: actions/checkout@v4
@@ -53,10 +49,16 @@ jobs:
           docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$RUNNER_TEMP/calibration/mongo-image.json"
       - name: Build the candidate
         run: |
-          mvn -B -pl app,e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build.log" 2>&1 || {
-            tail -80 "$RUNNER_TEMP/calibration/build.log"
-            exit 1
-          }
+          for attempt in 1 2 3; do
+            if mvn -U -B -pl app,e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build.log" 2>&1; then
+              break
+            fi
+            if [ "$attempt" = 3 ] || ! grep -q 'HTTP Status: 429' "$RUNNER_TEMP/calibration/build.log"; then
+              tail -80 "$RUNNER_TEMP/calibration/build.log"
+              exit 1
+            fi
+            sleep "$((20 * attempt))"
+          done
           sha256sum app/target/app-0.8.0-boot.jar "$RUNNER_TEMP/connectors/"*.jar > "$RUNNER_TEMP/calibration/artifacts.sha256"
       - name: Measure each candidate workload and retain repeats
         env:
@@ -71,7 +73,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: benchmark-calibration-${{ matrix.case }}-${{ matrix.rate }}
+          name: benchmark-calibration-${{ matrix.case }}
           path: |
             ${{ runner.temp }}/calibration/
             !${{ runner.temp }}/calibration/run/**/runtime-input/**
