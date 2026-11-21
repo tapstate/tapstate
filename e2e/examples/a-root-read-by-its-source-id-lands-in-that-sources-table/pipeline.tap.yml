@@ -1,0 +1,22 @@
+version: tapstate/v1
+kind: pipeline
+id: soft_deleted_rooms
+source: [ sd_rooms, src_sd_decoy ]
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: sd_room_rows
+    type: map
+    from: [ sd_rooms ]
+    soft_delete: is_deleted
+  - id: sd_room_doc
+    type: nest
+    from: { r: sd_room_rows, d: src_sd_decoy.sd_rooms }
+    root:
+      from: r
+      key: [ id ]
+      embed:
+        - { from: d, on: { id: id }, as: object, path: decoy }
+serve:
+  from: sd_room_doc
+  sync:
+    - source: tgt_sd_rooms_mongo

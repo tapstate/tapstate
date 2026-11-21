@@ -392,6 +392,50 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
     }
 
     /**
+     * A source whose id is the same word as another source's table. The DAG reads the reference as the
+     * source, so the walk does too: answering with the same-named table would land the documents in the
+     * other source's table, keyed on its key.
+     */
+    @Test
+    void aSourceIdWinsOverATableOfTheSameName() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("source: [ src_orders, src_items ]", "source: [ src_orders, src_items, orders ]")
+                .replace("from: { o: src_orders.orders, i: src_items.order_items }",
+                        "from: { o: live_orders, i: src_items.order_items, c: src_orders.orders }")
+                .replace("key: [ id ]", "key: [ archive_id ]")
+                .replace("- { from: i, on: { order_id: id }, as: array, path: items, arrayKey: [ id ] }",
+                        "- { from: i, on: { order_id: archive_id }, as: array, path: items, arrayKey: [ id ] }\n"
+                        + "        - { from: c, on: { id: archive_id }, as: object, path: current }")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ orders ]
+                            soft_delete: is_deleted
+                        """),
+                List.of("""
+                        version: tapstate/v1
+                        kind: source
+                        id: orders
+                        connector: mysql
+                        config: { host: h, port: 3306, database: d2, username: u, password: p }
+                        mode: cdc
+                        tables: [ archived_orders ]
+                        """),
+                List.of(new DiscoveredSourceModel("orders", "mysql", 0L,
+                        new SourceModel(List.of(new SourceTable("archived_orders",
+                                List.of(new SourceField("archive_id", "int"), new SourceField("name", "string")),
+                                List.of("archive_id"), List.of())))))),
+                capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.name()).isEqualTo("archived_orders");
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactly("archive_id");
+    }
+
+    /**
      * The table half of the same claim, over a root that was never discovered. The columns are a
      * discovery's to supply and are absent here; which table the documents land in is the topology's, and
      * is known without one.

@@ -156,6 +156,14 @@ class UnwindParentKeyTest {
         assertThatThrownBy(() -> keyReaching(expand, map, expand)).isInstanceOf(TapstateException.class);
     }
 
+    /** A soft-delete marker named after the parent key overwrites it on every row, just as a rule would. */
+    @Test
+    void aSoftDeleteMarkerNamedAfterTheParentKeyCannotStandInForIt() {
+        Step.Inline map = step("map", "orders", new TransformBody.MapProjection(Map.of(), "o_id"));
+        Step.Inline expand = step("expand", "map", unwind(null, "sku"));
+        assertThatThrownBy(() -> keyReaching(expand, map, expand)).isInstanceOf(TapstateException.class);
+    }
+
     @Test
     void aSecondExpansionUsesRenamedParentAndEarlierLocatorColumns() {
         Step.Inline outer = step("outer", "orders", unwind("item_no", null));
