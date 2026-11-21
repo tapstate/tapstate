@@ -2,8 +2,8 @@ name: Nightly Test
 
 on:
   schedule:
-    # 21:00 Asia/Shanghai.
-    - cron: "0 13 * * *"
+    # 18:00 Asia/Shanghai.
+    - cron: "0 10 * * *"
   workflow_dispatch:
     inputs:
       reactor-only:
