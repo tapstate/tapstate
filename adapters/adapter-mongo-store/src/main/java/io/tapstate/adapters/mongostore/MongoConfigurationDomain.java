@@ -1165,21 +1165,19 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     private final MongoStructureProof observationStructures = new MongoStructureProof();
-    private volatile boolean observationCollations;
     public ObservationCheck observationConfiguration(io.tapstate.spi.store.PipelineIntentStore.ActuationReading before,
             String defaultSource, Map<String, ObservationCapture> sources) {
         requireOpen();
         if (before.configurationRevision().isEmpty() || sources.isEmpty() || sources.size() > 4
                 || !MongoReadBudget.supportsSnapshotReads(connection.client())) return ObservationCheck.fallback();
         try {
-            observationStructures.require(MongoStructureProof.Kind.OBSERVATION, () -> {
-                observationCollations = MongoCacheMetadataStructure.simpleCollations(connection.database(), MongoPipelineObservationConfig.COLLECTIONS);
-                if (observationCollations) {
-                    bindings.verifyObservationIndex();
-                    MongoCapturePreparationFacts.verify(connection.database());
-                }
+            boolean admitted = observationStructures.permits(MongoStructureProof.Kind.OBSERVATION, () -> {
+                if (!MongoCacheMetadataStructure.simpleCollations(connection.database(), MongoPipelineObservationConfig.COLLECTIONS)) return false;
+                bindings.verifyObservationIndex();
+                MongoCapturePreparationFacts.verify(connection.database());
+                return true;
             });
-            if (!observationCollations) return ObservationCheck.fallback();
+            if (!admitted) return ObservationCheck.fallback();
             var facts = new MongoPipelineObservationConfig(connection.client(), connection.database(), bindings, artifacts)
                     .read(before, defaultSource, sources);
             requireOpen();
