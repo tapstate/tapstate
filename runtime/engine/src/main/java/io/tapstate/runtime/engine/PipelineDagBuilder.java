@@ -551,7 +551,7 @@ public final class PipelineDagBuilder {
             boolean severalPaths = chains != null && chains.anyOverSeveralPaths(sink.upstream());
             ProcessorMetaSupplier supplier = preparingTargets(sinkVertex(sink.name(), sink.writers(), sinkAck, axes,
                     assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream()),
-                    sink.batch()), sink);
+                    chains == null ? Map.of() : chains.assembledOutputs(sink.upstream()), sink.batch()), sink);
             if (startsTheRun) {
                 supplier = WriterRunStart.of(supplier, sinkAck, roster);
                 startsTheRun = false;
@@ -706,7 +706,8 @@ public final class PipelineDagBuilder {
                         LevelBounds.HOLDS_NOTHING);
         ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
                 sinkAck, () -> SettledFloor.forRoutedWriter(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
-                shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis()),
+                shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis(),
+                chains == null ? Map.of() : chains.assembledOutputs(sink.upstream())),
                 sink);
         if (startsTheRun != null) {
             writers = WriterRunStart.of(writers, sinkAck, startsTheRun);
@@ -839,7 +840,7 @@ public final class PipelineDagBuilder {
     private static ProcessorMetaSupplier sinkVertex(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAck, ChainAxes axes, boolean assembled, Map<Integer, List<String>> chainsByOrdinal,
-            BatchSpec batch) {
+            Map<String, List<String>> assembledOutputs, BatchSpec batch) {
         if (sinkAck == null) {
             return SinkProcessor.metaSupplier(vertexName, writerFactory, batch.effectiveMaxRecords(),
                     batch.effectiveMaxWaitMillis());
@@ -851,7 +852,7 @@ public final class PipelineDagBuilder {
                 ? null
                 : () -> new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING);
         return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier, edges,
-                batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis());
+                batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis(), assembledOutputs);
     }
 
     /**
