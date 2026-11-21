@@ -12,7 +12,7 @@ import tempfile
 from urllib.request import Request, urlopen
 
 import actions_health
-from actions_run import REPORT_RESERVE_SECONDS
+from actions_run import CONTROL_RESERVE_SECONDS
 import actions_report
 import notifications
 import runner
@@ -76,7 +76,7 @@ def latest_state(repository, branch, now):
 
 def stop_expiring_run(repository, performance, now):
     deadline = actions_health.workflow_deadline(performance)
-    if now < deadline - timedelta(seconds=REPORT_RESERVE_SECONDS):
+    if now < deadline - timedelta(seconds=CONTROL_RESERVE_SECONDS):
         return
     run_id = performance["id"]
     if now < deadline:

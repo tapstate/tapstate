@@ -94,6 +94,7 @@ class ActionsRunTest(unittest.TestCase):
         self.assertEqual(upstream["updated_at"], timing["nightly"]["completed_at"])
         started = datetime.fromisoformat(timing["started_at"]).timestamp()
         self.assertEqual(25200, timing["deadline_epoch_seconds"] - started)
+        self.assertEqual(1620, timing["deadline_epoch_seconds"] - timing["measurement_stop_epoch_seconds"])
         with patch.object(actions_run.time, "time", return_value=started + 3600):
             self.assertEqual(21000, actions_run.remaining_seconds(timing, reserve=600))
 
@@ -194,11 +195,12 @@ class ActionsRunTest(unittest.TestCase):
         waiting = {"name": "measure (0)", "status": "queued"}
         reporting = {"name": "report", "status": "in_progress"}
         for seconds_before, live, jobs, expected_calls in (
-            (601, {"run_attempt": 1, "status": "in_progress"}, [waiting], 0),
+            (1501, {"run_attempt": 1, "status": "in_progress"}, [waiting], 0),
+            (1500, {"run_attempt": 1, "status": "in_progress"}, [waiting], 1),
+            (1500, {"run_attempt": 2, "status": "in_progress"}, [waiting], 0),
+            (1500, {"run_attempt": 1, "status": "completed"}, [waiting], 0),
+            (1500, {"run_attempt": 1, "status": "in_progress"}, [reporting], 0),
             (600, {"run_attempt": 1, "status": "in_progress"}, [waiting], 1),
-            (600, {"run_attempt": 2, "status": "in_progress"}, [waiting], 0),
-            (600, {"run_attempt": 1, "status": "completed"}, [waiting], 0),
-            (600, {"run_attempt": 1, "status": "in_progress"}, [reporting], 0),
             (0, {"run_attempt": 1, "status": "in_progress"}, [reporting], 1),
         ):
             with self.subTest(seconds_before=seconds_before, live=live, jobs=jobs), \

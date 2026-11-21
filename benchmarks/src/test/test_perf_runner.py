@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from actions_run import (BUDGET_SECONDS, BUILD_RESERVE_SECONDS, DEFAULT_BATCH_SECONDS, DEFAULT_SLOTS,
-                         REPORT_RESERVE_SECONDS, RUNNER_PROFILE, TEARDOWN_RESERVE_SECONDS, selection)
+                         MEASUREMENT_RESERVE_SECONDS, RUNNER_PROFILE, selection)
 import catalog
 import runner
 import workloads
@@ -174,7 +174,7 @@ class PerfRunnerTest(unittest.TestCase):
         references = {workloads.case_reference(case) for case in self.cases}
         self.assertEqual(references, set(catalog.read_json(registry)["cases"]))
         self.assertEqual(references, set(catalog.read_json(estimates)["cases"]))
-        budget = BUDGET_SECONDS - REPORT_RESERVE_SECONDS - TEARDOWN_RESERVE_SECONDS
+        budget = BUDGET_SECONDS - MEASUREMENT_RESERVE_SECONDS
         with tempfile.TemporaryDirectory() as output:
             manifest_path = Path(output) / "manifest.json"
             allocate = [

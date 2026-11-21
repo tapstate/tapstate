@@ -18,7 +18,10 @@ import runner
 RUNNER_PROFILE = "ubuntu-24.04-x64-op"
 BUDGET_SECONDS = 7 * 60 * 60
 REPORT_RESERVE_SECONDS = 600
+# Health checks run every ten minutes and GitHub allows five minutes for cancellation.
+CONTROL_RESERVE_SECONDS = REPORT_RESERVE_SECONDS + (10 + 5) * 60
 TEARDOWN_RESERVE_SECONDS = 120
+MEASUREMENT_RESERVE_SECONDS = CONTROL_RESERVE_SECONDS + TEARDOWN_RESERVE_SECONDS
 BUILD_RESERVE_SECONDS = 600
 DEFAULT_BATCH_SECONDS = 5 * 60 * 60
 DEFAULT_SLOTS = 8
@@ -68,11 +71,13 @@ def run_timing(run, upstream):
     if started < created:
         raise ValueError("Workflow start precedes its creation")
     business_time = timestamp(upstream["created_at"]) if upstream else created
+    deadline = int(started.timestamp()) + BUDGET_SECONDS
     return {
         "created_at": created.isoformat(),
         "started_at": started.isoformat(),
         "queue_seconds": (started - created).total_seconds(),
-        "deadline_epoch_seconds": int(started.timestamp()) + BUDGET_SECONDS,
+        "deadline_epoch_seconds": deadline,
+        "measurement_stop_epoch_seconds": deadline - MEASUREMENT_RESERVE_SECONDS,
         "business_date": business_time.astimezone(timezone(timedelta(hours=8))).date().isoformat(),
         "nightly": {"run_id": upstream["id"], "attempt": upstream["run_attempt"],
                     "completed_at": upstream["updated_at"], "url": upstream["html_url"]} if upstream else None,
@@ -122,7 +127,7 @@ def prepare(args, event_name, event, attempt, run):
     flags = selection(scope, inputs.get("group", ""), inputs.get("filters", ""), inputs.get("case_ids", ""))
     receipt = baseline.pin(output, RUNNER_PROFILE, inputs.get("baseline_version"))
     runner.write_json(output / "baseline-receipt.json", receipt)
-    budget = remaining_seconds(timing, reserve=REPORT_RESERVE_SECONDS + TEARDOWN_RESERVE_SECONDS)
+    budget = remaining_seconds(timing, reserve=MEASUREMENT_RESERVE_SECONDS)
     if budget <= BUILD_RESERVE_SECONDS:
         raise ValueError("Insufficient workflow time remains to prepare a measurement batch")
     manifest_path = output / "manifest.json"
@@ -150,8 +155,7 @@ def prepare(args, event_name, event, attempt, run):
         raise ValueError("Actions requires a formal workload manifest")
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
         print("batches=" + json.dumps([batch["index"] for batch in manifest["batches"]]), file=outputs)
-        print("measurement_stop=" + str(timing["deadline_epoch_seconds"]
-                                       - REPORT_RESERVE_SECONDS - TEARDOWN_RESERVE_SECONDS), file=outputs)
+        print("measurement_stop=" + str(timing["measurement_stop_epoch_seconds"]), file=outputs)
     return 0
 
 
