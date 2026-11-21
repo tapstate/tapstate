@@ -40,10 +40,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -435,35 +438,20 @@ class MongoCachePipelineStoresIT {
         var client = mock(MongoClient.class);
         var held = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var interrupted = new CountDownLatch(1);
-        var waitingThread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        var waitingThread = new AtomicReference<Thread>();
         try (var workers = Executors.newFixedThreadPool(3)) {
             var owner = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "orders", () -> {
                 held.countDown(); await(release); return true;
             }));
-            java.util.concurrent.Future<?> waiting = null;
+            Future<Boolean> waiting = null;
             try {
                 assertThat(held.await(5, TimeUnit.SECONDS)).isTrue();
-                waiting = workers.submit(() -> {
-                    waitingThread.set(Thread.currentThread());
-                    try {
-                        return MongoCachePipelineStateStore.writeTransaction(client,
-                                List.of("shipments", "orders", "shipments"), () -> true);
-                    } catch (TapstateException failure) {
-                        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
-                        assertThat(Thread.currentThread().isInterrupted()).isTrue();
-                        return false;
-                    } finally { interrupted.countDown(); }
-                });
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                while (waitingThread.get() == null || waitingThread.get().getState() != Thread.State.WAITING) {
-                    if (System.nanoTime() >= deadline) throw new AssertionError("multi-Pipeline caller did not wait for the held lane");
-                    Thread.sleep(1);
-                }
+                waiting = waitForBothCheckpointLanes(workers, client, waitingThread);
+                Thread waiter = awaitCheckpointLaneWait(waitingThread);
                 var independent = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "shipments", () -> true));
                 assertThat(independent.get(2, TimeUnit.SECONDS)).isTrue();
-                waiting.cancel(true);
-                assertThat(interrupted.await(5, TimeUnit.SECONDS)).isTrue();
+                waiter.interrupt();
+                assertThat(waiting.get(5, TimeUnit.SECONDS)).isFalse();
                 var afterInterruption = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "shipments", () -> true));
                 assertThat(afterInterruption.get(2, TimeUnit.SECONDS)).isTrue();
             } finally {
@@ -472,6 +460,65 @@ class MongoCachePipelineStoresIT {
                 assertThat(owner.get(15, TimeUnit.SECONDS)).isTrue();
             }
         }
+    }
+
+    @Test void interruptingAMultiPipelineWaitReleasesItsAlreadyAcquiredLane() throws Exception {
+        var client = mock(MongoClient.class);
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var waitingThread = new AtomicReference<Thread>();
+        var contenderThread = new AtomicReference<Thread>();
+        try (var workers = Executors.newFixedThreadPool(3)) {
+            var owner = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "shipments", () -> {
+                held.countDown(); await(release); return true;
+            }));
+            Future<Boolean> waiting = null;
+            Future<Boolean> contender = null;
+            try {
+                assertThat(held.await(5, TimeUnit.SECONDS)).isTrue();
+                waiting = waitForBothCheckpointLanes(workers, client, waitingThread);
+                Thread waiter = awaitCheckpointLaneWait(waitingThread);
+                contender = workers.submit(() -> {
+                    contenderThread.set(Thread.currentThread());
+                    return MongoCachePipelineStateStore.writeTransaction(client, "orders", () -> true);
+                });
+                awaitCheckpointLaneWait(contenderThread);
+                assertThat(contender.isDone()).as("the multi-Pipeline caller already holds orders").isFalse();
+                waiter.interrupt();
+                assertThat(waiting.get(5, TimeUnit.SECONDS)).isFalse();
+                assertThat(contender.get(2, TimeUnit.SECONDS)).isTrue();
+            } finally {
+                if (waiting != null) waiting.cancel(true);
+                if (contender != null) contender.cancel(true);
+                release.countDown();
+                assertThat(owner.get(15, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    private static Future<Boolean> waitForBothCheckpointLanes(ExecutorService workers, MongoClient client,
+            AtomicReference<Thread> waitingThread) {
+        return workers.submit(() -> {
+            waitingThread.set(Thread.currentThread());
+            try {
+                return MongoCachePipelineStateStore.writeTransaction(client,
+                        List.of("shipments", "orders", "shipments"), () -> true);
+            } catch (TapstateException failure) {
+                assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                assertThat(Thread.currentThread().isInterrupted()).isTrue();
+                return false;
+            }
+        });
+    }
+
+    private static Thread awaitCheckpointLaneWait(AtomicReference<Thread> thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        Thread waiting;
+        while ((waiting = thread.get()) == null || waiting.getState() != Thread.State.WAITING) {
+            if (System.nanoTime() >= deadline) throw new AssertionError("caller did not wait for the held checkpoint lane");
+            Thread.sleep(1);
+        }
+        return waiting;
     }
 
     @Test void delayedObservationCanWriteItsOwnRecordButCannotCrossAStopOrReplacement() {

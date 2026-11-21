@@ -5,11 +5,16 @@ import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.runtime.scheduler.ConvergeResult;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineIntentStore;
+import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -17,6 +22,7 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
@@ -87,6 +93,49 @@ class NativeObservationSamplingTest {
         verifyNoInteractions(f.cache, f.captures, f.configuration);
     }
 
+    @Test void aQueuedCombinedObservationDoesNotRetainItsReadAndSchema() throws IllegalAccessException {
+        var f = new Fixture();
+        f.warm();
+        var reading = f.cacheHas(CHECKPOINT);
+        var fields = java.util.stream.IntStream.range(0, 4096)
+                .mapToObj(i -> new SourceField("source-column-" + i, "text")).toList();
+        var model = new DiscoveredSourceModel("source", "fixture", 0,
+                new SourceModel(List.of(new SourceTable("orders", fields, List.of(), List.of()))));
+        when(reading.facts()).thenReturn(new MongoCacheDomain.ObservationFacts(CHECKPOINT, Map.of(), Map.of(), Map.of("source", model)));
+        when(f.configuration.observationConfiguration(CONFIG, "views", Map.of())).thenReturn(
+                new MongoConfigurationDomain.ObservationCheck(false, Optional.of(
+                        new MongoConfigurationDomain.ObservationConfiguration(null, Map.of(), Map.of()))));
+        when(f.captures.observationSample(any(), any(), any(), any())).thenReturn(Optional.of(
+                new ObservationPublisher.CaptureSample(SnapshotReading.NONE, SnapshotReading.NONE, Map.of(), null)));
+        var projected = new Observation(PIPELINE, PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, Instant.EPOCH);
+        when(f.publisher.publishRunning(eq(SCOPE), eq(CHECKPOINT), any(), any())).thenAnswer(call -> {
+            call.<ObservationStore>getArgument(2).save(projected, CHECKPOINT.epoch());
+            return Optional.of(projected);
+        });
+        when(f.pass.guardOriginal(CLAIM)).thenReturn(() -> {});
+        try (var writer = new ProcessObservationWriter(f.cache, false)) {
+            var stage = writer.stage(f.pass);
+            assertThat(f.sampling.publish(f.publisher, f.pass, f.result, CONFIG, null, stage::wrap)).contains(projected);
+            assertThat(writer.submit(stage, () -> {}, () -> {})).isTrue();
+            boolean retained = retainsRead(stage.write().active(), reading, 3);
+            System.out.println("OBSERVATION_SCHEMA_RETAINED " + retained + " columns=" + fields.size()
+                    + " chargedBytes=" + writer.usage().retainedBytes());
+            assertThat(retained).as("a queued execution guard should not retain the synchronous observation read").isFalse();
+        }
+    }
+
+    private static boolean retainsRead(Object capture, MongoCacheDomain.ObservationRead reading, int remaining)
+            throws IllegalAccessException {
+        if (capture == reading) return true;
+        if (remaining == 0 || !(capture instanceof Runnable || capture instanceof ObservationStore)) return false;
+        for (var field : capture.getClass().getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+            field.setAccessible(true);
+            if (retainsRead(field.get(capture), reading, remaining - 1)) return true;
+        }
+        return false;
+    }
+
     private static final class Fixture {
         final MongoCacheDomain cache = mock(MongoCacheDomain.class);
         final MongoConfigurationDomain configuration = mock(MongoConfigurationDomain.class);
@@ -112,12 +161,13 @@ class NativeObservationSamplingTest {
 
         void warm() { assertThat(publish(CONFIG)).contains(running); }
 
-        void cacheHas(CheckpointDoc checkpoint) {
+        MongoCacheDomain.ObservationRead cacheHas(CheckpointDoc checkpoint) {
             when(captures.observationSelection(EXECUTION)).thenReturn(Optional.of(
                     new ScopedPipelineCaptureCoordinator.ObservationSelection(EXECUTION, Map.of(), Map.of())));
             var reading = mock(MongoCacheDomain.ObservationRead.class);
             when(reading.facts()).thenReturn(new MongoCacheDomain.ObservationFacts(checkpoint, Map.of(), Map.of(), Map.of()));
             when(cache.readObservation(eq(SCOPE), eq(CLAIM), eq(Map.of()), any())).thenReturn(Optional.of(reading));
+            return reading;
         }
 
         Optional<Observation> publish(PipelineIntentStore.ActuationReading config) {

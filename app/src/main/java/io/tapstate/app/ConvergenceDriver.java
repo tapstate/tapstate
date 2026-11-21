@@ -325,7 +325,7 @@ final class ConvergenceDriver {
             var projection = projection(pipeline, pass, result, origin, null, stage::wrap);
             projection.ifPresent(value -> scoped.writes().submit(stage,
                     () -> publicationCommitted(pass, result, value), history(value, pass),
-                    () -> alert(() -> scoped.alerts().unavailable(pass))));
+                    () -> alert(() -> scoped.alerts().unavailableIfExpected(pass))));
             return;
         }
         writeObservationNow(pipeline, () -> projection(pipeline, pass, result, origin, failure, null)
@@ -343,7 +343,7 @@ final class ConvergenceDriver {
 
     private void publicationCommitted(PipelineConvergencePass pass, ConvergeResult result,
             io.tapstate.core.lifecycle.Observation value) {
-        if (scoped != null) alert(() -> scoped.alerts().published(pass, value, result.failure().orElse(null)));
+        if (scoped != null) alert(() -> scoped.alerts().publishedIfExpected(pass, value, result.failure().orElse(null)));
         export(value);
     }
 
@@ -362,7 +362,8 @@ final class ConvergenceDriver {
         if (sampler == null) return null;
         var sample = RateSampler.sampleOf(value);
         if (sample == null) return null;
-        return new ProcessObservationWriter.History(sample, () -> sampler.offerPrepared(sample, pass.scope(), pass.rateHistory(true)));
+        return new ProcessObservationWriter.History(sample,
+                remaining -> sampler.offerPrepared(sample, pass.scope(), pass.rateHistory(remaining)));
     }
 
     private void prepareStart(PipelineIntentStore.PendingStart pending) {
@@ -407,7 +408,7 @@ final class ConvergenceDriver {
         }
         try {
             if (pass == null) sampler.offer(published);
-            else sampler.offer(published, pass.scope(), pass.rateHistory(scoped.writes() != null));
+            else sampler.offer(published, pass.scope(), pass.rateHistory());
         } catch (RuntimeException unsampled) {
             LOG.warn("Could not sample the history of pipeline {}", published.pipelineId(), unsampled);
         }

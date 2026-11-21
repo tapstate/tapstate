@@ -18,6 +18,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -29,6 +30,7 @@ final class ProcessObservationWriter implements AutoCloseable {
     private static final long MAX_BYTES = 16L * 1024 * 1024;
     private static final int BATCH_ENTRIES = 32;
     private static final long BATCH_BYTES = 4L * 1024 * 1024;
+    private static final long HISTORY_ALLOWANCE_NANOS = Duration.ofSeconds(2).toNanos();
     private final MongoCacheDomain cache;
     private final Map<String, Stage> pending = new LinkedHashMap<>();
     private final ArrayDeque<History> pendingHistory = new ArrayDeque<>();
@@ -36,8 +38,9 @@ final class ProcessObservationWriter implements AutoCloseable {
     private final java.util.function.LongSupplier nanoTime;
     private long historySequence;
     private final ReentrantLock writing = new ReentrantLock();
-    private final AtomicBoolean draining = new AtomicBoolean();
-    private final ScheduledThreadPoolExecutor timer;
+    private final AtomicBoolean drainingHistory = new AtomicBoolean();
+    private final ScheduledThreadPoolExecutor observationTimer;
+    private final ScheduledThreadPoolExecutor historyTimer;
     private long retainedBytes;
     private int inFlight;
     private boolean closed;
@@ -54,12 +57,22 @@ final class ProcessObservationWriter implements AutoCloseable {
             java.util.function.LongSupplier nanoTime) {
         this.nanoTime = nanoTime;
         this.cache = java.util.Objects.requireNonNull(cache, "cache");
-        timer = new ScheduledThreadPoolExecutor(1, task -> ShutdownAwait.daemon(task, "pipeline-observation-writer"));
-        timer.setRemoveOnCancelPolicy(true);
-        if (scheduled) timer.scheduleWithFixedDelay(this::flush, interval.toNanos(), interval.toNanos(), TimeUnit.NANOSECONDS);
+        observationTimer = timer("pipeline-observation-writer");
+        historyTimer = timer("pipeline-history-writer");
+        if (scheduled) {
+            long delay = interval.toNanos();
+            observationTimer.scheduleWithFixedDelay(this::drainObservations, delay, delay, TimeUnit.NANOSECONDS);
+            historyTimer.scheduleWithFixedDelay(this::drainHistory, delay, delay, TimeUnit.NANOSECONDS);
+        }
     }
 
-    interface ActiveStore extends ObservationStore { void requireWriteActive(); }
+    private static ScheduledThreadPoolExecutor timer(String name) {
+        var timer = new ScheduledThreadPoolExecutor(1, task -> ShutdownAwait.daemon(task, name));
+        timer.setRemoveOnCancelPolicy(true);
+        return timer;
+    }
+
+    interface ActiveStore extends ObservationStore { Runnable writeGuard(); }
 
     Stage stage(PipelineConvergencePass pass) { return new Stage(pass); }
 
@@ -68,13 +81,14 @@ final class ProcessObservationWriter implements AutoCloseable {
         synchronized (pending) { return new Usage(pending.size() + pendingHistory.size(), inFlight, retainedBytes); }
     }
 
-    record History(String pipeline, Instant observedAt, long bytes, Runnable append) {
-        History(RateSample sample, Runnable append) {
-            this(sample.pipelineId(), sample.observedAt(), historyBytes(sample), append);
+    record History(String pipeline, Instant observedAt, long bytes, Runnable requireActive, Consumer<Duration> append) {
+        History(RateSample sample, Consumer<Duration> append) {
+            this(sample.pipelineId(), sample.observedAt(), historyBytes(sample), () -> {}, append);
         }
 
-        History guardedBy(Runnable requireActive) {
-            return new History(pipeline, observedAt, bytes, () -> { requireActive.run(); append.run(); });
+        History guardedBy(Runnable guard) {
+            Runnable prior = requireActive;
+            return new History(pipeline, observedAt, bytes, () -> { guard.run(); prior.run(); }, append);
         }
     }
 
@@ -177,21 +191,32 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     void flush() {
-        if (!draining.compareAndSet(false, true)) return;
+        drainObservations();
+        drainHistory();
+    }
+
+    private void drainObservations() {
+        if (!writing.tryLock()) return;
         List<Stage> batch = new ArrayList<>();
+        List<History> history = new ArrayList<>();
         try {
-            var history = new ArrayList<History>();
-            if (writing.tryLock()) {
-                try { writeObservations(batch, history); }
-                finally { writing.unlock(); }
-            }
-            appendHistory(history);
+            writeObservations(batch, history);
         } finally {
-            synchronized (pending) {
-                for (Stage stage : batch) retainedBytes -= stage.bytes;
-                inFlight -= batch.size();
+            try { handoffHistory(batch, history); }
+            finally { writing.unlock(); }
+        }
+    }
+
+    private void handoffHistory(List<Stage> batch, List<History> history) {
+        synchronized (pending) {
+            for (Stage stage : batch) retainedBytes -= stage.bytes;
+            inFlight -= batch.size();
+            if (closed) return;
+            // Each completed Stage already reserved one entry and the bytes of its compact sample.
+            for (History sample : history) {
+                pendingHistory.addLast(sample);
+                retainedBytes += sample.bytes();
             }
-            draining.set(false);
         }
     }
 
@@ -236,51 +261,50 @@ final class ProcessObservationWriter implements AutoCloseable {
         }
     }
 
-    private void appendHistory(List<History> recentlyCommitted) {
-        long deadline = nanoTime.getAsLong() + Duration.ofSeconds(2).toNanos();
-        for (int index = 0; index < BATCH_ENTRIES && nanoTime.getAsLong() < deadline; index++) {
-            HistoryAttempt attempt = takeHistory(recentlyCommitted);
-            if (attempt == null) return;
-            History sample = attempt.sample();
-            try {
-                if (rememberHistoryAttempt(sample.pipeline())) inPipeline(sample.pipeline(), sample.append());
-            } catch (RuntimeException failure) {
-                LOG.warn("Could not sample the history of pipeline {}", sample.pipeline(), failure);
-            } finally {
-                if (attempt.queued()) {
-                    synchronized (pending) {
-                        retainedBytes -= sample.bytes();
-                        inFlight--;
-                    }
-                }
+    private void drainHistory() {
+        if (!drainingHistory.compareAndSet(false, true)) return;
+        try {
+            long deadline = nanoTime.getAsLong() + HISTORY_ALLOWANCE_NANOS;
+            for (int index = 0; index < BATCH_ENTRIES && deadline - nanoTime.getAsLong() > 0; index++) {
+                History sample = takeHistory();
+                if (sample == null) return;
+                appendHistory(sample, deadline);
+            }
+        } finally {
+            drainingHistory.set(false);
+        }
+    }
+
+    private void appendHistory(History sample, long deadline) {
+        try {
+            if (rememberHistoryAttempt(sample.pipeline())) inPipeline(sample.pipeline(), () -> {
+                sample.requireActive().run();
+                long remaining = deadline - nanoTime.getAsLong();
+                if (remaining > 0) sample.append().accept(Duration.ofNanos(remaining));
+            });
+        } catch (RuntimeException failure) {
+            LOG.warn("Could not sample the history of pipeline {}", sample.pipeline(), failure);
+        } finally {
+            synchronized (pending) {
+                retainedBytes -= sample.bytes();
+                inFlight--;
             }
         }
     }
 
-    private record HistoryAttempt(History sample, boolean queued) {}
-
-    private HistoryAttempt takeHistory(List<History> recentlyCommitted) {
+    private History takeHistory() {
         synchronized (pending) {
             if (closed) return null;
-            History first = firstHistory(recentlyCommitted);
-            History waiting = firstHistory(pendingHistory);
-            if (waiting != null && (first == null || compareHistory(waiting, first) <= 0)) {
-                pendingHistory.remove(waiting);
-                inFlight++;
-                return new HistoryAttempt(waiting, true);
+            History first = null;
+            for (History sample : pendingHistory) {
+                if (first == null || compareHistory(sample, first) < 0) first = sample;
             }
-            if (first == null) return null;
-            recentlyCommitted.remove(first);
-            return new HistoryAttempt(first, false);
+            if (first != null) {
+                pendingHistory.remove(first);
+                inFlight++;
+            }
+            return first;
         }
-    }
-
-    private History firstHistory(Collection<History> samples) {
-        History first = null;
-        for (History sample : samples) {
-            if (first == null || compareHistory(sample, first) < 0) first = sample;
-        }
-        return first;
     }
 
     private int compareHistory(History left, History right) {
@@ -334,8 +358,11 @@ final class ProcessObservationWriter implements AutoCloseable {
             for (String pipeline : historyAttempts.keySet()) retainedBytes -= historyBytes(pipeline);
             historyAttempts.clear();
         }
-        timer.shutdown();
-        ShutdownAwait.executor(timer, System.nanoTime() + Duration.ofSeconds(10).toNanos());
+        observationTimer.shutdown();
+        historyTimer.shutdown();
+        long deadline = ShutdownAwait.deadline();
+        ShutdownAwait.executor(observationTimer, deadline);
+        ShutdownAwait.executor(historyTimer, deadline);
     }
 
     final class Stage {
@@ -363,7 +390,7 @@ final class ProcessObservationWriter implements AutoCloseable {
 
         ObservationStore wrap(ObservationStore destination) {
             Runnable original = pass.guardOriginal(claim);
-            Runnable measured = destination instanceof ActiveStore guarded ? guarded::requireWriteActive : () -> {};
+            Runnable measured = destination instanceof ActiveStore guarded ? guarded.writeGuard() : () -> {};
             return new ObservationStore() {
                 @Override public void save(Observation value) { throw new IllegalArgumentException("an observation requires its measured checkpoint epoch"); }
                 @Override public void save(Observation value, long checkpointEpoch) {

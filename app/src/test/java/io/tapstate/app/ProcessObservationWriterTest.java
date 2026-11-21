@@ -1,27 +1,44 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.runtime.scheduler.ConvergeResult;
+import io.tapstate.runtime.scheduler.ConvergeStatus;
+import io.tapstate.runtime.scheduler.ObservationPublisher;
+import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
+import io.tapstate.spi.store.PipelineIntentStore;
+import io.tapstate.spi.store.PipelineStoreViews;
+import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -166,6 +183,77 @@ class ProcessObservationWriterTest {
         }
     }
 
+    @Test void aScheduledObservationCommitsWhileAnotherPipelineWaitsToAppendHistory() throws Exception {
+        var cache = mock(MongoCacheDomain.class);
+        when(cache.writeObservations(anyList())).thenAnswer(call -> Collections.nCopies(((List<?>) call.getArgument(0)).size(), null));
+        var appending = new CountDownLatch(1);
+        var releaseHistory = new CountDownLatch(1);
+        var published = new CountDownLatch(1);
+        try (var writer = new ProcessObservationWriter(cache, Duration.ofMillis(20))) {
+            writer.submit(stage(writer, "slow", 1), () -> {}, history("slow", 1, () -> {
+                appending.countDown();
+                try {
+                    assertThat(releaseHistory.await(5, TimeUnit.SECONDS)).isTrue();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+            }), () -> {});
+            boolean publishedBeforeRelease;
+            try {
+                assertThat(appending.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(writer.submit(stage(writer, "healthy", 2), published::countDown, () -> {})).isTrue();
+                publishedBeforeRelease = published.await(1, TimeUnit.SECONDS);
+            } finally {
+                releaseHistory.countDown();
+            }
+            assertThat(published.await(5, TimeUnit.SECONDS)).as("publication completes after releasing history").isTrue();
+            assertThat(publishedBeforeRelease).as("a scheduled observation commits before history is released").isTrue();
+        }
+    }
+
+    @Test void theSecondNativeHistoryAppendReceivesOnlyTheRemainingAllowance() {
+        var nanoTime = new AtomicLong();
+        var destination = mock(RateHistoryStore.class);
+        var allowances = new ArrayList<Duration>();
+        doAnswer(call -> {
+            RateSample sample = call.getArgument(0);
+            allowances.add(call.getArgument(1));
+            if (sample.pipelineId().equals("slow")) nanoTime.addAndGet(Duration.ofMillis(1900).toNanos());
+            return null;
+        }).when(destination).appendWithin(any(RateSample.class), any(Duration.class));
+
+        try (var writer = new ProcessObservationWriter(mock(MongoCacheDomain.class), false, nanoTime::get)) {
+            var intents = mock(PipelineIntentStore.class);
+            when(intents.pipelineIds()).thenReturn(List.of("slow", "healthy"));
+            var views = mock(PipelineStoreViews.class);
+            when(views.pipelineRateHistory(any(), any(), any())).thenReturn(destination);
+            var ownership = mock(PipelineActuationOwnership.class);
+            when(ownership.enterPass(any())).thenReturn(mock(PipelineActuationOwnership.Pass.class));
+            var publisher = mock(ObservationPublisher.class);
+            for (String pipeline : List.of("slow", "healthy")) {
+                var scope = new PipelineIntentScope("cluster", 1, "cache", pipeline, 1);
+                var intent = new PipelineIntentSnapshot(scope, 1, new DesiredState(pipeline, PipelineState.RUNNING, "revision", false));
+                var claim = new WorkloadClaim(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, pipeline),
+                        new WorkloadOwner("node", "boot"), 1, 1, 1, AT.plusSeconds(60));
+                when(intents.loadForActuation(pipeline)).thenReturn(Optional.of(intent));
+                when(ownership.permit(scope)).thenReturn(new PipelineActuationOwnership.Permit(true, claim));
+                var sampleTime = AT.plusSeconds(pipeline.equals("slow") ? 1 : 2);
+                when(publisher.publishScoped(org.mockito.ArgumentMatchers.eq(scope), any(), isNull(), isNull())).thenReturn(Optional.of(
+                        new Observation(pipeline, PipelineState.RUNNING, Map.of("records.out", 1L), Map.of(), Map.of(), null, sampleTime)));
+            }
+            var converger = mock(PipelineConverger.class);
+            when(converger.convergeScoped(any(), any(), isNull(), isNull(), any(), any())).thenReturn(
+                    new ConvergeResult(ConvergeStatus.NOTHING_TO_DO, Optional.empty(), Optional.empty()));
+            var sampler = new RateSampler(mock(RateHistoryStore.class), Duration.ofSeconds(1));
+            var ports = new ConvergenceDriver.ScopedPorts(intents, views, () -> {}, pass -> null, pass -> null,
+                    ignored -> {}, PipelineAlertFeed.none(), null, null, null, writer);
+            ConvergenceDriver.scoped(converger, publisher, sampler, null, () -> true, ownership, ports).reconcile();
+            writer.flush();
+            assertThat(allowances).containsExactly(Duration.ofSeconds(2), Duration.ofMillis(100));
+        }
+    }
+
     @Test void slowFailingHistoryRotatesBehindHealthyPipelinesWithinABoundedFlushAllowance() {
         var cache = mock(MongoCacheDomain.class);
         when(cache.writeObservations(anyList())).thenAnswer(call -> Collections.nCopies(((List<?>) call.getArgument(0)).size(), null));
@@ -240,10 +328,9 @@ class ProcessObservationWriterTest {
         try (var writer = new ProcessObservationWriter(cache, false)) {
             var current = new java.util.concurrent.atomic.AtomicBoolean(true);
             var checked = mock(ProcessObservationWriter.ActiveStore.class);
-            org.mockito.Mockito.doAnswer(call -> {
+            when(checked.writeGuard()).thenReturn(() -> {
                 if (!current.get()) throw new IllegalStateException("fixture execution was superseded");
-                return null;
-            }).when(checked).requireWriteActive();
+            });
             var guarded = writer.stage(pass("guarded"));
             guarded.wrap(checked).save(new Observation("guarded", PipelineState.RUNNING,
                     Map.of("records.out", 1L), Map.of(), Map.of(), null, AT), 1);
@@ -265,10 +352,9 @@ class ProcessObservationWriterTest {
         });
         try (var writer = new ProcessObservationWriter(cache, false)) {
             var checked = mock(ProcessObservationWriter.ActiveStore.class);
-            org.mockito.Mockito.doAnswer(call -> {
+            when(checked.writeGuard()).thenReturn(() -> {
                 if (!current.get()) throw new IllegalStateException("fixture execution was superseded during IO");
-                return null;
-            }).when(checked).requireWriteActive();
+            });
             var stage = writer.stage(pass("orders"));
             stage.wrap(checked).save(new Observation("orders", PipelineState.RUNNING,
                     Map.of("records.out", 1L), Map.of(), Map.of(), null, AT), 1);
@@ -282,7 +368,8 @@ class ProcessObservationWriterTest {
     }
 
     private static ProcessObservationWriter.History history(String pipeline, long seconds, Runnable append) {
-        return new ProcessObservationWriter.History(new RateSample(pipeline, AT.plusSeconds(seconds), Map.of("recordCount", 1L), Map.of(), null), append);
+        return new ProcessObservationWriter.History(new RateSample(pipeline, AT.plusSeconds(seconds),
+                Map.of("recordCount", 1L), Map.of(), null), ignored -> append.run());
     }
 
     private static ProcessObservationWriter.Stage stage(ProcessObservationWriter writer, String pipeline, long count) {

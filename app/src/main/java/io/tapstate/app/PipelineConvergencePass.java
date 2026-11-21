@@ -11,6 +11,7 @@ import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimType;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
@@ -32,9 +33,8 @@ final class PipelineConvergencePass {
     private final AtomicReference<PipelineCaptureBindings> captures = new AtomicReference<>();
 
     private final io.tapstate.spi.store.RateHistoryStore rateHistory = rateHistory(null);
-    private final io.tapstate.spi.store.RateHistoryStore timedRateHistory = rateHistory(java.time.Duration.ofSeconds(2));
 
-    private io.tapstate.spi.store.RateHistoryStore rateHistory(java.time.Duration timeout) {
+    io.tapstate.spi.store.RateHistoryStore rateHistory(Duration timeout) {
         return new io.tapstate.spi.store.RateHistoryStore() {
             @Override public void append(io.tapstate.core.lifecycle.RateSample sample) {
                 WorkloadClaimFence original = claim.get(); requirePipeline(sample.pipelineId());
@@ -144,9 +144,6 @@ final class PipelineConvergencePass {
     }
     io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() { return derivedSchemas; }
     io.tapstate.spi.store.RateHistoryStore rateHistory() { return rateHistory; }
-    io.tapstate.spi.store.RateHistoryStore rateHistory(boolean deadline) {
-        return deadline ? timedRateHistory : rateHistory;
-    }
 
     io.tapstate.spi.store.NestShapeStore nestShapes(String database) {
         Objects.requireNonNull(database, "database");

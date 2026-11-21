@@ -180,15 +180,26 @@ class MongoCacheRateHistoryStoreIT {
     @Test void runtimeSamplingBudgetAlsoBoundsAMetadataStall() {
         withFixture(Duration.ofDays(15), f -> {
             var before = f.snapshot();
-            failpoint(f.client, new Document("failCommands", List.of("listCollections"))
-                    .append("blockConnection", true).append("blockTimeMS", 4000));
-            long started = System.nanoTime();
-            try {
-                assertCode(() -> f.writer(f.client, ACTIVE).appendWithin(sample(0, 1), Duration.ofMillis(400)),
-                        IoError.STORE_UNAVAILABLE);
-                assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(3));
-            } finally {
-                clearFailpoint(f.client);
+            var reachedMetadata = new AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("listCollections") && event.getDatabaseName().equals(f.database.getName()))
+                        reachedMetadata.set(true);
+                }
+            };
+            try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                failpoint(f.client, new Document("failCommands", List.of("listCollections"))
+                        .append("blockConnection", true).append("blockTimeMS", 4000));
+                long started = System.nanoTime();
+                try {
+                    assertCode(() -> f.writer(observed, ACTIVE).appendWithin(sample(0, 1), Duration.ofMillis(400)),
+                            IoError.STORE_UNAVAILABLE);
+                    assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(3));
+                    assertThat(reachedMetadata).as("the timed append reached the blocked metadata command").isTrue();
+                } finally {
+                    clearFailpoint(f.client);
+                }
             }
             assertThat(f.snapshot()).isEqualTo(before);
             f.writer(f.client, ACTIVE).append(sample(0, 1));

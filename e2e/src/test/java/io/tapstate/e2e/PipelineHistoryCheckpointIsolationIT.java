@@ -17,8 +17,6 @@ import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
-import static org.assertj.core.api.Assertions.assertThat;
-
 @RequiresDocker
 class PipelineHistoryCheckpointIsolationIT {
     @Container private static final MongoDBContainer CONFIG_AND_DATA = mongo();
@@ -93,13 +91,13 @@ class PipelineHistoryCheckpointIsolationIT {
                 }, () -> "checkpoint lock acquisition");
                 try {
                     Instant heldSince = Instant.now();
-                    Await.until("two fresh history samples while the checkpoint write lock is held", Duration.ofSeconds(12),
-                            () -> history.countDocuments(new Document(filter).append("observedAt",
-                                    new Document("$gt", java.util.Date.from(heldSince)))) >= 2,
+                    var fresh = new Document(filter).append("observedAt", new Document("$gt", java.util.Date.from(heldSince)));
+                    Await.until("two fresh history samples and a fresh observation while the checkpoint write lock is held",
+                            Duration.ofSeconds(12),
+                            () -> history.countDocuments(fresh) >= 2 && control.observedAt(PIPELINE)
+                                    .filter(observed -> observed.isAfter(heldSince) && observed.isAfter(initialObservation)).isPresent(),
                             () -> "latest observation " + control.observedAt(PIPELINE) + ", history rows "
-                                    + history.countDocuments(filter));
-                    assertThat(control.observedAt(PIPELINE)).hasValueSatisfying(observed ->
-                            assertThat(observed).isAfter(initialObservation));
+                                    + history.countDocuments(fresh));
                 } finally {
                     holder.abortTransaction();
                 }

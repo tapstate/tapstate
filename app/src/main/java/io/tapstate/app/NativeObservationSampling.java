@@ -118,7 +118,7 @@ final class NativeObservationSampling {
         if (sample.isEmpty()) return Attempt.fallback();
 
         ObservationStore sink = new ProcessObservationWriter.ActiveStore() {
-            @Override public void requireWriteActive() { current.run(); }
+            @Override public Runnable writeGuard() { return current; }
             @Override public Optional<Observation> read(String pipeline) { return pass.observationSample().read(pipeline); }
             @Override public void save(Observation value) { throw new IllegalArgumentException("observation checkpoint is required"); }
             @Override public void save(Observation value, long epoch) {
@@ -138,7 +138,7 @@ final class NativeObservationSampling {
 
     private static ObservationStore guarded(ObservationStore store, Runnable current) {
         return new ProcessObservationWriter.ActiveStore() {
-            @Override public void requireWriteActive() { current.run(); }
+            @Override public Runnable writeGuard() { return current; }
             @Override public void save(Observation value) { current.run(); store.save(value); }
             @Override public void save(Observation value, long epoch) { current.run(); store.save(value, epoch); }
             @Override public void afterSave(Runnable action) { store.afterSave(action); }

@@ -154,7 +154,20 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void published(PipelineConvergencePass pass, Observation observation, Throwable cause) {
         if (pass == null || closed.get()) return;
         Slot slot = slot(pass); if (slot == null) return;
-        long sequence = slot.sequence.getAndIncrement();
+        publish(slot, slot.sequence.getAndIncrement(), observation, cause);
+    }
+    @Override public void publishedIfExpected(PipelineConvergencePass pass, Observation observation, Throwable cause) {
+        Slot slot;
+        long sequence;
+        synchronized (objectAdmission) {
+            slot = expectedSlot(pass);
+            if (slot == null) return;
+            // Consecutive intents for one incarnation share the sequence counter.
+            sequence = slot.sequence.getAndIncrement();
+        }
+        publish(slot, sequence, observation, cause);
+    }
+    private void publish(Slot slot, long sequence, Observation observation, Throwable cause) {
         int bytes = inputBytes(observation);
         if (bytes < 0 || observation.observedAt() == null || observation.observedAt().isAfter(clock.instant())) {
             reject(slot, "input-budget-or-clock"); return;
@@ -187,6 +200,18 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     @Override public void unavailable(PipelineConvergencePass pass) {
         if (pass != null) reject(slots.get(pass.scope().pipelineId()), "publication-unavailable");
+    }
+    @Override public void unavailableIfExpected(PipelineConvergencePass pass) {
+        synchronized (objectAdmission) {
+            var slot = expectedSlot(pass);
+            if (slot != null) reject(slot, "publication-unavailable");
+        }
+    }
+    private Slot expectedSlot(PipelineConvergencePass pass) {
+        if (pass == null || closed.get()) return null;
+        var producer = new Producer(pass.scope(), pass.claim(), pass.intent());
+        var current = slots.get(producer.scope().pipelineId());
+        return current != null && current.producer.equals(producer) ? current : null;
     }
     @Override public void retain(Collection<String> ids) {
         slots.keySet().retainAll(Set.copyOf(ids));

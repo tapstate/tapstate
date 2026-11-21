@@ -8,6 +8,12 @@ interface PipelineAlertFeed {
     void expecting(PipelineConvergencePass pass);
     void published(PipelineConvergencePass pass, Observation observation, Throwable originalFailure);
     void unavailable(PipelineConvergencePass pass);
+    default void publishedIfExpected(PipelineConvergencePass pass, Observation observation, Throwable originalFailure) {
+        published(pass, observation, originalFailure);
+    }
+    default void unavailableIfExpected(PipelineConvergencePass pass) {
+        unavailable(pass);
+    }
     void retain(Collection<String> pipelineIds);
     static PipelineAlertFeed none() {
         return new PipelineAlertFeed() {
