@@ -33,6 +33,9 @@ final class ProcessObservationWriter implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(ProcessObservationWriter.class);
     private static final int MAX_ENTRIES = 1024;
     private static final long MAX_BYTES = 16L * 1024 * 1024;
+    private static final int MAX_HISTORY_ENTRIES = MAX_ENTRIES - 256;
+    private static final long MAX_HISTORY_BYTES = MAX_BYTES - 4L * 1024 * 1024;
+    private static final long BARRIER_WAIT_NANOS = Duration.ofSeconds(10).toNanos();
     private static final int BATCH_ENTRIES = 32;
     private static final long BATCH_BYTES = 4L * 1024 * 1024;
     private static final long HISTORY_ALLOWANCE_NANOS = Duration.ofSeconds(2).toNanos();
@@ -50,6 +53,8 @@ final class ProcessObservationWriter implements AutoCloseable {
     private final ScheduledThreadPoolExecutor historyTimer;
     private long retainedBytes;
     private int inFlight;
+    private long retainedHistoryBytes;
+    private int retainedHistoryEntries;
     private boolean closed;
 
     ProcessObservationWriter(MongoCacheDomain cache, Duration interval) { this(cache, interval, true, System::nanoTime); }
@@ -134,9 +139,7 @@ final class ProcessObservationWriter implements AutoCloseable {
         synchronized (pending) {
             if (closed) return;
             if (pending.size() + pendingHistory.size() + inFlight < MAX_ENTRIES
-                    && retainedBytes + sample.bytes() <= MAX_BYTES) {
-                pendingHistory.addLast(sample);
-                retainedBytes += sample.bytes();
+                    && retainedBytes + sample.bytes() <= MAX_BYTES && enqueueHistory(sample)) {
                 return;
             }
         }
@@ -157,11 +160,16 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     private void reserveBarrier(String pipeline) {
+        long deadline = nanoTime.getAsLong() + BARRIER_WAIT_NANOS;
         synchronized (pending) {
             waitingBarriers.merge(pipeline, 1, Integer::sum);
             try {
-                while (!closed && activePipelines.contains(pipeline)) pending.wait();
-                if (closed) throw StorageRuntime.unavailable();
+                while (!closed && activePipelines.contains(pipeline)) {
+                    long remaining = deadline - nanoTime.getAsLong();
+                    if (remaining <= 0) throw StorageRuntime.unavailable();
+                    TimeUnit.NANOSECONDS.timedWait(pending, remaining);
+                }
+                if (closed || nanoTime.getAsLong() - deadline >= 0) throw StorageRuntime.unavailable();
                 activePipelines.add(pipeline);
                 Stage removed = pending.remove(pipeline);
                 if (removed != null) retainedBytes -= removed.bytes;
@@ -188,7 +196,7 @@ final class ProcessObservationWriter implements AutoCloseable {
             while (history.hasNext()) {
                 History sample = history.next();
                 if (!pipelines.contains(sample.pipeline())) {
-                    retainedBytes -= sample.bytes();
+                    releaseHistory(sample);
                     history.remove();
                 }
             }
@@ -196,7 +204,7 @@ final class ProcessObservationWriter implements AutoCloseable {
             while (attempts.hasNext()) {
                 String pipeline = attempts.next();
                 if (!pipelines.contains(pipeline)) {
-                    retainedBytes -= historyBytes(pipeline);
+                    accountHistoryBytes(-historyBytes(pipeline));
                     attempts.remove();
                 }
             }
@@ -251,6 +259,7 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     private void handoffHistory(List<Stage> batch, List<History> history) {
+        int dropped = 0;
         synchronized (pending) {
             for (Stage stage : batch) {
                 retainedBytes -= stage.bytes;
@@ -261,10 +270,29 @@ final class ProcessObservationWriter implements AutoCloseable {
             if (closed) return;
             // Each completed Stage already reserved one entry and the bytes of its compact sample.
             for (History sample : history) {
-                pendingHistory.addLast(sample);
-                retainedBytes += sample.bytes();
+                if (!enqueueHistory(sample)) dropped++;
             }
         }
+        if (dropped > 0) LOG.warn("History write capacity is exhausted; dropped {} committed observation samples", dropped);
+    }
+
+    private boolean enqueueHistory(History sample) {
+        if (retainedHistoryEntries >= MAX_HISTORY_ENTRIES
+                || retainedHistoryBytes + sample.bytes() > MAX_HISTORY_BYTES) return false;
+        pendingHistory.addLast(sample);
+        retainedHistoryEntries++;
+        accountHistoryBytes(sample.bytes());
+        return true;
+    }
+
+    private void releaseHistory(History sample) {
+        retainedHistoryEntries--;
+        accountHistoryBytes(-sample.bytes());
+    }
+
+    private void accountHistoryBytes(long delta) {
+        retainedHistoryBytes += delta;
+        retainedBytes += delta;
     }
 
     private void writeObservations(List<Stage> batch, List<History> history) {
@@ -280,7 +308,12 @@ final class ProcessObservationWriter implements AutoCloseable {
                 RuntimeException failure = results.get(index);
                 inPipeline(stage.pipeline(), () -> {
                     if (failure == null) {
-                        stage.active.run();
+                        try {
+                            stage.active.run();
+                        } catch (RuntimeException guardFailure) {
+                            stage.failed.run();
+                            throw guardFailure;
+                        }
                         stage.committed.forEach(Runnable::run);
                         if (stage.sampled != null) history.add(stage.sampled);
                     } else {
@@ -319,7 +352,7 @@ final class ProcessObservationWriter implements AutoCloseable {
             LOG.warn("Could not sample the history of pipeline {}", sample.pipeline(), failure);
         } finally {
             synchronized (pending) {
-                retainedBytes -= sample.bytes();
+                releaseHistory(sample);
                 inFlight--;
             }
         }
@@ -358,18 +391,22 @@ final class ProcessObservationWriter implements AutoCloseable {
 
     private boolean rememberHistoryAttempt(String pipeline) {
         synchronized (pending) {
-            if (historyAttempts.remove(pipeline) != null) retainedBytes -= historyBytes(pipeline);
+            if (historyAttempts.remove(pipeline) != null) accountHistoryBytes(-historyBytes(pipeline));
             long bytes = historyBytes(pipeline);
-            while (!historyAttempts.isEmpty() && (historyAttempts.size() >= MAX_ENTRIES || retainedBytes + bytes > MAX_BYTES)) {
+            while (!historyAttempts.isEmpty() && (historyAttempts.size() >= MAX_ENTRIES || !canRetainHistoryBytes(bytes))) {
                 String oldest = historyAttempts.keySet().iterator().next();
                 historyAttempts.remove(oldest);
-                retainedBytes -= historyBytes(oldest);
+                accountHistoryBytes(-historyBytes(oldest));
             }
-            if (closed || retainedBytes + bytes > MAX_BYTES) return false;
+            if (closed || !canRetainHistoryBytes(bytes)) return false;
             historyAttempts.put(pipeline, ++historySequence);
-            retainedBytes += bytes;
+            accountHistoryBytes(bytes);
             return true;
         }
+    }
+
+    private boolean canRetainHistoryBytes(long bytes) {
+        return retainedBytes + bytes <= MAX_BYTES && retainedHistoryBytes + bytes <= MAX_HISTORY_BYTES;
     }
 
     private static long historyBytes(String pipeline) { return 96 + stringBytes(pipeline); }
@@ -386,9 +423,9 @@ final class ProcessObservationWriter implements AutoCloseable {
             closed = true;
             for (Stage stage : pending.values()) retainedBytes -= stage.bytes;
             pending.clear();
-            for (History sample : pendingHistory) retainedBytes -= sample.bytes();
+            for (History sample : pendingHistory) releaseHistory(sample);
             pendingHistory.clear();
-            for (String pipeline : historyAttempts.keySet()) retainedBytes -= historyBytes(pipeline);
+            for (String pipeline : historyAttempts.keySet()) accountHistoryBytes(-historyBytes(pipeline));
             historyAttempts.clear();
             pending.notifyAll();
         }

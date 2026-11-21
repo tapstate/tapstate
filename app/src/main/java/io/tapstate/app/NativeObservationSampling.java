@@ -164,7 +164,7 @@ final class NativeObservationSampling {
                 deferred == null ? sink : deferred.apply(sink), sample.orElseThrow(), stillCurrent));
     }
 
-    private void requireExecution(PipelineConvergencePass pass, ExecutionFence original) {
+    void requireExecution(PipelineConvergencePass pass, ExecutionFence original) {
         pass.requirePipeline(pass.scope().pipelineId());
         if (!execution.apply(pass.scope().pipelineId()).filter(original::equals).isPresent()) throw ThreeLayerStorePort.refused();
     }

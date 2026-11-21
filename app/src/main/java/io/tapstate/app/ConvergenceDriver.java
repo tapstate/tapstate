@@ -470,6 +470,11 @@ final class ConvergenceDriver {
                     : store -> stage.wrap(NativeObservationSampling.guarded(store, () -> {
                         if (!current.getAsBoolean()) throw ThreeLayerStorePort.refused();
                     }));
+            if (deferred != null && scoped.observations() != null) {
+                var execution = new ExecutionFence(scope, original);
+                observation = NativeObservationSampling.guarded(observation,
+                        () -> scoped.observations().requireExecution(pass, execution));
+            }
             var destination = deferred == null ? observation : deferred.apply(observation);
             var projection = scoped.observations() == null
                     ? publisher.publishRunningScoped(scope, checkpoint, destination, current)

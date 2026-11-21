@@ -35,8 +35,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -155,7 +158,7 @@ class ProcessObservationWriterTest {
         var cache = mock(MongoCacheDomain.class);
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var samePipelineRequested = new CountDownLatch(1);
+        var samePipelineThread = new AtomicReference<Thread>();
         var originalCommitted = new AtomicBoolean();
         var superseded = new AtomicInteger();
         when(cache.writeObservations(anyList())).thenAnswer(call -> {
@@ -171,10 +174,10 @@ class ProcessObservationWriterTest {
                 assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
                 writer.submit(stage(writer, "orders", 2), superseded::incrementAndGet, () -> {});
                 same = callers.submit(() -> {
-                    samePipelineRequested.countDown();
+                    samePipelineThread.set(Thread.currentThread());
                     writer.now("orders", () -> assertThat(originalCommitted).isTrue());
                 });
-                assertThat(samePipelineRequested.await(5, TimeUnit.SECONDS)).isTrue();
+                await().atMost(Duration.ofSeconds(5)).until(() -> waitingInBarrier(samePipelineThread.get()));
                 var other = callers.submit(() -> writer.now("invoices", () -> assertThat(originalCommitted).isFalse()));
                 other.get(1, TimeUnit.SECONDS);
                 assertThat(same.isDone()).isFalse();
@@ -186,6 +189,112 @@ class ProcessObservationWriterTest {
             writer.flush();
             assertThat(superseded).hasValue(0);
             assertThat(writer.usage()).isEqualTo(new ProcessObservationWriter.Usage(0, 0, 0));
+        }
+    }
+
+    @Test void historyBacklogDoesNotConsumeEveryLatestObservationSlot() {
+        var cache = mock(MongoCacheDomain.class);
+        when(cache.writeObservations(anyList())).thenAnswer(call -> Collections.nCopies(((List<?>) call.getArgument(0)).size(), null));
+        try (var writer = new ProcessObservationWriter(cache, false)) {
+            for (int sample = 0; sample < 769; sample++)
+                writer.offerHistory(history("history", sample, () -> {}));
+            int queued = writer.usage().pending();
+            assertThat(queued).isEqualTo(768);
+            boolean acceptedWhileHistoryWasFull = writer.submit(stage(writer, "latest", 1), () -> {}, () -> {});
+
+            writer.flush();
+            assertThat(writer.submit(stage(writer, "recovery", 2), () -> {}, () -> {})).isTrue();
+            assertThat(acceptedWhileHistoryWasFull).as("a history-only backlog of %s samples leaves room for latest observation work", queued)
+                    .isTrue();
+        }
+    }
+
+    @Test void historyBacklogDoesNotConsumeEveryLatestObservationByte() {
+        var cache = mock(MongoCacheDomain.class);
+        when(cache.writeObservations(anyList())).thenAnswer(call -> Collections.nCopies(((List<?>) call.getArgument(0)).size(), null));
+        try (var writer = new ProcessObservationWriter(cache, false)) {
+            long allowedHistoryBytes = 12L * 1024 * 1024;
+            writer.offerHistory(new ProcessObservationWriter.History("history", AT, allowedHistoryBytes, () -> {}, ignored -> {}));
+            writer.offerHistory(history("overflow", 1, () -> {}));
+            long queuedBytes = writer.usage().retainedBytes();
+            assertThat(queuedBytes).isEqualTo(allowedHistoryBytes);
+            boolean acceptedWithHistoryBytesRetained = writer.submit(stage(writer, "latest", 1), () -> {}, () -> {});
+
+            writer.flush();
+            assertThat(writer.submit(stage(writer, "recovery", 2), () -> {}, () -> {})).isTrue();
+            assertThat(acceptedWithHistoryBytesRetained).as("history alone retaining %s bytes leaves room for latest observation work", queuedBytes)
+                    .isTrue();
+        }
+    }
+
+    @Test void aCommittedSampleCannotTakeTheReservedSlotOfAnInFlightHistoryAppend() throws Exception {
+        var cache = mock(MongoCacheDomain.class);
+        when(cache.writeObservations(anyList())).thenAnswer(call -> Collections.nCopies(((List<?>) call.getArgument(0)).size(), null));
+        var appending = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (var writer = new ProcessObservationWriter(cache, false); var caller = Executors.newSingleThreadExecutor()) {
+            writer.offerHistory(history("holding", 0, () -> {
+                appending.countDown();
+                try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+            }));
+            for (int sample = 1; sample < 768; sample++) writer.offerHistory(history("queued", sample, () -> {}));
+            var drain = caller.submit(writer::flush);
+            try {
+                assertThat(appending.await(5, TimeUnit.SECONDS)).isTrue();
+                var committed = new AtomicBoolean();
+                writer.submit(stage(writer, "latest", 1), () -> committed.set(true), history("latest", 1, () -> {}), () -> {});
+                writer.flush();
+                assertThat(committed).isTrue();
+                assertThat(writer.usage().pending()).isEqualTo(767);
+                assertThat(writer.usage().inFlight()).isOne();
+            } finally {
+                release.countDown();
+            }
+            drain.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test void aLifecycleBarrierTimesOutWithoutRetiringItsHeldMixedBatch() throws Exception {
+        var cache = mock(MongoCacheDomain.class);
+        var bulkEntered = new CountDownLatch(1);
+        var releaseBulk = new CountDownLatch(1);
+        var barrierThread = new AtomicReference<Thread>();
+        var barrierCommitted = new CountDownLatch(1);
+        var clock = new AtomicLong();
+        when(cache.writeObservations(anyList())).thenAnswer(call -> {
+            List<MongoCacheDomain.ObservationWrite> batch = call.getArgument(0);
+            assertThat(batch).extracting(write -> write.observation().pipelineId()).containsExactly("slow", "healthy");
+            bulkEntered.countDown();
+            assertThat(releaseBulk.await(5, TimeUnit.SECONDS)).isTrue();
+            return Collections.nCopies(batch.size(), null);
+        });
+        try (var writer = new ProcessObservationWriter(cache, false, clock::get); var callers = Executors.newFixedThreadPool(3)) {
+            writer.submit(stage(writer, "slow", 1), () -> {}, () -> {});
+            writer.submit(stage(writer, "healthy", 1), () -> {}, () -> {});
+            var batch = callers.submit(writer::flush);
+            try {
+                assertThat(bulkEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                var barrier = callers.submit(() -> {
+                    barrierThread.set(Thread.currentThread());
+                    writer.now("healthy", barrierCommitted::countDown);
+                });
+                await().atMost(Duration.ofSeconds(5)).until(() -> waitingInBarrier(barrierThread.get()));
+                clock.set(Duration.ofSeconds(10).toNanos());
+                callers.submit(() -> writer.now("outside-batch", () -> {})).get(1, TimeUnit.SECONDS);
+                assertThatThrownBy(() -> barrier.get(1, TimeUnit.SECONDS))
+                        .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                        .cause().isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                refusal -> assertThat(refusal.code()).isSameAs(StorageRuntime.unavailable().code()));
+                assertThat(barrierCommitted.getCount()).isOne();
+                assertThat(writer.usage().inFlight()).isEqualTo(2);
+                assertThat(batch).isNotDone();
+            } finally {
+                releaseBulk.countDown();
+            }
+            batch.get(5, TimeUnit.SECONDS);
+            writer.now("healthy", barrierCommitted::countDown);
+            assertThat(barrierCommitted.getCount()).isZero();
         }
     }
 
@@ -411,11 +520,46 @@ class ProcessObservationWriterTest {
                     Map.of("records.out", 1L), Map.of(), Map.of(), null, AT), 1);
             var callbacks = new ArrayList<String>();
             writer.submit(stage, () -> callbacks.add("alert"), history("orders", 0, () -> callbacks.add("history")),
-                    () -> callbacks.add("failed"));
+                    () -> { if (current.get()) callbacks.add("failed"); });
             writer.flush();
             assertThat(callbacks).isEmpty();
             assertThat(writer.usage()).isEqualTo(new ProcessObservationWriter.Usage(0, 0, 0));
         }
+    }
+
+    @Test void aPostCommitStoreRevalidationFailureNotifiesTheProducerWithoutPublishingItsSample() {
+        var cache = mock(MongoCacheDomain.class);
+        var bulkReturned = new AtomicBoolean();
+        when(cache.writeObservations(anyList())).thenAnswer(call -> {
+            List<MongoCacheDomain.ObservationWrite> batch = call.getArgument(0);
+            batch.forEach(write -> write.active().run());
+            bulkReturned.set(true);
+            return Collections.nCopies(batch.size(), null);
+        });
+        try (var writer = new ProcessObservationWriter(cache, false)) {
+            var checked = mock(ProcessObservationWriter.ActiveStore.class);
+            when(checked.writeGuard()).thenReturn(() -> {
+                if (bulkReturned.get()) throw StorageRuntime.unavailable();
+            });
+            var stage = writer.stage(pass("orders"));
+            stage.wrap(checked).save(new Observation("orders", PipelineState.RUNNING,
+                    Map.of("records.out", 1L), Map.of(), Map.of(), null, AT), 1);
+            var callbacks = new ArrayList<String>();
+            writer.submit(stage, () -> callbacks.add("published"), history("orders", 1, () -> callbacks.add("history")),
+                    () -> callbacks.add("unavailable"));
+            writer.flush();
+            assertThat(bulkReturned).isTrue();
+            assertThat(callbacks).containsExactly("unavailable");
+        }
+    }
+
+    private static boolean waitingInBarrier(Thread thread) {
+        if (thread == null || thread.getState() != Thread.State.TIMED_WAITING) return false;
+        for (StackTraceElement frame : thread.getStackTrace()) {
+            if (frame.getClassName().equals(ProcessObservationWriter.class.getName())
+                    && frame.getMethodName().equals("reserveBarrier")) return true;
+        }
+        return false;
     }
 
     private static ProcessObservationWriter.History history(String pipeline, long seconds, Runnable append) {

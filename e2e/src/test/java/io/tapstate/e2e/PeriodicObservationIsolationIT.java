@@ -2,12 +2,13 @@ package io.tapstate.e2e;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.sun.jdi.*;
 import com.sun.jdi.event.*;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
-import io.tapstate.core.common.JsonReader;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
@@ -118,7 +119,8 @@ class PeriodicObservationIsolationIT {
                      port -> List.of("--tapstate.cluster.id=" + storage.clusterId(), "--tapstate.hz.member-port=0",
                              "--tapstate.hz.jet.cooperative-thread-count=2"));
              var ca = MongoClients.create(ta);
-             var cb = MongoClients.create(tb)) {
+             var cb = MongoClients.create(tb);
+             var cache = MongoClients.create(storage.cacheUri())) {
             System.out.println("probe server PID=" + server.pid() + " log=" + server.output());
             var control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
@@ -131,6 +133,7 @@ class PeriodicObservationIsolationIT {
             control.discoverSchema(B + "_source", "mysql", sb);
             MongoDatabase dbA = ca.getDatabase(new ConnectionString(ta).getDatabase());
             MongoDatabase dbB = cb.getDatabase(new ConnectionString(tb).getDatabase());
+            var observations = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(cache.getDatabase(storage.cacheDatabase()));
             var vm = attach(server.output());
             try {
                 try (var held = hold(vm, Mode.EXECUTION_ADVANCE, () -> control.lifecycle(A, LifecycleVerb.START))) {
@@ -146,9 +149,9 @@ class PeriodicObservationIsolationIT {
                 Await.until("A CDC target arrives", START, () -> amount(dbA) == 1, () -> "A=" + amount(dbA));
                 update(sb);
                 Await.until("B delivers one real CDC row and publishes outbound facts before arming", START,
-                        () -> amount(dbB) == 1 && outbound(control).orElse(0) >= 2,
-                        () -> "B=" + amount(dbB) + " outbound=" + outbound(control));
-                Supplier<Reading> read = () -> read(control, dbB);
+                        () -> amount(dbB) == 1 && control.recordsOut(B).orElse(0L) >= 2,
+                        () -> "B=" + amount(dbB) + " outbound=" + control.recordsOut(B));
+                Supplier<Reading> read = () -> read(observations, dbB);
                 for (var mode : List.of(Mode.NATIVE_METRICS, Mode.OBSERVATION_WRITE, Mode.NATIVE_METRICS, Mode.OBSERVATION_WRITE)) {
                     Reading beforeControl = read.get();
                     update(sb);
@@ -192,16 +195,16 @@ class PeriodicObservationIsolationIT {
         return read.get();
     }
 
-    private static Reading read(ControlPlane control, MongoDatabase database) {
-        Instant at = control.observedAt(B).orElseThrow();
-        return new Reading(amount(database), outbound(control).orElseThrow(), at);
-    }
-
-    private static OptionalLong outbound(ControlPlane control) {
-        var json = (Map<?, ?>) JsonReader.parse(control.metricsJson(B));
-        var metrics = (Map<?, ?>) json.get("metrics");
-        Object count = metrics.get("records.out");
-        return count instanceof Number n ? OptionalLong.of(n.longValue()) : OptionalLong.empty();
+    private static Reading read(MongoCollection<Document> observations, MongoDatabase database) {
+        // The batch timestamp and the count must belong to the same persisted observation.
+        var row = observations.find(new Document("pipelineId", B).append("state", "RUNNING"))
+                .sort(new Document("observedAt", -1)).first();
+        if (row == null || !(row.get("observedAt") instanceof Date observedAt)
+                || !(row.get("metrics") instanceof Document metrics)
+                || !(metrics.get("records.out") instanceof Number recordsOut)) {
+            throw new AssertionError("No persisted running observation with outbound facts for " + B);
+        }
+        return new Reading(amount(database), recordsOut.longValue(), observedAt.toInstant());
     }
 
     private static VirtualMachine attach(Path log) throws Exception {
