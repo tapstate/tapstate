@@ -1,31 +1,48 @@
 name: CI
+run-name: ${{ github.event_name == 'workflow_run' && format('Pipeline Performance | Nightly {0}/{1}', github.event.workflow_run.id, github.event.workflow_run.run_attempt) || 'Pipeline Performance | Manual' }}
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Selection mode for the branch or tag chosen in the dispatch form
+        type: choice
+        options: [all, group, filter, ids]
+        default: all
+      group:
+        description: One primary group, for example nest
+        type: string
+      filters:
+        description: Space- or comma-separated field=value filters
+        type: string
+      case_ids:
+        description: Space- or comma-separated case IDs with optional @version
+        type: string
+      baseline_version:
+        description: Previously published baseline version, or leave empty for the current release
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  calibration:
+  prepare:
+    if: >-
+      github.run_attempt == '1' &&
+      (github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.event == 'schedule' &&
+         github.event.workflow_run.run_attempt == 1 &&
+         github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+         github.event.workflow_run.head_repository.id == github.event.repository.id))
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - case: join.live.hot-update.standard@1
-            rows: 16000
-            rate: 16
-            window: 300
-          - case: join.live.hot-update.wide@2
-            rows: 5000
-            rate: 5
-            window: 300
-          - case: nest.live.child-update.standard@1
-            rows: 25000
-            rate: 25
-            window: 300
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      batches: ${{ steps.prepare.outputs.batches }}
+      measurement_stop: ${{ steps.prepare.outputs.measurement_stop }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,50 +52,41 @@ jobs:
         with:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
-          cache: maven
-      - name: Set up Maven
-        run: bash .github/scripts/setup-ci-maven.sh
-      - name: Verify dependencies and record environment
-        run: |
-          mkdir "$RUNNER_TEMP/calibration"
-          {
-            echo "Image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
-            uname -a
-            lscpu
-            free -m
-            df -h "$RUNNER_TEMP"
-            java -version
-            mvn -version
-            docker info
-            git rev-parse HEAD
-          } > "$RUNNER_TEMP/calibration/environment.txt" 2>&1
-          python3 -B deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy --output "$RUNNER_TEMP/connectors"
-          docker pull mongo:7.0
-          docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$RUNNER_TEMP/calibration/mongo-image.json"
-      - name: Build the candidate
-        run: |
-          mvn -B -pl app,e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build.log" 2>&1 || {
-            tail -80 "$RUNNER_TEMP/calibration/build.log"
-            exit 1
-          }
-          sha256sum app/target/app-0.8.0-boot.jar "$RUNNER_TEMP/connectors/"*.jar > "$RUNNER_TEMP/calibration/artifacts.sha256"
-      - name: Measure each candidate workload and retain repeats
+      - name: Read the start time for this attempt
         env:
-          CASE: ${{ matrix.case }}
-          ROWS: ${{ matrix.rows }}
-          RATE: ${{ matrix.rate }}
-          WINDOW: ${{ matrix.window }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/performance-run.json"
+      - name: Select and allocate formal cases
+        id: prepare
         run: |
-          python3 -B benchmarks/runner.py run --id "$CASE" --repeats 1 --rows "$ROWS" --backlog-events 30000 \
-            --rate "$RATE" --warmup-seconds 30 --measurement-seconds "$WINDOW" --timeout-seconds 600 \
-            --connectors "$RUNNER_TEMP/connectors" --output "$RUNNER_TEMP/calibration/run"
+          python3 -B benchmarks/actions_run.py \
+            --workloads benchmarks/cases/formal-workloads.json \
+            --estimates benchmarks/cases/hosted-runner-estimates.json \
+            --run "$RUNNER_TEMP/performance-run.json" \
+            --output "$RUNNER_TEMP/performance-inputs"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: benchmark-calibration-${{ matrix.case }}
-          path: |
-            ${{ runner.temp }}/calibration/
-            !${{ runner.temp }}/calibration/run/**/runtime-input/**
-            !${{ runner.temp }}/calibration/run/**/witness-input/**
+          name: performance-inputs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/performance-inputs
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
+
+  measure:
+    if: github.run_attempt == '1' && needs.prepare.result == 'success'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Preserve a failed batch with an existing allocation output
+        env:
+          BATCHES: ${{ needs.prepare.outputs.batches }}
+        run: |
+          test -n "$BATCHES"
+          exit 15
+
+  report:
+    if: always() && github.run_attempt == '1' && needs.prepare.result != 'skipped'
+    needs: [prepare, measure]
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo 'First attempt report fixture'
