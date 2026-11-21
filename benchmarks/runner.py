@@ -534,6 +534,7 @@ def main():
         }
         if args.formal_workloads:
             manifest["scale"] = "formal"
+            manifest["whole_case_estimates_seconds"] = durations
             manifest["selected_cases"] = [
                 {"id": case["id"], "version": case["case_version"], "scenario": case["description"],
                  "mode": case["mode"], "phase": case["phase"], "profile": case["profile"],

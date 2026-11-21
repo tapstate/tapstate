@@ -1,5 +1,7 @@
+from argparse import Namespace
 from datetime import datetime
 from io import BytesIO
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -44,6 +46,43 @@ class ActionsRunTest(unittest.TestCase):
             actions_run.selection("all", group="copy")
         with self.assertRaisesRegex(ValueError, "matching input"):
             actions_run.selection("group", group="copy", case_ids="map.live.basic.standard")
+
+    def test_preparation_reports_missing_work_and_emits_no_matrix(self):
+        now = datetime.fromisoformat("2026-11-21T15:00:00+00:00")
+        run = {"id": 111, "run_attempt": 1, "created_at": now.isoformat(), "run_started_at": now.isoformat()}
+        attempt = {"run_id": 111, "attempt": 1}
+        case_id = "nest.snapshot.fanout.wide"
+        manifest = {
+            "identity": {"code_sha": "candidate"}, "environment": "ubuntu-24.04-x64-op",
+            "selected_ids": [case_id], "selected_cases": [
+                {"id": case_id, "version": 2, "profile": "wide", "repeats": 3, "paired_control": True},
+            ],
+            "batches": [], "unallocated": [{"id": case_id, "reason": "missing whole-case estimate"}],
+            "scale": "formal", "whole_case_estimates_seconds": {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = root / "summary"
+            matrix = root / "matrix"
+            args = Namespace(output=root / "prepare", workloads=root / "workloads", estimates=root / "estimates")
+
+            def allocate(command, *, check):
+                runner.write_json(Path(command[-1]), manifest)
+                return Namespace(returncode=int(bool(manifest["unallocated"])))
+
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary), "GITHUB_OUTPUT": str(matrix)}), \
+                    patch.object(actions_run.time, "time", return_value=now.timestamp()), \
+                    patch.object(actions_run.baseline, "pin", return_value={"status": "unavailable"}), \
+                    patch.object(actions_run.subprocess, "run", side_effect=allocate):
+                self.assertEqual(1, actions_run.prepare(args, "workflow_dispatch", {}, attempt, run))
+                self.assertIn("| nest.snapshot.fanout.wide@2 | wide | 3 | Yes | - | missing whole-case estimate |",
+                              summary.read_text())
+                self.assertFalse(matrix.exists())
+                manifest.update(scale="qualification", unallocated=[])
+                args.output = root / "qualification"
+                with self.assertRaisesRegex(ValueError, "formal workload manifest"):
+                    actions_run.prepare(args, "workflow_dispatch", {}, attempt, run)
+                self.assertFalse(matrix.exists())
 
     def test_queue_is_separate_from_deadline_and_nightly_sets_business_date(self):
         run = {"created_at": "2026-11-21T16:04:00Z", "run_started_at": "2026-11-21T16:14:00Z"}

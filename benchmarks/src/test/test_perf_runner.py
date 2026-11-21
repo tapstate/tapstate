@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from actions_run import (BUDGET_SECONDS, BUILD_RESERVE_SECONDS, DEFAULT_BATCH_SECONDS, DEFAULT_SLOTS,
+                         REPORT_RESERVE_SECONDS, RUNNER_PROFILE, TEARDOWN_RESERVE_SECONDS, selection)
 import catalog
 import runner
 import workloads
@@ -164,6 +166,63 @@ class PerfRunnerTest(unittest.TestCase):
             runner.write_json(registry, registry_data)
             self.assertEqual(1, self.invoke(allocate, clean)[0])
             self.assertEqual("missing whole-case estimate", catalog.read_json(manifest)["unallocated"][0]["reason"])
+
+    def test_hosted_manifest_covers_the_versioned_catalog_and_manual_selections(self):
+        directory = catalog.CASE_ROOT
+        registry = directory / "formal-workloads.json"
+        estimates = directory / "hosted-runner-estimates.json"
+        references = {workloads.case_reference(case) for case in self.cases}
+        self.assertEqual(references, set(catalog.read_json(registry)["cases"]))
+        self.assertEqual(references, set(catalog.read_json(estimates)["cases"]))
+        budget = BUDGET_SECONDS - REPORT_RESERVE_SECONDS - TEARDOWN_RESERVE_SECONDS
+        with tempfile.TemporaryDirectory() as output:
+            manifest_path = Path(output) / "manifest.json"
+            allocate = [
+                "allocate", "--formal-workloads", str(registry), "--estimates", str(estimates),
+                "--environment", RUNNER_PROFILE, "--slots", str(DEFAULT_SLOTS), "--deadline-seconds", str(budget),
+                "--batch-seconds", str(DEFAULT_BATCH_SECONDS), "--reserve-seconds", str(BUILD_RESERVE_SECONDS),
+                "--output", str(manifest_path),
+            ]
+            checkout = dict(self.catalog, source_dirty=False)
+            cases = [
+                (selection("all"), [], []),
+                (selection("group", group="nest"), [], ["group=nest"]),
+                (selection("filter", filters="operators=nest, profile=wide"), [], ["operators=nest", "profile=wide"]),
+                (selection("ids", case_ids="copy.snapshot.basic.standard@1"), ["copy.snapshot.basic.standard@1"], []),
+                (selection("ids", case_ids="copy.snapshot.basic.standard@1, nest.snapshot.fanout.wide@2"),
+                 ["copy.snapshot.basic.standard@1", "nest.snapshot.fanout.wide@2"], []),
+            ]
+            for flags, ids, filters in cases:
+                with self.subTest(selection=flags):
+                    self.assertEqual((0, ""), self.invoke(allocate + flags, checkout))
+                    manifest = catalog.read_json(manifest_path)
+                    expected = runner.select(self.cases, ids, filters, "all")
+                    self.assertEqual([case["id"] for case in expected], manifest["selected_ids"])
+                    self.assertEqual([], manifest["unallocated"])
+                    entries = [entry for batch in manifest["batches"]
+                               for entry in runner.replay(checkout, manifest, batch["index"])]
+                    self.assertEqual(len(expected), len(entries))
+                    self.assertTrue(all(entry["scale"] == "formal" and entry["repeats"] == 3 for entry in entries))
+                    costs = manifest["whole_case_estimates_seconds"]
+                    self.assertEqual(set(manifest["selected_ids"]), set(costs))
+                    for batch in manifest["batches"]:
+                        self.assertEqual(batch["estimated_seconds"], sum(
+                            costs[entry["case"]["id"]] for entry in batch["entries"]
+                        ))
+                    for entry in entries:
+                        case = entry["case"]
+                        cycles = case["workload_spec"]["scenario"]["parameters"].get("same_jvm_cycles_per_repeat", 1)
+                        if case["mode"] == "live-latency" or cycles > 1:
+                            arms = 2 if "paired-control" in case["tags"] else 1
+                            window = entry["warmup_seconds"] + entry["measurement_seconds"]
+                            self.assertGreaterEqual(costs[case["id"]], entry["repeats"] * arms * cycles * window)
+                    if not flags:
+                        self.assertEqual({"small", "standard", "wide", "large"},
+                                         {case["profile"] for case in manifest["selected_cases"]})
+                        self.assertEqual({"snapshot", "live-latency", "backlog-throughput"},
+                                         {case["mode"] for case in manifest["selected_cases"]})
+                        self.assertTrue(any(case["paired_control"] for case in manifest["selected_cases"]))
+                        self.assertLessEqual(manifest["longest_seconds"], DEFAULT_BATCH_SECONDS)
 
     def manifest_commands(self, root):
         estimates = root / "estimates.json"

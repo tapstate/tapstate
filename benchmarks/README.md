@@ -111,10 +111,30 @@ or to `allocate` for hosted execution. Qualification commands keep their explici
 load options. Formal workloads use the catalog's repeat count and operation mix.
 
 `cases/hosted-runner-estimates.json` binds each estimate to a formal workload
-digest and the `ubuntu-24.04-x64-op` environment. Record the observed whole-case
-duration across all repeats and arms, its evidence URL and the margin used to
-plan the batch. A full selection with missing or mismatched recipes or estimates
-publishes an incomplete allocation and leaves every measurement job skipped.
+digest and the `ubuntu-24.04-x64-op` environment. Entries with an
+`observed_whole_case_seconds` field come from a completed same-workload run,
+including all repeats and arms. A `projection` identifies its hosted reference,
+the bounded qualification estimate and the work scheduled at the formal scale.
+Live projections budget the full warm-up and scoring windows for every repeat,
+arm and lifecycle cycle before adding the larger of the observed hosted overhead
+and the remaining qualification estimate. Snapshot and backlog projections use
+comparable hosted input volumes and the qualification estimate as a floor. The
+hosted planning margin is 25% plus 60 seconds per case.
+
+The preparation summary shows each selected case version, profile, repeat count,
+paired-control requirement, estimate and batch. The manifest preserves the
+individual estimates with the frozen case definitions and load. A selection with
+missing or mismatched recipes or estimates publishes an incomplete allocation
+and leaves every measurement job skipped.
+
+Initial snapshot sizes are 100,000 rows for small and standard, 25,000 for wide
+and 10,000 for large. Individual calibrated recipes can retain other input
+sizes. Formal live workloads normally use 100 events per second with a 30-second
+warm-up and a 300-second scoring window. The two-input Union live case uses a
+hosted-calibrated rate of 50 events per second across both streams. The paired
+hotspot cases use lower, versioned rates to preserve the hot-region allocation
+when mutations sample existing keys without replacement. Lifecycle repeats
+retain three cycles with shorter scoring windows and matching idle observations.
 
 The report artifact `performance-report-<attempt>` includes `report.json` and
 `report.md`. The input and batch artifact names also carry the attempt. Reproduce

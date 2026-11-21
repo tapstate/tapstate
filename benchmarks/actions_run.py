@@ -83,6 +83,30 @@ def remaining_seconds(timing, *, reserve=0):
     return int(timing["deadline_epoch_seconds"] - time.time() - reserve)
 
 
+def preparation_summary(manifest):
+    slots = {
+        entry["case"]["id"]: batch["index"]
+        for batch in manifest["batches"] for entry in batch["entries"]
+    }
+    pending = {item["id"]: item["reason"] for item in manifest["unallocated"]}
+    estimates = manifest.get("whole_case_estimates_seconds", {})
+    lines = [
+        "## Planned performance cases",
+        "",
+        f"Candidate: `{manifest['identity']['code_sha']}` ({manifest['environment']})",
+        "",
+        "| Case | Profile | Repeats | Paired control | Estimate (s) | Allocation |",
+        "|---|---|---:|---|---:|---|",
+    ]
+    for case in manifest["selected_cases"]:
+        case_id = case["id"]
+        paired = "Yes" if case["paired_control"] else "-"
+        allocation = pending.get(case_id, f"Batch {slots.get(case_id, '-')}")
+        lines.append(f"| {case_id}@{case['version']} | {case['profile']} | {case['repeats']} | "
+                     f"{paired} | {estimates.get(case_id, '-')} | {allocation} |")
+    return "\n".join(lines) + "\n"
+
+
 def prepare(args, event_name, event, attempt, run):
     if not eligible_event(event_name, event, attempt["attempt"]):
         raise ValueError("This event or attempt cannot start performance work")
@@ -114,6 +138,10 @@ def prepare(args, event_name, event, attempt, run):
         return result.returncode
     manifest = catalog.read_json(manifest_path)
     print("Selected cases:", ", ".join(manifest["selected_ids"]))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary and manifest.get("scale") == "formal":
+        with Path(summary).open("a", encoding="utf-8") as destination:
+            destination.write(preparation_summary(manifest))
     if result.returncode:
         return result.returncode
     if manifest.get("scale") != "formal" or any(
