@@ -82,8 +82,11 @@ final class NativeObservationSampling {
             pass.requirePipeline(id);
             if (!execution.apply(id).filter(original::equals).isPresent()) throw ThreeLayerStorePort.refused();
         };
-        var facts = cache.readObservation(pass.scope(), pass.claim(), selection.sources(), current);
-        if (facts.isEmpty() || !checkpoint.equals(facts.get().checkpoint())) return Attempt.fallback();
+        var admitted = cache.readObservation(pass.scope(), pass.claim(), selection.sources(), current);
+        if (admitted.isEmpty()) return Attempt.fallback();
+        var reading = admitted.orElseThrow();
+        var facts = reading.facts();
+        if (!checkpoint.equals(facts.checkpoint())) return Attempt.fallback();
 
         var capturesByBinding = new HashMap<String, MongoConfigurationDomain.ObservationCapture>();
         selection.sources().forEach((run, source) -> capturesByBinding.put(run.sourceId(),
@@ -92,9 +95,9 @@ final class NativeObservationSampling {
         var checked = configuration.observationConfiguration(config, defaultSource, capturesByBinding);
         if (checked.changed()) return new Attempt(true, Optional.empty());
         var currentConfig = checked.configuration();
-        if (currentConfig.isEmpty() || !matches(currentConfig.get(), facts.get(), selection)) return Attempt.fallback();
+        if (currentConfig.isEmpty() || !matches(currentConfig.get(), facts, selection)) return Attempt.fallback();
         current.run();
-        var sample = captures.observationSample(selection, facts.orElseThrow(), plans.apply(id), clock.instant());
+        var sample = captures.observationSample(selection, facts, plans.apply(id), clock.instant());
         if (sample.isEmpty()) return Attempt.fallback();
 
         ObservationStore sink = new ObservationStore() {
@@ -102,8 +105,7 @@ final class NativeObservationSampling {
             @Override public void save(Observation value) { throw new IllegalArgumentException("observation checkpoint is required"); }
             @Override public void save(Observation value, long epoch) {
                 current.run();
-                if (!cache.updateObservation(pass.scope(), pass.claim(), current, value, epoch))
-                    pass.observationSample().save(value, epoch);
+                if (!reading.updateExisting(value, epoch)) pass.observationSample().save(value, epoch);
             }
             @Override public void delete(String pipeline) { pass.observationSample().delete(pipeline); }
         };
