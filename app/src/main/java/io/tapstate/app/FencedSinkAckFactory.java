@@ -113,6 +113,8 @@ final class FencedSinkAckFactory implements SinkAckFactory {
         public void bounded(String chain, SourceOrder through) {
             ack.bounded(chain, through, authorization.require(fence));
         }
+        @Override public void flush(boolean complete) { ack.flush(complete); }
+        @Override public void flushOnClose() { if (authorization.authorized(fence)) ack.flushOnClose(); }
         @Override public void started(long jobId, long executionId) {
             try { ack.started(jobId, executionId); }
             catch (RuntimeException failedObservation) { System.getLogger(FencedSinkAckFactory.class.getName()).log(System.Logger.Level.WARNING, "writer initialization observation failed", failedObservation); }

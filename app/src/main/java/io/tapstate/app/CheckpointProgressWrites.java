@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.MDC;
 
-/** Bounded original-run progress folding with completion only after the owning store commits. */
+/** Bounded nonblocking progress admission, with original-run receipts completed after persistence. */
 final class CheckpointProgressWrites implements AutoCloseable {
     static final String USER_CONTEXT_KEY = "tapstate.checkpoint-progress-writes";
     private static final int REQUEST_OVERHEAD = 512;
@@ -37,8 +37,6 @@ final class CheckpointProgressWrites implements AutoCloseable {
     private final ExecutorService worker;
     private long retainedBytes;
     private int callers;
-    private int waitingCallers;
-    private long waitingBytes;
     private boolean closed;
 
     CheckpointProgressWrites() { this(1024, 4L * 1024 * 1024, 64, Duration.ofMillis(25)); }
@@ -60,29 +58,33 @@ final class CheckpointProgressWrites implements AutoCloseable {
         return value instanceof CheckpointProgressWrites writes ? writes : null;
     }
 
-    void writer(ScopedSrsConsumerAccess.Bound bound, WorkloadClaimFence claimed, String runId,
-                String table, String writer, WriterProgress progress) {
-        if (!submit(new SrsWriter(bound, claimed, runId, table, writer, progress)))
-            throw ScopedSrsConsumerAccess.refused(bound.run());
+    CompletableFuture<Boolean> offerWriter(ScopedSrsConsumerAccess.Bound bound, WorkloadClaimFence claimed,
+            String runId, String table, String writer, WriterProgress progress) {
+        return offer(new SrsWriter(bound, claimed, runId, table, writer, progress));
     }
 
-    boolean read(ScopedSrsConsumerAccess.Bound bound, String table, long sequence) {
-        return submit(new SrsRead(bound, table, sequence));
+    CompletableFuture<Boolean> offerWriter(ScopedDirectSinkAckFactory.Bound bound, WorkloadClaimFence claimed,
+            String runId, String table, String writer, WriterProgress progress) {
+        return offer(new DirectWriter(bound, claimed, runId, table, writer, progress));
+    }
+
+    /** Explicit lifecycle boundaries can await the original report while ordinary reports only offer it. */
+    void writer(ScopedSrsConsumerAccess.Bound bound, WorkloadClaimFence claimed, String runId,
+                String table, String writer, WriterProgress progress) {
+        if (!await(offerWriter(bound, claimed, runId, table, writer, progress)))
+            throw ScopedSrsConsumerAccess.refused(bound.run());
     }
 
     boolean writer(ScopedDirectSinkAckFactory.Bound bound, WorkloadClaimFence claimed, String runId,
                    String table, String writer, WriterProgress progress) {
-        return submit(new DirectWriter(bound, claimed, runId, table, writer, progress));
+        return await(offerWriter(bound, claimed, runId, table, writer, progress));
     }
 
-    private boolean submit(Request request) {
-        request.verify();
-        Receipt receipt = admit(request);
-        try {
-            boolean result = receipt.completion.get();
-            request.verify();
-            return result;
+    private boolean await(CompletableFuture<Boolean> completion) {
+        synchronized (this) {
+            if (writers.contains(Thread.currentThread())) throw new IllegalStateException("a progress write cannot wait on its own worker");
         }
+        try { return completion.get(); }
         catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw StorageRuntime.unavailable();
@@ -90,60 +92,25 @@ final class CheckpointProgressWrites implements AutoCloseable {
             if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
             if (failed.getCause() instanceof Error error) throw error;
             throw new IllegalStateException("progress write failed with a checked exception", failed.getCause());
-        } finally {
-            synchronized (this) {
-                receipt.returned = true;
-                release(receipt);
-            }
         }
     }
 
-    private synchronized Receipt admit(Request request) {
-        if (writers.contains(Thread.currentThread())) throw new IllegalStateException("a progress write cannot wait on its own worker");
-        long callerBytes = request.bytes() + REQUEST_OVERHEAD;
-        if (request.bytes() + callerBytes > maximumBytes) throw StorageRuntime.unavailable();
-        Receipt receipt = tryAdmit(request, callerBytes);
-        if (receipt != null) return receipt;
-
-        // Callers applying backpressure retain their original request on their own stacks.
-        if (waitingCallers == maximumEntries || waitingBytes + callerBytes > maximumBytes)
-            throw StorageRuntime.unavailable();
-        waitingCallers++;
-        waitingBytes += callerBytes;
-        try {
-            while (receipt == null) {
-                wait();
-                receipt = tryAdmit(request, callerBytes);
-            }
-            return receipt;
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw StorageRuntime.unavailable();
-        } finally {
-            waitingCallers--;
-            waitingBytes -= callerBytes;
-        }
-    }
-
-    private Receipt tryAdmit(Request request, long callerBytes) {
+    private synchronized CompletableFuture<Boolean> offer(Request request) {
         if (closed) throw StorageRuntime.unavailable();
         Key key = request.key();
         Pending entry = pending.get(key);
         Request merged = entry == null ? request : entry.request.merge(request);
-        long increase = merged.bytes() - (entry == null ? 0 : entry.request.bytes()) + callerBytes;
-        if (callers >= maximumEntries || retainedBytes + increase > maximumBytes) return null;
-
-        Receipt receipt = new Receipt(callerBytes);
+        long increase = merged.bytes() - (entry == null ? 0 : entry.request.bytes()) + REQUEST_OVERHEAD;
+        if (callers >= maximumEntries || retainedBytes + increase > maximumBytes) throw StorageRuntime.unavailable();
+        Receipt receipt = new Receipt();
         if (entry == null) {
             entry = new Pending(merged);
             pending.put(key, entry);
-        } else {
-            entry.request = merged;
-        }
+        } else entry.request = merged;
         entry.completions.add(receipt);
         retainedBytes += increase;
         callers++;
-        return receipt;
+        return receipt.completion;
     }
 
     void flush() {
@@ -192,8 +159,14 @@ final class CheckpointProgressWrites implements AutoCloseable {
             var outcomes = group.getFirst().request.commit(group.stream().map(entry -> entry.request).toList());
             if (outcomes.size() != group.size()) throw new IllegalStateException("progress store returned the wrong number of receipts");
             for (int index = 0; index < group.size(); index++) {
-                var outcome = outcomes.get(index);
-                group.get(index).completions.forEach(receipt -> receipt.complete(outcome));
+                var entry = group.get(index);
+                try {
+                    var outcome = outcomes.get(index);
+                    if (outcome.failure() == null && outcome.committed()) entry.request.verify();
+                    entry.completions.forEach(receipt -> receipt.complete(outcome));
+                } catch (RuntimeException | Error failure) {
+                    entry.completions.forEach(receipt -> receipt.completion.completeExceptionally(failure));
+                }
             }
         } catch (RuntimeException | Error failure) {
             group.forEach(entry -> entry.completions.forEach(receipt -> receipt.completion.completeExceptionally(failure)));
@@ -208,30 +181,17 @@ final class CheckpointProgressWrites implements AutoCloseable {
     }
 
     private void retire(Pending entry) {
-        retainedBytes -= entry.request.bytes();
+        retainedBytes -= entry.request.bytes() + (long) REQUEST_OVERHEAD * entry.completions.size();
+        callers -= entry.completions.size();
         entry.request = null;
-        for (Receipt receipt : entry.completions) {
-            receipt.retired = true;
-            release(receipt);
-        }
         entry.completions.clear();
-    }
-
-    private synchronized void release(Receipt receipt) {
-        if (receipt.returned && receipt.retired && !receipt.released) {
-            receipt.released = true;
-            retainedBytes -= receipt.bytes;
-            callers--;
-            notifyAll();
-        }
     }
 
     private static List<List<Pending>> groups(List<Pending> batch) {
         Map<GroupKey, List<Pending>> groups = new LinkedHashMap<>();
         for (Pending entry : batch) {
             Key key = entry.request.key();
-            var group = new GroupKey(key.run(), key.kind(), key.claimed(), key.runId(),
-                    entry.request instanceof SrsRead ? key.table() : null);
+            var group = new GroupKey(key.run(), key.kind(), key.claimed(), key.runId());
             groups.computeIfAbsent(group, ignored -> new ArrayList<>()).add(entry);
         }
         return new ArrayList<>(groups.values());
@@ -259,8 +219,8 @@ final class CheckpointProgressWrites implements AutoCloseable {
     }
 
     private record Key(Object run, String kind, WorkloadClaimFence claimed, String runId, String table, String writer) {}
-    private record GroupKey(Object run, String kind, WorkloadClaimFence claimed, String runId, String table) {}
-    private sealed interface Request permits SrsWriter, SrsRead, DirectWriter {
+    private record GroupKey(Object run, String kind, WorkloadClaimFence claimed, String runId) {}
+    private sealed interface Request permits SrsWriter, DirectWriter {
         Key key();
         String pipeline();
         Request merge(Request later);
@@ -292,18 +252,6 @@ final class CheckpointProgressWrites implements AutoCloseable {
                 }
             });
             return result.get();
-        }
-    }
-    private record SrsRead(ScopedSrsConsumerAccess.Bound bound, String table, long sequence) implements Request {
-        @Override public Key key() { return new Key(bound.run(), "srs-read", null, null, table, null); }
-        @Override public String pipeline() { return bound.run().scope().pipelineId(); }
-        @Override public Request merge(Request later) { return new SrsRead(bound, table, Math.max(sequence, ((SrsRead) later).sequence)); }
-        @Override public long bytes() { return strings(table); }
-        @Override public void verify() { bound.requireClaim(null); }
-        @Override public List<WriterProgressOutcome> commit(List<Request> batch) {
-            batch.forEach(Request::verify);
-            return receipt(bound.store().advanceReadSequence(bound.run().context(), bound.run().membershipRevision(),
-                    table, sequence, bound.run().originalClaim()));
         }
     }
     private record DirectWriter(ScopedDirectSinkAckFactory.Bound bound, WorkloadClaimFence claimed, String runId,
@@ -347,11 +295,6 @@ final class CheckpointProgressWrites implements AutoCloseable {
     }
     private static final class Receipt {
         private final CompletableFuture<Boolean> completion = new CompletableFuture<>();
-        private final long bytes;
-        private boolean returned;
-        private boolean retired;
-        private boolean released;
-        private Receipt(long bytes) { this.bytes = bytes; }
         private void complete(WriterProgressOutcome outcome) {
             if (outcome.failure() != null) completion.completeExceptionally(outcome.failure());
             else completion.complete(outcome.committed());

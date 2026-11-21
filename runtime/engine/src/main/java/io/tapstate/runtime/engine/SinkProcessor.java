@@ -8,6 +8,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
@@ -79,13 +80,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     }
 
     /**
-     * Not cooperative where there is an ack to report to. A write that settles hands the positions it earned
-     * to the ack there and then, and the ack a pipeline is built with writes them to the durable store and
-     * waits for the store to answer - for as long as the store takes, which is as long as it goes on holding
-     * a document for a writer that stopped halfway through writing it. A cooperative processor shares its
-     * thread with every other cooperative vertex on the member, of every run, so a report waiting there stops
-     * all of them with it, and nothing fails or says why. A sink with no ack only hands rows to its writer,
-     * which writes them off this thread, so it keeps its place in the cooperative pool.
+     * A sink with an ack may wait for its checkpoint at load and job completion. Those waits need their
+     * own thread. A sink with no ack only hands rows to its writer, which writes them off this thread.
      */
     @Override
     public boolean isCooperative() {
@@ -569,7 +565,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         } while (writeWhatIsDue());
         reportWaiting();
         boolean done = inFlight.isEmpty() && queued.isEmpty();
-        if (ack != null && done) ack.flush(true);
+        if (done) flushCheckpoint(true);
         return done;
     }
 
@@ -804,8 +800,18 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         });
         if (frontier != null) {
             releaseHeld();
-        if (ack != null) ack.flush(false);
+            flushCheckpoint(false);
             reportTrailing();
+        }
+    }
+
+    private void flushCheckpoint(boolean complete) {
+        if (ack == null) return;
+        try {
+            ack.flush(complete);
+        } catch (RuntimeException | Error failure) {
+            if (failureRegistry != null) failureRegistry.record(new FailureFact(failure));
+            throw failure;
         }
     }
 

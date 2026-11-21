@@ -607,6 +607,22 @@ class SinkProcessorTest {
     }
 
     @Test
+    void an_asynchronous_checkpoint_failure_is_retained_by_the_original_idle_processor() throws Exception {
+        var fixture = new EngineRunHandleTest.Fixture(null);
+        var failure = new IllegalStateException("checkpoint write refused");
+        var ack = new SinkAck() {
+            @Override public void advance(String chain, ChainPosition position) { }
+            @Override public void flush(boolean complete) { throw failure; }
+        };
+        var processor = new SinkProcessor(new RecordingWriter(), ack, new ContiguousPrefix(AXES), 1, 1);
+        processor.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext()
+                .setHazelcastInstance(fixture.member).setJobConfig(new JobConfig().setName("p")));
+
+        assertThatThrownBy(processor::tryProcess).isSameAs(failure);
+        assertThat(JobFailureRegistry.of(fixture.member).get("p")).containsSame(failure);
+    }
+
+    @Test
     void a_snapshot_row_is_acked_when_a_change_above_it_settles_in_the_same_batch() throws Exception {
         RecordingAck ack = new RecordingAck();
         // A batch wide enough to hold a table's whole load and the first change above it. That is the

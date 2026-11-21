@@ -95,6 +95,7 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
         private final transient Map<DirectSourceRun,Bound> bound;
         private final String writer;
         private final transient CheckpointProgressWrites progressWrites;
+        private final transient CheckpointWriteAcks receipts = new CheckpointWriteAcks();
         Writer(Map<DirectSourceRun,Bound> bound,String writer,CheckpointProgressWrites progressWrites) {
             this.bound = bound; this.writer = writer; this.progressWrites = progressWrites;
         }
@@ -110,10 +111,22 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
         private void report(String stream,WriterProgress progress,WorkloadClaimFence claim) {
             if (writer == null) throw new IllegalStateException("a private acknowledgement must name its original writer");
             var source = source(stream); var run = source.run(); var handle = bound.get(run); handle.requireClaim(claim);
-            boolean committed = progressWrites == null
-                    ? handle.store().advanceWriter(run.context(),run.epoch(),runId,source.table(),writer,progress,run.pipelineClaim())
-                    : progressWrites.writer(handle, claim, runId, source.table(), writer, progress);
-            if (!committed) throw run.refused();
+            if (progressWrites == null) {
+                if (!handle.store().advanceWriter(run.context(),run.epoch(),runId,source.table(),writer,progress,run.pipelineClaim())) throw run.refused();
+                return;
+            }
+            receipts.check();
+            if (progress.durableThrough().seq() == SourceOrder.SNAPSHOT_SEQ) {
+                receipts.await();
+                if (!progressWrites.writer(handle, claim, runId, source.table(), writer, progress)) throw run.refused();
+            } else {
+                receipts.track(progressWrites.offerWriter(handle, claim, runId, source.table(), writer, progress), run::refused);
+            }
         }
+        @Override public void flush(boolean complete) {
+            if (complete) receipts.await();
+            else receipts.check();
+        }
+        @Override public void flushOnClose() { flush(true); }
     }
 }

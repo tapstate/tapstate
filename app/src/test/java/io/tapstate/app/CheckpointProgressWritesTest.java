@@ -6,16 +6,13 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.*;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
-
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -28,45 +25,38 @@ class CheckpointProgressWritesTest {
     private static final SrsConsumerRun RUN = SrsConsumerRun.of(SCOPE, new SrsConsumerMembership(
             new SrsConsumerContext(new SrsConsumerKey("chain", "pipeline", "source"), 7), 4, false, Set.of("orders"), FENCE));
 
-    @Test void foldsBoundsWithoutLosingTheLastResumableTokenAndWaitsForCommit() throws Exception {
-        var store = mock(SrsConsumerStore.class);
-        when(store.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenReturn(true);
+    @Test void offersReturnBeforePersistenceAndFoldBoundsWithoutLosingTheLastResumableToken() throws Exception {
+        var store = successfulStore();
         var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(10, "token-10")));
-            awaitRequests(writes, 1);
-            var second = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(20, null)));
-            awaitRequests(writes, 2);
+        try (var writes = manualWrites(8, 8192)) {
+            var first = writes.offerWriter(bound, null, "run", "orders", "writer", progress(10, "token-10"));
+            var second = writes.offerWriter(bound, null, "run", "orders", "writer", progress(20, null));
             assertThat(first).isNotDone();
             assertThat(second).isNotDone();
             verifyNoInteractions(store);
             writes.flush();
-            first.get(5, TimeUnit.SECONDS);
-            second.get(5, TimeUnit.SECONDS);
+            assertThat(first.get(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(second.get(5, TimeUnit.SECONDS)).isTrue();
             var report = ArgumentCaptor.forClass(WriterProgress.class);
             verify(store).advanceWriter(eq(RUN.context()), eq(4L), eq("run"), eq("orders"), eq("writer"), report.capture(), eq(FENCE));
             assertThat(report.getValue().durableThrough()).isEqualTo(new SourceOrder(1, 20));
             assertThat(report.getValue().lastTokened()).isEqualTo(new ChainPosition(new SourceOrder(1, 10), "token-10"));
+            assertThat(writes.retainedRequests()).isZero();
+            assertThat(writes.retainedBytes()).isZero();
         }
     }
 
     @Test void batchesDistinctWritersOnlyWithinTheirOriginalRun() throws Exception {
         var store = mock(SrsConsumerStore.class);
-        var committed = new WriterProgressOutcome(true, null);
-        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(List.of(committed, committed));
+        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(List.of(
+                new WriterProgressOutcome(true, null), new WriterProgressOutcome(true, null)));
         var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "one", progress(10, "token-10")));
-            awaitRequests(writes, 1);
-            var second = callers.submit(() -> writes.writer(bound, null, "run", "orders", "two", progress(20, "token-20")));
-            awaitRequests(writes, 2);
+        try (var writes = manualWrites(8, 8192)) {
+            var first = writes.offerWriter(bound, null, "run", "orders", "one", progress(10, "token-10"));
+            var second = writes.offerWriter(bound, null, "run", "orders", "two", progress(20, "token-20"));
             writes.flush();
-            first.get(5, TimeUnit.SECONDS);
-            second.get(5, TimeUnit.SECONDS);
+            assertThat(first.get(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(second.get(5, TimeUnit.SECONDS)).isTrue();
             verify(store).advanceWriters(RUN.context(), 4, "run", List.of(
                     new WriterProgressUpdate("orders", "one", progress(10, "token-10")),
                     new WriterProgressUpdate("orders", "two", progress(20, "token-20"))), FENCE);
@@ -74,129 +64,111 @@ class CheckpointProgressWritesTest {
         }
     }
 
-    @Test void aRefusedAtomicBatchRefusesEveryIncludedCaller() throws Exception {
+    @Test void eachRefusedReportKeepsItsOriginalOutcomeAndCause() throws Exception {
         var store = mock(SrsConsumerStore.class);
-        var refused = new WriterProgressOutcome(false, null);
-        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(List.of(refused, refused));
-        var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "one", progress(10, null)));
-            awaitRequests(writes, 1);
-            var second = callers.submit(() -> writes.writer(bound, null, "run", "orders", "two", progress(20, null)));
-            awaitRequests(writes, 2);
-            writes.flush();
-            for (var caller : List.of(first, second))
-                assertThatThrownBy(() -> caller.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
-            verify(store).advanceWriters(eq(RUN.context()), eq(4L), eq("run"), anyList(), eq(FENCE));
-        }
-    }
-
-    @Test void aDeterministicallyRefusedSiblingKeepsItsExactErrorWithoutFailingAValidReceipt() throws Exception {
-        var store = mock(SrsConsumerStore.class);
-        var refused = new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE, java.util.Map.of("chain", "chain"), null);
+        var refused = new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE, java.util.Map.of("chain", "chain"), new IllegalStateException("fixture cause"));
         when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(List.of(
-                new WriterProgressOutcome(true, null), new WriterProgressOutcome(false, refused)));
+                new WriterProgressOutcome(true, null), new WriterProgressOutcome(false, refused), new WriterProgressOutcome(false, null)));
         var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
-            var valid = callers.submit(() -> writes.writer(bound, null, "run", "orders", "valid", progress(10, "token-10")));
-            awaitRequests(writes, 1);
-            var invalid = callers.submit(() -> writes.writer(bound, null, "run", "orders", "unknown", progress(20, "token-20")));
-            awaitRequests(writes, 2);
+        try (var writes = manualWrites(8, 8192)) {
+            var valid = writes.offerWriter(bound, null, "run", "orders", "valid", progress(10, "token-10"));
+            var invalid = writes.offerWriter(bound, null, "run", "orders", "invalid", progress(20, "token-20"));
+            var stale = writes.offerWriter(bound, null, "run", "orders", "stale", progress(30, null));
             writes.flush();
-            Throwable validFailure = catchThrowable(() -> valid.get(5, TimeUnit.SECONDS));
+            assertThat(valid.get(5, TimeUnit.SECONDS)).isTrue();
             assertThatThrownBy(() -> invalid.get(5, TimeUnit.SECONDS)).hasCause(refused);
-            assertThat(validFailure).as("a valid original receipt must remain independent of its refused sibling").isNull();
+            assertThat(refused.getCause()).hasMessage("fixture cause");
+            assertThat(stale.get(5, TimeUnit.SECONDS)).isFalse();
             verify(store, never()).advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any());
         }
     }
 
-    @Test void anOutcomeUnknownBatchMustNotReplayIndividualWriterReports() throws Exception {
+    @Test void directOffersKeepTheirOriginalPerReportOutcomes() throws Exception {
+        var store = mock(DirectChannelStore.class);
+        var run = new DirectSourceRun(new ExecutionFence(SCOPE, FENCE),
+                new DirectChannelContext(SCOPE, "channel", "source", "capture"), 1, 0, Set.of("orders"),
+                "capture-node", "capture-boot", 1, 1, 1);
+        var bound = new ScopedDirectSinkAckFactory.Bound(run, store, () -> {});
+        var refused = new TapstateException(IoError.DIRECT_CHANNEL_UNAVAILABLE, java.util.Map.of("channel", "channel"), null);
+        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(List.of(
+                new WriterProgressOutcome(true, null), new WriterProgressOutcome(false, refused)));
+        try (var writes = manualWrites(8, 8192)) {
+            var first = writes.offerWriter(bound, FENCE, "run", "orders", "one", progress(10, "token-10"));
+            var second = writes.offerWriter(bound, FENCE, "run", "orders", "two", progress(20, "token-20"));
+            assertThat(first).isNotDone();
+            verifyNoInteractions(store);
+            writes.flush();
+            assertThat(first.get(5, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> second.get(5, TimeUnit.SECONDS)).hasCause(refused);
+            verify(store).advanceWriters(run.context(), 1, "run", List.of(
+                    new WriterProgressUpdate("orders", "one", progress(10, "token-10")),
+                    new WriterProgressUpdate("orders", "two", progress(20, "token-20"))), FENCE);
+        }
+    }
+
+    @Test void anOutcomeUnknownBatchMustNotReplayIndividualWriterReports() {
         var store = mock(SrsConsumerStore.class);
         var unknown = new TapstateException(IoError.STORE_UNAVAILABLE, java.util.Map.of("detail", "fixture outcome unknown"), null);
         when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenThrow(unknown);
         var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "first", progress(10, "token-10")));
-            awaitRequests(writes, 1);
-            var second = callers.submit(() -> writes.writer(bound, null, "run", "orders", "second", progress(20, "token-20")));
-            awaitRequests(writes, 2);
+        try (var writes = manualWrites(8, 8192)) {
+            var first = writes.offerWriter(bound, null, "run", "orders", "first", progress(10, "token-10"));
+            var second = writes.offerWriter(bound, null, "run", "orders", "second", progress(20, "token-20"));
             writes.flush();
             assertThatThrownBy(() -> first.get(5, TimeUnit.SECONDS)).hasCause(unknown);
             assertThatThrownBy(() -> second.get(5, TimeUnit.SECONDS)).hasCause(unknown);
             verify(store, never()).advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any());
+            assertThat(writes.retainedRequests()).isZero();
         }
     }
 
     @Test void distinctWriterRunsUseDistinctOriginalTransactions() throws Exception {
-        var store = mock(SrsConsumerStore.class);
-        when(store.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenReturn(true);
+        var store = successfulStore();
         var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "first", "orders", "writer", progress(10, null)));
-            awaitRequests(writes, 1);
-            var second = callers.submit(() -> writes.writer(bound, null, "second", "orders", "writer", progress(20, null)));
-            awaitRequests(writes, 2);
+        try (var writes = manualWrites(8, 8192)) {
+            var first = writes.offerWriter(bound, null, "first", "orders", "writer", progress(10, null));
+            var second = writes.offerWriter(bound, null, "second", "orders", "writer", progress(20, null));
             writes.flush();
-            first.get(5, TimeUnit.SECONDS);
-            second.get(5, TimeUnit.SECONDS);
+            assertThat(first.get(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(second.get(5, TimeUnit.SECONDS)).isTrue();
             verify(store).advanceWriter(RUN.context(), 4, "first", "orders", "writer", progress(10, null), FENCE);
             verify(store).advanceWriter(RUN.context(), 4, "second", "orders", "writer", progress(20, null), FENCE);
             verify(store, never()).advanceWriters(any(), anyLong(), anyString(), anyList(), any());
         }
     }
 
-    @Test void anIndependentPipelineReceiptDoesNotWaitForAStalledCommit() throws Exception {
+    @Test void anIndependentPipelineDoesNotWaitForAStalledCommitAndTheSamePipelineDoesNotOverlap() throws Exception {
         var slowStore = mock(SrsConsumerStore.class);
-        var fastStore = mock(SrsConsumerStore.class);
+        var fastStore = successfulStore();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var healthy = bound("shipments", fastStore);
         var slow = bound(slowStore, () -> {});
         when(slowStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
             entered.countDown();
             assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
             return true;
         });
-        when(fastStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenReturn(true);
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(3, task -> thread(task, threads));
-             var flushing = Executors.newSingleThreadExecutor();
-             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(slow, null, "run", "orders", "writer", progress(10, null)));
-            awaitRequests(writes, 1);
-            var second = callers.submit(() -> writes.writer(healthy, null, "run", "orders", "writer", progress(10, null)));
-            awaitRequests(writes, 2);
+        try (var flushing = Executors.newSingleThreadExecutor(); var writes = manualWrites(8, 8192)) {
+            var first = writes.offerWriter(slow, null, "run", "orders", "writer", progress(10, null));
+            var fast = writes.offerWriter(bound("shipments", fastStore), null, "run", "orders", "writer", progress(10, null));
             var flush = flushing.submit(writes::flush);
             try {
                 assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
-                second.get(1, TimeUnit.SECONDS);
+                assertThat(fast.get(1, TimeUnit.SECONDS)).isTrue();
                 assertThat(first).isNotDone();
-                awaitRequests(writes, 1);
-                var samePipeline = callers.submit(() -> writes.writer(slow, null, "run", "orders", "writer", progress(20, null)));
-                awaitRequests(writes, 2);
+                var later = writes.offerWriter(slow, null, "run", "orders", "writer", progress(20, null));
                 writes.flush();
-                assertThat(samePipeline).isNotDone();
+                assertThat(later).isNotDone();
                 verify(slowStore, times(1)).advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any());
                 release.countDown();
                 flush.get(5, TimeUnit.SECONDS);
-                first.get(5, TimeUnit.SECONDS);
                 writes.flush();
-                samePipeline.get(5, TimeUnit.SECONDS);
-            } finally {
-                release.countDown();
-            }
+                assertThat(later.get(5, TimeUnit.SECONDS)).isTrue();
+            } finally { release.countDown(); }
         }
     }
 
-    @Test void anInFlightRequestRetainsItsCapacityUntilItsTransactionFinishes() throws Exception {
+    @Test void inFlightCapacityRejectsAnOfferImmediatelyAndIsReleasedAfterCommit() throws Exception {
         var store = mock(SrsConsumerStore.class);
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -206,154 +178,80 @@ class CheckpointProgressWritesTest {
             return true;
         });
         var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
-             var flushing = Executors.newSingleThreadExecutor();
-             var writes = new CheckpointProgressWrites(1, 8192, 1, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "one", progress(10, null)));
-            awaitRequests(writes, 1);
+        try (var flushing = Executors.newSingleThreadExecutor(); var writes = manualWrites(1, 8192)) {
+            var first = writes.offerWriter(bound, null, "run", "orders", "one", progress(10, null));
             var commit = flushing.submit(writes::flush);
             try {
                 assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
-                var second = callers.submit(() -> writes.writer(bound, null, "run", "orders", "two", progress(20, null)));
-                awaitWaiting(threads, 2);
-                assertThat(writes.retainedRequests()).isEqualTo(1);
-                assertThat(second).isNotDone();
-                verify(store, times(1)).advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any());
+                assertThatThrownBy(() -> writes.offerWriter(bound, null, "run", "orders", "two", progress(20, null)))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(StorageRuntime.unavailable().code()));
+                assertThat(first).isNotDone();
                 release.countDown();
                 commit.get(5, TimeUnit.SECONDS);
-                first.get(5, TimeUnit.SECONDS);
-                awaitRequests(writes, 1);
+                var later = writes.offerWriter(bound, null, "run", "orders", "two", progress(20, null));
                 writes.flush();
-                second.get(5, TimeUnit.SECONDS);
+                assertThat(later.get(5, TimeUnit.SECONDS)).isTrue();
             } finally { release.countDown(); }
         }
     }
 
     @Test void aFifthHealthyPipelineCanCommitWhileFourIndependentCommitsAreHeld() throws Exception {
         var blockedStore = mock(SrsConsumerStore.class);
-        var healthyStore = mock(SrsConsumerStore.class);
+        var healthyStore = successfulStore();
         var entered = new CountDownLatch(4);
         var release = new CountDownLatch(1);
-        var healthyEntered = new CountDownLatch(1);
         when(blockedStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
             entered.countDown();
             assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
             return true;
         });
-        when(healthyStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
-            healthyEntered.countDown();
-            return true;
-        });
-        try (var callers = Executors.newFixedThreadPool(5);
-             var flushing = Executors.newSingleThreadExecutor();
-             var writes = new CheckpointProgressWrites(16, 16384, 8, Duration.ofHours(1))) {
-            var slow = new java.util.ArrayList<java.util.concurrent.Future<?>>();
-            for (int pipeline = 0; pipeline < 4; pipeline++) {
-                var bound = bound("blocked-" + pipeline, blockedStore);
-                slow.add(callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(10, null))));
-            }
-            awaitRequests(writes, 4);
+        try (var flushing = Executors.newSingleThreadExecutor(); var writes = manualWrites(16, 16384)) {
+            for (int pipeline = 0; pipeline < 4; pipeline++)
+                writes.offerWriter(bound("blocked-" + pipeline, blockedStore), null, "run", "orders", "writer", progress(10, null));
             var firstFlush = flushing.submit(writes::flush);
-            java.util.concurrent.Future<?> healthy;
-            boolean reachedBeforeRelease;
             try {
                 assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
-                var bound = bound("healthy-fifth", healthyStore);
-                healthy = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(10, null)));
-                awaitRequests(writes, 5);
+                var healthy = writes.offerWriter(bound("healthy-fifth", healthyStore), null, "run", "orders", "writer", progress(10, null));
                 writes.flush();
-                reachedBeforeRelease = healthyEntered.await(1, TimeUnit.SECONDS);
-                if (reachedBeforeRelease) healthy.get(1, TimeUnit.SECONDS);
-            } finally {
-                release.countDown();
-            }
-            firstFlush.get(5, TimeUnit.SECONDS);
-            for (var caller : slow) caller.get(5, TimeUnit.SECONDS);
-            writes.flush();
-            healthy.get(5, TimeUnit.SECONDS);
-            System.out.println("CHECKPOINT_FIFTH_PIPELINE reachedBeforeRelease=" + reachedBeforeRelease + " committedAfterRelease=true");
-            assertThat(reachedBeforeRelease).as("a healthy Pipeline with spare admission capacity must reach its own store").isTrue();
-        }
-    }
-
-    @Test void refusesExcessBackpressureWaitersAndCommitsTheAdmittedWaiterAfterRecovery() throws Exception {
-        var store = mock(SrsConsumerStore.class);
-        var entered = new CountDownLatch(1);
-        var release = new CountDownLatch(1);
-        when(store.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
-            entered.countDown();
-            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
-            return true;
-        });
-        var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
-             var flushing = Executors.newSingleThreadExecutor();
-             var writes = new CheckpointProgressWrites(1, 1024, 1, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "one", progress(10, null)));
-            awaitRequests(writes, 1);
-            var commit = flushing.submit(writes::flush);
-            try {
-                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
-                var waiting = callers.submit(() -> writes.writer(bound, null, "run", "orders", "two", progress(20, null)));
-                awaitWaiting(threads, 2);
-                assertThat(writes.retainedRequests()).isEqualTo(1);
-                assertThat(waiting).isNotDone();
-                assertThatThrownBy(() -> writes.writer(bound, null, "run", "orders", "excess", progress(30, null)))
-                        .isInstanceOf(TapstateException.class)
-                        .satisfies(failure -> assertThat(((TapstateException) failure).code()).isEqualTo(StorageRuntime.unavailable().code()));
-                verify(store, times(1)).advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any());
-                release.countDown();
-                commit.get(5, TimeUnit.SECONDS);
-                first.get(5, TimeUnit.SECONDS);
-                awaitRequests(writes, 1);
-                writes.flush();
-                waiting.get(5, TimeUnit.SECONDS);
-                verify(store).advanceWriter(RUN.context(), 4, "run", "orders", "two", progress(20, null), FENCE);
-                verify(store, never()).advanceWriter(eq(RUN.context()), eq(4L), eq("run"), eq("orders"), eq("excess"), any(), eq(FENCE));
-                assertThat(writes.retainedRequests()).isZero();
+                assertThat(healthy.get(1, TimeUnit.SECONDS)).isTrue();
             } finally { release.countDown(); }
+            firstFlush.get(5, TimeUnit.SECONDS);
+            assertThat(writes.retainedRequests()).isZero();
         }
     }
 
-    @Test void rejectsAnOversizedReportBeforeAllocatingAWaiter() {
+    @Test void rejectsAnOversizedOfferWithoutTouchingTheStore() {
         var store = mock(SrsConsumerStore.class);
-        try (var writes = new CheckpointProgressWrites(8, 1024, 8, Duration.ofHours(1))) {
-            assertThatThrownBy(() -> writes.writer(bound(store, () -> {}), null, "run", "orders", "writer", progress(1, "x".repeat(1000))))
+        try (var writes = manualWrites(8, 1024)) {
+            assertThatThrownBy(() -> writes.offerWriter(bound(store, () -> {}), null, "run", "orders", "writer", progress(1, "x".repeat(1000))))
                     .isInstanceOf(TapstateException.class);
             verifyNoInteractions(store);
+            assertThat(writes.retainedRequests()).isZero();
         }
     }
 
-    @Test void propagatesStoreFailureAndReleasesCapacityForTheNextReport() throws Exception {
+    @Test void failedPersistenceKeepsItsExactCauseAndReleasesCapacityForTheNextOffer() throws Exception {
         var store = mock(SrsConsumerStore.class);
         var expected = new TapstateException(IoError.STORE_UNAVAILABLE, java.util.Map.of("detail", "test conflict"), null);
         when(store.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenThrow(expected).thenReturn(true);
         var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newSingleThreadExecutor(task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(1, 8192, 1, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(10, null)));
-            awaitRequests(writes, 1);
+        try (var writes = manualWrites(1, 8192)) {
+            var first = writes.offerWriter(bound, null, "run", "orders", "writer", progress(10, null));
             writes.flush();
             assertThatThrownBy(() -> first.get(5, TimeUnit.SECONDS)).hasCause(expected);
-            var second = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(20, null)));
-            awaitRequests(writes, 1);
+            var second = writes.offerWriter(bound, null, "run", "orders", "writer", progress(20, null));
             writes.flush();
-            second.get(5, TimeUnit.SECONDS);
+            assertThat(second.get(5, TimeUnit.SECONDS)).isTrue();
         }
     }
 
-    @Test void rechecksTheOriginalGuardWhenAQueuedReportReachesTheWriter() throws Exception {
+    @Test void queuedOffersRecheckTheirOriginalGuardOnTheWorker() {
         var active = new AtomicBoolean(true);
         var store = mock(SrsConsumerStore.class);
         var bound = bound(store, () -> { if (!active.get()) throw ScopedSrsConsumerAccess.refused(RUN); });
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newSingleThreadExecutor(task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(10, null)));
-            awaitRequests(writes, 1);
+        try (var writes = manualWrites(8, 8192)) {
+            var first = writes.offerWriter(bound, null, "run", "orders", "writer", progress(10, null));
             active.set(false);
             writes.flush();
             assertThatThrownBy(() -> first.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
@@ -361,102 +259,114 @@ class CheckpointProgressWritesTest {
         }
     }
 
-    @Test void coalescedDistinctTokensKeepEachAdmittedCallersBytesReserved() throws Exception {
-        var store = mock(SrsConsumerStore.class);
-        when(store.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenReturn(true);
+    @Test void coalescingReplacesTheOldPayloadAndReservesEachBoundedReceipt() throws Exception {
+        var store = successfulStore();
         var bound = bound(store, () -> {});
-        var threads = new CopyOnWriteArrayList<Thread>();
-        try (var callers = Executors.newFixedThreadPool(3, task -> thread(task, threads));
-             var writes = new CheckpointProgressWrites(8, 4096, 8, Duration.ofHours(1))) {
-            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(10, "a".repeat(200))));
-            awaitRequests(writes, 1);
-            var second = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(20, "b".repeat(200))));
-            awaitRequests(writes, 2);
-            var third = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(30, "c".repeat(200))));
-            awaitWaiting(threads, 3);
+        try (var writes = manualWrites(8, 4096)) {
+            var first = writes.offerWriter(bound, null, "run", "orders", "writer", progress(10, "a".repeat(500)));
+            var second = writes.offerWriter(bound, null, "run", "orders", "writer", progress(20, "b".repeat(500)));
             assertThat(writes.retainedRequests()).isEqualTo(2);
-            assertThat(writes.retainedBytes()).isBetween(2900L, 4096L);
+            assertThat(writes.retainedBytes()).isLessThan(4096L);
+            assertThatThrownBy(() -> writes.offerWriter(bound, null, "run", "orders", "writer", progress(30, "x".repeat(2000))))
+                    .isInstanceOf(TapstateException.class);
             writes.flush();
-            first.get(5, TimeUnit.SECONDS);
-            second.get(5, TimeUnit.SECONDS);
-            awaitRequests(writes, 1);
-            writes.flush();
-            third.get(5, TimeUnit.SECONDS);
+            assertThat(first.get(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(second.get(5, TimeUnit.SECONDS)).isTrue();
             var report = ArgumentCaptor.forClass(WriterProgress.class);
-            verify(store, times(2)).advanceWriter(eq(RUN.context()), eq(4L), eq("run"), eq("orders"), eq("writer"), report.capture(), eq(FENCE));
-            assertThat(report.getAllValues()).extracting(value -> value.lastTokened().token()).containsExactly("b".repeat(200), "c".repeat(200));
+            verify(store).advanceWriter(eq(RUN.context()), eq(4L), eq("run"), eq("orders"), eq("writer"), report.capture(), eq(FENCE));
+            assertThat(report.getValue().lastTokened().token()).isEqualTo("b".repeat(500));
             assertThat(writes.retainedBytes()).isZero();
-            assertThat(writes.retainedRequests()).isZero();
         }
     }
 
-    @Test void aCommittedReceiptRetainsItsCallerChargeUntilPostCommitVerificationReturns() throws Exception {
+    @Test void theWorkerKeepsAdmissionUntilPostCommitVerificationFinishes() throws Exception {
         var store = mock(SrsConsumerStore.class);
-        var committed = new AtomicBoolean();
-        var callerThread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        var persisted = new AtomicBoolean();
         var verifying = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var returned = new CountDownLatch(1);
         when(store.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
             assertThat(org.slf4j.MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY)).isEqualTo("pipeline");
-            committed.set(true);
+            persisted.set(true);
             return true;
         });
         var bound = bound(store, () -> {
-            if (Thread.currentThread() == callerThread.get() && committed.get()) {
+            if (persisted.get()) {
                 verifying.countDown();
                 try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
-                catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw StorageRuntime.unavailable();
-                }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw StorageRuntime.unavailable(); }
             }
         });
-        try (var callers = Executors.newSingleThreadExecutor();
-             var writes = new CheckpointProgressWrites(1, 8192, 1, Duration.ofHours(1))) {
-            var first = callers.submit(() -> {
-                callerThread.set(Thread.currentThread());
-                try { writes.writer(bound, null, "run", "orders", "writer", progress(10, "token")); }
-                finally { returned.countDown(); }
-            });
+        try (var flushing = Executors.newSingleThreadExecutor(); var writes = manualWrites(1, 8192)) {
+            var first = writes.offerWriter(bound, null, "run", "orders", "writer", progress(10, null));
+            var flush = flushing.submit(writes::flush);
             try {
-                awaitRequests(writes, 1);
-                org.slf4j.MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, "outer");
-                writes.flush();
-                assertThat(org.slf4j.MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY)).isEqualTo("outer");
                 assertThat(verifying.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(first).isNotDone();
                 assertThat(writes.retainedRequests()).isEqualTo(1);
-                assertThat(writes.retainedBytes()).isPositive();
-                first.cancel(true);
-                assertThat(returned.await(5, TimeUnit.SECONDS)).isTrue();
-                awaitRequests(writes, 0);
-                assertThat(writes.retainedBytes()).isZero();
-            } finally {
+                assertThatThrownBy(() -> writes.offerWriter(bound, null, "run", "orders", "writer", progress(20, null)))
+                        .isInstanceOf(TapstateException.class);
                 release.countDown();
-                org.slf4j.MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
-            }
+                flush.get(5, TimeUnit.SECONDS);
+                assertThat(first.get(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(writes.retainedRequests()).isZero();
+            } finally { release.countDown(); }
         }
     }
 
-    @Test void anInterruptedCallerCannotReleaseItsReceiptBeforeTheWriterRetiresIt() throws Exception {
+    @Test void explicitSynchronousWriterBoundariesStillWaitForTheOriginalRefusal() throws Exception {
+        var store = mock(SrsConsumerStore.class);
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        when(store.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return false;
+        });
+        try (var callers = Executors.newSingleThreadExecutor(); var writes = new CheckpointProgressWrites()) {
+            var caller = callers.submit(() -> writes.writer(bound(store, () -> {}), null, "run", "orders", "writer", progress(10, null)));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(caller).isNotDone();
+                release.countDown();
+                assertThatThrownBy(() -> caller.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(TapstateException.class)
+                        .satisfies(failure -> assertThat(((TapstateException) failure.getCause()).code())
+                                .isEqualTo(ScopedSrsConsumerAccess.refused(RUN).code()));
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test void cancellingAnOfferedReceiptDoesNotDiscardItsAlreadyAdmittedProgress() {
+        var store = successfulStore();
+        try (var writes = manualWrites(1, 8192)) {
+            var first = writes.offerWriter(bound(store, () -> {}), null, "run", "orders", "writer", progress(10, null));
+            first.cancel(true);
+            assertThatThrownBy(() -> writes.offerWriter(bound(store, () -> {}), null, "run", "orders", "other", progress(20, null)))
+                    .isInstanceOf(TapstateException.class);
+            writes.flush();
+            verify(store).advanceWriter(RUN.context(), 4, "run", "orders", "writer", progress(10, null), FENCE);
+            assertThat(writes.retainedRequests()).isZero();
+        }
+    }
+
+    @Test void closingRejectsPendingOffersWithTheExistingTypedUnavailableRefusal() {
+        var writes = manualWrites(1, 8192);
+        var first = writes.offerWriter(bound(mock(SrsConsumerStore.class), () -> {}), null, "run", "orders", "writer", progress(10, null));
+        writes.close();
+        assertThatThrownBy(() -> first.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+        assertThat(writes.retainedRequests()).isZero();
+        assertThatThrownBy(() -> writes.offerWriter(bound(mock(SrsConsumerStore.class), () -> {}), null, "run", "orders", "writer", progress(20, null)))
+                .isInstanceOf(TapstateException.class);
+    }
+
+    private static CheckpointProgressWrites manualWrites(int entries, long bytes) {
+        return new CheckpointProgressWrites(entries, bytes, entries, Duration.ofHours(1));
+    }
+
+    private static SrsConsumerStore successfulStore() {
         var store = mock(SrsConsumerStore.class);
         when(store.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenReturn(true);
-        var returned = new CountDownLatch(1);
-        try (var callers = Executors.newSingleThreadExecutor();
-             var writes = new CheckpointProgressWrites(1, 8192, 1, Duration.ofHours(1))) {
-            var first = callers.submit(() -> {
-                try { writes.writer(bound(store, () -> {}), null, "run", "orders", "writer", progress(10, "token")); }
-                finally { returned.countDown(); }
-            });
-            awaitRequests(writes, 1);
-            first.cancel(true);
-            assertThat(returned.await(5, TimeUnit.SECONDS)).isTrue();
-            assertThat(writes.retainedRequests()).isEqualTo(1);
-            assertThat(writes.retainedBytes()).isPositive();
-            writes.flush();
-            assertThat(writes.retainedRequests()).isZero();
-            assertThat(writes.retainedBytes()).isZero();
-        }
+        return store;
     }
 
     private static ScopedSrsConsumerAccess.Bound bound(SrsConsumerStore store, Runnable active) {
@@ -466,8 +376,7 @@ class CheckpointProgressWritesTest {
 
     private static ScopedSrsConsumerAccess.Bound bound(String pipeline, SrsConsumerStore store) {
         var scope = new PipelineIntentScope("cluster", 3, "cache", pipeline, 7);
-        var fence = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, pipeline),
-                FENCE.owner(), 2, 5, 9);
+        var fence = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, pipeline), FENCE.owner(), 2, 5, 9);
         var run = SrsConsumerRun.of(scope, new SrsConsumerMembership(
                 new SrsConsumerContext(new SrsConsumerKey("chain", pipeline, "source"), 7), 4, false, Set.of("orders"), fence));
         return new ScopedSrsConsumerAccess.Bound(run, store, null, () -> {}, new SrsConsumerProgressReads(), store,
@@ -477,27 +386,5 @@ class CheckpointProgressWritesTest {
     private static WriterProgress progress(long sequence, String token) {
         var order = new SourceOrder(1, sequence);
         return new WriterProgress(order, token == null ? null : new ChainPosition(order, token));
-    }
-
-    private static Thread thread(Runnable task, List<Thread> threads) {
-        var thread = new Thread(task);
-        threads.add(thread);
-        return thread;
-    }
-
-    private static void awaitRequests(CheckpointProgressWrites writes, int count) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (writes.retainedRequests() != count) {
-            if (System.nanoTime() >= deadline) throw new AssertionError("progress reports did not reach the bounded entrance");
-            Thread.sleep(1);
-        }
-    }
-
-    private static void awaitWaiting(List<Thread> threads, int count) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (threads.stream().filter(thread -> thread.getState() == Thread.State.WAITING).count() < count) {
-            if (System.nanoTime() >= deadline) throw new AssertionError("progress callers did not reach their bounded wait");
-            Thread.sleep(1);
-        }
     }
 }

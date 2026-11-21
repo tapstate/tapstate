@@ -105,12 +105,13 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
     private final class Writer implements SinkAck {
         private static final long serialVersionUID = 1L;
         private final transient Map<SrsConsumerRun,Bound> bound;
-        // A settled row and its bound can report the same order. Keep successful receipts per writer,
+        // A settled row and its bound can report the same order. Keep admitted progress per writer,
         // so those bounds do not repeat the store transaction while other tables are waiting to write.
         private final transient Map<String,SourceOrder> reported = new HashMap<>();
         private final String writer;
         private final SinkAck direct;
         private final transient CheckpointProgressWrites progressWrites;
+        private final transient CheckpointWriteAcks receipts = new CheckpointWriteAcks();
         Writer(Map<SrsConsumerRun,Bound> bound,String writer,SinkAck direct, CheckpointProgressWrites progressWrites) {
             this.bound = bound; this.writer = writer; this.direct = direct; this.progressWrites = progressWrites;
         }
@@ -133,11 +134,18 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
             }
             var source = source(stream); var run = source.run(); var handle = bound.get(run);
             if (progressWrites != null) {
+                receipts.check();
                 if (progress.lastTokened() == null && progress.durableThrough().equals(reported.get(stream))) {
                     handle.withWriterStore(claimed, ignored -> {});
                     return;
                 }
-                progressWrites.writer(handle, claimed, runId, source.table(), writer, progress);
+                if (progress.durableThrough().seq() == SourceOrder.SNAPSHOT_SEQ) {
+                    receipts.await();
+                    progressWrites.writer(handle, claimed, runId, source.table(), writer, progress);
+                } else {
+                    receipts.track(progressWrites.offerWriter(handle, claimed, runId, source.table(), writer, progress),
+                            () -> refused(run));
+                }
                 reported.put(stream, progress.durableThrough());
                 return;
             }
@@ -147,5 +155,11 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
                 reported.put(stream,progress.durableThrough());
             });
         }
+        @Override public void flush(boolean complete) {
+            if (complete) receipts.await();
+            else receipts.check();
+            if (direct != null) direct.flush(complete);
+        }
+        @Override public void flushOnClose() { flush(true); }
     }
 }
