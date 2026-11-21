@@ -2,9 +2,12 @@ package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -13,6 +16,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,10 +31,12 @@ final class ProcessObservationWriter implements AutoCloseable {
     private static final long BATCH_BYTES = 4L * 1024 * 1024;
     private final MongoCacheDomain cache;
     private final Map<String, Stage> pending = new LinkedHashMap<>();
+    private final ArrayDeque<History> pendingHistory = new ArrayDeque<>();
     private final Map<String, Long> historyAttempts = new LinkedHashMap<>();
     private final java.util.function.LongSupplier nanoTime;
     private long historySequence;
     private final ReentrantLock writing = new ReentrantLock();
+    private final AtomicBoolean draining = new AtomicBoolean();
     private final ScheduledThreadPoolExecutor timer;
     private long retainedBytes;
     private int inFlight;
@@ -59,19 +65,29 @@ final class ProcessObservationWriter implements AutoCloseable {
 
     record Usage(int pending, int inFlight, long retainedBytes) {}
     Usage usage() {
-        synchronized (pending) { return new Usage(pending.size(), inFlight, retainedBytes); }
+        synchronized (pending) { return new Usage(pending.size() + pendingHistory.size(), inFlight, retainedBytes); }
+    }
+
+    record History(String pipeline, Instant observedAt, long bytes, Runnable append) {
+        History(RateSample sample, Runnable append) {
+            this(sample.pipelineId(), sample.observedAt(), historyBytes(sample), append);
+        }
+
+        History guardedBy(Runnable requireActive) {
+            return new History(pipeline, observedAt, bytes, () -> { requireActive.run(); append.run(); });
+        }
     }
 
     boolean submit(Stage stage, Runnable committed, Runnable failed) {
         return submit(stage, committed, null, failed);
     }
 
-    boolean submit(Stage stage, Runnable committed, Runnable sampled, Runnable failed) {
+    boolean submit(Stage stage, Runnable committed, History sampled, Runnable failed) {
         if (stage.observation == null) return true;
         stage.committed.add(committed);
-        stage.sampled = sampled;
+        stage.sampled = sampled == null ? null : sampled.guardedBy(stage.active);
         stage.failed = failed;
-        stage.bytes = estimatedBytes(stage.observation);
+        stage.bytes = estimatedBytes(stage.observation) + (sampled == null ? 0 : sampled.bytes());
         if (stage.bytes > MAX_BYTES) {
             LOG.debug("Publishing a large observation synchronously for pipeline {}", stage.pipeline());
             now(stage.pipeline(), () -> {
@@ -79,7 +95,7 @@ final class ProcessObservationWriter implements AutoCloseable {
                 if (failure != null) throw failure;
                 stage.active.run();
                 stage.committed.forEach(Runnable::run);
-                if (sampled != null) sampled.run();
+                offerHistory(stage.sampled);
             });
             return true;
         }
@@ -88,7 +104,7 @@ final class ProcessObservationWriter implements AutoCloseable {
             Stage previous = pending.get(stage.pipeline());
             long nextBytes = retainedBytes - (previous == null ? 0 : previous.bytes) + stage.bytes;
             accepted = !closed && nextBytes <= MAX_BYTES
-                    && (previous != null || pending.size() + inFlight < MAX_ENTRIES);
+                    && (previous != null || pending.size() + pendingHistory.size() + inFlight < MAX_ENTRIES);
             if (accepted) {
                 pending.put(stage.pipeline(), stage);
                 retainedBytes = nextBytes;
@@ -99,6 +115,21 @@ final class ProcessObservationWriter implements AutoCloseable {
             failed.run();
         }
         return accepted;
+    }
+
+    /** Already committed synchronous publications hand off only their compact sample. */
+    void offerHistory(History sample) {
+        if (sample == null) return;
+        synchronized (pending) {
+            if (closed) return;
+            if (pending.size() + pendingHistory.size() + inFlight < MAX_ENTRIES
+                    && retainedBytes + sample.bytes() <= MAX_BYTES) {
+                pendingHistory.addLast(sample);
+                retainedBytes += sample.bytes();
+                return;
+            }
+        }
+        LOG.warn("History write capacity is exhausted for pipeline {}", sample.pipeline());
     }
 
     /** Lifecycle barriers use the same entrance and finish before their checkpoint transition proceeds. */
@@ -126,6 +157,14 @@ final class ProcessObservationWriter implements AutoCloseable {
                     iterator.remove();
                 }
             }
+            var history = pendingHistory.iterator();
+            while (history.hasNext()) {
+                History sample = history.next();
+                if (!pipelines.contains(sample.pipeline())) {
+                    retainedBytes -= sample.bytes();
+                    history.remove();
+                }
+            }
             var attempts = historyAttempts.keySet().iterator();
             while (attempts.hasNext()) {
                 String pipeline = attempts.next();
@@ -138,65 +177,116 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     void flush() {
-        if (!writing.tryLock()) return;
+        if (!draining.compareAndSet(false, true)) return;
         List<Stage> batch = new ArrayList<>();
         try {
-            synchronized (pending) {
-                if (closed) return;
-                long bytes = 0;
-                var iterator = pending.values().iterator();
-                while (iterator.hasNext() && batch.size() < BATCH_ENTRIES) {
-                    Stage next = iterator.next();
-                    if (!batch.isEmpty() && bytes + next.bytes > BATCH_BYTES) break;
-                    batch.add(next);
-                    bytes += next.bytes;
-                    iterator.remove();
-                }
-                inFlight = batch.size();
+            var history = new ArrayList<History>();
+            if (writing.tryLock()) {
+                try { writeObservations(batch, history); }
+                finally { writing.unlock(); }
             }
-            if (batch.isEmpty()) return;
-            List<RuntimeException> results;
-            try {
-                results = cache.writeObservations(batch.stream().map(Stage::write).toList());
-            } catch (RuntimeException failure) {
-                results = java.util.Collections.nCopies(batch.size(), failure);
-            }
-            var history = new ArrayList<Stage>();
-            for (int index = 0; index < batch.size(); index++) {
-                Stage stage = batch.get(index);
-                try {
-                    RuntimeException failure = results.get(index);
-                    inPipeline(stage.pipeline(), () -> {
-                        if (failure == null) {
-                            stage.active.run();
-                            stage.committed.forEach(Runnable::run);
-                            if (stage.sampled != null) history.add(stage);
-                        } else {
-                            LOG.warn("Could not publish the observation of pipeline {}", stage.pipeline(), failure);
-                            stage.failed.run();
-                        }
-                    });
-                } catch (RuntimeException failure) {
-                    LOG.warn("Observation follow-up failed for pipeline {}", stage.pipeline(), failure);
-                }
-            }
-            synchronized (pending) {
-                history.sort(java.util.Comparator.comparingLong(stage -> historyAttempt(stage.pipeline())));
-            }
-            long historyDeadline = nanoTime.getAsLong() + Duration.ofSeconds(2).toNanos();
-            for (Stage stage : history) {
-                if (nanoTime.getAsLong() >= historyDeadline) break;
-                if (!rememberHistoryAttempt(stage.pipeline())) continue;
-                try { inPipeline(stage.pipeline(), stage.sampled); }
-                catch (RuntimeException failure) { LOG.warn("Could not sample the history of pipeline {}", stage.pipeline(), failure); }
-            }
+            appendHistory(history);
         } finally {
             synchronized (pending) {
                 for (Stage stage : batch) retainedBytes -= stage.bytes;
-                inFlight = 0;
+                inFlight -= batch.size();
             }
-            writing.unlock();
+            draining.set(false);
         }
+    }
+
+    private void writeObservations(List<Stage> batch, List<History> history) {
+        synchronized (pending) {
+            if (closed) return;
+            long bytes = 0;
+            var iterator = pending.values().iterator();
+            while (iterator.hasNext() && batch.size() < BATCH_ENTRIES) {
+                Stage next = iterator.next();
+                if (!batch.isEmpty() && bytes + next.bytes > BATCH_BYTES) break;
+                batch.add(next);
+                bytes += next.bytes;
+                iterator.remove();
+            }
+            inFlight += batch.size();
+        }
+        if (batch.isEmpty()) return;
+        List<RuntimeException> results;
+        try {
+            results = cache.writeObservations(batch.stream().map(Stage::write).toList());
+        } catch (RuntimeException failure) {
+            results = java.util.Collections.nCopies(batch.size(), failure);
+        }
+        for (int index = 0; index < batch.size(); index++) {
+            Stage stage = batch.get(index);
+            try {
+                RuntimeException failure = results.get(index);
+                inPipeline(stage.pipeline(), () -> {
+                    if (failure == null) {
+                        stage.active.run();
+                        stage.committed.forEach(Runnable::run);
+                        if (stage.sampled != null) history.add(stage.sampled);
+                    } else {
+                        LOG.warn("Could not publish the observation of pipeline {}", stage.pipeline(), failure);
+                        stage.failed.run();
+                    }
+                });
+            } catch (RuntimeException failure) {
+                LOG.warn("Observation follow-up failed for pipeline {}", stage.pipeline(), failure);
+            }
+        }
+    }
+
+    private void appendHistory(List<History> recentlyCommitted) {
+        long deadline = nanoTime.getAsLong() + Duration.ofSeconds(2).toNanos();
+        for (int index = 0; index < BATCH_ENTRIES && nanoTime.getAsLong() < deadline; index++) {
+            HistoryAttempt attempt = takeHistory(recentlyCommitted);
+            if (attempt == null) return;
+            History sample = attempt.sample();
+            try {
+                if (rememberHistoryAttempt(sample.pipeline())) inPipeline(sample.pipeline(), sample.append());
+            } catch (RuntimeException failure) {
+                LOG.warn("Could not sample the history of pipeline {}", sample.pipeline(), failure);
+            } finally {
+                if (attempt.queued()) {
+                    synchronized (pending) {
+                        retainedBytes -= sample.bytes();
+                        inFlight--;
+                    }
+                }
+            }
+        }
+    }
+
+    private record HistoryAttempt(History sample, boolean queued) {}
+
+    private HistoryAttempt takeHistory(List<History> recentlyCommitted) {
+        synchronized (pending) {
+            if (closed) return null;
+            History first = firstHistory(recentlyCommitted);
+            History waiting = firstHistory(pendingHistory);
+            if (waiting != null && (first == null || compareHistory(waiting, first) <= 0)) {
+                pendingHistory.remove(waiting);
+                inFlight++;
+                return new HistoryAttempt(waiting, true);
+            }
+            if (first == null) return null;
+            recentlyCommitted.remove(first);
+            return new HistoryAttempt(first, false);
+        }
+    }
+
+    private History firstHistory(Collection<History> samples) {
+        History first = null;
+        for (History sample : samples) {
+            if (first == null || compareHistory(sample, first) < 0) first = sample;
+        }
+        return first;
+    }
+
+    private int compareHistory(History left, History right) {
+        int attempt = Long.compare(historyAttempts.getOrDefault(left.pipeline(), Long.MIN_VALUE),
+                historyAttempts.getOrDefault(right.pipeline(), Long.MIN_VALUE));
+        return attempt != 0 ? attempt : left.observedAt().compareTo(right.observedAt());
     }
 
     private static void inPipeline(String pipeline, Runnable action) {
@@ -207,10 +297,6 @@ final class ProcessObservationWriter implements AutoCloseable {
             if (previous == null) MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
             else MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, previous);
         }
-    }
-
-    private long historyAttempt(String pipeline) {
-        synchronized (pending) { return historyAttempts.getOrDefault(pipeline, Long.MIN_VALUE); }
     }
 
     private boolean rememberHistoryAttempt(String pipeline) {
@@ -231,11 +317,20 @@ final class ProcessObservationWriter implements AutoCloseable {
 
     private static long historyBytes(String pipeline) { return 96 + stringBytes(pipeline); }
 
+    private static long historyBytes(RateSample sample) {
+        long bytes = 512 + stringBytes(sample.pipelineId());
+        for (String counter : sample.counters().keySet()) bytes += 96 + stringBytes(counter);
+        for (String table : sample.lag().keySet()) bytes += 96 + stringBytes(table);
+        return bytes * 2;
+    }
+
     @Override public void close() {
         synchronized (pending) {
             closed = true;
             for (Stage stage : pending.values()) retainedBytes -= stage.bytes;
             pending.clear();
+            for (History sample : pendingHistory) retainedBytes -= sample.bytes();
+            pendingHistory.clear();
             for (String pipeline : historyAttempts.keySet()) retainedBytes -= historyBytes(pipeline);
             historyAttempts.clear();
         }
@@ -251,7 +346,7 @@ final class ProcessObservationWriter implements AutoCloseable {
         private long epoch;
         private long bytes;
         private Runnable failed = () -> {};
-        private Runnable sampled;
+        private History sampled;
         private Runnable active;
 
         private Stage(PipelineConvergencePass pass) {

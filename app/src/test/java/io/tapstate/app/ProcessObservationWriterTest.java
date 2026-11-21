@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -90,6 +91,7 @@ class ProcessObservationWriterTest {
             for (int pipeline = 0; pipeline < 1024; pipeline++)
                 assertThat(writer.submit(stage(writer, "p" + pipeline, 1), () -> {}, () -> {})).isTrue();
             assertThat(writer.submit(stage(writer, "overflow", 1), () -> {}, () -> {})).isFalse();
+            writer.offerHistory(history("synchronous-overflow", 1, () -> {}));
             assertThat(writer.usage().pending()).isEqualTo(1024);
             writer.retain(List.of("p0"));
             assertThat(writer.usage().pending()).isOne();
@@ -120,6 +122,50 @@ class ProcessObservationWriterTest {
         }
     }
 
+    @Test void aLifecyclePublicationCompletesWhileAnIndependentHistoryAppendIsBlocked() throws Exception {
+        var cache = mock(MongoCacheDomain.class);
+        when(cache.writeObservations(anyList())).thenAnswer(call -> Collections.nCopies(((List<?>) call.getArgument(0)).size(), null));
+        var appending = new CountDownLatch(1);
+        var releaseHistory = new CountDownLatch(1);
+        var publishing = new CountDownLatch(1);
+        var samples = new AtomicInteger();
+        try (var writer = new ProcessObservationWriter(cache, false); var workers = Executors.newFixedThreadPool(2)) {
+            writer.submit(stage(writer, "slow", 1), () -> {}, history("slow", 1, () -> {
+                appending.countDown();
+                try {
+                    assertThat(releaseHistory.await(5, TimeUnit.SECONDS)).isTrue();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+                samples.incrementAndGet();
+            }), () -> {});
+            var flush = workers.submit(writer::flush);
+            try {
+                assertThat(appending.await(5, TimeUnit.SECONDS)).isTrue();
+                var barrier = workers.submit(() -> {
+                    publishing.countDown();
+                    writer.now("completing", () -> writer.offerHistory(history("completing", 2, () -> {
+                        assertThat(samples).hasValue(1);
+                        samples.incrementAndGet();
+                    })));
+                });
+                assertThat(publishing.await(5, TimeUnit.SECONDS)).isTrue();
+                barrier.get(1, TimeUnit.SECONDS);
+                assertThat(flush.isDone()).isFalse();
+                writer.flush();
+                assertThat(samples).hasValue(0);
+                assertThat(writer.usage().inFlight()).isOne();
+                assertThat(writer.usage().pending()).isOne();
+            } finally {
+                releaseHistory.countDown();
+            }
+            flush.get(5, TimeUnit.SECONDS);
+            writer.flush();
+            assertThat(samples).hasValue(2);
+        }
+    }
+
     @Test void slowFailingHistoryRotatesBehindHealthyPipelinesWithinABoundedFlushAllowance() {
         var cache = mock(MongoCacheDomain.class);
         when(cache.writeObservations(anyList())).thenAnswer(call -> Collections.nCopies(((List<?>) call.getArgument(0)).size(), null));
@@ -129,13 +175,13 @@ class ProcessObservationWriterTest {
             var histories = new ArrayList<String>();
             for (int round = 0; round < 2; round++) {
                 for (String pipeline : List.of("slow", "healthy-a", "healthy-b")) {
-                    writer.submit(stage(writer, pipeline, round), durable::incrementAndGet, () -> {
+                    writer.submit(stage(writer, pipeline, round), durable::incrementAndGet, history(pipeline, round, () -> {
                         histories.add(pipeline);
                         if (pipeline.equals("slow")) {
                             time.addAndGet(TimeUnit.SECONDS.toNanos(2));
                             throw new IllegalStateException("fixture history timeout");
                         }
-                    }, () -> {});
+                    }), () -> {});
                 }
                 writer.flush();
                 if (round == 0) assertThat(histories).containsExactly("slow");
@@ -165,12 +211,18 @@ class ProcessObservationWriterTest {
             writer.flush();
             assertThat(sizes).containsExactly(1);
             var synchronous = writer.stage(pass("synchronous"));
+            var sampled = new AtomicInteger();
             synchronous.wrap(mock(ObservationStore.class)).save(new Observation("synchronous", PipelineState.RUNNING,
                     Map.of(), Map.of(), Map.of("table", "x".repeat(4_300_000)), null, AT), 1);
-            assertThat(writer.submit(synchronous, committed::incrementAndGet, () -> {})).isTrue();
+            assertThat(writer.submit(synchronous, committed::incrementAndGet,
+                    history("synchronous", 0, sampled::incrementAndGet), () -> {})).isTrue();
             assertThat(sizes).containsExactly(1, 1);
             assertThat(committed).hasValue(2);
-            assertThat(writer.usage()).isEqualTo(new ProcessObservationWriter.Usage(0, 0, 0));
+            assertThat(sampled).hasValue(0);
+            assertThat(writer.usage().retainedBytes()).isLessThan(1024 * 1024);
+            writer.flush();
+            assertThat(sampled).hasValue(1);
+            assertThat(sizes).containsExactly(1, 1);
         }
     }
 
@@ -221,11 +273,16 @@ class ProcessObservationWriterTest {
             stage.wrap(checked).save(new Observation("orders", PipelineState.RUNNING,
                     Map.of("records.out", 1L), Map.of(), Map.of(), null, AT), 1);
             var callbacks = new ArrayList<String>();
-            writer.submit(stage, () -> callbacks.add("alert"), () -> callbacks.add("history"), () -> callbacks.add("failed"));
+            writer.submit(stage, () -> callbacks.add("alert"), history("orders", 0, () -> callbacks.add("history")),
+                    () -> callbacks.add("failed"));
             writer.flush();
             assertThat(callbacks).isEmpty();
             assertThat(writer.usage()).isEqualTo(new ProcessObservationWriter.Usage(0, 0, 0));
         }
+    }
+
+    private static ProcessObservationWriter.History history(String pipeline, long seconds, Runnable append) {
+        return new ProcessObservationWriter.History(new RateSample(pipeline, AT.plusSeconds(seconds), Map.of("recordCount", 1L), Map.of(), null), append);
     }
 
     private static ProcessObservationWriter.Stage stage(ProcessObservationWriter writer, String pipeline, long count) {

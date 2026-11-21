@@ -136,36 +136,72 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
     }
     @Override public boolean advanceWriter(DirectChannelContext context, long epoch, String runId,
             String table, String writer, WriterProgress report, WorkloadClaimFence pipeline) {
-        return advanceWriters(context, epoch, runId, List.of(new WriterProgressUpdate(table, writer, report)), pipeline);
+        return advanceWriters(context, epoch, runId, List.of(new WriterProgressUpdate(table, writer, report)), pipeline, true)
+                .getFirst().committedOrThrow();
     }
 
-    @Override public boolean advanceWriters(DirectChannelContext context, long epoch, String runId,
+    @Override public List<WriterProgressOutcome> advanceWriters(DirectChannelContext context, long epoch, String runId,
             List<WriterProgressUpdate> reports, WorkloadClaimFence pipeline) {
-        List<WriterProgressUpdate> original = List.copyOf(reports);
-        if (original.isEmpty()) return true;
-        return transaction(context, pipeline, (session, first) -> {
-            var held = first;
-            for (int i = 0; i < original.size(); i++) {
-                var update = original.get(i);
-                var old = held.value();
-                var current = old.current();
-                var run = old.writerRun();
-                if (current == null || current.epoch() != epoch || run == null || !run.accounting().runId().equals(runId))
-                    return false;
-                if (!current.pipelineFence().equals(pipeline) || !run.commandFence().equals(pipeline)) throw fenced();
-                if (!run.accounting().expectedFor(update.table()).contains(update.writerId())) throw unavailable(context);
-                if (current.anchor() == null && !snapshotBeforeRequestedAnchor(old, update.progress())) throw unavailable(context);
-                var next = DirectChannelAccounting.report(old, update.table(), update.writerId(), update.progress());
-                if (!next.cursor().equals(old.cursor()) || !next.writers().equals(run)) {
-                    if (current.anchor() == null)
-                        replace(session, old, next(old, current, old.retained(), next.cursor(), next.writers()), held.current(), held.retained());
-                    else settleAndReplace(session, old, current, next.cursor(), next.writers(), held.current());
-                }
-                if (i + 1 < original.size()) held = held(session, context);
-            }
-            return true;
-        });
+        return advanceWriters(context, epoch, runId, reports, pipeline, false);
     }
+
+    private List<WriterProgressOutcome> advanceWriters(DirectChannelContext context, long epoch, String runId,
+            List<WriterProgressUpdate> reports, WorkloadClaimFence pipeline, boolean throwRefusal) {
+        List<WriterProgressUpdate> original = List.copyOf(reports);
+        if (original.isEmpty()) return List.of();
+        try {
+            return transaction(context, pipeline, (session, first) -> {
+                var current = first.value().current();
+                var run = first.value().writerRun();
+                if (current == null || current.epoch() != epoch || run == null || !run.accounting().runId().equals(runId))
+                    return Collections.nCopies(original.size(), new WriterProgressOutcome(false, null));
+                if (!current.pipelineFence().equals(pipeline) || !run.commandFence().equals(pipeline)) throw fenced();
+                var outcomes = new ArrayList<WriterProgressOutcome>(original.size());
+                var held = first;
+                for (int i = 0; i < original.size(); i++) {
+                    var update = original.get(i);
+                    var old = held.value();
+                    RuntimeException refusal = reportRefusal(context, old, update);
+                    if (refusal != null) {
+                        if (throwRefusal) throw refusal;
+                        outcomes.add(new WriterProgressOutcome(false, refusal));
+                        continue;
+                    }
+                    var next = DirectChannelAccounting.report(old, update.table(), update.writerId(), update.progress());
+                    if (!next.cursor().equals(old.cursor()) || !next.writers().equals(old.writerRun())) {
+                        if (current.anchor() == null)
+                            replace(session, old, next(old, current, old.retained(), next.cursor(), next.writers()), held.current(), held.retained());
+                        else settleAndReplace(session, old, old.current(), next.cursor(), next.writers(), held.current());
+                    }
+                    outcomes.add(new WriterProgressOutcome(true, null));
+                    if (i + 1 < original.size()) held = held(session, context);
+                }
+                if (outcomes.stream().noneMatch(WriterProgressOutcome::committed)) throw new UnchangedReports(outcomes);
+                return List.copyOf(outcomes);
+            });
+        } catch (UnchangedReports refused) {
+            return refused.outcomes;
+        }
+    }
+
+    private static final class UnchangedReports extends RuntimeException {
+        private final List<WriterProgressOutcome> outcomes;
+        private UnchangedReports(List<WriterProgressOutcome> outcomes) {
+            super(null, null, false, false);
+            this.outcomes = List.copyOf(outcomes);
+        }
+    }
+
+
+    private static RuntimeException reportRefusal(DirectChannelContext context, DirectChannelProgress original,
+            WriterProgressUpdate report) {
+        if (report.writerId() == null) return new NullPointerException("writerId");
+        if (!original.writerRun().accounting().expectedFor(report.table()).contains(report.writerId())
+                || original.current().anchor() == null && !snapshotBeforeRequestedAnchor(original, report.progress()))
+            return unavailable(context);
+        return null;
+    }
+
     private static boolean snapshotBeforeRequestedAnchor(DirectChannelProgress old, WriterProgress report) {
         var pending = old.resumeOverride(); var cursor = old.cursor();
         if (pending == null || old.epoch() <= pending.fromEpoch() || cursor.snapshotEpoch() < 1) return false;

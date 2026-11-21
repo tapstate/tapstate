@@ -67,25 +67,33 @@ public final class RateSampler {
     /** The original Pipeline scope owns both the cadence and this invocation's destination. */
     public void offer(Observation observation, io.tapstate.spi.store.PipelineIntentScope scope, RateHistoryStore destination) {
         Objects.requireNonNull(observation, "observation"); Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(destination, "destination");
-        if (!scope.pipelineId().equals(observation.pipelineId())) throw new io.tapstate.core.common.TapstateException(
-                io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        requirePipeline(observation.pipelineId(), scope);
         offer(scope, observation, destination);
     }
 
+    /** Offers a sample prepared from an already published observation. */
+    public void offerPrepared(RateSample sample, io.tapstate.spi.store.PipelineIntentScope scope, RateHistoryStore destination) {
+        requirePipeline(sample.pipelineId(), scope);
+        appendWhenDue(scope, sample, destination);
+    }
+
+    private static void requirePipeline(String pipeline, io.tapstate.spi.store.PipelineIntentScope scope) {
+        if (!scope.pipelineId().equals(pipeline)) throw new io.tapstate.core.common.TapstateException(
+                io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
     private void offer(Object key, Observation observation, RateHistoryStore destination) {
-        if (observation.observedAt() == null) {
-            return;
-        }
         RateSample sample = sampleOf(observation);
-        if (sample == null) {
-            return;
-        }
-        Cadence last = lastSampledAt.get(observation.pipelineId());
-        if (last != null && key.equals(last.scope()) && observation.observedAt().isBefore(last.at().plus(interval))) {
+        if (sample != null) appendWhenDue(key, sample, destination);
+    }
+
+    private void appendWhenDue(Object key, RateSample sample, RateHistoryStore destination) {
+        Cadence last = lastSampledAt.get(sample.pipelineId());
+        if (last != null && key.equals(last.scope()) && sample.observedAt().isBefore(last.at().plus(interval))) {
             return;
         }
         destination.append(sample);
-        lastSampledAt.put(observation.pipelineId(), new Cadence(key, observation.observedAt()));
+        lastSampledAt.put(sample.pipelineId(), new Cadence(key, sample.observedAt()));
     }
 
     /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */
@@ -94,8 +102,8 @@ public final class RateSampler {
     }
 
     /** The sample {@code observation} yields, or {@code null} when it carries nothing to draw a line from. */
-    static RateSample sampleOf(Observation observation) {
-        if (observation.state() == PipelineState.COMPLETED) {
+    public static RateSample sampleOf(Observation observation) {
+        if (observation.observedAt() == null || observation.state() == PipelineState.COMPLETED) {
             return null;
         }
         Map<String, Long> counters = new LinkedHashMap<>();

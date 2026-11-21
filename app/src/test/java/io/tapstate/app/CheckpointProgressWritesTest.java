@@ -54,7 +54,8 @@ class CheckpointProgressWritesTest {
 
     @Test void batchesDistinctWritersOnlyWithinTheirOriginalRun() throws Exception {
         var store = mock(SrsConsumerStore.class);
-        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(true);
+        var committed = new WriterProgressOutcome(true, null);
+        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(List.of(committed, committed));
         var bound = bound(store, () -> {});
         var threads = new CopyOnWriteArrayList<Thread>();
         try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
@@ -75,7 +76,8 @@ class CheckpointProgressWritesTest {
 
     @Test void aRefusedAtomicBatchRefusesEveryIncludedCaller() throws Exception {
         var store = mock(SrsConsumerStore.class);
-        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(false);
+        var refused = new WriterProgressOutcome(false, null);
+        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(List.of(refused, refused));
         var bound = bound(store, () -> {});
         var threads = new CopyOnWriteArrayList<Thread>();
         try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
@@ -88,6 +90,46 @@ class CheckpointProgressWritesTest {
             for (var caller : List.of(first, second))
                 assertThatThrownBy(() -> caller.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
             verify(store).advanceWriters(eq(RUN.context()), eq(4L), eq("run"), anyList(), eq(FENCE));
+        }
+    }
+
+    @Test void aDeterministicallyRefusedSiblingKeepsItsExactErrorWithoutFailingAValidReceipt() throws Exception {
+        var store = mock(SrsConsumerStore.class);
+        var refused = new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE, java.util.Map.of("chain", "chain"), null);
+        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenReturn(List.of(
+                new WriterProgressOutcome(true, null), new WriterProgressOutcome(false, refused)));
+        var bound = bound(store, () -> {});
+        var threads = new CopyOnWriteArrayList<Thread>();
+        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
+             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
+            var valid = callers.submit(() -> writes.writer(bound, null, "run", "orders", "valid", progress(10, "token-10")));
+            awaitRequests(writes, 1);
+            var invalid = callers.submit(() -> writes.writer(bound, null, "run", "orders", "unknown", progress(20, "token-20")));
+            awaitRequests(writes, 2);
+            writes.flush();
+            Throwable validFailure = catchThrowable(() -> valid.get(5, TimeUnit.SECONDS));
+            assertThatThrownBy(() -> invalid.get(5, TimeUnit.SECONDS)).hasCause(refused);
+            assertThat(validFailure).as("a valid original receipt must remain independent of its refused sibling").isNull();
+            verify(store, never()).advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any());
+        }
+    }
+
+    @Test void anOutcomeUnknownBatchMustNotReplayIndividualWriterReports() throws Exception {
+        var store = mock(SrsConsumerStore.class);
+        var unknown = new TapstateException(IoError.STORE_UNAVAILABLE, java.util.Map.of("detail", "fixture outcome unknown"), null);
+        when(store.advanceWriters(any(), anyLong(), anyString(), anyList(), any())).thenThrow(unknown);
+        var bound = bound(store, () -> {});
+        var threads = new CopyOnWriteArrayList<Thread>();
+        try (var callers = Executors.newFixedThreadPool(2, task -> thread(task, threads));
+             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
+            var first = callers.submit(() -> writes.writer(bound, null, "run", "orders", "first", progress(10, "token-10")));
+            awaitRequests(writes, 1);
+            var second = callers.submit(() -> writes.writer(bound, null, "run", "orders", "second", progress(20, "token-20")));
+            awaitRequests(writes, 2);
+            writes.flush();
+            assertThatThrownBy(() -> first.get(5, TimeUnit.SECONDS)).hasCause(unknown);
+            assertThatThrownBy(() -> second.get(5, TimeUnit.SECONDS)).hasCause(unknown);
+            verify(store, never()).advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any());
         }
     }
 
@@ -108,6 +150,56 @@ class CheckpointProgressWritesTest {
             verify(store).advanceWriter(RUN.context(), 4, "first", "orders", "writer", progress(10, null), FENCE);
             verify(store).advanceWriter(RUN.context(), 4, "second", "orders", "writer", progress(20, null), FENCE);
             verify(store, never()).advanceWriters(any(), anyLong(), anyString(), anyList(), any());
+        }
+    }
+
+    @Test void anIndependentPipelineReceiptDoesNotWaitForAStalledCommit() throws Exception {
+        var slowStore = mock(SrsConsumerStore.class);
+        var fastStore = mock(SrsConsumerStore.class);
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var healthyScope = new PipelineIntentScope("cluster", 3, "cache", "shipments", 7);
+        var healthyClaim = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "shipments"), FENCE.owner(), 2, 5, 9);
+        var healthyRun = SrsConsumerRun.of(healthyScope, new SrsConsumerMembership(
+                new SrsConsumerContext(new SrsConsumerKey("chain", "shipments", "source"), 7), 4, false,
+                Set.of("orders"), healthyClaim));
+        var healthy = new ScopedSrsConsumerAccess.Bound(healthyRun, fastStore, null, () -> {}, new SrsConsumerProgressReads(),
+                fastStore, null, new ExecutionFence(healthyScope, healthyClaim), new ThreadLocal<>());
+        var slow = bound(slowStore, () -> {});
+        when(slowStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return true;
+        });
+        when(fastStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenReturn(true);
+        var threads = new CopyOnWriteArrayList<Thread>();
+        try (var callers = Executors.newFixedThreadPool(3, task -> thread(task, threads));
+             var flushing = Executors.newSingleThreadExecutor();
+             var writes = new CheckpointProgressWrites(8, 8192, 8, Duration.ofHours(1))) {
+            var first = callers.submit(() -> writes.writer(slow, null, "run", "orders", "writer", progress(10, null)));
+            awaitRequests(writes, 1);
+            var second = callers.submit(() -> writes.writer(healthy, null, "run", "orders", "writer", progress(10, null)));
+            awaitRequests(writes, 2);
+            var flush = flushing.submit(writes::flush);
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                second.get(1, TimeUnit.SECONDS);
+                assertThat(first).isNotDone();
+                awaitRequests(writes, 1);
+                var samePipeline = callers.submit(() -> writes.writer(slow, null, "run", "orders", "writer", progress(20, null)));
+                awaitRequests(writes, 2);
+                writes.flush();
+                assertThat(samePipeline).isNotDone();
+                verify(slowStore, times(1)).advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any());
+                release.countDown();
+                flush.get(5, TimeUnit.SECONDS);
+                first.get(5, TimeUnit.SECONDS);
+                writes.flush();
+                samePipeline.get(5, TimeUnit.SECONDS);
+            } finally {
+                release.countDown();
+            }
         }
     }
 

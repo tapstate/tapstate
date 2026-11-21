@@ -12,6 +12,11 @@ import org.bson.Document;
 
 import java.time.Instant;
 import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.TreeSet;
 import java.util.Objects;
 import java.util.WeakHashMap;
 import java.util.concurrent.Semaphore;
@@ -22,32 +27,79 @@ import java.util.Optional;
 /** Writes the native checkpoint within each caller's original CACHE transaction. */
 final class MongoCachePipelineStateStore implements StateStore {
     private static final int MAX_CALLERS = 1024;
-    private record Writer(ReentrantLock transaction, Semaphore capacity) {
-        private Writer() { this(new ReentrantLock(true), new Semaphore(MAX_CALLERS)); }
+    private static final class Lane {
+        private final String pipeline;
+        private final ReentrantLock transaction = new ReentrantLock(true);
+        private int users;
+        private Lane(String pipeline) { this.pipeline = pipeline; }
+    }
+
+    private static final class Writer {
+        private final Semaphore capacity = new Semaphore(MAX_CALLERS);
+        private final Map<String, Lane> lanes = new HashMap<>();
+
+        private synchronized boolean ownsAll(List<String> pipelines) {
+            return pipelines.stream().allMatch(pipeline -> {
+                Lane lane = lanes.get(pipeline);
+                return lane != null && lane.transaction.isHeldByCurrentThread();
+            });
+        }
+
+        private synchronized List<Lane> retain(List<String> pipelines) {
+            var retained = new ArrayList<Lane>(pipelines.size());
+            for (String pipeline : pipelines) {
+                Lane lane = lanes.computeIfAbsent(pipeline, Lane::new);
+                lane.users++;
+                retained.add(lane);
+            }
+            return retained;
+        }
+
+        private synchronized void release(List<Lane> retained) {
+            for (Lane lane : retained) {
+                if (--lane.users == 0) lanes.remove(lane.pipeline);
+            }
+        }
     }
 
     private static final Map<MongoClient, Writer> WRITERS = new WeakHashMap<>();
 
-    /** Admit a write before starting its transaction. Independent clients still contend at MongoDB. */
-    static <T> T writeTransaction(MongoClient client, Supplier<T> operation) {
+    /** Admit a Pipeline write before its transaction while preserving independent Pipeline progress. */
+    static <T> T writeTransaction(MongoClient client, String pipeline, Supplier<T> operation) {
+        return writeOrderedTransaction(client, List.of(pipeline), operation);
+    }
+
+    /** A transaction touching several Pipelines acquires their lanes in one stable order. */
+    static <T> T writeTransaction(MongoClient client, Collection<String> pipelines, Supplier<T> operation) {
+        return writeOrderedTransaction(client, List.copyOf(new TreeSet<>(pipelines)), operation);
+    }
+
+    private static <T> T writeOrderedTransaction(MongoClient client, List<String> selected, Supplier<T> operation) {
+        if (selected.isEmpty()) return operation.get();
         Writer writer;
         synchronized (WRITERS) {
             writer = WRITERS.computeIfAbsent(client, ignored -> new Writer());
         }
-        if (writer.transaction().isHeldByCurrentThread()) return operation.get();
-        if (!writer.capacity().tryAcquire()) throw unavailable("checkpoint writer capacity exhausted");
+        if (writer.ownsAll(selected)) return operation.get();
+        if (!writer.capacity.tryAcquire()) throw unavailable("checkpoint writer capacity exhausted");
         try {
-            writer.transaction().lockInterruptibly();
+            List<Lane> retained = writer.retain(selected);
+            int acquired = 0;
             try {
+                for (Lane lane : retained) {
+                    lane.transaction.lockInterruptibly();
+                    acquired++;
+                }
                 return operation.get();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw unavailable("checkpoint writer interrupted");
             } finally {
-                writer.transaction().unlock();
+                for (int index = acquired - 1; index >= 0; index--) retained.get(index).transaction.unlock();
+                writer.release(retained);
             }
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw unavailable("checkpoint writer interrupted");
         } finally {
-            writer.capacity().release();
+            writer.capacity.release();
         }
     }
 

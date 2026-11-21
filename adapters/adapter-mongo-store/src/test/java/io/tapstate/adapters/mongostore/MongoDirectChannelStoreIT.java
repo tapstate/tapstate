@@ -74,12 +74,74 @@ class MongoDirectChannelStoreIT {
             long fence = checkpoint.find(id).first().getLong("runtimeWriteFence");
             assertThat(f.store().advanceWriters(CONTEXT, 1, "run", List.of(
                     new WriterProgressUpdate("orders", "fast", point(1, 1)),
-                    new WriterProgressUpdate("orders", "slow", point(1, 1))), f.pipelineFence())).isTrue();
+                    new WriterProgressUpdate("orders", "slow", point(1, 1))), f.pipelineFence()))
+                    .containsExactly(new WriterProgressOutcome(true, null), new WriterProgressOutcome(true, null));
             assertThat(checkpoint.find(id).first().getLong("runtimeWriteFence")).isEqualTo(fence + 1);
             assertThat(f.store().pending(CONTEXT,1)).isEmpty(); assertThat(f.store().load(CONTEXT).cursor().sinkAcked()).isEqualTo(second.boundary());
             assertThat(f.store().recordBatch(first,0,f.captureFence(),f.pipelineFence())).isFalse();
         });
     }
+    @ParameterizedTest @ValueSource(booleans = {true, false})
+    void aValidWriterCommitsBesideAnInvalidSiblingWithItsOwnOutcome(boolean validFirst) {
+        withBusiness(f -> {
+            open(f);
+            var original = batch(1, 1, 2, Map.of("orders", 1L));
+            assertThat(f.store().recordBatch(original, 0, f.captureFence(), f.pipelineFence())).isTrue();
+            var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var id = new Document("_id", SCOPE.pipelineId());
+            long beforeFence = checkpoint.find(id).first().getLong("runtimeWriteFence");
+            var valid = new WriterProgressUpdate("orders", "fast", point(1, 1));
+            var invalid = new WriterProgressUpdate("orders", "unknown", point(1, 1));
+            var reports = validFirst ? List.of(valid, invalid) : List.of(invalid, valid);
+            var outcomes = f.store().advanceWriters(CONTEXT, 1, "run", reports, f.pipelineFence());
+            var accepted = outcomes.get(validFirst ? 0 : 1);
+            var refused = outcomes.get(validFirst ? 1 : 0);
+            assertThat(accepted).isEqualTo(new WriterProgressOutcome(true, null));
+            assertThat(refused.committed()).isFalse();
+            unavailable(refused.failure());
+            assertThatThrownBy(refused::committedOrThrow).isSameAs(refused.failure());
+            assertThat(f.store().load(CONTEXT).writerRun().accounting().progressFor("orders"))
+                    .containsEntry("fast", valid.progress()).doesNotContainKey("unknown");
+            assertThat(f.store().pending(CONTEXT, 1)).containsExactly(original);
+            assertThat(checkpoint.find(id).first().getLong("runtimeWriteFence")).isEqualTo(beforeFence + 1);
+        });
+    }
+
+    @Test void anAllInvalidBatchAndASingletonRefusalKeepTheirOriginalPhysicalState() {
+        withBusiness(f -> {
+            open(f);
+            var before = f.store().load(CONTEXT);
+            var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var id = new Document("_id", SCOPE.pipelineId());
+            var beforeCheckpoint = checkpoint.find(id).first();
+            var outcomes = f.store().advanceWriters(CONTEXT, 1, "run", List.of(
+                    new WriterProgressUpdate("orders", "unknown", point(1, 1)),
+                    new WriterProgressUpdate("orders", "other-unknown", point(1, 1))), f.pipelineFence());
+            assertThat(outcomes).hasSize(2).allSatisfy(outcome -> {
+                assertThat(outcome.committed()).isFalse();
+                unavailable(outcome.failure());
+            });
+            assertThatThrownBy(() -> f.store().advanceWriter(CONTEXT, 1, "run", "orders", "unknown", point(1, 1), f.pipelineFence()))
+                    .satisfies(MongoDirectChannelStoreIT::unavailable);
+            assertThatThrownBy(() -> f.store().advanceWriter(CONTEXT, 1, "run", "orders", null, point(1, 1), f.pipelineFence()))
+                    .isInstanceOf(NullPointerException.class);
+            assertThat(f.store().load(CONTEXT)).isEqualTo(before);
+            assertThat(checkpoint.find(id).first()).isEqualTo(beforeCheckpoint);
+        });
+    }
+
+    @Test void aWrongRunRefusesTheWholeBatchBeforeAnyWriterProgressCanAdvance() {
+        withBusiness(f -> {
+            open(f);
+            var before = f.store().load(CONTEXT);
+            assertThat(f.store().advanceWriters(CONTEXT, 1, "different-run", List.of(
+                    new WriterProgressUpdate("orders", "fast", point(1, 1)),
+                    new WriterProgressUpdate("orders", "slow", point(1, 1))), f.pipelineFence()))
+                    .containsExactly(new WriterProgressOutcome(false, null), new WriterProgressOutcome(false, null));
+            assertThat(f.store().load(CONTEXT)).isEqualTo(before);
+        });
+    }
+
     @Test void writerConfirmationBeforeManifestArrivalStillSettlesAtomicallyWhenItsBoundaryIsRegistered() {
         withBusiness(f -> {
             open(f); f.store().advanceWriter(CONTEXT,1,"run","orders","fast",point(1,1),f.pipelineFence());

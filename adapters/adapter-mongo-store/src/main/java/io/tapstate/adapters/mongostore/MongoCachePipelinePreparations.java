@@ -346,7 +346,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
 
     private <T> T checkpointTransaction(PipelineIntentScope scope, boolean admission, Runnable originalActive,
             Function<ClientSession, T> action) {
-        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(scope, admission, originalActive, action));
+        return MongoCachePipelineStateStore.writeTransaction(client, scope.pipelineId(), () -> transaction(scope, admission, originalActive, action));
     }
 
     private <T> T transaction(PipelineIntentScope scope, boolean admission, Runnable originalActive, Function<ClientSession, T> action) {

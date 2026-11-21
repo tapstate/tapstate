@@ -133,7 +133,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
         });
     }
     private <T> T checkpointTransaction(PipelineRetirementPreparation original, Function<ClientSession, T> action) {
-        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(original, action));
+        return MongoCachePipelineStateStore.writeTransaction(client, original.request().scope().pipelineId(), () -> transaction(original, action));
     }
     private <T>T transaction(PipelineRetirementPreparation original,Function<ClientSession,T> action) {
         return StoreIo.call(() -> {check(original);try(var session=client.startSession()) {

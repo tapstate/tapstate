@@ -106,14 +106,17 @@ public interface SrsConsumerStore {
     boolean advanceWriter(SrsConsumerContext context, long membershipRevision, String runId, String table, String writerId,
                           WriterProgress progress, WorkloadClaimFence originalPipelineFence);
 
-    /** Applies reports for one original run and returns only after the original store has committed them. */
-    default boolean advanceWriters(SrsConsumerContext context, long membershipRevision, String runId,
+    /** Returns one ordered outcome per original report after its owning store has committed. */
+    default List<WriterProgressOutcome> advanceWriters(SrsConsumerContext context, long membershipRevision, String runId,
             List<WriterProgressUpdate> reports, WorkloadClaimFence fence) {
+        var outcomes = new java.util.ArrayList<WriterProgressOutcome>(reports.size());
+        boolean stopped = false;
         for (var report : reports) {
-            if (!advanceWriter(context, membershipRevision, runId, report.table(), report.writerId(), report.progress(), fence))
-                return false;
+            boolean committed = !stopped && advanceWriter(context, membershipRevision, runId, report.table(), report.writerId(), report.progress(), fence);
+            outcomes.add(new WriterProgressOutcome(committed, null));
+            if (!committed) stopped = true;
         }
-        return true;
+        return List.copyOf(outcomes);
     }
 
     /**

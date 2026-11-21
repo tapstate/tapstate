@@ -4,36 +4,41 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.spi.store.WriterProgressOutcome;
 import io.tapstate.spi.store.WriterProgressUpdate;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.MDC;
 
 /** Bounded original-run progress folding with completion only after the owning store commits. */
 final class CheckpointProgressWrites implements AutoCloseable {
     static final String USER_CONTEXT_KEY = "tapstate.checkpoint-progress-writes";
     private static final int REQUEST_OVERHEAD = 512;
+    private static final int PARALLEL_PIPELINES = 4;
     private final int maximumEntries;
     private final long maximumBytes;
     private final int maximumBatch;
     private final Map<Key, Pending> pending = new LinkedHashMap<>();
+    private final Set<String> activePipelines = new HashSet<>();
+    private final Set<Thread> writers = new HashSet<>();
     private final ScheduledExecutorService worker;
     private long retainedBytes;
     private int callers;
     private int waitingCallers;
     private long waitingBytes;
     private boolean closed;
-    private Thread writing;
-    private boolean flushing;
 
     CheckpointProgressWrites() { this(1024, 4L * 1024 * 1024, 64, Duration.ofMillis(25)); }
 
@@ -43,8 +48,9 @@ final class CheckpointProgressWrites implements AutoCloseable {
         this.maximumEntries = maximumEntries;
         this.maximumBytes = maximumBytes;
         this.maximumBatch = maximumBatch;
-        worker = Executors.newSingleThreadScheduledExecutor(task -> ShutdownAwait.daemon(task, "checkpoint-progress-writes"));
-        worker.scheduleWithFixedDelay(this::flush, interval.toNanos(), interval.toNanos(), TimeUnit.NANOSECONDS);
+        worker = Executors.newScheduledThreadPool(PARALLEL_PIPELINES + 1,
+                task -> ShutdownAwait.daemon(task, "checkpoint-progress-writes"));
+        worker.scheduleWithFixedDelay(this::dispatch, interval.toNanos(), interval.toNanos(), TimeUnit.NANOSECONDS);
     }
 
     static CheckpointProgressWrites of(HazelcastInstance member) {
@@ -91,7 +97,7 @@ final class CheckpointProgressWrites implements AutoCloseable {
     }
 
     private synchronized Receipt admit(Request request) {
-        if (Thread.currentThread() == writing) throw new IllegalStateException("a progress write cannot wait on its own worker");
+        if (writers.contains(Thread.currentThread())) throw new IllegalStateException("a progress write cannot wait on its own worker");
         long callerBytes = request.bytes() + REQUEST_OVERHEAD;
         if (request.bytes() + callerBytes > maximumBytes) throw StorageRuntime.unavailable();
         Receipt receipt = tryAdmit(request, callerBytes);
@@ -139,25 +145,41 @@ final class CheckpointProgressWrites implements AutoCloseable {
     }
 
     void flush() {
-        List<Pending> batch = new ArrayList<>();
-        synchronized (this) {
-            if (flushing) return;
-            flushing = true;
-            writing = Thread.currentThread();
-            var iterator = pending.entrySet().iterator();
-            while (iterator.hasNext() && batch.size() < maximumBatch) {
-                batch.add(iterator.next().getValue());
-                iterator.remove();
-            }
+        dispatch().forEach(CompletableFuture::join);
+    }
+
+    private synchronized List<CompletableFuture<Void>> dispatch() {
+        int slots = PARALLEL_PIPELINES - activePipelines.size();
+        if (closed || slots == 0 || pending.isEmpty()) return List.of();
+        Map<String, List<Pending>> selected = new LinkedHashMap<>();
+        var iterator = pending.values().iterator();
+        int entries = 0;
+        while (iterator.hasNext() && entries < maximumBatch) {
+            var entry = iterator.next();
+            String pipeline = entry.request.pipeline();
+            if (activePipelines.contains(pipeline)) continue;
+            if (selected.size() == slots && !selected.containsKey(pipeline)) continue;
+            selected.computeIfAbsent(pipeline, ignored -> new ArrayList<>()).add(entry);
+            iterator.remove();
+            entries++;
         }
+        var dispatched = new ArrayList<CompletableFuture<Void>>(selected.size());
+        // Reserve a lane before submission; the executor never queues one task per report or per tick.
+        selected.forEach((pipeline, batch) -> {
+            activePipelines.add(pipeline);
+            dispatched.add(CompletableFuture.runAsync(() -> writePipeline(pipeline, batch), worker));
+        });
+        return dispatched;
+    }
+
+    private void writePipeline(String pipeline, List<Pending> batch) {
+        synchronized (this) { writers.add(Thread.currentThread()); }
         try {
-            for (List<Pending> group : groups(batch)) {
-                commit(group);
-            }
+            groups(batch).forEach(this::commit);
         } finally {
             synchronized (this) {
-                writing = null;
-                flushing = false;
+                writers.remove(Thread.currentThread());
+                activePipelines.remove(pipeline);
                 notifyAll();
             }
         }
@@ -167,8 +189,12 @@ final class CheckpointProgressWrites implements AutoCloseable {
         String previous = MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, group.getFirst().request.pipeline());
         try {
-            boolean committed = group.getFirst().request.commit(group.stream().map(entry -> entry.request).toList());
-            group.forEach(entry -> entry.completions.forEach(receipt -> receipt.completion.complete(committed)));
+            var outcomes = group.getFirst().request.commit(group.stream().map(entry -> entry.request).toList());
+            if (outcomes.size() != group.size()) throw new IllegalStateException("progress store returned the wrong number of receipts");
+            for (int index = 0; index < group.size(); index++) {
+                var outcome = outcomes.get(index);
+                group.get(index).completions.forEach(receipt -> receipt.complete(outcome));
+            }
         } catch (RuntimeException | Error failure) {
             group.forEach(entry -> entry.completions.forEach(receipt -> receipt.completion.completeExceptionally(failure)));
         } finally {
@@ -237,7 +263,7 @@ final class CheckpointProgressWrites implements AutoCloseable {
         Request merge(Request later);
         long bytes();
         void verify();
-        boolean commit(List<Request> batch);
+        List<WriterProgressOutcome> commit(List<Request> batch);
     }
     private record SrsWriter(ScopedSrsConsumerAccess.Bound bound, WorkloadClaimFence claimed, String runId,
                              String table, String writer, WriterProgress progress) implements Request {
@@ -248,21 +274,21 @@ final class CheckpointProgressWrites implements AutoCloseable {
         }
         @Override public long bytes() { return strings(runId, table, writer) + progressBytes(progress); }
         @Override public void verify() { bound.withWriterStore(claimed, ignored -> {}); }
-        @Override public boolean commit(List<Request> batch) {
+        @Override public List<WriterProgressOutcome> commit(List<Request> batch) {
             batch.forEach(Request::verify);
-            boolean[] result = {false};
+            var result = new AtomicReference<List<WriterProgressOutcome>>();
             bound.withWriterStore(claimed, store -> {
                 if (batch.size() == 1) {
-                    result[0] = store.advanceWriter(bound.run().context(), bound.run().membershipRevision(), runId,
-                            table, writer, progress, bound.run().originalClaim());
+                    result.set(receipt(store.advanceWriter(bound.run().context(), bound.run().membershipRevision(), runId,
+                            table, writer, progress, bound.run().originalClaim())));
                 } else {
-                    var updates = batch.stream().map(request -> (SrsWriter) request)
+                    var updates = batch.stream().map(SrsWriter.class::cast)
                             .map(request -> new WriterProgressUpdate(request.table, request.writer, request.progress)).toList();
-                    result[0] = store.advanceWriters(bound.run().context(), bound.run().membershipRevision(), runId,
-                            updates, bound.run().originalClaim());
+                    result.set(store.advanceWriters(bound.run().context(), bound.run().membershipRevision(), runId,
+                            updates, bound.run().originalClaim()));
                 }
             });
-            return result[0];
+            return result.get();
         }
     }
     private record SrsRead(ScopedSrsConsumerAccess.Bound bound, String table, long sequence) implements Request {
@@ -271,9 +297,10 @@ final class CheckpointProgressWrites implements AutoCloseable {
         @Override public Request merge(Request later) { return new SrsRead(bound, table, Math.max(sequence, ((SrsRead) later).sequence)); }
         @Override public long bytes() { return strings(table); }
         @Override public void verify() { bound.requireClaim(null); }
-        @Override public boolean commit(List<Request> batch) {
+        @Override public List<WriterProgressOutcome> commit(List<Request> batch) {
             batch.forEach(Request::verify);
-            return bound.store().advanceReadSequence(bound.run().context(), bound.run().membershipRevision(), table, sequence, bound.run().originalClaim());
+            return receipt(bound.store().advanceReadSequence(bound.run().context(), bound.run().membershipRevision(),
+                    table, sequence, bound.run().originalClaim()));
         }
     }
     private record DirectWriter(ScopedDirectSinkAckFactory.Bound bound, WorkloadClaimFence claimed, String runId,
@@ -285,14 +312,19 @@ final class CheckpointProgressWrites implements AutoCloseable {
         }
         @Override public long bytes() { return strings(runId, table, writer) + progressBytes(progress); }
         @Override public void verify() { bound.requireClaim(claimed); }
-        @Override public boolean commit(List<Request> batch) {
+        @Override public List<WriterProgressOutcome> commit(List<Request> batch) {
             batch.forEach(Request::verify);
             if (batch.size() == 1)
-                return bound.store().advanceWriter(bound.run().context(), bound.run().epoch(), runId, table, writer, progress, bound.run().pipelineClaim());
-            var updates = batch.stream().map(request -> (DirectWriter) request)
+                return receipt(bound.store().advanceWriter(bound.run().context(), bound.run().epoch(), runId,
+                        table, writer, progress, bound.run().pipelineClaim()));
+            var updates = batch.stream().map(DirectWriter.class::cast)
                     .map(request -> new WriterProgressUpdate(request.table, request.writer, request.progress)).toList();
             return bound.store().advanceWriters(bound.run().context(), bound.run().epoch(), runId, updates, bound.run().pipelineClaim());
         }
+    }
+
+    private static List<WriterProgressOutcome> receipt(boolean committed) {
+        return List.of(new WriterProgressOutcome(committed, null));
     }
 
     private static WriterProgress combine(WriterProgress before, WriterProgress after) {
@@ -317,6 +349,10 @@ final class CheckpointProgressWrites implements AutoCloseable {
         private boolean retired;
         private boolean released;
         private Receipt(long bytes) { this.bytes = bytes; }
+        private void complete(WriterProgressOutcome outcome) {
+            if (outcome.failure() != null) completion.completeExceptionally(outcome.failure());
+            else completion.complete(outcome.committed());
+        }
     }
 
     private static final class Pending {

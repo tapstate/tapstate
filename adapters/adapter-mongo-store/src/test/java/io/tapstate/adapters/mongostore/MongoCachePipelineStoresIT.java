@@ -361,6 +361,119 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void anUnrelatedPipelineCheckpointCommitsWhileAnotherPipelineWaitsOnTheSameClient() {
+        withFixture(f -> {
+            var healthyScope = new PipelineIntentScope(SCOPE.clusterId(), SCOPE.bindingVersion(),
+                    SCOPE.cacheIncarnation(), "shipments", SCOPE.stateGeneration());
+            var healthyKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION,
+                    healthyScope.pipelineId());
+            var healthyFence = new WorkloadClaimFence(healthyKey, f.fence().owner(), f.fence().claimGeneration(),
+                    f.fence().executionGeneration(), f.fence().topologyRevision());
+            var checkpoint = new Document(state(f.database()));
+            checkpoint.put("_id", healthyScope.pipelineId());
+            checkpoint.put("scope", header(healthyScope));
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).insertOne(checkpoint);
+            var healthyClaim = new Document(claim(f.database()));
+            healthyClaim.put("_id", MongoWorkloadClaimStore.id(healthyKey));
+            healthyClaim.put("resourceId", healthyScope.pipelineId());
+            healthyClaim.put("pipelineScope", header(healthyScope));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).insertOne(healthyClaim);
+
+            var held = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var stalled = new AtomicBoolean();
+            var healthyEntered = new CountDownLatch(1);
+            var healthyCompleted = new CountDownLatch(1);
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (isUpdate(event, "pipeline_state") && SCOPE.pipelineId().equals(event.getCommand()
+                            .getArray("updates").get(0).asDocument().getDocument("q").getString("_id").getValue())
+                            && stalled.compareAndSet(false, true)) {
+                        held.countDown();
+                        await(release);
+                    }
+                }
+            };
+            try (var observed = client(listener); var workers = Executors.newFixedThreadPool(2)) {
+                var database = observed.getDatabase(f.database().getName());
+                var slowStates = new MongoCachePipelineStateStore(
+                        new MongoCachePipelineAccess(observed, database, SCOPE, f.fence(), ACTIVE), new MongoStructureProof());
+                var healthyStates = new MongoCachePipelineStateStore(
+                        new MongoCachePipelineAccess(observed, database, healthyScope, healthyFence, ACTIVE), new MongoStructureProof());
+                var slow = workers.submit(() -> slowStates.compareAndSwap(SCOPE.pipelineId(), 0, "RUNNING", AT));
+                try {
+                    assertThat(held.await(10, TimeUnit.SECONDS)).isTrue();
+                    var healthy = workers.submit(() -> {
+                        healthyEntered.countDown();
+                        try { return healthyStates.compareAndSwap(healthyScope.pipelineId(), 0, "RUNNING", AT); }
+                        finally { healthyCompleted.countDown(); }
+                    });
+                    try {
+                        assertThat(healthyEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                        boolean completedBeforeRelease = healthyCompleted.await(2, TimeUnit.SECONDS);
+                        System.out.println("CHECKPOINT_PIPELINE_ISOLATION healthyCompletedBeforeRelease=" + completedBeforeRelease);
+                        assertThat(completedBeforeRelease)
+                                .as("an independent Pipeline checkpoint must commit while the other Pipeline remains stalled")
+                                .isTrue();
+                        assertThat(healthy.get(5, TimeUnit.SECONDS)).isInstanceOf(CasOutcome.Applied.class);
+                        assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database())
+                                .find(new Document("_id", healthyScope.pipelineId())).first()).containsEntry("stateJson", "RUNNING");
+                    } finally {
+                        release.countDown();
+                        assertThat(healthy.get(15, TimeUnit.SECONDS)).isInstanceOf(CasOutcome.Applied.class);
+                        System.out.println("CHECKPOINT_PIPELINE_ISOLATION healthyCommittedAfterRelease=true");
+                    }
+                } finally {
+                    release.countDown();
+                    assertThat(slow.get(15, TimeUnit.SECONDS)).isInstanceOf(CasOutcome.Applied.class);
+                }
+            }
+        });
+    }
+
+    @Test void aMultiPipelineWaitUsesStableOrderAndReleasesItsLanesWhenInterrupted() throws Exception {
+        var client = mock(MongoClient.class);
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var interrupted = new CountDownLatch(1);
+        var waitingThread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        try (var workers = Executors.newFixedThreadPool(3)) {
+            var owner = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "orders", () -> {
+                held.countDown(); await(release); return true;
+            }));
+            java.util.concurrent.Future<?> waiting = null;
+            try {
+                assertThat(held.await(5, TimeUnit.SECONDS)).isTrue();
+                waiting = workers.submit(() -> {
+                    waitingThread.set(Thread.currentThread());
+                    try {
+                        return MongoCachePipelineStateStore.writeTransaction(client,
+                                List.of("shipments", "orders", "shipments"), () -> true);
+                    } catch (TapstateException failure) {
+                        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        assertThat(Thread.currentThread().isInterrupted()).isTrue();
+                        return false;
+                    } finally { interrupted.countDown(); }
+                });
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (waitingThread.get() == null || waitingThread.get().getState() != Thread.State.WAITING) {
+                    if (System.nanoTime() >= deadline) throw new AssertionError("multi-Pipeline caller did not wait for the held lane");
+                    Thread.sleep(1);
+                }
+                var independent = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "shipments", () -> true));
+                assertThat(independent.get(2, TimeUnit.SECONDS)).isTrue();
+                waiting.cancel(true);
+                assertThat(interrupted.await(5, TimeUnit.SECONDS)).isTrue();
+                var afterInterruption = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "shipments", () -> true));
+                assertThat(afterInterruption.get(2, TimeUnit.SECONDS)).isTrue();
+            } finally {
+                if (waiting != null) waiting.cancel(true);
+                release.countDown();
+                assertThat(owner.get(15, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
     @Test void delayedObservationCanWriteItsOwnRecordButCannotCrossAStopOrReplacement() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);

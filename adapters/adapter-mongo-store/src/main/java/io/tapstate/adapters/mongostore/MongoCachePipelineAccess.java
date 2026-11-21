@@ -89,7 +89,7 @@ final class MongoCachePipelineAccess {
     }
 
     private <T> T checkpointTransaction(TransactionOptions options, Function<ClientSession, T> action) {
-        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(false, options, action));
+        return MongoCachePipelineStateStore.writeTransaction(client, scope.pipelineId(), () -> transaction(false, options, action));
     }
 
     private <T> T transaction(boolean observation, Function<ClientSession, T> action) {

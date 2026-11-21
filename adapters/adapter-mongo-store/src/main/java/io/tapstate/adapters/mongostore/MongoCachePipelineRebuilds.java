@@ -109,7 +109,7 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
         if (!business.equals(new CacheBusinessScope(old.clusterId(), old.bindingVersion(), old.cacheIncarnation()))) throw MongoCacheBusinessIdentity.businessFenced();
         Objects.requireNonNull(currentNode, "currentNode"); Objects.requireNonNull(ttl, "ttl"); Objects.requireNonNull(touchTime, "touchTime");
         if (ttl.isZero() || ttl.isNegative() || ttl.toMillis() < 1) throw new IllegalArgumentException("rebuild ttl must be at least one millisecond");
-        var result = MongoCachePipelineStateStore.writeTransaction(client, () -> StoreIo.call(() -> {
+        var result = MongoCachePipelineStateStore.writeTransaction(client, old.pipelineId(), () -> StoreIo.call(() -> {
             try {
                 active(original);
                 try (var session = client.startSession()) {

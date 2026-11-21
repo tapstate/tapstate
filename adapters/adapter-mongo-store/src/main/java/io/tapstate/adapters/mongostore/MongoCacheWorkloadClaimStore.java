@@ -126,14 +126,14 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireScope(original);
         var key = pipelineKey(original);
-        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl)));
+        return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl)));
     }
 
     @Override public WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope original, WorkloadClaimFence node,
             long topologyRevision) {
         requireScope(original);
         if (topologyRevision != 1 || !node.owner().nodeId().equals(scope.clusterId())) throw claimFenced();
-        return MongoCachePipelineStateStore.writeTransaction(client, () -> transaction(true, original, (store, session) -> {
+        return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> {
             MongoCachePipelinePreparations.proveNode(session, database, scope, node);
             return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
         }));
@@ -274,7 +274,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             return released;
         });
         return expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
-                ? MongoCachePipelineStateStore.writeTransaction(client, change) : change.get();
+                ? MongoCachePipelineStateStore.writeTransaction(client, expected.key().resourceId(), change) : change.get();
     }
     private boolean knownRetiredPipeline(ClientSession session, WorkloadClaimKey key) {
         if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION) return false;
@@ -302,7 +302,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             return advanced;
         });
         return expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
-                ? MongoCachePipelineStateStore.writeTransaction(client, change) : change.get();
+                ? MongoCachePipelineStateStore.writeTransaction(client, expected.key().resourceId(), change) : change.get();
     }
     @Override public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
         requireKey(Objects.requireNonNull(expected, "expected").key());

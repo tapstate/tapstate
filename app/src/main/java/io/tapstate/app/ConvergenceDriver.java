@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.runtime.scheduler.ConvergeResult;
@@ -323,7 +324,7 @@ final class ConvergenceDriver {
             var stage = scoped.writes().stage(pass);
             var projection = projection(pipeline, pass, result, origin, null, stage::wrap);
             projection.ifPresent(value -> scoped.writes().submit(stage,
-                    () -> publicationCommitted(pass, result, value), () -> sample(value, pass),
+                    () -> publicationCommitted(pass, result, value), history(value, pass),
                     () -> alert(() -> scoped.alerts().unavailable(pass))));
             return;
         }
@@ -349,8 +350,19 @@ final class ConvergenceDriver {
     private void published(PipelineConvergencePass pass, ConvergeResult result,
             io.tapstate.core.lifecycle.Observation value) {
         if (scoped != null) alert(() -> scoped.alerts().published(pass, value, result.failure().orElse(null)));
-        sample(value, pass);
+        if (scoped == null || scoped.writes() == null) sample(value, pass);
+        else {
+            var history = history(value, pass);
+            if (history != null) scoped.writes().offerHistory(history.guardedBy(pass.guardOriginal(pass.claim())));
+        }
         export(value);
+    }
+
+    private ProcessObservationWriter.History history(Observation value, PipelineConvergencePass pass) {
+        if (sampler == null) return null;
+        var sample = RateSampler.sampleOf(value);
+        if (sample == null) return null;
+        return new ProcessObservationWriter.History(sample, () -> sampler.offerPrepared(sample, pass.scope(), pass.rateHistory(true)));
     }
 
     private void prepareStart(PipelineIntentStore.PendingStart pending) {
