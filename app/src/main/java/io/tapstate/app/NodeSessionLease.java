@@ -183,7 +183,9 @@ final class NodeSessionLease implements AutoCloseable {
 
     private Proof confirm(Proof prior, long askedAt, long deadline) {
         WorkloadClaim expected = prior.claim();
-        var reading = bounded(expected, deadline, () -> store.read(expected.key()));
+        var reading = store instanceof DeadlineWorkloadClaimStore bounded
+                ? bounded.confirmNodeSession(expected.key(), deadline, this::requireActive)
+                : store.read(expected.key());
         if (reading.isEmpty()) return null;
         var observed = reading.orElseThrow();
         if (!observed.leased() || !WorkloadClaimFence.from(expected).equals(WorkloadClaimFence.from(observed.claim()))) {

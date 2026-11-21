@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
@@ -83,6 +84,51 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         if (key.type() != WorkloadClaimType.NODE_SESSION)
             throw new IllegalArgumentException("the node-session I/O lane requires a node-session key");
         return StoreIo.call(() -> operations.nodeSession(deadline, active, operation));
+    }
+
+    @Override public Optional<WorkloadClaimReading> confirmNodeSession(WorkloadClaimKey key, long deadline,
+            Runnable active) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.NODE_SESSION)
+            throw new IllegalArgumentException("node-session confirmation requires a node-session key");
+        return StoreIo.call(() -> operations.confirmNodeSession(deadline, active, () -> {
+            // A read in the confirmation lane must not wait for the writer's transaction cleanup.
+            if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return read(key);
+            requireActive.run();
+            var budget = operations.budget();
+            return MongoStructureFailureScope.inspectOnFailure(client, budget, () -> {
+                var selected = budget.database(database).withReadPreference(ReadPreference.primary())
+                        .withReadConcern(ReadConcern.SNAPSHOT);
+                var id = MongoWorkloadClaimStore.id(key);
+                var facts = SystemCollections.CACHE_IDENTITY.on(selected).aggregate(List.of(
+                        new Document("$match", new Document("_id", "cluster")),
+                        new Document("$project", new Document("identity", "$$ROOT")),
+                        proofLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business", List.of()),
+                        proofLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", id,
+                                List.of(MongoWorkloadClaimStore.leaseRemaining(true)))))
+                        .collation(com.mongodb.client.model.Collation.builder().locale("simple").build()).first();
+                var identity = facts == null ? null : facts.get("identity", Document.class);
+                MongoCacheBusinessIdentity.requireObservedAdmission(identity, proofRow(facts, "schema"), scope);
+                requireActive.run();
+                return Optional.ofNullable(proofRow(facts, "claim")).map(MongoWorkloadClaimStore::nodeSessionReading);
+            });
+        }));
+    }
+
+    private static Document proofLookup(SystemCollections table, String name, Object id, List<Document> extra) {
+        var stages = new java.util.ArrayList<>(List.of(
+                new Document("$match", new Document("_id", id)), new Document("$limit", 2)));
+        stages.addAll(extra);
+        return new Document("$lookup", new Document("from", table.collectionName())
+                .append("as", name).append("pipeline", stages));
+    }
+
+    private static Document proofRow(Document facts, String name) {
+        if (facts == null) return null;
+        var rows = facts.getList(name, Document.class);
+        if (rows.size() > 1) throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                java.util.Map.of("id", "node-session", "field", name), null);
+        return rows.isEmpty() ? null : rows.getFirst();
     }
 
     @Override public void awaitQuiescence(long deadline) { StoreIo.run(() -> operations.await(deadline)); }

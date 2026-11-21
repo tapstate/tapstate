@@ -516,6 +516,13 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 read(document), Duration.ofMillis(number(document, LEASE_REMAINING)));
     }
 
+    static WorkloadClaimReading nodeSessionReading(Document document) {
+        var claim = decodeStrict(document);
+        if (claim.key().type() != WorkloadClaimType.NODE_SESSION || nodeBacked(document)
+                || !(document.get(LEASE_REMAINING) instanceof Long remaining)) throw unreadableClaim();
+        return new WorkloadClaimReading(claim, Duration.ofMillis(remaining));
+    }
+
     private static long number(Document document, String field) {
         Number value = document.get(field, Number.class);
         if (value == null) {

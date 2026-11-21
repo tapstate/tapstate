@@ -42,12 +42,20 @@ final class MongoClaimOperations {
                 thread.setDaemon(true);
                 return thread;
             });
-    private final ThreadPoolExecutor nodeSession = new ThreadPoolExecutor(1, 1, 100, TimeUnit.MILLISECONDS,
-            new java.util.concurrent.SynchronousQueue<>(), action -> {
-                var thread = new Thread(action, "mongo-node-session-io");
-                thread.setDaemon(true);
-                return thread;
-            });
+    private final ThreadPoolExecutor nodeSession = nodeSessionWorker("mongo-node-session-io");
+    private final ThreadPoolExecutor nodeConfirmation = nodeSessionWorker("mongo-node-confirmation-io");
+
+    private static ThreadPoolExecutor nodeSessionWorker(String threadName) {
+        var worker = new ThreadPoolExecutor(1, 1, 100, TimeUnit.MILLISECONDS,
+                new java.util.concurrent.SynchronousQueue<>(), action -> {
+                    var thread = new Thread(action, threadName);
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        worker.allowCoreThreadTimeOut(true);
+        return worker;
+    }
+
     private final Set<Call<?>> calls = ConcurrentHashMap.newKeySet();
     private final Set<Transaction> transactions = ConcurrentHashMap.newKeySet();
     private final ThreadLocal<MongoReadBudget> current = new ThreadLocal<>();
@@ -65,7 +73,6 @@ final class MongoClaimOperations {
         observeTopology();
         workers.allowCoreThreadTimeOut(true);
         renewals.allowCoreThreadTimeOut(true);
-        nodeSession.allowCoreThreadTimeOut(true);
     }
 
     MongoReadBudget budget() { return current.get(); }
@@ -111,6 +118,10 @@ final class MongoClaimOperations {
     <T> T nodeSession(long deadline, Runnable guard, Supplier<T> action) {
         return call(deadline, guard, action, nodeSession);
     }
+    <T> T confirmNodeSession(long deadline, Runnable guard, Supplier<T> action) {
+        return call(deadline, guard, action, nodeConfirmation);
+    }
+
     private void observeTopology() {
         var topology = client.getClusterDescription();
         if (topology.getType() == com.mongodb.connection.ClusterType.REPLICA_SET) {
@@ -173,7 +184,7 @@ final class MongoClaimOperations {
         try { lane.execute(call); }
         catch (java.util.concurrent.RejectedExecutionException rejected) {
             call.finished();
-            if (lane == nodeSession) throw new WorkloadClaimRenewalException(
+            if (lane == nodeSession || lane == nodeConfirmation) throw new WorkloadClaimRenewalException(
                     WorkloadClaimRenewalException.Reason.NOT_STARTED, "the node-session I/O lane is still in use");
             throw rejected;
         }
@@ -415,5 +426,6 @@ final class MongoClaimOperations {
         workers.shutdown();
         renewals.shutdown();
         nodeSession.shutdown();
+        nodeConfirmation.shutdown();
     }
 }

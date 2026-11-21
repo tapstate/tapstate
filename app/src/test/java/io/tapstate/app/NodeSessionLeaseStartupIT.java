@@ -15,6 +15,7 @@ import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
+import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -33,11 +34,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Real server leases adopted after startup work, without restarting a member or changing its TTL. */
 @RequiresDocker
@@ -184,6 +187,45 @@ class NodeSessionLeaseStartupIT {
                 assertThat(fixture.successfulWrites).hasValue(1);
                 assertThat(lease.currentFence()).contains(WorkloadClaimFence.from(original));
                 assertThat(losses).hasValue(0);
+            }
+        }
+    }
+
+    @Test
+    void confirmationReadsTheCommittedLeaseWhileTheOriginalWriterStillOwnsItsWorker() throws Exception {
+        try (var fixture = new CacheFixture(); var caller = Executors.newSingleThreadExecutor()) {
+            var original = fixture.acquire(Duration.ofSeconds(15)).claim;
+            var committed = new CountDownLatch(1);
+            var releaseWriter = new CountDownLatch(1);
+            var key = original.key();
+            var response = caller.submit(() -> fixture.claims.withNodeSessionDeadline(
+                    key, System.nanoTime() + Duration.ofSeconds(2).toNanos(), () -> {}, () -> {
+                        var renewed = fixture.claims.renew(original, Duration.ofSeconds(30));
+                        committed.countDown();
+                        try {
+                            if (!releaseWriter.await(10, TimeUnit.SECONDS))
+                                throw new AssertionError("writer was not released");
+                        } catch (InterruptedException stopped) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(stopped);
+                        }
+                        return renewed;
+                    }));
+            try {
+                assertThat(committed.await(1, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> response.get(4, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(io.tapstate.core.common.TapstateException.class);
+                var reading = fixture.claims.confirmNodeSession(key,
+                        System.nanoTime() + Duration.ofSeconds(2).toNanos(), () -> {}).orElseThrow();
+                assertThat(reading.leased()).isTrue();
+                assertThat(reading.claim().leaseUntil()).isAfter(original.leaseUntil());
+                assertThat(WorkloadClaimFence.from(reading.claim())).isEqualTo(WorkloadClaimFence.from(original));
+                assertThatThrownBy(() -> fixture.claims.withNodeSessionDeadline(
+                        key, System.nanoTime() + Duration.ofSeconds(1).toNanos(), () -> {}, () -> null))
+                        .isInstanceOfSatisfying(WorkloadClaimRenewalException.class,
+                                busy -> assertThat(busy.reason()).isEqualTo(WorkloadClaimRenewalException.Reason.NOT_STARTED));
+            } finally {
+                releaseWriter.countDown();
             }
         }
     }

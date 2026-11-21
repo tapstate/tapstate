@@ -1,5 +1,6 @@
 package io.tapstate.spi.store;
 
+import java.util.Optional;
 import java.util.function.Supplier;
 
 /** Optional in-process deadline and ownership boundary for original claim operations. */
@@ -21,10 +22,16 @@ public interface DeadlineWorkloadClaimStore extends WorkloadClaimStore {
         return withDeadline(deadlineNanos, requireActive, operation);
     }
 
-    /** Bounds node-session renewal and confirmation independently of Pipeline claim work. */
+    /** Bounds a node-session renewal independently of Pipeline claim work. */
     default <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadlineNanos, Runnable requireActive,
             Supplier<T> operation) {
         return withDeadline(deadlineNanos, requireActive, operation);
+    }
+
+    /** Observes the stored node-session fence and remaining lease under the original deadline. */
+    default Optional<WorkloadClaimReading> confirmNodeSession(WorkloadClaimKey key, long deadlineNanos,
+            Runnable requireActive) {
+        return withNodeSessionDeadline(key, deadlineNanos, requireActive, () -> read(key));
     }
 
     /** Waits for those actual owners, retrying only cleanup, under the same shutdown deadline. */
