@@ -5,6 +5,7 @@ import io.tapstate.control.core.PipelineMetrics;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.model.canonical.CanonicalHash;
 
 import java.time.Instant;
 import java.util.Comparator;
@@ -22,7 +23,8 @@ import java.util.TreeMap;
  * metrics cell is a number, so nesting them put one string-valued cell in an otherwise numeric map and made
  * every reader type-test a cell before using it — the control read model already keeps the two apart, and
  * this is the wire saying the same thing. The position is absent until one is acked, mirroring the
- * never-faked, empty-is-unavailable rule the numeric metrics follow.
+ * never-faked, empty-is-unavailable rule the numeric metrics follow. Legacy Java-serialized
+ * positions are projected as opaque, equality-only {@code opaque-v1:} fingerprints on this face.
  *
  * <p><strong>The field is named for the position it carries.</strong> {@code targetAckedPosition} is how
  * far the target has confirmed writes; it is not how far the source could be read to and not how far the
@@ -54,7 +56,8 @@ import java.util.TreeMap;
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record PipelineMetricsResponse(String pipelineId, Map<String, Long> metrics,
-        Map<String, String> targetAckedPosition, List<String> positionsNotCollected, List<Fact> facts) {
+        @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, String> targetAckedPosition,
+        List<String> positionsNotCollected, List<Fact> facts) {
 
     /** One metric as measured: what it is called, what kind of measurement, in what unit, and its points. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -76,12 +79,28 @@ public record PipelineMetricsResponse(String pipelineId, Map<String, Long> metri
         // are copies whose iteration order is not a promise, and a wire whose key order changed from one
         // read to the next would be a wire no golden could pin and no diff could read.
         return new PipelineMetricsResponse(metrics.pipelineId(), new TreeMap<>(metrics.metrics()),
-                metrics.targetAckedPosition().isEmpty() ? null : new TreeMap<>(metrics.targetAckedPosition()),
+                wirePositions(metrics.targetAckedPosition()),
                 PipelineMetrics.POSITIONS_NOT_COLLECTED,
                 metrics.facts().stream()
                         .sorted(Comparator.comparing(MetricFact::name))
                         .map(PipelineMetricsResponse::fact)
                         .toList());
+    }
+
+    private static Map<String, String> wirePositions(Map<String, String> acknowledgedPositions) {
+        Map<String, String> positions = new TreeMap<>(acknowledgedPositions);
+        positions.replaceAll((table, position) -> hasSerializedStreamHeader(position)
+                ? "opaque-v1:" + CanonicalHash.ofText(position) : position);
+        return positions;
+    }
+
+    private static boolean hasSerializedStreamHeader(String position) {
+        // The base64 prefix for AC ED 00 05. Four lower bits in the sixth digit belong to the next byte.
+        if (position.length() < 8 || !position.startsWith("rO0AB")) {
+            return false;
+        }
+        char sixthDigit = position.charAt(5);
+        return (sixthDigit >= 'Q' && sixthDigit <= 'Z') || (sixthDigit >= 'a' && sixthDigit <= 'f');
     }
 
     private static Fact fact(MetricFact fact) {
