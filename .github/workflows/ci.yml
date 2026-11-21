@@ -1,5 +1,5 @@
 name: CI
-run-name: Pipeline Performance | Deadline and artifact fixture
+run-name: ${{ github.event_name == 'workflow_run' && format('Pipeline Performance | Nightly {0}/{1}', github.event.workflow_run.id, github.event.workflow_run.run_attempt) || 'Pipeline Performance | Manual' }}
 
 on:
   workflow_dispatch:
@@ -42,11 +42,11 @@ jobs:
       actions: read
     outputs:
       batches: ${{ steps.prepare.outputs.batches }}
-      measurement_stop: ${{ steps.fixture_clock.outputs.measurement_stop }}
+      measurement_stop: ${{ steps.prepare.outputs.measurement_stop }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b77b4c54cbe3255d0942882ae7db18787a935d86
+          ref: 89cba0205a4f8f6504164983322e5c63871b828a
           persist-credentials: false
       - uses: actions/setup-java@v4
         with:
@@ -64,19 +64,6 @@ jobs:
             --estimates benchmarks/cases/hosted-runner-estimates.json \
             --run "$RUNNER_TEMP/performance-run.json" \
             --output "$RUNNER_TEMP/performance-inputs"
-      - name: Set the shortened fixture clock
-        id: fixture_clock
-        shell: bash
-        run: |
-          set -euo pipefail
-          metadata="$RUNNER_TEMP/performance-run.json"
-          started=$(date -d "$(jq -r .run_started_at "$metadata")" +%s)
-          now=$(date +%s)
-          stop_at=$((now + 75))
-          echo "measurement_stop=$stop_at" >> "$GITHUB_OUTPUT"
-          jq -n --argjson started "$started" --argjson stop "$stop_at" --argjson created "$now" \
-            '{fixture:"deadline", attempt_started:$started, cutoff_calculated_at:$created, measurement_stop:$stop,
-              fixture_budget_seconds:($stop-$started)}' > "$RUNNER_TEMP/performance-inputs/fixture-clock.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -86,7 +73,8 @@ jobs:
           retention-days: 90
 
   measure:
-    if: github.run_attempt == '1' && needs.prepare.result == 'success'
+    name: measure (${{ matrix.batch }})
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.prepare.result == 'success' }}
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 350
@@ -98,11 +86,6 @@ jobs:
       STOP_AT: ${{ needs.prepare.outputs.measurement_stop }}
       BATCH: ${{ matrix.batch }}
     steps:
-      - name: Model runner availability after the short deadline
-        if: matrix.batch == 1
-        shell: bash
-        run: |
-          while (( $(date +%s) <= STOP_AT )); do sleep 1; done
       - name: Check the remaining budget
         id: budget
         run: |
@@ -112,75 +95,76 @@ jobs:
             mkdir -p "$RUNNER_TEMP/performance-batch"
             printf 'No time remained for this batch when the runner started.\n' > "$RUNNER_TEMP/performance-batch/expired.txt"
           else
+            # Leave time to upload evidence before the job's 350 minute timeout.
+            job_stop=$((now + 340 * 60))
+            if (( job_stop < STOP_AT )); then
+              echo "STOP_AT=$job_stop" >> "$GITHUB_ENV"
+            fi
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@v4
         if: steps.budget.outputs.run == 'true'
         with:
-          ref: b77b4c54cbe3255d0942882ae7db18787a935d86
+          ref: 89cba0205a4f8f6504164983322e5c63871b828a
           persist-credentials: false
+      - uses: actions/setup-java@v4
+        if: steps.budget.outputs.run == 'true'
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+          cache: maven
       - uses: actions/download-artifact@v4
         if: steps.budget.outputs.run == 'true'
         with:
           name: performance-inputs-${{ github.run_attempt }}
           path: ${{ runner.temp }}/performance-inputs
-      - name: Exercise the runner against the remaining absolute budget
+      - name: Set up Maven
+        if: steps.budget.outputs.run == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/performance-batch"
+          bash .github/scripts/performance-with-budget.sh "Maven setup" bash .github/scripts/setup-ci-maven.sh \
+            > "$RUNNER_TEMP/performance-batch/maven-setup.log" 2>&1
+      - name: Build and measure the fixed batch
         if: steps.budget.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
           output="$RUNNER_TEMP/performance-batch"
           mkdir -p "$output"
-          if [[ "$BATCH" == 2 ]]; then
-            printf 'Controlled setup failure before runner entry.\n' > "$output/build.log"
-            exit 42
+          {
+            printf 'Image %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            printf 'Measurement cutoff %s\n' "$STOP_AT"
+            uname -a
+            lscpu
+            free -m
+            df -h "$RUNNER_TEMP"
+            java -version
+            mvn -version
+            bash .github/scripts/performance-with-budget.sh "Docker inspection" docker info
+            git rev-parse HEAD
+          } > "$output/environment.txt" 2>&1
+          budget_script=.github/scripts/performance-with-budget.sh
+          bash "$budget_script" "connector preparation" python3 -B deploy/cloud/prepare-test-inputs.py \
+            --mongodb-only --with-dummy --output "$RUNNER_TEMP/connectors" > "$output/connectors.log" 2>&1
+          bash "$budget_script" "MongoDB image pull" docker pull mongo:7.0 > "$output/mongo-pull.log" 2>&1
+          bash "$budget_script" "MongoDB image inspection" \
+            docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$output/mongo-image.json"
+          bash "$budget_script" "application build" mvn -B -pl app,e2e -am -DskipTests package > "$output/build.log" 2>&1
+          sha256sum app/target/app-0.8.0-boot.jar "$RUNNER_TEMP/connectors/"*.jar > "$output/artifacts.sha256"
+          if (( STOP_AT <= $(date +%s) )); then
+            printf 'The batch budget expired before measurement.\n' > "$output/expired.txt"
+            exit 124
           fi
-          if [[ "$BATCH" == 3 ]]; then
-            printf 'Controlled upload failure fixture.\n' > "$output/fixture.txt"
-            exit 0
-          fi
-          mkdir -p "$RUNNER_TEMP/fixture-bin" "$RUNNER_TEMP/connectors"
-          touch "$RUNNER_TEMP/fixture-boot.jar"
-          cat > "$RUNNER_TEMP/fixture-bin/mvn" <<'PYTHON'
-          #!/usr/bin/env python3
-          import json
-          import sys
-          import time
-          from pathlib import Path
-
-          prefix = "-Dtapstate.benchmarks.request="
-          request = json.loads(Path(next(arg.removeprefix(prefix) for arg in sys.argv if arg.startswith(prefix))).read_text())
-          output = Path(request["output"])
-          (output / "fixture-started").touch()
-          case = request["entries"][0]["case"]
-          first_repeat = output / case["id"] / "1"
-          first_repeat.mkdir(parents=True)
-          (first_repeat / "partial.json").write_text(json.dumps({
-              "fixture": "controlled slow process",
-              "run_id": request["run_id"],
-              "entered_at": time.time(),
-          }))
-          print("First repeat entered; intentionally hold it until the deadline", flush=True)
-          time.sleep(120)
-          raise SystemExit("Deadline guard failed to stop the fixture")
-          PYTHON
-          chmod +x "$RUNNER_TEMP/fixture-bin/mvn"
-          export PATH="$RUNNER_TEMP/fixture-bin:$PATH"
-          while (( $(date +%s) < STOP_AT - 7 )); do sleep 1; done
-          now=$(date +%s)
-          jq -n --argjson stop "$STOP_AT" --argjson now "$now" \
-            '{fixture:"deadline", runner_entry:$now, measurement_stop:$stop, remaining_seconds:($stop-$now)}' \
-            > "$output/fixture-clock.json"
           python3 -B benchmarks/runner.py run \
             --manifest "$RUNNER_TEMP/performance-inputs/manifest.json" --batch "$BATCH" \
-            --stop-at-epoch-seconds "$STOP_AT" --boot-jar "$RUNNER_TEMP/fixture-boot.jar" \
-            --connectors "$RUNNER_TEMP/connectors" --output "$output/run"
-      - uses: actions/upload-artifact@v4
+            --stop-at-epoch-seconds "$STOP_AT" --connectors "$RUNNER_TEMP/connectors" --output "$output/run"
+      - name: Upload batch evidence
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: performance-batch-${{ github.run_attempt }}-${{ matrix.batch }}
           path: |
-            ${{ runner.temp }}/${{ matrix.batch == 3 && 'intentionally-absent' || 'performance-batch' }}/
+            ${{ runner.temp }}/performance-batch/
             !${{ runner.temp }}/performance-batch/run/**/runtime-input/**
             !${{ runner.temp }}/performance-batch/run/**/witness-input/**
             !${{ runner.temp }}/performance-batch/run/**/verified-connectors/**
@@ -198,7 +182,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b77b4c54cbe3255d0942882ae7db18787a935d86
+          ref: 89cba0205a4f8f6504164983322e5c63871b828a
           persist-credentials: false
       - uses: actions/download-artifact@v4
         continue-on-error: true
