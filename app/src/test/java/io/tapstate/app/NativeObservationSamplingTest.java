@@ -74,6 +74,44 @@ class NativeObservationSamplingTest {
         verifyNoInteractions(f.cache, f.captures, f.configuration);
     }
 
+    @Test void aRevocationAfterFastUpdateRefusalAlsoFencesTheFallbackWrite() {
+        var f = new Fixture();
+        f.warm();
+        var reading = f.cacheHas(CHECKPOINT);
+        when(f.configuration.observationConfiguration(CONFIG, "views", Map.of())).thenReturn(
+                new MongoConfigurationDomain.ObservationCheck(false, Optional.of(
+                        new MongoConfigurationDomain.ObservationConfiguration(null, Map.of(), Map.of()))));
+        when(f.captures.observationSample(any(), any(), isNull(), any())).thenReturn(Optional.of(
+                new ObservationPublisher.CaptureSample(io.tapstate.core.lifecycle.SnapshotReading.NONE,
+                        io.tapstate.core.lifecycle.SnapshotReading.NONE, Map.of(), null)));
+        var admitted = new java.util.concurrent.atomic.AtomicBoolean(true);
+        when(reading.updateExisting(f.running, CHECKPOINT.epoch())).thenAnswer(call -> {
+            admitted.set(false);
+            return false;
+        });
+        var writer = mock(ObservationStore.class);
+        var writeGuard = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+        when(f.cache.pipelineObservations(eq(SCOPE), eq(CLAIM), any())).thenAnswer(call -> {
+            writeGuard.set(call.getArgument(2));
+            return writer;
+        });
+        doAnswer(call -> {
+            writeGuard.get().run();
+            return null;
+        }).when(writer).save(f.running, CHECKPOINT.epoch());
+        when(f.publisher.publishRunning(eq(SCOPE), eq(CHECKPOINT), any(), any(), any())).thenAnswer(call -> {
+            call.<ObservationStore>getArgument(2).save(f.running, CHECKPOINT.epoch());
+            return Optional.of(f.running);
+        });
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.sampling.publishRunning(f.publisher, f.pass, CHECKPOINT,
+                CONFIG, admitted::get, () -> { if (!admitted.get()) throw ThreeLayerStorePort.refused(); }, Optional::empty))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED));
+        verify(reading).updateExisting(f.running, CHECKPOINT.epoch());
+        verify(f.observations, never()).save(f.running, CHECKPOINT.epoch());
+    }
+
     private static final class Fixture {
         final MongoCacheDomain cache = mock(MongoCacheDomain.class);
         final MongoConfigurationDomain configuration = mock(MongoConfigurationDomain.class);
@@ -99,11 +137,13 @@ class NativeObservationSamplingTest {
 
         void warm() { assertThat(publish(CONFIG)).contains(running); }
 
-        void cacheHas(CheckpointDoc checkpoint) {
+        MongoCacheDomain.ObservationRead cacheHas(CheckpointDoc checkpoint) {
             when(captures.observationSelection(EXECUTION)).thenReturn(Optional.of(
                     new ScopedPipelineCaptureCoordinator.ObservationSelection(EXECUTION, Map.of(), Map.of())));
-            when(cache.readObservation(eq(SCOPE), eq(CLAIM), eq(Map.of()), any())).thenReturn(Optional.of(
-                    new MongoCacheDomain.ObservationFacts(checkpoint, Map.of(), Map.of(), Map.of())));
+            var reading = mock(MongoCacheDomain.ObservationRead.class);
+            when(reading.facts()).thenReturn(new MongoCacheDomain.ObservationFacts(checkpoint, Map.of(), Map.of(), Map.of()));
+            when(cache.readObservation(eq(SCOPE), eq(CLAIM), eq(Map.of()), any())).thenReturn(Optional.of(reading));
+            return reading;
         }
 
         Optional<Observation> publish(PipelineIntentStore.ActuationReading config) {
