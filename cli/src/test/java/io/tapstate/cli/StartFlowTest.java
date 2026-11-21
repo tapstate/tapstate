@@ -157,12 +157,13 @@ class StartFlowTest {
         assertThat(out.toString()).contains("start: cancelled; pl1 was left as it is");
     }
 
-    @Test
-    void aDefinitionChangedWhileAnsweringIsReadAgainAndAskedAgain() throws IOException {
+    @ParameterizedTest
+    @ValueSource(strings = {"TS0230005", "pipeline.version-conflict"})
+    void aDefinitionChangedWhileAnsweringIsReadAgainAndAskedAgain(String code) throws IOException {
         Map<String, Object> first = report("NEEDS_CONFIRMATION", notEmpty("orders"));
         Map<String, Object> second = withHash(report("NEEDS_CONFIRMATION", notEmpty("orders")), "2" + HASH.substring(1));
         server.starts.add(stoppedBy(first));
-        server.starts.add(new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"),
+        server.starts.add(new StartAttempt.Rejected(code, Map.of("id", "pl1"),
                 "pl1 changed", List.of()));
         server.starts.add(started(second, List.of(), List.of()));
         server.checks = new StartChecksOutcome.Found(StartChecks.parse(second));
@@ -190,7 +191,7 @@ class StartFlowTest {
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(prompter.offered).isEmpty();
         assertThat(server.startsSent()).containsExactly("start pl1 []");
-        assertThat(err.toString()).contains("cli.start-needs-an-answer")
+        assertThat(err.toString()).contains("TS0330028")
                 .contains("2 start check question(s) need an answer")
                 // one command per answer, written for the whole check because both questions offer it
                 .contains("tapstate start pl1 --decide target-not-empty=clear | "
@@ -255,7 +256,7 @@ class StartFlowTest {
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(server.startsSent()).isEmpty();
-        assertThat(err.toString()).contains("cli.decide-not-offered")
+        assertThat(err.toString()).contains("TS0330032")
                 .contains("target-not-empty/warehouse/customers");
     }
 
@@ -296,7 +297,7 @@ class StartFlowTest {
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(server.startsSent()).isEmpty();
-        assertThat(err.toString()).contains("cli.decide-on-a-refusal");
+        assertThat(err.toString()).contains("TS0330033");
         // the refusal says what it needs, so it is on the screen with the answer that cannot change it
         assertThat(out.toString()).contains("orders on warehouse already holds 5 rows, and on_full_load is fail.");
     }
@@ -311,7 +312,7 @@ class StartFlowTest {
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         // the server would take the start and drop the answer, and the rows would stay with nobody told
         assertThat(server.calls).containsExactly("checks start pl1");
-        assertThat(err.toString()).contains("cli.start-checks-unsupported").contains("--decide");
+        assertThat(err.toString()).contains("TS0330029").contains("--decide");
     }
 
     @Test
@@ -449,7 +450,7 @@ class StartFlowTest {
         StartFlow.Result result = flow(true, new ScriptedPrompter()).checksOnly("pl1", OutputFormat.TEXT);
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(err.toString()).contains("cli.start-checks-unsupported").contains("--checks-only");
+        assertThat(err.toString()).contains("TS0330029").contains("--checks-only");
     }
 
     // ---- what the server changed ----------------------------------------------------------------------
@@ -477,7 +478,7 @@ class StartFlowTest {
         StartFlow.Result result = flow(false, new ScriptedPrompter()).start("pl1", asked());
 
         assertThat(result.exitCode()).isZero();
-        assertThat(err.toString()).contains("cli.start-checks-not-run");
+        assertThat(err.toString()).contains("TS0330030");
     }
 
     // ---- restart --rerun ------------------------------------------------------------------------------
@@ -526,11 +527,12 @@ class StartFlowTest {
                 "start pl1 [target-not-empty/warehouse/orders=clear] if-match " + HASH);
     }
 
-    @Test
-    void aRerunWhoseStartIsRefusedAfterTheStopSaysWhereThatLeftThePipeline() {
+    @ParameterizedTest
+    @ValueSource(strings = {"TS0230005", "pipeline.version-conflict"})
+    void aRerunWhoseStartIsRefusedAfterTheStopSaysWhereThatLeftThePipeline(String code) {
         Map<String, Object> report = withIntent(report("NEEDS_CONFIRMATION", notEmpty("orders")), "RERUN");
         server.checks = new StartChecksOutcome.Found(StartChecks.parse(report));
-        server.starts.add(new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"),
+        server.starts.add(new StartAttempt.Rejected(code, Map.of("id", "pl1"),
                 "pl1 changed", List.of()));
         StartFlow flow = rerunFlow(false, new ScriptedPrompter());
 
@@ -539,7 +541,8 @@ class StartFlowTest {
         StartFlow.Result result = flow.startAfterRerunStop("pl1", plan, deciding(false, "target-not-empty=keep"));
 
         assertThat(result.exitCode()).isNotZero();
-        assertThat(reported).containsExactly("pipeline.version-conflict");
+        assertThat(reported).containsExactly(code);
+        assertThat(server.startsSent()).hasSize(1);
         assertThat(err.toString()).contains("restart: pl1 was stopped and its state cleared, but it has not been "
                 + "started").contains("Start it with: tapstate start pl1 --decide target-not-empty=<answer> (or -y)");
     }
@@ -552,14 +555,15 @@ class StartFlowTest {
                 .isInstanceOf(StartFlow.RerunPlan.Unchecked.class);
         assertThat(rerunFlow(false, new ScriptedPrompter()).planRerun("pl1",
                 deciding(false, "target-not-empty=clear"))).isInstanceOf(StartFlow.RerunPlan.Stop.class);
-        assertThat(err.toString()).contains("cli.start-checks-unsupported");
+        assertThat(err.toString()).contains("TS0330029");
     }
 
     @ParameterizedTest
-    @EnumSource(value = OutputFormat.class, names = {"JSON", "YAML"})
-    void aRefusalAfterApplyingChangesIsOneStructuredDocument(OutputFormat format) {
+    @org.junit.jupiter.params.provider.CsvSource({"JSON,TS0230005", "JSON,pipeline.version-conflict",
+            "YAML,TS0230005", "YAML,pipeline.version-conflict"})
+    void aRefusalAfterApplyingChangesIsOneStructuredDocument(OutputFormat format, String code) {
         server.checks = new StartChecksOutcome.Found(StartChecks.parse(report("NEEDS_CONFIRMATION", notEmpty("orders"))));
-        server.starts.add(new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"),
+        server.starts.add(new StartAttempt.Rejected(code, Map.of("id", "pl1"),
                 "pl1 changed", List.of(applied("orders"))));
 
         StartFlow.Result result = flow(false, new ScriptedPrompter()).start("pl1",
@@ -567,7 +571,8 @@ class StartFlowTest {
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         Map<?, ?> document = structured(format);
-        assertThat(document.get("code")).isEqualTo("pipeline.version-conflict");
+        assertThat(document.get("code")).isEqualTo(code);
+        assertThat(server.startsSent()).hasSize(1);
         assertThat(document.get("decisionsApplied")).isInstanceOf(List.class);
         assertThat(out.toString()).doesNotContain("Updated pl1:", "still says");
     }
@@ -583,7 +588,7 @@ class StartFlowTest {
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         Map<?, ?> document = structured(format);
-        assertThat(document.get("code")).isEqualTo("lifecycle.start-needs-confirmation");
+        assertThat(document.get("code")).isEqualTo("TS0280006");
         assertThat(document.get("params")).isInstanceOfSatisfying(Map.class,
                 params -> assertThat(params.get("subject")).isEqualTo("warehouse/customers"));
         assertThat(document.get("message")).isInstanceOf(String.class);

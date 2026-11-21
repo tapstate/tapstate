@@ -35,7 +35,7 @@ import java.util.Map;
  *
  * <ul>
  *   <li>{@code POST /auth/login} — verify a username / password and mint a short-lived session token. A bad
- *       credential is refused with {@code control.auth-failed} (401), revealing nothing about which half was
+ *       credential is refused with {@code TS0210002} (401), revealing nothing about which half was
  *       wrong.
  *   <li>{@code POST /auth/bootstrap} — the zero-user exception: on a brand-new server create the first admin,
  *       accepted only from the loopback interface and only while no user exists. The remote address is

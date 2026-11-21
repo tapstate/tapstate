@@ -2,37 +2,37 @@ package io.tapstate.mcp;
 
 import io.tapstate.core.common.Severity;
 import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.McpErrorDefinitions;
 
 import java.util.Set;
 
 /** Stable coded failures owned by the local MCP presentation adapter. */
 enum McpError implements TapstateErrorCode {
 
-    CONNECTOR_SPEC_UNAVAILABLE("mcp.connector-spec-unavailable", Set.of("connector")),
-    ENVIRONMENT_MISSING("mcp.environment-missing", Set.of("variable")),
-    INVALID_SERVER_RESPONSE("mcp.invalid-server-response", Set.of("operation")),
-    SERVER_REJECTED("mcp.server-rejected", Set.of("status"));
+    CONNECTOR_SPEC_UNAVAILABLE(McpErrorDefinitions.CONNECTOR_SPEC_UNAVAILABLE),
+    ENVIRONMENT_MISSING(McpErrorDefinitions.ENVIRONMENT_MISSING),
+    INVALID_SERVER_RESPONSE(McpErrorDefinitions.INVALID_SERVER_RESPONSE),
+    SERVER_REJECTED(McpErrorDefinitions.SERVER_REJECTED);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    McpError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
+    McpError(ProductErrorDefinition definition) {
+        this.definition = definition;
     }
 
     @Override
     public String code() {
-        return code;
+        return definition.code();
     }
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return definition.severity();
     }
 
     @Override
     public Set<String> placeholders() {
-        return placeholders;
+        return definition.parameters();
     }
 }

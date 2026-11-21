@@ -1,6 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.ListCollectionsIterable;
+import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
@@ -12,7 +13,6 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
@@ -35,17 +35,19 @@ class MongoObservationStructureProofTest {
         var oldMetadataRead = new CountDownLatch(1);
         var finishOldAudit = new CountDownLatch(1);
         var audits = new AtomicInteger();
-        when(collections.into(any())).thenAnswer(call -> {
-            List<Document> rows = call.getArgument(0);
+        when(collections.iterator()).thenAnswer(call -> {
+            var row = new Document("name", "cache_identity");
             if (audits.incrementAndGet() == 1) {
-                rows.add(new Document("name", "cache_identity"));
                 oldMetadataRead.countDown();
                 assertThat(finishOldAudit.await(5, TimeUnit.SECONDS)).isTrue();
             } else {
-                rows.add(new Document("name", "cache_identity")
-                        .append("options", new Document("collation", new Document("locale", "en"))));
+                row.append("options", new Document("collation", new Document("locale", "en")));
             }
-            return rows;
+            @SuppressWarnings("unchecked")
+            MongoCursor<Document> cursor = mock(MongoCursor.class);
+            when(cursor.hasNext()).thenReturn(true, false);
+            when(cursor.next()).thenReturn(row);
+            return cursor;
         });
 
         var proof = new MongoStructureProof();
@@ -71,7 +73,6 @@ class MongoObservationStructureProofTest {
         var now = new AtomicLong();
         var proof = new MongoStructureProof(now::get);
         var database = mock(MongoDatabase.class, RETURNS_DEEP_STUBS);
-        when(database.listCollections().filter(any()).into(any())).thenAnswer(call -> call.getArgument(0));
         var scope = new PipelineIntentScope("cluster", 1, "cache", "flow", 1);
         var original = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "flow"),
                 new WorkloadOwner("node", "boot"), 1, 1, 1);

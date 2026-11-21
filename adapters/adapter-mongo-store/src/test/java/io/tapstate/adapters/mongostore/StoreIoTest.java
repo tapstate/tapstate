@@ -55,7 +55,7 @@ class StoreIoTest {
         for (MongoException driver : List.of(command, write, bulk, concern, new MongoWriteConcernException(
                 new WriteConcernError(8000, "AtlasError", message, new BsonDocument()), new ServerAddress()))) {
             TapstateException failure = (TapstateException) catchThrowable(() -> StoreIo.run(() -> { throw driver; }));
-            assertThat(failure.code().code()).isEqualTo("io.store-quota-exceeded");
+            assertThat(failure.code().code()).isEqualTo("TS0480002");
             assertThat(failure.args()).isEmpty();
             assertThat(failure.getCause()).isNull();
             assertThat(failure.getSuppressed()).isEmpty();

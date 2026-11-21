@@ -243,7 +243,7 @@ class EngineTest {
         assertThat(engine.failureOf("orders-pipe"))
                 .get()
                 .isInstanceOfSatisfying(TapstateException.class, coded -> {
-                    assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                    assertThat(coded.code().code()).isEqualTo("TS0440009");
                     assertThat(coded.args()).containsEntry("pipeline", "orders-pipe");
                     assertThat(coded.getCause()).isSameAs(error);
                 });
@@ -291,7 +291,7 @@ class EngineTest {
         assertThat(engine.failureOf("orders-pipe"))
                 .get()
                 .isInstanceOfSatisfying(TapstateException.class, coded ->
-                        assertThat(coded.code().code()).isEqualTo("engine.out-of-memory"));
+                        assertThat(coded.code().code()).isEqualTo("TS0440009"));
     }
 
     @Test
@@ -317,7 +317,7 @@ class EngineTest {
             assertThat(engine.failureOf("orders-pipe"))
                     .get()
                     .isInstanceOfSatisfying(TapstateException.class, coded -> {
-                        assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                        assertThat(coded.code().code()).isEqualTo("TS0440009");
                         assertThat(coded.getCause()).isSameAs(escaping.error());
                     });
             assertThat(engine.hasLiveJob("orders-pipe")).isFalse();
@@ -471,7 +471,7 @@ class EngineTest {
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .satisfies(e -> {
                     io.tapstate.core.common.TapstateException coded = (io.tapstate.core.common.TapstateException) e;
-                    assertThat(coded.code().code()).isEqualTo("engine.no-such-job");
+                    assertThat(coded.code().code()).isEqualTo("TS0440001");
                     assertThat(coded.args()).containsEntry("pipeline", "ghost");
                 });
     }
@@ -492,7 +492,7 @@ class EngineTest {
         assertThatThrownBy(() -> engine.resume("ghost"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .satisfies(e -> assertThat(((io.tapstate.core.common.TapstateException) e).code().code())
-                        .isEqualTo("engine.no-such-job"));
+                        .isEqualTo("TS0440001"));
     }
 
     @Test
@@ -553,7 +553,7 @@ class EngineTest {
         assertThatThrownBy(() -> engine.suspend("orders-pipe"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .satisfies(e -> assertThat(((io.tapstate.core.common.TapstateException) e).code().code())
-                        .isEqualTo("engine.no-such-job"));
+                        .isEqualTo("TS0440001"));
     }
 
     @Test
@@ -568,7 +568,7 @@ class EngineTest {
         assertThatThrownBy(() -> engine.resume("orders-pipe"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .satisfies(e -> assertThat(((io.tapstate.core.common.TapstateException) e).code().code())
-                        .isEqualTo("engine.no-such-job"));
+                        .isEqualTo("TS0440001"));
     }
 
     @Test
@@ -1080,7 +1080,7 @@ class EngineTest {
     private static void refusedForWantOfMemory(ThrowingCallable operation) {
         assertThatThrownBy(operation)
                 .isInstanceOfSatisfying(TapstateException.class, coded -> {
-                    assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                    assertThat(coded.code().code()).isEqualTo("TS0440009");
                     assertThat(coded.args()).containsEntry("pipeline", "orders-pipe");
                 });
     }

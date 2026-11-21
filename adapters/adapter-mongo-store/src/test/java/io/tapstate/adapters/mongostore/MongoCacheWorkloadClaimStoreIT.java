@@ -1088,7 +1088,7 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
-    @Test void anOversizedCheckpointSnapshotFallsBackToTheOrdinaryTransaction() {
+    @Test void aWideCheckpointRemainsReadableInTheOrdinaryTransaction() {
         withBusiness(f -> {
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(
                     new Document("_id", PIPELINE.pipelineId()), new Document("$set",
@@ -1105,7 +1105,7 @@ class MongoCacheWorkloadClaimStoreIT {
             } finally {
                 MongoCommandObservation.COLLECTIONS.remove();
             }
-            assertThat(commands).containsSubsequence("aggregate:cache_identity", "find:pipeline_state");
+            assertThat(commands).contains("find:pipeline_state", "find:workload_claims").doesNotContain("aggregate:cache_identity");
         });
     }
 

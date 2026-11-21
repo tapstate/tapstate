@@ -71,7 +71,7 @@ class ChainAxesTest {
 
         assertThatThrownBy(() -> ChainAxes.assign(namedChains(ChainAxes.MAX_CHAINS + 1)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.chain-axis-limit-exceeded")
+                .hasMessageContaining("TS0490011")
                 .hasMessageContaining("chains=256")
                 .hasMessageContaining("limit=255");
     }

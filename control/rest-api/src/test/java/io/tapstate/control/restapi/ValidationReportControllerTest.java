@@ -66,6 +66,6 @@ class ValidationReportControllerTest {
             @Override public Cleanup retain(Retention command){throw new AssertionError("read cannot expire");}
         };
         var beans=new DefaultListableBeanFactory();beans.registerSingleton("reports",new ValidationReportService(reports,budget));
-        return new ValidationReportController(beans.getBeanProvider(ValidationReportService.class),JsonMapper.builder().build());
+        return new ValidationReportController(beans.getBeanProvider(ValidationReportService.class),JsonMapper.builder().build(),io.tapstate.messages.MessageCatalog.bundled());
     }
 }

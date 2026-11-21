@@ -111,7 +111,7 @@ class RowExpressionValueBindingTest {
         assertThatThrownBy(() -> compute("next", "after.id + 1", Map.of("id", beyond)))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("transform.expression-failed");
+                .isEqualTo("TS0450001");
     }
 
     @Test
@@ -174,6 +174,6 @@ class RowExpressionValueBindingTest {
         assertThatThrownBy(() -> compute("next", "after.counter + 1", row))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("transform.expression-failed");
+                .isEqualTo("TS0450001");
     }
 }

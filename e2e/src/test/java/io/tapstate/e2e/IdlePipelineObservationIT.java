@@ -47,9 +47,33 @@ class IdlePipelineObservationIT {
                 control.apply(Map.of("source.tap.yml", sourceYaml(sourceUri), "target.tap.yml", targetYaml(targetUri),
                         "pipeline.tap.yml", pipelineYaml()));
                 control.discoverSchema(SOURCE, "mongodb", Map.of("isUri", true, "uri", sourceUri));
-                control.lifecycle(PIPELINE, LifecycleVerb.START);
-                Await.until("the first snapshot row to reach the native target", () -> target.countDocuments() == 1,
-                        () -> "target rows=" + target.countDocuments());
+                var admin = client.getDatabase("admin");
+                admin.runCommand(new Document("setParameter", 1)
+                        .append("logComponentVerbosity", new Document("command", new Document("verbosity", 2))));
+                try {
+                    control.lifecycle(PIPELINE, LifecycleVerb.START);
+                    Await.until("the first snapshot row to reach the native target", () -> target.countDocuments() == 1,
+                            () -> "target rows=" + target.countDocuments());
+                } finally {
+                    admin.runCommand(new Document("setParameter", 1)
+                            .append("logComponentVerbosity", new Document("command", new Document("verbosity", -1))));
+                }
+                var cacheCommands = mongo.getLogs().lines()
+                        .filter(line -> line.contains("\"msg\":\"About to run the command\"")
+                                && line.contains("\"db\":\"" + storage.cacheDatabase() + "\""))
+                        .map(Document::parse)
+                        .map(line -> line.getEmbedded(List.of("attr", "commandArgs"), Document.class))
+                        .toList();
+                assertThat(cacheCommands).as("pipeline startup reads the CACHE checkpoint in a transaction")
+                        .anyMatch(command -> "pipeline_state".equals(command.get("find"))
+                                && Boolean.FALSE.equals(command.get("autocommit"))
+                                && command.get("filter") instanceof Document filter && PIPELINE.equals(filter.get("_id")));
+                assertThat(cacheCommands).as("pipeline startup avoids the old checkpoint snapshot")
+                        .noneMatch(IdlePipelineObservationIT::isLegacyCheckpointRead);
+                assertThat(cacheCommands).as("pipeline startup avoids the unsupported CACHE metadata filter")
+                        .noneMatch(command -> command.containsKey("listCollections")
+                                && command.get("filter") instanceof Document filter
+                                && filter.get("name") instanceof Document name && name.containsKey("$in"));
 
                 var observations = client.getDatabase(storage.cacheDatabase()).getCollection("pipeline_observation");
                 Date first = awaitObservation(observations, new Date(0));
@@ -109,6 +133,17 @@ class IdlePipelineObservationIT {
             checkpoints.updateOne(stateId, clear);
             claims.updateOne(claimId, clear);
         }
+    }
+
+    private static boolean isLegacyCheckpointRead(Document command) {
+        if (!"cache_identity".equals(command.get("aggregate"))) return false;
+        var stages = command.getList("pipeline", Document.class);
+        return stages != null && stages.size() == 4 && stages.stream()
+                .map(stage -> stage.get("$lookup"))
+                .filter(Document.class::isInstance)
+                .map(Document.class::cast)
+                .map(lookup -> lookup.getString("as"))
+                .toList().equals(List.of("schema", "state", "claim"));
     }
 
     private static Date awaitObservation(MongoCollection<Document> observations, Date after) {

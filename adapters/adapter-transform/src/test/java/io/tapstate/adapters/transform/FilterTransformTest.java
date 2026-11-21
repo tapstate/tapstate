@@ -323,7 +323,7 @@ class FilterTransformTest {
         assertThatThrownBy(() -> filter.transform(update))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(failure -> assertThat(((TapstateException) failure).code().code())
-                        .isEqualTo("transform.expression-failed"));
+                        .isEqualTo("TS0450001"));
     }
 
     @Test
@@ -370,8 +370,9 @@ class FilterTransformTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException e = (TapstateException) thrown;
-                    assertThat(e.code().code()).isEqualTo("transform.expression-failed");
+                    assertThat(e.code().code()).isEqualTo("TS0450001");
                     assertThat(e.args().get("expr")).isEqualTo("today(after.zone) == today(after.zone)");
+
                     assertThat(e.args()).containsKey("detail");
                 });
     }

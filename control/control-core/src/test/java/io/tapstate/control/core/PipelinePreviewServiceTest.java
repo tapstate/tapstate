@@ -62,7 +62,7 @@ class PipelinePreviewServiceTest {
         assertThatThrownBy(() -> PipelinePreviewService.requireDrafts(drafts))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test
@@ -73,7 +73,7 @@ class PipelinePreviewServiceTest {
         assertThatThrownBy(() -> PipelinePreviewService.requireDrafts(List.of(oversized)))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test

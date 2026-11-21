@@ -166,7 +166,7 @@ class ValidationKeyRecommendationsTest {
                 new ValidationKeyRecommendations.Limits(10, 10, 10, 10, 512))) {
             assertThatThrownBy(() -> ValidationKeyRecommendations.recommend("mapping", source, Map.of("id", NUMBER), target,
                     Map.of("id", NUMBER), Optional.of(write("target", List.of())), limits))
-                    .isInstanceOf(TapstateException.class).hasMessageContaining("validation.value-limit-exceeded");
+                    .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300012");
         }
         var report = recommend(source, Map.of("id", NUMBER), target, Map.of("id", NUMBER), Optional.of(write("target", List.of())));
         assertThat(report.accountedMetadataBytes()).isBetween(512L, LIMITS.bytes());

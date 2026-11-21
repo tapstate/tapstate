@@ -130,7 +130,7 @@ class ViewsListOnlyShapeOutputsIT {
                         assertThat(((Number) row.get("documents")).longValue()).isEqualTo(1);
                     });
                     assertThat((List<?>) before.get("unresolved")).singleElement().satisfies(value ->
-                            assertThat(((Map<?, ?>) value).get("code")).isEqualTo("actuation.source-schema-not-discovered"));
+                            assertThat(((Map<?, ?>) value).get("code")).isEqualTo("TS0360004"));
                     control.discoverSchema(sameSource ? "src" : "unknown", "mongodb", Map.of("uri", sourceUri));
                     Map<?, ?> after = (Map<?, ?>) JsonReader.parse(
                             control.sourceRequest("GET", "/api/views", null, null, 200).body());

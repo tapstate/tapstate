@@ -39,7 +39,38 @@ final class PipelineLogAppender extends AppenderBase<ILoggingEvent> {
             return;
         }
         sink.append(pipelineId,
-                new LogLine(event.getTimeStamp(), event.getLevel().toString(), redactor.redactLog(render(event))));
+                new LogLine(event.getTimeStamp(), event.getLevel().toString(), redactor.redactLog(render(event)), diagnostic(event, redactor)));
+    }
+
+    static java.util.Map<String, Object> diagnostic(ILoggingEvent event, SecretRedactor redactor) {
+        var fields = event.getKeyValuePairs();
+        if (fields == null) return java.util.Map.of();
+        for (var field : fields) {
+            if ("diagnostic".equals(field.key)) {
+                var checked = io.tapstate.core.common.RuntimeDiagnosticProjection.read(field.value);
+                var bounded = io.tapstate.core.logging.LogDiagnosticProjection.fit(checked);
+                return io.tapstate.core.logging.LogDiagnosticProjection.fit(redactFields(bounded, redactor, false));
+            }
+        }
+        return java.util.Map.of();
+    }
+
+    private static java.util.Map<String, Object> redactFields(java.util.Map<?, ?> fields, SecretRedactor redactor, boolean parameterNames) {
+        var safe = new java.util.LinkedHashMap<String, Object>();
+        fields.forEach((key, value) -> {
+            String name = (String) key;
+            Object redacted = "params".equals(name) && !parameterNames && value instanceof java.util.Map<?, ?> params
+                    ? redactFields(params, redactor, true) : redactValue(value, redactor);
+            safe.put(parameterNames ? redactor.redactLog(name) : name, redacted);
+        });
+        return safe;
+    }
+
+    private static Object redactValue(Object value, SecretRedactor redactor) {
+        if (value instanceof String text) return redactor.redactLog(text);
+        if (value instanceof java.util.Map<?, ?> fields) return redactFields(fields, redactor, false);
+        if (value instanceof java.util.List<?> values) return values.stream().map(item -> redactValue(item, redactor)).toList();
+        return value;
     }
 
     /** The formatted message, with the exception's stack trace appended when the event carries one. */

@@ -120,7 +120,7 @@ class TheLimitOnHowManyRowsMayPointAtOneReachesTheJobThatEnforcesItTest {
         DAG dag = ordersPointingAtOneCustomer(LIMIT + 1);
 
         assertThatThrownBy(() -> run(dag))
-                .hasStackTraceContaining("nest.reference-fanout-limit-exceeded")
+                .hasStackTraceContaining("TS0490020")
                 .hasStackTraceContaining("referrers=" + (LIMIT + 1))
                 .hasStackTraceContaining("limit=" + LIMIT);
     }
@@ -151,7 +151,7 @@ class TheLimitOnHowManyRowsMayPointAtOneReachesTheJobThatEnforcesItTest {
                 .get()
                 .isInstanceOf(TapstateException.class)
                 .extracting(recorded -> ((TapstateException) recorded).code().code())
-                .isEqualTo("nest.reference-fanout-limit-exceeded");
+                .isEqualTo("TS0490020");
     }
 
     /** Named, because what a coded failure is filed under is the job's name. */

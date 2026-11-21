@@ -1,0 +1,146 @@
+{
+  "TS0010001": {
+    "message": "This document declares version '{got}', which this build cannot read.",
+    "solution": "Write one of the supported versions: {supported}. A version is supported for two further minor releases after its successor ships."
+  },
+  "TS0010002": {
+    "message": "Unknown field '{field}' at {path}.",
+    "solution": "Remove it, or run `tapstate explain` to see the fields allowed here."
+  },
+  "TS0010003": {
+    "message": "Field '{field}' is not allowed at {path}.",
+    "solution": "It is valid elsewhere but not in this position; run `tapstate explain` to confirm."
+  },
+  "TS0010004": {
+    "message": "Required field '{field}' is missing at {path}.",
+    "solution": "Add '{field}' to that block. It has no default, and nothing else in the document implies it."
+  },
+  "TS0010005": {
+    "message": "Reference '{ref}' at {path} points to nothing in this workspace.",
+    "solution": "Define the referenced resource '{ref}', or select an existing resource at {path}."
+  },
+  "TS0010006": {
+    "message": "Reference '{ref}' at {path} is ambiguous across more than one source.",
+    "solution": "Qualify the table with its source, e.g. `source.table`."
+  },
+  "TS0010007": {
+    "message": "Field '{field}' at {path} is not allowed for mode '{mode}'.",
+    "solution": "Remove the field, or change the source mode to one that supports it."
+  },
+  "TS0010008": {
+    "message": "Source '{source}' is read by pipeline '{pipeline}' but declares no {path}.",
+    "solution": "Add '{path}:' to '{source}', saying how it is read. A source named only as a sync or push target supplies a connection rather than rows, and correctly declares none."
+  },
+  "TS0010009": {
+    "message": "Value '{value}' at {path} is not allowed; expected {expected}.",
+    "solution": "Use one of the accepted values."
+  },
+  "TS0010010": {
+    "message": "Expression at {path} did not compile: {detail} (expression: {expr}).",
+    "solution": "Fix the CEL expression; only the row envelope fields are in scope."
+  },
+  "TS0010011": {
+    "message": "Composition rule broken at {path}: {detail}.",
+    "solution": "Review how the resources are wired together."
+  },
+  "TS0010012": {
+    "message": "Duplicate id '{id}' at {path}.",
+    "solution": "Ids must be unique within the workspace; rename one of them."
+  },
+  "TS0010013": {
+    "message": "Connector '{connector}' does not support mode '{mode}' at {path}.",
+    "solution": "Choose one of the connector's supported modes: {allowed}."
+  },
+  "TS0010014": {
+    "message": "Config field '{field}' of connector '{connector}' at {path} has the wrong type; expected {expected}.",
+    "solution": "Provide a value of the expected type."
+  },
+  "TS0010015": {
+    "message": "Required config field '{field}' of connector '{connector}' is missing at {path}.",
+    "solution": "Provide the field, or choose a connection mode that makes it unnecessary."
+  },
+  "TS0010016": {
+    "message": "Config field '{field}' of connector '{connector}' at {path} has an invalid value '{value}'.",
+    "solution": "Use one of the allowed values: {allowed}."
+  },
+  "TS0010017": {
+    "message": "Malformed YAML: {detail}.",
+    "solution": "Fix the YAML syntax; the line and column point at the problem."
+  },
+  "TS0010018": {
+    "message": "Variable '{name}' is not set, and the reference to it gives no default.",
+    "solution": "Set '{name}' in the environment you apply from, or give the reference a fallback with the $\\{var:NAME:default\\} form."
+  },
+  "TS0010019": {
+    "message": "Reference '{ref}' is not a form the grammar defines.",
+    "solution": "A reference names a variable, as in $\\{var:NAME:default\\} for one with a fallback; a lone dollar sign is ordinary text."
+  },
+  "TS0010020": {
+    "message": "Expression `{expr}` at {path} reads row fields, but source `{source}` has no discovered schema.",
+    "solution": "Discover the source before applying this: run `discover-schema {source}`."
+  },
+  "TS0010021": {
+    "message": "Expression `{expr}` at {path} computes on column `{column}` of table `{table}`, which is {type} and cannot be computed on without losing what it holds.",
+    "solution": "Compute on a column whose type survives the operation, or carry `{column}` through unchanged instead of computing on it."
+  },
+  "TS0010022": {
+    "message": "Expression `{expr}` at {path} reads column `{column}` of table `{table}`, which nothing resolved a type for.",
+    "solution": "Whether this expression can run is unknown; drop the reference to `{column}`, or read a column whose type the source declares."
+  },
+  "TS0010023": {
+    "message": "The sync at {path} upserts table `{table}` of source `{source}`, but that table declares no key, so no write can be matched to the row it belongs to.",
+    "solution": "Give `{table}` a primary key and discover `{source}` again, or write with `write_mode: append`, which adds rows instead of matching them. A unique index is not enough: only a primary key is read as the key here."
+  },
+  "TS0010024": {
+    "message": "The unwind step `{step}` at {path} names nothing that varies from one element to the next, so every row it expands out of a row would carry that row's own key and the target would keep only the last of them.",
+    "solution": "Add `element_key` naming a field inside each element that identifies the row it becomes, or `include_array_index` to carry each element's position in the array and be told apart by that."
+  },
+  "TS0010025": {
+    "message": "The unwind step `{step}` is written by sync `{sync}`, whose {path} appends rows instead of matching them, so deleting a row would append the elements it used to hold instead of taking their rows away.",
+    "solution": "Write that sync with `write_mode: upsert`, the default, so the expanded rows can be matched and removed; or serve the unwind to a sync that upserts and keep the append target on output that does not expand."
+  },
+  "TS0010026": {
+    "message": "Sync element at {path} of '{resource}' writes through connector '{connector}', which this release does not support as a write target.",
+    "solution": "Point that element at a source on one of the supported write connectors: {supported}. Reading through '{connector}' is unaffected: the restriction is on what '{source}' is written to, not on what it can be read from."
+  },
+  "TS0010027": {
+    "message": "Unwind option `{option}` generates column `{column}`, but that name is already in use.",
+    "solution": "Choose a name distinct from the parent columns, the array path, and the other generated column. Rename a parent column in an earlier map if necessary."
+  },
+  "TS0010028": {
+    "message": "The join SQL at {path} is not valid SQL: {detail}",
+    "solution": "Fix the SQL; the line and column in that message count from the start of the `sql:` block itself."
+  },
+  "TS0010029": {
+    "message": "The join SQL at {path} uses {shape} at line {line}, column {column}, which this release does not run.",
+    "solution": "A join is one SELECT over tables combined with equality conditions, publishing one row per match; it cannot filter, sort, cut, de-duplicate, aggregate or nest queries. Rewrite the SQL within that subset, or do the rest in a later step."
+  },
+  "TS0010030": {
+    "message": "Join `{step}` at {path} reads step `{ref}` through alias `{alias}`, but a join can only read source tables.",
+    "solution": "Point `{alias}` at the source table the step reads, and do the step's work after the join instead. A join resolves its SQL against the discovered columns of each input and keys its rows on the driving table's primary key; a step's output has neither."
+  },
+  "TS0010031": {
+    "message": "Join `{step}` at {path} binds alias `{alias}` to the pattern `/{pattern}/`, but a join input must name one source table.",
+    "solution": "Write the table's name instead of a pattern, for example `{alias}: orders`. A join reads one table per alias: its SQL names that table's columns and its rows are keyed on that table's primary key. A pattern names a set that can change, so it is refused even where it matches a single table today."
+  },
+  "TS0010032": {
+    "message": "Pipeline {pipeline} sets {setting}, which no longer decides anything; nothing reads it.",
+    "solution": "Remove {setting} and set {instead} on each node that should run differently. A node that sets nothing runs at its node type's default."
+  },
+  "TS0010033": {
+    "message": "Source {source} asks to be read by {requested} processors; one processor reads it.",
+    "solution": "No connector has declared a split read yet, so a source is read by one processor whatever is written. Remove the parallelism, or leave it; nothing else changes."
+  },
+  "TS0010034": {
+    "message": "Rollup field `{field}` at {path} names `{function}` as its function; a rollup field names exactly one of {known}.",
+    "solution": "Write one function key with its argument, for example `{field}: \\{ sum: $amount \\}`. The qualifiers `filter`, `type` and `default` go beside it."
+  },
+  "TS0010035": {
+    "message": "The embed at {path} is `as: {as}` and holds at most one row, so it cannot carry rollup fields.",
+    "solution": "Read the row's columns directly, or declare the embed `as: array` (or `as: rollup` when the rows should not be shown) if it gathers many rows."
+  },
+  "TS0010036": {
+    "message": "The embed at {path} is `as: rollup` but declares no `rollup:` fields, so it would be held and never shown.",
+    "solution": "Add the fields to compute over it under `rollup:`, or declare it `as: array` to render its rows."
+  }
+}

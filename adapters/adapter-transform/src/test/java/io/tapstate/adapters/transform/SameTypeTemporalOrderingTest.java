@@ -99,6 +99,6 @@ class SameTypeTemporalOrderingTest {
         assertThatThrownBy(() -> filter.transform(row))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(failure -> assertThat(((TapstateException) failure).code().code())
-                        .isEqualTo("transform.expression-failed"));
+                        .isEqualTo("TS0450001"));
     }
 }

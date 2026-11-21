@@ -26,7 +26,7 @@ class DataBrowserCriteriaTest {
         assertThatThrownBy(() -> new Match("status", Operator.IN, "Paid"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test
@@ -36,7 +36,7 @@ class DataBrowserCriteriaTest {
         assertThatThrownBy(() -> new Match("status", Operator.IN, List.of()))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test
@@ -44,7 +44,7 @@ class DataBrowserCriteriaTest {
         assertThatThrownBy(() -> new Match("note", Operator.EXISTS, "true"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test
@@ -52,7 +52,7 @@ class DataBrowserCriteriaTest {
         assertThatThrownBy(() -> new Match("carrier", Operator.CONTAINS, 42))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test
@@ -88,7 +88,7 @@ class DataBrowserCriteriaTest {
         assertThatThrownBy(() -> new All(List.of()))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test

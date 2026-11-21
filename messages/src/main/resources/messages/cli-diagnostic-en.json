@@ -1,0 +1,254 @@
+{
+  "TS0330001": {
+    "message": "An artifact already exists at {path}.",
+    "solution": "Choose a different id or --out, or pass --force to overwrite."
+  },
+  "TS0330002": {
+    "message": "The workspace already holds a demo resource at {path}.",
+    "solution": "Use a different workspace with -w, or pass --force to overwrite the demo files there."
+  },
+  "TS0330003": {
+    "message": "Could not write {path}: {reason}",
+    "solution": "Check that the directory exists, is writable, and that no plain file is sitting where a directory is needed. Demo files this run wrote were removed and any it overwrote were put back, though empty directories it created can remain."
+  },
+  "TS0330004": {
+    "message": "Could not read the workspace at {path}: {reason}",
+    "solution": "Check that the workspace directory and every directory and *.tap.yml file under it can be read, then run `tapstate up` again."
+  },
+  "TS0330005": {
+    "message": "The workspace at {path} holds no pipeline (a *.tap.yml with kind: pipeline), so there is nothing to bring up.",
+    "solution": "Run `tapstate new` to write one, or point -w at a workspace that holds a pipeline."
+  },
+  "TS0330006": {
+    "message": "`{path}` already exists and is not the tapstate shortcut.",
+    "solution": "Leave it in place - tapstate works without the shortcut. Remove that file yourself if you want the `tap` name, then run `tapstate alias install` again."
+  },
+  "TS0330007": {
+    "message": "No installed `tapstate` was found in `{path}`.",
+    "solution": "Run this where tapstate is installed, or set TAPSTATE_INSTALL_DIR to that directory - the same variable the installer honours."
+  },
+  "TS0330008": {
+    "message": "The `tap` shortcut at `{path}` could not be created or removed: {reason}",
+    "solution": "Check that the directory exists and you can write to it, then run `tapstate alias install` again. tapstate itself works without the shortcut."
+  },
+  "TS0330009": {
+    "message": "The local development stack cannot be run in Docker: {reason}.",
+    "solution": "Install Docker with the Compose v2 plugin and make sure it is running, then run `tapstate up` again - or point the workspace at a server you already run with --server."
+  },
+  "TS0330010": {
+    "message": "This workspace is not bound to a server, and there is nothing to ask.",
+    "solution": "Pass --server <url> to name the server to use, or --start-local to start the local development stack on {server}."
+  },
+  "TS0330011": {
+    "message": "Signing in to {server} needs a password, and there is nothing to ask.",
+    "solution": "Set {variable} in the environment, or pass --server for a server you are already signed in to."
+  },
+  "TS0330012": {
+    "message": "Signing in to {server} did not return a usable persistent session.",
+    "solution": "Check the server connection and compatibility, then run `tapstate up` again."
+  },
+  "TS0330013": {
+    "message": "No connector '{connector}' in the catalog.",
+    "solution": "Pick a connector id from the catalog; run `tapstate new` interactively to choose one."
+  },
+  "TS0330014": {
+    "message": "This release installs these connectors: {official}. '{connector}' is in the catalog but is not one of them.",
+    "solution": "Pick one of the connectors listed above. The supported set grows as connectors complete certification, so a connector missing here is not necessarily faulty."
+  },
+  "TS0330015": {
+    "message": "Could not download the published connector '{connector}': {reason}",
+    "solution": "Check network access to GitHub Releases, or set TAPSTATE_CONNECTORS_URL to an HTTPS mirror that carries the connector assets, then retry. You can still register a local jar path."
+  },
+  "TS0330016": {
+    "message": "Artifact {path} declares kind '{kind}' but sits in a '{dir}' directory.",
+    "solution": "Move it under a '{kind}' directory, or change its declared kind to match."
+  },
+  "TS0330017": {
+    "message": "No resource with id '{id}' in the workspace.",
+    "solution": "Run `tapstate ls` to see the available resources."
+  },
+  "TS0330018": {
+    "message": "Could not reach any Tapstate server among the seeds: {seeds}.",
+    "solution": "Check the addresses are correct and that a Tapstate server is running there, then try connect again."
+  },
+  "TS0330019": {
+    "message": "The request to {server} timed out before the server answered.",
+    "solution": "The server may be busy or the upload large. It may have completed there anyway \u2014 re-running a register is safe (it is idempotent). Wait and retry, or check the server logs."
+  },
+  "TS0330020": {
+    "message": "The `{verb}` command needs a connection to a Tapstate server.",
+    "solution": "Run `connect <host:port>` first, or start with `tapstate -c <host:port> -u <user>`."
+  },
+  "TS0330021": {
+    "message": "The `{verb}` command needs you to sign in first.",
+    "solution": "Run `login <username>`, or start with `tapstate -c <host:port> -u <user>`."
+  },
+  "TS0330022": {
+    "message": "The `{verb}` command is reserved but not implemented yet.",
+    "solution": "Use the commands it will be built from in the meantime; `help` lists what this build can do."
+  },
+  "TS0330023": {
+    "message": "`{verb}` works inside the Tapstate session, not as a one-shot command.",
+    "solution": "Start `tapstate` with no arguments and type `{verb}` at the prompt; `help` lists the session commands."
+  },
+  "TS0330024": {
+    "message": "The MCP sidecar is unavailable: {reason}.",
+    "solution": "Install the complete Tapstate CLI bundle, including libexec/tapstate-mcp, and retry."
+  },
+  "TS0330025": {
+    "message": "`watch` redraws one row in place, which needs a terminal; here its output is a pipe or a file.",
+    "solution": "Use `tail <source>.<collection>` for a stream you can pipe, or `<source>.<collection>.find(...)` for a one-shot look."
+  },
+  "TS0330026": {
+    "message": "`{verb}` clears what the pipeline accumulated, and there is no terminal here to confirm at.",
+    "solution": "Add `-y` to go ahead without being asked, or run `stop <pipeline-id> --keep-state` to stop it and keep everything it has."
+  },
+  "TS0330027": {
+    "message": "`--if-match` names one version, but this apply covers {count} resources.",
+    "solution": "Apply the single file you are editing, or drop `--if-match` and let the batch apply unconditionally."
+  },
+  "TS0330028": {
+    "message": "{pipeline} was left as it is: {count} start check question(s) need an answer, and there is no terminal here to ask at.",
+    "solution": "Answer them on the command line: {commands}"
+  },
+  "TS0330029": {
+    "message": "This server does not run start checks, so {option} cannot take effect; nothing was started.",
+    "solution": "Upgrade the server, or start without {option}."
+  },
+  "TS0330030": {
+    "message": "The server started {pipeline} without running start checks; it is likely older than this client.",
+    "solution": "The pipeline was started; inspect its status. Upgrade the server before relying on start checks for future starts."
+  },
+  "TS0330031": {
+    "message": "--decide {decide} is not an answer: write <check>=<action>, or <check>/<subject>=<action> for one question.",
+    "solution": "Use --decide <check>=<action>, or --decide <check>/<subject>=<action> for one finding."
+  },
+  "TS0330032": {
+    "message": "--decide {decide} cannot be taken: {findings} do(es) not offer that answer.",
+    "solution": "Answer each of them on its own with --decide <check>/<subject>=<action>, using an answer it offers."
+  },
+  "TS0330033": {
+    "message": "--decide {decide} answers a start check that refuses the start, and no answer changes a refusal.",
+    "solution": "Read the start checks for what the refusal needs changed, change it, then start again."
+  },
+  "TS0330034": {
+    "message": "The start of {pipeline} was sent to {server}, and no answer came back in time; it may have gone ahead there.",
+    "solution": "Check with 'tapstate status {pipeline}' before starting it again."
+  },
+  "TS0330035": {
+    "message": "The context configuration at `{path}` is unsafe or invalid: {reason}",
+    "solution": "Fix or remove the configuration file, then run the context manager again. The invalid file was not overwritten."
+  },
+  "TS0330036": {
+    "message": "The context configuration at `{path}` uses unsupported schema version `{version}`.",
+    "solution": "Use a compatible tapstate release or migrate the configuration with a release that supports this version."
+  },
+  "TS0330037": {
+    "message": "The context configuration path `{path}` is not owner-only: {reason}",
+    "solution": "Restore ownership and owner-only permissions, then retry. Tapstate will not read or overwrite an unsafe file."
+  },
+  "TS0330038": {
+    "message": "The auth cache at `{path}` is unsafe or invalid: {reason}",
+    "solution": "Sign in again after checking the context target. The invalid auth file was not overwritten."
+  },
+  "TS0330039": {
+    "message": "The auth cache at `{path}` uses unsupported schema version `{version}`.",
+    "solution": "Use a compatible tapstate release or sign in again with this release."
+  },
+  "TS0330040": {
+    "message": "The auth cache path `{path}` is not owner-only: {reason}",
+    "solution": "Restore ownership and owner-only permissions, then retry. Tapstate will not read or overwrite an unsafe auth file."
+  },
+  "TS0330041": {
+    "message": "The cached session for `{principal}` was rejected by the server: {code}.",
+    "solution": "Run `tapstate auth login` again for this context."
+  },
+  "TS0330042": {
+    "message": "The cached session for `{principal}` could not be exchanged because the server was unreachable.",
+    "solution": "Check the server connection and retry, or run `tapstate auth login` again."
+  },
+  "TS0330043": {
+    "message": "Login for context `{context}` did not return a usable persistent session.",
+    "solution": "Check the server connection and compatibility, then run `tapstate auth login` again."
+  },
+  "TS0330044": {
+    "message": "Login for `{principal}` was rejected by the server: {code}.",
+    "solution": "Check the username and password, then run `tapstate auth login` again."
+  },
+  "TS0330045": {
+    "message": "The remote session for context `{context}` could not be revoked; the local cache was kept.",
+    "solution": "Retry when the server is reachable, or use `tapstate auth logout --local-only` to remove only the local cache."
+  },
+  "TS0330046": {
+    "message": "The session for context `{context}` changed while logout was in progress; the newer local session was kept.",
+    "solution": "Run `tapstate auth status` to inspect the current session, then retry logout if needed."
+  },
+  "TS0330047": {
+    "message": "Invalid storage command: {reason}.",
+    "solution": "Read storage or configuration help and provide request secrets only in a local JSON file."
+  },
+  "TS0330048": {
+    "message": "Invalid auth command: {reason}.",
+    "solution": "Use `tapstate auth login [username]`, `tapstate auth status`, or `tapstate auth logout [--local-only]`."
+  },
+  "TS0330049": {
+    "message": "Invalid context manager input: {reason}.",
+    "solution": "Run `tapstate context` in an interactive terminal and choose one of the offered actions."
+  },
+  "TS0330050": {
+    "message": "Context `{name}` is invalid: {reason}",
+    "solution": "Use a non-empty name, at least one absolute HTTP(S) seed, and valid context settings."
+  },
+  "TS0330051": {
+    "message": "No context named `{name}` exists.",
+    "solution": "Open the context manager and choose an existing context or create this one."
+  },
+  "TS0330052": {
+    "message": "A context named `{name}` already exists.",
+    "solution": "Edit the existing context or choose another name."
+  },
+  "TS0330053": {
+    "message": "`--connect` and `--context` select different kinds of target and cannot be used together.",
+    "solution": "Keep `--connect` for a temporary target, or keep `--context` for a saved context."
+  },
+  "TS0330054": {
+    "message": "The `{verb}` command needs a server context, but no target was selected.",
+    "solution": "Use `--context`, set `TAPSTATE_CONTEXT`, bind this exact workspace, or use `--connect` for a temporary target."
+  },
+  "TS0330055": {
+    "message": "Server seed {seed} uses plaintext HTTP outside loopback.",
+    "solution": "Use HTTPS for remote servers; HTTP is allowed only for a loopback development server."
+  },
+  "TS0330056": {
+    "message": "Server seed {seed} did not return its anonymous cluster identity.",
+    "solution": "Check that the seed is reachable and serves /.well-known/tapstate, then try again."
+  },
+  "TS0330057": {
+    "message": "Server seed {seed} returned an invalid cluster identity ({reason}).",
+    "solution": "Check that the URL targets a compatible Tapstate server and has not been replaced by another service."
+  },
+  "TS0330058": {
+    "message": "Server seed {seed} refused anonymous issuer discovery: {reason}",
+    "solution": "A server older than this CLI does not serve /.well-known/tapstate; upgrade the server, or use a CLI matching its version."
+  },
+  "TS0330059": {
+    "message": "Server seed {seed} reports issuer {actual}, but {expected} was required.",
+    "solution": "Check the context seeds and sign in again only after confirming that this is the intended cluster."
+  },
+  "TS0330060": {
+    "message": "This CLI is {cli} and the server it connected to is {server}.",
+    "solution": "Install the CLI that matches the server, or connect to a server on {cli}; where the two disagree, the server decides."
+  },
+  "TS0330061": {
+    "message": "The result of the request to {server} could not be confirmed.",
+    "solution": "Check the current resource state before retrying a write. Restore connectivity if needed; the server may have completed the request."
+  },
+  "TS0330062": {
+    "message": "Connection lost: no reachable cluster member.",
+    "solution": "Restore connectivity, then reconnect. The last request result may be unconfirmed; check the current resource state before retrying a write."
+  },
+  "TS0330063": {
+    "message": "The stream stopped after {attempts} consecutive attachments ended without a frame.",
+    "solution": "Check the stream endpoint and network path, then reconnect. This does not establish whether the pipeline is running or failed."
+  }
+}

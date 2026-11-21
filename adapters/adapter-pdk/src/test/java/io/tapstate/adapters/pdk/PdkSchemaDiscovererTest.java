@@ -17,6 +17,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
@@ -329,6 +331,42 @@ class PdkSchemaDiscovererTest {
         // whose every table is uncounted and nothing anywhere saying why.
         assertThatThrownBy(() -> new PdkSchemaDiscoverer(connectorId -> null, Duration.ZERO))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"28P01", "28000"})
+    void typedDatabaseAuthenticationRefusalsHaveTheirOwnDiscoveryCode(String sqlState, @TempDir Path dir) {
+        SchemaDiscoverer discoverer = discoverer(Synthetic.authenticationRejectedDiscoverSource(dir, sqlState),
+                "synthetic.AuthenticationDiscover");
+        assertThatThrownBy(() -> discoverer.discover(config())).isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    var failure = (TapstateException) error;
+                    assertThat(failure.code()).isEqualTo(ConnectorError.DISCOVERY_AUTHENTICATION_REJECTED);
+                    assertThat(failure.args()).containsExactlyEntriesOf(Map.of("connector", "demo"));
+                    assertThat(failure.getCause()).hasCauseInstanceOf(java.sql.SQLException.class);
+                });
+    }
+
+    @Test
+    void aDeclaredPdkAuthenticationRefusalDoesNotDependOnADatabaseSpecificSqlState(@TempDir Path dir) {
+        var discoverer = discoverer(Synthetic.declaredAuthenticationRejectedDiscoverSource(dir),
+                "synthetic.DeclaredAuthenticationDiscover");
+        assertThatThrownBy(() -> discoverer.discover(config())).isInstanceOf(TapstateException.class)
+                .satisfies(error -> assertThat(((TapstateException) error).code())
+                        .isEqualTo(ConnectorError.DISCOVERY_AUTHENTICATION_REJECTED));
+    }
+
+    @Test
+    void passwordWordsWithoutAnAuthenticationSqlStateRemainAnUnclassifiedDiscoveryFailure(@TempDir Path dir) {
+        SchemaDiscoverer discoverer = discoverer(Synthetic.authenticationRejectedDiscoverSource(dir, "XX000"),
+                "synthetic.AuthenticationDiscover");
+        assertThatThrownBy(() -> discoverer.discover(config())).isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    var failure = (TapstateException) error;
+                    assertThat(failure.code()).isEqualTo(ConnectorError.DISCOVER_FAILED);
+                    assertThat(failure.args()).containsEntry("connector", "demo")
+                            .containsEntry("detail", "RuntimeException: java.sql.SQLException: password rejected marker <- SQLException: password rejected marker");
+                });
     }
 
     @Test

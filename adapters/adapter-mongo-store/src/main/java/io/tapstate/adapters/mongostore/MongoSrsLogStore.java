@@ -262,7 +262,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 return new SrsLogBounds(bounds.getLong(LARGEST_SEQUENCE), bounds.getLong(TRIMMED_THROUGH));
             } catch (RuntimeException e) {
                 throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                        Map.of("id", boundsId(ring)), e);
+                        Map.of("id", boundsId(ring), "field", "bounds"), e);
             }
         }
         // Older logs have no independent bounds record. Their surviving highest sequence is known,
@@ -569,7 +569,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
         Object id = document.get("_id");
         if (!(id instanceof Document key) || !(key.get(SEQ) instanceof Number seq)) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", String.valueOf(id)), null);
+                    Map.of("id", String.valueOf(id), "field", "_id.seq"), null);
         }
         return seq.longValue();
     }
@@ -630,7 +630,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                     document.containsKey("epoch") ? document.getLong("epoch") : 0L);
         } catch (RuntimeException e) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", String.valueOf(document.get("_id"))), e);
+                    Map.of("id", String.valueOf(document.get("_id")), "field", "record"), e);
         }
     }
 

@@ -40,7 +40,7 @@ class PipelinePreviewControllerTest {
         assertThatThrownBy(() -> PipelinePreviewController.readBounded(new ByteArrayInputStream(body), 4))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test

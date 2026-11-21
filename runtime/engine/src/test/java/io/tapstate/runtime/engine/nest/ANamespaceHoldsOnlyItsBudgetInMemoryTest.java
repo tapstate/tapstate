@@ -80,7 +80,7 @@ class ANamespaceHoldsOnlyItsBudgetInMemoryTest {
         assertThatThrownBy(() -> NestSettings.defaults().withEntriesHeldInMemory(BUDGET - 1))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.memory-budget-below-partition-count");
+                .isEqualTo("TS0490015");
     }
 
     @Test

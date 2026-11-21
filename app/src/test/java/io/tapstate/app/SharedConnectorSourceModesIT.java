@@ -225,7 +225,7 @@ class SharedConnectorSourceModesIT {
                 .body(draft(cloud, fixture, fixture.settings("stale-sentinel"), "stale", List.of()))
                 .exchange((request, response) -> {
                     String body = response.bodyTo(String.class);
-                    assertThat(body).contains("source.version-conflict").doesNotContain(original, replacement, "stale-sentinel");
+                    assertThat(body).contains("TS0220005").doesNotContain(original, replacement, "stale-sentinel");
                     return response.getStatusCode().value();
                 });
         assertThat(conflict).isEqualTo(412);

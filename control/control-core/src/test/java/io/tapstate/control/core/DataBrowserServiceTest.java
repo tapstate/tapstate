@@ -55,6 +55,25 @@ class DataBrowserServiceTest {
             null, null, null, null);
 
     @Test
+    void targetProbeTreatsOnlyTheTypedMissingCollectionAsEmpty() {
+        var browser = service(store(VIEWS), config -> List.of());
+        var probe = new DataBrowserTargetProbe(browser);
+        assertThatThrownBy(() -> browser.find("views", "absent", null, null, 1))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isSameAs(DataBrowserError.UNKNOWN_COLLECTION);
+                    assertThat(failure.code().code()).isEqualTo("TS0390001");
+                });
+        assertThat(probe.rows("views", "absent")).isEqualTo(TargetProbe.TargetRows.EMPTY);
+        assertThat(probe.rows(VIEWS, "absent")).isEqualTo(TargetProbe.TargetRows.EMPTY);
+        assertThatThrownBy(() -> probe.rows("missing-source", "absent"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isSameAs(SourceError.NOT_FOUND));
+        var defect = new IllegalStateException("listing invariant");
+        var broken = new DataBrowserTargetProbe(service(store(VIEWS), config -> { throw defect; }));
+        assertThatThrownBy(() -> broken.rows("views", "absent")).isSameAs(defect);
+    }
+
+    @Test
     void listsThroughTheProbeOnTheSourcesOwnConnection() {
         AtomicReference<ConnectionConfig> driven = new AtomicReference<>();
         DataBrowserService service = service(store(VIEWS), config -> {
@@ -152,7 +171,7 @@ class DataBrowserServiceTest {
                 new DataBrowserSortOrder("price\\usd", DataBrowserSortOrder.Direction.ASC), 10))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test
@@ -162,7 +181,7 @@ class DataBrowserServiceTest {
         assertThatThrownBy(() -> service.collections("absent"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("source.not-found");
+                .isEqualTo("TS0220001");
     }
 
     @Test
@@ -176,7 +195,7 @@ class DataBrowserServiceTest {
         assertThatThrownBy(() -> service.collections("orders"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("source.not-found");
+                .isEqualTo("TS0220001");
     }
 
     @Test
@@ -187,7 +206,7 @@ class DataBrowserServiceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(failure -> {
                     TapstateException coded = (TapstateException) failure;
-                    assertThat(coded.code().code()).isEqualTo("data-browser.unknown-collection");
+                    assertThat(coded.code().code()).isEqualTo("TS0390001");
                     assertThat(coded.args())
                             .containsEntry("source", "views")
                             .containsEntry("collection", "absent");
@@ -393,7 +412,7 @@ class DataBrowserServiceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException coded = (TapstateException) thrown;
-                    assertThat(coded.code().code()).isEqualTo("data-browser.unorderable-field");
+                    assertThat(coded.code().code()).isEqualTo("TS0390003");
                     assertThat(coded.args())
                             .as("named as the reader wrote it -- told about `price.usd` they would go "
                                     + "looking for a different column")
@@ -479,7 +498,7 @@ class DataBrowserServiceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(failure -> {
                     TapstateException coded = (TapstateException) failure;
-                    assertThat(coded.code().code()).isEqualTo("data-browser.invalid-limit");
+                    assertThat(coded.code().code()).isEqualTo("TS0390002");
                     assertThat(coded.args()).containsEntry("limit", "201").containsEntry("max", "200");
                 });
         assertThat(driven.get()).isNull();
@@ -507,7 +526,7 @@ class DataBrowserServiceTest {
             assertThatThrownBy(() -> service.find("views", "order_state", null, null, unreadable))
                     .isInstanceOf(TapstateException.class)
                     .extracting(failure -> ((TapstateException) failure).code().code())
-                    .isEqualTo("data-browser.invalid-limit");
+                    .isEqualTo("TS0390002");
         }
     }
 
@@ -557,7 +576,7 @@ class DataBrowserServiceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(failure -> {
                     TapstateException coded = (TapstateException) failure;
-                    assertThat(coded.code().code()).isEqualTo("data-browser.connector-not-browsable");
+                    assertThat(coded.code().code()).isEqualTo("TS0390004");
                     // Both parameters carry their weight: one says which source cannot be read, the
                     // other says what can, which is the only thing a reader can act on.
                     assertThat(coded.args())
@@ -579,7 +598,7 @@ class DataBrowserServiceTest {
         assertThatThrownBy(() -> service.tail("rows_in_sql", "orders", null, change -> { }))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("data-browser.connector-not-browsable");
+                .isEqualTo("TS0390004");
     }
 
     @Test

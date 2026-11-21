@@ -701,9 +701,9 @@ class ObservationPublisherTest {
     @Test
     void aRecoveredPipelineKeepsTheFailuresItAlreadyHad() {
         state.seed("orders", PipelineState.FAILED);
-        publisher.publish("orders", new ObservationFailure("engine.job-failed", Map.of()));
+        publisher.publish("orders", new ObservationFailure("TS0440008", Map.of()));
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errors.engine.job-failed", 1L));
+                .containsOnly(entry("errors.TS0440008", 1L));
 
         // Recovery goes through STOPPED (stop -> start). The other inversion: the number used to drop back
         // to zero here, because it tracked the state. A counter that went down on recovery is one every
@@ -713,7 +713,7 @@ class ObservationPublisherTest {
         publisher.publish("orders");
 
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errors.engine.job-failed", 1L));
+                .containsOnly(entry("errors.TS0440008", 1L));
     }
 
     @Test
@@ -766,13 +766,13 @@ class ObservationPublisherTest {
         state.seed("orders", PipelineState.FAILED);
 
         publisher.publish("orders", new ObservationFailure(
-                "engine.job-failed", Map.of("pipeline", "orders", "cause", "the sink rejected the batch")));
+                "TS0440008", Map.of("pipeline", "orders", "cause", "the sink rejected the batch")));
 
         Observation published = observations.read("orders").orElseThrow();
         // A dead job is observable as a state and a count, but neither says why. The failure carries the
         // canonical code and its named arguments, so the read face can answer that from the store alone.
         assertThat(published.failure()).isNotNull();
-        assertThat(published.failure().code()).isEqualTo("engine.job-failed");
+        assertThat(published.failure().code()).isEqualTo("TS0440008");
         assertThat(published.failure().params())
                 .containsOnly(entry("pipeline", "orders"), entry("cause", "the sink rejected the batch"));
     }
@@ -794,20 +794,20 @@ class ObservationPublisherTest {
         // still-FAILED pipeline keeps the reason it already published rather than going reasonless the
         // moment its publisher loses whatever in-memory copy it held.
         state.seed("orders", PipelineState.FAILED);
-        publisher.publish("orders", new ObservationFailure("engine.job-failed", Map.of("cause", "boom")));
+        publisher.publish("orders", new ObservationFailure("TS0440008", Map.of("cause", "boom")));
 
         publisher.publish("orders", null);
 
         ObservationFailure kept = observations.read("orders").orElseThrow().failure();
         assertThat(kept).isNotNull();
-        assertThat(kept.code()).isEqualTo("engine.job-failed");
+        assertThat(kept.code()).isEqualTo("TS0440008");
         assertThat(kept.params()).containsOnly(entry("cause", "boom"));
     }
 
     @Test
     void republishClearsTheFailureWhenThePipelineRecovers() {
         state.seed("orders", PipelineState.FAILED);
-        publisher.publish("orders", new ObservationFailure("engine.job-failed", Map.of("pipeline", "orders")));
+        publisher.publish("orders", new ObservationFailure("TS0440008", Map.of("pipeline", "orders")));
         assertThat(observations.read("orders").orElseThrow().failure()).isNotNull();
 
         state.seed("orders", PipelineState.RUNNING);
@@ -866,7 +866,7 @@ class ObservationPublisherTest {
         // A pass that could not run witnessed no transition in the failure reason or the source positions,
         // any more than it witnessed one in the state: a dead pipeline whose reconcile then starts throwing
         // must keep saying why it died and where each table's read had gotten to, not go blank on both.
-        ObservationFailure priorFailure = new ObservationFailure("engine.job-failed", Map.of("cause", "boom"));
+        ObservationFailure priorFailure = new ObservationFailure("TS0440008", Map.of("cause", "boom"));
         Map<String, String> priorPositions = Map.of("orders", "binlog.000123:456");
         observations.save(new Observation(
                 "orders", PipelineState.FAILED, Map.of("reconcileFailuresInARow", 1L), Map.of(),

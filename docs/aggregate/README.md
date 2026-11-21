@@ -61,7 +61,7 @@ every write and several totals can share one table:
 
 As in SQL, the total exists over no rows: it is written when the step starts, shows a `count` of 0 and
 null (or `default:`) elsewhere, and is never deleted. A step with no `groupBy` cannot name a field
-`aggregate`; that is refused with `aggregate.name-conflict`.
+`aggregate`; that is refused with `TS0500004`.
 
 ### `where:` or a `filter` step upstream
 
@@ -71,7 +71,7 @@ Both keep rows out of a group. They differ in what they need from the source.
   matching is taken out of its group whatever the source sends.
 - A `filter` step upstream has to tell the step that a row stopped matching, and it can only do that
   when the source sends the row as it was before the update. On a source that does not guarantee this,
-  an aggregate step reading a `filter` is refused with `aggregate.upstream-filter-unsafe`.
+  an aggregate step reading a `filter` is refused with `TS0500002`.
 
 Use `where:` unless the filter is shared with other consumers.
 
@@ -95,7 +95,7 @@ expression are decided by the input row's key.
 Numbers are exact or refused. A sum over a 64-bit integer stays a 64-bit integer, a sum over a decimal
 keeps its scale, and nothing is rounded except `avg`, whose scale is part of its type. A column whose
 numeric type nothing resolved cannot be summed or averaged and is refused at apply with
-`aggregate.type-unknown`.
+`TS0500006`.
 
 ## What reaches the target
 
@@ -112,20 +112,20 @@ are right again once both groups have been written.
 A target that reads an aggregate step must be set to `on_full_load: clear` (or `fail`). A full load
 rebuilds the step's state from nothing, and a target that kept its old rows would keep groups that no
 longer exist. The default policy keeps rows, so it is refused at apply with
-`aggregate.rebuild-needs-clear`.
+`TS0500012`.
 
 ### Changing the step
 
 The step's state is valid only for the definition that built it. After a change to `from`, `key`,
 `where`, `groupBy` or `fields`, the step refuses to start on the old state with
-`aggregate.definition-changed`, naming what changed. Rebuild the pipeline from a full load, which clears
+`TS0500011`, naming what changed. Rebuild the pipeline from a full load, which clears
 the state and the target, or restore the previous definition.
 
 ## A group that cannot be given exactly
 
 Some results cannot be computed exactly on some data: a sum that no longer fits its type
-(`aggregate.overflow`), a value whose type is not the one its column declared
-(`aggregate.value-type-mismatch`), a result `type:` cannot hold (`aggregate.result-not-convertible`).
+(`TS0500008`), a value whose type is not the one its column declared
+(`TS0500009`), a result `type:` cannot hold (`TS0500010`).
 The step never writes a wrong number. It keeps the group's row at the last values that were exact and
 marks it:
 
@@ -135,7 +135,7 @@ marks it:
   "order_count": 41, "revenue": "18200.00",
   "__tap": { "aggregate": { "sales_by_region_day": {
     "status": "failed",
-    "code": "aggregate.overflow",
+    "code": "TS0500008",
     "failed_since": "2026-03-01T10:15:00Z",
     "last_good_at": "2026-03-01T10:14:58Z"
   } } }
@@ -173,10 +173,10 @@ change that removed it a second time, and is then forgotten.
 
 ### What it costs
 
-- Applying a pipeline states the cost before anything runs: `aggregate.state-estimate` gives the most
+- Applying a pipeline states the cost before anything runs: `TS0500019` gives the most
   entries a row can take and the total that makes for the rows the inputs were discovered to hold. It is
   an upper bound: a step with a `count_distinct` over repeating values stores less. When an input reports no row
-  count, `aggregate.state-estimate-unsized` gives the cost per row and no total.
+  count, `TS0500020` gives the cost per row and no total.
 - `explain <pipeline>` shows the same estimate beside what the running step last counted. It answers
   once the pipeline is running.
 - All changes to one group are applied by one worker, in order. Many changes to the same group in a
@@ -230,14 +230,14 @@ same two actions are `POST /api/pipelines/{id}/aggregates/{step}:check` and `:re
 body `{ "group": { "<name>": "<value>" }, "after": "<cursor>" }`.
 
 - A **check** changes nothing. It reports each group whose stored fields differ from what its stored
-  rows give (`aggregate.total-mismatch`), by field.
+  rows give (`TS0500013`), by field.
 - A **repair** writes the group's fields again from its stored rows, in one commit, and sends the group
   to the target again. It requires write access and is audited.
 - A group too large to recompute in memory is reported as too large to decide, and nothing is claimed or
   changed for it.
 - The step answers between two of its own updates, so the pipeline keeps running. It must be running:
-  otherwise the answer is `aggregate.step-not-running`. A step that runs but fails while answering says
-  so with `aggregate.step-failed`, naming the failure.
+  otherwise the answer is `TS0500014`. A step that runs but fails while answering says
+  so with `TS0500017`, naming the failure.
 
 **What a check does not prove.** It compares the step's fields with the rows *the step holds*. It reads
 neither the source nor the target. A clean check says the fields are consistent with the stored rows; it
@@ -251,15 +251,15 @@ altogether is found only by a check that names it.
 
 | Code | When |
 |---|---|
-| `aggregate.input-not-supported` | `from` is not a source table or a `filter`, `map` or `union` over source tables |
-| `aggregate.upstream-filter-unsafe` | reads a `filter` step on a source without guaranteed before-images |
-| `aggregate.key-required` | the input has no primary key and the step names no `key:` |
-| `aggregate.name-conflict` | a name is used for both a group and a field, or a step with no `groupBy` names a field `aggregate` |
-| `aggregate.too-many-fields` | the step declares more than 64 fields |
-| `aggregate.expression-invalid` | `where`, a `groupBy` expression, an argument, a filter or a default does not check |
-| `aggregate.type-unknown` | `sum` or `avg` over a column whose numeric type nothing resolved |
-| `aggregate.rebuild-needs-clear` | a target reading the step keeps its rows on a full load |
-| `aggregate.definition-changed` | the stored state was built by a different definition |
+| `TS0500001` | `from` is not a source table or a `filter`, `map` or `union` over source tables |
+| `TS0500002` | reads a `filter` step on a source without guaranteed before-images |
+| `TS0500003` | the input has no primary key and the step names no `key:` |
+| `TS0500004` | a name is used for both a group and a field, or a step with no `groupBy` names a field `aggregate` |
+| `TS0500018` | the step declares more than 64 fields |
+| `TS0500005` | `where`, a `groupBy` expression, an argument, a filter or a default does not check |
+| `TS0500006` | `sum` or `avg` over a column whose numeric type nothing resolved |
+| `TS0500012` | a target reading the step keeps its rows on a full load |
+| `TS0500011` | the stored state was built by a different definition |
 
 ## Known limits
 

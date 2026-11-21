@@ -56,10 +56,45 @@ final class PipelineFailures {
                 Map.of("pipeline", pipelineId, "cause", describe(failure)));
     }
 
+    static ObservationFailure of(String pipelineId, Throwable failure, Map<String, Object> diagnostic) {
+        return of(pipelineId, failure, diagnostic, null);
+    }
+
+    static ObservationFailure of(String pipelineId, Throwable failure, Map<String, Object> diagnostic,
+            io.tapstate.core.common.FailureFact.PublicFailure publicFailure) {
+        var firstCoded = codedCause(failure);
+        if (publicFailure == null && firstCoded != null && firstCoded.code() instanceof ConnectorError) {
+            var unavailable = io.tapstate.core.common.FailureFact.unavailable(failure);
+            return of(pipelineId, failure, diagnostic.isEmpty() ? unavailable.diagnostic() : diagnostic,
+                    unavailable.publicFailure());
+        }
+        if (publicFailure != null && publicFailure.code().isEmpty() && firstCoded == null) {
+            String safeCause = diagnostic.get("message") instanceof String message && !message.isBlank()
+                    ? bound(message) : "[diagnostic unavailable]";
+            return new ObservationFailure(EngineError.JOB_FAILED.code(),
+                    Map.of("pipeline", pipelineId, "cause", safeCause), diagnostic);
+        }
+        if (publicFailure == null) {
+            var primary = of(pipelineId, failure);
+            return new ObservationFailure(primary.code(), primary.params(), diagnostic);
+        }
+        var coded = codedCause(failure);
+        String code = coded == null ? EngineError.JOB_FAILED.code() : coded.code().code();
+        var keys = coded == null ? java.util.Set.of("pipeline", "cause") : coded.args().keySet();
+        Map<String, String> safe = new LinkedHashMap<>();
+        keys.forEach(key -> safe.put(key, code.equals(publicFailure.code())
+                ? publicFailure.params().getOrDefault(key, "[diagnostic unavailable]") : "[diagnostic unavailable]"));
+        return new ObservationFailure(code, safe, diagnostic);
+    }
+
+    static boolean isCoded(Throwable failure) {
+        return codedCause(failure) != null;
+    }
+
     /** Recognizes the coded sink failure before Jet can reduce it to a generic wrapper. */
     static boolean isSinkWriteFailure(String pipelineId, Throwable failure) {
-        return failure != null
-                && ConnectorError.WRITE_FAILED.code().equals(of(pipelineId, failure).code());
+        var coded = codedCause(failure);
+        return coded != null && coded.code() == ConnectorError.WRITE_FAILED;
     }
 
     /**

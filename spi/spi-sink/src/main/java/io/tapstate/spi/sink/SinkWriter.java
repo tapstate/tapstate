@@ -24,6 +24,16 @@ public interface SinkWriter extends AutoCloseable {
      */
     CompletionStage<WriteResult> write(List<Envelope> records);
 
+    /** Captures a safe attachment using this writer's fixed source context, before terminal flattening. */
+    default java.util.Map<String, Object> diagnostic(Throwable failure) {
+        return java.util.Map.of();
+    }
+
+    /** Keeps the original throwable paired with all owner-redacted public fields. */
+    default io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure, diagnostic(failure));
+    }
+
     /** Closes the writer, releasing the target resource. Idempotent. */
     @Override
     void close();

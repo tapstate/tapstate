@@ -110,7 +110,7 @@ class CloudConfigurationInitializationDiagnosticsTest {
             verifyNoInteractions(fixture.bridge());
             if (unbound) {
                 assertThat(logs.events.list).singleElement().satisfies(event ->
-                        assertThat(event.getFormattedMessage()).contains("io.store-unavailable", "MongoCommandException code=8000"));
+                        assertThat(event.getFormattedMessage()).contains("TS0480001", "MongoCommandException code=8000"));
             } else {
                 assertThat(logs.events.list).isEmpty();
             }
@@ -167,7 +167,7 @@ class CloudConfigurationInitializationDiagnosticsTest {
             assertThat(catchThrowable(initialization::open)).isSameAs(first);
             assertThat(catchThrowable(initialization::open)).isSameAs(later);
             assertThat(logs.events.list).hasSize(2);
-            assertThat(logs.events.list.get(0).getFormattedMessage()).contains("stage=prepare", "io.store-unavailable",
+            assertThat(logs.events.list.get(0).getFormattedMessage()).contains("stage=prepare", "TS0480001",
                     "MongoCommandException code=24", "creationGranted=true", "creationInvoked=true");
             assertThat(logs.events.list.get(1).getFormattedMessage()).contains("stage=resume", later.code().code());
             assertSafe(logs);
@@ -194,7 +194,7 @@ class CloudConfigurationInitializationDiagnosticsTest {
             domains.when(() -> MongoConfigurationDomain.open(settings, "cluster")).thenThrow(refusal);
             assertThat(catchThrowable(initialization::open)).isSameAs(refusal);
             assertThat(logs.events.list).singleElement().satisfies(event ->
-                    assertThat(event.getFormattedMessage()).contains("stage=claim", "io.store-unavailable", "detail=none", "creationGranted=unknown"));
+                    assertThat(event.getFormattedMessage()).contains("stage=claim", "TS0480001", "detail=none", "creationGranted=unknown"));
             assertSafe(logs);
         }
     }

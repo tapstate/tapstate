@@ -1,6 +1,6 @@
 package io.tapstate.control.core;
 
-import io.tapstate.core.common.Domain;
+import io.tapstate.core.common.ProductErrorModule;
 import io.tapstate.core.common.Severity;
 import org.junit.jupiter.api.Test;
 
@@ -10,9 +10,9 @@ class ArtifactErrorTest {
 
     @Test
     void everyCodeIsInTheArtifactDomainAndErrorSeverity() {
-        assertThat(Domain.isRegistered("artifact")).isTrue();
+        assertThat(ProductErrorModule.ARTIFACT.number()).isEqualTo("024");
         for (ArtifactError e : ArtifactError.values()) {
-            assertThat(e.code()).startsWith("artifact.");
+            assertThat(e.code()).matches("TS024[0-9]{4}");
             assertThat(e.severity()).isEqualTo(Severity.ERROR);
         }
     }
@@ -21,17 +21,17 @@ class ArtifactErrorTest {
     void carriesTheResourceTypeAgnosticEditAndDeleteVocabulary() {
         assertThat(ArtifactError.values()).extracting(ArtifactError::code).containsExactlyInAnyOrder(
                 // the id names no stored artifact
-                "artifact.not-found",
+                "TS0240001",
                 // a delete arrived without the mandatory content-hash precondition
-                "artifact.precondition-required",
+                "TS0240002",
                 // the supplied content hash is not the stored artifact's current one
-                "artifact.version-conflict",
+                "TS0240003",
                 // another stored resource still references the id
-                "artifact.in-use",
+                "TS0240004",
                 // the id is a pipeline that is running or is about to run
-                "artifact.pipeline-not-stopped",
+                "TS0240005",
                 // the artifact was removed and some of its dependent bookkeeping was not
-                "artifact.reclaim-incomplete");
+                "TS0240006");
     }
 
     @Test
