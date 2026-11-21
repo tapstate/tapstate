@@ -720,6 +720,11 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
 
         private Map<String, Object> failurePayload(Throwable problem) {
             if (problem instanceof TapstateException coded) {
+                if (coded.code() == ActuationError.PREVIEW_ASSOCIATION_KEY_DROPPED) {
+                    String message = io.tapstate.messages.MessageCatalog.bundled()
+                            .render(coded.code(), coded.args()).message();
+                    return Map.of("code", coded.code().code(), "reason", message, "params", coded.args());
+                }
                 Object reason = coded.args().get("reason");
                 return failure(coded.code().code(), reason instanceof String text
                         ? text : "the preview could not be completed safely");
