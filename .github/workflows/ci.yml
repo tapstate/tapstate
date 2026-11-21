@@ -1,5 +1,5 @@
 name: CI
-run-name: ${{ github.event_name == 'workflow_run' && format('Pipeline Performance | Nightly {0}/{1}', github.event.workflow_run.id, github.event.workflow_run.run_attempt) || 'Pipeline Performance | Manual' }}
+run-name: Pipeline Performance | Cancellation fixture
 
 on:
   workflow_dispatch:
@@ -80,6 +80,7 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         batch: ${{ fromJSON(needs.prepare.outputs.batches) }}
     env:
@@ -102,62 +103,18 @@ jobs:
             fi
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/checkout@v4
-        if: steps.budget.outputs.run == 'true'
-        with:
-          ref: fb52a9597c7d9299691b88fbb5516faadcf2ec0a
-          persist-credentials: false
-      - uses: actions/setup-java@v4
-        if: steps.budget.outputs.run == 'true'
-        with:
-          distribution: temurin
-          java-version: '21.0.13+9.0.LTS'
-          cache: maven
-      - uses: actions/download-artifact@v4
-        if: steps.budget.outputs.run == 'true'
-        with:
-          name: performance-inputs-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/performance-inputs
-      - name: Set up Maven
-        if: steps.budget.outputs.run == 'true'
-        run: |
-          mkdir -p "$RUNNER_TEMP/performance-batch"
-          bash .github/scripts/performance-with-budget.sh "Maven setup" bash .github/scripts/setup-ci-maven.sh \
-            > "$RUNNER_TEMP/performance-batch/maven-setup.log" 2>&1
-      - name: Build and measure the fixed batch
+      - name: Preserve completed evidence or hold an unfinished batch
         if: steps.budget.outputs.run == 'true'
         shell: bash
         run: |
-          set -euo pipefail
           output="$RUNNER_TEMP/performance-batch"
           mkdir -p "$output"
-          {
-            printf 'Image %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
-            printf 'Measurement cutoff %s\n' "$STOP_AT"
-            uname -a
-            lscpu
-            free -m
-            df -h "$RUNNER_TEMP"
-            java -version
-            mvn -version
-            bash .github/scripts/performance-with-budget.sh "Docker inspection" docker info
-            git rev-parse HEAD
-          } > "$output/environment.txt" 2>&1
-          budget_script=.github/scripts/performance-with-budget.sh
-          bash "$budget_script" "connector preparation" python3 -B deploy/cloud/prepare-test-inputs.py \
-            --mongodb-only --with-dummy --output "$RUNNER_TEMP/connectors" > "$output/connectors.log" 2>&1
-          bash "$budget_script" "MongoDB image pull" docker pull mongo:7.0 > "$output/mongo-pull.log" 2>&1
-          bash "$budget_script" "MongoDB image inspection" \
-            docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$output/mongo-image.json"
-          bash "$budget_script" "application build" mvn -B -pl app,e2e -am -DskipTests package > "$output/build.log" 2>&1
-          sha256sum app/target/app-0.8.0-boot.jar "$RUNNER_TEMP/connectors/"*.jar > "$output/artifacts.sha256"
-          if (( STOP_AT <= $(date +%s) )); then
-            printf 'The batch budget expired before measurement.\n' > "$output/expired.txt"
-            exit 124
+          if [[ "$BATCH" == 0 ]]; then
+            printf 'Controlled completed job with expiry evidence.\n' > "$output/expired.txt"
+          else
+            printf 'Controlled unfinished job waiting for the reserve-window cancellation.\n' > "$output/fixture.txt"
+            sleep 240
           fi
-          python3 -B benchmarks/runner.py run \
-            --manifest "$RUNNER_TEMP/performance-inputs/manifest.json" --batch "$BATCH" \
-            --stop-at-epoch-seconds "$STOP_AT" --connectors "$RUNNER_TEMP/connectors" --output "$output/run"
       - name: Upload batch evidence
         uses: actions/upload-artifact@v4
         if: always()
