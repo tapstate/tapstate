@@ -10,6 +10,7 @@ import io.tapstate.runtime.engine.SinkAckFactory;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Holds one run's durable acknowledgements to that run. A position advanced by a superseded run is worse
@@ -71,6 +72,14 @@ final class FencedSinkAckFactory implements SinkAckFactory {
     @Override
     public LoadLandings loadLandings(HazelcastInstance member) {
         return delegate.loadLandings(member);
+    }
+
+    @Override
+    public Set<String> completedSnapshotInputs(HazelcastInstance member, Set<String> streams) {
+        ExecutionAuthorization.of(member).require(fence);
+        var completed = delegate.completedSnapshotInputs(member, streams);
+        ExecutionAuthorization.of(member).require(fence);
+        return completed;
     }
 
     /**

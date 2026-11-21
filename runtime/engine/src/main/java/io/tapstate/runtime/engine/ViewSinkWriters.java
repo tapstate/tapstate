@@ -97,6 +97,11 @@ public final class ViewSinkWriters {
             }
 
             @Override
+            public void snapshotDelivered(String stream) {
+                delegate.snapshotDelivered(stream);
+            }
+
+            @Override
             public void close() {
                 delegate.close();
             }

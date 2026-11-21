@@ -81,6 +81,24 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
             }).toList();
         };
     }
+
+    @Override
+    public Set<String> completedSnapshotInputs(HazelcastInstance member, Set<String> streams) {
+        var direct = new LinkedHashSet<String>();
+        var completed = new LinkedHashSet<String>();
+        var read = new HashMap<SrsConsumerRun, SrsConsumerProgress>();
+        for (String stream : streams) {
+            if (directSources.containsKey(stream)) {
+                direct.add(stream);
+                continue;
+            }
+            var source = source(stream);
+            var progress = read.computeIfAbsent(source.run(), run -> bind(member, run).progress());
+            if (progress.cursor().snapshotCompletedTables().contains(source.table())) completed.add(stream);
+        }
+        if (!direct.isEmpty()) completed.addAll(directFactory.completedSnapshotInputs(member, direct));
+        return Set.copyOf(completed);
+    }
     private Source source(String stream) {
         var source = sources.get(stream); if (source == null) throw new IllegalStateException("writer reported an uncompiled source stream: " + stream); return source;
     }

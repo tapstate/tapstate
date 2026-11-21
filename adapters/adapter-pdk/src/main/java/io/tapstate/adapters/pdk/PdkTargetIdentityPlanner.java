@@ -18,6 +18,10 @@ import java.util.Set;
 public final class PdkTargetIdentityPlanner {
     private static final Set<String> DOCUMENT_IDENTITIES = Set.of(
             "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb");
+    static boolean hasFlexibleColumns(String connectorId) {
+        return DOCUMENT_IDENTITIES.contains(connectorId);
+    }
+
     private final ConnectorProvisioner provisioner;
 
     public PdkTargetIdentityPlanner(ConnectorProvisioner provisioner) {
@@ -84,7 +88,7 @@ public final class PdkTargetIdentityPlanner {
 
     private static TargetIdentityPlan resolveTarget(PdkConnector connector, SinkConfig config,
             TargetTable target, boolean allowPreparation) throws Throwable {
-        boolean documentIdentity = DOCUMENT_IDENTITIES.contains(connector.connectorId());
+        boolean documentIdentity = hasFlexibleColumns(connector.connectorId());
         TapTable existing = existingTable(connector, target.name(), documentIdentity);
         TargetShape shape = targetShape(existing, documentIdentity);
         var evidence = indexEvidence(connector, target.name(), existing, documentIdentity, shape.primary());
@@ -191,17 +195,32 @@ public final class PdkTargetIdentityPlanner {
             Map<String, TargetIdentityPlan> expected) {verifyPrepared(connector,config,targets,expected,io.tapstate.spi.capture.SourceOperationObserver.NONE);}
     static void verifyPrepared(PdkConnector connector,SinkConfig config,Map<String,TargetTable> targets,
             Map<String,TargetIdentityPlan> expected,io.tapstate.spi.capture.SourceOperationObserver observer) {
+        targets.forEach((stream, target) -> verifyPrepared(connector, config, target, expected.get(stream), observer));
+    }
+
+    static void verifyEagerTargets(PdkConnector connector, SinkConfig config, Map<String, TargetTable> targets,
+            Map<String, TargetIdentityPlan> expected, io.tapstate.spi.capture.SourceOperationObserver observer) {
         targets.forEach((stream, target) -> {
-            if (!TargetIdentityPlan.AUTOMATIC.equals(expected.get(stream).status())) return;
-            TargetIdentityPlan checked;
-            try {checked=assess(connector,config,target,false);report(observer,target.name(),null);}
-            catch(RuntimeException | Error failure){report(observer,target.name(),failure);throw failure;}
-            TargetIdentityProjection.requireUsable(checked);
-            if (!TargetIdentityPlan.AUTOMATIC.equals(checked.status()) || !checked.writeKey().equals(expected.get(stream).writeKey())) {
-                throw failed(config.connectorId(), target.name(),
-                        new IllegalStateException("target identity changed during preparation"));
-            }
+            if (!target.hasDeferredDecimal()) verifyPrepared(connector, config, target, expected.get(stream), observer);
         });
+    }
+
+    static void verifyPrepared(PdkConnector connector, SinkConfig config, TargetTable target,
+            TargetIdentityPlan expected, io.tapstate.spi.capture.SourceOperationObserver observer) {
+        if (!expected.isAutomatic()) return;
+        TargetIdentityPlan checked;
+        try {
+            checked = assess(connector, config, target, false);
+            report(observer, target.name(), null);
+        } catch (RuntimeException | Error failure) {
+            report(observer, target.name(), failure);
+            throw failure;
+        }
+        TargetIdentityProjection.requireUsable(checked);
+        if (!checked.isAutomatic() || !checked.writeKey().equals(expected.writeKey())) {
+            throw failed(config.connectorId(), target.name(),
+                    new IllegalStateException("target identity changed during preparation"));
+        }
     }
 
     static TargetIdentityPlan unchanged(TargetTable target) {
