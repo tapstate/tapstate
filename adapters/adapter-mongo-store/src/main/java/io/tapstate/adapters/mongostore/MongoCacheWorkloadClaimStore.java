@@ -77,6 +77,14 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return StoreIo.call(() -> operations.renew(deadline,active,operation));
     }
 
+    @Override public <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadline, Runnable active,
+            java.util.function.Supplier<T> operation) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.NODE_SESSION)
+            throw new IllegalArgumentException("the node-session I/O lane requires a node-session key");
+        return StoreIo.call(() -> operations.nodeSession(deadline, active, operation));
+    }
+
     @Override public void awaitQuiescence(long deadline) { StoreIo.run(() -> operations.await(deadline)); }
 
     @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
@@ -167,6 +175,8 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
+        if (expected.key().type() == WorkloadClaimType.NODE_SESSION)
+            return operations.nodeSessionRenewal(expected.key(), () -> renewClaim(expected, ttl));
         if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION) return renewClaim(expected, ttl);
         var previous = MongoCommandObservation.COLLECTIONS.get();
         var stage = new java.util.concurrent.atomic.AtomicReference<String>();
@@ -515,6 +525,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                             ? WorkloadClaimRenewalException.Reason.WRITE_CONFLICT
                             : WorkloadClaimRenewalException.Reason.UNCONFIRMED,
                             "Mongo Pipeline renewal WriteConflict code=112");
+                }
+                if (operations.nodeSessionRenewal() && (retryCommit || failed instanceof MongoException mongo
+                        && (committedAck || !owned.released() || mongo.hasErrorLabel("UnknownTransactionCommitResult")))) {
+                    throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                            "the node-session renewal result could not be confirmed");
                 }
                 if (operations.pipelineRenewal() && failed instanceof MongoException mongo
                         && mongo.hasErrorLabel("UnknownTransactionCommitResult")) {

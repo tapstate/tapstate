@@ -10,6 +10,7 @@ import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimRenewalException;
+import io.tapstate.spi.store.WorkloadClaimType;
 import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -41,6 +42,12 @@ final class MongoClaimOperations {
                 thread.setDaemon(true);
                 return thread;
             });
+    private final ThreadPoolExecutor nodeSession = new ThreadPoolExecutor(1, 1, 100, TimeUnit.MILLISECONDS,
+            new java.util.concurrent.SynchronousQueue<>(), action -> {
+                var thread = new Thread(action, "mongo-node-session-io");
+                thread.setDaemon(true);
+                return thread;
+            });
     private final Set<Call<?>> calls = ConcurrentHashMap.newKeySet();
     private final Set<Transaction> transactions = ConcurrentHashMap.newKeySet();
     private final ThreadLocal<MongoReadBudget> current = new ThreadLocal<>();
@@ -58,20 +65,29 @@ final class MongoClaimOperations {
         observeTopology();
         workers.allowCoreThreadTimeOut(true);
         renewals.allowCoreThreadTimeOut(true);
+        nodeSession.allowCoreThreadTimeOut(true);
     }
 
     MongoReadBudget budget() { return current.get(); }
 
     <T> T pipelineRenewal(WorkloadClaimKey key, Supplier<T> action) {
+        if (budget() == null || renewalLane.get() == null) return action.get();
+        return renewClaim(key, action);
+    }
+
+    <T> T nodeSessionRenewal(WorkloadClaimKey key, Supplier<T> action) {
+        return budget() == null ? action.get() : renewClaim(key, action);
+    }
+
+    private <T> T renewClaim(WorkloadClaimKey key, Supplier<T> action) {
         var budget = budget();
-        if (budget == null || renewalLane.get() == null) return action.get();
         for (var transaction : transactions) {
             if (!key.equals(transaction.renewalKey)) continue;
             try {
                 abort(transaction, budget);
             } catch (RuntimeException unconfirmed) {
                 throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
-                        "previous Pipeline renewal transaction remains unresolved");
+                        "previous claim renewal transaction remains unresolved");
             }
         }
         renewalKey.set(key);
@@ -82,7 +98,19 @@ final class MongoClaimOperations {
         }
     }
 
-    boolean pipelineRenewal() { return renewalKey.get() != null; }
+    boolean pipelineRenewal() {
+        var key = renewalKey.get();
+        return key != null && key.type() == WorkloadClaimType.PIPELINE_ACTUATION;
+    }
+
+    boolean nodeSessionRenewal() {
+        var key = renewalKey.get();
+        return key != null && key.type() == WorkloadClaimType.NODE_SESSION;
+    }
+
+    <T> T nodeSession(long deadline, Runnable guard, Supplier<T> action) {
+        return call(deadline, guard, action, nodeSession);
+    }
     private void observeTopology() {
         var topology = client.getClusterDescription();
         if (topology.getType() == com.mongodb.connection.ClusterType.REPLICA_SET) {
@@ -143,7 +171,12 @@ final class MongoClaimOperations {
         if (renewal) renewalRunning = true;
         calls.add(call);
         try { lane.execute(call); }
-        catch (RuntimeException rejected) { call.finished(); throw rejected; }
+        catch (java.util.concurrent.RejectedExecutionException rejected) {
+            call.finished();
+            if (lane == nodeSession) throw new WorkloadClaimRenewalException(
+                    WorkloadClaimRenewalException.Reason.NOT_STARTED, "the node-session I/O lane is still in use");
+            throw rejected;
+        }
         return call;
     }
 
@@ -381,5 +414,6 @@ final class MongoClaimOperations {
         closed = true;
         workers.shutdown();
         renewals.shutdown();
+        nodeSession.shutdown();
     }
 }

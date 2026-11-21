@@ -21,6 +21,12 @@ public interface DeadlineWorkloadClaimStore extends WorkloadClaimStore {
         return withDeadline(deadlineNanos, requireActive, operation);
     }
 
+    /** Bounds node-session renewal and confirmation independently of Pipeline claim work. */
+    default <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadlineNanos, Runnable requireActive,
+            Supplier<T> operation) {
+        return withDeadline(deadlineNanos, requireActive, operation);
+    }
+
     /** Waits for those actual owners, retrying only cleanup, under the same shutdown deadline. */
     void awaitQuiescence(long deadlineNanos);
 }
