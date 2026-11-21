@@ -1,5 +1,19 @@
 {
   "cases": {
+    "aggregate.snapshot.basic.small@1": {
+      "definition_sha256": "a6558502d33906e0f06c13b40e27694e906c8539d37309625cb9193fc9cf8191",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 40000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
     "copy.backlog.fixed-iud.standard@1": {
       "definition_sha256": "7f023c567c7121ce554491b3ac180aa095207d26a11f1ab970c1b2e93567fd04",
       "load": {
@@ -30,6 +44,20 @@
     },
     "nest.snapshot.fanout.wide@2": {
       "definition_sha256": "d0d05f0dd61c87f519cde4c4fc0aca336116dbbd88d6396f9c5f9c02e644b9dc",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "unwind.snapshot.basic.large@1": {
+      "definition_sha256": "071035a8c9b04aef70220f5e0e4152e7c2af6de354a7203b74f7ca4bab55cc7d",
       "load": {
         "backlog_events": 30000,
         "measurement_seconds": 300,

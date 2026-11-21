@@ -1,5 +1,11 @@
 {
   "cases": {
+    "aggregate.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "observed_whole_case_seconds": 97.12,
+      "seconds": 182,
+      "workload_sha256": "f8cf392d52f7dba7698ea1535bb10052550912937b7bf43bfeb12830a252132b"
+    },
     "copy.backlog.fixed-iud.standard@1": {
       "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
       "observed_whole_case_seconds": 220.869,
@@ -17,6 +23,12 @@
       "observed_whole_case_seconds": 353.466,
       "seconds": 502,
       "workload_sha256": "046fc5497df13a309bdf398bf76ac022ade7904a622d1133665e6dca966fead5"
+    },
+    "unwind.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "observed_whole_case_seconds": 148.03,
+      "seconds": 246,
+      "workload_sha256": "eebbbc77eecc232e93fc54f1a0b5618f59eab37cbeb7c272eddd896e0b8dda16"
     }
   },
   "environment": "ubuntu-24.04-x64-op",

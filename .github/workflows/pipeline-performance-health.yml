@@ -31,10 +31,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PERFORMANCE_FEISHU_MENTION_ID: ${{ vars.PERFORMANCE_FEISHU_MENTION_ID }}
         run: python3 -B benchmarks/actions_watch.py prepare "$RUNNER_TEMP/performance-health"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: performance-notification-intent
+          path: ${{ runner.temp }}/performance-health/next-state.json
+          if-no-files-found: ignore
+          retention-days: 90
       - name: Deliver scheduled notifications
         env:
           PERFORMANCE_FEISHU_WEBHOOK: ${{ secrets.NIGHTLY_FEISHU_WEBHOOK }}
         run: python3 -B benchmarks/actions_watch.py send "$RUNNER_TEMP/performance-health"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-notification-receipt
+          path: ${{ runner.temp }}/performance-health/delivery.json
+          if-no-files-found: ignore
+          retention-days: 90
       - uses: actions/upload-artifact@v4
         if: always()
         with:

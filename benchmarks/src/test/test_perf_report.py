@@ -153,6 +153,23 @@ class PerfReportTest(unittest.TestCase):
         result = report.reconcile(self.manifest, [self.summary], self.baseline)
         self.assertEqual("unavailable", result["case_verdicts"][case_id]["comparison"])
 
+    def test_memory_budget_failure_is_independent_of_comparison_eligibility(self):
+        case = self.row["case_id"]
+        self.baseline["memory_limits"] = {case: {"snapshot.rss_peak_kib": {"source": "fixture", "limit_kib": 115}}}
+        result = report.reconcile(self.manifest, [self.summary], self.baseline)
+        self.assertEqual("failed", result["results"][0]["status"])
+        self.assertEqual("memory-budget-exceeded", result["results"][0]["memory_failures"][0]["reason"])
+        self.assertEqual("failed", result["case_verdicts"][case]["execution"])
+        self.assertEqual("unavailable", result["case_verdicts"][case]["comparison"])
+        self.assertEqual("completed", self.row["status"])
+
+        self.row["resources"]["windows"]["snapshot"]["covered"] = False
+        result = report.reconcile(self.manifest, [self.summary], self.baseline)
+        self.assertEqual("completed", result["results"][0]["status"])
+        self.row.update(status="failed", exit_attribution="observed-java-out-of-memory")
+        result = report.reconcile(self.manifest, [self.summary])
+        self.assertEqual("observed-java-out-of-memory", result["results"][0]["memory_failures"][0]["reason"])
+
     def test_mismatched_or_missing_environment_profile_never_qualifies(self):
         variants = [
             dict(self.row, environment_profile="other-env"),

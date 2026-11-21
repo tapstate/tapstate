@@ -33,19 +33,44 @@ def artifact(repository, run_id, name, filename):
         return actions_report.object_or_empty(Path(folder) / filename)
 
 
-def latest_state(repository, branch, now):
-    artifacts = api(repository, "artifacts?name=performance-notification-state&per_page=50")["artifacts"]
-    candidates = sorted(artifacts, key=lambda item: item["created_at"], reverse=True)
+def latest_artifact(repository, branch, name):
+    artifacts = api(repository, f"artifacts?name={name}&per_page=50")["artifacts"]
+    candidates = sorted(artifacts, key=artifact_order, reverse=True)
     for candidate in candidates:
         reference = candidate.get("workflow_run")
         if not reference or candidate["expired"] or reference["head_branch"] != branch:
             continue
         source = api(repository, f"runs/{reference['id']}")
         if source["event"] == "schedule" and source["path"] == ".github/workflows/pipeline-performance-health.yml":
-            state = artifact(repository, reference["id"], "performance-notification-state", "state.json")
-            if state:
-                return state
-    return {"updated_at": (now - timedelta(days=1)).isoformat(), "active": {}}
+            return candidate
+    return None
+
+
+def artifact_order(item):
+    return item["created_at"], item["id"]
+
+
+def latest_state(repository, branch, now):
+    committed = latest_artifact(repository, branch, "performance-notification-state")
+    state = {"updated_at": (now - timedelta(days=1)).isoformat(), "active": {}}
+    if committed:
+        run_id = committed["workflow_run"]["id"]
+        state = artifact(repository, run_id, "performance-notification-state", "state.json")
+        if not state:
+            raise ValueError(f"Notification state from run {run_id} could not be read")
+    intent = latest_artifact(repository, branch, "performance-notification-intent")
+    if not intent or (committed and artifact_order(intent) < artifact_order(committed)):
+        return state
+    run_id = intent["workflow_run"]["id"]
+    receipt = artifact(repository, run_id, "performance-notification-receipt", "delivery.json")
+    delivery = receipt.get("status")
+    if delivery == "rejected":
+        return state
+    if delivery == "accepted":
+        proposed = artifact(repository, run_id, "performance-notification-intent", "next-state.json")
+        if proposed:
+            return proposed
+    raise ValueError(f"Delivery from health run {run_id} is uncertain")
 
 
 def prepare(output, repository, branch, mention_id):
@@ -68,7 +93,14 @@ def prepare(output, repository, branch, mention_id):
         "status": health["status"], "due_at": health["due_at"],
         "nightly_run_id": health["nightly"]["id"] if health["nightly"] else None,
         "performance_run_id": performance["id"] if performance else None,
+        "queue_seconds": (now - actions_health.timestamp(performance["created_at"])).total_seconds()
+        if health["status"] == "performance-queued" else None,
     })
+    if health["status"] == "performance-expired" and performance["status"] != "completed":
+        live = api(repository, f"runs/{performance['id']}")
+        if live["run_attempt"] == 1 and live["status"] != "completed":
+            subprocess.run(["gh", "api", "--method", "POST",
+                            f"repos/{repository}/actions/runs/{performance['id']}/cancel"], check=True, timeout=30)
     previous = latest_state(repository, branch, now)
     active, healthy = notifications.signals(health)
     notices, next_state = notifications.changes(previous["active"], active, healthy)
@@ -82,10 +114,6 @@ def prepare(output, repository, branch, mention_id):
         runner.write_json(output / "next-state.json", {"updated_at": now.isoformat(), "active": next_state})
     elif now - actions_health.timestamp(previous["updated_at"]) >= timedelta(days=1):
         runner.write_json(output / "state.json", {"updated_at": now.isoformat(), "active": previous["active"]})
-    if (health["status"] == "performance-expired" and performance["status"] != "completed"
-            and api(repository, f"runs/{performance['id']}")["run_attempt"] == 1):
-        subprocess.run(["gh", "api", "--method", "POST",
-                        f"repos/{repository}/actions/runs/{performance['id']}/cancel"], check=True, timeout=30)
 
 
 def send(output, webhook):
@@ -93,15 +121,23 @@ def send(output, webhook):
     if not card.exists():
         return
     if not webhook.startswith("https://"):
+        runner.write_json(output / "delivery.json", {"status": "rejected"})
         raise ValueError("Configure the scheduled Feishu webhook")
     request = Request(webhook, card.read_bytes(), {"Content-Type": "application/json"}, method="POST")
     try:
         with urlopen(request, timeout=15) as response:
             receipt = json.loads(response.read(4096))
     except (OSError, ValueError):
+        runner.write_json(output / "delivery.json", {"status": "unknown"})
         raise ValueError("Feishu receipt unavailable") from None
-    if receipt.get("code", receipt.get("StatusCode")) != 0:
+    code = receipt.get("code", receipt.get("StatusCode")) if isinstance(receipt, dict) else None
+    if type(code) is not int:
+        runner.write_json(output / "delivery.json", {"status": "unknown"})
+        raise ValueError("Feishu receipt did not confirm a delivery result")
+    if code != 0:
+        runner.write_json(output / "delivery.json", {"status": "rejected"})
         raise ValueError("Feishu did not accept the notification")
+    runner.write_json(output / "delivery.json", {"status": "accepted"})
     (output / "next-state.json").replace(output / "state.json")
 
 

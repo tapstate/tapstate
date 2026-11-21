@@ -535,7 +535,10 @@ def main():
         if args.formal_workloads:
             manifest["scale"] = "formal"
             manifest["selected_cases"] = [
-                {"id": case["id"], "version": case["case_version"], "description": case["description"]}
+                {"id": case["id"], "version": case["case_version"], "scenario": case["description"],
+                 "mode": case["mode"], "phase": case["phase"], "profile": case["profile"],
+                 "repeats": case["workload_spec"]["repetition"]["count"],
+                 "paired_control": "paired-control" in case["tags"]}
                 for case in cases
             ]
         if args.bind_github_attempt:

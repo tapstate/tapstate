@@ -26,7 +26,7 @@ def signals(health):
             context = report["case_context"][case_id]
             condition = catalog.digest({
                 "version": context["version"], "profile": context["profile"],
-                "load": context["effective_load"], "environment": report["environment"],
+                "load": context.get("effective_load"), "environment": report["environment"],
             })
             key = f"execution:{case_id}:{condition}"
             if case["execution"] == "completed":

@@ -18,7 +18,11 @@ class LiveLatencyEligibilityTest {
         assertNull(LiveLatencyEligibility.assess(10010, samples, false, 10000, 0.999).p99Nanos());
         assertNull(LiveLatencyEligibility.assess(10000, samples.subList(0, 9999), true, 10000, 0.999).p99Nanos());
         assertNull(LiveLatencyEligibility.assess(10100, samples, true, 10000, 0.999).p99Nanos());
-        assertEquals(9900L, LiveLatencyEligibility.assess(10010, samples, true, 10000, 0.999).p99Nanos());
+        var reading = LiveLatencyEligibility.assess(10010, samples, true, 10000, 0.999);
+        assertEquals(5000L, reading.p50Nanos());
+        assertEquals(9500L, reading.p95Nanos());
+        assertEquals(9900L, reading.p99Nanos());
+        assertNull(rawAggregate.p95Nanos());
         assertThrows(IllegalArgumentException.class, () -> LiveLatencyEligibility.assess(10000,
                 List.of(samples.getFirst(), samples.getFirst()), true, 10000, 0.999));
     }

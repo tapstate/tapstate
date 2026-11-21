@@ -64,12 +64,18 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
     for key, entry in expected.items():
         fallback = {"case_id": key[0], "case_version": entry["case"]["case_version"],
                     "repeat": key[1], "status": "missing"}
-        comparison = compare(rows.get(key), baseline, manifest["environment"])
+        row = {**fallback, **rows.get(key, {})}
+        failures = memory_failures(row, baseline, manifest["environment"])
+        if failures:
+            row["memory_failures"] = failures
+            if row["status"] == "completed":
+                row.update(status="failed", last_stage="memory", reason=failures[0]["reason"])
+        comparison = compare(row if key in rows else None, baseline, manifest["environment"])
         if comparison["status"] == "baseline-not-supplied" and baseline_status:
             reason = baseline_status.get("reason")
             if reason and reason != "baseline-not-supplied":
                 comparison = {"status": "baseline-unavailable", "reason": reason}
-        results.append({**fallback, **rows.get(key, {}), "comparisons": comparison})
+        results.append({**row, "comparisons": comparison})
     result = {"manifest_sha256": manifest["manifest_sha256"], "identity": manifest["identity"],
             "environment": manifest["environment"], "baseline_id": baseline["id"] if baseline else None,
             "baseline_kind": baseline["kind"] if baseline else None, "errors": errors, "results": results,
@@ -84,6 +90,25 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
 def matches_environment(row, profile):
     return (row.get("environment_profile") == profile
             and all(arm.get("environment_profile") == profile for arm in row.get("paired_arms", {}).values()))
+
+
+def memory_failures(row, baseline, environment):
+    failures = []
+    limits = {}
+    if baseline and baseline["environment"] == environment and row["status"] == "completed":
+        reference = baseline["cases"].get(row["case_id"], {})
+        if reference and all(key in reference and reference[key] == row.get(key) for key in CASE_CONDITIONS):
+            limits = baseline.get("memory_limits", {}).get(row["case_id"], {})
+    for name, arm in row.get("paired_arms", {"single": row}).items():
+        if arm.get("exit_attribution") == "observed-java-out-of-memory":
+            failures.append({"arm": name, "scope": "OP process", "reason": "observed-java-out-of-memory"})
+        if limits:
+            for metric, observed, source in eligible_metrics(arm):
+                limit = limits.get(metric)
+                if limit and source == limit["source"] and valid(observed) and observed > limit["limit_kib"]:
+                    failures.append({"arm": name, "reason": "memory-budget-exceeded", "metric": metric,
+                                     "observed": observed, **limit})
+    return failures
 
 
 def summarize_repeats(results):
@@ -120,9 +145,34 @@ def eligible_metrics(arm):
         yield "endpoint_p95_nanos", latency.get("p95Nanos"), latency["source"]
     resources = arm.get("resources", {})
     if resources.get("status") == "observed":
-        for phase, usage in resources["windows"].items():
+        windows = resources["windows"]
+        for phase, usage in windows.items():
             if usage.get("covered") and identified_source(usage.get("source")):
                 yield f"{phase}.rss_peak_kib", usage.get("rss_peak_kib"), usage["source"]
+        steady = [windows.get(f"steady-{index}", {}) for index in (1, 2, 3)]
+        steady_source = covered_rss_source(steady)
+        if steady_source and nondecreasing_rss(steady):
+            yield "steady.rss_growth_kib_per_second", resources.get("steady_rss_growth_kib_per_second"), steady_source
+        cycles = arm.get("lifecycle_cycles", [])
+        idle = [windows.get(f"lifecycle-cycle-{cycle['cycle']}/idle", {}) for cycle in cycles]
+        idle_source = covered_rss_source(idle)
+        if (len(cycles) >= 3 and idle_source and len({cycle["idle_seconds"] for cycle in cycles}) == 1
+                and all(cycle.get("state") == "STOPPED" and cycle.get("target_readback") == "verified"
+                        for cycle in cycles)
+                and nondecreasing_rss(idle)):
+            yield "lifecycle.idle_rss_retained_kib", idle[-1]["rss_median_kib"] - idle[0]["rss_median_kib"], idle_source
+
+
+def covered_rss_source(windows):
+    if not windows or not all(window.get("covered") and valid(window.get("rss_median_kib"))
+                              for window in windows):
+        return None
+    source = windows[0].get("source")
+    return source if identified_source(source) and all(window.get("source") == source for window in windows) else None
+
+
+def nondecreasing_rss(windows):
+    return all(first["rss_median_kib"] <= second["rss_median_kib"] for first, second in zip(windows, windows[1:]))
 
 
 def compare(row, baseline, environment):

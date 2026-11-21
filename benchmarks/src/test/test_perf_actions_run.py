@@ -109,6 +109,25 @@ class ActionsRunTest(unittest.TestCase):
             with self.subTest(status=status):
                 self.assertEqual(status, actions_health.assess(now, nightlies, jobs, {})["status"])
 
+    def test_failed_allocation_accounts_for_every_selected_case_as_not_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = {"run_id": 111, "attempt": 1}
+            runner.write_json(root / "run.json", {"github_attempt": attempt, "scope": "all"})
+            selected = [{"id": case, "version": 1, "repeats": 3, "profile": "standard"} for case in ("first", "second")]
+            runner.write_json(root / "manifest.json", {
+                "identity": {"code_sha": "candidate"}, "github_attempt": attempt, "environment": "hosted",
+                "batches": [], "selected_cases": selected, "selected_ids": ["first", "second"],
+                "unallocated": [{"id": "first", "reason": "missing formal workload"}],
+            })
+            result = actions_report.collect(root, root, attempt, {"prepare": "failure", "measure": "skipped"})
+            self.assertEqual({"not-run": 2}, result["case_counts"])
+            self.assertEqual({"not-run": 6}, result["repeat_counts"])
+            self.assertEqual("missing formal workload", result["results"][0]["reason"])
+            self.assertEqual("allocation incomplete", result["results"][-1]["reason"])
+            active, _ = notifications.signals({"status": "reported", "report": result})
+            self.assertEqual({"workflow"}, set(active))
+
     def test_notification_only_repeats_on_escalation_and_qualified_recovery(self):
         first = {"kind": "workflow", "reason": "missing-handoff"}
         changed = {"kind": "workflow", "reason": "report-missing"}
@@ -136,3 +155,15 @@ class ActionsRunTest(unittest.TestCase):
                 actions_watch.send(output, "https://example.invalid/fixture")
             self.assertTrue((output / "state.json").exists())
             self.assertFalse((output / "next-state.json").exists())
+
+    def test_delivery_intent_prevents_a_duplicate_when_state_artifact_upload_is_lost(self):
+        now = datetime.fromisoformat("2026-11-21T15:00:00+00:00")
+        delivery_intent = {"workflow_run": {"id": 10}, "id": 11, "created_at": now.isoformat()}
+        draft_state = {"updated_at": now.isoformat(), "active": {"workflow": {"reason": "missing-handoff"}}}
+        with patch.object(actions_watch, "latest_artifact", side_effect=[None, delivery_intent]), \
+                patch.object(actions_watch, "artifact", side_effect=[{"status": "accepted"}, draft_state]):
+            self.assertEqual(draft_state, actions_watch.latest_state("example/repo", "main", now))
+        with patch.object(actions_watch, "latest_artifact", side_effect=[None, delivery_intent]), \
+                patch.object(actions_watch, "artifact", return_value={"status": "unknown"}):
+            with self.assertRaisesRegex(ValueError, "run 10 is uncertain"):
+                actions_watch.latest_state("example/repo", "main", now)

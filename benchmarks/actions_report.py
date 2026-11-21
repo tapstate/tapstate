@@ -13,6 +13,7 @@ import baseline
 import catalog
 import report
 import runner
+import verdict
 
 
 def collect(inputs, artifacts, attempt, job_results):
@@ -64,10 +65,19 @@ def collect(inputs, artifacts, attempt, job_results):
         result = report.reconcile(manifest, measurements, reference, baseline_status=baseline_status)
         result["errors"].extend(errors)
     else:
+        reasons = {item["id"]: item["reason"] for item in errors if "id" in item}
+        unmeasured = [
+            {"case_id": case["id"], "case_version": case["version"], "repeat": repeat, "status": "not-run",
+             "last_stage": "prepare", "reason": reasons.get(case["id"], "allocation incomplete"),
+             "comparisons": {"status": "result-unavailable"}}
+            for case in (manifest or {}).get("selected_cases", [])
+            for repeat in range(1, case["repeats"] + 1)
+        ]
         result = {"identity": manifest["identity"] if manifest else {},
                   "environment": manifest["environment"] if manifest else None,
                   "baseline": baseline_status, "baseline_id": baseline_status.get("id"),
-                  "errors": errors, "results": [], "statistics": {}}
+                  "errors": errors, "results": unmeasured, "statistics": {},
+                  "case_verdicts": verdict.case_verdicts(unmeasured, None)}
     result["github_attempt"] = attempt
     result["workflow"] = run
     result["job_results"] = job_results
@@ -137,6 +147,9 @@ def summary(result, repository):
         elapsed = (datetime.fromisoformat(result["generated_at"]) - started).total_seconds()
         lines.append(f"- Business date {timeline['business_date']}, initial queue {timeline['queue_seconds']:.0f}s, "
                      f"elapsed {elapsed:.0f}s")
+    for job in result.get("jobs", []):
+        if job["elapsed_seconds"] is not None:
+            lines.append(f"- {escape(job['name'])} elapsed {job['elapsed_seconds']:.0f}s ({job['conclusion']})")
     if result["repeat_counts"]:
         lines.append("- Repeat outcomes " + ", ".join(
             f"{status} {count}" for status, count in sorted(result["repeat_counts"].items())))
@@ -148,11 +161,21 @@ def summary(result, repository):
     lines.extend(f"- {escape(item.get('reason', 'Unknown outcome'))}"
                  + (f" ({item['id']})" if "id" in item else
                     f" (batch {item['batch']})" if "batch" in item else "") for item in result["errors"])
+    lines.extend(["", "<details><summary>Coverage by case</summary>", "",
+                  "| Case | Profile | Repeats | Execution | Comparison |",
+                  "|---|---|---:|---|---|"])
+    for case_id in result["selected_ids"]:
+        context = result["case_context"].get(case_id, {})
+        case = result["case_verdicts"].get(case_id, {})
+        lines.append(f"| {case_id}@{context.get('version', '-')} | {context.get('profile') or '-'} | "
+                     f"{context.get('repeats', '-')} | {case.get('execution', 'unavailable')} | "
+                     f"{case.get('comparison', 'unavailable')} |")
+    lines.extend(["", "</details>"])
     lines.extend(["", "## Case execution failures", "", "<details><summary>Repeat evidence</summary>", "",
                   "| Case | Repeat | Status | Stage | Reason |",
                   "|---|---:|---|---|---|"])
     for row in result["results"]:
-        if row["status"] == "completed":
+        if row["status"] in {"completed", "not-run", "missing"}:
             continue
         fields = [f"{row['case_id']}@{row['case_version']}", row["repeat"], row["status"],
                   row.get("last_stage", "-"), row.get("reason", "-")]
@@ -175,16 +198,33 @@ def summary(result, repository):
     return "\n".join(lines)
 
 
+def jobs_for_report(path):
+    if not path:
+        return []
+    document = object_or_empty(path)
+    jobs = []
+    for job in document.get("jobs", []):
+        started, completed = job.get("started_at"), job.get("completed_at")
+        elapsed = None
+        if started and completed:
+            elapsed = (datetime.fromisoformat(completed) - datetime.fromisoformat(started)).total_seconds()
+        jobs.append({"name": job["name"], "started_at": started, "completed_at": completed,
+                     "elapsed_seconds": elapsed, "conclusion": job.get("conclusion")})
+    return jobs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--jobs", type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True)
     attempt = runner.github_attempt()
     jobs = json.loads(os.environ.get("PERFORMANCE_JOB_RESULTS", "{}"))
     result = collect(args.inputs, args.artifacts, attempt, jobs)
+    result["jobs"] = jobs_for_report(args.jobs)
     runner.write_json(args.output / "report.json", result)
     markdown = summary(result, os.environ["GITHUB_REPOSITORY"])
     (args.output / "report.md").write_text(markdown, encoding="utf-8")

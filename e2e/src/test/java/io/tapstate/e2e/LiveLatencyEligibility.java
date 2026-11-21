@@ -11,7 +11,8 @@ final class LiveLatencyEligibility {
     record Sample(String sourceEvent, long latencyNanos) {
     }
 
-    record Reading(String status, int expected, int valid, double coverage, Long p99Nanos, String reason) {
+    record Reading(String status, int expected, int valid, double coverage, String source,
+                   Long p50Nanos, Long p95Nanos, Long p99Nanos, String reason) {
     }
 
     static Reading assess(int expected, List<Sample> samples, boolean comparableClocks, int minimum, double requiredCoverage) {
@@ -32,9 +33,14 @@ final class LiveLatencyEligibility {
         if (!comparableClocks || valid < minimum || coverage < requiredCoverage) {
             String reason = !comparableClocks ? "Window-level event correlation and a comparable clock are required"
                     : valid < minimum ? "Too few valid latency samples" : "Confirmation coverage below threshold";
-            return new Reading("insufficient-evidence", expected, valid, coverage, null, reason);
+            return new Reading("insufficient-evidence", expected, valid, coverage, null, null, null, null, reason);
         }
         long[] times = samples.stream().mapToLong(Sample::latencyNanos).sorted().toArray();
-        return new Reading("eligible", expected, valid, coverage, times[(int) Math.ceil(times.length * 0.99) - 1], null);
+        return new Reading("eligible", expected, valid, coverage, "correlated-source-to-target-v1",
+                nearestRank(times, 0.50), nearestRank(times, 0.95), nearestRank(times, 0.99), null);
+    }
+
+    private static long nearestRank(long[] sorted, double fraction) {
+        return sorted[(int) Math.ceil(sorted.length * fraction) - 1];
     }
 }

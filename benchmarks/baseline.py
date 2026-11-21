@@ -91,6 +91,8 @@ def load(path, *, identity=None):
             raise ValueError("invalid-baseline-case")
         if "comparison_rules" in baseline and not valid_rules(baseline["comparison_rules"]):
             raise ValueError("invalid-baseline-comparison-rules")
+        if "memory_limits" in baseline and not valid_memory_limits(baseline["memory_limits"]):
+            raise ValueError("invalid-baseline-memory-limits")
         if "id" in details and (baseline["kind"] != "accepted" or baseline["id"] != details["id"]
                                 or baseline.get("version") != details.get("version")
                                 or baseline["environment"] != details.get("environment")
@@ -120,6 +122,12 @@ def valid_case(row):
         ):
             return False
         resources = arm.get("resources", {})
+        cycles = arm.get("lifecycle_cycles", [])
+        if not isinstance(cycles, list) or any(
+            not isinstance(cycle, dict) or type(cycle.get("cycle")) is not int
+            or type(cycle.get("idle_seconds")) is not int for cycle in cycles
+        ):
+            return False
         if resources.get("status") == "observed":
             windows = resources.get("windows")
             if not isinstance(windows, dict) or any(not isinstance(window, dict) for window in windows.values()):
@@ -143,5 +151,19 @@ def valid_rules(policy):
                 if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                     return False
             if rule["observe_ratio"] >= rule["suspect_ratio"]:
+                return False
+    return True
+
+
+def valid_memory_limits(policies):
+    if not isinstance(policies, dict):
+        return False
+    for metrics in policies.values():
+        if not isinstance(metrics, dict):
+            return False
+        for name, policy in metrics.items():
+            if (not name.endswith(".rss_peak_kib") or not isinstance(policy, dict)
+                    or not isinstance(policy.get("source"), str) or not policy["source"]
+                    or type(policy.get("limit_kib")) is not int or policy["limit_kib"] < 1):
                 return False
     return True

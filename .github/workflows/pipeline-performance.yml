@@ -173,6 +173,9 @@ jobs:
     needs: [prepare, measure]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -188,13 +191,18 @@ jobs:
         with:
           pattern: performance-batch-${{ github.run_attempt }}-*
           path: ${{ runner.temp }}/performance-batches
+      - name: Read job timing evidence
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" > "$RUNNER_TEMP/performance-jobs.json"
       - name: Reconcile and publish
         env:
           PERFORMANCE_JOB_RESULTS: ${{ format('{{"prepare":"{0}","measure":"{1}"}}', needs.prepare.result, needs.measure.result) }}
         run: |
           python3 -B benchmarks/actions_report.py \
             --inputs "$RUNNER_TEMP/performance-inputs" --artifacts "$RUNNER_TEMP/performance-batches" \
-            --output "$RUNNER_TEMP/performance-report"
+            --output "$RUNNER_TEMP/performance-report" --jobs "$RUNNER_TEMP/performance-jobs.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
