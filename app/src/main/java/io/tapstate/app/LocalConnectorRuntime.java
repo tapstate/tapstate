@@ -11,13 +11,14 @@ import io.tapstate.spi.store.ContentHash;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /** Owns incremental registration of the immutable image and the on-premises drop directory. */
 final class LocalConnectorRuntime implements AutoCloseable {
@@ -47,7 +48,7 @@ final class LocalConnectorRuntime implements AutoCloseable {
     List<SeedOutcome> initialize(CloudConnectorSeedReadiness readiness) {
         try {
             List<SeedOutcome> results = new ArrayList<>();
-            var manifest = seed.toAbsolutePath().normalize().resolveSibling("release").resolve("connectors.lock.json");
+            var manifest = bundleManifest(seed);
             if (Files.isRegularFile(manifest)) {
                 for (Object value : bundleEntries(manifest)) {
                     Map<?, ?> entry = (Map<?, ?>) value;
@@ -83,6 +84,22 @@ final class LocalConnectorRuntime implements AutoCloseable {
             if (readiness != null) throw CloudConnectorSeedReadiness.sweepUnavailable();
             throw new UncheckedIOException(unavailable);
         }
+    }
+
+    static Set<String> bundledFileNames(Path seed) {
+        var manifest = bundleManifest(seed);
+        if (!Files.isRegularFile(manifest)) return null;
+        try {
+            return bundleEntries(manifest).stream()
+                    .map(value -> ((Map<?, ?>) value).get("id") + "-connector.jar")
+                    .collect(Collectors.toUnmodifiableSet());
+        } catch (IOException unavailable) {
+            throw new UncheckedIOException(unavailable);
+        }
+    }
+
+    private static Path bundleManifest(Path seed) {
+        return seed.toAbsolutePath().normalize().resolveSibling("release").resolve("connectors.lock.json");
     }
 
     private static List<?> bundleEntries(Path manifest) throws IOException {

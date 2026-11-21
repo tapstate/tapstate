@@ -20,14 +20,18 @@ SPEC.loader.exec_module(STAGE)
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def select(boot_jar: Path, profile: str, java: str) -> list[dict]:
+def select(boot_jar: Path, profile: str, java: str, extra: tuple[str, ...] = ()) -> list[dict]:
     command = [java, "-Dloader.main=io.tapstate.app.ConnectorBundleSelection", "-cp", str(boot_jar),
-               "org.springframework.boot.loader.launch.PropertiesLauncher", profile]
+               "org.springframework.boot.loader.launch.PropertiesLauncher", profile, *extra]
     try:
         process = subprocess.run(command, capture_output=True, check=True, timeout=300)
         selected = json.loads(process.stdout, object_pairs_hook=STAGE.unique_object)
     except (OSError, subprocess.SubprocessError, ValueError) as failure:
-        raise STAGE.StageError("packaged connector selection failed") from failure
+        diagnostic = (failure.stderr or "").decode(errors="replace") if isinstance(
+            failure, subprocess.CalledProcessError) else ""
+        line = next((line for line in diagnostic.splitlines() if "Required connector" in line
+                     or "No compatible published JAR" in line), "")
+        raise STAGE.StageError(line.strip() or "packaged connector selection failed") from failure
     if not isinstance(selected, dict) or set(selected) != {"schemaVersion", "connectors"} or selected["schemaVersion"] != 1:
         raise STAGE.StageError("packaged connector selector returned an invalid response")
     return selected["connectors"]
@@ -70,11 +74,15 @@ def inspect(path: Path, selected: dict) -> dict:
             "specPath": paths[0], **{key: selected[key] for key in STAGE.COORDINATE_KEYS}}
 
 
-def stage(boot_jar: Path, profile: str, output: Path, java: str = "java", *, selection: list[dict] | None = None) -> None:
+def stage(boot_jar: Path, profile: str, output: Path, java: str = "java", *,
+          selection: list[dict] | None = None, extra: tuple[str, ...] = ()) -> None:
     if output.exists() or output.is_symlink():
         raise STAGE.StageError("stage directory already exists; refusing to overwrite it")
-    selected = select(boot_jar, profile, java) if selection is None else selection
-    required = STAGE.CLOUD_IDS if profile == "cloud" else STAGE.PUBLISHED_ONPREM_IDS
+    if profile == "op":
+        required = tuple(dict.fromkeys(("mongodb", *extra)))
+    else:
+        required = STAGE.CLOUD_IDS if profile == "cloud" else STAGE.PUBLISHED_ONPREM_IDS
+    selected = select(boot_jar, profile, java, extra) if selection is None else selection
     if not isinstance(selected, list) or len(selected) != len(required) or {entry.get("id") for entry in selected} != set(required):
         raise STAGE.StageError("packaged connector selection has an incomplete or duplicate profile")
     with tempfile.TemporaryDirectory(prefix="maven-connector-bundle-") as temporary:
@@ -85,7 +93,7 @@ def stage(boot_jar: Path, profile: str, output: Path, java: str = "java", *, sel
             download(entry["url"], path)
             entries.append(inspect(path, entry))
         licenses = []
-        if profile == "onprem":
+        if profile != "cloud":
             for name in STAGE.REQUIRED_LICENSE_FILES:
                 source = ROOT / "deploy/connectors/licenses" / name
                 shutil.copyfile(source, jars / name)

@@ -394,7 +394,7 @@ jobs:
       # asks has to be the tree this release was built from.
       - name: write the release version into every file that pins one
         run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
-      # Take only the CLI assets. An unfiltered download pulls in whatever else the other jobs upload,
+      # Take only the CLI and OP archive assets. An unfiltered download pulls in whatever else the other jobs upload,
       # so this job's success came to depend on artifacts it never uses, and one that failed to download
       # sank the whole release step.
       - uses: actions/download-artifact@v4

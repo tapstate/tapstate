@@ -1,0 +1,68 @@
+name: Repackage a published OP release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Published Tapstate release tag (for example v0.8.0)
+        type: string
+        required: true
+      platform:
+        description: Controller platform
+        type: choice
+        options:
+          - linux-amd64
+          - darwin-arm64
+        required: true
+      connectors:
+        description: Optional comma-separated connector IDs
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  op-repackage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Verify the published source and create the single-platform archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release }}
+          PLATFORM: ${{ inputs.platform }}
+          CONNECTORS: ${{ inputs.connectors }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9]+)*$ ]] || {
+            echo "Use the exact version tag of a published Tapstate release" >&2
+            exit 1
+          }
+          gh release view "$TAG" --json isDraft,tagName --repo "$GITHUB_REPOSITORY" |
+            jq -e --arg tag "$TAG" '.tagName == $tag and (.isDraft | not)' >/dev/null || {
+              echo "Tapstate $TAG is not a published release" >&2
+              exit 1
+            }
+          version="${TAG#v}"
+          asset="tapstate-op-$version.tar.gz"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/source" \
+            --pattern "$asset" --pattern "$asset.sha256" || {
+              echo "Published release $TAG does not have the OP archive and its checksum" >&2
+              exit 1
+            }
+          python3 deploy/op/package.py manual --version "$version" \
+            --archive "$RUNNER_TEMP/source/$asset" --checksum "$RUNNER_TEMP/source/$asset.sha256" \
+            --platform "$PLATFORM" --connectors "$CONNECTORS" \
+            --output "$RUNNER_TEMP/output/tapstate-op-$version-$PLATFORM-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tapstate-op-${{ inputs.release }}-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/output/
+          if-no-files-found: error

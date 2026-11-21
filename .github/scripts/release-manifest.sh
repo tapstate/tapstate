@@ -26,11 +26,6 @@
 # Both directions are checked. An asset with no platform offering it is as wrong as a platform with no
 # asset: one of the two is a mistake, and which one it is needs a person.
 #
-# Known boundary, not a gap: connector jars are not part of a versioned release. They are carried by a
-# floating prerelease that is republished on its own schedule, so they are neither expected here nor
-# counted as missing. That is a temporary arrangement, and while it holds this check would otherwise
-# have to choose between reporting them missing every time and not looking at connectors at all.
-#
 # Reports everything wrong before exiting, rather than stopping at the first. A release is assembled
 # once and looked at by a person once; handing back one problem at a time wastes both.
 
@@ -91,6 +86,17 @@ for platform in $platforms; do
     printf '%s\n' "$listing" | grep -qE '(^|/)libexec/tapstate-mcp(\.jar)?$' \
         || problem "tapstate-${version}-${platform}.tar.gz has no libexec MCP sidecar (install.sh refuses a bundle without one)"
 done
+
+# The source checkout decides whether the selected release predates the OP archive.
+if [ -f deploy/op/package.py ]; then
+    asset="$staging/tapstate-op-$version.tar.gz"
+    python3 deploy/op/package.py verify --version "$version" --archive "$asset" \
+        --checksum "$asset.sha256" ${OP_BOOT_SHA256:+--boot-sha256 "$OP_BOOT_SHA256"} \
+        || problem "tapstate-op-$version.tar.gz or its checksum is invalid"
+    if ! grep -Fq "  tapstate-op-$version.tar.gz" "$staging/checksums.txt"; then
+        problem "checksums.txt does not cover the OP archive"
+    fi
+fi
 
 # --- named outright: nothing fetches these, so nothing else would report them gone ---------------
 [ -s "$staging/checksums.txt" ] || problem "checksums.txt (the only verification path that does not go through our own tooling)"

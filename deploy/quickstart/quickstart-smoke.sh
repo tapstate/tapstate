@@ -2,7 +2,7 @@
 #
 # Test harness for deploy/quickstart/quickstart.sh. Black-box, against local file:// stubs, with no
 # network and no Docker. It covers the platform gate (reused from install.sh), the prepare phase (fetch
-# the compose file, the CLI, and the connector jars; generate .env and the demo work/), the demo
+# the compose file and the CLI; generate .env and the demo work/), the demo
 # workspace itself, and idempotency. The live run phase (docker compose up + the online verbs) is out of
 # scope here -- the live end-to-end test covers it -- so the script runs with TAPSTATE_QUICKSTART_PREPARE_ONLY=1,
 # which stops before Docker. A fake `uname` (and, for the musl case, a fake `ldd`) placed first on PATH
@@ -34,7 +34,20 @@ CLI_STUB="$(mktemp -d)"
 make_cli() {   # $1 = platform; the fake binary just echoes, so a run phase (if ever reached) won't hang
   d="$CLI_STUB/download/v$VERSION"; mkdir -p "$d"; stage="$(mktemp -d)"
   mkdir -p "$stage/tapstate-cli-$VERSION/bin" "$stage/tapstate-cli-$VERSION/libexec"
-  printf '#!/bin/sh\necho "tapstate %s %s"\n' "$VERSION" "$1" > "$stage/tapstate-cli-$VERSION/bin/tapstate"
+  {
+    printf '#!/bin/sh\n'
+    cat <<'CLI'
+case " $* " in
+  *" -w "*" connectors -o json "*)
+    printf '%s\n' 'The CLI refuses -w before a one-shot command' >&2
+    exit 2 ;;
+  *" connectors -o json "*)
+    printf '%s\n' '{"connectors":[{"id":"mongodb","origin":"registered"},{"id":"mysql","origin":"registered"},{"id":"postgres","origin":"registered"}]}'
+    exit 0 ;;
+esac
+CLI
+    printf 'echo "tapstate %s %s"\n' "$VERSION" "$1"
+  } > "$stage/tapstate-cli-$VERSION/bin/tapstate"
   chmod +x "$stage/tapstate-cli-$VERSION/bin/tapstate"
   printf '#!/bin/sh\necho mcp\n' > "$stage/tapstate-cli-$VERSION/libexec/tapstate-mcp"
   chmod +x "$stage/tapstate-cli-$VERSION/libexec/tapstate-mcp"
@@ -44,20 +57,16 @@ make_cli() {   # $1 = platform; the fake binary just echoes, so a run phase (if 
 }
 for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do make_cli "$p"; done
 
-# --- quickstart asset stub: the REAL repo files (install.sh, compose, mysql-init) + fake conn jars ---
+# --- quickstart asset stub: the REAL repo files (install.sh, compose, mysql-init) ---
 # Serving the real files means the smoke also proves the script fetches assets that actually exist at the
 # paths it expects, and that the generated demo matches the real seed schema.
 QS_STUB="$(mktemp -d)"
 mkdir -p "$QS_STUB/install" "$QS_STUB/deploy/quickstart/mysql-init" \
-         "$QS_STUB/deploy/quickstart/postgres-init" "$QS_STUB/connectors-preview"
+         "$QS_STUB/deploy/quickstart/postgres-init"
 cp "$REPO/install/install.sh"                              "$QS_STUB/install/install.sh"
 cp "$REPO/deploy/quickstart/docker-compose.yml"           "$QS_STUB/deploy/quickstart/docker-compose.yml"
 cp "$REPO/deploy/quickstart/mysql-init/01-orders.sql"     "$QS_STUB/deploy/quickstart/mysql-init/01-orders.sql"
 cp "$REPO/deploy/quickstart/postgres-init/01-shipments.sql" "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql"
-printf 'fake-mysql-connector-jar\n'   > "$QS_STUB/connectors-preview/mysql-connector.jar"
-printf 'fake-mongodb-connector-jar\n' > "$QS_STUB/connectors-preview/mongodb-connector.jar"
-printf 'fake-postgres-connector-jar\n' > "$QS_STUB/connectors-preview/postgres-connector.jar"
-printf 'fake-dummy-connector-jar\n'    > "$QS_STUB/connectors-preview/dummy-connector.jar"
 
 trap 'rm -rf "$CLI_STUB" "$QS_STUB"' EXIT
 
@@ -95,7 +104,6 @@ EOF
     TAPSTATE_VERSION="${PIN_VERSION-$VERSION}" \
     TAPSTATE_BASE_URL="file://$CLI_STUB" \
     TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
-    TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
     TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
     sh "$DEMO/quickstart.sh" 2>&1)"
   RC=$?
@@ -133,17 +141,11 @@ have mysql-init/01-orders.sql         "fetches the demo seed SQL"
 # it creates an empty directory and starts a database with no demo data, which surfaces much later as
 # a pipeline that reads nothing.
 have postgres-init/01-shipments.sql   "fetches the second engine's seed SQL"
-have mysql-connector.jar              "fetches the mysql connector jar"
-have mongodb-connector.jar            "fetches the mongodb connector jar"
-if cmp -s "$PREP/mongodb-connector.jar" "$PREP/connectors/mongodb-connector.jar"; then
-  ok "stages the MongoDB connector for storage setup"
+if [ ! -e "$PREP/connectors" ] && [ -z "$(find "$PREP" -name '*-connector.jar' -print)" ] \
+   && ! grep -q TAPSTATE_CONNECTORS_SEED_DIR "$PREP/docker-compose.yml"; then
+  ok "uses the image's connector seeds without downloading JARs or overriding the seed directory"
 else
-  bad "MongoDB connector is missing from the installation seed directory"
-fi
-if cmp -s "$PREP/connectors/dummy-connector.jar" "$QS_STUB/connectors-preview/dummy-connector.jar"; then
-  ok "stages the downloaded Dummy bytes in the connectors/ seed dir"
-else
-  bad "connectors/ seed dir is missing the downloaded Dummy bytes"
+  bad "quickstart prepared a legacy connector seed or override"
 fi
 
 # --- the pinned CLI version: it must resolve with TAPSTATE_VERSION unset, and match the build ---------
@@ -341,6 +343,18 @@ case " $* " in
       && printf '{\n  "tokenId" : "tok-1",\n  "scope" : "WRITE",\n  "token" : "%s"\n}\n' "$FAKE_AGENT_TOKEN"
     exit 0 ;;
   *" ls ") [ "${FAKE_TOKEN_ACCEPTED:-no}" = yes ]; exit $? ;;
+  *" -w "*" connectors -o json "*)
+    printf '%s\n' 'The CLI refuses -w before a one-shot command' >&2
+    exit 2 ;;
+  *" connectors -o json "*)
+    printf 'connectors -o json\n' >> .cli-stdin
+    if [ "${FAKE_CATALOG_UNAVAILABLE:-no}" = yes ] ||
+       { [ "${FAKE_BUSINESS_READINESS:-}" = delayed ] && [ ! -e .business-ready ]; }; then
+      printf '%s\n' 'error: control.storage-unavailable' >&2
+      exit 1
+    fi
+    printf '%s\n' '{"connectors":[{"id":"mongodb","origin":"registered"},{"id":"mysql","origin":"registered"},{"id":"postgres","origin":"registered"}]}'
+    exit 0 ;;
 esac
 printf '%s\n' "${TAPSTATE_PASSWORD:-}" >> .login-env
 cat >> .cli-stdin
@@ -370,7 +384,21 @@ case "$*" in
     entry="${FAKE_INITIAL_ENTRY:-SETUP_REQUIRED}"
     [ ! -f .storage-committed ] || entry=FIRST_ADMIN_REQUIRED
     [ ! -f .first-admin-created ] || entry=LOGIN
-    printf '{"entry":"%s"}\n' "$entry"
+    business_ready=false
+    if [ "$entry" = LOGIN ]; then
+      business_ready=true
+      case "${FAKE_BUSINESS_READINESS:-}" in
+        delayed)
+          if [ -e .business-probed ]; then
+            touch .business-ready
+          else
+            touch .business-probed
+            business_ready=false
+          fi ;;
+        stalled) business_ready=false ;;
+      esac
+    fi
+    printf '{"entry":"%s","businessReady":%s}\n' "$entry" "$business_ready"
     exit 0 ;;
   *'stage.json'*)
     printf '%s\n' '{"managementUrl":"http://127.0.0.1:31917"}'
@@ -417,12 +445,13 @@ DOCK
   chmod +x "$shim/uname" "$shim/docker" "$shim/java"
   RUN_OUT="$(cd "${RUN_CWD:-$RUN}" && PATH="$shim:$PATH" \
     TAPSTATE_VERSION="$VERSION" TAPSTATE_BASE_URL="file://$CLI_STUB" \
-    TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
+    TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
     FAKE_TARGET_ROWS="${1:-5}" FAKE_SHIPMENT_ROWS="${2:-6}" \
     TAPSTATE_ADMIN_USER=smoke-owner TAPSTATE_ADMIN_PASSWORD="$RUN_PW" \
     FAKE_INITIAL_ENTRY="${FAKE_INITIAL_ENTRY:-}" FAKE_ADMIN_FAILURE="${FAKE_ADMIN_FAILURE:-}" \
     FAKE_CLI_OUT="${FAKE_CLI_OUT:-}" \
     FAKE_CLI_STATUS="${FAKE_CLI_STATUS:-0}" \
+    FAKE_BUSINESS_READINESS="${FAKE_BUSINESS_READINESS:-}" FAKE_CATALOG_UNAVAILABLE="${FAKE_CATALOG_UNAVAILABLE:-no}" \
     FAKE_AGENT_TOKEN="${FAKE_AGENT_TOKEN-tsk_fake_agent_token}" FAKE_TOKEN_ACCEPTED="${FAKE_TOKEN_ACCEPTED:-no}" \
     FAKE_JAVA_MAJOR="${FAKE_JAVA_MAJOR:-17}" JAVA_HOME='' \
     TAPSTATE_QUICKSTART_POLL_SECONDS=0 \
@@ -442,6 +471,43 @@ running_rerun_case() {
   fi
 }
 
+business_readiness_cases() {
+  FAKE_INITIAL_ENTRY=LOGIN FAKE_BUSINESS_READINESS=delayed run_phase_fakes
+  if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.business-ready" ] \
+     && [ "$(grep -c '^connectors -o json$' "$RUN/.cli-stdin")" -eq 1 ] \
+     && grep -Fq 'apply source/orders_db.tap.yml' "$RUN/.cli-stdin" \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'waiting for the business services to start'; then
+    ok "waits for the business signal before making one catalog query"
+  else
+    bad "the configured stack ran before business readiness (rc=$RUN_RC): $RUN_OUT"
+  fi
+
+  FAKE_INITIAL_ENTRY=LOGIN FAKE_BUSINESS_READINESS=stalled run_phase_fakes
+  if [ "$RUN_RC" -ne 0 ] && [ ! -e "$RUN/.cli-stdin" ] \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'the business services did not finish starting' \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'docker compose logs --tail=80 server' \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'rerun Quickstart from this directory'; then
+    ok "names the stalled business startup and gives log and recovery commands"
+  else
+    bad "stalled startup ran commands or omitted recovery guidance (rc=$RUN_RC): $RUN_OUT"
+  fi
+
+  FAKE_INITIAL_ENTRY=LOGIN FAKE_CATALOG_UNAVAILABLE=yes run_phase_fakes
+  if [ "$RUN_RC" -ne 0 ] && [ "$(grep -c '^connectors -o json$' "$RUN/.cli-stdin")" -eq 1 ] \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'control.storage-unavailable' \
+     && ! grep -Fq 'apply source/orders_db.tap.yml' "$RUN/.cli-stdin"; then
+    ok "reports a catalog refusal after readiness without retrying or applying"
+  else
+    bad "catalog refusal was retried, hidden, or ignored (rc=$RUN_RC): $RUN_OUT"
+  fi
+}
+
+if [ "${1:-}" = --business-readiness ]; then
+  business_readiness_cases
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 # Run only this regression, sharing the suite's local assets and run-phase fakes.
 if [ "${1:-}" = --running-rerun ]; then
   running_rerun_case
@@ -460,15 +526,15 @@ fi
 
 redacted_stdin() { cat "$RUN/.cli-stdin"; }
 
-if grep -q 'register \.\./postgres-connector.jar' "$RUN/.cli-stdin" 2>/dev/null \
+if grep -q '^connectors -o json$' "$RUN/.cli-stdin" 2>/dev/null \
    && grep -q 'discover-schema fulfillment_db' "$RUN/.cli-stdin" 2>/dev/null \
    && grep -q 'apply source/fulfillment_db.tap.yml' "$RUN/.cli-stdin" 2>/dev/null; then
   ok "drives the second engine's connector, source and discovery too"
 else
   bad "the second engine is not driven: $(redacted_stdin)"
 fi
-if grep -q 'register \.\./mysql-connector.jar' "$RUN/.cli-stdin" 2>/dev/null && grep -q '^apply' "$RUN/.cli-stdin" 2>/dev/null && grep -q 'start order_pipeline' "$RUN/.cli-stdin" 2>/dev/null; then
-  ok "drives register / apply / start through the REPL"
+if ! grep -q '^register ' "$RUN/.cli-stdin" && grep -q '^apply' "$RUN/.cli-stdin" 2>/dev/null && grep -q 'start order_pipeline' "$RUN/.cli-stdin" 2>/dev/null; then
+  ok "applies and starts using the preinstalled connectors"
 else
   bad "online verbs not driven: $(redacted_stdin)"
 fi
@@ -734,6 +800,7 @@ fi
 # A re-run reaches the same START refusal as the real lifecycle machine. Only that
 # exact diagnostic is benign; another failed verb in the session must still stop it.
 running_rerun_case
+business_readiness_cases
 for refusal in 'error: connector.not-registered' \
                'error: lifecycle.illegal-transition
   Cannot start a pipeline in state FAILED.' \
@@ -1019,16 +1086,7 @@ else
 fi
 
 # --- a dropped transfer leaves no stump, and the run survives one -----------------------------------
-# Reported from a from-scratch install of a published release: the postgres jar transfer dropped
-# mid-flight three runs in a row, at three different offsets. Two things then went wrong, and the
-# second is the expensive one. The transfer wrote in place, so the partial bytes landed at the real
-# path; the guard below is `[ -f ... ] ||`, existence only, so every later run read the stump as
-# "already have it" and never re-fetched it. The stack came up with a corrupt connector and the
-# failure surfaced three steps downstream, naming a remedy that was the step that had just failed.
-#
-# The fake curl reproduces the drop rather than describing it: it writes a few bytes to wherever -o
-# points and exits 18 (partial file), the code the real one gave, for the first $FAIL_TIMES attempts
-# at that URL. Every other transfer is passed through to the real curl untouched.
+# Drop the PostgreSQL seed SQL transfer to check partial-file recovery for an asset the demo fetches.
 REAL_CURL="$(command -v curl 2>/dev/null || true)"
 DROP_DIR="$(mktemp -d)"
 cat > "$DROP_DIR/curl" <<EOF
@@ -1040,11 +1098,11 @@ for a in "\$@"; do
   prev="\$a"
 done
 case "\$url" in
-  *postgres-connector.jar)
+  *01-shipments.sql)
     n=0; [ -f "$DROP_DIR/n" ] && n="\$(cat "$DROP_DIR/n")"
     if [ "\$n" -lt "\$(cat "$DROP_DIR/fail_times")" ]; then
       echo "\$((n + 1))" > "$DROP_DIR/n"
-      [ -n "\$out" ] && printf 'fake-pos' > "\$out"
+      [ -n "\$out" ] && head -c 8 "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql" > "\$out"
       echo "curl: (18) Transferred a partial file" >&2
       exit 18
     fi ;;
@@ -1052,7 +1110,7 @@ esac
 exec "$REAL_CURL" "\$@"
 EOF
 chmod +x "$DROP_DIR/curl"
-JAR_BYTES="$(wc -c < "$QS_STUB/connectors-preview/postgres-connector.jar" | tr -d ' ')"
+SEED_BYTES="$(wc -c < "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql" | tr -d ' ')"
 
 if [ -z "$REAL_CURL" ]; then
   bad "no curl on PATH, so the dropped-transfer cases never ran"
@@ -1062,10 +1120,10 @@ else
   CURL_SHIM="$DROP_DIR/curl"; echo 1 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
   run_prepare Linux x86_64 glibc
   DROP1="$DEMO"
-  if [ "$RC" -eq 0 ] && cmp -s "$DROP1/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP1/postgres-init/01-shipments.sql" "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql"; then
     ok "a transfer that drops once is retried, and the run completes on its own"
   else
-    bad "one dropped transfer ended the run (rc=$RC, jar=$(wc -c < "$DROP1/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes)"
+    bad "one dropped transfer ended the run (rc=$RC, seed=$(wc -c < "$DROP1/postgres-init/01-shipments.sql" 2>/dev/null | tr -d ' ') of $SEED_BYTES bytes)"
   fi
 
   # A link that never recovers. The run must fail -- but it must not leave a partial file at the real
@@ -1073,20 +1131,20 @@ else
   CURL_SHIM="$DROP_DIR/curl"; echo 99 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
   run_prepare Linux x86_64 glibc
   DROP2="$DEMO"
-  if [ "$RC" -ne 0 ] && [ ! -f "$DROP2/postgres-connector.jar" ]; then
+  if [ "$RC" -ne 0 ] && [ ! -f "$DROP2/postgres-init/01-shipments.sql" ]; then
     ok "a transfer that never completes leaves nothing at the final path"
   else
-    bad "a stump survived a failed transfer (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes at the real path)"
+    bad "a stump survived a failed transfer (rc=$RC, $(wc -c < "$DROP2/postgres-init/01-shipments.sql" 2>/dev/null | tr -d ' ') of $SEED_BYTES bytes at the real path)"
   fi
 
   # And the run after it recovers, which is the half the user actually hits: same directory, working
   # link, no manual deletion. Under the old guard the stump was read as "already have it" forever.
   CURL_SHIM=""
   run_prepare Linux x86_64 glibc "$DROP2"
-  if [ "$RC" -eq 0 ] && cmp -s "$DROP2/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
-    ok "re-running after a failed transfer re-fetches the jar instead of accepting the stump"
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP2/postgres-init/01-shipments.sql" "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql"; then
+    ok "re-running after a failed transfer re-fetches the seed instead of accepting the stump"
   else
-    bad "the re-run did not recover the jar (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes): $OUT"
+    bad "the re-run did not recover the seed (rc=$RC, $(wc -c < "$DROP2/postgres-init/01-shipments.sql" 2>/dev/null | tr -d ' ') of $SEED_BYTES bytes): $OUT"
   fi
   CURL_SHIM=""
 fi
@@ -1129,8 +1187,7 @@ else
       TAPSTATE_VERSION="$VERSION" \
       TAPSTATE_BASE_URL="file://$CLI_STUB" \
       TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
-      TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
-      TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
+        TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
       TAPSTATE_TELEMETRY_URL="$SINK_URL" \
       sh "$DEMO/quickstart.sh" >"$outf" 2>"$errf" )
     rm -rf "$shim"

@@ -28,4 +28,5 @@ python3 .github/scripts/web-provenance.py create \
 python3 .github/scripts/web-provenance.py verify \
   --oci-layout image/layout --provenance "$provenance" --web-profile onprem \
   --boot-jar-sha256 "$boot_sha256"
+export OP_BOOT_SHA256="$boot_sha256"
 .github/scripts/release-manifest.sh "$version" staging image/layout

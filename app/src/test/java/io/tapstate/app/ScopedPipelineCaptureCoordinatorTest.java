@@ -1078,6 +1078,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(notes.origin(any())).thenAnswer(call -> noteOrigins.get(call.getArgument(0)));
             var artifact=new ConnectorRef(List.of(),connector.equals("mongodb")
                     ?"io.tapdata.mongodb.MongodbConnector":"not.loaded","2.0.8",null,null,"a".repeat(64),false);
+            doCallRealMethod().when(connectors).withArtifactRetention(any());
             when(connectors.resolve(connector)).thenReturn(artifact);
             when(connectors.resolve(connector,"a".repeat(64))).thenReturn(artifact);
             runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),mock(SrsConsumerStore.class)),mock(HazelcastInstance.class)));

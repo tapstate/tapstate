@@ -12,7 +12,7 @@
 #   * A fresh runner is the clean machine. The job asserts that up front rather than assuming it, so a
 #     warmer runner cannot quietly turn "pulled from GHCR" into "already had it".
 #   * Nothing is built. The server arrives as a published multi-arch image, the CLI as a release tarball,
-#     the connector jars as release assets -- no mvn, no GraalVM. The image is checked to carry a repo
+#     the release assets -- no mvn, no GraalVM. The image is checked to carry a repo
 #     digest on published runs. Source runs verify the container uses the image built by that job.
 #   * The pipeline is proved by reading the target, not by trusting the script's own summary.
 #   * Change-data-capture is exercised the way the script's closing instructions tell a user to, with all
@@ -20,7 +20,7 @@
 #
 # Each leg is one world, and mixing them is what this lane kept doing. A user never runs a script from
 # one point in history against another point's assets: they pipe what install.tapstate.dev serves, which
-# is a release tag's script, and that script pins the release whose compose file, seed SQL, CLI and jars
+# is a release tag's script, and that script pins the release whose compose file, seed SQL and CLI
 # it then fetches. So the published leg takes all of it from the newest published release, and the
 # from-source leg takes all of it from this checkout. The checkout's script is therefore still exercised
 # before it merges -- on the leg that also brings the server it was written for.
@@ -177,6 +177,29 @@ jobs:
           fi
           echo "clean: no quickstart volumes"
 
+      - name: Install the locked native CLI build JDK
+        if: matrix.server == 'from-source'
+        run: bash .github/scripts/install-liberica-nik.sh linux-x64
+      - name: Prepare the matching native CLI installer asset
+        if: matrix.server == 'from-source'
+        env:
+          REF: ${{ steps.leg.outputs.ref }}
+        run: |
+          set -euo pipefail
+          version="${REF##*:}"
+          mkdir -p ~/.m2
+          cat > ~/.m2/toolchains.xml <<EOF
+          <toolchains><toolchain><type>jdk</type><provides><version>21</version></provides>
+          <configuration><jdkHome>$JAVA_HOME</jdkHome></configuration></toolchain></toolchains>
+          EOF
+          mvn -B -T1 -Pnative -pl cli,control/mcp-server,distribution/cli-bundle -am -DskipTests package
+          bundle="$(find distribution/cli-bundle/target -type f -name '*-native.tar.gz' -print -quit)"
+          directory="$RUNNER_TEMP/cli-assets/download/v$version"
+          mkdir -p "$directory"
+          name="tapstate-$version-linux-x64.tar.gz"
+          cp "$bundle" "$directory/$name"
+          (cd "$directory" && sha256sum "$name" > "$name.sha256")
+
       - uses: actions/setup-java@v4
         if: matrix.server == 'from-source'
         with:
@@ -193,7 +216,10 @@ jobs:
         run: |
           set -eu
           mvn -q -pl app -am -DskipTests clean package
-          docker build -f deploy/docker/Dockerfile -t "${{ steps.leg.outputs.ref }}" .
+          python3 deploy/cloud/stage-published-connectors.py --boot-jar app/target/app-*-boot.jar \
+            --profile onprem --stage-dir "$RUNNER_TEMP/quickstart-seeds"
+          docker build -f deploy/docker/Dockerfile --target onprem-release \
+            --build-context "onprem_connectors=$RUNNER_TEMP/quickstart-seeds" -t "${{ steps.leg.outputs.ref }}" .
           docker image inspect "${{ steps.leg.outputs.ref }}" --format '{{.Id}}' > "$RUNNER_TEMP/quickstart-built-image"
 
       - name: Run the quickstart, piped, and let it make its own directory
@@ -214,7 +240,13 @@ jobs:
           # world": the released script pins its own release and needs nothing said to it, and the
           # checkout's is pointed at the checkout so the whole stack is the code under test.
           if [ "$LEG" = from-source ]; then
-            export TAPSTATE_QUICKSTART_BASE_URL="file://$GITHUB_WORKSPACE"
+            mkdir -p "$RUNNER_TEMP/assets/install" "$RUNNER_TEMP/assets/deploy"
+            cp "$GITHUB_WORKSPACE/install/install.sh" "$RUNNER_TEMP/assets/install/"
+            cp -R "$GITHUB_WORKSPACE/deploy/quickstart" "$RUNNER_TEMP/assets/deploy/"
+            sed -i '/^  server:$/a\    extra_hosts:\n      raw.githubusercontent.com: 127.0.0.1\n      nexus.tapdata.net: 127.0.0.1' \
+              "$RUNNER_TEMP/assets/deploy/quickstart/docker-compose.yml"
+            export TAPSTATE_QUICKSTART_BASE_URL="file://$RUNNER_TEMP/assets"
+            export TAPSTATE_BASE_URL="file://$RUNNER_TEMP/cli-assets"
           fi
           cd "$RUNNER_TEMP"
           if ! grep -q '^read_admin_credentials()' "$SCRIPT"; then
@@ -347,27 +379,29 @@ jobs:
             *) echo "the stack runs $PREPARED but the CLI beside it reports '$got'" >&2; exit 1 ;;
           esac
 
-      - name: The connector jars the quickstart fetched are readable jars
-        # These are fetched from a release, not built here, and a jar that arrives mangled or with its
-        # entries encrypted is still a file of the right name and roughly the right size. The failure it
-        # produces is a first read that throws from inside the server, with no filename in it -- from
-        # the outside that is a pipeline that will not start, and the fetch is the last place anyone
-        # looks. Opening each one here separates "fetched something" from "fetched a jar", where the
-        # answer is still cheap.
+      - name: Verify the demo's connector inputs
+        env:
+          LEG: ${{ matrix.server }}
         run: |
           set -eu
           cd "$RUNNER_TEMP/tapstate-demo"
-          python3 -c '
+          if [ "$LEG" = from-source ] || [ ! -f ./mongodb-connector.jar ]; then
+            test -z "$(find . -name '*-connector.jar' -print)"
+            docker compose exec -T server sh -ec '
+              cd /opt/tapstate/connectors
+              sha256sum -c /opt/tapstate/release/connectors.sha256
+              for id in mongodb mysql postgres; do test -s "$id-connector.jar"; done
+            '
+          else
+            # The published leg may still be paired with a prior, supported quickstart release.
+            python3 -c '
           import sys, zipfile
           for path in sys.argv[1:]:
-              z = zipfile.ZipFile(path)
-              bad = z.testzip()
-              if bad:
-                  raise SystemExit(path + ": opens, but entry " + bad + " does not read back")
-              if not any(n.endswith(".class") for n in z.namelist()):
-                  raise SystemExit(path + ": opens as a zip but carries no classes")
-              print(path + ": " + str(len(z.namelist())) + " entries")
+              with zipfile.ZipFile(path) as jar:
+                  assert jar.testzip() is None
+                  assert any(name.endswith(".class") for name in jar.namelist())
           ' ./*.jar
+          fi
 
       - name: The target really holds the seeded rows
         # Read the target directly. The script prints a count of its own, and a check that only re-reads

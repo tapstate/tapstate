@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # tapstate quickstart — brings up the local demo from an empty directory: it downloads the compose stack,
-# the platform's CLI, and the demo connector jars. It initializes storage, creates an administrator,
+# and the platform's CLI. The server image supplies the connectors. The script initializes storage,
 # and runs the demo pipeline.
 #
 # Usage, either form:
@@ -25,7 +25,6 @@
 #   TAPSTATE_QUICKSTART_BASE_URL  where install.sh, the compose file, and the seed SQL are fetched from.
 #   TAPSTATE_BASE_URL             CLI release base, passed through to install.sh.
 #   TAPSTATE_VERSION              pin the CLI version (default: the pinned CLI_VERSION below).
-#   TAPSTATE_CONNECTORS_URL       base URL for the demo connector jars.
 #   TAPSTATE_ADMIN_USER / TAPSTATE_ADMIN_PASSWORD  credentials for non-interactive runs.
 #   TAPSTATE_QUICKSTART_PREPARE_ONLY  stop after preparing the directory, before Docker (used by tests).
 #
@@ -35,7 +34,7 @@ set -eu
 # The CLI release this quickstart installs. install.sh's own default resolves /releases/latest, and
 # GitHub fills that only from full releases -- the CLI ships as a prerelease, so that lookup finds
 # nothing and install.sh refuses, which would strand the quickstart at the CLI step on a clean machine.
-# Pin it here instead, the same way the demo connector jars are pinned to a published tag. This must
+# Pin it here to match the image version. This must
 # match the version in pom.xml; quickstart-smoke.sh fails the build when the two drift apart.
 CLI_VERSION="0.8.0"
 
@@ -366,7 +365,7 @@ print_next_steps() {
         removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, agent configuration)"
     else
         removal_line="  this directory is yours, so nothing here removes it. What the quickstart added:
-    tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ docker-compose.yml tapstate-mcp.json"
+    tapstate tap versions/ mysql-init/ postgres-init/ work/ docker-compose.yml tapstate-mcp.json"
     fi
     # The agent block names the file only when there is one; otherwise it says why there is not, so the
     # option is never advertised over a configuration that was never written.
@@ -547,16 +546,28 @@ read_hidden() {
 
 await_entry() {
     i=0
+    waiting_for_business=no
     while [ "$i" -lt 90 ]; do
-        entry="$(docker compose exec -T server curl -fsS --max-time 5 http://127.0.0.1:8080/auth/storage-entry 2>/dev/null \
-            | jq -r '.entry // empty')"
+        startup="$(docker compose exec -T server curl -fsS --max-time 5 http://127.0.0.1:8080/auth/storage-entry 2>/dev/null \
+            | jq -r '[.entry // "UNAVAILABLE", (.businessReady == true)] | join(":")')"
+        entry="${startup%%:*}"
         for expected in "$@"; do
-            [ "$entry" != "$expected" ] || return 0
+            if [ "$entry" = "$expected" ] && { [ "$expected" != LOGIN ] || [ "$startup" = LOGIN:true ]; }; then
+                return 0
+            fi
         done
+        if [ "$startup" = LOGIN:false ] && [ "$waiting_for_business" = no ]; then
+            printf 'quickstart: login is available; waiting for the business services to start\n'
+            waiting_for_business=yes
+        fi
         i=$((i + 1))
         sleep "$poll"
     done
-    die "the installation did not reach $* (last state: ${entry:-unavailable}); inspect it with: docker compose logs server"
+    recovery="Inspect the startup logs with: docker compose logs --tail=80 server. After resolving the startup issue, rerun Quickstart from this directory to reuse your setup and data."
+    if [ "$startup" = LOGIN:false ]; then
+        die "login is available, but the business services did not finish starting. $recovery"
+    fi
+    die "the installation did not reach $* (last state: ${entry:-unavailable}). $recovery"
 }
 
 setup_post() {
@@ -646,7 +657,7 @@ main() {
     # mounts each of them, and a missing mount source is not an error Docker reports - it creates an
     # empty directory and starts a database with no demo data in it, which then fails much later as a
     # pipeline that reads nothing.
-    mkdir -p mysql-init postgres-init connectors
+    mkdir -p mysql-init postgres-init
     # Fetched from the tag, then pinned to this script's own version. A release tag's tree carries the
     # previous release's pins by construction: the number is written into the tree inside the release
     # runner, which never commits, so the tag lands on the commit CI validated and that tree still says
@@ -695,21 +706,6 @@ main() {
             darwin-*) if command -v xattr >/dev/null 2>&1; then xattr -d com.apple.quarantine ./tapstate 2>/dev/null || true; fi ;;
         esac
     fi
-
-    # MongoDB is staged before storage setup. Dummy is staged for startup registration.
-    #
-    # The postgres one is fetched for the same reason its seed is: the compose file has run a postgres
-    # service with a seeded shipments table since the second engine was added, and a demo that fetches
-    # only two jars can never read it. The half that is missing then is precisely the interesting one -
-    # a row a user types into the second engine after the stack is up.
-    cbase="${TAPSTATE_CONNECTORS_URL:-${TAPSTATE_BASE_URL:-https://github.com/tapstate/tapstate/releases}/download/connectors-preview}"
-    [ -f ./mysql-connector.jar ]    || fetch "${cbase}/mysql-connector.jar" ./mysql-connector.jar
-    [ -f ./mongodb-connector.jar ]  || fetch "${cbase}/mongodb-connector.jar" ./mongodb-connector.jar
-    [ -f ./postgres-connector.jar ] || fetch "${cbase}/postgres-connector.jar" ./postgres-connector.jar
-    [ -f ./connectors/dummy-connector.jar ] || fetch "${cbase}/dummy-connector.jar" ./connectors/dummy-connector.jar
-
-    # Storage setup needs the default views connector before a user can log in.
-    [ -f ./connectors/mongodb-connector.jar ] || cp ./mongodb-connector.jar ./connectors/mongodb-connector.jar
 
     # Generate the demo workspace, unless one is already here: a re-run must not clobber edits the user
     # made to their resources.
@@ -760,9 +756,19 @@ main() {
         await_entry LOGIN
     fi
 
+    # Verify the image's registrations before applying the sources. A support-list entry alone
+    # doesn't provide an installed connector.
+    connectors="$(TAPSTATE_PASSWORD="$admin_pw" ./tapstate \
+        -c http://127.0.0.1:8080 -u "$admin_user" connectors -o json)" \
+        || die "could not read the connector registrations from the OP image"
+    printf '%s\n' "$connectors" | jq -e \
+        '[.connectors[] | select(.origin == "registered") | .id] |
+         contains(["mongodb", "mysql", "postgres"])' >/dev/null \
+        || die "the OP image must have MongoDB, MySQL, and PostgreSQL registered. Check the image version and server logs."
+
     # Apply and discover each source before applying the pipeline that reads its schema.
     repl_status=0
-    repl_out="$(printf 'register ../mysql-connector.jar\nregister ../postgres-connector.jar\napply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' \
+    repl_out="$(printf 'apply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' \
         | TAPSTATE_PASSWORD="$admin_pw" ./tapstate -w work -c http://127.0.0.1:8080 -u "$admin_user" 2>&1)" || repl_status=$?
     # The status is taken beside the output rather than being left to `set -e`. As the bare assignment
     # it was, a CLI that exits non-zero ends the script AT this line: the print below never runs, the

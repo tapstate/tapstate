@@ -1105,6 +1105,14 @@
         "First COUNT acquisition publishes the exact committed CACHE birth and lease under the original ISSUED preparation only when CONFIG advances that original to COMPLETE. An expired or mismatching original is discarded. No replay creates another lease or revives a superseded owner."
       ]
     },
+    "op-controller-preferences": {
+      "goal": "Reuse the account's last explicitly selected Java home and data directory across package replacements and host restarts.",
+      "entry": "Read the current account's controller.json before resolving OP service commands.",
+      "prerequisites": [
+        "Default resolution works without a file. An invalid record requires explicit Java home and data directory to recover.",
+        "Stored paths must be absolute. The existing installation under the selected data directory remains the source of installation and recovery state."
+      ]
+    },
     "connector-support-snapshot": {
       "goal": "Restore the most recent valid official connector support manifest before any network request.",
       "entry": "Connector catalog initialization after service start or CACHE rebuild.",
@@ -1594,6 +1602,10 @@
     "operator-generations-validation-count-r1": {
       "atomicDomain": "CONFIG",
       "fencing": "Existing ordinary CONFIG transactions remain. The shared operation start atomically verifies the original immutable plan, complete current dependency/scope revisions, reserves one fixed effective mapping and installs only exact affected old-scope gates and STOPPED intents. CACHE executes independently with an adapter-issued narrow handle and separate transaction, with CONFIG checks outside that transaction. Protected reconfirm requires the exact CACHE CANCELLED arbitration receipt; completion requires the original reservation and exact RETIRED/new-namespace/CAPTURE receipt without reinterpreting later authoring. The winning per-Pipeline explicit full completion removes only its original scope gate. No cross-instance atomicity is promised. Manual COUNT CONFIG writes conditionally touch the same operator_generations row and compare the exact current validationCountOwner and preparation. CACHE commits separately under its live lease."
+    },
+    "op-controller-preferences": {
+      "atomicDomain": "LOCAL",
+      "fencing": "Serialize explicit updates using an exclusive advisory lock on the account-owned preferences directory. After the selected service reaches setup or readiness, merge only the explicit values into the last record and publish with a synced same-directory temporary file and atomic rename. Failed startup or publication leaves the previous record; a failed publication requests orderly stop of the newly started service."
     },
     "connector-support-snapshot": {
       "atomicDomain": "LOCAL",
@@ -4773,6 +4785,31 @@
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationControlStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationIndependentPreparationIT.java"
+      ]
+    },
+    {
+      "id": "local.op-controller-preferences",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "FILE_SET",
+      "layer": "CONFIG",
+      "database": "LOCAL",
+      "physicalNames": [
+        "~/.config/tapstate/controller.json",
+        "~/Library/Application Support/tapstate-ctl/controller.json"
+      ],
+      "responsibility": "Retain the current account's successful explicit OP controller launch paths. JSON schemaVersion 1, optional javaHome and dataDir. Default-only startup creates no preferences file.",
+      "writers": [
+        "deploy/op/controller"
+      ],
+      "readers": [
+        "deploy/op/controller"
+      ],
+      "recovery": "op-controller-preferences",
+      "consistency": "op-controller-preferences",
+      "growth": "At most one small record per account. Size depends only on the two local paths.",
+      "evidence": [
+        "deploy/op/README.md"
       ]
     },
     {

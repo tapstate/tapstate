@@ -128,11 +128,9 @@ services:
         condition: service_healthy
     environment:
       TAPSTATE_INSTALLATION_DIRECTORY: /var/lib/tapstate/installation
-      TAPSTATE_CONNECTORS_SEED_DIR: /var/lib/tapstate/connectors
       TAPSTATE_BROWSER_AUTH_ALLOW_INSECURE_LOOPBACK: "true"
     volumes:
       - tapstate-quickstart-installation:/var/lib/tapstate
-      - ./connectors:/var/lib/tapstate/connectors:ro
     ports:
       # Bound to the loopback interface: an unauthenticated first run must not be reachable from
       # other machines on the network.

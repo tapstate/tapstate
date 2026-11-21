@@ -20,14 +20,20 @@ public final class ConnectorBundleSelection {
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
-        if (args.length != 1) throw new IllegalArgumentException("Expected one connector bundle profile");
+        if (args.length == 0 || args.length != 1 && !"op".equals(args[0])) {
+            throw new IllegalArgumentException("Expected a connector bundle profile and optional OP connector IDs");
+        }
+        List<String> required = "op".equals(args[0])
+                ? java.util.stream.Stream.concat(java.util.stream.Stream.of("mongodb"),
+                        java.util.Arrays.stream(args).skip(1)).distinct().toList()
+                : profileIds(args[0]);
         var fetch = new ConnectorCatalogHttp();
         URI configuration = ConnectorCatalogBackground.CONFIGURATION;
         var support = ConnectorSupportManifest.read(
                 new String(fetch.read(configuration.resolve("supported-connectors.json")), StandardCharsets.UTF_8));
         var repositories = ConnectorReleaseCatalog.repositories(
                 new String(fetch.read(configuration.resolve("repositories.json")), StandardCharsets.UTF_8));
-        var selected = select(args[0], support, repositories, RuntimeVersion.current(),
+        var selected = select(required, support, repositories, RuntimeVersion.current(),
                 ConnectorCatalogBackground.hostApiVersion(), fetch);
         System.out.println(JsonWriter.write(Map.of("schemaVersion", 1, "connectors", selected.stream()
                 .map(ConnectorBundleSelection::asJson).toList())));
@@ -37,11 +43,22 @@ public final class ConnectorBundleSelection {
             String profile, ConnectorSupportManifest support, Map<String, ConnectorReleaseCatalog.Repository> repositories,
             String engineVersion, String hostApiVersion, ConnectorReleaseCatalog.Fetch fetch)
             throws IOException, InterruptedException {
-        var required = switch (profile) {
+        return select(profileIds(profile), support, repositories, engineVersion, hostApiVersion, fetch);
+    }
+
+    private static List<String> profileIds(String profile) {
+        return switch (profile) {
             case "cloud" -> CLOUD;
             case "onprem" -> ON_PREM;
             default -> throw new IllegalArgumentException("Unknown connector bundle profile");
         };
+    }
+
+    private static List<ConnectorReleaseCatalog.Download> select(
+            List<String> required, ConnectorSupportManifest support,
+            Map<String, ConnectorReleaseCatalog.Repository> repositories,
+            String engineVersion, String hostApiVersion, ConnectorReleaseCatalog.Fetch fetch)
+            throws IOException, InterruptedException {
         Map<String, ConnectorSupportManifest.Entry> manifest = new LinkedHashMap<>();
         for (String id : required) {
             var entry = support.entries().get(id);

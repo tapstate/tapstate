@@ -32,6 +32,8 @@ Open **http://127.0.0.1:8080**, sign in, and explore the running pipeline. The i
 
 [Follow the full quickstart](https://tapstate.dev/docs/overview/quickstart) · [Explore the documentation](https://tapstate.dev/docs)
 
+For a single-node installation with your own MongoDB, see the [OP server archive guide](deploy/op/README.md).
+
 > **Alpha preview — local evaluation only.** The bundled MongoDB has no authentication, and Tapstate users with tokens can access control-plane data through source declarations. Use non-sensitive data and do not expose the playground to untrusted networks.
 
 ## Why operational state?
