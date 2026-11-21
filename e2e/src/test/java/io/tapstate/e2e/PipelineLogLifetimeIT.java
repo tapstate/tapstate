@@ -7,6 +7,7 @@ import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.io.TempDir;
@@ -119,18 +120,11 @@ class PipelineLogLifetimeIT {
 
     static void deleteAtRest(ControlPlane control, String id, String hash) {
         Await.until("delete after acquiring its existing workload claim", WAIT, () -> {
-            try {
-                control.deleteArtifact(id, hash);
-                return true;
-            } catch (AssertionError refused) {
-                if (!refused.getMessage().contains("io.workload-claim-fenced")) {
-                    throw refused;
-                }
-                require(control.artifact(id).isPresent() && control.contentHash(id).equals(hash),
-                        "retry refused because the original artifact is no longer the same one");
-                System.out.println("DELETE_PRECONDITION_RETRY " + id + " code=io.workload-claim-fenced");
-                return false;
-            }
+            if (control.deleteArtifactWhenClaimAvailable(id, hash)) return true;
+            require(control.artifact(id).isPresent() && control.contentHash(id).equals(hash),
+                    "retry refused because the original artifact is no longer the same one");
+            System.out.println("DELETE_PRECONDITION_RETRY " + id + " code=" + IoError.WORKLOAD_CLAIM_FENCED.code());
+            return false;
         }, () -> "artifact=" + id + " still fenced");
     }
 
