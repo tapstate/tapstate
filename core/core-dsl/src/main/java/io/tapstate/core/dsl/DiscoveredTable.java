@@ -21,13 +21,25 @@ import java.util.Objects;
  */
 public record DiscoveredTable(
         String name, Map<String, TapstateType> columns, List<String> primaryKey,
-        Long approximateRowCount) {
+        Long approximateRowCount, Map<String, String> renamedColumns) {
 
     public DiscoveredTable {
         Objects.requireNonNull(name, "name");
         columns = columns == null ? Map.of()
                 : Collections.unmodifiableMap(new LinkedHashMap<>(columns));
         primaryKey = primaryKey == null ? List.of() : List.copyOf(primaryKey);
+        renamedColumns = renamedColumns == null ? Map.of()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(renamedColumns));
+    }
+
+    /**
+     * A table none of whose columns was renamed on the way in, which is nearly every table.
+     * {@code renamedColumns} maps a column's name here to the name its source gives it, for the
+     * columns where the two differ.
+     */
+    public DiscoveredTable(String name, Map<String, TapstateType> columns, List<String> primaryKey,
+            Long approximateRowCount) {
+        this(name, columns, primaryKey, approximateRowCount, Map.of());
     }
 
     /**

@@ -39,6 +39,8 @@ import io.tapstate.core.model.SrsSchemaEvolution;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.common.ReservedField;
+import io.tapstate.core.model.InternalFields;
 import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
@@ -144,7 +146,8 @@ public final class DslParser {
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
     static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs", "nodeConfig", "as");
     static final Set<String> SYNC_KEYS = Set.of(
-            "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD, EXECUTION_FIELD);
+            "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", "internal_fields", OPTIONS_FIELD,
+            EXECUTION_FIELD);
     static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
     static final Set<String> BATCH_KEYS = Set.of("max_records", "max_wait");
     private static final String SOFT_DELETE_TOKEN = "soft_delete";
@@ -562,7 +565,7 @@ public final class DslParser {
     private TransformBody body(String type, YamlMap s) {
         return switch (type) {
             case "js" -> new TransformBody.Js(s.requireString("script"));
-            case "map" -> mapProjection(s);
+            case "map" -> mapProjection(type, s);
             case FILTER_TOKEN -> {
                 String expr = s.requireString("expr");
                 checkPredicate(s, "expr", expr);
@@ -596,13 +599,19 @@ public final class DslParser {
         };
     }
 
+    /** What a step is called in a diagnostic: its id where it wrote one, its type otherwise. */
+    private static String stepName(String type, YamlMap step) {
+        String id = step.string("id");
+        return id == null ? type : id;
+    }
+
     /**
      * A map's body. {@code fields} may be left out only where {@code soft_delete} is given, since a
      * step adding the deleted-row column is a whole step on its own. The column may not also be a
      * declared field: two values for one column, one of them silently losing on every row, is a
      * mistake the author should hear about where they wrote it.
      */
-    private TransformBody.MapProjection mapProjection(YamlMap s) {
+    private TransformBody.MapProjection mapProjection(String type, YamlMap s) {
         String softDelete = s.string(SOFT_DELETE_TOKEN);
         YamlMap fields = s.mapping(FIELDS_TOKEN);
         if (softDelete == null) {
@@ -610,8 +619,11 @@ public final class DslParser {
         } else if (softDelete.isBlank()) {
             throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
                     Map.of(VALUE_TOKEN, softDelete, EXPECTED_TOKEN, "a column name"));
+        } else if (ReservedField.is(softDelete)) {
+            throw s.errorAt(SOFT_DELETE_TOKEN, DslError.RESERVED_FIELD_DECLARED,
+                    Map.of("step", stepName(type, s), "field", softDelete));
         }
-        Map<String, FieldRule> rules = fields == null ? Map.of() : fieldRules(fields);
+        Map<String, FieldRule> rules = fields == null ? Map.of() : fieldRules(fields, stepName(type, s));
         if (softDelete != null && rules.containsKey(softDelete)) {
             throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
                     Map.of(VALUE_TOKEN, softDelete,
@@ -620,10 +632,21 @@ public final class DslParser {
         return new TransformBody.MapProjection(rules, softDelete);
     }
 
-    private Map<String, FieldRule> fieldRules(YamlMap fields) {
+    private Map<String, FieldRule> fieldRules(YamlMap fields, String step) {
         Map<String, FieldRule> rules = new LinkedHashMap<>();
         for (String name : fields.keys()) {
+            if (ReservedField.is(name)) {
+                // Dropping it is declaring it too: no customer column carries this name past capture,
+                // so a rule about it can only be about the product's own data, which no step may touch.
+                throw fields.errorAt(name, DslError.RESERVED_FIELD_DECLARED,
+                        Map.of("step", step, "field", name));
+            }
             FieldRule rule = fieldRule(YamlMap.nodeValue(fields.node(name)));
+            if (rule instanceof FieldRule.Rename rename && ReservedField.is(rename.sourceField())) {
+                throw fields.errorAt(name, DslError.ILLEGAL_EXPRESSION, Map.of(
+                        "expr", "$" + rename.sourceField(),
+                        "detail", "the field " + rename.sourceField() + " is reserved and cannot be read"));
+            }
             if (rule instanceof FieldRule.Computed computed) {
                 checkValue(fields, name, computed.celExpr());
             }
@@ -783,6 +806,10 @@ public final class DslParser {
         YamlMap groups = s.mapping("groupBy");
         if (groups != null) {
             for (String name : groups.keys()) {
+                if (ReservedField.is(name)) {
+                    throw groups.errorAt(name, DslError.RESERVED_FIELD_DECLARED,
+                            Map.of("step", stepName("aggregate", s), "field", name));
+                }
                 groupBy.put(name, rollupExpression(groups, name));
             }
         }
@@ -801,6 +828,11 @@ public final class DslParser {
         }
         Map<String, RollupField> out = new LinkedHashMap<>();
         for (String name : fields.keys()) {
+            if (ReservedField.is(name)) {
+                // A computed field is a column of the row it is written to, and that name is the product's.
+                throw fields.errorAt(name, DslError.RESERVED_FIELD_DECLARED,
+                        Map.of("step", stepName(fieldsKey, owner), "field", name));
+            }
             YamlMap f = YamlMap.requireMapping(fields.node(name), fields.childPath(name));
             List<String> functions = new ArrayList<>();
             for (String key : f.keys()) {
@@ -986,7 +1018,8 @@ public final class DslParser {
                     rename(s.mapping("rename")),
                     enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
                     enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, s, "on_full_load"),
-                    execution(s.mapping(EXECUTION_FIELD))));
+                    execution(s.mapping(EXECUTION_FIELD)),
+                    enumByYaml(InternalFields.values(), InternalFields::yaml, s, "internal_fields")));
         }
         return out;
     }
@@ -1050,7 +1083,7 @@ public final class DslParser {
             checkValue(owner, FORMAT_FIELD, expr);
             return PushFormat.cel(expr);
         }
-        return PushFormat.fields(fieldRules(YamlMap.requireMapping(n, owner.childPath(FORMAT_FIELD))));
+        return PushFormat.fields(fieldRules(YamlMap.requireMapping(n, owner.childPath(FORMAT_FIELD)), "format"));
     }
 
     private Settings settings(YamlMap m) {

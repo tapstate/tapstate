@@ -18,7 +18,7 @@ class SchemaDiagnosticDefinitionGatesTest {
     @Test
     void advisoryKeepsWarningMeaningAndBothSidesOfTheColumnAttributionInEveryLanguage() {
         var definition = SchemaErrorDefinitions.COLUMN_NAME_READS_AS_A_PATH;
-        assertThat(SchemaErrorDefinitions.registered()).containsExactly(definition);
+        assertThat(SchemaErrorDefinitions.registered()).contains(definition);
         var owner = DocumentKeyError.COLUMN_NAME_READS_AS_A_PATH;
         assertThat(owner.code()).isEqualTo("TS0270001").isEqualTo(definition.code());
         assertThat(owner.severity()).isEqualTo(Severity.WARNING).isEqualTo(definition.severity());

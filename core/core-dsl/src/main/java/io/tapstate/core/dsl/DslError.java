@@ -142,6 +142,11 @@ public enum DslError implements TapstateErrorCode {
     UNSUPPORTED_TARGET_CONNECTOR("unsupported-target-connector", DslErrorDefinitions.UNSUPPORTED_TARGET_CONNECTOR),
     /** A generated unwind column would overwrite a parent column or another generated column. */
     UNWIND_COLUMN_ALREADY_EXISTS("unwind-column-already-exists", DslErrorDefinitions.UNWIND_COLUMN_ALREADY_EXISTS),
+    /** A step names an output field with the one top-level name the product reserves for its own
+     *  data on a row. The author controls that name, so it is refused rather than renamed: whatever
+     *  serves a row removes the reserved field, and the declared column would be removed with it.
+     *  {@code step} is the declaring step or definition, {@code field} the name. */
+    RESERVED_FIELD_DECLARED("reserved-field-declared", DslErrorDefinitions.RESERVED_FIELD_DECLARED),
     /** A join's {@code sql:} is not SQL at all. {@code detail} carries the parser's own diagnosis,
      *  which already names the line and column it stopped at. Kept apart from
      *  {@link #JOIN_SQL_UNSUPPORTED} because the two send a reader in opposite directions: one to

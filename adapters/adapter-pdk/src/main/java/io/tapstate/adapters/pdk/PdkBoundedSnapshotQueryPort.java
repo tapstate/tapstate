@@ -236,7 +236,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             compiled.put(field.name(), field.type());
         }
         for (Map.Entry<String, String> expected : compiled.entrySet()) {
-            TapField live = fields.get(expected.getKey());
+            TapField live = fields.get(ReservedColumn.atSource(fields, expected.getKey()));
             if (live == null || (expected.getValue() != null
                     && !Objects.equals(expected.getValue(), live.getDataType()))) {
                 throw schemaChanged(connector, request);
@@ -248,6 +248,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             required.addAll(exact.tuples().getFirst().keySet());
         }
         required.addAll(request.projection());
+        required.replaceAll(name -> ReservedColumn.atSource(fields, name));
         if (!fields.keySet().containsAll(required)) {
             throw schemaChanged(connector, request);
         }
@@ -271,11 +272,12 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                 .limit(queryLimit)
                 .batchSize(Math.min(queryLimit, 1000));
         for (String field : request.stableOrder()) {
-            filter.sort(SortOn.ascending(field));
+            filter.sort(SortOn.ascending(ReservedColumn.atSource(table.getNameFieldMap(), field)));
         }
         if (!request.projection().isEmpty()) {
             Projection projection = Projection.create();
-            request.projection().forEach(projection::include);
+            request.projection().forEach(field ->
+                    projection.include(ReservedColumn.atSource(table.getNameFieldMap(), field)));
             filter.projection(projection);
         }
 
@@ -347,7 +349,8 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                 try {
                     Map<String, Object> copy = stringKeyed(sourceRow);
                     TapEvent event = TapInsertRecordEvent.create().table(table.getId()).after(copy);
-                    Envelope envelope = TapEventCodec.decodeSnapshotRow(event, connector.conversions(), schema);
+                    Envelope envelope = ReservedColumn.entered(connector.connectorId(),
+                            TapEventCodec.decodeSnapshotRow(event, connector.conversions(), schema));
                     long remainingBytes = request.maxBytes() - bytesUsed[0];
                     // Byte accounting renders PDK temporal values without changing the typed row.
                     long rowBytes = PdkPreviewJsonValues.encodedSize(envelope.after(), remainingBytes);
@@ -396,7 +399,9 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         if (tuple.isEmpty()) {
             return DataMap.create();
         }
-        TapEvent encoded = TapEventCodec.encode(Envelope.read(0, table.getId(), tuple, null), connector.conversions());
+        // The request speaks the names rows are known by here; the source is asked in its own.
+        TapEvent encoded = TapEventCodec.encode(Envelope.read(0, table.getId(),
+                ReservedColumn.atSource(table.getNameFieldMap(), tuple), null), connector.conversions());
         @SuppressWarnings("unchecked")
         Map<String, Object> values = ((TapInsertRecordEvent) encoded).getAfter();
         return DataMap.create(new LinkedHashMap<>(values));

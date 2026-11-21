@@ -28,7 +28,28 @@ import java.util.Objects;
  * investigates. So the reason is a component rather than a convention, and a resolved type may not
  * carry one: a reason beside a known type is a caller that has confused the two.
  */
-public record SourceField(String name, String dataType, TapstateType type, String unknownBecause, NumericType numericType, StringType stringType) {
+public record SourceField(String name, String dataType, TapstateType type, String unknownBecause, NumericType numericType, StringType stringType,
+        String sourceName) {
+
+    /** A field known here by the name its source gives it, which is every field but a renamed one. */
+    public SourceField(String name, String dataType, TapstateType type, String unknownBecause, NumericType numericType, StringType stringType) {
+        this(name, dataType, type, unknownBecause, numericType, stringType, null);
+    }
+
+    /**
+     * This field under {@code renamed}, remembering the name its source gives it. A source column
+     * whose name the product reserves is known by another name from discovery onwards; the original
+     * is kept so that apply can say the rename happened and a read against the source can still ask
+     * for the column by the only name the source knows.
+     */
+    public SourceField renamedTo(String renamed) {
+        return new SourceField(renamed, dataType, type, unknownBecause, numericType, stringType, name);
+    }
+
+    /** The name the source itself gives this column. */
+    public String nameAtSource() {
+        return sourceName == null ? name : sourceName;
+    }
 
     /** Compatibility constructor for observations without string attributes. */
     public SourceField(String name, String dataType, TapstateType type, String unknownBecause, NumericType numericType) {
