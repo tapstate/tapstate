@@ -4,6 +4,7 @@ import io.tapstate.core.event.Op;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
@@ -17,7 +18,6 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.InitialLoad;
-import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
@@ -48,6 +48,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -448,6 +449,7 @@ public final class ObservationPublisher {
     private static final Map<String, String> OP_NAMES = Arrays.stream(Op.values())
             .collect(Collectors.toUnmodifiableMap(Op::symbol, op -> op.name().toLowerCase(Locale.ROOT)));
 
+    private final StoredObservationFacts storedFacts = new StoredObservationFacts();
     private final StateStore state;
     private final ObservationStore observations;
     private final Function<String, OptionalLong> recordCounts;
@@ -856,7 +858,7 @@ public final class ObservationPublisher {
      * the reason its previous run died of the moment it leaves FAILED.
      */
     public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
-        return publish(pipelineId, failure, state, observations, false);
+        return publish(pipelineId, failure, state, observations, false, null);
     }
 
     /** Projects through the fixed state and original-claim observation views captured by this pass. */
@@ -864,7 +866,20 @@ public final class ObservationPublisher {
             ObservationStore scopedObservations, ObservationFailure failure) {
         Objects.requireNonNull(scope, "scope");
         return publish(scope.pipelineId(), failure, Objects.requireNonNull(scopedState, "scopedState"),
-                Objects.requireNonNull(scopedObservations, "scopedObservations"), true);
+                Objects.requireNonNull(scopedObservations, "scopedObservations"), true, scope);
+    }
+
+    /**
+     * Publishes a periodic RUNNING reading for the checkpoint and claim captured by convergence.
+     * A stale request never measures the successor by pipeline ID or refreshes its last observation.
+     */
+    public Optional<Observation> publishRunningScoped(PipelineIntentScope scope, CheckpointDoc checkpoint,
+            ObservationStore observations, BooleanSupplier stillCurrent) {
+        if (!scope.pipelineId().equals(checkpoint.pipelineId())
+                || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING) {
+            throw new IllegalArgumentException("periodic observations require the original running checkpoint");
+        }
+        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent, scope, null);
     }
 
     /** Capture facts obtained together for the current execution and checked against its checkpoint. */
@@ -876,22 +891,29 @@ public final class ObservationPublisher {
     }
 
     public Optional<Observation> publishRunning(PipelineIntentScope scope, CheckpointDoc checkpoint,
-            ObservationStore store, CaptureSample capture) {
+            ObservationStore store, CaptureSample capture, BooleanSupplier stillCurrent) {
         if (!scope.pipelineId().equals(checkpoint.pipelineId()) || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING)
             throw new IllegalArgumentException("a combined observation requires its running checkpoint");
-        return publish(scope.pipelineId(), null, Optional.of(checkpoint), store, true, Objects.requireNonNull(capture));
+        return publishCheckpoint(Optional.of(checkpoint), null, store, true, stillCurrent, scope,
+                Objects.requireNonNull(capture));
     }
 
     private Optional<Observation> publish(String pipelineId, ObservationFailure failure, StateStore state,
-            ObservationStore observations, boolean requirePreparedState) {
+            ObservationStore observations, boolean requirePreparedState, PipelineIntentScope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        return publish(pipelineId, failure, state.read(pipelineId), observations, requirePreparedState, null);
+        var current = state.read(pipelineId);
+        if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
+        return publishCheckpoint(current, failure, observations, requirePreparedState, () -> true, scope, null);
     }
 
-    private Optional<Observation> publish(String pipelineId, ObservationFailure failure, Optional<CheckpointDoc> current,
-            ObservationStore observations, boolean requirePreparedState, CaptureSample capture) {
-        if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
-        return current.map(checkpoint -> {
+    private Optional<Observation> publishCheckpoint(Optional<CheckpointDoc> expected, ObservationFailure failure,
+            ObservationStore observations, boolean requirePreparedState, BooleanSupplier stillCurrent,
+            PipelineIntentScope scope, CaptureSample capture) {
+        return expected.flatMap(checkpoint -> {
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
+            String pipelineId = checkpoint.pipelineId();
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
             if (actual == PipelineState.COMPLETED) {
                 Optional<Observation> previous = observations.read(pipelineId)
@@ -906,8 +928,8 @@ public final class ObservationPublisher {
                     Observation terminal = new Observation(pipelineId, actual,
                             retainedMetrics, last.snapshot(),
                             last.positions(), null, observedNow(), retained, terminalLoad(pipelineId, last));
-                    save(observations, terminal, requirePreparedState ? checkpoint.epoch() : null);
-                    return terminal;
+                    save(observations, terminal, requirePreparedState ? checkpoint.epoch() : null, scope);
+                    return Optional.of(terminal);
                 }
             }
             ObservationFailure carried = failure;
@@ -960,7 +982,13 @@ public final class ObservationPublisher {
             }
             // Both paths use the original observation port. Its scope, checkpoint and claim checks
             // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.
-            save(observations, published, requirePreparedState ? checkpoint.epoch() : null);
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
+            save(observations, published, requirePreparedState ? checkpoint.epoch() : null, scope);
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
             if (measuredSuccessfully) {
                 var committedReadings = readings;
                 var committedPinned = pinned;
@@ -972,7 +1000,7 @@ public final class ObservationPublisher {
             }
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
-            return published;
+            return Optional.of(published);
         });
     }
 
@@ -1005,7 +1033,7 @@ public final class ObservationPublisher {
         } catch (RuntimeException unavailable) {
             // This path must still report when the state store itself is what the pass could not read.
         }
-        publishReconcileFailure(pipelineId, consecutiveFailures, observations, current, null);
+        publishReconcileFailure(pipelineId, consecutiveFailures, observations, current, null, null);
     }
 
     /** A failed pass still uses its original ports, including when no projection has been made yet. */
@@ -1015,11 +1043,12 @@ public final class ObservationPublisher {
         Objects.requireNonNull(scopedState, "scopedState");
         Objects.requireNonNull(scopedObservations, "scopedObservations");
         var current = scopedState.read(scope.pipelineId()).orElseThrow(() -> missingCheckpoint(scope.pipelineId()));
-        publishReconcileFailure(scope.pipelineId(), consecutiveFailures, scopedObservations, StateJson.parse(current.stateJson()), current.epoch());
+        publishReconcileFailure(scope.pipelineId(), consecutiveFailures, scopedObservations,
+                StateJson.parse(current.stateJson()), current.epoch(), scope);
     }
 
     private void publishReconcileFailure(String pipelineId, long consecutiveFailures, ObservationStore observations,
-            PipelineState unpublishedState, Long checkpointEpoch) {
+            PipelineState unpublishedState, Long checkpointEpoch, PipelineIntentScope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation previous = observations.read(pipelineId).orElse(null);
         if (checkpointEpoch != null && unpublishedState == PipelineState.STOPPED
@@ -1044,16 +1073,21 @@ public final class ObservationPublisher {
                     .forEach(measured::add);
         }
         measured.add(readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
-        var observation = new Observation(pipelineId, lastState,
-                FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
+        // Stored facts may have folded away a table dimension. Retain the original flat values
+        // rather than feeding an overflow series back through a per-table flat reduction.
+        Map<String, Long> flat = keepLoad ? new LinkedHashMap<>(previous.metrics()) : new LinkedHashMap<>();
+        flat.put(RECONCILE_STREAK_FLAT, consecutiveFailures);
+        var observation = new Observation(pipelineId, lastState, flat,
                 keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured,
                 keepLoad ? previous.initialLoad() : null);
-        save(observations, observation, checkpointEpoch);
+        save(observations, observation, checkpointEpoch, scope);
     }
 
-    private static void save(ObservationStore store, Observation observation, Long checkpointEpoch) {
-        if (checkpointEpoch == null) store.save(observation);
-        else store.save(observation, checkpointEpoch);
+    private void save(ObservationStore store, Observation observation, Long checkpointEpoch,
+            PipelineIntentScope scope) {
+        var stored = storedFacts.project(observation, scope);
+        if (checkpointEpoch == null) store.save(stored);
+        else store.save(stored, checkpointEpoch);
     }
 
     private static TapstateException missingCheckpoint(String pipelineId) {
@@ -1393,6 +1427,7 @@ public final class ObservationPublisher {
     public void forgetPipelinesOutside(Collection<String> live) {
         Objects.requireNonNull(live, "live");
         failuresByPipelineAndCode.keySet().retainAll(Set.copyOf(live));
+        storedFacts.retain(live);
     }
 
     /**

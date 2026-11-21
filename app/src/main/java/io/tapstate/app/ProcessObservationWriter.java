@@ -10,14 +10,19 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,11 +40,13 @@ final class ProcessObservationWriter implements AutoCloseable {
     private final Map<String, Stage> pending = new LinkedHashMap<>();
     private final ArrayDeque<History> pendingHistory = new ArrayDeque<>();
     private final Map<String, Long> historyAttempts = new LinkedHashMap<>();
+    private final Set<String> activePipelines = new HashSet<>();
+    private final Map<String, Integer> waitingBarriers = new HashMap<>();
     private final java.util.function.LongSupplier nanoTime;
     private long historySequence;
-    private final ReentrantLock writing = new ReentrantLock();
     private final AtomicBoolean drainingHistory = new AtomicBoolean();
     private final ScheduledThreadPoolExecutor observationTimer;
+    private final ExecutorService observationWorkers;
     private final ScheduledThreadPoolExecutor historyTimer;
     private long retainedBytes;
     private int inFlight;
@@ -58,10 +65,11 @@ final class ProcessObservationWriter implements AutoCloseable {
         this.nanoTime = nanoTime;
         this.cache = java.util.Objects.requireNonNull(cache, "cache");
         observationTimer = timer("pipeline-observation-writer");
+        observationWorkers = Executors.newThreadPerTaskExecutor(task -> ShutdownAwait.virtual(task, "pipeline-observation-batch"));
         historyTimer = timer("pipeline-history-writer");
         if (scheduled) {
             long delay = interval.toNanos();
-            observationTimer.scheduleWithFixedDelay(this::drainObservations, delay, delay, TimeUnit.NANOSECONDS);
+            observationTimer.scheduleWithFixedDelay(this::dispatchObservations, delay, delay, TimeUnit.NANOSECONDS);
             historyTimer.scheduleWithFixedDelay(this::drainHistory, delay, delay, TimeUnit.NANOSECONDS);
         }
     }
@@ -99,20 +107,9 @@ final class ProcessObservationWriter implements AutoCloseable {
     boolean submit(Stage stage, Runnable committed, History sampled, Runnable failed) {
         if (stage.observation == null) return true;
         stage.committed.add(committed);
-        stage.sampled = sampled == null ? null : sampled.guardedBy(stage.active);
+        stage.sampled = sampled == null ? null : sampled.guardedBy(stage.original);
         stage.failed = failed;
         stage.bytes = estimatedBytes(stage.observation) + (sampled == null ? 0 : sampled.bytes());
-        if (stage.bytes > MAX_BYTES) {
-            LOG.debug("Publishing a large observation synchronously for pipeline {}", stage.pipeline());
-            now(stage.pipeline(), () -> {
-                RuntimeException failure = cache.writeObservations(List.of(stage.write())).getFirst();
-                if (failure != null) throw failure;
-                stage.active.run();
-                stage.committed.forEach(Runnable::run);
-                offerHistory(stage.sampled);
-            });
-            return true;
-        }
         boolean accepted;
         synchronized (pending) {
             Stage previous = pending.get(stage.pipeline());
@@ -148,16 +145,32 @@ final class ProcessObservationWriter implements AutoCloseable {
 
     /** Lifecycle barriers use the same entrance and finish before their checkpoint transition proceeds. */
     void now(String pipeline, Runnable publication) {
-        writing.lock();
+        reserveBarrier(pipeline);
         try {
-            synchronized (pending) {
-                Stage removed = pending.remove(pipeline);
-                if (removed != null) retainedBytes -= removed.bytes;
-                if (closed) throw StorageRuntime.unavailable();
-            }
             inPipeline(pipeline, publication);
         } finally {
-            writing.unlock();
+            synchronized (pending) {
+                activePipelines.remove(pipeline);
+                pending.notifyAll();
+            }
+        }
+    }
+
+    private void reserveBarrier(String pipeline) {
+        synchronized (pending) {
+            waitingBarriers.merge(pipeline, 1, Integer::sum);
+            try {
+                while (!closed && activePipelines.contains(pipeline)) pending.wait();
+                if (closed) throw StorageRuntime.unavailable();
+                activePipelines.add(pipeline);
+                Stage removed = pending.remove(pipeline);
+                if (removed != null) retainedBytes -= removed.bytes;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw StorageRuntime.unavailable();
+            } finally {
+                waitingBarriers.computeIfPresent(pipeline, (id, count) -> count == 1 ? null : count - 1);
+            }
         }
     }
 
@@ -191,26 +204,60 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     void flush() {
-        drainObservations();
+        CompletableFuture<Void> batch;
+        synchronized (pending) { batch = dispatchBatch(); }
+        if (batch != null) batch.join();
         drainHistory();
     }
 
-    private void drainObservations() {
-        if (!writing.tryLock()) return;
+    private void dispatchObservations() {
+        synchronized (pending) {
+            // With admission locked, a tick can dispatch only the entries it already owns.
+            while (!pending.isEmpty()) {
+                if (dispatchBatch() == null) return;
+            }
+        }
+    }
+
+    /** Called under the admission lock. Every dispatched task holds the entries and bytes of its batch. */
+    private CompletableFuture<Void> dispatchBatch() {
+        if (closed) return null;
         List<Stage> batch = new ArrayList<>();
+        long bytes = 0;
+        var iterator = pending.entrySet().iterator();
+        while (iterator.hasNext() && batch.size() < BATCH_ENTRIES) {
+            var entry = iterator.next();
+            String pipeline = entry.getKey();
+            if (activePipelines.contains(pipeline) || waitingBarriers.containsKey(pipeline)) continue;
+            Stage next = entry.getValue();
+            if (!batch.isEmpty() && bytes + next.bytes > BATCH_BYTES) break;
+            activePipelines.add(pipeline);
+            batch.add(next);
+            bytes += next.bytes;
+            iterator.remove();
+        }
+        if (batch.isEmpty()) return null;
+        inFlight += batch.size();
+        return CompletableFuture.runAsync(() -> writeBatch(batch), observationWorkers);
+    }
+
+    private void writeBatch(List<Stage> batch) {
         List<History> history = new ArrayList<>();
         try {
             writeObservations(batch, history);
         } finally {
-            try { handoffHistory(batch, history); }
-            finally { writing.unlock(); }
+            handoffHistory(batch, history);
         }
     }
 
     private void handoffHistory(List<Stage> batch, List<History> history) {
         synchronized (pending) {
-            for (Stage stage : batch) retainedBytes -= stage.bytes;
+            for (Stage stage : batch) {
+                retainedBytes -= stage.bytes;
+                activePipelines.remove(stage.pipeline());
+            }
             inFlight -= batch.size();
+            pending.notifyAll();
             if (closed) return;
             // Each completed Stage already reserved one entry and the bytes of its compact sample.
             for (History sample : history) {
@@ -221,20 +268,6 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     private void writeObservations(List<Stage> batch, List<History> history) {
-        synchronized (pending) {
-            if (closed) return;
-            long bytes = 0;
-            var iterator = pending.values().iterator();
-            while (iterator.hasNext() && batch.size() < BATCH_ENTRIES) {
-                Stage next = iterator.next();
-                if (!batch.isEmpty() && bytes + next.bytes > BATCH_BYTES) break;
-                batch.add(next);
-                bytes += next.bytes;
-                iterator.remove();
-            }
-            inFlight += batch.size();
-        }
-        if (batch.isEmpty()) return;
         List<RuntimeException> results;
         try {
             results = cache.writeObservations(batch.stream().map(Stage::write).toList());
@@ -357,17 +390,21 @@ final class ProcessObservationWriter implements AutoCloseable {
             pendingHistory.clear();
             for (String pipeline : historyAttempts.keySet()) retainedBytes -= historyBytes(pipeline);
             historyAttempts.clear();
+            pending.notifyAll();
         }
         observationTimer.shutdown();
+        observationWorkers.shutdown();
         historyTimer.shutdown();
         long deadline = ShutdownAwait.deadline();
         ShutdownAwait.executor(observationTimer, deadline);
+        ShutdownAwait.executor(observationWorkers, deadline);
         ShutdownAwait.executor(historyTimer, deadline);
     }
 
     final class Stage {
         private final PipelineConvergencePass pass;
         private final WorkloadClaimFence claim;
+        private final Runnable original;
         private final List<Runnable> committed = new ArrayList<>();
         private Observation observation;
         private long epoch;
@@ -379,7 +416,8 @@ final class ProcessObservationWriter implements AutoCloseable {
         private Stage(PipelineConvergencePass pass) {
             this.pass = pass;
             this.claim = pass.claim();
-            this.active = pass.guardOriginal(claim);
+            this.original = pass.guardOriginal(claim);
+            this.active = original;
         }
 
         String pipeline() { return pass.scope().pipelineId(); }
@@ -389,14 +427,14 @@ final class ProcessObservationWriter implements AutoCloseable {
         }
 
         ObservationStore wrap(ObservationStore destination) {
-            Runnable original = pass.guardOriginal(claim);
+            Runnable originalGuard = original;
             Runnable measured = destination instanceof ActiveStore guarded ? guarded.writeGuard() : () -> {};
             return new ObservationStore() {
                 @Override public void save(Observation value) { throw new IllegalArgumentException("an observation requires its measured checkpoint epoch"); }
                 @Override public void save(Observation value, long checkpointEpoch) {
                     observation = value;
                     epoch = checkpointEpoch;
-                    active = () -> { original.run(); measured.run(); };
+                    active = () -> { originalGuard.run(); measured.run(); };
                 }
                 @Override public void afterSave(Runnable action) { committed.add(action); }
                 @Override public Optional<Observation> read(String pipeline) { return destination.read(pipeline); }

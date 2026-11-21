@@ -29,8 +29,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -45,20 +47,24 @@ import static org.mockito.Mockito.when;
 class ProcessObservationWriterTest {
     private static final Instant AT = Instant.parse("2026-11-20T00:00:00Z");
 
-    @Test void aSlowFlushKeepsOnlyTheNextLatestSnapshotAndDoesNotOverlapAnotherBatch() throws Exception {
+    @Test void aStalledBatchDoesNotBlockIndependentPipelinesOrOverlapItsOwnPipeline() throws Exception {
         var cache = mock(MongoCacheDomain.class);
         var started = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var writes = new ArrayList<List<MongoCacheDomain.ObservationWrite>>();
+        var writes = new CopyOnWriteArrayList<List<MongoCacheDomain.ObservationWrite>>();
         when(cache.writeObservations(anyList())).thenAnswer(call -> {
             List<MongoCacheDomain.ObservationWrite> batch = call.getArgument(0);
             writes.add(batch);
-            started.countDown();
-            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            if (batch.getFirst().observation().pipelineId().equals("orders")
+                    && batch.getFirst().observation().metrics().get("records.out") == 1L) {
+                started.countDown();
+                assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            }
             return Collections.nCopies(batch.size(), null);
         });
         try (var writer = new ProcessObservationWriter(cache, false); var workers = Executors.newSingleThreadExecutor()) {
             var committed = new AtomicInteger();
+            var independent = new AtomicInteger();
             var first = stage(writer, "orders", 1);
             assertThat(writer.submit(first, committed::incrementAndGet, () -> {})).isTrue();
             var running = workers.submit(writer::flush);
@@ -66,7 +72,13 @@ class ProcessObservationWriterTest {
                 assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
                 for (int sample = 2; sample <= 1000; sample++)
                     assertThat(writer.submit(stage(writer, "orders", sample), committed::incrementAndGet, () -> {})).isTrue();
+                assertThat(writer.submit(stage(writer, "invoices", 1), independent::incrementAndGet, () -> {})).isTrue();
+                assertThat(writer.submit(stage(writer, "refunds", 1), independent::incrementAndGet, () -> {})).isTrue();
                 writer.flush();
+                assertThat(independent).hasValue(2);
+                assertThat(writes).hasSize(2);
+                assertThat(writes.get(1)).extracting(write -> write.observation().pipelineId())
+                        .containsExactly("invoices", "refunds");
                 assertThat(writer.usage().pending()).isOne();
                 assertThat(writer.usage().inFlight()).isOne();
                 assertThat(committed).hasValue(0);
@@ -75,9 +87,9 @@ class ProcessObservationWriterTest {
             }
             running.get(5, TimeUnit.SECONDS);
             writer.flush();
-            assertThat(writes).hasSize(2);
-            assertThat(writes.get(1)).hasSize(1);
-            assertThat(writes.get(1).getFirst().observation().metrics()).containsEntry("records.out", 1000L);
+            assertThat(writes).hasSize(3);
+            assertThat(writes.get(2)).hasSize(1);
+            assertThat(writes.get(2).getFirst().observation().metrics()).containsEntry("records.out", 1000L);
             assertThat(committed).hasValue(2);
             assertThat(writer.usage()).isEqualTo(new ProcessObservationWriter.Usage(0, 0, 0));
         }
@@ -136,6 +148,44 @@ class ProcessObservationWriterTest {
             writer.flush();
             assertThat(writer.usage()).isEqualTo(new ProcessObservationWriter.Usage(0, 0, 0));
             org.mockito.Mockito.verifyNoInteractions(cache);
+        }
+    }
+
+    @Test void aLifecycleBarrierWaitsOnlyForAnEarlierWriteOnItsOwnPipeline() throws Exception {
+        var cache = mock(MongoCacheDomain.class);
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var samePipelineRequested = new CountDownLatch(1);
+        var originalCommitted = new AtomicBoolean();
+        var superseded = new AtomicInteger();
+        when(cache.writeObservations(anyList())).thenAnswer(call -> {
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return Collections.nCopies(((List<?>) call.getArgument(0)).size(), null);
+        });
+        try (var writer = new ProcessObservationWriter(cache, false); var callers = Executors.newFixedThreadPool(3)) {
+            writer.submit(stage(writer, "orders", 1), () -> originalCommitted.set(true), () -> {});
+            var batch = callers.submit(writer::flush);
+            java.util.concurrent.Future<?> same;
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                writer.submit(stage(writer, "orders", 2), superseded::incrementAndGet, () -> {});
+                same = callers.submit(() -> {
+                    samePipelineRequested.countDown();
+                    writer.now("orders", () -> assertThat(originalCommitted).isTrue());
+                });
+                assertThat(samePipelineRequested.await(5, TimeUnit.SECONDS)).isTrue();
+                var other = callers.submit(() -> writer.now("invoices", () -> assertThat(originalCommitted).isFalse()));
+                other.get(1, TimeUnit.SECONDS);
+                assertThat(same.isDone()).isFalse();
+            } finally {
+                release.countDown();
+            }
+            batch.get(5, TimeUnit.SECONDS);
+            same.get(5, TimeUnit.SECONDS);
+            writer.flush();
+            assertThat(superseded).hasValue(0);
+            assertThat(writer.usage()).isEqualTo(new ProcessObservationWriter.Usage(0, 0, 0));
         }
     }
 
@@ -281,7 +331,7 @@ class ProcessObservationWriterTest {
         }
     }
 
-    @Test void anObservationAboveTheBatchTargetWritesAloneAndABoveBudgetSnapshotUsesTheSameSynchronousEntrance() {
+    @Test void anObservationAboveTheBatchTargetWritesAloneAndAnOverBudgetSnapshotIsRefused() {
         var cache = mock(MongoCacheDomain.class);
         var sizes = new ArrayList<Integer>();
         when(cache.writeObservations(anyList())).thenAnswer(call -> {
@@ -298,19 +348,20 @@ class ProcessObservationWriterTest {
             assertThat(sizes).isEmpty();
             writer.flush();
             assertThat(sizes).containsExactly(1);
-            var synchronous = writer.stage(pass("synchronous"));
+            var overBudget = writer.stage(pass("over-budget"));
             var sampled = new AtomicInteger();
-            synchronous.wrap(mock(ObservationStore.class)).save(new Observation("synchronous", PipelineState.RUNNING,
+            var refused = new AtomicInteger();
+            overBudget.wrap(mock(ObservationStore.class)).save(new Observation("over-budget", PipelineState.RUNNING,
                     Map.of(), Map.of(), Map.of("table", "x".repeat(4_300_000)), null, AT), 1);
-            assertThat(writer.submit(synchronous, committed::incrementAndGet,
-                    history("synchronous", 0, sampled::incrementAndGet), () -> {})).isTrue();
-            assertThat(sizes).containsExactly(1, 1);
-            assertThat(committed).hasValue(2);
+            assertThat(writer.submit(overBudget, committed::incrementAndGet,
+                    history("over-budget", 0, sampled::incrementAndGet), refused::incrementAndGet)).isFalse();
+            assertThat(refused).hasValue(1);
+            assertThat(committed).hasValue(1);
             assertThat(sampled).hasValue(0);
-            assertThat(writer.usage().retainedBytes()).isLessThan(1024 * 1024);
+            assertThat(writer.usage()).isEqualTo(new ProcessObservationWriter.Usage(0, 0, 0));
             writer.flush();
-            assertThat(sampled).hasValue(1);
-            assertThat(sizes).containsExactly(1, 1);
+            assertThat(sampled).hasValue(0);
+            assertThat(sizes).containsExactly(1);
         }
     }
 

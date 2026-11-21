@@ -401,6 +401,63 @@ class PipelineAlertRuntimeTest {
             await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
         } finally { release.countDown(); }
     }
+    @Test void aDelayedPeriodicReadingCannotReinstallThePriorAlertProducer() {
+        var rule = AlertEvaluationHostTest.definition("pipeline.failed");
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+        try (var runtime = runtime()) {
+            runtime.tick();
+            await().atMost(Duration.ofSeconds(3)).until(() -> !runtime.health().degraded());
+            var original = pass("orders");
+            runtime.expecting(original);
+            var scope = original.scope();
+            var claim = original.claim();
+            var nextIntent = new PipelineIntentSnapshot(scope, original.intent().intentRevision() + 1,
+                    new DesiredState("orders", PipelineState.RUNNING, "replacement"));
+            var successor = mock(PipelineConvergencePass.class);
+            when(successor.scope()).thenReturn(scope);
+            when(successor.claim()).thenReturn(claim);
+            when(successor.intent()).thenReturn(nextIntent);
+            intents.put("orders", nextIntent);
+            runtime.expecting(successor);
+            runtime.publishedPeriodic(original, observation("orders", T, PipelineState.RUNNING), () -> true);
+            drained(runtime);
+            assertThat(runtime.health().rejected()).isZero();
+            runtime.publishedPeriodic(successor, observation("orders", T, PipelineState.FAILED), () -> true);
+            await().atMost(Duration.ofSeconds(3)).until(() -> rows.values().stream().anyMatch(
+                    row -> row.value().snapshot().status() == AlertSnapshot.Status.FIRING));
+        }
+    }
+
+    @Test void aPeriodicInputSupersededDuringItsProofDoesNotDegradeCollection() throws Exception {
+        var original = pass("orders");
+        try (var runtime = runtime()) {
+            runtime.expecting(original);
+            var checking = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var checks = new java.util.concurrent.atomic.AtomicInteger();
+            try {
+                runtime.publishedPeriodic(original, observation("orders", T, PipelineState.RUNNING), () -> {
+                    if (checks.incrementAndGet() != 2) return true;
+                    checking.countDown();
+                    try { return release.await(5, TimeUnit.SECONDS); }
+                    catch (InterruptedException stopped) { Thread.currentThread().interrupt(); return false; }
+                });
+                assertThat(checking.await(5, TimeUnit.SECONDS)).isTrue();
+                var nextIntent = new PipelineIntentSnapshot(original.scope(), original.intent().intentRevision() + 1,
+                        new DesiredState("orders", PipelineState.RUNNING, "replacement"));
+                var successor = mock(PipelineConvergencePass.class);
+                var scope = original.scope(); var claim = original.claim();
+                when(successor.scope()).thenReturn(scope);
+                when(successor.claim()).thenReturn(claim);
+                when(successor.intent()).thenReturn(nextIntent);
+                intents.put("orders", nextIntent);
+                runtime.expecting(successor);
+            } finally { release.countDown(); }
+            drained(runtime);
+            assertThat(runtime.health().rejected()).isZero();
+        }
+    }
+
     @Test void freshnessRunsWithoutPublicationsAndStopDoesNotInventRecovery() {
         var rule=AlertEvaluationHostTest.definition("pipeline.observation-stale");
         when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));

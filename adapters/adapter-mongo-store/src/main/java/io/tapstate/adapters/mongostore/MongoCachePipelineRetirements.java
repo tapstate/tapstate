@@ -125,8 +125,12 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
         if(!(receipt instanceof Receipt))throw fenced();MongoPipelineRetirements.requireOriginalActive(receipt.preparation());
     }
     static void requireCurrentReceipt(PipelineRetirementReceipt candidate) {
+        requireCurrentReceipt(candidate, null);
+    }
+    static void requireCurrentReceipt(PipelineRetirementReceipt candidate, WorkloadClaimFence node) {
         requireNativeReceipt(candidate);var receipt=(Receipt)candidate;
         receipt.owner.transaction(receipt.preparation(),session -> {
+            if (node != null) MongoCachePipelinePreparations.proveNode(session, receipt.owner.database, receipt.owner.business, node);
             if(receipt.retiredState().isPresent())receipt.owner.verifyRetired(session,receipt.retiredState().orElseThrow());
             else receipt.owner.requireAbsent(session,receipt.preparation().request().scope());
             receipt.owner.models(receipt.preparation().request().scope()).requireAbsentInTransaction(session);return null;

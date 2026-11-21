@@ -40,14 +40,20 @@ final class ConnectorLog implements Log {
 
     private final Logger host;
     private final String pipelineId;
+    private final long stateGeneration;
 
     /**
      * A log for one connector handle. {@code pipelineId} is the pipeline whose drive opened it, or null
      * for a drive that names no pipeline.
      */
     ConnectorLog(String connectorId, String pipelineId) {
+        this(connectorId, pipelineId, 0);
+    }
+
+    ConnectorLog(String connectorId, String pipelineId, long stateGeneration) {
         this.host = LoggerFactory.getLogger(LOGGER_PREFIX + connectorId);
         this.pipelineId = pipelineId;
+        this.stateGeneration = stateGeneration;
     }
 
     /**
@@ -112,11 +118,8 @@ final class ConnectorLog implements Log {
             write.run();
             return;
         }
-        String previous = ConnectorAttribution.claim(pipelineId);
-        try {
+        try (var ignored = ConnectorAttribution.claim(pipelineId, stateGeneration)) {
             write.run();
-        } finally {
-            ConnectorAttribution.restore(previous);
         }
     }
 

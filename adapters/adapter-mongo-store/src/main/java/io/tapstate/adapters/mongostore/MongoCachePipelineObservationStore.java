@@ -272,7 +272,10 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
 
     private void requireWriteActive(boolean verifyStructure) {
         access.requireObservationActive();
-        if (verifyStructure) access.verifyObservationStructure();
+        if (verifyStructure) {
+            access.verifyObservationStructure();
+            access.requireObservationActive();
+        }
     }
 
     private UpdateOneModel<Document> prepare(Observation observation, long checkpointEpoch, boolean create) {
