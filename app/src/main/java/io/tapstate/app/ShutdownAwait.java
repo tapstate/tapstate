@@ -20,12 +20,20 @@ final class ShutdownAwait {
     }
 
     static Thread daemon(Runnable task, String name) {
-        var thread = new Thread(() -> {
-            WORKER.set(true);
-            try { task.run(); } finally { WORKER.remove(); }
-        }, name);
+        var thread = new Thread(workerTask(task), name);
         thread.setDaemon(true);
         return thread;
+    }
+
+    static Thread virtual(Runnable task, String name) {
+        return Thread.ofVirtual().name(name).unstarted(workerTask(task));
+    }
+
+    private static Runnable workerTask(Runnable task) {
+        return () -> {
+            WORKER.set(true);
+            try { task.run(); } finally { WORKER.remove(); }
+        };
     }
 
     static long remaining(long deadline) {

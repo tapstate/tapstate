@@ -186,7 +186,8 @@ class IndependentCdcRecoveryIT {
                         String[] start = firstLine(path).split(" ");
                         return start.length >= 2 && Long.parseLong(start[1]) < 3;
                     }), () -> streamText(fixture));
-            assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+            assertThat(Await.answered("the restarted Direct execution's first observation", TIMEOUT,
+                    () -> control.errorCount(ROOT_PIPELINE))).isZero();
         } finally {
             Files.writeString(fixture.signals().resolve("release"), "");
         }

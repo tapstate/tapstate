@@ -155,21 +155,31 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void published(PipelineConvergencePass pass, Observation observation, Throwable cause) {
         if (pass == null || closed.get()) return;
         Slot slot = slot(pass); if (slot == null) return;
-        publish(slot, observation, cause, () -> true);
+        publish(slot, slot.sequence.getAndIncrement(), observation, cause, () -> true);
+    }
+    @Override public void publishedIfExpected(PipelineConvergencePass pass, Observation observation, Throwable cause) {
+        publishIfExpected(pass, observation, cause, () -> true);
     }
 
     @Override public void publishedPeriodic(PipelineConvergencePass pass, Observation observation, BooleanSupplier current) {
-        if (closed.get() || !current.getAsBoolean()) return;
-        Slot slot = slots.get(pass.scope().pipelineId());
-        // Only convergence can install a producer. A delayed worker cannot reinstate its old slot.
-        if (slot != null && slot.producer.equals(new Producer(pass.scope(), pass.claim(), pass.intent()))) {
-            publish(slot, observation, null, () -> current.getAsBoolean()
-                    && slots.get(pass.scope().pipelineId()) == slot);
-        }
+        publishIfExpected(pass, observation, null, current);
     }
 
-    private void publish(Slot slot, Observation observation, Throwable cause, BooleanSupplier current) {
-        long sequence = slot.sequence.getAndIncrement();
+    private void publishIfExpected(PipelineConvergencePass pass, Observation observation, Throwable cause, BooleanSupplier current) {
+        if (closed.get() || !current.getAsBoolean()) return;
+        Slot slot;
+        long sequence;
+        synchronized (objectAdmission) {
+            slot = expectedSlot(pass);
+            if (slot == null) return;
+            // Consecutive intents for one incarnation share the sequence counter.
+            sequence = slot.sequence.getAndIncrement();
+        }
+        publish(slot, sequence, observation, cause, () -> current.getAsBoolean()
+                && slots.get(slot.producer.scope().pipelineId()) == slot);
+    }
+
+    private void publish(Slot slot, long sequence, Observation observation, Throwable cause, BooleanSupplier current) {
         int bytes = inputBytes(observation);
         if (bytes < 0 || observation.observedAt() == null || observation.observedAt().isAfter(clock.instant())) {
             reject(slot, "input-budget-or-clock"); return;
@@ -213,6 +223,18 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     @Override public void unavailable(PipelineConvergencePass pass) {
         if (pass != null) reject(slots.get(pass.scope().pipelineId()), "publication-unavailable");
+    }
+    @Override public void unavailableIfExpected(PipelineConvergencePass pass) {
+        synchronized (objectAdmission) {
+            var slot = expectedSlot(pass);
+            if (slot != null) reject(slot, "publication-unavailable");
+        }
+    }
+    private Slot expectedSlot(PipelineConvergencePass pass) {
+        if (pass == null || closed.get()) return null;
+        var producer = new Producer(pass.scope(), pass.claim(), pass.intent());
+        var current = slots.get(producer.scope().pipelineId());
+        return current != null && current.producer.equals(producer) ? current : null;
     }
     @Override public void retain(Collection<String> ids) {
         slots.keySet().retainAll(Set.copyOf(ids));
