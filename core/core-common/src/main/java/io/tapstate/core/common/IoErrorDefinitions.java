@@ -89,6 +89,8 @@ public final class IoErrorDefinitions {
             DEFINITIONS.define(40, Severity.ERROR, Set.of("id"));
     public static final ProductErrorDefinition SOURCE_IDENTITY_EXHAUSTED =
             DEFINITIONS.define(41, Severity.ERROR, Set.of("id"));
+    public static final ProductErrorDefinition PIPELINE_COMMIT_OUTCOME_UNKNOWN =
+            DEFINITIONS.define(42, Severity.ERROR, Set.of("pipeline"));
 
     private IoErrorDefinitions() {}
 

@@ -95,6 +95,11 @@ final class StoreIo {
         return new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", detail(e)), null);
     }
 
+    /** Reports an exhausted pipeline commit retry without exposing the driver failure. */
+    static TapstateException pipelineCommitOutcomeUnknown(String pipelineId) {
+        return new TapstateException(IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN, Map.of("pipeline", pipelineId), null);
+    }
+
     /** Inspect only structured server errors; no server message, response document or cause leaves this adapter. */
     private static boolean quotaExceeded(MongoException failure) {
         if (failure instanceof MongoCommandException command)

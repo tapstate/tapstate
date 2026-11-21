@@ -1,5 +1,16 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoException;
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.FindIterable;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.result.UpdateResult;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineDraft;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -8,10 +19,65 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class MongoPipelineDraftStoreTest {
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishBoundsPersistentUnknownCommitResults() {
+        MongoClient client = mock(MongoClient.class);
+        ClientSession session = mock(ClientSession.class);
+        MongoCollection<Document> drafts = mock(MongoCollection.class);
+        MongoCollection<Document> artifacts = mock(MongoCollection.class);
+        FindIterable<Document> draftQuery = mock(FindIterable.class);
+        FindIterable<Document> artifactQuery = mock(FindIterable.class, RETURNS_SELF);
+        when(client.startSession()).thenReturn(session);
+
+        PipelineDraft draft = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG,
+                "Orders", "", new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)),
+                null, null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+        when(drafts.find(eq(session), any(Document.class))).thenReturn(draftQuery);
+        when(draftQuery.first()).thenReturn(MongoPipelineDraftStore.toDocument(draft));
+        when(artifacts.find(eq(session), any(Document.class))).thenReturn(artifactQuery);
+        when(drafts.replaceOne(eq(session), any(Document.class), any(Document.class)))
+                .thenReturn(UpdateResult.acknowledged(1, 1L, null));
+
+        var artifact = new PipelineResource("orders", null, List.of(SourceRef.bare("crm")), List.of(),
+                null, null, null, Map.of());
+        var publication = new PipelineDraft.Publication("orders", 1, null, artifact, CanonicalHash.of(artifact),
+                Instant.EPOCH, "publisher");
+        var store = new MongoPipelineDraftStore(client, drafts, artifacts);
+        var unknownCommit = new MongoException("Commit result unavailable");
+        unknownCommit.addLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL);
+
+        // Guard the test against an unbounded retry loop while every simulated reply remains unknown.
+        long guardDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        doAnswer(invocation -> {
+            if (System.nanoTime() - guardDeadline >= 0) {
+                throw new AssertionError("Publish kept retrying commit after 5 seconds of unknown commit results");
+            }
+            Thread.sleep(10);
+            throw unknownCommit;
+        }).when(session).commitTransaction();
+
+        assertThatThrownBy(() -> store.publish(publication))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code())
+                        .as("uncertain commit outcome must be distinguishable from a generic store failure")
+                        .isNotEqualTo(IoError.STORE_UNAVAILABLE));
+        verify(session, atLeastOnce()).commitTransaction();
+    }
 
     @Test
     void roundTripsTheVersionedDraftShapeWithoutCollapsingModePayloads() {
