@@ -158,14 +158,7 @@ class CheckpointProgressWritesTest {
         var fastStore = mock(SrsConsumerStore.class);
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var healthyScope = new PipelineIntentScope("cluster", 3, "cache", "shipments", 7);
-        var healthyClaim = new WorkloadClaimFence(
-                new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "shipments"), FENCE.owner(), 2, 5, 9);
-        var healthyRun = SrsConsumerRun.of(healthyScope, new SrsConsumerMembership(
-                new SrsConsumerContext(new SrsConsumerKey("chain", "shipments", "source"), 7), 4, false,
-                Set.of("orders"), healthyClaim));
-        var healthy = new ScopedSrsConsumerAccess.Bound(healthyRun, fastStore, null, () -> {}, new SrsConsumerProgressReads(),
-                fastStore, null, new ExecutionFence(healthyScope, healthyClaim), new ThreadLocal<>());
+        var healthy = bound("shipments", fastStore);
         var slow = bound(slowStore, () -> {});
         when(slowStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
             entered.countDown();
@@ -234,6 +227,53 @@ class CheckpointProgressWritesTest {
                 writes.flush();
                 second.get(5, TimeUnit.SECONDS);
             } finally { release.countDown(); }
+        }
+    }
+
+    @Test void aFifthHealthyPipelineCanCommitWhileFourIndependentCommitsAreHeld() throws Exception {
+        var blockedStore = mock(SrsConsumerStore.class);
+        var healthyStore = mock(SrsConsumerStore.class);
+        var entered = new CountDownLatch(4);
+        var release = new CountDownLatch(1);
+        var healthyEntered = new CountDownLatch(1);
+        when(blockedStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return true;
+        });
+        when(healthyStore.advanceWriter(any(), anyLong(), anyString(), anyString(), anyString(), any(), any())).thenAnswer(call -> {
+            healthyEntered.countDown();
+            return true;
+        });
+        try (var callers = Executors.newFixedThreadPool(5);
+             var flushing = Executors.newSingleThreadExecutor();
+             var writes = new CheckpointProgressWrites(16, 16384, 8, Duration.ofHours(1))) {
+            var slow = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+            for (int pipeline = 0; pipeline < 4; pipeline++) {
+                var bound = bound("blocked-" + pipeline, blockedStore);
+                slow.add(callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(10, null))));
+            }
+            awaitRequests(writes, 4);
+            var firstFlush = flushing.submit(writes::flush);
+            java.util.concurrent.Future<?> healthy;
+            boolean reachedBeforeRelease;
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                var bound = bound("healthy-fifth", healthyStore);
+                healthy = callers.submit(() -> writes.writer(bound, null, "run", "orders", "writer", progress(10, null)));
+                awaitRequests(writes, 5);
+                writes.flush();
+                reachedBeforeRelease = healthyEntered.await(1, TimeUnit.SECONDS);
+                if (reachedBeforeRelease) healthy.get(1, TimeUnit.SECONDS);
+            } finally {
+                release.countDown();
+            }
+            firstFlush.get(5, TimeUnit.SECONDS);
+            for (var caller : slow) caller.get(5, TimeUnit.SECONDS);
+            writes.flush();
+            healthy.get(5, TimeUnit.SECONDS);
+            System.out.println("CHECKPOINT_FIFTH_PIPELINE reachedBeforeRelease=" + reachedBeforeRelease + " committedAfterRelease=true");
+            assertThat(reachedBeforeRelease).as("a healthy Pipeline with spare admission capacity must reach its own store").isTrue();
         }
     }
 
@@ -422,6 +462,16 @@ class CheckpointProgressWritesTest {
     private static ScopedSrsConsumerAccess.Bound bound(SrsConsumerStore store, Runnable active) {
         return new ScopedSrsConsumerAccess.Bound(RUN, store, null, active, new SrsConsumerProgressReads(), store,
                 null, new ExecutionFence(SCOPE, FENCE), new ThreadLocal<>());
+    }
+
+    private static ScopedSrsConsumerAccess.Bound bound(String pipeline, SrsConsumerStore store) {
+        var scope = new PipelineIntentScope("cluster", 3, "cache", pipeline, 7);
+        var fence = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, pipeline),
+                FENCE.owner(), 2, 5, 9);
+        var run = SrsConsumerRun.of(scope, new SrsConsumerMembership(
+                new SrsConsumerContext(new SrsConsumerKey("chain", pipeline, "source"), 7), 4, false, Set.of("orders"), fence));
+        return new ScopedSrsConsumerAccess.Bound(run, store, null, () -> {}, new SrsConsumerProgressReads(), store,
+                null, new ExecutionFence(scope, fence), new ThreadLocal<>());
     }
 
     private static WriterProgress progress(long sequence, String token) {

@@ -16,6 +16,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -26,14 +27,14 @@ import org.slf4j.MDC;
 final class CheckpointProgressWrites implements AutoCloseable {
     static final String USER_CONTEXT_KEY = "tapstate.checkpoint-progress-writes";
     private static final int REQUEST_OVERHEAD = 512;
-    private static final int PARALLEL_PIPELINES = 4;
     private final int maximumEntries;
     private final long maximumBytes;
     private final int maximumBatch;
     private final Map<Key, Pending> pending = new LinkedHashMap<>();
     private final Set<String> activePipelines = new HashSet<>();
     private final Set<Thread> writers = new HashSet<>();
-    private final ScheduledExecutorService worker;
+    private final ScheduledExecutorService timer;
+    private final ExecutorService worker;
     private long retainedBytes;
     private int callers;
     private int waitingCallers;
@@ -48,9 +49,10 @@ final class CheckpointProgressWrites implements AutoCloseable {
         this.maximumEntries = maximumEntries;
         this.maximumBytes = maximumBytes;
         this.maximumBatch = maximumBatch;
-        worker = Executors.newScheduledThreadPool(PARALLEL_PIPELINES + 1,
+        timer = Executors.newSingleThreadScheduledExecutor(
                 task -> ShutdownAwait.daemon(task, "checkpoint-progress-writes"));
-        worker.scheduleWithFixedDelay(this::dispatch, interval.toNanos(), interval.toNanos(), TimeUnit.NANOSECONDS);
+        worker = Executors.newThreadPerTaskExecutor(task -> ShutdownAwait.virtual(task, "checkpoint-progress-write"));
+        timer.scheduleWithFixedDelay(this::dispatch, interval.toNanos(), interval.toNanos(), TimeUnit.NANOSECONDS);
     }
 
     static CheckpointProgressWrites of(HazelcastInstance member) {
@@ -149,8 +151,7 @@ final class CheckpointProgressWrites implements AutoCloseable {
     }
 
     private synchronized List<CompletableFuture<Void>> dispatch() {
-        int slots = PARALLEL_PIPELINES - activePipelines.size();
-        if (closed || slots == 0 || pending.isEmpty()) return List.of();
+        if (closed || pending.isEmpty()) return List.of();
         Map<String, List<Pending>> selected = new LinkedHashMap<>();
         var iterator = pending.values().iterator();
         int entries = 0;
@@ -158,13 +159,12 @@ final class CheckpointProgressWrites implements AutoCloseable {
             var entry = iterator.next();
             String pipeline = entry.request.pipeline();
             if (activePipelines.contains(pipeline)) continue;
-            if (selected.size() == slots && !selected.containsKey(pipeline)) continue;
             selected.computeIfAbsent(pipeline, ignored -> new ArrayList<>()).add(entry);
             iterator.remove();
             entries++;
         }
         var dispatched = new ArrayList<CompletableFuture<Void>>(selected.size());
-        // Reserve a lane before submission; the executor never queues one task per report or per tick.
+        // One task per selected Pipeline, with its existing admission charges held until the writes retire.
         selected.forEach((pipeline, batch) -> {
             activePipelines.add(pipeline);
             dispatched.add(CompletableFuture.runAsync(() -> writePipeline(pipeline, batch), worker));
@@ -251,8 +251,11 @@ final class CheckpointProgressWrites implements AutoCloseable {
             pending.clear();
             notifyAll();
         }
+        timer.shutdown();
         worker.shutdown();
-        ShutdownAwait.executor(worker, ShutdownAwait.deadline());
+        long deadline = ShutdownAwait.deadline();
+        ShutdownAwait.executor(timer, deadline);
+        ShutdownAwait.executor(worker, deadline);
     }
 
     private record Key(Object run, String kind, WorkloadClaimFence claimed, String runId, String table, String writer) {}
