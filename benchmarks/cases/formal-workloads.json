@@ -42,8 +42,36 @@
       },
       "version": 1
     },
+    "join.snapshot.basic.large@1": {
+      "definition_sha256": "bba07a1468f92239708112f1ba1ce1d8b820e3c0661e67929e685bd7307e542e",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
     "nest.snapshot.fanout.wide@2": {
       "definition_sha256": "d0d05f0dd61c87f519cde4c4fc0aca336116dbbd88d6396f9c5f9c02e644b9dc",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "union.backlog.basic.standard@1": {
+      "definition_sha256": "8614d6c6b1db184c309a85f4ab5f273919ba60a38df0717d01e9386b54ddcab5",
       "load": {
         "backlog_events": 30000,
         "measurement_seconds": 300,

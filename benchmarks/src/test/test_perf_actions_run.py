@@ -167,3 +167,40 @@ class ActionsRunTest(unittest.TestCase):
                 patch.object(actions_watch, "artifact", return_value={"status": "unknown"}):
             with self.assertRaisesRegex(ValueError, "run 10 is uncertain"):
                 actions_watch.latest_state("example/repo", "main", now)
+
+    def test_mixed_card_uses_full_counts_and_one_example_per_category(self):
+        result = {"environment": "hosted", "errors": [{"reason": "batch expired"}],
+                  "case_counts": {"failed": 4, "completed": 4},
+                  "comparison_counts": {"suspected-regression": 4, "unavailable": 4},
+                  "selected_ids": [], "case_context": {}, "case_verdicts": {}, "results": []}
+        for category in ("failure", "regression"):
+            for number in range(1, 5):
+                case_id = f"{category}.{number}"
+                result["selected_ids"].append(case_id)
+                result["case_context"][case_id] = {"version": 2, "profile": "standard", "suites": ["basic"],
+                                                   "scenario": f"Scenario {case_id}", "effective_load": {"rows": 10000}}
+                if category == "failure":
+                    result["case_verdicts"][case_id] = {"execution": "failed", "metrics": []}
+                    result["results"].append({"case_id": case_id, "status": "failed",
+                                              "last_stage": "readback", "reason": "different rows"})
+                else:
+                    metric = {"status": "suspected-regression", "metric": "endpoint_p95_nanos", "arm": "single",
+                              "baseline": 100, "observed_median": 125, "change_ratio": 0.25}
+                    result["case_verdicts"][case_id] = {"execution": "completed", "metrics": [metric]}
+        health = {"status": "reported", "due_at": "2026-11-21T10:00:00+00:00", "report": result}
+        active, healthy = notifications.signals(health)
+        updates, _ = notifications.changes({}, active, healthy)
+        url = "https://github.com/example/repo/actions/runs/10/attempts/1"
+        card = notifications.card(health, updates, "ou_fixture", url)
+        markdown, action = card["card"]["elements"]
+        content = markdown["content"]
+        self.assertIn("<at id=ou_fixture></at>", content)
+        self.assertIn("Planned 8 | Completed 4 | Failed 4", content)
+        self.assertIn("Comparable 4 | Suspected regressions 4", content)
+        self.assertIn("failure.1@2 (basic)", content)
+        self.assertIn("readback: different rows", content)
+        self.assertIn("regression.1@2 (basic)", content)
+        self.assertIn("100 → 125 (+25.0%)", content)
+        self.assertNotIn("failure.2", content)
+        self.assertNotIn("regression.2", content)
+        self.assertEqual(url, action["actions"][0]["url"])

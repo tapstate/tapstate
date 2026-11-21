@@ -105,7 +105,8 @@ def prepare(output, repository, branch, mention_id):
     active, healthy = notifications.signals(health)
     notices, next_state = notifications.changes(previous["active"], active, healthy)
     if notices:
-        if any(not notice.get("recovered") for notice in notices) and not re.fullmatch(r"[A-Za-z0-9_-]+", mention_id):
+        if (any(not notice.get("recovered") for notice in notices)
+                and (not re.fullmatch(r"[A-Za-z0-9_-]+", mention_id) or mention_id.lower() == "all")):
             raise ValueError("Configure the verified Feishu recipient ID for performance alerts")
         target = performance or health["nightly"]
         details = (f"https://github.com/{repository}/actions/runs/{target['id']}/attempts/1" if target

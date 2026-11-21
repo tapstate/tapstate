@@ -18,11 +18,23 @@
       "seconds": 183,
       "workload_sha256": "28a8438ce7b0f45ba347504e491c918b26ff7177a43ea6b314ccebddb1036722"
     },
+    "join.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "observed_whole_case_seconds": 306.073,
+      "seconds": 443,
+      "workload_sha256": "2fb262ba2c7297145a45f7b1a052e876c4fb8a5d149e4a6ef18829a7d1a479ea"
+    },
     "nest.snapshot.fanout.wide@2": {
       "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
       "observed_whole_case_seconds": 353.466,
       "seconds": 502,
       "workload_sha256": "046fc5497df13a309bdf398bf76ac022ade7904a622d1133665e6dca966fead5"
+    },
+    "union.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "observed_whole_case_seconds": 217.636,
+      "seconds": 333,
+      "workload_sha256": "56605476ae06a28d7f0f34319eee939b8909bf1c1955c5beb1953d167d0ef570"
     },
     "unwind.snapshot.basic.large@1": {
       "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
