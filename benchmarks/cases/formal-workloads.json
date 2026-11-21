@@ -342,13 +342,13 @@
         "backlog_events": 30000,
         "measurement_seconds": 300,
         "mix": null,
-        "rate": 16,
+        "rate": 5,
         "repeats": 3,
-        "rows": 16000,
+        "rows": 5000,
         "timeout_seconds": 600,
         "warmup_seconds": 30
       },
-      "version": 1
+      "version": 2
     },
     "join.live.hot-update.wide@2": {
       "definition_sha256": "02601990ed702e5a87d5ff9cf1d044b724707c8a5318e968aea85547518b6e79",

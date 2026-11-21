@@ -292,7 +292,7 @@
     "join.live.hot-update.standard@1": {
       "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
       "projection": {
-        "before_hosted_headroom_seconds": 2358,
+        "before_hosted_headroom_seconds": 5161.545,
         "qualification_case": "join.live.hot-update.standard",
         "qualification_estimate_seconds": 420,
         "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
@@ -300,13 +300,18 @@
         "representative_whole_case_seconds": 1127.99,
         "scheduled_window_seconds": 1980
       },
-      "seconds": 3008,
-      "workload_sha256": "77157c22f7182073288e17e0fd9be1144d47f11b8b1cb209724639224f47ca52"
+      "seconds": 6512,
+      "single_repeat_sample": {
+        "case": "join.live.hot-update.wide@2",
+        "elapsed_seconds": 1720.515,
+        "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879500135"
+      },
+      "workload_sha256": "484ccdf0763c5a91a6a5d6605021b477d05b2d12da77266f7531221840526476"
     },
     "join.live.hot-update.wide@2": {
       "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
       "projection": {
-        "before_hosted_headroom_seconds": 2662,
+        "before_hosted_headroom_seconds": 5161.545,
         "qualification_case": "join.live.hot-update.wide",
         "qualification_estimate_seconds": 724,
         "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
@@ -314,7 +319,12 @@
         "representative_whole_case_seconds": 1127.99,
         "scheduled_window_seconds": 1980
       },
-      "seconds": 3388,
+      "seconds": 6512,
+      "single_repeat_sample": {
+        "case": "join.live.hot-update.wide@2",
+        "elapsed_seconds": 1720.515,
+        "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879500135"
+      },
       "workload_sha256": "48e619bedb0d72dd07d9ae72fecfc19d198fc15400864bb78f0f1a8c68d1f6c1"
     },
     "join.live.steady-state.standard@2": {
@@ -586,6 +596,7 @@
       },
       "seconds": 3194,
       "single_repeat_sample": {
+        "case": "nest.live.child-update.standard@1",
         "elapsed_seconds": 835.55,
         "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879500135"
       },
@@ -664,6 +675,7 @@
       },
       "seconds": 1546,
       "single_repeat_sample": {
+        "case": "union.live.basic.standard@1",
         "elapsed_seconds": 396.078,
         "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879889351"
       },

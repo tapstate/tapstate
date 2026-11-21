@@ -119,7 +119,8 @@ Live projections budget the full warm-up and scoring windows for every repeat,
 arm and lifecycle cycle before adding the larger of the observed hosted overhead
 and the remaining qualification estimate. Snapshot and backlog projections use
 comparable hosted input volumes and the qualification estimate as a floor. The
-hosted planning margin is 25% plus 60 seconds per case.
+already observed elapsed time of a matching single repeat can raise a
+projection. The hosted planning margin is 25% plus 60 seconds per case.
 
 The preparation summary shows each selected case version, profile, repeat count,
 paired-control requirement, estimate and batch. The manifest preserves the
