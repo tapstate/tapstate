@@ -153,6 +153,73 @@ class RateSamplerTest {
     }
 
     @Test
+    void retirementDropsPendingWorkAndDoesNotLetTheActiveAppendRestoreOldCadence() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var unit = java.util.concurrent.TimeUnit.SECONDS;
+        var active = new RecordingHistory() {
+            @Override public void append(RateSample sample) {
+                entered.countDown();
+                try { assertThat(release.await(5, unit)).isTrue(); }
+                catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new AssertionError(stopped); }
+                super.append(sample);
+            }
+        };
+        var retired = new RecordingHistory();
+        var sampler = new RateSampler(new RecordingHistory(), Duration.ofSeconds(60));
+        try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            try {
+                var first = executor.submit(() -> sampler.offer(moving(T0, 1), scope(1), active));
+                assertThat(entered.await(5, unit)).isTrue();
+                sampler.offer(moving(T0.plusSeconds(3), 2), scope(1), retired);
+                sampler.forgetPipelinesOutside(List.of("orders"));
+                sampler.forgetPipelinesOutside(List.of());
+                release.countDown();
+                first.get(5, unit);
+                assertThat(retired.appended).isEmpty();
+                sampler.offer(moving(T0.plusSeconds(1), 3), scope(1), retired);
+                assertThat(retired.appended).extracting(RateSample::observedAt).containsExactly(T0.plusSeconds(1));
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test
+    void aNewerPendingSampleTakesPriorityAndItsFatalErrorRemainsVisible() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var unit = java.util.concurrent.TimeUnit.SECONDS;
+        var refused = new IllegalStateException("old append");
+        var fatal = new AssertionError("pending append invariant");
+        var active = new RecordingHistory() {
+            @Override public void append(RateSample sample) {
+                entered.countDown();
+                try { assertThat(release.await(5, unit)).isTrue(); }
+                catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new AssertionError(stopped); }
+                throw refused;
+            }
+        };
+        var superseded = new RecordingHistory();
+        RecordingHistory latest = new RecordingHistory() {
+            @Override public void append(RateSample sample) { super.append(sample); throw fatal; }
+        };
+        var sampler = new RateSampler(new RecordingHistory(), Duration.ofSeconds(1));
+        try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            try {
+                var first = executor.submit(() -> sampler.offer(moving(T0, 1), scope(1), active));
+                assertThat(entered.await(5, unit)).isTrue();
+                sampler.offer(moving(T0.plusSeconds(2), 2), scope(2), superseded);
+                sampler.offer(moving(T0.plusSeconds(4), 3), scope(2), latest);
+                sampler.offer(moving(T0.plusSeconds(3), 4), scope(2), superseded);
+                release.countDown();
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> first.get(5, unit)).hasCause(fatal);
+                assertThat(fatal.getSuppressed()).containsExactly(refused);
+                assertThat(latest.appended).extracting(RateSample::observedAt).containsExactly(T0.plusSeconds(4));
+                assertThat(superseded.appended).isEmpty();
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test
     @DisplayName("one sample per interval, however many observations are offered")
     void oneSamplePerInterval() {
         RecordingHistory history = new RecordingHistory();

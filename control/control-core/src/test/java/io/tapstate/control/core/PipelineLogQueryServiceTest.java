@@ -93,6 +93,20 @@ class PipelineLogQueryServiceTest {
     }
 
     @Test
+    void aContinuouslyChangingLifetimeNeverExposesAnUnverifiedTail() {
+        var sink = new RingBufferLogSink(8, 8);
+        var scopes = new java.util.concurrent.atomic.AtomicInteger();
+        var service = PipelineLogQueryService.scoped(sink, id -> {
+            int generation = scopes.incrementAndGet();
+            sink.append("orders", generation, line("line " + generation));
+            return Optional.of(new LogWindow(generation, generation));
+        });
+
+        assertThat(service.logs("orders").lines()).isEmpty();
+        assertThat(scopes.get()).isEqualTo(3);
+    }
+
+    @Test
     void aPipelineWithNoLinesProjectsAnEmptyTailNotAnError() {
         var service = new PipelineLogQueryService(new RingBufferLogSink(8, 8));
 

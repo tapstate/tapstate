@@ -66,6 +66,34 @@ class MongoPipelineLogWindowTest {
         assertUnreadable(fixture);
     }
 
+    @Test
+    void aBudgetedMappingReadPreservesIdentityAndRejectsInconsistentRows() {
+        var fixture = new Fixture();
+        var millis = java.util.concurrent.TimeUnit.MILLISECONDS;
+        when(fixture.database.withTimeout(org.mockito.ArgumentMatchers.anyLong(), eq(millis)))
+                .thenAnswer(call -> {
+                    assertThat(call.<Long>getArgument(0)).isBetween(1L, 5000L);
+                    return fixture.database;
+                });
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
+        fixture.reads(true, mapping(4, "ACTIVE"));
+        assertThat(fixture.store.read(PIPELINE, budget).orElseThrow().stateGeneration()).isEqualTo(4);
+
+        fixture.reads(false, null);
+        assertThat(fixture.store.read(PIPELINE, budget)).isEmpty();
+
+        fixture.reads(false, mapping(4, "RETIRED"));
+        assertThat(fixture.store.read(PIPELINE, budget).orElseThrow().phase())
+                .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRED);
+
+        fixture.reads(false, mapping(4, "ACTIVE"));
+        assertThatThrownBy(() -> fixture.store.read(PIPELINE, budget))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        org.mockito.Mockito.verify(fixture.database, org.mockito.Mockito.times(4))
+                .withTimeout(org.mockito.ArgumentMatchers.anyLong(), eq(millis));
+    }
+
     private static void assertUnreadable(Fixture fixture) {
         assertThatThrownBy(() -> fixture.store.logWindow(PIPELINE))
                 .isInstanceOfSatisfying(TapstateException.class,
