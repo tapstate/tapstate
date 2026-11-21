@@ -2,7 +2,10 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.core.logging.RingBufferLogSink;
+import io.tapstate.spi.store.PipelineStateMappings.LogWindow;
 import org.junit.jupiter.api.Test;
+
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
@@ -44,6 +47,63 @@ class PipelineLogQueryServiceTest {
 
         assertThat(logs.lines()).extracting(LogLine::message)
                 .containsExactly("second", "third");
+    }
+
+    @Test
+    void scopesTheTailBeforeApplyingTheLimitAndHidesRetiredPipelines() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+        sink.append("orders_sync", 3, line("retired"));
+        sink.append("orders_sync", 4, line("started"));
+        sink.append("orders_sync", 5, line("resumed"));
+        sink.append("orders_sync", 3, line("late predecessor"));
+        sink.append("orders_sync", 6, line("different window"));
+        sink.append("removed", 1, line("removed"));
+        var service = PipelineLogQueryService.scoped(sink, id -> id.equals("orders_sync")
+                ? Optional.of(new LogWindow(4, 5)) : Optional.empty());
+
+        assertThat(service.logs("orders_sync", 1).lines()).extracting(LogLine::message).containsExactly("resumed");
+        assertThat(service.logs("orders_sync").lines()).extracting(LogLine::message).containsExactly("started", "resumed");
+        assertThat(service.logs("removed").lines()).isEmpty();
+    }
+
+    @Test
+    void retriesWhenTheLifetimeChangesAfterTakingTheTail() {
+        var sink = new RingBufferLogSink(8, 2);
+        var scopeReads = new java.util.concurrent.atomic.AtomicInteger();
+        sink.append("orders", 1, line("predecessor"));
+        var service = PipelineLogQueryService.scoped(sink, id -> {
+            if (scopeReads.incrementAndGet() == 1) return Optional.of(new LogWindow(1, 1));
+            sink.append("orders", 2, line("successor"));
+            return Optional.of(new LogWindow(2, 2));
+        });
+
+        assertThat(service.logs("orders").lines()).extracting(LogLine::message).containsOnly("successor");
+        assertThat(scopeReads.get()).isEqualTo(3);
+    }
+
+    @Test
+    void retriesWhenARebuildAdvancesOnlyTheUpperBound() {
+        var sink = new RingBufferLogSink(8, 1);
+        sink.append("orders", 2, line("rebuilt"));
+        var scopeReads = new java.util.concurrent.atomic.AtomicInteger();
+        var service = PipelineLogQueryService.scoped(sink, id -> Optional.of(
+                scopeReads.incrementAndGet() == 1 ? new LogWindow(1, 1) : new LogWindow(1, 2)));
+
+        assertThat(service.logs("orders").lines()).extracting(LogLine::message).containsExactly("rebuilt");
+    }
+
+    @Test
+    void aContinuouslyChangingLifetimeNeverExposesAnUnverifiedTail() {
+        var sink = new RingBufferLogSink(8, 8);
+        var scopes = new java.util.concurrent.atomic.AtomicInteger();
+        var service = PipelineLogQueryService.scoped(sink, id -> {
+            int generation = scopes.incrementAndGet();
+            sink.append("orders", generation, line("line " + generation));
+            return Optional.of(new LogWindow(generation, generation));
+        });
+
+        assertThat(service.logs("orders").lines()).isEmpty();
+        assertThat(scopes.get()).isEqualTo(3);
     }
 
     @Test

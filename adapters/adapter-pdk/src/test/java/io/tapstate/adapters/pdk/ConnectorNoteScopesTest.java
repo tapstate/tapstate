@@ -82,6 +82,26 @@ class ConnectorNoteScopesTest {
         assertThat(f.accesses).hasValue(0);
     }
 
+    @Test void theDefaultGuardPreservesTheCustomProviderLogGeneration() {
+        var fixture = new Fixture();
+        var added = new AtomicInteger();
+        ConnectorNoteScopes custom = new ConnectorNoteScopes() {
+            @Override public RequiredNoteStore store() { return fixture.scopes.store(); }
+            @Override public RequiredNoteScope open(String namespace) { return ORIGINAL; }
+            @Override public void requireActive() { fixture.guard(0, "original").run(); }
+            @Override public boolean batchSharedStartup() { return true; }
+            @Override public long logStateGeneration() { return 3; }
+        };
+        var guarded = custom.guardedBy(added::incrementAndGet);
+        assertThat(guarded.logStateGeneration()).isEqualTo(3);
+        assertThat(guarded.batchSharedStartup()).isTrue();
+        assertThat(guarded.open(ORIGINAL.owner().namespace())).isSameAs(ORIGINAL);
+        assertThat(added.get()).isEqualTo(2);
+        fixture.active.getFirst().set(false);
+        assertThatThrownBy(() -> guarded.open(ORIGINAL.owner().namespace())).isInstanceOf(TapstateException.class);
+        assertThat(added.get()).isEqualTo(2);
+    }
+
     private static final class Fixture {
         final List<String> calls = new ArrayList<>();
         final List<AtomicBoolean> active = List.of(new AtomicBoolean(true), new AtomicBoolean(true), new AtomicBoolean(true));

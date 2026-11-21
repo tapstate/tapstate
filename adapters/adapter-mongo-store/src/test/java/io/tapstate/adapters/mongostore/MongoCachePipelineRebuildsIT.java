@@ -933,6 +933,8 @@ class MongoCachePipelineRebuildsIT {
 
     @Test void aPurgeWithPinnedModelsCanThenDeleteItsSuccessorWithoutTouchingAnotherPipeline() {
         withFixture(f -> {
+            var mappings = f.configuration.pipelineStates();
+            assertThat(mappings.logWindow("flow")).contains(new PipelineStateMappings.LogWindow(1, 1));
             var originalClaim = f.advance("flow");
             var models = f.domain.pipelineDerivedSchemas(f.scope, originalClaim, ACTIVE);
             models.record("flow", "source.orders", Map.of("id", "bigint"), "statement", "sources", "derivation");
@@ -948,18 +950,25 @@ class MongoCachePipelineRebuildsIT {
             assertThat(f.configuration.intents().compareAndSet(f.scope, intent.intentRevision(),
                     new DesiredState("flow", PipelineState.STOPPED, intent.desired().revision(), true))).isTrue();
             var pending = f.pending(0);
+            assertThat(mappings.logWindow("flow")).contains(new PipelineStateMappings.LogWindow(1, 1));
             var receipt = f.rebuilds().prepare(pending, f.node, TTL, AT);
             var prepared = f.configuration.rebuilds().complete(receipt);
+            assertThat(mappings.logWindow("flow")).contains(new PipelineStateMappings.LogWindow(1, 2));
             var pipeline = f.configuration.artifacts().get("flow").orElseThrow();
             var deletion = f.configuration.retirements().begin(new PipelineRetirementRequest("delete-after-purge", prepared.scope(),
                     CanonicalHash.of(pipeline), java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(receipt.claim(), receipt.checkpointEpoch()))));
 
+            assertThat(mappings.logWindow("flow")).isEmpty();
             var retired = f.domain.pipelineRetirements(f.business, ACTIVE).retire(deletion, f.node);
             f.configuration.retirements().complete(retired);
 
             assertThat(f.configuration.artifacts().get("flow")).isEmpty();
+            assertThat(mappings.logWindow("flow")).isEmpty();
             assertThat(rows.find(new Document("_id", "flow.source.orders")).first()).isNull();
             assertThat(rows.find(new Document("_id", "other.source.orders")).first()).isEqualTo(other);
+            assertThat(f.configuration.artifacts().create(pipeline)).isEqualTo(ArtifactMutation.CREATED);
+            assertThat(mappings.logWindow("flow")).contains(new PipelineStateMappings.LogWindow(3, 3));
+            assertThat(mappings.logWindow("other")).contains(new PipelineStateMappings.LogWindow(1, 1));
         });
     }
 

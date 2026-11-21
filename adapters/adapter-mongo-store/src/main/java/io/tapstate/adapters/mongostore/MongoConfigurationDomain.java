@@ -752,6 +752,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return pipelineStates;
     }
 
+    public java.util.Optional<io.tapstate.spi.store.PipelineStateMapping> pipelineState(String pipelineId, java.time.Duration budget) {
+        requireOpen();
+        return ((MongoPipelineStateMappings) pipelineStates).read(pipelineId,new MongoReadBudget(budget));
+    }
+
     public io.tapstate.spi.store.PipelineRetirements retirements() {
         requireOpen();return new MongoPipelineRetirements(connection.client(),connection.database(),clusterId,bindings,artifacts,
                 (MongoRequiredNoteStore)requiredNotes,this::requireOpen);
@@ -759,6 +764,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public void requireRetiredPipelinePredecessor(io.tapstate.spi.store.PipelineIntentScope current, io.tapstate.spi.store.PipelineIntentScope earlier) {
         requireOpen(); new MongoPipelineStatePreparations(connection.client(),connection.database(),clusterId,bindings,artifacts,this::requireOpen)
                 .requireRetiredPredecessor(current,earlier);
+    }
+
+    public void requireCompletedStopPurge(io.tapstate.spi.store.PipelineIntentSnapshot purge,
+            String operation, io.tapstate.spi.store.WorkloadClaimFence node) {
+        ((MongoPipelineStateRebuilds) rebuilds()).requireCompletedStopPurge(purge, operation, node);
     }
 
     public io.tapstate.spi.store.CaptureStatePreparations capturePreparations() {
