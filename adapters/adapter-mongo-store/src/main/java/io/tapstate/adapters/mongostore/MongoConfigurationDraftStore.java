@@ -191,7 +191,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
             throw new IllegalArgumentException("publication hash must match the captured Pipeline");
         }
         try {
-            return transaction(session -> {
+            return StoreIo.callForPipelinePublication(publication.pipelineId(), () -> withTransaction(session -> {
                 Document row = drafts.find(session, new Document("_id", publication.pipelineId())).first();
                 if (row == null || deleted(row)) return new Published(PipelineDraftMutation.NOT_FOUND, 0);
                 PipelineDraft current = codec.decode(row);
@@ -205,7 +205,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
                 drafts.replaceOne(session, new Document("_id", current.pipelineId()).append("revision", current.revision()).append("deleted", false),
                         codec.encode(published, session));
                 return new Published(PipelineDraftMutation.PUBLISHED, generation);
-            });
+            }));
         } catch (MongoConfigurationArtifactStore.Refused conflict) {
             return new Published(PipelineDraftMutation.ARTIFACT_CONFLICT, 0);
         }
@@ -264,11 +264,12 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
         codec.tombstoneRevision(row); return true;
     }
     private <T> T transaction(Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
-            try (var session = client.startSession()) {
-                return session.withTransaction(() -> action.apply(session), TRANSACTION);
-            }
-        });
+        return StoreIo.call(() -> withTransaction(action));
+    }
+    private <T> T withTransaction(Function<ClientSession, T> action) {
+        try (var session = client.startSession()) {
+            return session.withTransaction(() -> action.apply(session), TRANSACTION);
+        }
     }
     private static PipelineDraft withRevision(PipelineDraft draft, long revision) {
         return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), revision, draft.mode(), draft.name(), draft.description(),

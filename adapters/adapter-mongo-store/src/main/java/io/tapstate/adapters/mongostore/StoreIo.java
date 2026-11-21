@@ -22,7 +22,8 @@ import java.util.function.Supplier;
  * {@code io.document-too-large}, whether the driver refused it or the endpoint did; any other driver
  * explicitly confirmed quota refusal maps to {@code io.store-quota-exceeded}; another driver
  * failure maps to {@code io.store-unavailable}
- * carrying only a safe driver type and numeric code. Driver messages and causes may contain
+ * carrying only a safe driver type and numeric code. An unconfirmed pipeline publication has
+ * its own diagnostic so callers can verify the outcome before retrying. Driver messages and causes may contain
  * connection credentials or document values and never cross this boundary. A non-driver throwable
  * — a coded reconstruction failure ({@code io.document-unreadable}) or a bare invariant crash —
  * passes straight through, never relabelled as a driver failure.
@@ -58,11 +59,23 @@ final class StoreIo {
 
     /** As {@link #call(Supplier)}, naming the document the operation is for, for a size failure. */
     static <T> T call(String id, Supplier<T> operation) {
+        return call(id, null, operation);
+    }
+
+    /** Runs a publication transaction and preserves an unknown commit result from the driver. */
+    static <T> T callForPipelinePublication(String pipelineId, Supplier<T> operation) {
+        return call(UNNAMED, pipelineId, operation);
+    }
+
+    private static <T> T call(String id, String publishingPipeline, Supplier<T> operation) {
         try {
             return operation.get();
         } catch (BsonMaximumSizeExceededException e) {
             throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
         } catch (MongoException e) {
+            if (publishingPipeline != null && e.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
+                throw pipelineCommitOutcomeUnknown(publishingPipeline);
+            }
             if (DOCUMENT_TOO_LARGE_CODES.contains(errorCode(e))) {
                 throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
             }
