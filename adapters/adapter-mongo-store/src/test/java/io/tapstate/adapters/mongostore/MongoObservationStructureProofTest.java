@@ -3,8 +3,10 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.ListCollectionsIterable;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.OperatorDatabaseBinding;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -24,6 +26,7 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
@@ -43,11 +46,7 @@ class MongoObservationStructureProofTest {
             } else {
                 row.append("options", new Document("collation", new Document("locale", "en")));
             }
-            @SuppressWarnings("unchecked")
-            MongoCursor<Document> cursor = mock(MongoCursor.class);
-            when(cursor.hasNext()).thenReturn(true, false);
-            when(cursor.next()).thenReturn(row);
-            return cursor;
+            return cursor(row);
         });
 
         var proof = new MongoStructureProof();
@@ -69,7 +68,7 @@ class MongoObservationStructureProofTest {
         }
     }
 
-    @Test void aFreshReadCannotExtendAnOlderObservationsWriteProof() throws Exception {
+    @Test void anObservationCanWriteOnlyWithItsOriginalLiveProof() throws Exception {
         var now = new AtomicLong();
         var proof = new MongoStructureProof(now::get);
         var database = mock(MongoDatabase.class, RETURNS_DEEP_STUBS);
@@ -77,6 +76,9 @@ class MongoObservationStructureProofTest {
         var original = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "flow"),
                 new WorkloadOwner("node", "boot"), 1, 1, 1);
         var observation = mock(Observation.class);
+        var failedObservation = mock(Observation.class);
+        var unavailable = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "write timeout"),
+                new java.io.IOException("fixture"));
         var checkpoint = CheckpointDoc.initial("flow", "RUNNING", Instant.EPOCH);
         var facts = new MongoCacheDomain.ObservationFacts(checkpoint, Map.of(), Map.of(), Map.of());
 
@@ -85,8 +87,10 @@ class MongoObservationStructureProofTest {
              var metadata = mockConstruction(MongoCacheMetadataStructure.class);
              var readers = mockConstruction(MongoPipelineObservationRead.class,
                      (reader, ignored) -> when(reader.read(Map.of())).thenReturn(Optional.of(facts)));
-             var writers = mockConstruction(MongoCachePipelineObservationStore.class,
-                     (writer, ignored) -> when(writer.updateExisting(observation, 1)).thenReturn(true))) {
+             var writers = mockConstruction(MongoCachePipelineObservationStore.class, (writer, ignored) -> {
+                 when(writer.updateExisting(observation, 1)).thenReturn(true);
+                 when(writer.updateExisting(failedObservation, 1)).thenThrow(unavailable);
+             })) {
             topology.when(() -> MongoReadBudget.supportsSnapshotReads(any())).thenReturn(true);
             var old = domain.readObservation(scope, original, Map.of(), () -> {}).orElseThrow();
             assertThat(old.facts()).isEqualTo(facts);
@@ -99,10 +103,40 @@ class MongoObservationStructureProofTest {
             assertThat(refreshed.updateExisting(observation, 1)).isTrue();
             assertThat(writers.constructed()).hasSize(1);
             proof.clear();
-            domain.readObservation(scope, original, Map.of(), () -> {}).orElseThrow();
+            var current = domain.readObservation(scope, original, Map.of(), () -> {}).orElseThrow();
             assertThat(refreshed.updateExisting(observation, 1)).isFalse();
             assertThat(writers.constructed()).hasSize(1);
+
+            assertThatThrownBy(() -> current.updateExisting(failedObservation, 1)).isSameAs(unavailable);
+            assertThat(current.updateExisting(observation, 1)).isFalse();
+            assertThat(writers.constructed()).hasSize(2);
         }
+    }
+
+    @Test void aNonSimpleCollationKeepsObservationReadsOnTheOrdinaryPath() throws Exception {
+        var database = mock(MongoDatabase.class, RETURNS_DEEP_STUBS);
+        when(database.listCollections().iterator()).thenAnswer(ignored -> cursor(new Document("name", "cache_identity")
+                .append("options", new Document("collation", new Document("locale", "en")))));
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "flow", 1);
+        var original = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "flow"),
+                new WorkloadOwner("node", "boot"), 1, 1, 1);
+
+        try (var domain = domain(database, new MongoStructureProof());
+             var topology = mockStatic(MongoReadBudget.class);
+             var metadata = mockConstruction(MongoCacheMetadataStructure.class);
+             var readers = mockConstruction(MongoPipelineObservationRead.class)) {
+            topology.when(() -> MongoReadBudget.supportsSnapshotReads(any())).thenReturn(true);
+            assertThat(domain.readObservation(scope, original, Map.of(), () -> {})).isEmpty();
+            assertThat(readers.constructed()).isEmpty();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static MongoCursor<Document> cursor(Document row) {
+        MongoCursor<Document> cursor = mock(MongoCursor.class);
+        when(cursor.hasNext()).thenReturn(true, false);
+        when(cursor.next()).thenReturn(row);
+        return cursor;
     }
 
     private static MongoCacheDomain domain(MongoDatabase database, MongoStructureProof proof) throws Exception {
