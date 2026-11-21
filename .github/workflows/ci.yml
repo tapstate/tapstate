@@ -14,37 +14,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - case: map.snapshot.basic.standard@1
-            rows: 100000
-            rate: 100
+          - case: join.live.hot-update.standard@1
+            rows: 16000
+            rate: 16
             window: 300
-          - case: filter.snapshot.basic.small@1
-            rows: 100000
-            rate: 100
+          - case: join.live.hot-update.wide@2
+            rows: 5000
+            rate: 5
             window: 300
-          - case: nest.snapshot.basic.wide@1
+          - case: nest.live.child-update.standard@1
             rows: 25000
-            rate: 100
-            window: 300
-          - case: js.snapshot.basic.large@1
-            rows: 10000
-            rate: 100
-            window: 300
-          - case: copy.snapshot.dummy-baseline.standard@1
-            rows: 100000
-            rate: 100
-            window: 300
-          - case: join.lifecycle.release.standard@2
-            rows: 10000
-            rate: 30
-            window: 60
-          - case: union.live.basic.standard@1
-            rows: 10000
-            rate: 100
-            window: 300
-          - case: aggregate.backlog.basic.standard@1
-            rows: 10000
-            rate: 100
+            rate: 25
             window: 300
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +69,7 @@ jobs:
           RATE: ${{ matrix.rate }}
           WINDOW: ${{ matrix.window }}
         run: |
-          python3 -B benchmarks/runner.py run --id "$CASE" --rows "$ROWS" --backlog-events 30000 \
+          python3 -B benchmarks/runner.py run --id "$CASE" --repeats 1 --rows "$ROWS" --backlog-events 30000 \
             --rate "$RATE" --warmup-seconds 30 --measurement-seconds "$WINDOW" --timeout-seconds 600 \
             --connectors "$RUNNER_TEMP/connectors" --output "$RUNNER_TEMP/calibration/run"
       - uses: actions/upload-artifact@v4
