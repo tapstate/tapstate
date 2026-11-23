@@ -651,13 +651,70 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return readableInventory().resources();
     }
 
+    private record StartRoot(PipelineResource pipeline, String defaultSourceId) {}
+
+    private StartRoot startRoot(ClientSession session, String id) {
+        if (!MongoBindingReadFacts.supported(client)) return null;
+        var stages = MongoStartConfigRead.root();
+        stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.PIPELINES, "pipeline", id));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_BINDING, "binding", "cluster"));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_SETUP, "setup", "cluster"));
+        stages.add(MongoStartConfigRead.boundedSingleton(SystemCollections.STORAGE_RECOVERY, "recovery"));
+        var defaultId = new Document("$arrayElemAt", List.of("$binding.value.defaultSourceId", 0));
+        var version = new Document("$arrayElemAt", List.of("$binding.value.bindingVersion", 0));
+        var globalId = new Document("bindingVersion", version).append("namespace", "pdk.global-state");
+        stages.add(joinStartRow(SystemCollections.SOURCES, "defaultSource", defaultId));
+        stages.add(joinStartRow(SystemCollections.PDK_NOTE_SCOPES, "global", globalId));
+        var otherKinds = List.of("pipeline", "transform", "view", "serve");
+        for (var kind : otherKinds) {
+            stages.add(new Document("$lookup", new Document("from", collection(kind).getNamespace().getCollectionName())
+                    .append("as", "occupied_" + kind).append("pipeline", List.of(new Document("$limit", 1),
+                            new Document("$project", new Document("_id", 0).append("present", new Document("$literal", true)))))));
+        }
+        var result = identity.aggregate(session, stages).first();
+        if (result == null || !(result.get("root") instanceof Document root) || !"cluster".equals(root.get("_id"))) return null;
+        var definition = MongoStartConfigRead.boundedRow(result, "pipeline", id);
+        var binding = MongoStartConfigRead.boundedRow(result, "binding", "cluster");
+        var setup = MongoStartConfigRead.boundedRow(result, "setup", "cluster");
+        var recovery = MongoStartConfigRead.boundedRow(result, "recovery", "cluster");
+        if (definition == null || setup == null || recovery == null || binding == null
+                || !(binding.get("defaultSourceId") instanceof String sourceId) || !(binding.get("bindingVersion") instanceof Long bindingVersion)
+                || !bindingVersion.equals(root.get("bindingVersion")) || bindingVersion <= 0) return null;
+        var source = MongoStartConfigRead.boundedRow(result, "defaultSource", sourceId);
+        var global = MongoStartConfigRead.boundedRow(result, "global", new Document("bindingVersion", bindingVersion).append("namespace", "pdk.global-state"));
+        if (source == null || global == null) return null;
+        requireKind(definition, "pipeline");
+        var pipeline = (PipelineResource) decode(definition);
+        // A populated foreign collection retains its own collation for the collision check.
+        boolean conflict = otherKinds.stream().anyMatch(kind -> !result.getList("occupied_" + kind, Document.class).isEmpty()
+                && collection(kind).find(session, new Document("_id", sourceId)).projection(new Document("_id", 1)).first() != null);
+        bindings.auditedObservationBinding(root, setup, binding, recovery, source, global, conflict);
+        return new StartRoot(pipeline, sourceId);
+    }
+
+    private static Document joinStartRow(SystemCollections table, String name, Document id) {
+        return new Document("$lookup", new Document("from", table.collectionName()).append("as", name)
+                .append("let", new Document("id", id)).append("pipeline", List.of(
+                        new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", "$$id")))),
+                        new Document("$limit", 2), new Document("$project", new Document("value", MongoStartConfigRead.boundedValue())))));
+    }
+
     @Override public Optional<ReadableInventory> runtimeStartInventory(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         return readSnapshot(session -> {
-            var row = find(session, pipelineId, Set.of("pipeline"));
-            if (row == null || !pipelineId.equals(row.getString("_id"))) return Optional.empty();
-            var pipeline = (PipelineResource) decode(row);
-            var binding = bindings.loadForTransaction(session).map(io.tapstate.spi.store.StorageBinding::defaultSourceId);
+            var captured = startRoot(session, pipelineId);
+            PipelineResource pipeline;
+            Optional<String> binding;
+            if (captured == null) {
+                var row = find(session, pipelineId, Set.of("pipeline"));
+                if (row == null || !pipelineId.equals(row.getString("_id"))) return Optional.empty();
+                pipeline = (PipelineResource) decode(row);
+                binding = bindings.loadForTransaction(session).map(io.tapstate.spi.store.StorageBinding::defaultSourceId);
+            } else {
+                pipeline = captured.pipeline();
+                binding = Optional.of(captured.defaultSourceId());
+            }
             if (binding.isEmpty() && pipeline.view() != null) return Optional.empty();
 
             var references = new LinkedHashMap<String, Resource>();
