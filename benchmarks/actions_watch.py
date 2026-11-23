@@ -119,7 +119,9 @@ def latest_state(repository, branch, now):
         raise ValueError(f"Notification intent from run {source['id']} could not be read")
     status = receipt.get("status") if receipt.get("intent_sha256") == catalog.digest(proposed) else None
     if status == "accepted":
-        return proposed
+        return state_from_intent(proposed)
+    # The previous accepted receipt may have survived without its state artifact.
+    state = proposed.get("previous", state)
     pending = dict(proposed.get("pending", state.get("pending", {})))
     if status != "rejected":
         before, after = state["active"], proposed["active"]
@@ -127,6 +129,10 @@ def latest_state(repository, branch, now):
             if before.get(key) != after.get(key):
                 pending[key] = "alert" if key in after else "recovery"
     return {**state, "pending": pending}
+
+
+def state_from_intent(proposed):
+    return {key: value for key, value in proposed.items() if key != "previous"}
 
 
 def stop_expiring_run(repository, performance, now):
@@ -214,7 +220,7 @@ def prepare(output, repository, branch, *, now=None):
         details = (f"https://github.com/{repository}/actions/runs/{target['id']}/attempts/1" if target
                    else f"https://github.com/{repository}/actions/workflows/pipeline-performance.yml")
         runner.write_json(output / "card.json", notifications.card(health, notices, details))
-        runner.write_json(output / "next-state.json", state)
+        runner.write_json(output / "next-state.json", {**state, "previous": previous})
     elif (marker != previous_marker or pending != previous_pending
           or now - actions_health.timestamp(previous["updated_at"]) >= timedelta(days=1)):
         runner.write_json(output / "state.json", state)
@@ -271,7 +277,10 @@ def send(output, webhook):
         save_receipt("rejected")
         raise ValueError("Feishu did not accept the notification")
     save_receipt("accepted")
-    (output / "next-state.json").replace(output / "state.json")
+    committed = output / "accepted-state.json"
+    runner.write_json(committed, state_from_intent(proposed))
+    committed.replace(output / "state.json")
+    (output / "next-state.json").unlink()
 
 
 def main():

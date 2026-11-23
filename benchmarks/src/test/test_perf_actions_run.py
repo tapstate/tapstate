@@ -499,3 +499,26 @@ class ActionsRunTest(unittest.TestCase):
                 health = catalog.read_json(output / "health.json")
                 self.assertEqual(bool(health["cancellation_errors"]), status == "in_progress")
                 self.assertTrue((output / "card.json").is_file())
+
+    def test_lost_committed_upload_cannot_undo_an_accepted_alert(self):
+        now = datetime.fromisoformat("2026-11-23T15:00:00+00:00")
+        initial = {"updated_at": now.isoformat(), "active": {}}
+        confirmed = {"updated_at": now.isoformat(),
+                     "active": {"workflow": {"kind": "workflow", "reason": "missing-handoff"}}}
+        proposal = {"updated_at": now.isoformat(), "previous": confirmed, "pending": {},
+                    "active": {**confirmed["active"], "case": {"kind": "execution", "reason": "read back failed"}}}
+        for status, pending, active in (
+            ("rejected", {}, confirmed["active"]),
+            ("unknown", {"case": "alert"}, confirmed["active"]),
+            ("accepted", {}, proposal["active"]),
+        ):
+            with self.subTest(status=status), patch.object(actions_watch, "latest_artifact", side_effect=[
+                ({"id": 8, "created_at": "2026-11-23T10:00:00Z"}, {"id": 7}),
+                ({"id": 10, "created_at": "2026-11-23T11:00:00Z"}, {"id": 9}),
+            ]), patch.object(actions_watch, "artifact", side_effect=[
+                initial, proposal, {"status": status, "intent_sha256": catalog.digest(proposal)},
+            ]):
+                loaded = actions_watch.latest_state("example/repo", "main", now)
+                self.assertEqual(active, loaded["active"])
+                self.assertEqual(pending, loaded["pending"])
+                self.assertNotIn("previous", loaded)
