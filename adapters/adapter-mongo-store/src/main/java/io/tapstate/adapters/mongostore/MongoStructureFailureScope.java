@@ -25,6 +25,7 @@ final class MongoStructureFailureScope {
     private static final Set<String> COMMANDS = Set.of("find", "aggregate", "insert", "update", "delete", "findAndModify");
     private static final Set<Integer> STRUCTURE_ERRORS = Set.of(26, 27, 48, 85, 86, 121, 166, 171, 197, 11000);
     private final MongoClient client;
+    private final MongoStructureFailureScope parent;
     private final MongoReadBudget budget;
     private MongoDatabase operatorDatabase;
     private Target pending;
@@ -37,8 +38,8 @@ final class MongoStructureFailureScope {
         boolean structural(int code) { return STRUCTURE_ERRORS.contains(code) || hinted && code == 2; }
     }
 
-    private MongoStructureFailureScope(MongoClient client, MongoReadBudget budget) {
-        this.client = client; this.budget = budget;
+    private MongoStructureFailureScope(MongoClient client, MongoReadBudget budget, MongoStructureFailureScope parent) {
+        this.client = client; this.budget = budget; this.parent = parent;
     }
 
     static <T> T call(MongoClient client, MongoReadBudget budget, Supplier<T> operation) {
@@ -53,7 +54,7 @@ final class MongoStructureFailureScope {
 
     static <T> T inspectOnFailure(MongoClient client, MongoReadBudget budget, Supplier<T> operation) {
         var previous = CURRENT.get();
-        var scope = new MongoStructureFailureScope(client, budget);
+        var scope = new MongoStructureFailureScope(client, budget, previous);
         CURRENT.set(scope);
         try { return operation.get(); }
         catch (RuntimeException original) {
@@ -96,8 +97,8 @@ final class MongoStructureFailureScope {
         }
 
         @Override public void commandStarted(CommandStartedEvent event) {
-            var scope = CURRENT.get();
-            if (scope != null && scope.client == client) scope.startedCommands++;
+            for (var scope = CURRENT.get(); scope != null; scope = scope.parent)
+                if (scope.client == client) scope.startedCommands++;
         }
     }
 

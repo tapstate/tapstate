@@ -157,4 +157,27 @@ class MongoStructureFailureScopeTest {
         }
         verify(session).close();
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"returned", "threw", "other-client", "commit", "abort"})
+    void commandsInsideNestedScopesCannotBecomeAZeroCommandRecoveryProof(String scenario) {
+        var observer = new MongoStructureFailureScope.CommandObserver();
+        observer.bind(client);
+        MongoStructureFailureScope.inspectOnFailure(client, () -> {
+            assertThat(MongoStructureFailureScope.provedNoCommandStarted(client)).isTrue();
+            var nested = scenario.equals("other-client") ? mock(MongoClient.class) : client;
+            try {
+                MongoStructureFailureScope.inspectOnFailure(nested, () -> {
+                    var command = mock(CommandStartedEvent.class);
+                    when(command.getCommandName()).thenReturn(scenario.equals("commit") ? "commitTransaction"
+                            : scenario.equals("abort") ? "abortTransaction" : "findAndModify");
+                    observer.commandStarted(command);
+                    if (scenario.equals("threw")) throw new com.mongodb.MongoOperationTimeoutException("test nested timeout");
+                    return null;
+                });
+            } catch (com.mongodb.MongoOperationTimeoutException expected) { }
+            assertThat(MongoStructureFailureScope.provedNoCommandStarted(client)).isFalse();
+            return null;
+        });
+    }
+
 }
