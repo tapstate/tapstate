@@ -109,6 +109,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
             assertThat(flow.captureFailure("flow")).as("the first takeover opens its original tail").isEmpty();
             assertThat(other.captureFailure("peer")).as("the follower keeps the same capture").isEmpty();
+            awaitOwnerOperations(f);
             assertThat(f.checkedConfigurations).hasSize(1);
             var opener = f.checkedConfigurations.getFirst();
             assertThat(opener.node()).isEqualTo(new PipelineNode("flow", "input"));
@@ -120,6 +121,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
             assertThat(flow.captureFailure("flow")).isEmpty();
             assertThat(other.captureFailure("peer")).isEmpty();
+            awaitOwnerOperations(f);
             assertThat(f.checkedConfigurations).hasSize(2).allSatisfy(opened -> {
                 assertThat(opened.node()).isEqualTo(opener.node());
                 assertThat(opened.primary()).isEqualTo(opener.primary());
@@ -184,6 +186,7 @@ class ScopedPipelineCaptureCoordinatorTest {
 
             org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
 
+            awaitOwnerOperations(f);
             assertThat(calls).hasPositiveValue();
             assertThat(underMonitor).as("a healthy remote fence read must not block unrelated start planning").isFalse();
         }
@@ -201,6 +204,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                     .thenReturn(new SrsConsumerStore.AttachedChain(topology, chain));
             clearInvocations(stores.chains(), stores.consumers());
             org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            awaitOwnerOperations(f);
             verify(stores.chains(), never()).load(held.chain());
             verify(stores.consumers()).attachedWithChain(eq(held.chain()), any(SrsChainStore.class));
         }
@@ -237,6 +241,25 @@ class ScopedPipelineCaptureCoordinatorTest {
             verify(consumers, times(2)).progress(f.streamingContext);
         }
     }
+    private static Object ownerOf(Fixture fixture, OwnedShared held) {
+        synchronized (fixture.coordinator) {
+            var owners = (Map<?, ?>) org.springframework.test.util.ReflectionTestUtils.getField(fixture.coordinator, "owners");
+            return java.util.Objects.requireNonNull(owners.get(held.preparation().captureId()));
+        }
+    }
+
+    private static void awaitOwnerOperations(Fixture fixture) throws Exception {
+        var attempts = new ArrayList<CompletableFuture<?>>();
+        synchronized (fixture.coordinator) {
+            var owners = (Map<?, ?>) org.springframework.test.util.ReflectionTestUtils.getField(fixture.coordinator, "owners");
+            for (Object owner : owners.values()) {
+                var attempt = (CompletableFuture<?>) org.springframework.test.util.ReflectionTestUtils.getField(owner, "operationAttempt");
+                if (attempt != null) attempts.add(attempt);
+            }
+        }
+        for (var attempt : attempts) attempt.get(3, TimeUnit.SECONDS);
+    }
+
     private static CaptureRun healthyCaptureRun() {
         var run = mock(CaptureRun.class);
         when(run.health()).thenReturn(new io.tapstate.runtime.srs.CaptureHealth());
@@ -608,7 +631,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var entered = new CountDownLatch(1);
             var release = new CountDownLatch(1);
             doAnswer(call -> {
-                if (Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                if (Thread.currentThread().getName().startsWith("tapstate-capture-owner-")) {
                     entered.countDown();
                     release.await();
                 }
@@ -625,22 +648,40 @@ class ScopedPipelineCaptureCoordinatorTest {
 
     @ParameterizedTest @ValueSource(booleans = {false, true})
     void aFailedMaintenanceReadCannotRetireAReplacementOwner(boolean fatal) throws Exception {
-        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC); var callers = Executors.newSingleThreadExecutor()) {
             var held = ownedShared(f);
             var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
             maintenance.shutdownNow();
             assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
-            Throwable failure = fatal ? new AssertionError("old owner read failed") : new IllegalStateException("old owner read failed");
+            awaitOwnerOperations(f);
+            var owner = ownerOf(f, held);
             var chains = f.sources.srs(BUSINESS, () -> {}).chains();
-            doAnswer(call -> { if (failure instanceof Error error) throw error; throw (RuntimeException) failure; })
-                    .when(chains).load(held.chain());
-            var checked = org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "checkServingTails");
-            held.run().stopCapture("flow", false);
-            var replacement = ownedShared(f);
-            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintain", checked);
-            assertThat(replacement.run().isCapturing("flow")).isTrue();
-            assertThat(replacement.run().captureFailure("flow")).isEmpty();
-            verify(replacement.tail(), never()).close();
+            var original = chains.load(held.chain()).orElseThrow();
+            var reading = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            Throwable failure = fatal ? new AssertionError("old owner read failed") : new IllegalStateException("old owner read failed");
+            doAnswer(call -> {
+                reading.countDown();
+                assertThat(release.await(3, TimeUnit.SECONDS)).isTrue();
+                if (failure instanceof Error error) throw error;
+                throw (RuntimeException) failure;
+            }).when(chains).load(held.chain());
+            try {
+                org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "scheduleOwnerOperation", owner,
+                        (Runnable) () -> org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintainOwner", owner));
+                assertThat(reading.await(3, TimeUnit.SECONDS)).isTrue();
+                var stopping = callers.submit(() -> held.run().stopCapture("flow", false));
+                assertThatThrownBy(() -> stopping.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                release.countDown();
+                stopping.get(3, TimeUnit.SECONDS);
+                doReturn(Optional.of(original)).when(chains).load(held.chain());
+                var replacement = ownedShared(f);
+                org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintainOwner", owner);
+                assertThat(ownerOf(f, replacement)).isNotSameAs(owner);
+                assertThat(replacement.run().isCapturing("flow")).isTrue();
+                assertThat(replacement.run().captureFailure("flow")).isEmpty();
+                verify(replacement.tail(), never()).close();
+            } finally { release.countDown(); }
         }
     }
 
@@ -655,8 +696,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var chains = f.sources.srs(BUSINESS, () -> {}).chains();
             doAnswer(call -> { if (failure instanceof Error error) throw error; throw (RuntimeException) failure; })
                     .when(chains).load(held.chain());
-            var checked = org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "checkServingTails");
-            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintain", checked);
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintainOwner", ownerOf(f, held));
             assertThat(held.run().captureFailure("flow")).contains(failure);
             verify(held.tail()).close();
         }
@@ -673,6 +713,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var chains = f.sources.srs(BUSINESS, () -> {}).chains();
             clearInvocations(chains);
             org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            awaitOwnerOperations(f);
             assertThat(held.run().captureFailure("flow")).contains(failure);
             verify(held.tail()).close();
             verify(chains, never()).load(anyString());

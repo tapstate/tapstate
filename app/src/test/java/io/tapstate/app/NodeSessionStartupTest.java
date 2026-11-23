@@ -39,8 +39,8 @@ class NodeSessionStartupTest {
 
     @Test
     void aLeaseConstructionFailureReleasesTheReservedNodeClaim() {
-        assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), null))
-                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(failLeaseConstruction(Duration.ofDays(106_752), Duration.ofNanos(500_000), null))
+                .isInstanceOf(ArithmeticException.class);
     }
 
     @Test
@@ -52,8 +52,8 @@ class NodeSessionStartupTest {
     @Test
     void cleanupStillReleasesTheNodeClaimAndPreservesTheConstructionFailure() {
         IllegalStateException releaseFailure = new IllegalStateException("owned release failure");
-        assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), releaseFailure))
-                .isInstanceOf(IllegalArgumentException.class).hasSuppressedException(releaseFailure);
+        assertThat(failLeaseConstruction(Duration.ofDays(106_752), Duration.ofNanos(500_000), releaseFailure))
+                .isInstanceOf(ArithmeticException.class).hasSuppressedException(releaseFailure);
     }
 
     private static Throwable failLeaseConstruction(Duration ttl, Duration interval, RuntimeException releaseFailure) {
@@ -77,15 +77,16 @@ class NodeSessionStartupTest {
         return failure;
     }
 
-    @Test
-    void theReservedNodeSessionRenewsWhileTheMemberFactoryIsStillRunning() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(longs = {500_000, 10_000_000})
+    void theReservedNodeSessionRenewsWhileTheMemberFactoryIsStillRunning(long intervalNanos) {
         ClusterProperties cluster = new ClusterProperties();
         cluster.setId("startup-cluster");
         cluster.setNodeId("node-a");
         cluster.setProfile(ClusterProperties.Profile.PROCESS_FAILURE_ONLY);
         cluster.setBootstrapMinMembers(2);
         cluster.setNodeSessionTtl(Duration.ofSeconds(5));
-        cluster.setNodeSessionRenewInterval(Duration.ofMillis(10));
+        cluster.setNodeSessionRenewInterval(Duration.ofNanos(intervalNanos));
         HazelcastProperties properties = new HazelcastProperties();
         properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);
         properties.getDiscovery().getTcpIp().setSeeds(java.util.List.of("10.20.0.11:5701"));

@@ -227,11 +227,10 @@ final class ValidationMemberResources implements AutoCloseable {
             synchronized(this){require();if(submitted)throw invalid("resources.controlSubmitted");submitted=true;}
             Runnable original=()->{
                 Throwable failure=null;
-                try{require();command.run();}
-                // A queued command can lose its original admission before its body starts.
-                // Its caller receives the coded refusal through released, not a global worker crash.
-                catch(TapstateException refused){failure=refused;}
-                catch(RuntimeException|Error failed){failure=failed;throw failed;}
+                try{
+                    try{require();}catch(TapstateException refused){failure=refused;return;}
+                    command.run();
+                }catch(RuntimeException|Error failed){failure=failed;throw failed;}
                 finally{finish(failure);}
             };
             try{controls.execute(original);}

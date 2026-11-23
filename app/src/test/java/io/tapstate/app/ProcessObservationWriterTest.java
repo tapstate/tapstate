@@ -398,8 +398,9 @@ class ProcessObservationWriterTest {
                 when(intents.loadForActuation(pipeline)).thenReturn(Optional.of(intent));
                 when(ownership.permit(scope)).thenReturn(new PipelineActuationOwnership.Permit(true, claim));
                 var sampleTime = AT.plusSeconds(pipeline.equals("slow") ? 1 : 2);
-                when(publisher.publishScoped(org.mockito.ArgumentMatchers.eq(scope), any(), isNull(), isNull())).thenReturn(Optional.of(
-                        new Observation(pipeline, PipelineState.RUNNING, Map.of("records.out", 1L), Map.of(), Map.of(), null, sampleTime)));
+                when(publisher.publishScopedReading(org.mockito.ArgumentMatchers.eq(scope), any(), isNull(), isNull(), org.mockito.ArgumentMatchers.anyBoolean())).thenReturn(Optional.of(
+                        new ObservationPublisher.Publication(new Observation(pipeline, PipelineState.RUNNING,
+                                Map.of("records.out", 1L), Map.of(), Map.of(), null, sampleTime), true)));
             }
             var converger = mock(PipelineConverger.class);
             when(converger.convergeScoped(any(), any(), isNull(), isNull(), any(), any())).thenReturn(

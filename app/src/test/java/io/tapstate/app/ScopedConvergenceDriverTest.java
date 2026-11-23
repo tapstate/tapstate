@@ -200,7 +200,7 @@ class ScopedConvergenceDriverTest {
             assertThat(intents.loads).isEqualTo(reads + 1);
             driver.reconcile();
             assertThat(intents.loads).isEqualTo(reads + 2);
-            verify(ownership, org.mockito.Mockito.atLeastOnce()).retain(Set.of("orders"));
+            verify(ownership, org.mockito.Mockito.atLeastOnce()).retain(org.mockito.ArgumentMatchers.argThat(ids -> ids.size() == 1 && ids.contains("orders")));
         }
     }
 
