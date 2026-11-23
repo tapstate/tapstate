@@ -2510,13 +2510,23 @@ class MongoSrsConsumerStoreIT {
             Optional<Map<String, SrsModel>> published;
             io.tapstate.spi.store.SrsConsumerStore.StartupSnapshot sample;
             var before = controlRows(f);
-            try {
+            var wireReads = new ArrayList<org.bson.BsonDocument>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (Set.of("find", "aggregate", "getMore").contains(event.getCommandName()))
+                        wireReads.add(event.getCommand().clone());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(MongoCommandObservation.LISTENER).addCommandListener(listener).build())) {
                 MongoCommandObservation.CURRENT.set(separate::add);
                 chain = f.chains().load(CHAIN).orElseThrow();
                 progress = f.consumers().progress(A).orElseThrow();
                 published = models(f).publishedForNewSnapshot(CHAIN, selection);
                 MongoCommandObservation.CURRENT.set(combined::add);
-                sample = f.consumers().startupSnapshot(A, selection).orElseThrow();
+                sample = new MongoSrsConsumerStore(observed, observed.getDatabase(f.database().getName()), SCOPE)
+                        .startupSnapshot(A, selection).orElseThrow();
             } finally {
                 MongoCommandObservation.CURRENT.remove();
             }
@@ -2526,7 +2536,14 @@ class MongoSrsConsumerStoreIT {
             assertThat(sample.published()).isEqualTo(published).isPresent();
             assertThat(sample.bounds()).containsOnlyKeys(ring("orders"));
             assertThat(sample.bounds().get(ring("orders")).largestSequence()).isEqualTo(4);
-            assertThat(combined.stream().filter("commitTransaction"::equals)).hasSize(1);
+            assertThat(combined).doesNotContain("commitTransaction", "abortTransaction");
+            assertThat(wireReads).isNotEmpty();
+            assertThat(wireReads.getFirst().getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
+            var originalSession = wireReads.getFirst().getDocument("lsid");
+            assertThat(wireReads).allSatisfy(command -> {
+                assertThat(command).doesNotContainKeys("autocommit", "startTransaction");
+                assertThat(command.getDocument("lsid")).isEqualTo(originalSession);
+            });
             assertThat(combined).hasSizeLessThan(separate.size());
             assertThat(controlRows(f)).isEqualTo(before);
         });
