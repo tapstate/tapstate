@@ -59,6 +59,100 @@ final class MongoSrsReadFacts {
         rows.put(lookup(table, new Document("_id", row.get("_id")), false), Optional.of(row));
     }
 
+    /** Only positive, exact rows enter this callback's memo; absent and ambiguous rows keep their point reads. */
+    void prefetchArrival(String chain, Document consumerId) {
+        requireSession(session, database);
+        var bytes = new Document("$bsonSize", "$$ROOT");
+        var stages = new java.util.ArrayList<Document>();
+        stages.add(new Document("$match", new Document("_id", chain)));
+        stages.add(new Document("$project", new Document("root", new Document("$cond", java.util.List.of(
+                new Document("$lte", java.util.List.of(bytes, 64 * 1024)), "$$ROOT", false)))));
+        var requested = java.util.List.of(SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS);
+        for (var table : requested) {
+            stages.add(new Document("$lookup", new Document("from", table.collectionName()).append("as", table.collectionName())
+                    .append("pipeline", java.util.List.of(new Document("$match", new Document("_id", consumerId)),
+                            new Document("$limit", 2), new Document("$project", new Document("value", new Document("$cond", java.util.List.of(
+                                    new Document("$lte", java.util.List.of(bytes, 64 * 1024)), "$$ROOT", false))))))));
+        }
+        var captured = SystemCollections.SRS_CHAINS.on(database).aggregate(session, stages).first();
+        if (captured == null || !(captured.get("root") instanceof Document root) || !chain.equals(root.get("_id"))) return;
+        seed(SystemCollections.SRS_CHAINS, root);
+        for (var table : requested) {
+            var found = captured.getList(table.collectionName(), Document.class);
+            if (found.size() == 1 && found.getFirst().get("value") instanceof Document row && exact(consumerId, row.get("_id")))
+                seed(table, row);
+        }
+    }
+
+    /** Prefetches the bounded predicates of one retained checkpoint without weakening their decoders. */
+    void prefetchStartupCheckpoint(Document root, io.tapstate.spi.store.SrsCaptureCheckpoint checkpoint) {
+        requireSession(session, database);
+        if (checkpoint == null || checkpoint.tables().isEmpty() || checkpoint.tables().size() > 8) return;
+        var requested = new java.util.LinkedHashMap<Lookup, Query>();
+        var contexts = new MongoSrsModelContexts(database, scope);
+        for (var at : checkpoint.tables().values()) {
+            var key = at.model();
+            var head = contexts.head(root, key.table());
+            if (head == null || !(head.get("ringName") instanceof String ring)) return;
+            addQuery(requested, SystemCollections.SRS_MODEL_CONTEXTS,
+                    new Document("_id", MongoSrsModelContexts.contextId(key)), false);
+            addQuery(requested, SystemCollections.SRS_MODEL_CONTEXTS,
+                    new Document("_id", head.get("contextId")), false);
+            addQuery(requested, SystemCollections.SRS_MODELS,
+                    new Document("_id", MongoSrsModelStore.key(key)), false);
+            addQuery(requested, SystemCollections.SRS_MODEL_CONTEXTS,
+                    new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring), false);
+            addQuery(requested, SystemCollections.SRS_MODELS,
+                    new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring), true);
+            addQuery(requested, SystemCollections.SRS_LOG_BOUNDS,
+                    new Document("_id", MongoSrsLogStore.boundsId(ring)), false);
+        }
+        prefetchStartupProofs(root, requested);
+    }
+
+    private void prefetchStartupProofs(Document root, Map<Lookup, Query> requested) {
+        if (requested.isEmpty()) return;
+        var stages = new java.util.ArrayList<Document>();
+        stages.add(new Document("$match", new Document("_id", root.get("_id"))));
+        stages.add(new Document("$project", new Document("_id", 1)));
+        var queries = java.util.List.copyOf(requested.values());
+        for (int i = 0; i < queries.size(); i++) {
+            var query = queries.get(i);
+            var bytes = new Document("$bsonSize", "$$ROOT");
+            stages.add(new Document("$lookup", new Document("from", query.table().collectionName())
+                    .append("as", "proof" + i).append("pipeline", java.util.List.of(
+                            new Document("$match", query.filter()), new Document("$limit", 2),
+                            new Document("$project", new Document("value", new Document("$cond", java.util.List.of(
+                                    new Document("$lte", java.util.List.of(bytes, 64 * 1024)), "$$ROOT", false))))))));
+        }
+        var captured = SystemCollections.SRS_CHAINS.on(database).aggregate(session, stages).first();
+        if (captured == null || !exact(root.get("_id"), captured.get("_id"))) return;
+        for (int i = 0; i < queries.size(); i++) {
+            var query = queries.get(i);
+            var found = captured.getList("proof" + i, Document.class);
+            if (found.isEmpty() || !query.idOnly() && found.size() != 1
+                    || !(found.getFirst().get("value") instanceof Document value)) continue;
+            if (query.filter().entrySet().stream().anyMatch(entry -> !exact(entry.getValue(), value.get(entry.getKey()))))
+                continue;
+            Document result = query.idOnly() ? new Document("_id", value.get("_id")) : value;
+            rows.put(lookup(query.table(), query.filter(), query.idOnly()), Optional.of(result));
+        }
+    }
+
+    private record Query(SystemCollections table, Document filter, boolean idOnly) {}
+
+    private void addQuery(Map<Lookup, Query> requested, SystemCollections table, Document filter, boolean idOnly) {
+        var key = lookup(table, filter, idOnly);
+        if (!rows.containsKey(key)) requested.putIfAbsent(key, new Query(table, filter, idOnly));
+    }
+
+    private static boolean exact(Object expected, Object actual) {
+        if (expected instanceof Document key)
+            return actual instanceof Document value && new java.util.ArrayList<>(key.keySet()).equals(
+                    new java.util.ArrayList<>(value.keySet())) && key.equals(value);
+        return java.util.Objects.equals(expected, actual);
+    }
+
     /** Seeds only a complete batch of exact IDs; aliases and missing rows fall back to point proofs. */
     boolean prefetchExactIds(SystemCollections table, Collection<?> ids, Runnable requireActive) {
         requireSession(session, database);

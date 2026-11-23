@@ -1715,6 +1715,228 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"false,0", "false,100", "true,0", "true,100"})
+    void oneTableArrivalCountsRemainBoundedWithOtherConsumers(boolean checkpointed, int siblings) {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            Map<String, SrsModelKey> refs;
+            if (checkpointed) {
+                preparedTrimLog(f);
+                var key = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0);
+                refs = Map.of("orders", key);
+                f.chains().requestTables(CHAIN, tables, f.captureFence());
+                assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+                f.chains().checkpoint(CHAIN, 0, new io.tapstate.spi.store.SrsCaptureCheckpoint(
+                        new ChainPosition(new SourceOrder(1, 4), "t4"),
+                        Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(key, 4))), f.captureFence()).orElseThrow();
+            } else refs = Map.of();
+            var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            f.consumers().attach(B, 0, tables, f.fenceB()).orElseThrow();
+            if (checkpointed) assertThat(f.consumers().pinSnapshot(A, member.revision(), 0,
+                    new SrsSnapshotPin(1, "retained", refs), f.fenceA())).isTrue();
+            var sibling = cursor(f, B);
+            for (var table : List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS,
+                    SystemCollections.CACHE_SRS_CONSUMER_OFFSETS, SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS)) {
+                var template = table.on(f.database()).find().first();
+                if (template == null) continue;
+                var peers = new ArrayList<Document>();
+                for (int i = 0; i < siblings; i++) {
+                    var row = Document.parse(template.toJson());
+                    Object key = row.get("_id");
+                    if (key instanceof Document id) id.put("chain", "peer-" + i);
+                    else row.put("_id", "peer-" + i);
+                    row.put("cacheIncarnation", "peer-cache");
+                    row.put("ringName", "peer-ring-" + i);
+                    peers.add(row);
+                }
+                if (!peers.isEmpty()) table.on(f.database()).insertMany(peers);
+            }
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            io.tapstate.spi.store.SrsConsumerProgress progress;
+            try {
+                progress = runtimeConsumer(f.client(), f.database()).startReadingAfterAndGet(A, member.revision(),
+                        checkpointed ? 1 : 0, Map.of("orders", checkpointed ? 4L : -1L), f.fenceA()).orElseThrow();
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            System.out.println("ARRIVAL_COMMANDS checkpoint=" + checkpointed + " siblings=" + siblings + " count=" + commands.size() + " commands=" + commands);
+            assertThat(progress.revision()).isEqualTo(checkpointed ? 2 : 1);
+            assertThat(cursor(f, B)).isEqualTo(sibling);
+            assertThat(commands).hasSize(checkpointed ? 14 : 8);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"case-alias", "ordered-id", "large"})
+    void arrivalPrefetchRetainsOriginalPointReadsForUncertainRows(String condition) {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var table = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database());
+            var expected = id(A);
+            var row = table.find(expected).first();
+            table.drop();
+            var options = new com.mongodb.client.model.CreateCollectionOptions();
+            if (condition.equals("case-alias")) options.collation(com.mongodb.client.model.Collation.builder().locale("en")
+                    .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build());
+            f.database().createCollection(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName(), options);
+            var storedId = row.get("_id", Document.class);
+            if (condition.equals("case-alias")) storedId.put("consumer", storedId.getString("consumer").toUpperCase(java.util.Locale.ROOT));
+            if (condition.equals("ordered-id")) {
+                var ordered = new Document();
+                var keys = new ArrayList<>(storedId.keySet());
+                java.util.Collections.reverse(keys);
+                keys.forEach(key -> ordered.put(key, storedId.get(key)));
+                row.put("_id", ordered);
+            }
+            if (condition.equals("large")) row.put("extra", "x".repeat(70 * 1024));
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).insertOne(row);
+            try (var session = f.client().startSession()) {
+                session.startTransaction();
+                var original = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).find(session, expected).first();
+                var facts = new MongoSrsReadFacts(session, f.database(), SCOPE, true);
+                facts.prefetchArrival(CHAIN, new MongoSrsConsumerRecords(SCOPE).id(A.key()));
+                assertThat(MongoSrsReadFacts.find(facts, session, f.database(), SystemCollections.CACHE_SRS_CONSUMER_OFFSETS, expected))
+                        .isEqualTo(original);
+                session.commitTransaction();
+            }
+        });
+    }
+
+    @org.junit.jupiter.api.RepeatedTest(5)
+    void startupArrivalPreparationLetsTheSamePipelineRenewBeforePublishingOnce() {
+        withBusiness(f -> {
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var renewal = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.WorkloadClaim>();
+            var probe = new ArrivalPreparationProbe(() -> {
+                try (var lease = f.client().startSession()) {
+                    lease.startTransaction();
+                    renewal.set(claims.inStrictSession(lease).renewBeforeReads(f.pipelineA(), Duration.ofSeconds(30))
+                            .orElseThrow().claim());
+                    lease.commitTransaction();
+                }
+            });
+
+            try (var client = arrivalProbeClient(probe)) {
+                var arrivals = runtimeConsumer(client, client.getDatabase(f.database().getName()));
+                var cursor = arrivals.startReadingAfterAndGet(A, member.revision(), 0, Map.of("orders", -1L), f.fenceA()).orElseThrow();
+                assertThat(probe.failure.get()).as("the same Pipeline can renew while the cursor is being read").isNull();
+                assertThat(renewal.get()).isNotNull();
+                assertThat(WorkloadClaimFence.from(renewal.get())).isEqualTo(f.fenceA());
+                assertThat(probe.attempts).hasValue(2);
+                assertThat(probe.conflicts).hasValue(1);
+                assertThat(probe.commits).hasValue(1);
+                assertThat(cursor.revision()).isOne();
+                assertThat(cursor.ringDoneThrough()).containsEntry("orders", -1L);
+                assertThat(f.consumers().progress(A)).contains(cursor);
+                System.out.printf("ARRIVAL_RENEWAL renewal_committed=true attempts=%d conflicts=%d cursor_commits=%d%n",
+                        probe.attempts.get(), probe.conflicts.get(), probe.commits.get());
+            }
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"expired", "new-owner", "new-execution", "retired"})
+    void startupArrivalRejectsAuthorityLostDuringPreparation(String loss) {
+        withBusiness(f -> {
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var originalCursor = cursor(f, A);
+            var states = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var stateKey = new Document("_id", A.key().pipelineId());
+            var originalState = states.find(stateKey).first();
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            if (loss.equals("expired")) assertThat(claims.renew(f.pipelineA(), Duration.ofSeconds(3))).isPresent();
+            if (loss.equals("retired")) {
+                SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("claimAdmissionFence", 0L)));
+            }
+            var probe = new ArrivalPreparationProbe(() -> {
+                switch (loss) {
+                    case "expired" -> {
+                        long limit = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                        while (claims.read(f.pipelineA().key()).orElseThrow().leased() && System.nanoTime() < limit) {
+                            Thread.sleep(25);
+                        }
+                        assertThat(claims.read(f.pipelineA().key()).orElseThrow().leased()).isFalse();
+                    }
+                    case "new-owner" -> {
+                        assertThat(claims.release(f.pipelineA())).isTrue();
+                        assertThat(claims.acquire(f.pipelineA().key(), new WorkloadOwner("new-node", "new-boot"),
+                                1, Duration.ofSeconds(30)).acquired()).isTrue();
+                    }
+                    case "new-execution" -> assertThat(claims.advanceExecution(f.pipelineA(),
+                            f.pipelineA().topologyRevision(), Set.of(f.pipelineA().owner().nodeId()))).isPresent();
+                    case "retired" -> {
+                        try (var retirement = f.client().startSession()) {
+                            retirement.startTransaction();
+                            new MongoCacheBusinessIdentity(f.database(), SCOPE).retire(retirement, "retire-before-arrival");
+                            retirement.commitTransaction();
+                        }
+                    }
+                    default -> throw new AssertionError(loss);
+                }
+            });
+
+            try (var client = arrivalProbeClient(probe)) {
+                var arrivals = runtimeConsumer(client, client.getDatabase(f.database().getName()));
+                assertThatThrownBy(() -> arrivals.startReadingAfterAndGet(A, member.revision(), 0, Map.of("orders", -1L), f.fenceA()))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(
+                                loss.equals("retired") ? IoError.CACHE_BUSINESS_FENCED : IoError.WORKLOAD_CLAIM_FENCED));
+                assertThat(probe.failure.get()).isNull();
+                assertThat(probe.paused).isTrue();
+                assertThat(probe.commits).hasValue(0);
+                assertThat(cursor(f, A)).isEqualTo(originalCursor);
+                assertThat(states.find(stateKey).first()).isEqualTo(originalState);
+            }
+        });
+    }
+
+    private static MongoClient arrivalProbeClient(ArrivalPreparationProbe probe) {
+        return MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                .addCommandListener(probe).build());
+    }
+
+    private static final class ArrivalPreparationProbe implements com.mongodb.event.CommandListener {
+        interface CompetingWrite { void run() throws Exception; }
+
+        private final CompetingWrite competing;
+        private final java.util.concurrent.atomic.AtomicInteger cursorRead = new java.util.concurrent.atomic.AtomicInteger(-1);
+        private final java.util.concurrent.atomic.AtomicBoolean paused = new java.util.concurrent.atomic.AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
+        private final java.util.concurrent.atomic.AtomicInteger conflicts = new java.util.concurrent.atomic.AtomicInteger();
+        private final java.util.concurrent.atomic.AtomicInteger commits = new java.util.concurrent.atomic.AtomicInteger();
+        private final java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+
+        ArrivalPreparationProbe(CompetingWrite competing) { this.competing = competing; }
+
+        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+            var body = event.getCommand();
+            if (body.containsKey("startTransaction")) attempts.incrementAndGet();
+            boolean cursor = "find".equals(event.getCommandName()) && "srs_consumer_offsets".equals(body.getString("find").getValue());
+            if ("aggregate".equals(event.getCommandName()) && "srs_chains".equals(body.getString("aggregate").getValue())) {
+                cursor = body.getArray("pipeline").stream().anyMatch(stage -> stage.isDocument()
+                        && stage.asDocument().containsKey("$lookup")
+                        && "srs_consumer_offsets".equals(stage.asDocument().getDocument("$lookup").getString("as").getValue()));
+            }
+            if (cursor) cursorRead.compareAndSet(-1, event.getRequestId());
+        }
+
+        @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+            if ("commitTransaction".equals(event.getCommandName())) commits.incrementAndGet();
+            if (event.getRequestId() != cursorRead.get() || !paused.compareAndSet(false, true)) return;
+            try {
+                competing.run();
+            } catch (Exception | AssertionError error) {
+                failure.set(error);
+            }
+        }
+
+        @Override public void commandFailed(com.mongodb.event.CommandFailedEvent event) {
+            if (event.getThrowable() instanceof com.mongodb.MongoCommandException error && error.getCode() == 112) {
+                conflicts.incrementAndGet();
+            }
+        }
+    }
+
     @Test void aBatchInitializesSeparateSampledFloorsWithOneRevisionAndKeepsConfirmedPlaces() {
         withBusiness(f -> {
             f.consumers().attach(A,0,Set.of("orders","items"),f.fenceA()).orElseThrow();
