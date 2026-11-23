@@ -80,7 +80,7 @@ final class MongoClaimOperations {
 
     MongoClaimOperations(MongoClient client) {
         this.client = client;
-        observeTopology();
+        observeTopology(client);
         workers.allowCoreThreadTimeOut(true);
         renewals.allowCoreThreadTimeOut(true);
     }
@@ -132,8 +132,8 @@ final class MongoClaimOperations {
         return call(deadline, guard, action, nodeConfirmation);
     }
 
-    private void observeTopology() {
-        var topology = client.getClusterDescription();
+    private void observeTopology(MongoClient originalClient) {
+        var topology = originalClient.getClusterDescription();
         if (topology.getType() == com.mongodb.connection.ClusterType.REPLICA_SET) {
             replicaSet = true;
         } else if (topology.getType() != com.mongodb.connection.ClusterType.UNKNOWN) {
@@ -355,6 +355,7 @@ final class MongoClaimOperations {
 
     final class Transaction {
         private final ClientSession session;
+        private final MongoClient originalClient;
         private final WorkloadClaimKey renewalKey = MongoClaimOperations.this.renewalKey.get();
         private long number;
         private BsonDocument recoveryToken;
@@ -365,10 +366,13 @@ final class MongoClaimOperations {
         private boolean released;
         private boolean closeAttempted;
 
-        private Transaction(ClientSession session) { this.session = session; }
+        private Transaction(ClientSession session, MongoClient originalClient) {
+            this.session = session;
+            this.originalClient = originalClient;
+        }
 
         void capture() {
-            observeTopology();
+            observeTopology(originalClient);
             if(session.getPinnedServerAddress()!=null)routed=true;
             if(!captured) {
                 number = session.getServerSession().getTransactionNumber();
@@ -388,8 +392,10 @@ final class MongoClaimOperations {
         void returned() {capture();callbackReturned=true;}
     }
 
-    Transaction own(ClientSession session) {
-        var transaction = new Transaction(session);
+    Transaction own(ClientSession session) { return own(session, client); }
+
+    Transaction own(ClientSession session, MongoClient originalClient) {
+        var transaction = new Transaction(session, originalClient);
         transactions.add(transaction);
         return transaction;
     }
@@ -437,13 +443,13 @@ final class MongoClaimOperations {
         if(!active)command.append("txnNumber", transaction.number).append("autocommit",false);
         if (transaction.recoveryToken != null) command.append("recoveryToken", transaction.recoveryToken);
         try {
-            var database=client.getDatabase("admin").withReadPreference(ReadPreference.primary());
+            var database=transaction.originalClient.getDatabase("admin").withReadPreference(ReadPreference.primary());
             // An active transaction already owns the original CSOT. Overriding it is invalid.
             var reply = (active?database:budget.database(database)).runCommand(transaction.session, command);
             if (reply.containsKey("writeConcernError"))
                 throw new MongoException(64, "transaction cleanup was not acknowledged");
         } catch (MongoCommandException ended) {
-            observeTopology();
+            observeTopology(transaction.originalClient);
             // The server has no active transaction under this exact session and transaction number.
             if (ended.getResponse().containsKey("writeConcernError")
                     || ended.getErrorCode() != 251 && ended.getErrorCode() != 256) throw ended;

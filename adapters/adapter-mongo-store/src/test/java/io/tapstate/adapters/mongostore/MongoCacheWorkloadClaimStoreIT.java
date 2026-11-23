@@ -55,6 +55,45 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void onlyNodeRenewalAndConfirmationUseTheDedicatedClient() {
+        withBusiness(f -> {
+            var ordinary = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var node = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            try (var businessClient = client(recording(ordinary)); var maintenanceClient = client(recording(node))) {
+                maintenanceClient.getDatabase("admin").runCommand(new Document("ping", 1));
+                node.clear();
+                var ops = new MongoClaimOperations(businessClient);
+                var store = new MongoCacheWorkloadClaimStore(businessClient, businessClient.getDatabase(f.database().getName()),
+                        SCOPE, ACTIVE, null, ops, () -> maintenanceClient);
+                var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, OWNER.nodeId());
+                var initial = store.acquire(key, OWNER, 1, TTL).claim();
+                assertThat(ordinary).isNotEmpty();
+                assertThat(node).isEmpty();
+                ordinary.clear();
+                var renewed = store.withNodeSessionDeadline(key, deadline(), ACTIVE,
+                        () -> store.renew(initial, TTL)).orElseThrow();
+                assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(WorkloadClaimFence.from(initial));
+                assertThat(node).contains("findAndModify", "commitTransaction");
+                node.clear();
+                assertThat(store.confirmNodeSession(key, deadline(), ACTIVE).orElseThrow().claim()).isEqualTo(renewed);
+                assertThat(node).containsExactly("aggregate");
+                assertThat(ordinary).isEmpty();
+                node.clear();
+                assertThat(store.release(renewed)).isTrue();
+                assertThat(ordinary).isNotEmpty();
+                assertThat(node).isEmpty();
+                store.awaitQuiescence(deadline());
+                ops.closeIfIdle();
+            }
+        });
+    }
+
+    private static CommandListener recording(List<String> commands) {
+        return new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+        };
+    }
+
     @org.junit.jupiter.api.RepeatedTest(3)
     void executionAdmissionKeepsItsFirstWriteAheadOfRenewalInterleavings() {
         withBusiness(f -> {

@@ -31,8 +31,11 @@ class MongoClaimOperationsTest {
         verify(session,times(2)).close();verify(session,never()).abortTransaction();verify(client,never()).getDatabase(anyString());
     }
 
-    @Test void terminalAbortWithFailedWriteConcernRetainsTheOriginalCleanupOwner() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void terminalAbortWithFailedWriteConcernRetainsTheOriginalCleanupOwner(boolean dedicated) {
         var client=client();var database=mock(MongoDatabase.class);var session=mock(ClientSession.class);
+        var businessClient = dedicated ? client() : client;
         var server=mock(com.mongodb.session.ServerSession.class);
         var number=new java.util.concurrent.atomic.AtomicLong(42);
         var originalToken=org.bson.BsonDocument.parse("{recoveryShardId:'original-shard',opaque:{version:7}}");
@@ -47,12 +50,13 @@ class MongoClaimOperationsTest {
         when(database.runCommand(eq(session),any(org.bson.Document.class)))
                 .thenThrow(new MongoCommandException(response,new ServerAddress()))
                 .thenThrow(new MongoCommandException(org.bson.BsonDocument.parse("{ok:0,code:251,errmsg:'no transaction'}"),new ServerAddress()));
-        var operations=new MongoClaimOperations(client);var transaction=operations.own(session);
+        var operations=new MongoClaimOperations(businessClient);var transaction=operations.own(session, client);
         assertThatThrownBy(()->operations.abort(transaction,new MongoReadBudget(Duration.ofSeconds(2))))
                 .isInstanceOf(MongoCommandException.class);
         verify(session,never()).close();
         assertThatThrownBy(operations::closeIfIdle).isInstanceOf(TapstateException.class);
         operations.await(deadline(2000));operations.closeIfIdle();verify(session).close();
+        if (dedicated) verify(businessClient, never()).getDatabase(anyString());
         var commands=org.mockito.ArgumentCaptor.forClass(org.bson.Document.class);
         verify(database,times(2)).runCommand(eq(session),commands.capture());
         assertThat(commands.getAllValues()).allSatisfy(c->{

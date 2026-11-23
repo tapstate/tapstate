@@ -19,7 +19,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-/** One cache client owner, with authentication preparation independent from business-domain assembly. */
+/** Owns the CACHE clients and keeps authentication preparation independent from business-domain assembly. */
 public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineStoreViews, io.tapstate.spi.store.SrsStoreViews, AutoCloseable {
     private final MongoConnection connection;
     private final com.mongodb.client.MongoClient client;
@@ -30,6 +30,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final String targetFingerprint;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
     private boolean connectionClosed;
+    private com.mongodb.client.MongoClient nodeSessionClient;
 
     private MongoCacheDomain(MongoConnection connection, Duration rateRetention, String targetFingerprint,
                              io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
@@ -425,11 +426,18 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         businessActive();
     }
 
-    /** The claims share this exact cache client, original scope and owner lifecycle. */
+    /** All claims share the original CACHE scope and its lifetime. */
     public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
         claimOperations.requireAdmission();
         loadBusinessScope(expected);
-        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive,null,claimOperations);
+        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive, null,
+                claimOperations, this::nodeSessionClient);
+    }
+
+    private synchronized com.mongodb.client.MongoClient nodeSessionClient() {
+        businessActive();
+        if (nodeSessionClient == null) nodeSessionClient = connection.openNodeSessionClient();
+        return nodeSessionClient;
     }
 
     public io.tapstate.spi.store.ClusterMembershipStore clusterMembership(CacheBusinessScope expected) {
@@ -854,6 +862,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         if(connectionClosed)return;
         claimOperations.closeIfIdle();
         closed.set(true);
+        if (nodeSessionClient != null) nodeSessionClient.close();
         connection.close();
         connectionClosed=true;
     }

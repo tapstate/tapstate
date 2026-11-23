@@ -72,6 +72,7 @@ public final class MongoConnection implements AutoCloseable {
     private final boolean strictStorage;
     private final boolean userAtlas;
     private MongoClient client;
+    private MongoClientSettings verifiedSettings;
     private MongoDatabase database;
     private String databaseName;
     private SourceConfigKeyringHandle sourceConfigKeyring;
@@ -310,6 +311,13 @@ public final class MongoConnection implements AutoCloseable {
         }
         this.database = opened.getDatabase(databaseName);
         this.client = opened;
+        this.verifiedSettings = clientSettings;
+    }
+
+    /** Reuses all options and credentials of the verified endpoint in a separate driver pool. */
+    MongoClient openNodeSessionClient() {
+        if (verifiedSettings == null) throw new IllegalStateException("store connection not verified");
+        return MongoClients.create(verifiedSettings);
     }
 
     static boolean isTransactionCapableTopology(Document hello) {
@@ -636,6 +644,7 @@ public final class MongoConnection implements AutoCloseable {
 
     @Override
     public void close() {
+        verifiedSettings = null;
         sourceConfigKeyring = null;
         if (client != null) {
             client.close();

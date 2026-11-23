@@ -46,6 +46,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     private final MongoWorkloadClaimStore raw;
     private final MongoValidationPreparations.Authority validation;
     private final MongoClaimOperations operations;
+    private final java.util.function.Supplier<MongoClient> nodeSessionClient;
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive) {
         this(client, database, scope, requireActive, null);
@@ -58,6 +59,13 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             MongoValidationPreparations.Authority validation, MongoClaimOperations operations) {
+        this(client, database, scope, requireActive, validation, operations, null);
+    }
+
+    MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
+            MongoValidationPreparations.Authority validation, MongoClaimOperations operations,
+            java.util.function.Supplier<MongoClient> nodeSessionClient) {
+        this.nodeSessionClient = nodeSessionClient;
         this.client = Objects.requireNonNull(client, "client");
         this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope");
@@ -91,28 +99,37 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireKey(key);
         if (key.type() != WorkloadClaimType.NODE_SESSION)
             throw new IllegalArgumentException("node-session confirmation requires a node-session key");
-        return StoreIo.call(() -> operations.confirmNodeSession(deadline, active, () -> {
-            // A read in the confirmation lane must not wait for the writer's transaction cleanup.
-            if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return read(key);
+        return StoreIo.call(() -> operations.confirmNodeSession(deadline, active, () -> nodeMaintenance().readNodeConfirmation(key)));
+    }
+
+    private MongoCacheWorkloadClaimStore nodeMaintenance() {
+        if (nodeSessionClient == null) return this;
+        var isolated = nodeSessionClient.get();
+        return new MongoCacheWorkloadClaimStore(isolated, isolated.getDatabase(database.getName()), scope,
+                requireActive, validation, operations);
+    }
+
+    private Optional<WorkloadClaimReading> readNodeConfirmation(WorkloadClaimKey key) {
+        // A read in the confirmation lane must not wait for the writer's transaction cleanup.
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return read(key);
+        requireActive.run();
+        var budget = operations.budget();
+        return MongoStructureFailureScope.inspectOnFailure(client, budget, () -> {
+            var selected = budget.database(database).withReadPreference(ReadPreference.primary())
+                    .withReadConcern(ReadConcern.SNAPSHOT);
+            var id = MongoWorkloadClaimStore.id(key);
+            var facts = SystemCollections.CACHE_IDENTITY.on(selected).aggregate(List.of(
+                    new Document("$match", new Document("_id", "cluster")),
+                    new Document("$project", new Document("identity", "$$ROOT")),
+                    proofLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business", List.of()),
+                    proofLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", id,
+                            List.of(MongoWorkloadClaimStore.leaseRemaining(true)))))
+                    .collation(com.mongodb.client.model.Collation.builder().locale("simple").build()).first();
+            var identity = facts == null ? null : facts.get("identity", Document.class);
+            MongoCacheBusinessIdentity.requireObservedAdmission(identity, proofRow(facts, "schema"), scope);
             requireActive.run();
-            var budget = operations.budget();
-            return MongoStructureFailureScope.inspectOnFailure(client, budget, () -> {
-                var selected = budget.database(database).withReadPreference(ReadPreference.primary())
-                        .withReadConcern(ReadConcern.SNAPSHOT);
-                var id = MongoWorkloadClaimStore.id(key);
-                var facts = SystemCollections.CACHE_IDENTITY.on(selected).aggregate(List.of(
-                        new Document("$match", new Document("_id", "cluster")),
-                        new Document("$project", new Document("identity", "$$ROOT")),
-                        proofLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business", List.of()),
-                        proofLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", id,
-                                List.of(MongoWorkloadClaimStore.leaseRemaining(true)))))
-                        .collation(com.mongodb.client.model.Collation.builder().locale("simple").build()).first();
-                var identity = facts == null ? null : facts.get("identity", Document.class);
-                MongoCacheBusinessIdentity.requireObservedAdmission(identity, proofRow(facts, "schema"), scope);
-                requireActive.run();
-                return Optional.ofNullable(proofRow(facts, "claim")).map(MongoWorkloadClaimStore::nodeSessionReading);
-            });
-        }));
+            return Optional.ofNullable(proofRow(facts, "claim")).map(MongoWorkloadClaimStore::nodeSessionReading);
+        });
     }
 
     private static Document proofLookup(SystemCollections table, String name, Object id, List<Document> extra) {
@@ -250,7 +267,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
         if (expected.key().type() == WorkloadClaimType.NODE_SESSION)
-            return operations.nodeSessionRenewal(expected.key(), () -> renewClaim(expected, ttl));
+            return operations.nodeSessionRenewal(expected.key(), () -> nodeMaintenance().renewClaim(expected, ttl));
         if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION) return renewClaim(expected, ttl);
         var previous = MongoCommandObservation.COLLECTIONS.get();
         var stage = new java.util.concurrent.atomic.AtomicReference<String>();
@@ -543,7 +560,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         for(int attempt=0;;attempt++) {
             operations.check();
             var session=client.startSession();
-            var owned=operations.own(session);
+            var owned=operations.own(session, client);
             boolean committedAck=false;
             try {
                 var result=session.withTransaction(()->{
