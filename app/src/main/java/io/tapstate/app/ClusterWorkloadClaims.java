@@ -32,7 +32,7 @@ final class ClusterWorkloadClaims {
         this.admission=admission;
     }
     ClusterWorkloadClaims draining(AdmissionDrain admission){return new ClusterWorkloadClaims(store,membership,admission);}
-    private enum Operation { ORDINARY, ACQUISITION, RENEWAL }
+    private enum Operation { ORDINARY, ACQUISITION, INITIAL_ACQUISITION, RENEWAL }
 
     private <T> T call(java.util.function.Supplier<T> action) {
         return call(action, Long.MAX_VALUE, null, Operation.ORDINARY, true);
@@ -43,7 +43,11 @@ final class ClusterWorkloadClaims {
     }
 
     private <T> T acquire(WorkloadClaimKey key, boolean requireCurrentResult, java.util.function.Supplier<T> action) {
-        return call(action, Long.MAX_VALUE, key, Operation.ACQUISITION, requireCurrentResult);
+        return acquire(key, requireCurrentResult, action, false);
+    }
+
+    private <T> T acquire(WorkloadClaimKey key, boolean requireCurrentResult, java.util.function.Supplier<T> action, boolean initialStart) {
+        return call(action, Long.MAX_VALUE, key, initialStart ? Operation.INITIAL_ACQUISITION : Operation.ACQUISITION, requireCurrentResult);
     }
 
     private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey key,
@@ -62,7 +66,7 @@ final class ClusterWorkloadClaims {
             if (kind == Operation.RENEWAL && !recoveries.isEmpty())
                 return ((io.tapstate.spi.store.DeadlineWorkloadClaimStore) store).withRenewalDeadline(
                         key, recoveries, System.nanoTime() + budgetNanos, () -> {}, action);
-            if (kind == Operation.ACQUISITION && store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)
+            if ((kind == Operation.ACQUISITION || kind == Operation.INITIAL_ACQUISITION) && store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)
                 return bounded.withClaimAcquisition(key, () -> {}, action);
             return action.get();
         }
@@ -76,6 +80,7 @@ final class ClusterWorkloadClaims {
                 result = switch (kind) {
                     case ORDINARY -> bounded.withDeadline(deadline, active, action);
                     case ACQUISITION -> bounded.withClaimAcquisitionDeadline(key, deadline, active, action);
+                    case INITIAL_ACQUISITION -> bounded.withInitialPipelineAcquisition(key, deadline, active, action);
                     case RENEWAL -> recoveries.isEmpty() ? bounded.withRenewalDeadline(key, deadline, active, action)
                             : bounded.withRenewalDeadline(key, recoveries, deadline, active, action);
                 };
@@ -109,17 +114,27 @@ final class ClusterWorkloadClaims {
 
     Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
             long topologyRevision, Duration ttl) {
+        return acquirePipeline(scope, owner, topologyRevision, ttl, false);
+    }
+
+    Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
+            long topologyRevision, Duration ttl, boolean initialStart) {
         return membership.businessEligible()
                 // Return a known grant for fenced cleanup even when local admission expires.
                 ? acquire(new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId()),
-                        false, () -> Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl))) : Optional.empty();
+                        false, () -> Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl)), initialStart) : Optional.empty();
     }
 
     Optional<WorkloadClaimAttempt> acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node,
             long topologyRevision) {
+        return acquireNodeBackedPipeline(scope, node, topologyRevision, false);
+    }
+
+    Optional<WorkloadClaimAttempt> acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node,
+            long topologyRevision, boolean initialStart) {
         return membership.businessEligible()
                 ? acquire(new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId()),
-                        false, () -> Optional.of(store.acquireNodeBackedPipeline(scope, node, topologyRevision))) : Optional.empty();
+                        false, () -> Optional.of(store.acquireNodeBackedPipeline(scope, node, topologyRevision)), initialStart) : Optional.empty();
     }
 
     Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {

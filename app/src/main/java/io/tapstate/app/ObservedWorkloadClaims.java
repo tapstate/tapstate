@@ -25,6 +25,10 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
         @Override public <T> T withClaimAcquisitionDeadline(WorkloadClaimKey key, long deadline, Runnable active, Supplier<T> operation) {
             return bounded.withClaimAcquisitionDeadline(key, deadline, active, operation);
         }
+        @Override public <T> T withInitialPipelineAcquisition(WorkloadClaimKey key, long deadline, Runnable active,
+                Supplier<T> operation) {
+            return bounded.withInitialPipelineAcquisition(key, deadline, active, operation);
+        }
         @Override public <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadline, Runnable active,
                 Supplier<T> operation) {
             return bounded.withNodeSessionDeadline(key, deadline, active, operation);

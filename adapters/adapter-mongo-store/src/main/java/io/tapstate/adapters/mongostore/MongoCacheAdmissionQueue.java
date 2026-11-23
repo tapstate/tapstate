@@ -87,7 +87,10 @@ final class MongoCacheAdmissionQueue {
         var ticket = current(original); return ticket == null ? null : ticket.owner.operations.get();
     }
     static <T> T first(MongoClient client, String database, CacheBusinessScope scope, Runnable active, Supplier<T> action) {
-        var queue = find(client, database, scope); return queue == null ? action.get() : StoreIo.call(() -> queue.call(true, Long.MAX_VALUE, active, action));
+        return first(client, database, scope, Long.MAX_VALUE, active, action);
+    }
+    static <T> T first(MongoClient client, String database, CacheBusinessScope scope, long deadline, Runnable active, Supplier<T> action) {
+        var queue = find(client, database, scope); return queue == null ? action.get() : StoreIo.call(() -> queue.call(true, deadline, active, action));
     }
     static <T> T other(MongoClient client, String database, CacheBusinessScope scope, long deadline, Runnable active, Supplier<T> action) {
         var queue = find(client, database, scope); return queue == null ? action.get() : StoreIo.call(() -> queue.call(false, deadline, active, action));

@@ -96,6 +96,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 () -> { requireActive.run(); active.run(); }, () -> withDeadline(deadline, active, operation));
     }
 
+    @Override public <T> T withInitialPipelineAcquisition(WorkloadClaimKey key, long deadline, Runnable active,
+            java.util.function.Supplier<T> operation) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION || validation != null)
+            return withClaimAcquisitionDeadline(key, deadline, active, operation);
+        return MongoCacheAdmissionQueue.first(client, database.getName(), scope, deadline,
+                () -> { requireActive.run(); active.run(); }, () -> withDeadline(deadline, active, operation));
+    }
+
     @Override public <T> T withRenewalDeadline(long deadline,Runnable active,java.util.function.Supplier<T> operation) {
         return StoreIo.call(() -> operations.renew(deadline,active,operation));
     }

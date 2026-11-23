@@ -29,6 +29,12 @@ public interface DeadlineWorkloadClaimStore extends WorkloadClaimStore {
         return withDeadline(deadlineNanos, requireActive, operation);
     }
 
+    /** One verified initial RUNNING intent may share the bounded first-admission scheduling turn. */
+    default <T> T withInitialPipelineAcquisition(WorkloadClaimKey key, long deadlineNanos, Runnable requireActive,
+            Supplier<T> operation) {
+        return withClaimAcquisitionDeadline(key, deadlineNanos, requireActive, operation);
+    }
+
     /** Scoped Pipeline renewal can use a separate execution lane. */
     default <T> T withRenewalDeadline(long deadlineNanos, Runnable requireActive, Supplier<T> operation) {
         return withDeadline(deadlineNanos, requireActive, operation);

@@ -291,7 +291,7 @@ final class ConvergenceDriver implements AutoCloseable {
                     if (periodicDue(candidate)) pipelineConvergences.beginStop(candidate.pipelineId(),
                             () -> scheduledStop(candidate));
                 }
-                else if (isNewStart(candidate)) passes.submitStart(candidate.pipelineId(), () -> reconcilePipeline(candidate));
+                else if (isNewStart(candidate)) passes.submitStart(candidate.pipelineId(), () -> reconcileCurrentPipeline(candidate, false, true));
                 else periodic[index] = true;
             }
             if (prioritizeStarts && size > 0) {
@@ -409,6 +409,13 @@ final class ConvergenceDriver implements AutoCloseable {
         }
     }
 
+    static boolean initialClaimMatches(PipelineIntentStore.ScanCandidate candidate, PipelineIntentSnapshot intent) {
+        return candidate.pipelineId().equals(intent.scope().pipelineId())
+                && candidate.startRevision() > 0 && candidate.startRevision() == candidate.intentRevision()
+                && candidate.intentRevision() == intent.intentRevision() && intent.scope().equals(candidate.scope())
+                && candidate.targetState() == PipelineState.RUNNING && intent.desired().targetState() == PipelineState.RUNNING;
+    }
+
     private boolean isNewStart(PipelineIntentStore.ScanCandidate candidate) {
         return candidate.startRevision() > attemptedStarts.getOrDefault(candidate.pipelineId(), 0L);
     }
@@ -456,6 +463,10 @@ final class ConvergenceDriver implements AutoCloseable {
     }
 
     private void reconcileCurrentPipeline(PipelineIntentStore.ScanCandidate candidate, boolean stopOperation) {
+        reconcileCurrentPipeline(candidate, stopOperation, false);
+    }
+
+    private void reconcileCurrentPipeline(PipelineIntentStore.ScanCandidate candidate, boolean stopOperation, boolean initialStart) {
         String pipelineId = candidate.pipelineId();
         if (!reconcileEligible.getAsBoolean()
                 || !stopOperation && pipelineConvergences != null && pipelineConvergences.stopping(pipelineId)) return;
@@ -523,7 +534,9 @@ final class ConvergenceDriver implements AutoCloseable {
                 MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
                         Long.toString(snapshot.get().scope().stateGeneration()));
                 try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CLAIM)) {
-                    permit = actuation.permit(snapshot.get().scope());
+                    var intent = snapshot.orElseThrow();
+                    boolean priority = initialStart && isNewStart(candidate) && initialClaimMatches(candidate, intent);
+                    permit = priority ? actuation.permit(intent.scope(), true) : actuation.permit(intent.scope());
                 }
                 if (permit.granted()) {
                     if (candidate.startRevision() != 0 && snapshot.get().intentRevision() == candidate.startRevision()

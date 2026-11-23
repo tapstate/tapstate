@@ -488,7 +488,9 @@ final class PipelineActuationOwnership {
     }
 
     /** A new physical scope must be admitted by the store before it can replace the local holder. */
-    Permit permit(PipelineIntentScope scope) {
+    Permit permit(PipelineIntentScope scope) { return permit(scope, false); }
+
+    Permit permit(PipelineIntentScope scope, boolean initialStart) {
         Objects.requireNonNull(scope, "scope");
         if (!admission.enter()) return Permit.denied();
         ScopedAcquisition acquisition = null;
@@ -517,7 +519,7 @@ final class PipelineActuationOwnership {
             long started = nanoTime.getAsLong();
             var planned = membership.committed();
             if (planned == null) return Permit.denied();
-            var grant = requestClaim(scope.pipelineId(), scope, planned.revision());
+            var grant = requestClaim(scope.pipelineId(), scope, planned.revision(), initialStart);
             if (grant.isEmpty()) return Permit.denied();
             var claim = grant.orElseThrow();
             PendingRelease pending;
@@ -1844,12 +1846,16 @@ final class PipelineActuationOwnership {
     }
 
     private Optional<WorkloadClaim> requestClaim(String pipelineId, PipelineIntentScope scope, long revision) {
+        return requestClaim(pipelineId, scope, revision, false);
+    }
+
+    private Optional<WorkloadClaim> requestClaim(String pipelineId, PipelineIntentScope scope, long revision, boolean initialStart) {
         var key = new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
         Optional<WorkloadClaimAttempt> attempt;
         try {
             if (scope == null) attempt = claims.acquire(key, owner, revision, ttl);
-            else if (nodeSession != null) attempt = claims.acquireNodeBackedPipeline(scope, nodeSession, revision);
-            else attempt = claims.acquirePipeline(scope, owner, revision, ttl);
+            else if (nodeSession != null) attempt = claims.acquireNodeBackedPipeline(scope, nodeSession, revision, initialStart);
+            else attempt = claims.acquirePipeline(scope, owner, revision, ttl, initialStart);
         } catch (RuntimeException unreachable) {
             return Optional.empty();
         }
