@@ -467,10 +467,6 @@ final class PipelineActuationOwnership {
                 }
                 state = held.get(scope.pipelineId());
             }
-            if (state != null && scope.equals(state.scope) && nodeSession == null) {
-                var lease = state.scopedLease.get();
-                if (lease != null && !lease.retry()) renewScoped(state, nanoTime.getAsLong());
-            }
             synchronized (this) {
                 if (closing || !admission.current() || !accepts(scope)
                         || controls.containsKey(scope.pipelineId()) || acquisitions.containsKey(scope.pipelineId())
