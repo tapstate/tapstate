@@ -40,8 +40,11 @@ class PipelineAlertRuntimeTest {
         }).when(fixture.store).commit(any());
     }
     PipelineConvergencePass pass(String id) {
+        return pass(id, 1);
+    }
+    PipelineConvergencePass pass(String id, long intentRevision) {
         var scope = new PipelineIntentScope("cluster", 1, "cache", id, 1);
-        var intent = new PipelineIntentSnapshot(scope, 1, new DesiredState(id, PipelineState.RUNNING, "revision"));
+        var intent = new PipelineIntentSnapshot(scope, intentRevision, new DesiredState(id, PipelineState.RUNNING, "revision"));
         intents.put(id, intent);
         var claim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, id),
                 new WorkloadOwner("node", "boot"), 1, 1, 1);
@@ -475,6 +478,66 @@ class PipelineAlertRuntimeTest {
             assertThat(after.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
         }
     }
+
+    @Test void aLatePublicationCannotDisplaceNewerIntentFreshness() {
+        var rule = AlertEvaluationHostTest.definition("pipeline.observation-stale");
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+        try (var runtime = runtime()) {
+            runtime.tick();
+            drained(runtime);
+            var original = pass("orders", 20);
+            runtime.expecting(original);
+            var current = pass("orders", 21);
+            runtime.expecting(current);
+
+            runtime.publishedIfExpected(current, observation("orders", T, PipelineState.RUNNING), null);
+            drained(runtime);
+            runtime.publishedIfExpected(original, observation("orders", T, PipelineState.FAILED), null);
+            drained(runtime);
+
+            fixture.now.set(T.plusSeconds(121));
+            runtime.tick();
+            drained(runtime);
+
+            assertThat(rows.values()).singleElement()
+                    .satisfies(row -> assertThat(row.value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING));
+            verify(fixture.store, atLeastOnce()).commit(argThat(commit -> commit.state().proof() != null
+                    && commit.state().proof().pipeline().equals(current.intent())));
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void onlyTheCurrentIntentRefusalInterruptsPendingAlertEvaluation(boolean currentRefusal) {
+        var originalRule = AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule = new AlertConfiguration.Rule(originalRule.header(), originalRule.name(), originalRule.typeId(), 1,
+                originalRule.resources(), Map.of("trigger-for", java.math.BigDecimal.valueOf(4)), null, true, null)
+                .validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+        try (var runtime = runtime()) {
+            runtime.tick();
+            drained(runtime);
+            var original = pass("orders", 20);
+            runtime.expecting(original);
+            var current = pass("orders", 21);
+            runtime.expecting(current);
+
+            runtime.published(current, observation("orders", T, PipelineState.FAILED), null);
+            drained(runtime);
+            assertThat(resourceHead("orders").snapshot().pendingSince()).isEqualTo(T);
+
+            fixture.now.set(T.plusSeconds(2));
+            runtime.unavailableIfExpected(currentRefusal ? current : original);
+            fixture.now.set(T.plusSeconds(4));
+            runtime.published(current, observation("orders", fixture.now.get(), PipelineState.FAILED), null);
+            drained(runtime);
+
+            var state = resourceHead("orders").snapshot();
+            assertThat(state.status()).isEqualTo(currentRefusal ? AlertSnapshot.Status.PENDING : AlertSnapshot.Status.FIRING);
+            assertThat(state.pendingSince()).isEqualTo(currentRefusal ? T.plusSeconds(4) : null);
+        }
+    }
+
     @Test void aQueueRefusalCannotBridgeThePreviousPendingWindow() {
         var original=AlertEvaluationHostTest.definition("pipeline.failed");
         var rule=new AlertConfiguration.Rule(original.header(),original.name(),original.typeId(),1,original.resources(),

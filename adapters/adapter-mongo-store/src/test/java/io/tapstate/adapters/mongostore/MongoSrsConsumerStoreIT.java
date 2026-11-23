@@ -23,6 +23,8 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.spi.store.WriterProgressOutcome;
+import io.tapstate.spi.store.WriterProgressUpdate;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
@@ -1188,6 +1190,87 @@ class MongoSrsConsumerStoreIT {
                 assertThat(reopened.advanceWriter(A,1,"run-a","orders","slow",point(1,7,"t7"),f.fenceA())).isTrue();
                 assertThat(reopened.cursor(A).orElseThrow().sinkAcked().token()).isEqualTo("t7");
             }
+        });
+    }
+
+    @Test
+    void reportsInOneOriginalRunAdvanceTheCheckpointFenceOnce() {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A, 1, "run", Map.of("orders", List.of("fast", "slow")), f.fenceA())).isTrue();
+            var checkpoints = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var id = new Document("_id", positionScope(A).pipelineId());
+            long fence = checkpoints.find(id).first().getLong("runtimeWriteFence");
+            assertThat(f.consumers().advanceWriters(A, 1, "run", List.of(
+                    new WriterProgressUpdate("orders", "fast", point(1, 10, "t10")),
+                    new WriterProgressUpdate("orders", "slow", point(1, 6, "t6"))), f.fenceA()))
+                    .containsExactly(new WriterProgressOutcome(true, null), new WriterProgressOutcome(true, null));
+            assertThat(f.consumers().progress(A).orElseThrow().cursor().sinkAcked())
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 6), "t6"));
+            assertThat(checkpoints.find(id).first().getLong("runtimeWriteFence")).isEqualTo(fence + 1);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {true, false})
+    void aValidWriterCommitsBesideAnInvalidSiblingWithItsOwnOutcome(boolean validFirst) {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A, 1, "run", Map.of("orders", List.of("fast", "slow")), f.fenceA())).isTrue();
+            var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var id = new Document("_id", positionScope(A).pipelineId());
+            long beforeFence = checkpoint.find(id).first().getLong("runtimeWriteFence");
+            var valid = new WriterProgressUpdate("orders", "fast", point(1, 10, "token-10"));
+            var invalid = new WriterProgressUpdate("orders", "unknown", point(1, 6, "token-6"));
+            var reports = validFirst ? List.of(valid, invalid) : List.of(invalid, valid);
+            var outcomes = f.consumers().advanceWriters(A, 1, "run", reports, f.fenceA());
+            var accepted = outcomes.get(validFirst ? 0 : 1);
+            var refused = outcomes.get(validFirst ? 1 : 0);
+            assertThat(accepted).isEqualTo(new WriterProgressOutcome(true, null));
+            assertThat(refused.committed()).isFalse();
+            unavailable(refused.failure());
+            assertThatThrownBy(refused::committedOrThrow).isSameAs(refused.failure());
+            assertThat(f.consumers().progress(A).orElseThrow().writerRun().progress().get("orders"))
+                    .containsEntry("fast", valid.progress()).doesNotContainKey("unknown");
+            assertThat(checkpoint.find(id).first().getLong("runtimeWriteFence")).isEqualTo(beforeFence + 1);
+        });
+    }
+
+    @Test void anAllInvalidBatchAndASingletonRefusalKeepTheirOriginalPhysicalState() {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A, 1, "run", Map.of("orders", List.of("fast", "slow")), f.fenceA())).isTrue();
+            var before = f.consumers().progress(A).orElseThrow();
+            var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var id = new Document("_id", positionScope(A).pipelineId());
+            var beforeCheckpoint = checkpoint.find(id).first();
+            var outcomes = f.consumers().advanceWriters(A, 1, "run", List.of(
+                    new WriterProgressUpdate("orders", "unknown", point(1, 10, "token-10")),
+                    new WriterProgressUpdate("orders", "", point(1, 6, "token-6"))), f.fenceA());
+            assertThat(outcomes).hasSize(2);
+            assertThat(outcomes.getFirst().committed()).isFalse();
+            unavailable(outcomes.getFirst().failure());
+            assertThat(outcomes.getLast().committed()).isFalse();
+            assertThat(outcomes.getLast().failure()).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> f.consumers().advanceWriter(A, 1, "run", "orders", "unknown", point(1, 10, "token-10"), f.fenceA()))
+                    .satisfies(MongoSrsConsumerStoreIT::unavailable);
+            assertThatThrownBy(() -> f.consumers().advanceWriter(A, 1, "run", "orders", "", point(1, 6, "token-6"), f.fenceA()))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThat(f.consumers().progress(A)).contains(before);
+            assertThat(checkpoint.find(id).first()).isEqualTo(beforeCheckpoint);
+        });
+    }
+
+    @Test
+    void aWrongRunRefusesTheWholeBatchBeforeAnyWriterProgressCanAdvance() {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A, 1, "run", Map.of("orders", List.of("fast", "slow")), f.fenceA())).isTrue();
+            var before = f.consumers().progress(A).orElseThrow();
+            assertThat(f.consumers().advanceWriters(A, 1, "different-run", List.of(
+                    new WriterProgressUpdate("orders", "fast", point(1, 10, "token-10")),
+                    new WriterProgressUpdate("orders", "slow", point(1, 6, "token-6"))), f.fenceA()))
+                    .containsExactly(new WriterProgressOutcome(false, null), new WriterProgressOutcome(false, null));
+            assertThat(f.consumers().progress(A)).contains(before);
         });
     }
 

@@ -8,6 +8,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
@@ -79,13 +80,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     }
 
     /**
-     * Not cooperative where there is an ack to report to. A write that settles hands the positions it earned
-     * to the ack there and then, and the ack a pipeline is built with writes them to the durable store and
-     * waits for the store to answer - for as long as the store takes, which is as long as it goes on holding
-     * a document for a writer that stopped halfway through writing it. A cooperative processor shares its
-     * thread with every other cooperative vertex on the member, of every run, so a report waiting there stops
-     * all of them with it, and nothing fails or says why. A sink with no ack only hands rows to its writer,
-     * which writes them off this thread, so it keeps its place in the cooperative pool.
+     * A sink with an ack may wait for its checkpoint at load and job completion. Those waits need their
+     * own thread. A sink with no ack only hands rows to its writer, which writes them off this thread.
      */
     @Override
     public boolean isCooperative() {
@@ -189,6 +185,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // with its totals back at zero, and a start that did not move with them would describe a stream that
     // no longer exists.
     private long countingSince;
+    private StopWaitLog.Site closeSite;
 
     /** No sink-ack watermark: the order-independent or append-only path (any in-flight bound is allowed). */
     public SinkProcessor(SinkWriter writer, int maxInFlight, int maxBatchSize) {
@@ -410,6 +407,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             ack = sinkAck.forWriter(writerId(writerOf, totalOne ? 0 : context.globalProcessorIndex()));
         }
         HazelcastInstance instance = context.hazelcastInstance();
+        if (instance != null && instance.getCluster() != null) {
+            String member = instance.getCluster().getLocalMember().getUuid().toString();
+            closeSite = new StopWaitLog.Site(pipelineId, context.jobId() + "/" + context.executionId(), member, "SinkProcessor.close");
+        }
         this.failureRegistry = JobFailureRegistry.forProcessor(instance, context);
         configureJobGauges(instance);
         if (ack != null) ack.started(context.jobId(), context.executionId());
@@ -569,7 +570,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         } while (writeWhatIsDue());
         reportWaiting();
         boolean done = inFlight.isEmpty() && queued.isEmpty();
-        if (ack != null && done) ack.flush(true);
+        if (done) flushCheckpoint(true);
         return done;
     }
 
@@ -765,10 +766,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
         closed = true;
         try {
-            if (ack != null) ack.flushOnClose();
+            if (ack != null) closeStep("SinkAck.flushOnClose", ack::flushOnClose);
         } finally {
-            writer.close();
+            closeStep("SinkWriter.close", writer::close);
         }
+    }
+
+    private void closeStep(String operation, Runnable close) {
+        StopWaitLog.around(closeSite == null ? null : closeSite.at(operation), close);
     }
 
     /** Removes every settled write, surfacing the cause of a failed one so it fails the job. */
@@ -804,8 +809,18 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         });
         if (frontier != null) {
             releaseHeld();
-        if (ack != null) ack.flush(false);
+            flushCheckpoint(false);
             reportTrailing();
+        }
+    }
+
+    private void flushCheckpoint(boolean complete) {
+        if (ack == null) return;
+        try {
+            ack.flush(complete);
+        } catch (RuntimeException | Error failure) {
+            if (failureRegistry != null) failureRegistry.record(new FailureFact(failure));
+            throw failure;
         }
     }
 

@@ -295,6 +295,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var beans = context == null ? null : context.getBeanFactory();
         var periodic = beans == null ? null : (PeriodicObservations) beans.getSingleton("periodicObservations");
         var convergence = beans == null ? null : (PipelineConvergences) beans.getSingleton("pipelineConvergences");
+        var observationWrites = beans == null ? null : (ProcessObservationWriter) beans.getSingleton("processObservationWriter");
         if (convergence != null) convergence.close();
         if (periodic != null) periodic.close();
         var alerts = alertRuntime.get();
@@ -302,6 +303,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
         if (convergence != null) convergence.awaitStopped(deadline);
         if (periodic != null) periodic.awaitStopped(deadline);
+        if (observationWrites != null) observationWrites.close();
         var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
         Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
         Throwable failure = null;
@@ -707,6 +709,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 }
             };
         }
+        @Bean(destroyMethod = "close") ProcessObservationWriter processObservationWriter(NativeBusinessContext owner,
+                @org.springframework.beans.factory.annotation.Value("${tapstate.converge.interval-ms:1000}") String interval) {
+            return new ProcessObservationWriter(owner.original.cache(),
+                    org.springframework.boot.convert.DurationStyle.detectAndParse(interval, java.time.temporal.ChronoUnit.MILLIS));
+        }
         @Bean(destroyMethod = "close") PeriodicObservations periodicObservations() {
             return new PeriodicObservations();
         }
@@ -720,7 +727,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
                 ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,
-                ClusterNodeAlertSource resourceAlerts, PeriodicObservations periodicObservations,
+                ClusterNodeAlertSource resourceAlerts, ProcessObservationWriter observationWrites, PeriodicObservations periodicObservations,
                 PipelineConvergences pipelineConvergences) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
@@ -768,7 +775,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                         try (var ignored = ownership.enterPass(intent.scope())) {
                                             rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
                                         }
-                                    }), observationSampling), periodicObservations, pipelineConvergences);
+                                    }), observationSampling, observationWrites), periodicObservations, pipelineConvergences);
         }
         @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {

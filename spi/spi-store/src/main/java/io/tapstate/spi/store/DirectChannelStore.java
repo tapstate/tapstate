@@ -26,4 +26,17 @@ public interface DirectChannelStore {
     boolean beginWriterRun(DirectChannelContext context,long epoch,String runId,Map<String,List<String>> expected,WorkloadClaimFence originalPipeline);
     boolean recordBatch(DirectBatch original,long expectedRecordedThrough,WorkloadClaimFence originalCapture,WorkloadClaimFence originalPipeline);
     boolean advanceWriter(DirectChannelContext context,long epoch,String runId,String table,String writer,WriterProgress report,WorkloadClaimFence originalPipeline);
+
+    /** Returns one ordered outcome per original report after its owning store has committed. */
+    default List<WriterProgressOutcome> advanceWriters(DirectChannelContext context, long epoch, String runId,
+            List<WriterProgressUpdate> reports, WorkloadClaimFence originalPipeline) {
+        var outcomes = new java.util.ArrayList<WriterProgressOutcome>(reports.size());
+        boolean stopped = false;
+        for (var report : reports) {
+            boolean committed = !stopped && advanceWriter(context, epoch, runId, report.table(), report.writerId(), report.progress(), originalPipeline);
+            outcomes.add(new WriterProgressOutcome(committed, null));
+            if (!committed) stopped = true;
+        }
+        return List.copyOf(outcomes);
+    }
 }
