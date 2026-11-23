@@ -277,12 +277,42 @@ final class MongoAlertCoordinator implements AlertStore {
     @Override public EvaluationPage evaluationStates(AlarmKey after,int limit){return tx(null,false,false,s->evaluationStates(s,after,limit,true));}
     private EvaluationPage evaluationStates(ClientSession s,AlarmKey after,int limit,boolean nodeEvidenceReady){
         var page=new MongoAlertReads(db,host.scope(),states,clock).evaluationStates(s,after,limit);var removed=new HashSet<AlarmKey.Resource>();var superseded=new HashSet<AlarmKey>();
+        var resources = page.rows().stream().map(row -> row.value().snapshot().rule().key().resource()).toList();
+        var pages = new EnumMap<SystemCollections, Map<String, Document>>(SystemCollections.class);
         for(var row:page.rows()){
             var key=row.value().snapshot().rule().key();
-            if(!nodeEvidenceReady && key.resource().kind().equals("cluster-node"))continue;
-            if(resourceRemoved(s,key.resource()))removed.add(key.resource());else if(sourceBindingChanged(s,row.value()))superseded.add(key);
+            var resource=key.resource();
+            if(!nodeEvidenceReady && resource.kind().equals("cluster-node"))continue;
+            SystemCollections table = switch (resource.kind()) {
+                case "pipeline" -> SystemCollections.OPERATOR_GENERATIONS;
+                case "source" -> SystemCollections.SOURCES;
+                default -> null;
+            };
+            Document captured = table == null ? null : pages.computeIfAbsent(table,
+                    selected -> evaluationResources(s, resources, resource.kind(), selected)).get(resource.id());
+            if(resourceRemoved(s,resource,captured))removed.add(resource);
+            else if(sourceBindingChanged(s,row.value(),captured))superseded.add(key);
         }
         return new EvaluationPage(page.rows(),page.next(),removed,superseded);
+    }
+    private Map<String, Document> evaluationResources(ClientSession session, List<AlarmKey.Resource> resources,
+            String kind, SystemCollections table) {
+        var ids = resources.stream().filter(resource -> resource.kind().equals(kind)).map(AlarmKey.Resource::id)
+                .collect(java.util.stream.Collectors.toSet());
+        if (ids.isEmpty()) return Map.of();
+        var stages = new ArrayList<Document>();
+        stages.add(new Document("$match", new Document("_id", new Document("$in", List.copyOf(ids)))));
+        stages.add(new Document("$limit", ids.size() + 1));
+        if (table == SystemCollections.SOURCES) {
+            stages.add(new Document("$project", new Document("kind", 1).append(MongoSourceIdentitySchema.FIELD, 1)));
+        }
+        stages.add(new Document("$project", new Document("_id", 0).append("row", MongoStartConfigRead.boundedValue())));
+        var found = new HashMap<String, Document>();
+        for (var result : table.on(db).aggregate(session, stages)) {
+            if (result.get("row") instanceof Document saved && saved.get("_id") instanceof String id && ids.contains(id))
+                found.put(id, saved);
+        }
+        return found;
     }
     @Override public EvaluationSnapshot evaluationSnapshot(AlarmKey after,int limit){return tx(null,false,false,s->{
         var definitions=new ArrayList<Definition>();var unavailable=new HashMap<String,RuleCapability>();String cursor=null;
@@ -558,9 +588,12 @@ final class MongoAlertCoordinator implements AlertStore {
                 && AlertOperationDomain.supported(head.snapshot().rule().key()) && sourceBindingChanged(session,head);
     }
     private boolean sourceBindingChanged(ClientSession session,AlertStateRecord.Head head) {
+        return sourceBindingChanged(session, head, null);
+    }
+    private boolean sourceBindingChanged(ClientSession session,AlertStateRecord.Head head,Document captured) {
         var resource=head.snapshot().rule().key().resource();
         if(!resource.kind().equals("source") || head.binding()==null || head.binding().sourceBindingRevision()<1)return false;
-        var row=SystemCollections.SOURCES.on(db).find(session,new Document("_id",resource.id())).first();
+        var row=captured!=null?captured:SystemCollections.SOURCES.on(db).find(session,new Document("_id",resource.id())).first();
         if(row==null)return false;
         var actual=MongoSourceIdentity.read(row).binding();
         if(!actual.incarnation().equals(resource.incarnation()))return false;
@@ -568,13 +601,16 @@ final class MongoAlertCoordinator implements AlertStore {
         return actual.bindingRevision()>head.binding().sourceBindingRevision();
     }
     private boolean resourceRemoved(ClientSession s,AlarmKey.Resource resource){
+        return resourceRemoved(s,resource,null);
+    }
+    private boolean resourceRemoved(ClientSession s,AlarmKey.Resource resource,Document captured){
         if(resource.kind().equals("pipeline")){
-            var row=SystemCollections.OPERATOR_GENERATIONS.on(db).find(s,new Document("_id",resource.id())).first();
+            var row=captured!=null?captured:SystemCollections.OPERATOR_GENERATIONS.on(db).find(s,new Document("_id",resource.id())).first();
             if(row==null)throw unreadable("missing-retained-pipeline-identity");
             var mapping=MongoPipelineStateMappings.decode(resource.id(),row);
             return mapping.phase()!=PipelineStateMapping.Phase.ACTIVE||!Long.toString(mapping.stateGeneration()).equals(resource.incarnation());
         }else if(resource.kind().equals("source")){
-            var row=SystemCollections.SOURCES.on(db).find(s,new Document("_id",resource.id())).first();
+            var row=captured!=null?captured:SystemCollections.SOURCES.on(db).find(s,new Document("_id",resource.id())).first();
             return row==null||!MongoSourceIdentity.read(row).binding().incarnation().equals(resource.incarnation());
         }else if(resource.kind().equals("cluster-storage")){
             if(resource.id().equals("cache")) {

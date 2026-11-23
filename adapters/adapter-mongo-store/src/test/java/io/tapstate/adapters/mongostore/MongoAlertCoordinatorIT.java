@@ -432,12 +432,17 @@ class MongoAlertCoordinatorIT {
             var head=new AlertStateRecord.Head(snapshot,POLICY.deployment(),AlertOwnership.unclaimed(),null,false,episode,binding);
             f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,head,List.of(),null),List.of(),List.of()));
             var reads = new HashMap<String, Integer>();
+            var sourceBatches = new java.util.concurrent.atomic.AtomicInteger();
             MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
                 if (command.equals("find")) reads.merge(collection, 1, Integer::sum);
+                if (command.equals("aggregate") && collection.equals(SystemCollections.SOURCES.collectionName()))
+                    sourceBatches.incrementAndGet();
             });
             try {
                 var page = f.store.evaluationStates(null, 10);
                 assertThat(page.rows()).hasSize(2);
+                assertThat(sourceBatches).hasValue(1);
+                assertThat(reads.getOrDefault(SystemCollections.SOURCES.collectionName(), 0)).isLessThanOrEqualTo(1);
                 assertThat(reads.get(SystemCollections.ALERT_INSTANCES.collectionName())).isEqualTo(1);
                 assertThat(reads.get(SystemCollections.ALERT_EPISODES.collectionName())).isEqualTo(1);
             } finally { MongoCommandObservation.COLLECTIONS.remove(); }
