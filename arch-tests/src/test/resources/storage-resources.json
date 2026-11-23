@@ -2802,14 +2802,14 @@
     {
       "id": "mongo.config.pipeline_intents",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "pipeline_intents"
       ],
-      "responsibility": "Latest desired Pipeline intent; not an execution queue or runtime claim.",
+      "responsibility": "Latest desired Pipeline intent and its current deferred first-start rejection. An optional pair of document identifier and field name for DOCUMENT_UNREADABLE is written with the rejection under the same CONFIG transaction and intent fence. Retry replaces the previous rejection. Existing records without the pair retain generic diagnostics. Upgrade requires all readers to support the optional pair before it is written.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoPipelineIntentStore"
       ],
@@ -2818,9 +2818,10 @@
       ],
       "recovery": "configuration-backup",
       "consistency": "config",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "growth": "At most one pair of bounded identifiers per intent, up to 256 UTF-8 bytes each; retained and recovered with the CONFIG backup.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineIntentStoreIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineIntentStoreIT.java",
+        "app/src/test/java/io/tapstate/app/PipelineFirstStatePreparerIT.java"
       ]
     },
     {

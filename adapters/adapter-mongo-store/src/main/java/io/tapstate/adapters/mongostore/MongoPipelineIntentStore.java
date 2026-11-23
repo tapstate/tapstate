@@ -37,6 +37,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     private static final Set<String> BODY = Set.of("targetState", "revision", "purgeState", "assemblyRevision", "reassemble", "rebuiltAtStateEpoch");
     private static final String PREPARATION = "startPreparation";
     private static final String FAILURE = "startFailure";
+    private static final String FAILURE_PARAMS = "startFailureParams";
     private final MongoClient client;
     private final MongoDatabase database;
     private final MongoCollection<Document> intents;
@@ -272,6 +273,14 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
 
     @Override public void failStart(PendingStart pending, IoError error) {
+        failStart(pending, error, Map.of());
+    }
+
+    @Override public void failStart(PendingStart pending, IoError error, Map<String, Object> params) {
+        var rejection = new Document(FAILURE, error.name());
+        if (error == IoError.DOCUMENT_UNREADABLE && validDocumentParams(params)) {
+            rejection.append(FAILURE_PARAMS, new Document("id", params.get("id")).append("field", params.get("field")));
+        }
         transaction(session -> {
             var generation = mappings.find(session, new Document("_id", pending.intent().scope().pipelineId())).first();
             var scope = pending.intent().scope();
@@ -279,7 +288,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
                     || !PipelineStateMapping.Phase.ACTIVE.name().equals(generation.get("phase"))
                     || MongoPipelinePreparationFacts.decode(scope.pipelineId(), generation, clusterId)
                             .phase() == io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE) return null;
-            if (intents.updateOne(session, pendingFilter(pending), new Document("$set", new Document(FAILURE, error.name()))).getMatchedCount() == 1) {
+            if (intents.updateOne(session, pendingFilter(pending), new Document("$set", rejection)).getMatchedCount() == 1) {
                 // Serialize reporting this failure with issuance/completion on the same state generation.
                 if (mappings.updateOne(session, new Document("_id", scope.pipelineId())
                         .append("noteWriteFence", generation.getLong("noteWriteFence")),
@@ -293,6 +302,24 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (!row.containsKey(FAILURE)) return Optional.empty();
         try { return Optional.of(IoError.valueOf(row.getString(FAILURE))); }
         catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw unreadable(); }
+    }
+
+    static Map<String, String> startFailureParams(Document row, IoError code) {
+        if (!row.containsKey(FAILURE_PARAMS)) return Map.of();
+        if (code != IoError.DOCUMENT_UNREADABLE || !(row.get(FAILURE_PARAMS) instanceof Document params)
+                || !validDocumentParams(params)) throw unreadable();
+        return Map.of("id", params.getString("id"), "field", params.getString("field"));
+    }
+
+    private static boolean validDocumentParams(Map<String, Object> params) {
+        return params.keySet().equals(IoError.DOCUMENT_UNREADABLE.placeholders())
+                && params.values().stream().allMatch(MongoPipelineIntentStore::boundedIdentifier);
+    }
+
+    private static boolean boundedIdentifier(Object value) {
+        return value instanceof String text && !text.isEmpty() && text.length() <= 256
+                && text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 256
+                && text.codePoints().allMatch(c -> Character.isLetterOrDigit(c) || c == '.' || c == '_' || c == '-');
     }
 
     @Override public boolean remove(PipelineIntentScope scope, long expected) { return change(scope, expected, null); }
@@ -440,9 +467,12 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             var fields = new HashSet<>(HEADER); if (!deleted) fields.addAll(BODY);
             if (!deleted && row.containsKey(PREPARATION)) {
                 fields.add(PREPARATION);
-                if (row.containsKey(FAILURE)) fields.add(FAILURE);
+                if (row.containsKey(FAILURE)) {
+                    fields.add(FAILURE);
+                    if (row.containsKey(FAILURE_PARAMS)) fields.add(FAILURE_PARAMS);
+                }
                 if (!PipelineState.RUNNING.name().equals(row.get("targetState"))) throw unreadable();
-                startFailure(row);
+                startFailure(row).ifPresent(code -> startFailureParams(row, code));
             }
             if (!fields.equals(row.keySet())) throw unreadable();
             var scope = new PipelineIntentScope(row.getString("clusterId"), binding, row.getString("cacheIncarnation"), row.getString("_id"), generation);

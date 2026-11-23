@@ -672,7 +672,18 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public record PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
             Optional<io.tapstate.core.lifecycle.DesiredState> desired,
-            Optional<TapstateException> intentFailure, boolean recovering, Optional<IoError> startFailure, long intentRevision) {
+            Optional<TapstateException> intentFailure, boolean recovering, Optional<IoError> startFailure,
+            long intentRevision, Map<String, String> startFailureParams) {
+        public PipelineDisplayHeader {
+            startFailureParams = Map.copyOf(startFailureParams);
+        }
+
+        public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
+                Optional<io.tapstate.core.lifecycle.DesiredState> desired, Optional<TapstateException> intentFailure,
+                boolean recovering, Optional<IoError> startFailure, long intentRevision) {
+            this(mapping, preparation, desired, intentFailure, recovering, startFailure, intentRevision, Map.of());
+        }
+
         public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
                 Optional<io.tapstate.core.lifecycle.DesiredState> desired, Optional<TapstateException> intentFailure, boolean recovering) {
             this(mapping, preparation, desired, intentFailure, recovering, Optional.empty(), 0);
@@ -718,6 +729,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         Optional<io.tapstate.core.lifecycle.DesiredState> desired = Optional.empty();
                         Optional<TapstateException> failure = Optional.empty();
                         Optional<IoError> startFailure = Optional.empty();
+                        Map<String, String> startFailureParams = Map.of();
                         long intentRevision = 0;
                         var intent = intentsById.get(id);
                         if (intent != null) {
@@ -731,15 +743,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                                 if (!snapshot.deleted()) {
                                     desired = Optional.of(snapshot.desired());
                                     intentRevision = snapshot.intentRevision();
-                                    if (snapshot.scope().stateGeneration() == mapping.stateGeneration())
+                                    if (snapshot.scope().stateGeneration() == mapping.stateGeneration()) {
                                         startFailure = MongoPipelineIntentStore.startFailure(intent);
+                                        startFailureParams = startFailure
+                                                .map(code -> MongoPipelineIntentStore.startFailureParams(intent, code))
+                                                .orElseGet(Map::of);
+                                    }
                                 }
                             } catch (TapstateException malformed) {
                                 if (malformed.code() != IoError.DOCUMENT_UNREADABLE) throw malformed;
                                 failure = Optional.of(malformed);
                             }
                         }
-                        result.put(id, new PipelineDisplayHeader(mapping, preparation, desired, failure, row.containsKey("cacheRecovery"), startFailure, intentRevision));
+                        result.put(id, new PipelineDisplayHeader(mapping, preparation, desired, failure, row.containsKey("cacheRecovery"),
+                                startFailure, intentRevision, startFailureParams));
                     }
                     return Map.copyOf(result);
                 }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)
