@@ -74,6 +74,9 @@ public interface RateHistoryStore {
     /** Adds one sample. Never overwrites: a second sample at the same instant is a second document. */
     void append(RateSample sample);
 
+    /** Appends a runtime sample with a deadline when the store supports one. */
+    default void appendWithin(RateSample sample, Duration timeout) { append(sample); }
+
     /**
      * Reads at most {@code limit} samples of one pipeline in {@code [from, to)}, oldest first and with
      * equal timestamps ordered by their opaque internal key. When {@code after} is present, the page

@@ -229,7 +229,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         var original=MongoCaptureStatePreparations.consumeFirst(invocation,targetFingerprint);
         var preparation=original.preparation();var request=original.request();String ringRetention=original.retention();requireScope(preparation);
         if(preparation.replacement())throw history(preparation);
-        return transaction(original::requireActive,session -> {
+        return checkpointTransaction(request.pipeline(), original::requireActive,session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);
             if(preparation.mode()==CapturePreparation.Mode.SHARED_SRS)structure.verifySrs();
             if(preparation.mode()==CapturePreparation.Mode.DIRECT)structure.verifyDirect();
@@ -314,6 +314,9 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         }
     }
     private void requireScope(CapturePreparation original){if(!scope.equals(original.scope()))throw MongoCapturePreparationFacts.fenced();}
+    private <T> T checkpointTransaction(io.tapstate.spi.store.PipelineIntentScope pipeline, Runnable originalActive, Function<ClientSession, T> body) {
+        return MongoCachePipelineStateStore.writeTransaction(client, pipeline.pipelineId(), () -> transaction(originalActive, body));
+    }
     private <T>T transaction(Runnable originalActive,Function<ClientSession,T> body) {
         return StoreIo.call(() -> {
             try {

@@ -2,7 +2,9 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.lifecycle.DesiredState;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /** Configuration-owned latest intents; cache epochs are meaningful only within the captured scope. */
 public interface PipelineIntentStore {
@@ -54,6 +56,11 @@ public interface PipelineIntentStore {
         throw new UnsupportedOperationException("deferred first start is not supported");
     }
 
+    /** Records an optional public diagnostic for the same pending start and under the same fence. */
+    default void failStart(PendingStart pending, IoError error, Map<String, Object> params) {
+        failStart(pending, error);
+    }
+
     /** Only the current native full-recovery permission may publish its first RUNNING intent. */
     default boolean startRecovered(CacheRecoveryStore.FullPreparation confirmation,long expectedIntentRevision,String pipelineHash) {
         throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
@@ -61,6 +68,16 @@ public interface PipelineIntentStore {
 
     /** Retains only the next revision and coordinates, and removes the id from the reconcile set. */
     boolean remove(PipelineIntentScope scope, long expectedIntentRevision);
+
+    /** Scheduling hints only; the admitted pass still reads its original intent and proves ownership. */
+    record DispatchSnapshot(List<String> pipelineIds, Set<String> stopping) {
+        public DispatchSnapshot {
+            pipelineIds = List.copyOf(pipelineIds);
+            stopping = Set.copyOf(stopping);
+        }
+    }
+
+    default Optional<DispatchSnapshot> dispatchSnapshot() { return Optional.empty(); }
 
     /** Projects live ids only, without decoding intent bodies. */
     List<String> pipelineIds();

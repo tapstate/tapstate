@@ -76,6 +76,8 @@ class ScopedConvergenceDriverTest {
     private MetricsExport metricsExport = MetricsExport.none();
     private PipelineConvergences pipelineConvergences;
     private PeriodicObservations periodicObservations;
+    private NativeObservationSampling nativeSampling;
+    private ProcessObservationWriter observationWrites;
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -106,7 +108,8 @@ class ScopedConvergenceDriverTest {
                     pendingCleanup=false; carrying.set(false);
                 }
             };
-        }, pass -> RebuildAdmission.never(), ids -> retained.add(List.copyOf(ids)), alertFeed);
+        }, pass -> RebuildAdmission.never(), ids -> retained.add(List.copyOf(ids)), alertFeed,
+                null, null, nativeSampling, observationWrites);
         StateStore poisonState = mock(StateStore.class, call -> { throw new AssertionError("unscoped state accessed"); });
         ObservationStore poisonObservations = mock(ObservationStore.class, call -> { throw new AssertionError("unscoped observation accessed"); });
         var poisonDesired = mock(io.tapstate.spi.store.DesiredStore.class,
@@ -369,6 +372,42 @@ class ScopedConvergenceDriverTest {
             }
             org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> observations.pipelineIds().isEmpty());
             assertThat(views.writes.stream().filter(write -> write.kind().equals("observation")).count()).isEqualTo(before);
+        }
+    }
+
+    @Test void aStagedFallbackCannotPublishAfterOnlyItsOriginalEngineExecutionEnds() {
+        var execution = new java.util.concurrent.atomic.AtomicReference<ExecutionFence>();
+        onStart = pass -> {
+            advance(pass);
+            execution.set(new ExecutionFence(pass.scope(), pass.claim()));
+        };
+        nativeSampling = new NativeObservationSampling(null, null, null,
+                id -> Optional.ofNullable(execution.get()), id -> null, "orders", Clock.fixed(T0, ZoneOffset.UTC));
+        when(ownership.proveObservationClaim(any(), any())).thenReturn(true);
+        var cache = mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class);
+        when(cache.writeObservations(org.mockito.ArgumentMatchers.anyList())).thenAnswer(call -> {
+            List<io.tapstate.adapters.mongostore.MongoCacheDomain.ObservationWrite> batch = call.getArgument(0);
+            var write = batch.getFirst();
+            assertThat(batch).hasSize(1);
+            try {
+                write.active().run();
+                views.pipelineObservations(write.scope(), write.original(), write.active()).save(write.observation());
+                return java.util.Collections.singletonList(null);
+            } catch (RuntimeException refused) {
+                return List.of(refused);
+            }
+        });
+        try (var observations = new PeriodicObservations(1, 1); var writes = new ProcessObservationWriter(cache, false)) {
+            periodicObservations = observations;
+            observationWrites = writes;
+            var driver = driver();
+            driver.reconcile();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> writes.usage().pending() == 1);
+            int prior = views.writes.size();
+            assertThat(execution.get()).isNotNull();
+            execution.set(null);
+            writes.flush();
+            assertThat(views.writes.subList(prior, views.writes.size())).noneMatch(write -> write.kind().equals("observation"));
         }
     }
 

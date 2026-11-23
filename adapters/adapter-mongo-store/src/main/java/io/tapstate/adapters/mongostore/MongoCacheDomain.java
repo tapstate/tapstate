@@ -1,6 +1,9 @@
 package io.tapstate.adapters.mongostore;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -877,6 +880,17 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 return java.util.Optional.empty();
             throw failure;
         }
+    }
+
+    public record ObservationWrite(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active,
+            Observation observation, long checkpointEpoch) {}
+
+    /** Writes independent latest observations and returns each original entry's failure, or null on success. */
+    public List<RuntimeException> writeObservations(List<ObservationWrite> batch) {
+        return MongoCachePipelineObservationStore.writeBatch(batch.stream().map(write ->
+                new MongoCachePipelineObservationStore.BatchWrite(
+                        new MongoCachePipelineObservationStore(pipelineAccess(write.scope(), write.original(), write.active())),
+                        write.observation(), write.checkpointEpoch())).toList());
     }
 
     /** Missing projections are unknown; they do not permit creation of a missing checkpoint. */
