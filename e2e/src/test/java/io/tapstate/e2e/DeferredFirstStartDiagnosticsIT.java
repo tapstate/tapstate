@@ -69,8 +69,8 @@ class DeferredFirstStartDiagnosticsIT {
         control.login(NativeMongoStorageFixture.USER, NativeMongoStorageFixture.PASSWORD);
         var status = control.pipelineStatus("flow");
         assertThat(status.get("failure")).isInstanceOfSatisfying(Map.class, failure -> {
-            assertThat(failure.get("code")).isEqualTo("TS0480004");
-            assertThat(failure.get("params")).isEqualTo(Map.of("id", "doc-42", "field", "revision"));
+            assertThat(failure).containsEntry("code", "TS0480004")
+                    .containsEntry("params", Map.of("id", "doc-42", "field", "revision"));
             assertThat(String.valueOf(failure.get("message"))).contains("doc-42", "revision");
         });
     }

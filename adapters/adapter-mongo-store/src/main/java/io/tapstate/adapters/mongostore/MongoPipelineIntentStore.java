@@ -39,7 +39,9 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     private static final String PREPARATION = "startPreparation";
     private static final String FAILURE = "startFailure";
     private static final String FAILURE_PARAMS = "startFailureParams";
-    private static final Pattern DOCUMENT_FIELD = Pattern.compile("[\\p{L}\\p{Nd}._-]+(?:\\[[0-9]+\\][\\p{L}\\p{Nd}._-]*)*");
+    private static final String DOCUMENT_ID_PARAM = "id";
+    private static final String DOCUMENT_FIELD_PARAM = "field";
+    private static final Pattern DOCUMENT_FIELD = Pattern.compile("[\\p{L}\\p{Nd}._\\[\\]-]++");
     private final MongoClient client;
     private final MongoDatabase database;
     private final MongoCollection<Document> intents;
@@ -281,7 +283,8 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     @Override public void failStart(PendingStart pending, IoError error, Map<String, Object> params) {
         var rejection = new Document(FAILURE, error.name());
         if (error == IoError.DOCUMENT_UNREADABLE && validDocumentParams(params)) {
-            rejection.append(FAILURE_PARAMS, new Document("id", params.get("id")).append("field", params.get("field")));
+            rejection.append(FAILURE_PARAMS, new Document(DOCUMENT_ID_PARAM, params.get(DOCUMENT_ID_PARAM))
+                    .append(DOCUMENT_FIELD_PARAM, params.get(DOCUMENT_FIELD_PARAM)));
         }
         transaction(session -> {
             var generation = mappings.find(session, new Document("_id", pending.intent().scope().pipelineId())).first();
@@ -290,12 +293,12 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
                     || !PipelineStateMapping.Phase.ACTIVE.name().equals(generation.get("phase"))
                     || MongoPipelinePreparationFacts.decode(scope.pipelineId(), generation, clusterId)
                             .phase() == io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE) return null;
-            if (intents.updateOne(session, pendingFilter(pending), new Document("$set", rejection)).getMatchedCount() == 1) {
-                // Serialize reporting this failure with issuance/completion on the same state generation.
-                if (mappings.updateOne(session, new Document("_id", scope.pipelineId())
-                        .append("noteWriteFence", generation.getLong("noteWriteFence")),
-                        new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw fenced();
-            }
+            if (intents.updateOne(session, pendingFilter(pending), new Document("$set", rejection)).getMatchedCount() != 1)
+                return null;
+            // Serialize reporting this failure with issuance/completion on the same state generation.
+            if (mappings.updateOne(session, new Document("_id", scope.pipelineId())
+                    .append("noteWriteFence", generation.getLong("noteWriteFence")),
+                    new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw fenced();
             return null;
         });
     }
@@ -310,13 +313,14 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (!row.containsKey(FAILURE_PARAMS)) return Map.of();
         if (code != IoError.DOCUMENT_UNREADABLE || !(row.get(FAILURE_PARAMS) instanceof Document params)
                 || !validDocumentParams(params)) throw unreadable();
-        return Map.of("id", params.getString("id"), "field", params.getString("field"));
+        return Map.of(DOCUMENT_ID_PARAM, params.getString(DOCUMENT_ID_PARAM),
+                DOCUMENT_FIELD_PARAM, params.getString(DOCUMENT_FIELD_PARAM));
     }
 
     private static boolean validDocumentParams(Map<String, Object> params) {
         return params.keySet().equals(IoError.DOCUMENT_UNREADABLE.placeholders())
-                && params.get("id") instanceof String id && boundedText(id) && !id.contains("://")
-                && params.get("field") instanceof String field && boundedText(field) && DOCUMENT_FIELD.matcher(field).matches();
+                && params.get(DOCUMENT_ID_PARAM) instanceof String id && boundedText(id) && !id.contains("://")
+                && params.get(DOCUMENT_FIELD_PARAM) instanceof String field && boundedText(field) && DOCUMENT_FIELD.matcher(field).matches();
     }
 
     private static boolean boundedText(String text) {
@@ -469,30 +473,38 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             if (!(row.get("deleted") instanceof Boolean deleted) || !Integer.valueOf(1).equals(row.get("formatVersion"))
                     || !(row.get("intentRevision") instanceof Long revision) || !(row.get("bindingVersion") instanceof Long binding)
                     || !(row.get("stateGeneration") instanceof Long generation) || !clusterId.equals(row.get("clusterId"))) throw unreadable();
-            var fields = new HashSet<>(HEADER); if (!deleted) fields.addAll(BODY);
-            if (!deleted && row.containsKey(PREPARATION)) {
-                fields.add(PREPARATION);
-                if (row.containsKey(FAILURE)) {
-                    fields.add(FAILURE);
-                    if (row.containsKey(FAILURE_PARAMS)) fields.add(FAILURE_PARAMS);
-                }
-                if (!PipelineState.RUNNING.name().equals(row.get("targetState"))) throw unreadable();
-                startFailure(row).ifPresent(code -> startFailureParams(row, code));
-            }
-            if (!fields.equals(row.keySet())) throw unreadable();
+            validateFields(row, deleted);
             var scope = new PipelineIntentScope(row.getString("clusterId"), binding, row.getString("cacheIncarnation"), row.getString("_id"), generation);
-            DesiredState desired = null;
-            if (!deleted) {
-                if (!(row.get("purgeState") instanceof Boolean purge) || !(row.get("reassemble") instanceof Boolean reassemble)
-                        || !(row.get("revision") instanceof String hash) || hash.isBlank()
-                        || (row.get("assemblyRevision") != null && !(row.get("assemblyRevision") instanceof String))
-                        || (row.get("rebuiltAtStateEpoch") != null && (!(row.get("rebuiltAtStateEpoch") instanceof Long epoch) || epoch < 0))) throw unreadable();
-                desired = new DesiredState(scope.pipelineId(), PipelineState.valueOf(row.getString("targetState")), hash, purge,
-                        row.getString("assemblyRevision"), reassemble, row.getLong("rebuiltAtStateEpoch"));
-            }
+            DesiredState desired = deleted ? null : decodeDesired(row, scope);
             return new PipelineIntentSnapshot(scope, revision, desired);
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }
+    private static void validateFields(Document row, boolean deleted) {
+        var fields = new HashSet<>(HEADER);
+        if (!deleted) fields.addAll(BODY);
+        if (!deleted && row.containsKey(PREPARATION)) {
+            fields.add(PREPARATION);
+            if (!PipelineState.RUNNING.name().equals(row.get("targetState"))) throw unreadable();
+            var code = startFailure(row);
+            if (code.isPresent()) {
+                fields.add(FAILURE);
+                if (row.containsKey(FAILURE_PARAMS)) fields.add(FAILURE_PARAMS);
+                startFailureParams(row, code.orElseThrow());
+            }
+        }
+        if (!fields.equals(row.keySet())) throw unreadable();
+    }
+
+    private static DesiredState decodeDesired(Document row, PipelineIntentScope scope) {
+        if (!(row.get("purgeState") instanceof Boolean purge) || !(row.get("reassemble") instanceof Boolean reassemble)
+                || !(row.get("revision") instanceof String hash) || hash.isBlank()
+                || (row.get("assemblyRevision") != null && !(row.get("assemblyRevision") instanceof String))
+                || (row.get("rebuiltAtStateEpoch") != null
+                        && (!(row.get("rebuiltAtStateEpoch") instanceof Long epoch) || epoch < 0))) throw unreadable();
+        return new DesiredState(scope.pipelineId(), PipelineState.valueOf(row.getString("targetState")), hash, purge,
+                row.getString("assemblyRevision"), reassemble, row.getLong("rebuiltAtStateEpoch"));
+    }
+
     private <T> T transaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
@@ -505,5 +517,5 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
     private static void requireId(String id) { if (id == null || id.isBlank()) throw new IllegalArgumentException("Pipeline id must not be blank"); }
     private static TapstateException fenced() { return new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null); }
-    static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "pipeline-intent", "field", "intent"), null); }
+    static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of(DOCUMENT_ID_PARAM, "pipeline-intent", DOCUMENT_FIELD_PARAM, "intent"), null); }
 }
