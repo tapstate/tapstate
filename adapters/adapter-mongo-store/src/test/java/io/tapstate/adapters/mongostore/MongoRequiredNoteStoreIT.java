@@ -40,6 +40,59 @@ class MongoRequiredNoteStoreIT {
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
+    @Test void pipelineOriginPreparationPreservesForeignOriginCollationAndDamageRefusal() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var scope = f.initialize(pipeline("p1", 1));
+            var originRows = SystemCollections.PDK_NOTE_ORIGINS.on(f.database);
+            var stored = originRows.find().first();
+            var id = stored.get("_id", Document.class);
+            stored.put("_id", new Document(id).append("namespace", id.getString("namespace").toUpperCase(java.util.Locale.ROOT)));
+            String name = originRows.getNamespace().getCollectionName();
+            originRows.drop();
+            f.database.createCollection(name, new com.mongodb.client.model.CreateCollectionOptions().collation(
+                    com.mongodb.client.model.Collation.builder().locale("en").collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            originRows.insertOne(stored);
+            assertThat(f.notes.prepareOrigin(scope, origin("same-connection"))).isEqualTo(origin("same-connection"));
+            SystemCollections.PDK_NOTE_SCOPES.on(f.database).updateOne(new Document("_id", scopeMetadata(f, scope).get("_id")),
+                    new Document("$set", new Document("originGeneration", 0L)));
+            var before = scopeMetadata(f, scope);
+            assertThatThrownBy(() -> f.notes.prepareOrigin(scope, origin("same-connection")))
+                    .satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThat(scopeMetadata(f, scope)).isEqualTo(before);
+        });
+    }
+
+    @Test void pipelineOriginPreparationHasABoundedSameSnapshotCommandBudget() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var scope = f.notes.initialize(pipeline("p1", 1));
+            for (int sibling = 0; sibling < 100; sibling++) {
+                f.pipelineGeneration("sibling-" + sibling, 1);
+                f.initialize(pipeline("sibling-" + sibling, 1));
+            }
+            var commands = new ArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) { commands.add(event.getCommandName()); }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var notes = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher());
+                commands.clear();
+                assertThat(notes.prepareOrigin(scope, origin("same-connection"))).isEqualTo(origin("same-connection"));
+                System.out.println("PIPELINE_ORIGIN_FIRST " + commands);
+                assertThat(commands).hasSize(7);
+                commands.clear();
+                assertThat(notes.prepareOrigin(scope, origin("same-connection"))).isEqualTo(origin("same-connection"));
+                System.out.println("PIPELINE_ORIGIN_AGAIN " + commands);
+                assertThat(commands).hasSize(4);
+                assertThat(scopeMetadata(f, scope)).containsEntry("writeFence", 2L).containsEntry("originGeneration", 1L);
+            }
+        });
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"first-checkout", "twice", "guard", "owner", "deadline", "ordinary-write"})
     void aReadOnlyOpenRecoversOnlyOneCheckoutWithinItsOriginalAuthority(String stage) {

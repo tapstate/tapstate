@@ -355,6 +355,8 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         Objects.requireNonNull(origin, "origin");
         return transactionWithInspection(session -> {
             SourceConfigCipher cipher = cipherForWrite(session);
+            var prepared = preparePipelineOrigin(session, scope, origin, cipher);
+            if (prepared != null) return prepared;
             Document metadata = verifyScope(session, scope, true);
             RequiredNoteOrigin retained = retainedOrigin(session, scope, metadata);
             if (retained != null) {
@@ -371,6 +373,45 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                     new Document("$set", new Document("originGeneration", scope.generation()))).getMatchedCount() != 1) throw unavailable();
             return origin;
         });
+    }
+
+    private RequiredNoteOrigin preparePipelineOrigin(ClientSession session, RequiredNoteScope scope,
+            RequiredNoteOrigin origin, SourceConfigCipher cipher) {
+        var owner = scope.owner();
+        if (retirement != null || owner.kind() != RequiredNoteOwner.Kind.PIPELINE
+                || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
+        var stages = pipelineNoteStages(owner);
+        stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_ORIGINS, "origin", scopeId(owner)));
+        var snapshot = MongoStartConfigRead.snapshot(database, session, stages);
+        var operator = noteScopeRow(snapshot, "operator", owner.ownerId());
+        var metadata = noteScopeRow(snapshot, "primary", scopeId(owner));
+        if (operator == null || metadata == null) return null;
+        checkBinding(snapshot, owner);
+        checkPipelineOwner(operator, owner, false);
+        var operatorFence = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
+                .append("phase", "ACTIVE").append("noteWriteFence", operator.getLong("noteWriteFence"));
+        if (operators.updateOne(session, operatorFence, new Document("$inc", new Document("noteWriteFence", 1L)))
+                .getMatchedCount() != 1) throw unavailable();
+        if (!scopeOf(owner, metadata).equals(scope)) throw unavailable();
+        long fence = metadata.getLong("writeFence");
+        if (fence >= Long.MAX_VALUE - 1) throw unreadable("writeFence");
+        var capturedOrigin = noteScopeRow(snapshot, "origin", scopeId(owner));
+        // An absent or ambiguous lookup retains the origin collection's own predicate and collation.
+        var retained = capturedOrigin == null ? retainedOrigin(session, scope, metadata)
+                : retainedOrigin(scope, metadata, capturedOrigin);
+        if (retained != null && !retained.equals(origin)) throw originMismatch();
+        var filter = byScope(owner).append("generation", scope.generation()).append("writeFence", fence);
+        var update = new Document("$inc", new Document("writeFence", 1L));
+        if (retained == null) {
+            if (notes.find(session, new Document("_id.bindingVersion", owner.bindingVersion())
+                    .append("_id.namespace", owner.namespace()).append("_id.generation", scope.generation())).first() != null)
+                throw unavailable();
+            origins.insertOne(session, originDocument(scope, origin, cipher));
+            filter.append("originGeneration", 0L);
+            update.append("$set", new Document("originGeneration", scope.generation()));
+        }
+        if (scopes.updateOne(session, filter, update).getMatchedCount() != 1) throw unavailable();
+        return origin;
     }
 
     @Override
