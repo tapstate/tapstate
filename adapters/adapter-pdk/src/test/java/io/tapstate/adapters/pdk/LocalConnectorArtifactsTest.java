@@ -53,11 +53,16 @@ class LocalConnectorArtifactsTest {
         assertThat(rebuilt.resolve("orders", old).contentHash()).isEqualTo(old);
     }
 
-    @Test
-    void aLegacyBindingMigratesOnceAndLosingThatLocalCopyCannotReadGridFsAgain() throws IOException {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void localMigrationPrefersExistingBytesAndLosingTheCopyCannotReadGridFsAgain(boolean alreadyLocal) throws IOException {
         Path original = artifact("2.9.3");
         String hash = ContentHash.of(Files.readAllBytes(original));
         var cache = new Cache();
+        if (alreadyLocal) {
+            Path plugins = Files.createDirectories(work.resolve("plugins"));
+            Files.copy(original, plugins.resolve(hash + ".jar"));
+        }
         var copies = new AtomicInteger();
         LocalConnectorArtifacts.LegacyArtifact legacy = (requested, output) -> {
             assertThat(requested).isEqualTo(hash);
@@ -87,7 +92,7 @@ class LocalConnectorArtifactsTest {
 
         assertThat(installer.resolveRetained(notes, scope, origin).contentHash()).isEqualTo(hash);
         assertThat(ready).isTrue();
-        assertThat(copies).hasValue(1);
+        assertThat(copies).hasValue(alreadyLocal ? 0 : 1);
 
         var restarted = installer(cache, legacy);
         restarted.restore();
@@ -98,7 +103,17 @@ class LocalConnectorArtifactsTest {
                     assertThat(failure.code()).isEqualTo(ConnectorError.LOCAL_ARTIFACT_UNAVAILABLE);
                     assertThat(failure.args()).containsEntry("hash", hash);
                 });
-        assertThat(copies).hasValue(1);
+        assertThat(copies).hasValue(alreadyLocal ? 0 : 1);
+
+        var missingAtBoot = installer(cache, legacy);
+        missingAtBoot.restore();
+        assertThat(cache.forNode("node")).isEmpty();
+        assertThatThrownBy(() -> missingAtBoot.resolveRetained(notes, scope, origin)).isInstanceOfSatisfying(
+                TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ConnectorError.LOCAL_ARTIFACT_UNAVAILABLE);
+                    assertThat(failure.args()).containsEntry("hash", hash);
+                });
+        assertThat(copies).hasValue(alreadyLocal ? 0 : 1);
     }
 
     @Test
@@ -216,6 +231,46 @@ class LocalConnectorArtifactsTest {
     }
 
     @Test
+    void aJarRequiringANewerHostNeverReplacesTheInstalledCompatibleVersion() throws IOException {
+        var cache = new Cache();
+        var runtime = new LocalConnectorArtifacts(work.resolve("plugins"), new ConnectorIntrospector(), cache,
+                cache.specs, cache, "node", (hash, output) -> { throw new AssertionError("Unexpected GridFS"); },
+                () -> List.of("orders"), "2.0.8-SNAPSHOT");
+        var original = artifact("2.8.0", "2.8");
+        String installed = install(runtime, original);
+        var incompatible = artifact("2.9.12");
+
+        assertThatThrownBy(() -> install(runtime, incompatible)).isInstanceOfSatisfying(
+                TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ConnectorError.API_LEVEL_UNKNOWN));
+        assertThat(runtime.resolve("orders").contentHash()).isEqualTo(installed);
+        assertThat(cache.byHash).containsOnlyKeys(installed);
+        assertThat(cache.forNode("node")).extracting(ConnectorArtifactHoldings.Held::sha256).containsExactly(installed);
+    }
+
+    @Test
+    void aDropStaysAvailableForRetryWhenTheOfficialPolicyChanges() throws IOException {
+        var cache = new Cache();
+        var supported = new AtomicBoolean(false);
+        var runtime = new LocalConnectorArtifacts(work.resolve("plugins"), new ConnectorIntrospector(), cache,
+                cache.specs, cache, "node", (hash, output) -> { throw new AssertionError("Unexpected GridFS"); },
+                () -> supported.get() ? List.of("orders") : List.of(), "2.0.11-SNAPSHOT");
+        Path dropped = Files.copy(artifact("2.9.3"), work.resolve("dropped.jar"));
+        String hash = ContentHash.of(Files.readAllBytes(dropped));
+        assertThatThrownBy(() -> runtime.installDrop(dropped)).isInstanceOfSatisfying(
+                TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_OFFICIAL));
+        assertThat(dropped).exists();
+        assertThat(runtime.registryView().hasArtifact(hash)).isFalse();
+
+        supported.set(true);
+        assertThat(runtime.installDrop(dropped).registration().contentHash()).isEqualTo(hash);
+        assertThat(dropped).doesNotExist();
+        assertThat(runtime.registryView().hasArtifact(hash)).isTrue();
+        assertThat(runtime.registryView().findAll("orders"))
+                .extracting(io.tapstate.spi.store.ConnectorRegistration::contentHash).containsExactly(hash);
+        assertThat(runtime.resolve("orders").contentHash()).isEqualTo(hash);
+    }
+
+    @Test
     void stagingFailuresLeaveNoPublishedArtifactAndCanRetryTheSameDownload() throws IOException {
         var cache = new Cache();
         var installer = installer(cache, (hash, output) -> { throw new AssertionError("Unexpected GridFS"); });
@@ -308,6 +363,10 @@ class LocalConnectorArtifactsTest {
     }
 
     private Path artifact(String version) throws IOException {
+        return artifact(version, "2.9");
+    }
+
+    private Path artifact(String version, String pdkApiVersion) throws IOException {
         Path original = Synthetic.seedableOrdersConnector(work.resolve("build-" + version));
         Map<String, byte[]> entries = new HashMap<>();
         try (var jar = new JarFile(original.toFile())) {
@@ -320,7 +379,7 @@ class LocalConnectorArtifactsTest {
             }
         }
         return SyntheticJar.jarWithEntries(work.resolve("jar-" + version), entries,
-                Map.of("PDK-API-Version", "2.9", "Implementation-Version", version));
+                Map.of("PDK-API-Version", pdkApiVersion, "Implementation-Version", version));
     }
 
     private static final class Cache implements ConnectorCatalogStore, ConnectorArtifactHoldings {

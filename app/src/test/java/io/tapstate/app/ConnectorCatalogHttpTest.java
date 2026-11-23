@@ -37,6 +37,12 @@ class ConnectorCatalogHttpTest {
                 }
             }
         });
+        server.createContext("/full.jar", exchange -> {
+            try (exchange) {
+                exchange.sendResponseHeaders(200, bytes.size());
+                bytes.writeTo(exchange.getResponseBody());
+            }
+        });
         server.createContext("/missing.jar", exchange -> {
             try (exchange) {
                 exchange.sendResponseHeaders(404, -1);
@@ -56,6 +62,8 @@ class ConnectorCatalogHttpTest {
             assertThat(range.get()).isNull();
             assertThat(client.authentication(available)).isEqualTo("Beta");
             assertThat(range.get()).startsWith("bytes=0-");
+            assertThat(client.authentication(base.resolve("/full.jar"))).isEqualTo("Beta");
+            assertThat(client.read(base.resolve("/full.jar"))).isEqualTo(bytes.toByteArray());
             assertThat(client.available(base.resolve("/missing.jar"))).isFalse();
             assertThatThrownBy(() -> client.read(base.resolve("/missing.jar")))
                     .isInstanceOf(ConnectorReleaseCatalog.MissingResource.class);

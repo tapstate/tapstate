@@ -81,6 +81,22 @@ class MavenConnectorCatalogTest {
                 """), BOM)).isInstanceOf(IOException.class);
     }
 
+    @Test
+    void aRepositoryCannotOfferAnEmptyBomOrAnInvalidManagedRelease() {
+        String valid = bom("mongodb-connector", "2.11.0", "2.0.11");
+        for (String invalid : List.of(
+                valid.replace("<properties>", "<unrelated>").replace("</properties>", "</unrelated>"),
+                valid.replace("<dependencies>", "<unrelated>").replace("</dependencies>", "</unrelated>"),
+                valid.replaceAll("(?s)<dependency>.*?</dependency>", ""),
+                valid.replace("<version>2.11.0</version>", "<version>SNAPSHOT</version>"),
+                valid.replace("<artifactId>mongodb-connector</artifactId>", "<artifactId>mongodb connector</artifactId>"))) {
+            assertThatThrownBy(() -> MavenConnectorCatalog.read(xml(invalid), BOM)).isInstanceOf(IOException.class);
+        }
+        assertThatThrownBy(() -> MavenConnectorCatalog.readBomVersions(xml("""
+                <metadata><groupId>io.other</groupId><artifactId>connectors-bom</artifactId></metadata>
+                """), BOM)).isInstanceOf(IOException.class);
+    }
+
     private static ByteArrayInputStream xml(String value) {
         return new ByteArrayInputStream(value.getBytes(StandardCharsets.UTF_8));
     }

@@ -16,6 +16,8 @@
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoPipelineIntentStoreIT"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCapturePreparationsIT", "method": "sharedNoteLookupsRespectPipelineNodeSettingsAndTheCurrentArtifactHash"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCapturePreparationsIT", "method": "aVersionedCaptureGrantRequiresTheExactPreparedRevisionAndRetainsItsArtifact"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCapturePreparationsIT", "method": "sharedHistoryInspectionRejectsAConflictingPriorPhysicalIdentity"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCapturePreparationsIT", "method": "sharedHistoryInspectionRejectsMissingNoteScope"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoSrsLogStoreIT"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoSrsConsumerStoreIT", "method": "nodeBackedWriterUsesTheNodeLeaseAndRejectsBothOldExecutionsAndOldBoots"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoSrsConsumerStoreIT", "method": "handoffSeedsOnlyTheCandidateFromTheOriginalGlobalAck"},

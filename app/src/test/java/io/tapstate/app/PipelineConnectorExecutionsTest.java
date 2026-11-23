@@ -186,6 +186,30 @@ class PipelineConnectorExecutionsTest {
     }
 
     @Test
+    void legacySharedBindingComesFromThisPipelinesOriginalAttachedMember() {
+        var f = new Fixture();
+        var original = shared(SOURCE, CHAIN, OLD_HASH);
+        var scope = PipelineConnectorExecutions.business(SCOPE);
+        var prepared = new CapturePreparation(scope, CapturePreparation.Mode.SHARED_SRS,
+                CHAIN, original.captureId(), "mc-" + OLD_HASH, UUID.randomUUID().toString());
+        when(f.bindings.load(SCOPE)).thenReturn(Optional.empty());
+        when(f.capture.read(scope, original.captureId())).thenReturn(Optional.of(prepared));
+        when(f.notes.origin(original.notes())).thenReturn(origin(SOURCE, OLD_HASH));
+        var originalMember = f.member(CHAIN);
+
+        f.executions.publish(START, List.of(SOURCE), CLAIM, ACTIVE);
+        verify(f.bindings).seed(START, List.of(original));
+        verify(f.connectors).resolveRetained(f.notes, original.notes(), origin(SOURCE, OLD_HASH));
+        verify(f.connectors, never()).resolve(CONNECTOR);
+
+        var detached = new SrsConsumerMembership(originalMember.context(), originalMember.revision() + 1,
+                true, Set.of(), CLAIM);
+        when(f.consumers.find(key(CHAIN))).thenReturn(Optional.of(detached));
+        f.executions.publish(START, List.of(SOURCE), CLAIM, ACTIVE);
+        verify(f.bindings, times(1)).seed(START, List.of(original));
+    }
+
+    @Test
     void recoveryUsesASeparateChainForTheRetainedPrivateHash() {
         var f = new Fixture();
         var scope = PipelineConnectorExecutions.business(SCOPE);

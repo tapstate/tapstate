@@ -430,6 +430,8 @@ class CloudConnectorSeedReadinessTest {
         org.mockito.Mockito.when(registry.findAll(org.mockito.ArgumentMatchers.anyString()))
                 .thenThrow(new AssertionError("Published readiness must use exact artifact metadata"));
         var catalog = org.mockito.Mockito.mock(ConnectorCatalogStore.class);
+        CapabilityDeriver derive = id -> { throw new AssertionError("Published readiness uses verified artifact metadata"); };
+        var coldGate = CloudConnectorSeedReadiness.checkedRelease(seeds, registry, catalog, stores.specStore(), derive, false);
         var installed = new ArrayList<SeedOutcome>();
         for (var row : entries) {
             String id = (String) row.get("id");
@@ -441,12 +443,17 @@ class CloudConnectorSeedReadinessTest {
             installed.add(new SeedOutcome.Seeded(seeds.resolve(id + "-connector.jar"),
                     new RegistrationOutcome(new ConnectorRegistration(id, hash, VERSION, RegistrationSource.SEED), false)));
         }
-        var gate = new CloudConnectorSeedReadiness(seeds, published, registry, catalog, stores.specStore(),
-                id -> { throw new AssertionError("Complete metadata must avoid repeated capability derivation"); },
-                directoryEntries, bootstrap);
+        var gate = CloudConnectorSeedReadiness.checkedRelease(seeds, registry, catalog, stores.specStore(), derive, false);
         assertThat(gate.selectedFileNames()).containsExactlyInAnyOrder(
                 "mongodb-connector.jar", "mysql-connector.jar", "postgres-connector.jar", "mongodb-atlas-connector.jar");
+        assertThat(coldGate.selectedFileNames()).isEqualTo(gate.selectedFileNames());
+        coldGate.verifyRegistrations(installed);
         gate.verifyRegistrations(installed);
+        var mongo = installed.stream().map(SeedOutcome.Seeded.class::cast)
+                .map(SeedOutcome.Seeded::outcome).map(RegistrationOutcome::registration)
+                .filter(entry -> entry.connectorId().equals("mongodb")).findFirst().orElseThrow();
+        org.mockito.Mockito.when(registry.hasArtifact(mongo.contentHash())).thenReturn(false);
+        refused(() -> gate.verifyRegistrations(installed), "registered-artifact-unavailable");
     }
 
     private CloudConnectorSeedReadiness gate() throws Exception {

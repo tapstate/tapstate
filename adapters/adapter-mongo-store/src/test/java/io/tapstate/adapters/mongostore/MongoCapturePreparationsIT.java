@@ -209,6 +209,23 @@ class MongoCapturePreparationsIT {
             bindings.publish(restart);
             bindings.complete(scope, restart.intentRevision());
             assertThat(captures.issueFirstCreate(request)).isEqualTo(new CaptureCreationResult.AlreadyIssued(versioned));
+
+            var inputs = request.inputs();
+            String sourceHash = inputs.sourceHashes().get("input");
+            assertThat(captures.inspectSharedHistory(versioned, "input", sourceHash, scope.pipelineId(), inputs.pipelineHash()))
+                    .isEqualTo(new CaptureSharedHistory(versioned, false));
+            var previousCache = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), "previous-cache");
+            var previous = new CapturePreparation(previousCache, versioned.mode(), versioned.chainId(),
+                    versioned.captureId(), versioned.sourceIdentityHash(), UUID.randomUUID().toString());
+            var historyRow = MongoCapturePreparationFacts.withArtifact(MongoCapturePreparationFacts.row(previous), hash);
+            f.controls().insertOne(historyRow);
+            assertThat(captures.inspectSharedHistory(versioned, "input", sourceHash, scope.pipelineId(), inputs.pipelineHash()))
+                    .isEqualTo(new CaptureSharedHistory(versioned, true));
+            var historyKey = new Document("_id", historyRow.get("_id"));
+            f.controls().updateOne(historyKey, new Document("$set", new Document("artifactHash", "c".repeat(64))));
+            assertCode(() -> captures.inspectSharedHistory(versioned, "input", sourceHash,
+                    scope.pipelineId(), inputs.pipelineHash()), IoError.PIPELINE_INTENT_FENCED);
+
             try (var reopened = MongoConfigurationDomain.open(f.settings, scope.clusterId())) {
                 assertThat(reopened.capturePreparations().read(f.scope, captureId)).contains(versioned);
                 assertThat(reopened.intents().connectorBindings().load(scope).orElseThrow().effective())
@@ -252,7 +269,17 @@ class MongoCapturePreparationsIT {
         });
     }
 
-    @ParameterizedTest @ValueSource(strings = {"source", "preparation", "physical", "missing-current", "missing-notes"})
+    @Test
+    void sharedHistoryInspectionRejectsAConflictingPriorPhysicalIdentity() {
+        sharedHistoryInspectionRefusesConflictingOrIncompleteFactsWithoutRepair("physical");
+    }
+
+    @Test
+    void sharedHistoryInspectionRejectsMissingNoteScope() {
+        sharedHistoryInspectionRefusesConflictingOrIncompleteFactsWithoutRepair("missing-notes");
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"source", "preparation", "missing-current"})
     void sharedHistoryInspectionRefusesConflictingOrIncompleteFactsWithoutRepair(String damage) {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var original = f.issue(f.request).preparation();

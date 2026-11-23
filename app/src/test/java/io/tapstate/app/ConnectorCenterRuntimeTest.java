@@ -29,7 +29,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -69,6 +71,23 @@ class ConnectorCenterRuntimeTest {
             verify(remote).refreshNow();
             assertThat(row(online, ID)).containsEntry("downloadable", true);
             verify(local).manifestAuthentication(INSTALLED_HASH);
+        }
+    }
+
+    @Test
+    void theFirstInstallUsesRemoteStageAndHasNoDefaultArtifact() throws Exception {
+        var local = mock(LocalConnectorArtifacts.class);
+        when(local.inventory()).thenReturn(new LocalConnectorArtifacts.Inventory(List.of(), List.of()));
+        var remote = catalogAt(URI.create("http://127.0.0.1:1/postgres.jar"));
+        when(remote.admittedIds(any())).thenReturn(List.of(ID));
+        try (var center = new ConnectorCenterRuntime(remote, local, true)) {
+            var catalog = center.catalog();
+            assertThat(catalog).containsEntry("uploadAvailable", false);
+            assertThat(row(catalog, ID)).containsEntry("downloadable", true)
+                    .containsEntry("installedVersions", List.of()).containsEntry("updateAvailable", false)
+                    .containsEntry("properties", Map.of("authentication", "GA"))
+                    .doesNotContainKey("defaultSha256");
+            verify(local, never()).manifestAuthentication(anyString());
         }
     }
 
@@ -146,6 +165,25 @@ class ConnectorCenterRuntimeTest {
             assertThat(complete(center, center.upload(new ByteArrayInputStream(ARTIFACT), ARTIFACT.length, ID)))
                     .containsEntry("state", "INSTALLED").containsEntry("sha256", DOWNLOAD_HASH);
             await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> verify(staged).close());
+        }
+    }
+
+    @Test
+    void failedUploadsReleaseTheirSlotsAndBoundTheOperationHistory() {
+        var local = mock(LocalConnectorArtifacts.class);
+        var failure = new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", ID), null);
+        when(local.stage(any(), any())).thenThrow(failure);
+        try (var center = new ConnectorCenterRuntime(mock(ConnectorCatalogBackground.class), local, false)) {
+            var first = center.upload(new ByteArrayInputStream(ARTIFACT), ARTIFACT.length, null);
+            assertThat(first).containsEntry("state", "FAILED").containsEntry("errorCode", failure.code().code());
+            for (int i = 0; i < 127; i++) {
+                assertThat(center.upload(new ByteArrayInputStream(ARTIFACT), ARTIFACT.length, null))
+                        .containsEntry("state", "FAILED");
+            }
+            assertThat(center.operation((String) first.get("operationId"))).isEqualTo(first);
+            var next = center.upload(new ByteArrayInputStream(ARTIFACT), ARTIFACT.length, null);
+            assertThat(center.operation((String) next.get("operationId"))).isEqualTo(next);
+            refusal(() -> center.operation((String) first.get("operationId")), ConnectorCatalogError.NOT_FOUND.code());
         }
     }
 

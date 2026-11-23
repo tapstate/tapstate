@@ -106,6 +106,36 @@ class ConnectorCatalogRefreshTest {
     }
 
     @Test
+    void anInvalidRepositoryConfigCannotReplaceTheLocalSupportSnapshot() throws Exception {
+        var remote = new RepositoryFixture();
+        URI repository = URI.create("https://repository.test/");
+        remote.publish(repository, "mysql", DIGEST);
+        remote.repoint(repository);
+        String bundled = ConnectorSupportSnapshotTest.manifest(10, "mysql");
+        remote.files.put(SUPPORT, bundled);
+        var refresh = catalog(remote, bundled);
+        var original = refresh.refresh();
+        String settings = remote.files.get(REPOSITORIES);
+
+        remote.files.put(SUPPORT, ConnectorSupportSnapshotTest.manifest(11, "mysql"));
+        for (String invalid : List.of(
+                "{}",
+                settings.replace("oss", ""),
+                settings.replace(repository.toString(), "https://repository.test/?ambiguous=1"),
+                settings.replace(repository.toString(), "https://repository.test/#fragment"),
+                settings.replace(repository.toString(), "https://invalid-user@repository.test/"),
+                settings.replace(repository.toString(), "file:///fixture/"),
+                settings.replace(repository.toString(), "ftp://repository.test/"),
+                settings.replace(BOM_VERSION, ""),
+                settings.replace("oss", "missing"))) {
+            remote.files.put(REPOSITORIES, invalid);
+            assertThatThrownBy(refresh::refresh).isInstanceOf(IOException.class);
+            assertThat(refresh.current()).isSameAs(original);
+            assertThat(Files.readString(directory.resolve("cache/connector-support.json"))).isEqualTo(bundled);
+        }
+    }
+
+    @Test
     void anUnsupportedOrUnavailableArtifactIsNotOffered() throws Exception {
         var remote = new RepositoryFixture();
         URI repository = URI.create("https://repository.test/");
