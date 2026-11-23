@@ -261,6 +261,12 @@ final class MongoClaimOperations {
     }
 
     <T> T renew(WorkloadClaimKey key, long deadline, Runnable guard, Supplier<T> action) {
+        return renew(key, java.util.Set.of(), deadline, guard, action);
+    }
+
+    <T> T renew(WorkloadClaimKey key, java.util.Set<WorkloadClaimKey> recoveries, long deadline,
+            Runnable guard, Supplier<T> action) {
+        var reservations = java.util.Set.copyOf(recoveries);
         if (key != null && current.get() != null && !key.equals(reservedRenewalKey.get())) throw renewalBusy();
         return call(deadline, guard, () -> {
             var previous = reservedRenewalKey.get();
@@ -272,7 +278,7 @@ final class MongoClaimOperations {
                 if (!alreadyRenewing) renewalLane.remove();
                 if (previous == null) reservedRenewalKey.remove(); else reservedRenewalKey.set(previous);
             }
-        }, renewals, key);
+        }, renewals, key, reservations);
     }
 
     private <T> T call(long deadline, Runnable guard, Supplier<T> action, ThreadPoolExecutor lane) {
@@ -280,6 +286,11 @@ final class MongoClaimOperations {
     }
 
     private <T> T call(long deadline, Runnable guard, Supplier<T> action, ThreadPoolExecutor lane, WorkloadClaimKey key) {
+        return call(deadline, guard, action, lane, key, java.util.Set.of());
+    }
+
+    private <T> T call(long deadline, Runnable guard, Supplier<T> action, ThreadPoolExecutor lane,
+            WorkloadClaimKey key, java.util.Set<WorkloadClaimKey> recoveries) {
         requireAdmission();
         var inherited = current.get();
         if (inherited != null) {
@@ -290,15 +301,29 @@ final class MongoClaimOperations {
             try {check();var result=action.get();check();return result;}
             finally { current.set(inherited);active.set(previous); }
         }
-        return result(submit(deadline, guard, action, false, lane, key), deadline);
+        return result(submit(deadline, guard, action, false, lane, key, recoveries), deadline);
     }
 
     private synchronized <T> Call<T> submit(long deadline, Runnable guard, Supplier<T> action, boolean cleanup,
             ThreadPoolExecutor lane, WorkloadClaimKey key) {
+        return submit(deadline, guard, action, cleanup, lane, key, java.util.Set.of());
+    }
+
+    private synchronized <T> Call<T> submit(long deadline, Runnable guard, Supplier<T> action, boolean cleanup,
+            ThreadPoolExecutor lane, WorkloadClaimKey key, java.util.Set<WorkloadClaimKey> recoveries) {
         if (closed || stopping&&!cleanup) throw MongoCacheWorkloadClaimStore.claimFenced();
         remaining(deadline);
         boolean renewal = lane == renewals;
         if (renewal) {
+            if (!recoveries.isEmpty()) {
+                var reserved = new java.util.HashSet<>(activeRenewals);
+                reserved.addAll(recoveries);
+                for (var transaction : transactions) {
+                    if (transaction.renewalKey != null && transaction.renewalKey.type() == WorkloadClaimType.PIPELINE_ACTUATION)
+                        reserved.add(transaction.renewalKey);
+                }
+                if (reserved.size() >= MAX_RENEWALS) throw renewalBusy();
+            }
             if (unkeyedRenewal || (key == null ? !activeRenewals.isEmpty()
                     : activeRenewals.size() >= MAX_RENEWALS || !activeRenewals.add(key))) throw renewalBusy();
             if (key == null) unkeyedRenewal = true;

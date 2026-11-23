@@ -73,7 +73,7 @@ final class ActuationClaimRenewer implements AutoCloseable {
      */
     private static void renew(PipelineActuationOwnership ownership, Executor dispatch) {
         try {
-            ownership.dispatchDueRenewals(dispatch);
+            ownership.dispatchDueRenewals(dispatch, MAX_PARALLEL_RENEWALS);
         } catch (RuntimeException unexpected) {
             LOG.warn("Could not renew this member's actuation claims; looking again shortly", unexpected);
         }

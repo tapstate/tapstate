@@ -108,6 +108,18 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return StoreIo.call(() -> operations.renew(key, deadline, active, operation));
     }
 
+    @Override public <T> T withRenewalDeadline(WorkloadClaimKey key, java.util.Set<WorkloadClaimKey> recoveries,
+            long deadline, Runnable active, java.util.function.Supplier<T> operation) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION) throw new IllegalArgumentException("a Pipeline renewal requires a Pipeline key");
+        for (var recovery : recoveries) {
+            requireKey(recovery);
+            if (recovery.type() != WorkloadClaimType.PIPELINE_ACTUATION || recovery.equals(key))
+                throw new IllegalArgumentException("recovery reservations require other original Pipeline keys");
+        }
+        return StoreIo.call(() -> operations.renew(key, recoveries, deadline, active, operation));
+    }
+
     @Override public <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadline, Runnable active,
             java.util.function.Supplier<T> operation) {
         requireKey(key);

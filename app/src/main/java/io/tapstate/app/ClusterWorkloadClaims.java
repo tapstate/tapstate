@@ -48,7 +48,20 @@ final class ClusterWorkloadClaims {
 
     private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey key,
             Operation kind, boolean requireCurrentResult) {
+        return call(action, budgetNanos, key, kind, requireCurrentResult, java.util.Set.of());
+    }
+
+    private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey key,
+            Operation kind, boolean requireCurrentResult, java.util.Set<WorkloadClaimKey> recoveries) {
+        if (kind == Operation.RENEWAL && !recoveries.isEmpty()
+                && !(store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore))
+            throw new io.tapstate.spi.store.WorkloadClaimRenewalException(
+                    io.tapstate.spi.store.WorkloadClaimRenewalException.Reason.NOT_STARTED,
+                    "earlier Pipeline recovery requires its original renewal capacity");
         if (admission == null) {
+            if (kind == Operation.RENEWAL && !recoveries.isEmpty())
+                return ((io.tapstate.spi.store.DeadlineWorkloadClaimStore) store).withRenewalDeadline(
+                        key, recoveries, System.nanoTime() + budgetNanos, () -> {}, action);
             if (kind == Operation.ACQUISITION && store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)
                 return bounded.withClaimAcquisition(key, () -> {}, action);
             return action.get();
@@ -63,7 +76,8 @@ final class ClusterWorkloadClaims {
                 result = switch (kind) {
                     case ORDINARY -> bounded.withDeadline(deadline, active, action);
                     case ACQUISITION -> bounded.withClaimAcquisitionDeadline(key, deadline, active, action);
-                    case RENEWAL -> bounded.withRenewalDeadline(key, deadline, active, action);
+                    case RENEWAL -> recoveries.isEmpty() ? bounded.withRenewalDeadline(key, deadline, active, action)
+                            : bounded.withRenewalDeadline(key, recoveries, deadline, active, action);
                 };
             } else result = action.get();
             if (requireCurrentResult && !admission.current()) throw ThreeLayerStorePort.refused();
@@ -148,6 +162,11 @@ final class ClusterWorkloadClaims {
 
     /** Keeps a scoped run's exact fence across joins; only a subsequent submission adopts the new topology. */
     Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl, long budgetNanos) {
+        return renewScopedActuation(expected, ttl, budgetNanos, java.util.Set.of());
+    }
+
+    Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl, long budgetNanos,
+            java.util.Set<WorkloadClaimKey> recoveries) {
         if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
             throw new IllegalArgumentException("a scoped actuation renewal requires a Pipeline claim");
         ClusterMembership current = membership.committed();
@@ -155,7 +174,7 @@ final class ClusterWorkloadClaims {
                 || !current.clusterId().equals(expected.key().clusterId())
                 || current.revision() < expected.topologyRevision()
                 || expected.executionGeneration() == 0 && current.revision() != expected.topologyRevision()) return Optional.empty();
-        return call(()->store.renew(expected, ttl), budgetNanos, expected.key());
+        return call(() -> store.renew(expected, ttl), budgetNanos, expected.key(), Operation.RENEWAL, true, recoveries);
     }
 
     /**
@@ -168,8 +187,13 @@ final class ClusterWorkloadClaims {
     }
 
     Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl, long budgetNanos) {
+        return renewActuationControl(expected, ttl, budgetNanos, java.util.Set.of());
+    }
+
+    Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl, long budgetNanos,
+            java.util.Set<WorkloadClaimKey> recoveries) {
         return membership.singleControlEligible(expected)
-                ? call(() -> store.renew(expected, ttl), budgetNanos, expected.key()) : Optional.empty();
+                ? call(() -> store.renew(expected, ttl), budgetNanos, expected.key(), Operation.RENEWAL, true, recoveries) : Optional.empty();
     }
 
     Optional<WorkloadClaimReading> confirmPipelineRenewal(PipelineIntentScope scope, WorkloadClaim expected, long budgetNanos) {

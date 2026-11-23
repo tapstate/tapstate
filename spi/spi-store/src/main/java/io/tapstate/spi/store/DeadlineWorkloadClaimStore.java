@@ -39,6 +39,14 @@ public interface DeadlineWorkloadClaimStore extends WorkloadClaimStore {
         return withRenewalDeadline(deadlineNanos, requireActive, operation);
     }
 
+    /** Reserves the original earlier recovery keys before using any remaining renewal capacity. */
+    default <T> T withRenewalDeadline(WorkloadClaimKey key, java.util.Set<WorkloadClaimKey> recoveries,
+            long deadlineNanos, Runnable requireActive, Supplier<T> operation) {
+        if (!recoveries.isEmpty()) throw new WorkloadClaimRenewalException(
+                WorkloadClaimRenewalException.Reason.NOT_STARTED, "earlier Pipeline recovery requires its original renewal capacity");
+        return withRenewalDeadline(key, deadlineNanos, requireActive, operation);
+    }
+
     /** Bounds a node-session renewal independently of Pipeline claim work. */
     default <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadlineNanos, Runnable requireActive,
             Supplier<T> operation) {
