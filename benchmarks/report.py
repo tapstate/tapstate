@@ -219,6 +219,9 @@ def resource_conditions(arm):
 
 
 def metric_conditions(arm, metric):
+    if metric == "endpoint_p95_nanos":
+        return {"protocol": arm.get("latency_probe", {}).get("protocol"),
+                "source_clock_resolution_ms": arm.get("latency_source_clock_resolution_ms")}
     if ".rss_" not in metric:
         return {}
     conditions = resource_conditions(arm)

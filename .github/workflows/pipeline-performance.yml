@@ -160,7 +160,8 @@ jobs:
           fi
           python3 -B benchmarks/runner.py run \
             --manifest "$RUNNER_TEMP/performance-inputs/manifest.json" --batch "$BATCH" \
-            --stop-at-epoch-seconds "$STOP_AT" --connectors "$RUNNER_TEMP/connectors" --output "$output/run"
+            --stop-at-epoch-seconds "$STOP_AT" --endpoint-latency-probe \
+            --connectors "$RUNNER_TEMP/connectors" --output "$output/run"
       - name: Upload batch evidence
         uses: actions/upload-artifact@v4
         if: always()
@@ -171,6 +172,7 @@ jobs:
             !${{ runner.temp }}/performance-batch/run/**/runtime-input/**
             !${{ runner.temp }}/performance-batch/run/**/witness-input/**
             !${{ runner.temp }}/performance-batch/run/**/verified-connectors/**
+            !${{ runner.temp }}/performance-batch/run/**/verified-latency-delegate/**
           if-no-files-found: error
           retention-days: 30
 

@@ -10,6 +10,16 @@ import org.junit.jupiter.api.Test;
 
 class LiveLatencyEligibilityTest {
     @Test
+    void p95CanQualifyAtTheSmallerWindowWithoutQualifyingP99() {
+        var samples = IntStream.rangeClosed(1, 600)
+                .mapToObj(index -> new LiveLatencyEligibility.Sample("event-" + index, index)).toList();
+        var reading = LiveLatencyEligibility.assess(600, samples, true, 600, 10000, 0.999);
+        assertEquals(570L, reading.p95Nanos());
+        assertNull(reading.p99Nanos());
+        assertNull(LiveLatencyEligibility.assess(601, samples, true, 600, 10000, 0.999).p95Nanos());
+    }
+
+    @Test
     void onlyCorrelatedAndComparableSamplesProduceP99() {
         var samples = IntStream.rangeClosed(1, 10000)
                 .mapToObj(index -> new LiveLatencyEligibility.Sample("event-" + index, index)).toList();

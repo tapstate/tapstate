@@ -259,14 +259,19 @@ def summary(result, repository):
                  + (f" ({item['id']})" if "id" in item else
                     f" (batch {item['batch']})" if "batch" in item else "") for item in result["errors"])
     lines.extend(["", "<details><summary>Coverage by case</summary>", "",
-                  "| Case | Profile | Repeats | Execution | Comparison | Evidence qualification |",
-                  "|---|---|---:|---|---|---|"])
+                  "| Case | Profile | Repeats | Execution | Comparison | Evidence qualification | Covered measurements |",
+                  "|---|---|---:|---|---|---|---|"])
     for case_id in result["selected_ids"]:
         context = result["case_context"].get(case_id, {})
         case = result["case_verdicts"].get(case_id, {})
-        lines.append(f"| {case_id}@{context.get('version', '-')} | {context.get('profile') or '-'} | "
-                     f"{context.get('repeats', '-')} | {case.get('execution', 'unavailable')} | "
-                     f"{case.get('comparison', 'unavailable')} | {cell(case.get('comparison_reasons') or '-')} |")
+        measurements = {
+            f"{arm} {metric}": sum(group["count"] for group in cohorts)
+            for arm, metrics in result["statistics"].get(case_id, {}).items()
+            for metric, cohorts in metrics.items()
+        }
+        lines.append(table(f"{case_id}@{context.get('version', '-')}", context.get("profile"), context.get("repeats"),
+                           case.get("execution"), case.get("comparison"), case.get("comparison_reasons") or "-",
+                           measurements or None))
     lines.extend(["", "</details>"])
     lines.extend(execution_failures(result, repository, run_id))
     lines.extend(other_execution_outcomes(result, repository, run_id))
