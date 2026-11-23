@@ -394,7 +394,7 @@ done
 for j in server-image cloud-image; do
   hasnt "$j retains its default success guard" "$j" '^    if:'
 done
-if [[ "$(job cloud-server-jar | grep '^    if:')" == '    if: ${{ !inputs.onprem-only }}' ]]; then
+if [[ "$(job cloud-server-jar | grep '^    if:')" == "    if: \${{ !inputs.onprem-only }}" ]]; then
   ok "the Cloud build only skips in explicit OP candidate mode"
 else
   bad "the Cloud build only skips in explicit OP candidate mode" "unexpected Cloud job guard"
