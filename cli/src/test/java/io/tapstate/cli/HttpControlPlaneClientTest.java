@@ -50,6 +50,28 @@ class HttpControlPlaneClientTest {
         } finally { server.stop(0); }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0380001", "connector.not-found"})
+    void catalogRefusalDoesNotEnablePreviewFallback(String code) throws Exception {
+        HttpServer server = serverReplying("/api/connector-center/mysql:download", 404,
+                """
+                {"code":"%s","params":{"connector":"mysql"},"message":"Connector is unavailable."}
+                """.formatted(code));
+        try {
+            var result = new HttpControlPlaneClient().downloadConnector(baseOf(server), "token", "mysql");
+            assertThat(result).containsInstanceOf(ConnectorRegisterOutcome.Rejected.class);
+            assertThat(((ConnectorRegisterOutcome.Rejected) result.orElseThrow()).code()).isEqualTo(code);
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void absentConnectorDownloadRouteStillAllowsPreviewFallback() throws Exception {
+        HttpServer server = serverReplying("/api/connector-center/mysql:download", 404, "{}");
+        try {
+            assertThat(new HttpControlPlaneClient().downloadConnector(baseOf(server), "token", "mysql")).isEmpty();
+        } finally { server.stop(0); }
+    }
+
     private static HttpServer serverReplying(int status, String body) throws Exception {
         return serverReplying("/healthz", status, body);
     }

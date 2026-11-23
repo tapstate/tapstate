@@ -1,5 +1,6 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.common.ConnectorCatalogErrorDefinitions;
 import io.tapstate.core.common.DiagnosticProjection;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.control.client.ControlResponse;
@@ -815,7 +816,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             var response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() != 200 && response.statusCode() != 202) {
                 var rejected = rejection(response.body(), "The server refused the connector download.");
-                if (response.statusCode() == 404 && !"connector.not-found".equals(rejected.code()))
+                if (response.statusCode() == 404
+                        && !ConnectorCatalogErrorDefinitions.NOT_FOUND.code().equals(rejected.code())
+                        && !"connector.not-found".equals(rejected.code()))
                     return java.util.Optional.empty();
                 return java.util.Optional.of(new ConnectorRegisterOutcome.Rejected(rejected.code(), rejected.message()));
             }
