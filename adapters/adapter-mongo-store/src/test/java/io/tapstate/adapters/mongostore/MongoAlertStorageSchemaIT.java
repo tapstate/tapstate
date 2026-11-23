@@ -39,6 +39,30 @@ class MongoAlertStorageSchemaIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
+    @Test void boundedAuthorityReadPreservesFullValidationAndOversizedMarkerFallback() {
+        withConfiguration(false, f -> {
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> commands.add(name + ":" + collection));
+            try {
+                assertThat(f.domain().alertAuthorityVersion(new MongoReadBudget(Duration.ofSeconds(5))))
+                        .isEqualTo(MongoAlertStorageSchema.VERSION);
+                assertThat(commands).containsExactly("find:cluster_keys", "aggregate:cluster_identity", "commitTransaction:");
+                var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(f.database());
+                var config = new Document("_id", "config");
+                schemas.updateOne(config, new Document("$set", new Document("padding", "x".repeat(70_000))));
+                commands.clear();
+                assertThat(f.domain().alertAuthorityVersion(new MongoReadBudget(Duration.ofSeconds(5))))
+                        .isEqualTo(MongoAlertStorageSchema.VERSION);
+                assertThat(commands).contains("find:schema_migrations", "find:configuration_version");
+                schemas.updateOne(config, new Document("$unset", new Document("padding", ""))
+                        .append("$set", new Document("alerting.clusterId", "other")));
+                assertUnreadable(() -> f.domain().alertAuthorityVersion(new MongoReadBudget(Duration.ofSeconds(5))));
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+            }
+        });
+    }
+
     @Test void structureListingUsesNoFilterAndConsumesEveryBatchWithinItsBudget() {
         withConfiguration(false, f -> {
             var commands = new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();

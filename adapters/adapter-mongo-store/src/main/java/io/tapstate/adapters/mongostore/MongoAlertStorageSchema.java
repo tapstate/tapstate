@@ -73,7 +73,29 @@ final class MongoAlertStorageSchema {
     }
 
     Document loadAuthorityMarker(MongoReadBudget budget) {
-        return budget.transaction(client, session -> marker(session, budget));
+        return budget.transaction(client, session -> {
+            if (verifyKeyMaterial != null) return marker(session, budget);
+            requireActive.run();
+            budget.remainingMillis();
+            var stages = MongoStartConfigRead.root();
+            stages.add(new Document("$project", new Document("clusterId", 1).append("layoutId", 1)));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.CLUSTER_KEYS, "key", "cluster",
+                    new Document("keyId", 1)));
+            var bounded = new Document("_id", 1).append("value", MongoStartConfigRead.boundedValue());
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.SCHEMA_MIGRATIONS, "schema", "config", bounded));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.CONFIGURATION_VERSION, "version", ConfigurationVersion.ID, bounded));
+            var row = MongoStartConfigRead.snapshot(database, session, stages);
+            if (row == null || !"cluster".equals(row.get("_id"))) return marker(session, budget);
+            var keys = MongoStartConfigRead.row(row, "key", "cluster").orElse(null);
+            var schema = MongoStartConfigRead.boundedRow(row, "schema", "config");
+            var counter = MongoStartConfigRead.boundedRow(row, "version", ConfigurationVersion.ID);
+            if (keys == null || schema == null || counter == null) return marker(session, budget);
+            if (!clusterId.equals(row.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(row.get("layoutId")))
+                throw unreadable("identity");
+            if (!keyId.equals(keys.get("keyId"))) throw unreadable("key-binding");
+            requireConfigVersion(schema);
+            return verifyAuthorityState(schema, counter, clusterId, keyId);
+        });
     }
 
     Document loadVerifiedMarker(MongoReadBudget budget) {
@@ -343,11 +365,15 @@ final class MongoAlertStorageSchema {
         if (verifyKeyMaterial == null) keys = keyQuery.projection(new Document("keyId", 1)).first();
         if (keys == null || !keyId.equals(keys.get("keyId"))) { throw unreadable("key-binding"); }
         Document schema = SystemCollections.SCHEMA_MIGRATIONS.on(reads).find(session, new Document("_id", "config")).first();
-        if (schema == null || !(schema.get("installedVersion") instanceof Integer installed)
-                || installed < 1 || installed > MongoConfigurationDomain.SCHEMA_VERSION) { throw unreadable("config-version"); }
+        requireConfigVersion(schema);
         Document counter = SystemCollections.CONFIGURATION_VERSION.on(reads)
                 .find(session, new Document("_id", ConfigurationVersion.ID)).first();
         return verifyAuthorityState(schema, counter, clusterId, keyId);
+    }
+
+    private static void requireConfigVersion(Document schema) {
+        if (schema == null || !(schema.get("installedVersion") instanceof Integer installed)
+                || installed < 1 || installed > MongoConfigurationDomain.SCHEMA_VERSION) throw unreadable("config-version");
     }
 
     /** Load-only validation also runs on ordinary CONFIG reopen; it never reenrolls missing facts. */
