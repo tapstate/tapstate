@@ -56,12 +56,7 @@ def artifact(repository, source, name, filename):
         return {}
     item = candidates[0]
     path = f"repos/{repository}/actions/artifacts/{item['id']}/zip"
-    try:
-        archive = subprocess.check_output(["gh", "api", path], stderr=subprocess.PIPE, timeout=60)
-    except subprocess.CalledProcessError as error:
-        if has_http_status(error, 410):
-            return {}
-        raise
+    archive = subprocess.check_output(["gh", "api", path], stderr=subprocess.PIPE, timeout=60)
     if len(archive) > ARTIFACT_LIMIT or item.get("digest") != f"sha256:{sha256(archive).hexdigest()}":
         return {}
     try:
@@ -82,6 +77,25 @@ def report_removed_after_rerun(repository, run_id):
     jobs = api(repository, f"runs/{run_id}/attempts/1/jobs?per_page=100")["jobs"]
     return any(step["name"] == "Upload the report" and step["conclusion"] == "success"
                for job in jobs if job["name"] == "report" for step in job["steps"])
+
+
+def read_scheduled_report(repository, source, rerun):
+    run_id = source["id"]
+    try:
+        report = artifact(repository, source, REPORT_NAME, "report.json")
+    except subprocess.CalledProcessError as error:
+        gone = has_http_status(error, 410)
+        if not gone and not has_http_status(error, 404):
+            raise
+        # The archive can disappear after both the run and artifact inventories were read.
+        rerun = rerun or api(repository, f"runs/{run_id}")["run_attempt"] > 1
+        if rerun and report_removed_after_rerun(repository, run_id):
+            return {}, True
+        if gone:
+            return {}, False
+        raise
+    removed = not report and rerun and report_removed_after_rerun(repository, run_id)
+    return report, removed
 
 
 def latest_artifact(repository, branch, name):
@@ -172,18 +186,19 @@ def prepare(output, repository, branch, *, now=None):
     # The attempt's original status and timestamps survive later reruns of the workflow.
     rerun_ids = {run["id"] for run in runs if run["run_attempt"] > 1}
     candidates = [first_attempt(repository, run) for run in runs]
-    reports = {}
-    observed = actions_health.observations(now, nightlies, candidates, reports)
-    for observation in observed:
-        performance = observation["performance"]
-        if observation["status"] == "report-missing":
-            reports[performance["id"]] = artifact(repository, performance, REPORT_NAME, "report.json")
+    reports, removed_reports = {}, set()
     observed = actions_health.observations(now, nightlies, candidates, reports)
     for observation in observed:
         if observation["status"] == "report-missing":
-            run_id = observation["performance"]["id"]
-            if run_id in rerun_ids and not reports[run_id] and report_removed_after_rerun(repository, run_id):
-                observation["status"] = "report-removed-after-rerun"
+            performance = observation["performance"]
+            run_id = performance["id"]
+            reports[run_id], removed = read_scheduled_report(repository, performance, run_id in rerun_ids)
+            if removed:
+                removed_reports.add(run_id)
+    observed = actions_health.observations(now, nightlies, candidates, reports)
+    for observation in observed:
+        if observation["status"] == "report-missing" and observation["performance"]["id"] in removed_reports:
+            observation["status"] = "report-removed-after-rerun"
     output.mkdir(parents=True)
     check = {"observations": [observe_run(item, now) for item in observed], "cancellation_errors": []}
     for observation in observed:

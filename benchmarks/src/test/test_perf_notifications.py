@@ -452,26 +452,37 @@ class NotificationTest(unittest.TestCase):
                    "workflow_run": {"id": original["id"], "head_sha": original["head_sha"]},
                    "created_at": original["run_started_at"]}
         first_jobs = [{"name": "report", "steps": [{"name": "Upload the report", "conclusion": "success"}]}]
-        for status in (410, 403):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+        for status, rerun_listed, after_download, removed in (
+            (410, True, [], True),
+            (404, True, [], True),
+            (404, False, [later], True),
+            (404, False, [original], False),
+            (404, True, [{"artifacts": [archive]}], False),
+            (403, True, [], False),
+        ):
+            with self.subTest(status=status, rerun_listed=rerun_listed, removed=removed, latest=after_download), \
+                    tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "health"
-                responses = [{"workflow_runs": [nightly]}, {"workflow_runs": [later]}, original,
-                             {"artifacts": [archive]}, {"artifacts": []}, {"jobs": first_jobs}]
+                responses = [{"workflow_runs": [nightly]}, {"workflow_runs": [later if rerun_listed else original]}]
+                if rerun_listed:
+                    responses.append(original)
+                responses.extend([{"artifacts": [archive]}, *after_download])
+                if removed:
+                    responses.extend([{"artifacts": []}, {"jobs": first_jobs}])
                 failure = subprocess.CalledProcessError(1, "gh", stderr=f"gh: failed (HTTP {status})\n".encode())
                 with patch.object(actions_watch, "api", side_effect=responses) as query, \
                         patch.object(actions_watch.subprocess, "check_output", side_effect=failure), \
                         patch.object(actions_watch, "latest_state",
                                      return_value={"active": {}, "updated_at": now.isoformat()}):
-                    if status == 410:
+                    if removed:
                         actions_watch.prepare(output, REPOSITORY, "main", now=now)
-                        self.assertEqual(6, query.call_count)
                         health = catalog.read_json(output / "health.json")
                         self.assertEqual("report-removed-after-rerun", health["status"])
                         self.assertFalse((output / "card.json").exists())
                     else:
                         with self.assertRaises(subprocess.CalledProcessError):
                             actions_watch.prepare(output, REPOSITORY, "main", now=now)
-                        self.assertEqual(4, query.call_count)
+                    self.assertEqual(len(responses), query.call_count)
 
     def test_uncertain_alert_allows_an_independent_alert_and_clears_on_healthy_evidence(self):
         nightly, run, now = scheduled(21)
