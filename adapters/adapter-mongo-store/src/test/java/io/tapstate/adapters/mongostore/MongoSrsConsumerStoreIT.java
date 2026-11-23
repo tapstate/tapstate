@@ -7,6 +7,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsConsumerContext;
+import io.tapstate.spi.store.SrsConsumerStore;
 import io.tapstate.spi.store.SrsConsumerRun;
 import io.tapstate.spi.store.SrsSnapshotPin;
 import io.tapstate.spi.store.SrsModel;
@@ -58,6 +59,97 @@ class MongoSrsConsumerStoreIT {
     private static final String CHAIN = "chain-a";
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
     private static final SrsConsumerContext B = context("pipeline-b", "source-b", 1);
+    @Test void retainedStartupAttachBatchesTheReadAndPreservesCursorAndFence() {
+        withBusiness(f -> {
+            var admitted = new MongoSrsConsumerStore(f.client(), f.database(), SCOPE, () -> {}, () -> {});
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            f.chains().requestTables(CHAIN, Set.of("orders"), f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(
+                    new ChainPosition(SourceOrder.snapshotRow(1), "retained"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"), -1)), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            var tables = Set.of("orders");
+            var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0,
+                    new SrsSnapshotPin(1, "retained", refs), f.fenceA())).isTrue();
+            var before = f.consumers().progress(A).orElseThrow();
+
+            var authority = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var second = authority.advanceExecution(f.pipelineA(), 1, Set.of(f.pipelineA().owner().nodeId())).orElseThrow();
+            var old = new java.util.ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> old.add(name + ":" + collection));
+            try {
+                var observed = admitted.find(A.key()).orElseThrow();
+                admitted.attach(A, observed.revision(), tables, WorkloadClaimFence.from(second)).orElseThrow();
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+
+            var third = authority.advanceExecution(second, 1, Set.of(second.owner().nodeId())).orElseThrow();
+            var currentFence = WorkloadClaimFence.from(third);
+            var commands = new java.util.ArrayList<String>();
+            io.tapstate.spi.store.SrsConsumerMembership attached;
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> commands.add(name + ":" + collection));
+            try {
+                attached = admitted.attachForStartup(A, tables, currentFence).orElseThrow();
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            var after = f.consumers().progress(A).orElseThrow();
+            assertThat(attached.commandFence()).isEqualTo(currentFence);
+            assertThat(after.cursor()).isEqualTo(before.cursor());
+            assertThat(after.snapshot()).isEqualTo(before.snapshot());
+            assertThat(after.revision()).isEqualTo(before.revision());
+            System.out.println("RETAINED_STARTUP_ATTACH before=" + old.size() + " after=" + commands.size()
+                    + " previous=" + old + " captured=" + commands);
+            assertThat(commands.size()).isLessThan(old.size()).isLessThanOrEqualTo(8);
+            assertThat(commands.stream().filter(name -> name.startsWith("commitTransaction")).count()).isOne();
+            assertThat(f.consumers().attachForStartup(A, tables, currentFence)).contains(attached);
+            assertThatThrownBy(() -> f.consumers().attachForStartup(A, tables, WorkloadClaimFence.from(second)))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.consumers().find(A.key())).contains(attached);
+        });
+    }
+
+    @Test void startupAttachRetryDoesNotUndoAConcurrentDetach() {
+        withBusiness(f -> {
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var reader = new MongoSrsConsumerStore(f.client(), f.database(), SCOPE, () -> {}, () -> {});
+            var beforeProof = new CountDownLatch(1);
+            var afterDetach = new CountDownLatch(1);
+            var paused = new java.util.concurrent.atomic.AtomicBoolean();
+            var chainReads = new java.util.concurrent.atomic.AtomicInteger();
+            try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                var start = executor.submit(() -> {
+                    MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                        if ("aggregate".equals(command) && "srs_chains".equals(collection))
+                            chainReads.incrementAndGet();
+                        if ("update".equals(command) && "workload_claims".equals(collection)
+                                && paused.compareAndSet(false, true)) {
+                            beforeProof.countDown();
+                            try {
+                                if (!afterDetach.await(10, TimeUnit.SECONDS))
+                                    throw new AssertionError("Concurrent detach did not complete");
+                            } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                throw new AssertionError(interrupted);
+                            }
+                        }
+                    });
+                    try {
+                        return reader.attachForStartup(A, Set.of("orders", "lines"), f.fenceA());
+                    } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                });
+                try {
+                    assertThat(beforeProof.await(10, TimeUnit.SECONDS)).isTrue();
+                    assertThat(f.consumers().detach(A, member.revision(), f.fenceA())).isPresent();
+                } finally { afterDetach.countDown(); }
+                var result = start.get(10, TimeUnit.SECONDS);
+                assertThat(chainReads.get()).as("the original startup transaction retried").isGreaterThanOrEqualTo(2);
+                assertThat(result).as("startup must preserve the newer detach").isEmpty();
+                assertThat(f.consumers().find(A.key()).orElseThrow().detached()).isTrue();
+                assertThat(f.consumers().progress(A)).isEmpty();
+            }
+        });
+    }
+
     @ParameterizedTest
     @CsvSource({"1,1", "2,8", "2,80"})
     void loadPredictionReadsOnlyOriginalConsumersWithoutPeerOrModelScans(int ownSources, int peers) {
@@ -2322,6 +2414,58 @@ class MongoSrsConsumerStoreIT {
             assertThat(f.consumers().startReadingAfter(A,1,0,arrivals,f.fenceA())).isTrue();
             assertThat(f.consumers().progress(A)).contains(progressed);
             assertThat(cursor(f,B)).isEqualTo(other); assertThat(root(f)).isEqualTo(chain);
+        });
+    }
+
+    @Test void sharedStartupPreparationBatchesTopologyAndPostOpenReadsRemainFresh() {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            var refs = publishSnapshotModels(f, tables);
+            f.chains().requestTables(CHAIN, tables, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "retained"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"), -1)), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "retained", refs), f.fenceA())).isTrue();
+            f.consumers().attach(B, 0, tables, f.fenceB()).orElseThrow();
+            var startup = runtimeConsumer(f.client(), f.database());
+            var before = new ArrayList<String>();
+            SrsConsumerStore.StartupPreparation prepared;
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> before.add(command + ":" + collection));
+            try {
+                prepared = startup.startupPreparation(A, true).orElseThrow();
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(prepared.snapshot().chain()).isEqualTo(f.chains().load(CHAIN).orElseThrow());
+            assertThat(prepared.snapshot().progress()).isEqualTo(f.consumers().progress(A).orElseThrow());
+            assertThat(prepared.topology()).isEqualTo(f.consumers().attached(CHAIN));
+            assertThat(before).hasSize(3);
+            assertThat(before.stream().filter(value -> value.startsWith("commitTransaction:"))).hasSize(1);
+
+            f.chains().openEpoch(CHAIN, 1, f.captureFence()).orElseThrow();
+            var next = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 2, 0);
+            models(f).publishInitial(next, ring("orders"), new SourceTable("orders", List.of(new SourceField("id", "int")),
+                    List.of(), List.of()), f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 2, tables, f.captureFence())).isTrue();
+            var after = new ArrayList<String>();
+            SrsConsumerStore.StartupSnapshot opened;
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> after.add(command + ":" + collection));
+            try {
+                opened = startup.startupSnapshot(A, Map.of("orders", ring("orders"))).orElseThrow();
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(opened.chain().epoch()).isEqualTo(2);
+            assertThat(opened.published()).hasValueSatisfying(models -> assertThat(models.get("orders").key()).isEqualTo(next));
+            assertThat(opened.progress().snapshot().snapshotEpoch()).isOne();
+            assertThat(after.stream().filter(value -> value.startsWith("commitTransaction:"))).isEmpty();
+            System.out.println("CAPTURE_STARTUP_SNAPSHOTS pre=" + before.size() + " post=" + after.size()
+                    + " before=" + before + " after=" + after);
+            var stored = SystemCollections.SRS_MODELS.on(f.database()).findOneAndDelete(new Document("_id", MongoSrsModelStore.key(next)));
+            try {
+                assertThatThrownBy(() -> startup.startupSnapshot(A, Map.of("orders", ring("orders"))))
+                        .isInstanceOf(TapstateException.class);
+            } finally { SystemCollections.SRS_MODELS.on(f.database()).insertOne(stored); }
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).deleteOne(id(B));
+            assertThatThrownBy(() -> startup.startupPreparation(A, true)).isInstanceOf(TapstateException.class);
         });
     }
 

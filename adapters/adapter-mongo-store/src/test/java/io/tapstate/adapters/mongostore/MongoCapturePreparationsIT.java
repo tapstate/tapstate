@@ -581,6 +581,206 @@ class MongoCapturePreparationsIT {
         });
     }
 
+    @Test void retainedSharedStartupSequenceCompletesWithinTwentyTwoMongoCommands() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var original = f.request;
+            var first = f.preparations().createFirst(f.issue(original));
+            var notes = f.configuration.requiredNotes();
+            var noteOwner = new RequiredNoteOwner(f.scope.bindingVersion(), "pdk.chain." + first.preparation().canonicalChainId(),
+                    RequiredNoteOwner.Kind.CHAIN, first.preparation().canonicalChainId(), 0);
+            notes.prepareOrigin(notes.open(noteOwner), new RequiredNoteOrigin("mysql", "a".repeat(64), new byte[]{1}));
+            var claims = f.claims();
+            var owned = claims.acquire(first.claim().key(), OWNER, 1, TTL).claim();
+            var captureFence = WorkloadClaimFence.from(owned);
+            var stores = f.domain.runtimeSrs(f.scope, ACTIVE);
+            var chain = first.preparation().chainId();
+            var tables = Set.of("orders");
+            stores.chains().requestTables(chain, tables, captureFence);
+            stores.chains().openEpoch(chain, 0, captureFence).orElseThrow();
+            var model = new SrsModelKey(chain, "orders", f.scope.cacheIncarnation(), 1, 0);
+            stores.models().publish(new SrsModel(model, "srs." + chain + ".orders", new SourceTable("orders",
+                    List.of(new SourceField("id", "integer")), List.of("id"), List.of()), 0), captureFence);
+            assertThat(stores.chains().publishServingTables(chain, 1, tables, captureFence)).isTrue();
+            var checkpoint = new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(
+                    new io.tapstate.core.event.SourceOrder(1, 0), "retained-position"), Map.of("orders", new SrsTableCheckpoint(model, -1)));
+            stores.chains().checkpoint(chain, 0, checkpoint, captureFence).orElseThrow();
+            var consumer = new SrsConsumerContext(new SrsConsumerKey(chain, original.pipeline().pipelineId(),
+                    original.sourceId()), original.pipeline().stateGeneration());
+            var oldMember = stores.consumers().attach(consumer, 0, tables, original.originalPipeline()).orElseThrow();
+            var before = stores.consumers().progress(consumer).orElseThrow();
+            var next = claims.advanceExecution(claims.readPipeline(original.pipeline()).orElseThrow().claim(),
+                    1, Set.of(OWNER.nodeId())).orElseThrow();
+            var nextFence = WorkloadClaimFence.from(next);
+            var startup = new CapturePreparationRequest(original.pipeline(), nextFence, original.originalNode(),
+                    original.sourceId(), original.inputs());
+            assertThat(claims.release(owned)).isTrue();
+
+            var commands = new ArrayList<String>();
+            var boundaries = new ArrayList<Integer>();
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> commands.add(name + ":" + collection));
+            try {
+                var config = f.configuration.capturePreparations();
+                var issued = config.issueForStartup(startup, first.preparation().canonicalChainId());
+                assertThat(issued).isEqualTo(new CaptureCreationResult.AlreadyIssued(first.preparation()));
+                boundaries.add(commands.size());
+                assertThat(f.preparations().load(first.preparation()).chain()).hasValueSatisfying(state ->
+                        assertThat(state.checkpoint()).isEqualTo(checkpoint));
+                boundaries.add(commands.size());
+                assertThat(f.configuration.retainedCaptureSourceBinding(startup.sourceId())).hasValueSatisfying(identity ->
+                        assertThat(identity.contentHash()).isEqualTo(startup.inputs().sourceHashes().get(startup.sourceId())));
+                boundaries.add(commands.size());
+                assertThat(claims.acquire(first.claim().key(), OWNER, 1, TTL).acquired()).isTrue();
+                boundaries.add(commands.size());
+                assertThat(config.inspectSharedHistory(first.preparation(), startup.sourceId(),
+                        startup.inputs().sourceHashes().get(startup.sourceId())).preparation()).isEqualTo(first.preparation());
+                boundaries.add(commands.size());
+                var member = stores.consumers().attachForStartup(consumer, tables, nextFence).orElseThrow();
+                assertThat(member.commandFence()).isEqualTo(nextFence);
+                assertThat(member.revision()).isEqualTo(oldMember.revision() + 1);
+                boundaries.add(commands.size());
+                assertThat(f.domain.snapshotStates(startup.pipeline(), nextFence, ACTIVE).startupOrder()).isZero();
+                boundaries.add(commands.size());
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(stores.consumers().progress(consumer).orElseThrow().cursor()).isEqualTo(before.cursor());
+            var counts = new ArrayList<Integer>();
+            int previous = 0;
+            for (int boundary : boundaries) {
+                counts.add(boundary - previous);
+                previous = boundary;
+            }
+            System.out.println("RETAINED_STARTUP_SEQUENCE commands=" + commands.size() + " counts=" + counts + " trace=" + commands);
+            assertThat(commands.size()).isLessThanOrEqualTo(22);
+        });
+    }
+
+    @Test void retainedCaptureStartupMeasuresAllThreeStagesAndPreservesSnapshotResume() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var prepared = f.preparations().createFirst(f.issue(f.request)).preparation();
+            var claims = f.claims();
+            var captureKey = new WorkloadClaimKey(f.scope.clusterId(), WorkloadClaimType.CAPTURE, prepared.captureId());
+            var firstOwner = claims.acquire(captureKey, OWNER, 1, TTL).claim();
+            var firstFence = WorkloadClaimFence.from(firstOwner);
+            var stores = f.domain.runtimeSrs(f.scope, ACTIVE);
+            var registry = f.domain.connectors(f.scope, ACTIVE);
+            var registration = registry.register("mysql", "1", RegistrationSource.SEED, new byte[]{1,2,3}).registration();
+            var notes = f.configuration.requiredNotes();
+            var owner = new RequiredNoteOwner(f.scope.bindingVersion(), "pdk.chain." + prepared.canonicalChainId(),
+                    RequiredNoteOwner.Kind.CHAIN, prepared.canonicalChainId(), 0);
+            var global = new RequiredNoteOwner(f.scope.bindingVersion(), "pdk.global-state",
+                    RequiredNoteOwner.Kind.GLOBAL, f.scope.clusterId(), 0);
+            var origin = new RequiredNoteOrigin("mysql", registration.contentHash(), new byte[]{1});
+            notes.prepareOrigin(notes.open(owner), origin);
+            var chain = prepared.chainId();
+            var tables = Set.of("orders");
+            var ring = "srs." + chain + ".orders";
+            var schema = new SourceTable("orders", List.of(new SourceField("id", "integer")), List.of("id"), List.of());
+            stores.chains().openServingEpoch(chain, 0, tables, firstFence).orElseThrow();
+            var oldModel = new SrsModelKey(chain, "orders", f.scope.cacheIncarnation(), 1, 0);
+            stores.models().publish(new SrsModel(oldModel, ring, schema, 0), firstFence);
+            var checkpoint = new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(
+                    io.tapstate.core.event.SourceOrder.snapshotRow(1), "retained-position"),
+                    Map.of("orders", new SrsTableCheckpoint(oldModel, -1)), true);
+            stores.chains().checkpoint(chain, 0, checkpoint, firstFence).orElseThrow();
+            var consumer = new SrsConsumerContext(new SrsConsumerKey(chain, f.request.pipeline().pipelineId(),
+                    f.request.sourceId()), f.request.pipeline().stateGeneration());
+            var retained = stores.consumers().attach(consumer, 0, tables, f.request.originalPipeline()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "retained-position", Map.of("orders", oldModel));
+            assertThat(stores.consumers().pinSnapshot(consumer, retained.revision(), 0, pin, f.request.originalPipeline())).isTrue();
+            var retainedProgress = stores.consumers().progress(consumer).orElseThrow();
+            var next = claims.advanceExecution(claims.readPipeline(f.request.pipeline()).orElseThrow().claim(),
+                    1, Set.of(OWNER.nodeId())).orElseThrow();
+            var nextFence = WorkloadClaimFence.from(next);
+            var request = new CapturePreparationRequest(f.request.pipeline(), nextFence, f.request.originalNode(),
+                    f.request.sourceId(), f.request.inputs());
+            assertThat(claims.release(firstOwner)).isTrue();
+
+            var commands = new ArrayList<String>();
+            var counts = new ArrayList<Integer>();
+            var newModel = new SrsModelKey(chain, "orders", f.scope.cacheIncarnation(), 2, 0);
+            WorkloadClaimFence fence;
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> commands.add(name + ":" + collection));
+            try {
+                var config = f.configuration.capturePreparations();
+                assertThat(config.issueForStartup(request, prepared.canonicalChainId()))
+                        .isEqualTo(new CaptureCreationResult.AlreadyIssued(prepared));
+                assertThat(f.preparations().load(prepared).chain()).hasValueSatisfying(state ->
+                        assertThat(state.checkpoint()).isEqualTo(checkpoint));
+                var sourceHash = request.inputs().sourceHashes().get(request.sourceId());
+                assertThat(f.configuration.retainedCaptureSourceBinding(request.sourceId())).hasValueSatisfying(identity ->
+                        assertThat(identity.contentHash()).isEqualTo(sourceHash));
+                var acquired = claims.acquire(captureKey, OWNER, 1, TTL);
+                assertThat(acquired.acquired()).isTrue();
+                fence = WorkloadClaimFence.from(acquired.claim());
+                assertThat(config.inspectSharedHistory(prepared, request.sourceId(), sourceHash).preparation()).isEqualTo(prepared);
+                var attachment = stores.consumers().attachAndPrepareForStartup(consumer, tables, nextFence).orElseThrow();
+                var member = attachment.member();
+                assertThat(member.commandFence()).isEqualTo(nextFence);
+                assertThat(member.revision()).isEqualTo(retained.revision() + 1);
+                assertThat(f.domain.snapshotStates(request.pipeline(), nextFence, ACTIVE).startupOrder()).isZero();
+                counts.add(commands.size());
+
+                var before = attachment.preparation().orElseThrow();
+                assertThat(before.topology().consumers()).containsExactly(member);
+                assertThat(before.snapshot().progress().cursor()).isEqualTo(retainedProgress.cursor());
+                assertThat(before.snapshot().progress().snapshot()).isEqualTo(pin);
+                counts.add(commands.size());
+                assertThat(f.configuration.cacheRecoveries().readForCaptureStartup(f.request.pipeline().pipelineId())).isEmpty();
+                var scopes = notes.openCaptureScopes(owner, global);
+                assertThat(registry.findAllForCaptureStartup("mysql")).containsExactly(registration);
+                assertThat(notes.prepareSharedOrigin(scopes.primary(), origin)).isEqualTo(origin);
+                counts.add(commands.size());
+                var opened = stores.chains().openServingEpochForStartup(chain, before.snapshot().chain().epoch(),
+                        before.snapshot().chain().consumerRevision(), tables, fence).orElseThrow();
+                assertThat(opened.epoch()).isEqualTo(2);
+                counts.add(commands.size());
+                assertThat(registry.findAllForCaptureStartup("mysql")).containsExactly(registration);
+                assertThat(notes.sharedStartup(scopes.primary()).origin()).isEqualTo(origin);
+                counts.add(commands.size());
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            // These writes represent the physical tail publishing the new epoch before the startup reader resumes.
+            stores.models().publish(new SrsModel(newModel, ring, schema, 0), fence);
+            var current = new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(
+                    io.tapstate.core.event.SourceOrder.snapshotRow(2), "current-position"),
+                    Map.of("orders", new SrsTableCheckpoint(newModel, -1)), true);
+            stores.chains().checkpoint(chain, 1, current, fence).orElseThrow();
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> commands.add(name + ":" + collection));
+            try {
+                var after = stores.consumers().startupSnapshot(consumer, Map.of("orders", ring)).orElseThrow();
+                assertThat(after.chain().epoch()).isEqualTo(2);
+                assertThat(after.published().orElseThrow().get("orders").key()).isEqualTo(newModel);
+                assertThat(after.progress().snapshot()).isEqualTo(pin);
+                counts.add(commands.size());
+                // The runtime receives this exact retained progress and uses its revision for the pin.
+                assertThat(after.progress().cursor()).isEqualTo(retainedProgress.cursor());
+                assertThat(after.progress().membershipRevision()).isEqualTo(retained.revision() + 1);
+                counts.add(commands.size());
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            int previous = 0;
+            for (int index = 0; index < counts.size(); index++) {
+                int boundary = counts.get(index);
+                counts.set(index, boundary - previous);
+                previous = boundary;
+            }
+            int admission = counts.getFirst();
+            int resume = counts.getLast();
+            int source = commands.size() - admission - resume;
+            var legacy = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> legacy.add(name + ":" + collection));
+            try {
+                assertThat(stores.consumers().progress(consumer).orElseThrow().snapshot()).isEqualTo(pin);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            System.out.println("CAPTURE_STORAGE_SEQUENCE total=" + commands.size() + " stages=" + List.of(admission, source, resume)
+                    + " counts=" + counts + " trace=" + commands + " legacyResume=" + legacy);
+            assertThat(admission).isLessThanOrEqualTo(19);
+            assertThat(source).isLessThanOrEqualTo(17);
+            assertThat(resume).isZero();
+            assertCode(() -> stores.consumers().snapshotResumeProgress(
+                    new SrsConsumerContext(consumer.key(), consumer.stateGeneration() + 1)), IoError.SRS_CONSUMER_UNAVAILABLE);
+            SystemCollections.SRS_MODELS.on(f.cache).deleteOne(new Document("_id", MongoSrsModelStore.key(oldModel)));
+            assertThatThrownBy(() -> stores.consumers().snapshotResumeProgress(consumer)).isInstanceOf(TapstateException.class);
+        });
+    }
+
     @Test void preparedCaptureAdmissionUsesFourCommandsAndKeepsOwnershipAndHistoryFences() {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var first = f.preparations().createFirst(f.issue(f.request));

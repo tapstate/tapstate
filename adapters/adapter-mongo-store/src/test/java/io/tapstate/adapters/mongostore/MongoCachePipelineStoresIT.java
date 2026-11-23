@@ -56,6 +56,57 @@ class MongoCachePipelineStoresIT {
     private static final Runnable ACTIVE = () -> {};
     private static final Instant AT = Instant.parse("2026-10-18T00:00:00Z");
 
+    @Test void sharedStartupOrderReadsFreshLeaseAndCounterInOneCommand() {
+        withFixture(f -> {
+            try (var session = f.admin().startSession()) {
+                SystemCollections.CACHE_SNAPSHOT_ORDERS.prepareCollectionOn(f.database(), session);
+                MongoSnapshotStateStore.seedInitial(session, f.database(), SCOPE);
+            }
+            var commands = new ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                commands.clear();
+                var store = new MongoSnapshotStateStore(new MongoCachePipelineAccess(observed,
+                        observed.getDatabase(f.database().getName()), SCOPE, f.fence(), ACTIVE));
+                assertThat(store.startupOrder()).isZero();
+                assertThat(commands).containsExactly("aggregate");
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                        new Document("$set", new Document("leaseUntil", new java.util.Date(0))));
+                assertCode(store::startupOrder, IoError.WORKLOAD_CLAIM_FENCED);
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                        new Document("$set", new Document("leaseUntil", new java.util.Date(System.currentTimeMillis() + 30000))
+                                .append("ownerBootId", "other-boot")));
+                assertCode(store::startupOrder, IoError.WORKLOAD_CLAIM_FENCED);
+            }
+        });
+    }
+
+    @Test void sharedStartupOrderRequiresTheOriginalLiveNodeForANodeBackedPipeline() {
+        withFixture(f -> {
+            try (var session = f.admin().startSession()) {
+                SystemCollections.CACHE_SNAPSHOT_ORDERS.prepareCollectionOn(f.database(), session);
+                MongoSnapshotStateStore.seedInitial(session, f.database(), SCOPE);
+            }
+            var owner = new WorkloadOwner(SCOPE.clusterId(), "node-backed-boot");
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, owner.nodeId());
+            var node = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()))
+                    .acquire(key, owner, 1, Duration.ofSeconds(30)).claim();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                    new Document("$set", new Document("ownerNodeId", owner.nodeId()).append("ownerBootId", owner.bootId())
+                            .append("leaseUntil", new java.util.Date(-1)).append(MongoWorkloadClaimStore.NODE_LEASE_GENERATION, node.claimGeneration())));
+            var original = new WorkloadClaimFence(KEY, owner, f.fence().claimGeneration(),
+                    f.fence().executionGeneration(), f.fence().topologyRevision());
+            var store = new MongoSnapshotStateStore(new MongoCachePipelineAccess(f.admin(), f.database(), SCOPE, original, ACTIVE));
+            assertThat(store.startupOrder()).isZero();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(key)),
+                    new Document("$set", new Document("leaseUntil", new java.util.Date(0))));
+            assertCode(store::startupOrder, IoError.WORKLOAD_CLAIM_FENCED);
+        });
+    }
+
     @Test void preparedMetadataReadsKeepTheSameSnapshotAndWriteFences() {
         withFixture(f -> {
             var commands = new java.util.ArrayList<String>();

@@ -16,6 +16,50 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
     @Override public long order() {
         return access.stateTransaction(false,session -> { access.verifyOriginalClaim(session, true); return order(session,access.database,access.scope).getLong("order"); });
     }
+    @Override public long startupOrder() {
+        var original = access.originalClaim();
+        if (original == null) throw fenced();
+        var claimId = MongoWorkloadClaimStore.id(original.key());
+        var nodeKey = new WorkloadClaimKey(original.key().clusterId(), WorkloadClaimType.NODE_SESSION, original.owner().nodeId());
+        var nodeId = MongoWorkloadClaimStore.id(nodeKey);
+        var orderId = id(access.scope);
+        var captured = access.startupSnapshot(List.of(
+                new Document("$match", new Document("_id", "cluster")),
+                new Document("$project", new Document("identity", "$$ROOT").append("now", "$$NOW")),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_PIPELINE_STATE, "state", access.scope.pipelineId()),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", claimId),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "node", nodeId),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SNAPSHOT_ORDERS, "order", orderId)));
+        if (captured == null || !"cluster".equals(captured.get("identity", Document.class).get("_id"))
+                || MongoCaptureStartupRows.get(captured, "schema") == null
+                || MongoCaptureStartupRows.get(captured, "state") == null
+                || MongoCaptureStartupRows.get(captured, "claim") == null
+                || MongoCaptureStartupRows.get(captured, "order") == null
+                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
+                || MongoCaptureStartupRows.ambiguous(captured, "state", access.scope.pipelineId())
+                || MongoCaptureStartupRows.ambiguous(captured, "claim", claimId)
+                || MongoCaptureStartupRows.ambiguous(captured, "node", nodeId)
+                || MongoCaptureStartupRows.ambiguous(captured, "order", orderId)) return order();
+        MongoCacheBusinessIdentity.requireObservedAdmission(captured.get("identity", Document.class),
+                MongoCaptureStartupRows.get(captured, "schema"), business());
+        access.validateState(MongoCaptureStartupRows.get(captured, "state"));
+        var claim = MongoCaptureStartupRows.get(captured, "claim");
+        access.requirePreparedClaim(claim);
+        var decoded = MongoWorkloadClaimStore.decodeStrict(claim);
+        if (!original.equals(WorkloadClaimFence.from(decoded))) throw fenced();
+        var now = captured.getDate("now").toInstant();
+        if (MongoWorkloadClaimStore.nodeBacked(claim)) {
+            var node = MongoCaptureStartupRows.get(captured, "node");
+            if (node == null || !MongoWorkloadClaimStore.canUseNodeLease(original)) throw fenced();
+            var decodedNode = MongoWorkloadClaimStore.decodeStrict(node);
+            if (!(claim.get(MongoWorkloadClaimStore.NODE_LEASE_GENERATION) instanceof Long generation)
+                    || generation < 1 || !nodeKey.equals(decodedNode.key()) || !original.owner().equals(decodedNode.owner())
+                    || generation != decodedNode.claimGeneration() || !decodedNode.leaseUntil().isAfter(now)) throw fenced();
+        } else if (!decoded.leaseUntil().isAfter(now)) throw fenced();
+        return validatedOrder(MongoCaptureStartupRows.get(captured, "order"), access.scope).getLong("order");
+    }
+
     @Override public long advanceOrder(long expected,long floor,Map<String,CaptureCacheState> originals) {
         counter(expected); counter(floor); var captures = Map.copyOf(originals);
         return access.stateTransaction(true,session -> {
@@ -87,7 +131,11 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
                 || SystemCollections.CACHE_SNAPSHOT_COUNTS.on(database).find(session,new Document("_id.scope",id(scope))).first()!=null) throw unreadable();
     }
     static Document order(ClientSession session,MongoDatabase database,PipelineIntentScope scope) {
-        var row = SystemCollections.CACHE_SNAPSHOT_ORDERS.on(database).find(session,new Document("_id",id(scope))).first();
+        return validatedOrder(SystemCollections.CACHE_SNAPSHOT_ORDERS.on(database)
+                .find(session, new Document("_id", id(scope))).first(), scope);
+    }
+
+    private static Document validatedOrder(Document row, PipelineIntentScope scope) {
         try {
             if (row==null || !row.keySet().equals(Set.of("_id","formatVersion","order","previousOrder","retainedFloor","command","captures"))
                     || !id(scope).equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion"))

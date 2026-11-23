@@ -132,14 +132,29 @@ public final class MongoSrsChainStore implements SrsChainStore {
         }));
     }
     @Override public Optional<SrsChainState> openServingEpoch(String chain, long expectedEpoch, Set<String> tables, WorkloadClaimFence fence) {
+        return openServingEpoch(chain, expectedEpoch, OptionalLong.empty(), tables, fence);
+    }
+
+    @Override public Optional<SrsChainState> openServingEpochForStartup(String chain, long expectedEpoch,
+            long expectedConsumerRevision, Set<String> tables, WorkloadClaimFence fence) {
+        if (expectedConsumerRevision < 0) throw new IllegalArgumentException("invalid expected consumer revision");
+        return openServingEpoch(chain, expectedEpoch, OptionalLong.of(expectedConsumerRevision), tables, fence);
+    }
+
+    private Optional<SrsChainState> openServingEpoch(String chain, long expectedEpoch, OptionalLong expectedConsumerRevision,
+            Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain);
         if (expectedEpoch < 0 || expectedEpoch >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected capture epoch");
         Set<String> captured = tables(tables);
-        return changingChain(() -> transaction(session -> {
+        return changingChain(() -> transaction(!expectedConsumerRevision.isPresent(), session -> {
+            Document capturedRoot = expectedConsumerRevision.isPresent() ? startupRoot(session, chain) : null;
             prove(session, fence);
-            Document row = requireRoot(session, chain);
+            Document row = capturedRoot == null ? requireRoot(session, chain) : capturedRoot;
+            MongoSrsRecoveryControls.requireOrdinary(row);
             requireCapture(row, fence);
-            var held = state(session, row);
+            var held = expectedConsumerRevision.isPresent() ? startupState(session, row, true) : state(session, row);
+            if (expectedConsumerRevision.isPresent() && held.consumerRevision() != expectedConsumerRevision.getAsLong())
+                return Optional.empty();
             var requested = new TreeSet<>(held.requestedTables());
             requested.addAll(captured);
             long epoch = expectedEpoch + 1;
@@ -157,6 +172,23 @@ public final class MongoSrsChainStore implements SrsChainStore {
             replace(session, row, replacement);
             return Optional.of(decode(replacement));
         }));
+    }
+
+    private Document startupRoot(ClientSession session, String chain) {
+        var captured = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                new Document("$match", new Document("_id", "cluster")),
+                new Document("$project", new Document("identity", "$$ROOT")),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
+                MongoCaptureStartupRows.lookup(SystemCollections.SRS_CHAINS, "chain", chain))).first();
+        if (captured == null || !"cluster".equals(captured.get("identity", Document.class).get("_id"))
+                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
+                || MongoCaptureStartupRows.ambiguous(captured, "chain", chain)) {
+            new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+            return null;
+        }
+        MongoCacheBusinessIdentity.requireObservedReady(captured.get("identity", Document.class),
+                MongoCaptureStartupRows.get(captured, "schema"), scope);
+        return MongoCaptureStartupRows.get(captured, "chain");
     }
 
     @Override public boolean publishServingTables(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
@@ -408,13 +440,17 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private static List<String> sorted(Set<String> tables) { return new ArrayList<>(new TreeSet<>(tables)); }
     private static void requireName(String chain) { if (chain == null || chain.isBlank()) throw new IllegalArgumentException("blank mining chain"); }
     private <T> T transaction(Function<ClientSession, T> action) {
+        return transaction(true, action);
+    }
+    private <T> T transaction(boolean validateBusiness, Function<ClientSession, T> action) {
         return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
                 requireActive.run();
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> {
                         MongoStructureFailureScope.beginCallback();
-                        requireActive.run(); requireStructure.run(); requireActive.run(); new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+                        requireActive.run(); requireStructure.run(); requireActive.run();
+                        if (validateBusiness) new MongoCacheBusinessIdentity(database, scope).requireReady(session);
                         T result = action.apply(session); requireActive.run(); return result;
                     }, TRANSACTION);
                 }

@@ -44,7 +44,7 @@ public final class SrsSnapshotPreparation implements AutoCloseable {
         this.consumers = stores.consumers().guardedBy(this::requireUsable); this.models = stores.models().guardedBy(this::requireUsable);
         if (retained != null && freshFull != null) throw unavailable();
         this.original = retained != null ? retained : (freshFull == null
-                ? consumers.progress(run.context()) : consumers.progress(run.context())).orElseThrow(this::unavailable);
+                ? consumers.snapshotResumeProgress(run.context()) : consumers.progress(run.context())).orElseThrow(this::unavailable);
         requireUsable();
         if (!original.context().equals(run.context()) || original.membershipRevision() != run.membershipRevision()
                 || !original.cursor().perTableSeq().keySet().containsAll(this.tableRings.keySet())) throw unavailable();

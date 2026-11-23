@@ -112,6 +112,22 @@ public interface SrsConsumerStore {
         throw new UnsupportedOperationException("Capture startup sampling is not supported");
     }
 
+    /** The same pre-open read supplies this consumer's progress and the shared table demand. */
+    record StartupPreparation(StartupSnapshot snapshot, SrsConsumerTopology topology) {}
+
+    default Optional<StartupPreparation> startupPreparation(SrsConsumerContext context, boolean verifyControlClosure) {
+        return startupSnapshot(context, Map.of(), verifyControlClosure).map(snapshot ->
+                new StartupPreparation(snapshot, attachedWithChain(context.key().miningChainId()).topology()));
+    }
+
+    record StartupAttachment(SrsConsumerMembership member, Optional<StartupPreparation> preparation) {}
+
+    /** A store may return the validated topology and retained progress from its committed attach. */
+    default Optional<StartupAttachment> attachAndPrepareForStartup(SrsConsumerContext context, Set<String> tables,
+            WorkloadClaimFence fence) {
+        return attachForStartup(context, tables, fence).map(member -> new StartupAttachment(member, Optional.empty()));
+    }
+
     /** The first source on a shared chain also verifies its complete membership control closure. */
     default Optional<StartupSnapshot> startupSnapshot(SrsConsumerContext context, Map<String, String> ringsByTable,
             boolean verifyControlClosure) {
@@ -130,6 +146,11 @@ public interface SrsConsumerStore {
     default Optional<ConsumerOffset> observationCursor(SrsConsumerContext context) { return cursor(context); }
 
     Optional<SrsConsumerProgress> progress(SrsConsumerContext context);
+
+    /** Reads the current consumer progress and validates any retained snapshot pin for startup. */
+    default Optional<SrsConsumerProgress> snapshotResumeProgress(SrsConsumerContext context) {
+        return progress(context);
+    }
 
     /** An implementation may validate one event's original consumer and model in one guarded read. */
     default boolean supportsReadEventVerification() { return false; }
@@ -193,6 +214,15 @@ public interface SrsConsumerStore {
                                 WorkloadClaimFence originalPipelineFence);
 
     /** Uses the original expected relation revision and Pipeline claim; existing progress is preserved. */
+    /** Reads or attaches the original retained consumer under this Start's execution fence. */
+    default Optional<SrsConsumerMembership> attachForStartup(SrsConsumerContext context, Set<String> tables,
+            WorkloadClaimFence fence) {
+        var held = find(context.key());
+        return held.filter(member -> !member.detached() && member.context().equals(context)
+                && member.tables().equals(tables) && member.commandFence().equals(fence))
+                .or(() -> attach(context, held.map(SrsConsumerMembership::revision).orElse(0L), tables, fence));
+    }
+
     Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables,
                                           WorkloadClaimFence originalPipelineFence);
 

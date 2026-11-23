@@ -84,6 +84,17 @@ final class MongoCachePipelineAccess {
 
     <T> T transaction(Function<ClientSession, T> action) { return transaction(TRANSACTION, action); }
 
+    Document startupSnapshot(List<Document> stages) {
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            requireActive.run();
+            var selected = database.withReadPreference(com.mongodb.ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
+            Document result = SystemCollections.CACHE_IDENTITY.on(selected).aggregate(stages).first();
+            requireActive.run();
+            return result;
+        }));
+    }
+
     MongoPipelineProofFacts.SinkReceipt sinkReceipt(Document receiptId) {
         if (original == null || unpreparedModels || authoringModels != null || !MongoBindingReadFacts.supported(client)
                 || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
@@ -484,6 +495,24 @@ final class MongoCachePipelineAccess {
         if (row == null) return null;
         var rows = row.getList(field, Document.class);
         return rows.isEmpty() ? null : rows.getFirst().get("value", Document.class);
+    }
+
+    /** Startup already admitted this CACHE snapshot; reads the original prepared state and claim together. */
+    Document stateForStartupAttach(ClientSession session) {
+        var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION,
+                scope.pipelineId());
+        var id = MongoWorkloadClaimStore.id(key);
+        var captured = SystemCollections.CACHE_PIPELINE_STATE.on(database).aggregate(session, List.of(
+                new Document("$match", new Document("_id", scope.pipelineId())),
+                new Document("$project", new Document("state", "$$ROOT")),
+                startLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", id))).first();
+        if (captured == null) return state(session, true);
+        var state = captured.get("state", Document.class);
+        if (!scope.pipelineId().equals(state.get("_id")) || needsStartLookupFallback(captured, "claim", id))
+            return state(session, true);
+        validateState(state);
+        requirePreparedClaim(session, startDocument(captured, "claim"));
+        return state;
     }
 
     Document state(ClientSession session) {

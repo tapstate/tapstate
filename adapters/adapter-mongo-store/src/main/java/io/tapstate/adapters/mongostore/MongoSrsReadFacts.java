@@ -5,6 +5,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.SrsModelKey;
+import io.tapstate.spi.store.SrsSnapshotPin;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
@@ -108,6 +109,20 @@ final class MongoSrsReadFacts {
                     new Document("_id", MongoSrsLogStore.boundsId(ring)), false);
         }
         prefetchStartupProofs(root, requested);
+    }
+
+    void prefetchSnapshotReferences(Document root, SrsSnapshotPin pin) {
+        requireSession(session, database);
+        if (pin == null || pin.models().size() > 8) return;
+        var requested = new java.util.LinkedHashMap<Lookup, Query>();
+        for (var key : pin.models().values()) {
+            if (!key.miningChainId().equals(root.get("_id")) || !key.cacheIncarnation().equals(scope.cacheIncarnation())) return;
+            addQuery(requested, SystemCollections.SRS_MODEL_CONTEXTS,
+                    new Document("_id", MongoSrsModelContexts.contextId(key)), false);
+            addQuery(requested, SystemCollections.SRS_MODELS,
+                    new Document("_id", MongoSrsModelStore.key(key)), false);
+        }
+        if (requested.size() > 1) prefetchStartupProofs(root, requested);
     }
 
     private void prefetchStartupProofs(Document root, Map<Lookup, Query> requested) {

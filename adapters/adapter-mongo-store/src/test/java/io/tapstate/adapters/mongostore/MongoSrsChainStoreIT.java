@@ -293,6 +293,40 @@ class MongoSrsChainStoreIT {
     }
 
     @Test
+    void startupEpochBatchesCheckpointProofAndFencesConsumedTopologyRevision() {
+        withBusiness(f -> {
+            prepare(f, Set.of(ORDERS));
+            var saved = checkpoint(1, SourceOrder.SNAPSHOT_SEQ, "startup-cut", Map.of(ORDERS, -1L));
+            f.chains().checkpoint(CHAIN, 0, saved, f.fence()).orElseThrow();
+            var original = root(f);
+            long previousConsumerRevision = original.getLong("consumerRevision");
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document("_id", CHAIN),
+                    new Document("$inc", new Document("consumerRevision", 1L)));
+            var current = root(f);
+            assertThat(f.chains().openServingEpochForStartup(CHAIN, 1, previousConsumerRevision, Set.of(ORDERS), f.fence()))
+                    .isEmpty();
+            assertThat(root(f)).isEqualTo(current);
+            var commands = new ArrayList<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                var chains = new MongoSrsChainStore(observed, observed.getDatabase(f.database().getName()), SCOPE, () -> {}, () -> {});
+                var opened = chains.openServingEpochForStartup(CHAIN, 1, previousConsumerRevision + 1, Set.of(ORDERS), f.fence()).orElseThrow();
+                assertThat(opened.epoch()).isEqualTo(2);
+                assertThat(opened.checkpoint()).isEqualTo(saved);
+                assertThat(opened.servingTables()).containsExactly(ORDERS);
+                assertThat(commands).containsExactly("aggregate", "update", "aggregate", "update", "commitTransaction");
+                System.out.println("CAPTURE62_OPEN_SERVING_EPOCH " + commands);
+            }
+        });
+    }
+
+    @Test
     void wideningTheRequestStopsAnOldNarrowCallbackFromCertifyingASourcePosition() {
         withBusiness(f -> {
             prepare(f, Set.of(ORDERS));

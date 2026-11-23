@@ -307,6 +307,12 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         return available() ? context.getBean(DefaultSourceVerification.class).snapshot()
                 : DefaultSourceVerification.Verification.unknown();
     }
+    private boolean captureRecoveryPinned(PipelineIntentScope scope) {
+        original.requireBusiness();
+        return configuration.cacheRecoveries().readForCaptureStartup(scope.pipelineId())
+                .filter(value -> value.targetScope().equals(scope)).isPresent();
+    }
+
     private boolean recoveryPinned(PipelineIntentScope scope) {
         original.requireBusiness();return configuration.cacheRecoveries().read(scope.pipelineId()).filter(value -> value.targetScope().equals(scope)).isPresent();
     }
@@ -549,7 +555,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var scope = owner.original.preparation().businessScope();
             return new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(scope, owner.original.cache(),
                     owner.memberStorage.sourceViews(), owner.configuration.capturePreparations(),
-                    owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::recoveryPinned,boundedLoads,
+                    owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::captureRecoveryPinned,boundedLoads,
                     owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
                             cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding,signals::source)
