@@ -2809,7 +2809,7 @@
       "physicalNames": [
         "pipeline_intents"
       ],
-      "responsibility": "Latest desired Pipeline intent and its current deferred first-start rejection. An optional pair of document identifier and field name for DOCUMENT_UNREADABLE is written with the rejection under the same CONFIG transaction and intent fence. Retry replaces the previous rejection. Existing records without the pair retain generic diagnostics. Upgrade requires all readers to support the optional pair before it is written.",
+      "responsibility": "Latest desired Pipeline intent and its current deferred first-start rejection. An optional pair of document identifier and field name for DOCUMENT_UNREADABLE is written with the rejection under the same CONFIG transaction and intent fence. Retry replaces the previous rejection. Existing records without the pair retain generic diagnostics. Upgrade requires all readers to support the optional pair before it is written. Older binaries reject intent records containing startFailureParams, so program-only rollback against retained CONFIG data containing such records is unsupported. To roll back, restore the pre-upgrade CONFIG backup together with the older binary.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoPipelineIntentStore"
       ],
