@@ -891,7 +891,7 @@ class PipelineFirstStatePreparerIT {
             var cancelled=new java.util.concurrent.atomic.AtomicBoolean();var captureStopped=new java.util.concurrent.atomic.AtomicBoolean();var hotRetired=new java.util.concurrent.atomic.AtomicBoolean();
             org.mockito.Mockito.when(engine.captureRun("flow")).thenReturn(Optional.of(run));org.mockito.Mockito.when(run.operatorManifest()).thenReturn(manifest);
             org.mockito.Mockito.doAnswer(call -> {cancelled.set(true);return null;}).when(run).cancel();
-            org.mockito.Mockito.when(run.awaitTerminal(org.mockito.ArgumentMatchers.any())).thenAnswer(call -> cancelled.get());
+            org.mockito.Mockito.when(run.awaitTerminal()).thenAnswer(call -> cancelled.get());
             org.mockito.Mockito.when(captures.forRun(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any())).thenReturn(fixedCapture);
             org.mockito.Mockito.doAnswer(call -> {captureStopped.set(true);return null;}).when(fixedCapture).stopCapture("flow",false);
             org.mockito.Mockito.when(ownership.proveClaim(f.scope,fence)).thenReturn(true);

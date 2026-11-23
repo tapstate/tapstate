@@ -716,7 +716,7 @@ class MongoSrsConsumerStoreIT {
                     MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
                         if ("aggregate".equals(command) && "cache_identity".equals(collection)) snapshotStarted.set(true);
                         // This validation read follows the aggregate that fixed the original snapshot.
-                        if (!"find".equals(command) || !"srs_chains".equals(collection)
+                        if (!"find".equals(command) || !Set.of("srs_chains", "srs_model_contexts", "srs_models", "srs_log_bounds").contains(collection)
                                 || !snapshotStarted.compareAndSet(true, false)) return;
                         reading.countDown();
                         try {
