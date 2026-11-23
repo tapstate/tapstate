@@ -788,15 +788,23 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     /** Serializes model reclamation with attach, detach and exact snapshot-pin publication. */
-    Set<io.tapstate.spi.store.SrsModelKey> retainedModels(ClientSession session,String chain) {
-        var held=view(session,chain);var result=new java.util.HashSet<io.tapstate.spi.store.SrsModelKey>();
+    Set<io.tapstate.spi.store.SrsModelKey> retainedModels(ClientSession session,String chain, MongoSrsReadFacts facts) {
+        Document root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
+        if (root == null) throw new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE, Map.of("chain", chain), null);
+        facts.seed(SystemCollections.SRS_CHAINS, root);
+        var state = chains.state(session, root, false, facts);
+        var held = relations(session, chain, root, state);
+        var result = new java.util.HashSet<io.tapstate.spi.store.SrsModelKey>();
         for(var member:held.members().values()) {
             if(member.detached())continue;
             var snapshot=held.cursors().get(member.context().key().consumerId()).snapshot();
-            validateSnapshot(session,member.context(),snapshot);
+            validateSnapshot(session,member.context(),snapshot, facts);
             if(snapshot!=null)result.addAll(snapshot.models().values());
         }
-        chains.replace(session,held.root(),new Document(held.root()));return Set.copyOf(result);
+        var replacement = new Document(held.root());
+        chains.replace(session, held.root(), replacement);
+        facts.seed(SystemCollections.SRS_CHAINS, replacement);
+        return Set.copyOf(result);
     }
 
     /**

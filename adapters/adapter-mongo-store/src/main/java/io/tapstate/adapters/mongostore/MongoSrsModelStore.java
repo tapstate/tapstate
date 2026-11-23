@@ -85,8 +85,9 @@ public final class MongoSrsModelStore implements SrsModelStore {
             // Checkpoints take the same claim before the chain; retain that write order during cleanup.
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
             var consumers=new MongoSrsConsumerStore(client,database,scope,requireActive,requireStructure);
-            var pinned=consumers.retainedModels(session,chainId);
-            var chain=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chainId)).first();
+            var facts = new MongoSrsReadFacts(session, database, scope, false);
+            var pinned=consumers.retainedModels(session,chainId, facts);
+            var chain=MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_CHAINS, new Document("_id",chainId));
             if(chain==null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation")) || !fence.key().resourceId().equals(chain.get("captureId")))throw claimFenced();
             var state=MongoSrsChainStore.decode(chain,scope,contexts);
             var checkpoint=state.checkpoint();
@@ -97,12 +98,16 @@ public final class MongoSrsModelStore implements SrsModelStore {
             try(var rows=SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session,new Document("_id.chain",chainId)
                     .append("cacheIncarnation",scope.cacheIncarnation()).append("nextContext",new Document("$ne",null))).batchSize(64).iterator()) {
                 while(rows.hasNext() && deleted<256) {
-                    var stored=rows.next();var context=contexts.require(session,stored.get("_id",Document.class));contexts.requireAnchor(session,chain,context);
+                    var stored=rows.next();
+                    facts.seed(SystemCollections.SRS_MODEL_CONTEXTS, stored);
+                    var context=contexts.require(session,stored.get("_id",Document.class), facts);
+                    contexts.requireAnchor(session,chain,context, facts);
                     if(context.nextId()==null || protectedKeys.stream().anyMatch(key -> key.miningChainId().equals(chainId)
                             && key.table().equals(context.key().table()) && key.captureEpoch()==context.key().captureEpoch()))continue;
-                    var next=contexts.require(session,context.nextId());
+                    var next=contexts.require(session,context.nextId(), facts);
                     if(!next.ring().equals(context.ring()) || !Long.valueOf(next.firstSequence()).equals(context.nextSequence()))throw unreadable();
-                    var bounds=SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,new Document("_id",MongoSrsLogStore.boundsId(context.ring()))).first();
+                    var bounds=MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_LOG_BOUNDS,
+                            new Document("_id",MongoSrsLogStore.boundsId(context.ring())));
                     if(bounds==null)throw unavailable(context.key());
                     if(requireBounds(bounds).trimmedThrough()<context.nextSequence()-1)continue;
                     var filter=new Document("_id.chain",chainId).append("_id.table",context.key().table())
