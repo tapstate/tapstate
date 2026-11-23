@@ -65,12 +65,18 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private final java.util.function.LongSupplier reportClock;
     private static final long REPORT_DRAIN_NANOS=Duration.ofSeconds(15).toNanos();
     private Function<String,Optional<SourceBindingSnapshot>> sourceIdentities=id->Optional.empty();
+    private Function<String,Optional<SourceBindingSnapshot>> retainedSourceIdentities = id -> sourceIdentities.apply(id);
     @FunctionalInterface interface Operations {SourceOperationObserver open(SourceBindingSnapshot identity,String domain,Runnable guard,Runnable local);}
     private Operations operations=(identity,domain,guard,local)->SourceOperationObserver.NONE;
     ScopedPipelineCaptureCoordinator withSourceOperations(Function<String,Optional<SourceBindingSnapshot>> identities,
             Operations observers){
         this.sourceIdentities=Objects.requireNonNull(identities);this.operations=Objects.requireNonNull(observers);return this;
     }
+    ScopedPipelineCaptureCoordinator withRetainedSourceIdentities(Function<String,Optional<SourceBindingSnapshot>> identities) {
+        retainedSourceIdentities = Objects.requireNonNull(identities);
+        return this;
+    }
+
     private CapturePort observedPort(SourceBindingSnapshot identity,ConfiguredCaptureRun notes,CaptureConfig config,
             String domain,Runnable guard,Runnable local,io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer snapshot,
             io.tapstate.adapters.pdk.PdkCapturePort.StreamPreparer stream){
@@ -489,7 +495,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                         node,
                         definition.id(),
                         session.inputs);
-        var issued = stores.configuration().issueFirstCreate(request);
+        var issued = shared && stores.sources().supportsAdmittedCaptureStartup()
+                ? stores.configuration().issueForStartup(request, selected.orElseThrow().chainId().value())
+                : stores.configuration().issueFirstCreate(request);
         var prepared =
                 issued instanceof CaptureCreationResult.Issued first
                         ? stores.preparations().createFirst(first.creation())
@@ -510,7 +518,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                         : selected.orElseThrow();
         var source = new Source(definition.id(), resolution, shared, frozenModel);
         session.sources.put(source.id, source);
-        source.identity=sourceIdentities.apply(source.id).filter(identity->identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
+        var identities = shared && issued instanceof CaptureCreationResult.AlreadyIssued ? retainedSourceIdentities : sourceIdentities;
+        source.identity = identities.apply(source.id)
+                .filter(identity -> identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
         source.prepared = prepared.preparation();
         source.owner = owner(session, source, prepared);
         if (shared) attachSharedSource(session, source, issued instanceof CaptureCreationResult.Issued first

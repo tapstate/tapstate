@@ -312,14 +312,31 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     public CaptureScopes openCaptureScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {
         if (retirement != null || primary.kind() != RequiredNoteOwner.Kind.CHAIN || global.kind() != RequiredNoteOwner.Kind.GLOBAL)
             return RequiredNoteStore.super.openCaptureScopes(primary, global);
-        return StoreIo.call(() -> transaction(session -> {
-            Document cluster = identity.find(session, new Document("_id", "cluster")).first();
-            checkBinding(cluster, primary);
-            checkBinding(cluster, global);
-            // Exact per-owner lookups keep each namespace's existing collation behavior.
-            return new CaptureScopes(scopeOf(primary, scopes.find(session, byScope(primary)).first()),
-                    scopeOf(global, scopes.find(session, byScope(global)).first()));
-        }));
+        return StoreIo.call(() -> {
+            requireActive.run();
+            if (!MongoValidationClaimObservation.lacksSnapshotRead(client)) {
+                var stages = MongoStartConfigRead.root();
+                capturedLookup(stages, SystemCollections.PDK_NOTE_SCOPES, "primary", byScope(primary));
+                capturedLookup(stages, SystemCollections.PDK_NOTE_SCOPES, "global", byScope(global));
+                var snapshot = MongoStartConfigRead.snapshot(database, stages);
+                var first = capturedExact(snapshot, "primary", scopeId(primary));
+                var second = capturedExact(snapshot, "global", scopeId(global));
+                if (snapshot != null && "cluster".equals(snapshot.get("_id")) && first != null && second != null) {
+                    checkBinding(snapshot, primary);
+                    checkBinding(snapshot, global);
+                    var result = new CaptureScopes(scopeOf(primary, first), scopeOf(global, second));
+                    requireActive.run();
+                    return result;
+                }
+            }
+            return transaction(session -> {
+                Document cluster = identity.find(session, new Document("_id", "cluster")).first();
+                checkBinding(cluster, primary);
+                checkBinding(cluster, global);
+                return new CaptureScopes(scopeOf(primary, scopes.find(session, byScope(primary)).first()),
+                        scopeOf(global, scopes.find(session, byScope(global)).first()));
+            });
+        });
     }
 
     @Override
@@ -362,6 +379,24 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         requireShared(scope);
         Objects.requireNonNull(origin, "origin");
         return transactionWithInspection(session -> {
+            var snapshot = capturedStartup(session, scope.owner(), false);
+            var capturedMetadata = capturedExact(snapshot, "noteScope", scopeId(scope.owner()));
+            var capturedOrigin = capturedExact(snapshot, "noteOrigin", scopeId(scope.owner()));
+            if (snapshot != null && capturedMetadata != null && capturedOrigin != null) {
+                checkBinding(snapshot, scope.owner());
+                var observed = scopeOf(scope.owner(), capturedMetadata);
+                if (!scope.equals(observed)) throw unavailable();
+                var retained = retainedOrigin(scope, capturedMetadata, capturedOrigin);
+                if (retained != null) {
+                    if (!retained.equals(origin)) throw originMismatch();
+                    long fence = capturedMetadata.getLong("writeFence");
+                    if (fence >= Long.MAX_VALUE - 1) throw unreadable("writeFence");
+                    if (scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation())
+                                    .append("writeFence", fence), new Document("$inc", new Document("writeFence", 1L)))
+                            .getMatchedCount() != 1) throw unavailable();
+                    return retained;
+                }
+            }
             SourceConfigCipher cipher = cipherForWrite(session);
             Document metadata = verifyScope(session, scope, false);
             long writeFence = metadata.getLong("writeFence");
@@ -550,14 +585,36 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     @Override
     public SharedStartup sharedStartup(RequiredNoteScope shared) {
         requireShared(shared);
-        return transactionWithInspection(session -> {
-            Document metadata = verifyScope(session, shared, false);
-            var dependencies = verifiedCarries(session, shared, metadata);
-            var blocked = blocked(session, shared.owner(), ALL_KEYS);
-            var origin = retainedOrigin(session, shared, metadata);
-            if (origin == null) throw unavailable();
-            return new SharedStartup(dependencies, blocked, origin);
-        });
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            requireActive.run();
+            var captured = decodeSharedStartup(shared, capturedStartup(null, shared.owner(), true));
+            if (captured != null) {
+                requireActive.run();
+                return captured;
+            }
+            return transaction(session -> {
+                Document metadata = verifyScope(session, shared, false);
+                var dependencies = verifiedCarries(session, shared, metadata);
+                var blocked = blocked(session, shared.owner(), ALL_KEYS);
+                var origin = retainedOrigin(session, shared, metadata);
+                if (origin == null) throw unavailable();
+                return new SharedStartup(dependencies, blocked, origin);
+            });
+        }));
+    }
+
+    private SharedStartup decodeSharedStartup(RequiredNoteScope shared, Document snapshot) {
+        if (!hasCapturedSharedOrigin(snapshot)) return null;
+        var metadata = capturedExact(snapshot, "noteScope", scopeId(shared.owner()));
+        if (metadata == null || !snapshot.getList("noteCarries", Document.class).isEmpty()) return null;
+        if (!shared.equals(scopeOf(shared.owner(), metadata))) throw unavailable();
+        inspectCapturedSharedOrigin(snapshot, shared.owner());
+        var markers = snapshot.getList("barrier", Document.class);
+        var marker = capturedExact(snapshot, "barrier", markerId(shared.owner(), ALL_KEYS));
+        if (!markers.isEmpty() && marker == null) return null;
+        if (marker != null && !Boolean.TRUE.equals(marker.get("blocked"))) throw unreadable("migration");
+        var origin = retainedOrigin(shared, metadata, capturedExact(snapshot, "noteOrigin", scopeId(shared.owner())));
+        return new SharedStartup(List.of(), marker != null, origin);
     }
 
     private List<RequiredNoteCarry> verifiedCarries(ClientSession session, RequiredNoteScope shared, Document metadata) {
@@ -716,6 +773,76 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     void requireRecoveryRetirable(ClientSession session,RequiredNoteScope original) {
         requireOrdinary();checkBinding(session,original.owner());verifyPhysicalScope(session,original,false);requirePrivateUnreferenced(session,original);
     }
+    void captureSharedOrigin(List<Document> stages, RequiredNoteOwner owner) {
+        capturedLookup(stages, SystemCollections.PDK_NOTE_SCOPES, "noteScope", byScope(owner));
+        capturedLookup(stages, SystemCollections.PDK_NOTE_ORIGINS, "noteOrigin", byScope(owner));
+        capturedLookup(stages, SystemCollections.PDK_NOTE_CARRIES, "noteCarries",
+                new Document("_id.sharedBindingVersion", owner.bindingVersion()).append("_id.sharedNamespace", owner.namespace()));
+    }
+
+    private Document capturedStartup(ClientSession session, RequiredNoteOwner owner, boolean barrier) {
+        if (retirement != null || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
+        var stages = new ArrayList<Document>();
+        stages.add(new Document("$match", new Document("_id", "cluster")));
+        captureSharedOrigin(stages, owner);
+        if (barrier) capturedLookup(stages, SystemCollections.PDK_NOTE_MIGRATIONS, "barrier",
+                new Document("_id", markerId(owner, ALL_KEYS)));
+        var snapshot = session == null ? MongoStartConfigRead.snapshot(database, stages) : identity.aggregate(session, stages).first();
+        return snapshot != null && "cluster".equals(snapshot.get("_id")) ? snapshot : null;
+    }
+
+    private static Document capturedExact(Document snapshot, String slot, Object expected) {
+        if (snapshot == null || !(snapshot.get(slot) instanceof List<?> rows) || rows.size() != 1
+                || !(rows.getFirst() instanceof Document wrapper) || !(wrapper.get("value") instanceof Document value)) return null;
+        Object actual = value.get("_id");
+        if (expected instanceof Document id) {
+            if (!(actual instanceof Document found) || !new ArrayList<>(id.keySet()).equals(new ArrayList<>(found.keySet()))
+                    || !id.equals(found)) return null;
+        } else if (!expected.equals(actual)) return null;
+        return value;
+    }
+
+    private static void capturedLookup(List<Document> stages, SystemCollections table, String field, Document filter) {
+        var bytes = new Document("$bsonSize", "$$ROOT");
+        var projection = new Document("_id", 0).append("value", new Document("$cond",
+                List.of(new Document("$lte", List.of(bytes, 64 * 1024)), "$$ROOT", false)));
+        stages.add(new Document("$lookup", new Document("from", table.collectionName()).append("as", field)
+                .append("pipeline", List.of(new Document("$match", filter), new Document("$limit", 17),
+                        new Document("$project", projection)))));
+    }
+
+    boolean hasCapturedSharedOrigin(Document snapshot) {
+        if (snapshot == null) return false;
+        for (String field : List.of("noteScope", "noteOrigin", "noteCarries")) {
+            var rows = snapshot.getList(field, Document.class);
+            if (rows == null || rows.size() > 16 || rows.stream().anyMatch(row -> !(row.get("value") instanceof Document)))
+                return false;
+        }
+        return snapshot.getList("noteScope", Document.class).size() == 1
+                && snapshot.getList("noteOrigin", Document.class).size() == 1;
+    }
+
+    void inspectCapturedSharedOrigin(Document snapshot, RequiredNoteOwner owner) {
+        requireOrdinary();
+        requireActive.run();
+        checkBinding(snapshot, owner);
+        var metadata = snapshot.getList("noteScope", Document.class).getFirst().get("value", Document.class);
+        var origin = snapshot.getList("noteOrigin", Document.class).getFirst().get("value", Document.class);
+        if (!scopeId(owner).equals(metadata.get("_id")) || !scopeId(owner).equals(origin.get("_id"))) throw unavailable();
+        var token = scopeOf(owner, metadata);
+        if (retainedOrigin(token, metadata, origin) == null) throw unavailable();
+        var seen = new HashSet<Document>();
+        for (var captured : snapshot.getList("noteCarries", Document.class)) {
+            var row = captured.get("value", Document.class);
+            var carry = decodeCarry(row);
+            var endpoint = carry.shared().owner();
+            if (endpoint.bindingVersion() != owner.bindingVersion() || !endpoint.namespace().equals(owner.namespace())
+                    || endpoint.kind() != owner.kind() || !endpoint.ownerId().equals(owner.ownerId())
+                    || !seen.add(carryId(carry))) throw unavailable();
+        }
+        if (carryCount(metadata, "outgoingCarries") != seen.size()) throw unreadable("carryCount");
+    }
+
     java.util.Optional<RequiredNoteOrigin> inspectSharedOrigin(ClientSession session,RequiredNoteOwner owner,boolean known) {
         requireOrdinary();checkBinding(session,owner);
         if(owner.kind()!=RequiredNoteOwner.Kind.CHAIN)throw unavailable();

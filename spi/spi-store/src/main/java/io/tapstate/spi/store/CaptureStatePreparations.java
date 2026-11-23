@@ -7,6 +7,11 @@ public interface CaptureStatePreparations {
     CaptureStatePreparations guardedBy(Runnable requireActive);
     Optional<CapturePreparation> read(CacheBusinessScope scope,String captureId);
     CaptureCreationResult issueFirstCreate(CapturePreparationRequest original);
+
+    /** The chain is a lookup hint; the store must prove it from the current Source before reuse. */
+    default CaptureCreationResult issueForStartup(CapturePreparationRequest original, String canonicalChain) {
+        return issueFirstCreate(original);
+    }
     /** Reads the retained shared origin for one exact authoring source; no capture or namespace is prepared. */
     default Optional<RequiredNoteOrigin> inspectSharedOrigin(CacheBusinessScope current,String sourceId,String sourceHash) {
         throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,java.util.Map.of(),null);

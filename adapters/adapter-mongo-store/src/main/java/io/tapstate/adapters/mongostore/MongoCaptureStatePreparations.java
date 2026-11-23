@@ -49,38 +49,56 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
     @Override public CaptureSharedHistory inspectSharedHistory(CapturePreparation original, String sourceId, String sourceHash) {
         Objects.requireNonNull(original, "original");
         if (original.mode() != CapturePreparation.Mode.SHARED_SRS) throw fenced();
-        return transaction(session -> {
-            requireScope(session, original.scope());
-            var source = artifacts.getInTransaction(session, sourceId).filter(SourceResource.class::isInstance)
-                    .map(SourceResource.class::cast).orElseThrow(MongoCaptureStatePreparations::fenced);
-            String chain = SourceCaptureIdentity.resolve(source.connector(), source.config(), source.srs() == null ? null : source.srs().key());
-            if (!CanonicalHash.of(source).equals(sourceHash) || !chain.equals(original.canonicalChainId())
-                    || !SourceCaptureIdentity.sharedCapture(chain).equals(original.captureId())
-                    || !SourceCaptureIdentity.physical(source.connector(), source.config()).equals(original.sourceIdentityHash())) throw fenced();
-            var table = SystemCollections.CAPTURE_PREPARATIONS.on(database);
-            var current = MongoCapturePreparationFacts.available(table.find(session,
-                    new Document("_id", MongoCapturePreparationFacts.id(original.scope(), original.captureId()))).first());
-            if (!current.equals(original)) throw fenced();
-            boolean historical = current.replacement();
-            var filter = new Document("_id.clusterId", original.scope().clusterId())
-                    .append("_id.bindingVersion", original.scope().bindingVersion())
-                    .append("_id.capture", OperatorStateText.encode(original.captureId()))
-                    .append("_id.cacheIncarnation", new Document("$ne", original.scope().cacheIncarnation()));
-            try (var rows = table.find(session, filter).batchSize(64).iterator()) {
-                while (rows.hasNext()) {
-                    var prior = MongoCapturePreparationFacts.decode(rows.next());
-                    if (prior.mode() != original.mode() || !prior.canonicalChainId().equals(chain)
-                            || !prior.captureId().equals(original.captureId())
-                            || !prior.sourceIdentityHash().equals(original.sourceIdentityHash())) throw fenced();
-                    historical = true;
-                }
-            }
-            // A retained current record owns this already-reserved namespace. No inspection repairs it.
-            artifacts.configurationNotes().inspectSharedOrigin(session, new RequiredNoteOwner(original.scope().bindingVersion(),
-                    "pdk.chain." + chain, RequiredNoteOwner.Kind.CHAIN, chain, 0), true);
-            return new CaptureSharedHistory(current, historical);
+        return readSnapshot(() -> {
+            var captured = capturedHistory(original, sourceId);
+            if (captured.isPresent()) return inspectSharedHistory(null, original, sourceId, sourceHash, captured);
+            return transaction(session -> inspectSharedHistory(session, original, sourceId, sourceHash, Optional.empty()));
         });
     }
+
+    private CaptureSharedHistory inspectSharedHistory(ClientSession session, CapturePreparation original, String sourceId,
+            String sourceHash, Optional<CapturedHistory> captured) {
+        if (captured.isEmpty()) requireScope(session, original.scope());
+        var source = captured.map(CapturedHistory::source)
+                .orElseGet(() -> artifacts.getInTransaction(session, sourceId).filter(SourceResource.class::isInstance)
+                        .map(SourceResource.class::cast).orElseThrow(MongoCaptureStatePreparations::fenced));
+        String chain = SourceCaptureIdentity.resolve(source.connector(), source.config(), source.srs() == null ? null : source.srs().key());
+        if (!CanonicalHash.of(source).equals(sourceHash) || !chain.equals(original.canonicalChainId())
+                || !SourceCaptureIdentity.sharedCapture(chain).equals(original.captureId())
+                || !SourceCaptureIdentity.physical(source.connector(), source.config()).equals(original.sourceIdentityHash())) throw fenced();
+        var table = SystemCollections.CAPTURE_PREPARATIONS.on(database);
+        var current = MongoCapturePreparationFacts.available(captured.map(CapturedHistory::capture)
+                .orElseGet(() -> table.find(session,
+                        new Document("_id", MongoCapturePreparationFacts.id(original.scope(), original.captureId()))).first()));
+        if (!current.equals(original)) throw fenced();
+        boolean historical = current.replacement();
+        var filter = new Document("_id.clusterId", original.scope().clusterId())
+                .append("_id.bindingVersion", original.scope().bindingVersion())
+                .append("_id.capture", OperatorStateText.encode(original.captureId()))
+                .append("_id.cacheIncarnation", new Document("$ne", original.scope().cacheIncarnation()));
+        var historyRows = captured.map(CapturedHistory::prior)
+                .orElseGet(() -> table.find(session, filter).batchSize(64).into(new ArrayList<>()));
+        for (var historyRow : historyRows) {
+                var prior = MongoCapturePreparationFacts.decode(historyRow);
+                if (prior.mode() != original.mode() || !prior.canonicalChainId().equals(chain)
+                        || !prior.captureId().equals(original.captureId())
+                        || !prior.sourceIdentityHash().equals(original.sourceIdentityHash())) throw fenced();
+                historical = true;
+        }
+        var owner = new RequiredNoteOwner(original.scope().bindingVersion(),
+                "pdk.chain." + chain, RequiredNoteOwner.Kind.CHAIN, chain, 0);
+        if (captured.isPresent()) artifacts.configurationNotes().inspectCapturedSharedOrigin(captured.orElseThrow().snapshot(), owner);
+        else artifacts.configurationNotes().inspectSharedOrigin(session, owner, true);
+        return new CaptureSharedHistory(current, historical);
+    }
+    @Override public CaptureCreationResult issueForStartup(CapturePreparationRequest request, String canonicalChain) {
+        Objects.requireNonNull(request, "request");
+        Objects.requireNonNull(canonicalChain, "canonicalChain");
+        var retained = retainedStart(request, canonicalChain);
+        return retained.<CaptureCreationResult>map(CaptureCreationResult.AlreadyIssued::new)
+                .orElseGet(() -> issueFirstCreate(request));
+    }
+
     @Override public CaptureCreationResult issueFirstCreate(CapturePreparationRequest request) {
         Objects.requireNonNull(request,"request");String operation=UUID.randomUUID().toString();
         var issued=transaction(session -> {
@@ -137,6 +155,111 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
         });
         active.run();return issued.won()?new CaptureCreationResult.Issued(new Creation(issued.preparation(),request,issued.targetFingerprint(),issued.retention(),issued.newSharedHistory(),active)):new CaptureCreationResult.AlreadyIssued(issued.preparation());
     }
+    private record CapturedHistory(SourceResource source, Document capture, List<Document> prior,
+            Document snapshot) {}
+
+    private Optional<CapturedHistory> capturedHistory(CapturePreparation original, String sourceId) {
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return Optional.empty();
+        var stages = MongoStartConfigRead.root();
+        MongoStartConfigRead.addBinding(stages);
+        MongoStartConfigRead.addArtifacts(stages, List.of(sourceId));
+        var id = MongoCapturePreparationFacts.id(original.scope(), original.captureId());
+        stages.add(MongoValidationClaimObservation.lookup(SystemCollections.CAPTURE_PREPARATIONS, "capture", id, null));
+        var priorFilter = new Document("_id.clusterId", original.scope().clusterId())
+                .append("_id.bindingVersion", original.scope().bindingVersion())
+                .append("_id.capture", OperatorStateText.encode(original.captureId()))
+                .append("_id.cacheIncarnation", new Document("$ne", original.scope().cacheIncarnation()));
+        addBoundedLookup(stages, SystemCollections.CAPTURE_PREPARATIONS, "priorCaptures", priorFilter);
+        var noteOwner = new RequiredNoteOwner(original.scope().bindingVersion(), "pdk.chain." + original.canonicalChainId(),
+                RequiredNoteOwner.Kind.CHAIN, original.canonicalChainId(), 0);
+        artifacts.configurationNotes().captureSharedOrigin(stages, noteOwner);
+        var snapshot = MongoStartConfigRead.snapshot(database, stages);
+        if (MongoStartConfigRead.binding(snapshot, bindings, original.scope()).isEmpty()) throw fenced();
+        var rows = MongoStartConfigRead.artifacts(snapshot, List.of(sourceId));
+        var capture = MongoStartConfigRead.row(snapshot, "capture", id);
+        var prior = boundedRows(snapshot, "priorCaptures");
+        if (rows.isEmpty() || rows.orElseThrow().size() != 1 || capture.isEmpty() || prior.isEmpty()
+                || !artifacts.configurationNotes().hasCapturedSharedOrigin(snapshot)) return Optional.empty();
+        var source = artifacts.decode(rows.orElseThrow().getFirst());
+        if (!(source instanceof SourceResource selected)) throw fenced();
+        return Optional.of(new CapturedHistory(selected, capture.orElseThrow(), prior.orElseThrow(), snapshot));
+    }
+
+    private Optional<CapturePreparation> retainedStart(CapturePreparationRequest request, String canonicalChain) {
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client) || request.inputs().sourceHashes().size() > 15)
+            return Optional.empty();
+        return readSnapshot(() -> {
+            var scope = scopeOf(request.pipeline());
+            var ids = new LinkedHashSet<String>();
+            ids.add(request.pipeline().pipelineId()); ids.addAll(request.inputs().sourceHashes().keySet());
+            var stages = MongoStartConfigRead.root();
+            MongoStartConfigRead.addBinding(stages);
+            MongoStartConfigRead.addArtifacts(stages, List.copyOf(ids));
+            var captureKey = MongoCapturePreparationFacts.id(scope, SourceCaptureIdentity.sharedCapture(canonicalChain));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.CAPTURE_PREPARATIONS,
+                    "capture", captureKey, null));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.OPERATOR_GENERATIONS,
+                    "mapping", request.pipeline().pipelineId(), null));
+            var snapshot = MongoStartConfigRead.snapshot(database, stages);
+            if (MongoStartConfigRead.binding(snapshot, bindings, scope).isEmpty()) throw fenced();
+            var mapping = MongoStartConfigRead.row(snapshot, "mapping", request.pipeline().pipelineId());
+            if (mapping.isEmpty()) return Optional.empty();
+            var state = MongoPipelineStateMappings.decode(request.pipeline().pipelineId(), mapping.orElseThrow());
+            if (state.phase() != PipelineStateMapping.Phase.ACTIVE
+                    || state.stateGeneration() != request.pipeline().stateGeneration()) throw fenced();
+            var capturedRows = MongoStartConfigRead.artifacts(snapshot, List.copyOf(ids));
+            var candidate = MongoStartConfigRead.row(snapshot, "capture", captureKey);
+            if (capturedRows.isEmpty() || candidate.isEmpty()) return Optional.empty();
+            var captured = capturedRows.map(rows -> {
+                var values = new LinkedHashMap<String, Resource>();
+                rows.forEach(row -> { var value = artifacts.decode(row); values.put(value.id(), value); });
+                return Map.copyOf(values);
+            });
+            var verified = MongoPipelineStatePreparations.verifiedInputs(request.pipeline(), request.inputs(),
+                    captured.orElseThrow(), captured.orElseThrow()::get);
+            var pipeline = verified.pipeline();
+            var source = verified.sources().get(request.sourceId());
+            if (source == null) throw fenced();
+            var reference = pipeline.sources().stream().filter(value -> source.id().equals(value.id())).findFirst().orElseThrow(MongoCaptureStatePreparations::fenced);
+            var mode = pipeline.settings() == null ? null : pipeline.settings().readMode();
+            if (mode == ReadMode.SNAPSHOT_ONLY || !(reference instanceof SourceRef.Spec spec) || !spec.srs())
+                return Optional.empty();
+            String chain = SourceCaptureIdentity.resolve(source.connector(), source.config(), source.srs() == null ? null : source.srs().key());
+            if (!canonicalChain.equals(chain)) throw MongoPipelineSourcePreparations.identityUnproven(request.pipeline());
+            var held = MongoCapturePreparationFacts.available(candidate.orElseThrow());
+            if (held.mode() != CapturePreparation.Mode.SHARED_SRS || !chain.equals(held.canonicalChainId())
+                    || !SourceCaptureIdentity.physical(source.connector(), source.config()).equals(held.sourceIdentityHash()))
+                throw MongoPipelineSourcePreparations.identityUnproven(request.pipeline());
+            return Optional.of(held);
+        });
+    }
+
+    private <T> T readSnapshot(java.util.function.Supplier<T> action) {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            active.run();
+            try {
+                return action.get();
+            } finally { active.run(); }
+        }));
+    }
+
+    private static void addBoundedLookup(List<Document> stages, SystemCollections table, String field, Document filter) {
+        var bytes = new Document("$bsonSize", "$$ROOT");
+        var captured = new Document("_id", 0).append("value", new Document("$cond",
+                List.of(new Document("$lte", List.of(bytes, 64 * 1024)), "$$ROOT", false)));
+        stages.add(new Document("$lookup", new Document("from", table.collectionName()).append("as", field)
+                .append("pipeline", List.of(new Document("$match", filter), new Document("$limit", 17),
+                        new Document("$project", captured)))));
+    }
+
+    private static Optional<List<Document>> boundedRows(Document snapshot, String field) {
+        if (snapshot == null) return Optional.empty();
+        var values = snapshot.getList(field, Document.class);
+        if (values == null || values.size() > 16 || values.stream().anyMatch(row -> !(row.get("value") instanceof Document)))
+            return Optional.empty();
+        return Optional.of(values.stream().map(row -> row.get("value", Document.class)).toList());
+    }
+
     private void requireScope(ClientSession session,CacheBusinessScope expected){var current=bindings.cachePreparationForTransaction(session).orElseThrow(MongoCaptureStatePreparations::fenced).businessScope();if(!cluster.equals(expected.clusterId()) || !expected.equals(current))throw fenced();}
     MongoCapturePreparationFacts.Recovery reserveSharedRecovery(ClientSession session,StorageRecoveryCommands.Plan plan) {
         var previous=plan.manifest().sharedSrs().previous();requireScope(session,previous.scope());

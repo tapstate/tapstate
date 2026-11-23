@@ -772,6 +772,46 @@ class MongoRequiredNoteStoreIT {
     }
 
     @Test
+    void sharedStartupBatchesWarmScopesOriginFenceAndBarrierWithoutLosingGenerationChecks() {
+        withNotes(f -> {
+            var shared = f.initialize(chain("warm-start"));
+            var global = f.notes.initialize(global());
+            var expected = origin("same-connection");
+            var commands = new ArrayList<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var notes = new MongoRequiredNoteStore(observed, observed.getDatabase(f.database.getName()), f.cipher());
+                commands.clear();
+                assertThat(notes.openCaptureScopes(shared.owner(), global.owner()))
+                        .isEqualTo(new RequiredNoteStore.CaptureScopes(shared, global));
+                assertThat(commands).containsExactly("aggregate");
+                commands.clear();
+                assertThat(notes.prepareSharedOrigin(shared, expected)).isEqualTo(expected);
+                assertThat(commands).containsExactly("aggregate", "update", "commitTransaction");
+                commands.clear();
+                assertThat(notes.sharedStartup(shared)).isEqualTo(new RequiredNoteStore.SharedStartup(List.of(), false, expected));
+                assertThat(commands).containsExactly("aggregate");
+                assertThatThrownBy(() -> notes.prepareSharedOrigin(shared, origin("other")))
+                        .satisfies(MongoRequiredNoteStoreIT::originMismatch);
+                f.notes.compareAndSet(shared, "key", 0, bytes("payload"), false);
+                f.notes.compareAndSet(shared, "key", 1, null, true);
+                assertThat(notes.sharedStartup(shared).blocked()).isFalse();
+                f.notes.clear(shared, true);
+                assertThatThrownBy(() -> notes.sharedStartup(shared)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                assertThatThrownBy(() -> notes.prepareSharedOrigin(shared, expected)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                System.out.println("CAPTURE_STARTUP_NOTES open=1 prepare=3 shared=1");
+            }
+        });
+    }
+
+    @Test
     void sharedStartupUsesTheSameOriginAndRejectsTheClearedScope() {
         withNotes(f -> {
             var shared = f.notes.initialize(chain("physical"));

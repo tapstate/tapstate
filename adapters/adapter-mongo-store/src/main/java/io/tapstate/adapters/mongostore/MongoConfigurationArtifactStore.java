@@ -34,6 +34,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * Configuration resources in separate collections for each authoring kind. Every mutation writes the same
@@ -559,13 +560,23 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBinding(String id) {
-        return ordinarySourceBinding(id, new MongoReadBudget(java.time.Duration.ofSeconds(5)));
+        return ordinarySourceBinding(id);
+    }
+
+    Optional<io.tapstate.spi.store.SourceBindingSnapshot> retainedCaptureSourceBinding(String id) {
+        var budget = sourceBindingBudget();
+        return snapshotSourceBinding(id, budget, () -> ordinarySourceBinding(id, budget));
     }
 
     @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBindingForSinkStartup(String id) {
+        var budget = sourceBindingBudget();
+        return snapshotSourceBinding(id, budget, () -> ordinarySourceBinding(id, budget));
+    }
+
+    private Optional<io.tapstate.spi.store.SourceBindingSnapshot> snapshotSourceBinding(String id, MongoReadBudget budget,
+            Supplier<Optional<io.tapstate.spi.store.SourceBindingSnapshot>> fallback) {
         Objects.requireNonNull(id, "id");
-        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
-        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return ordinarySourceBinding(id, budget);
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return fallback.get();
         return StoreIo.call(() -> {
             var stages = MongoStartConfigRead.root();
             var bounded = new Document("$cond", List.of(
@@ -581,7 +592,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                     .filter(value -> value.get("value") instanceof Document).map(value -> value.get("value", Document.class));
             var resources = MongoStartConfigRead.artifacts(captured, List.of(id));
             if (identity == null || schema.isEmpty() || resources.isEmpty() || resources.orElseThrow().size() != 1)
-                return ordinarySourceBinding(id, budget);
+                return fallback.get();
             var state = MongoSourceIdentitySchema.read(identity, schema.orElseThrow(), ciphers.current().activeKeyId());
             if (state == null || state.phase() != MongoSourceIdentitySchema.Phase.READY)
                 throw MongoSourceIdentitySchema.unavailable(id);
@@ -594,6 +605,14 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             return Optional.of(new io.tapstate.spi.store.SourceBindingSnapshot(source, stored.getString("contentHash"),
                     MongoSourceIdentity.read(stored).binding()));
         });
+    }
+
+    private static MongoReadBudget sourceBindingBudget() {
+        return new MongoReadBudget(java.time.Duration.ofSeconds(5));
+    }
+
+    private Optional<io.tapstate.spi.store.SourceBindingSnapshot> ordinarySourceBinding(String id) {
+        return ordinarySourceBinding(id, sourceBindingBudget());
     }
 
     private Optional<io.tapstate.spi.store.SourceBindingSnapshot> ordinarySourceBinding(String id, MongoReadBudget budget) {

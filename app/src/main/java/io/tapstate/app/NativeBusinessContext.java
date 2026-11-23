@@ -552,7 +552,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::recoveryPinned,boundedLoads,
                     owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
-                            cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding,signals::source);
+                            cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding,signals::source)
+                    .withRetainedSourceIdentities(owner.configuration::retainedCaptureSourceBinding);
         }
         @Bean(destroyMethod="close") NativeValidationCaptureRoutes nativeValidationCaptureRoutes(NativeBusinessContext owner,
                 HazelcastInstance member,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization,ValidationMemberResources.Member resources){

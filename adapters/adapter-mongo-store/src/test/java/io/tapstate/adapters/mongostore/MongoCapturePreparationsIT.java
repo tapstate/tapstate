@@ -581,6 +581,60 @@ class MongoCapturePreparationsIT {
         });
     }
 
+    @Test void retainedCaptureConfigUsesOneSnapshotPerReadWithFreshSourceValidation() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var retained = f.issue(f.request).preparation();
+            var source = (SourceResource) f.configuration.artifacts().get("input").orElseThrow();
+            var owner = new RequiredNoteOwner(f.scope.bindingVersion(), "pdk.chain." + retained.canonicalChainId(),
+                    RequiredNoteOwner.Kind.CHAIN, retained.canonicalChainId(), 0);
+            var notes = f.configuration.requiredNotes();
+            notes.prepareOrigin(notes.open(owner), new RequiredNoteOrigin(source.connector(), "a".repeat(64), new byte[]{1}));
+            var commands = new ArrayList<String>();
+            var witness = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var client = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(CONFIG.getReplicaSetUrl())).addCommandListener(witness).build())) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var database = client.getDatabase(f.config.getName());
+                var cipher = SourceConfigCipherProvider.fixed(new SourceConfigCipher(Base64.getUrlDecoder()
+                        .decode(SystemCollections.CLUSTER_KEYS.on(f.config).find().first().getString("material"))));
+                var bindings = new MongoStorageBindingStore(client, database, cipher);
+                var artifacts = new MongoConfigurationArtifactStore(client, database, cipher);
+                var store = new MongoCaptureStatePreparations(client, database, "cluster-a", bindings, artifacts, ACTIVE);
+                var unrelated = SystemCollections.CAPTURE_PREPARATIONS.on(f.config);
+                var original = unrelated.find(new Document("_id", MongoCapturePreparationFacts.id(f.scope, retained.captureId()))).first();
+                for (int i = 0; i < 24; i++) {
+                    var other = new Document(original);
+                    other.put("_id", MongoCapturePreparationFacts.id(f.scope, "unrelated-capture-" + i));
+                    unrelated.insertOne(other);
+                }
+                commands.clear();
+                assertThat(store.issueForStartup(f.request, retained.canonicalChainId())).isEqualTo(new CaptureCreationResult.AlreadyIssued(retained));
+                assertThat(commands).containsExactly("aggregate");
+                commands.clear();
+                assertThat(artifacts.retainedCaptureSourceBinding(source.id())).get()
+                        .satisfies(binding -> assertThat(binding.contentHash()).isEqualTo(CanonicalHash.of(source)));
+                assertThat(commands).containsExactly("aggregate");
+                commands.clear();
+                assertThat(store.inspectSharedHistory(retained, source.id(), CanonicalHash.of(source)))
+                        .isEqualTo(new CaptureSharedHistory(retained, false));
+                assertThat(commands).containsExactly("aggregate");
+                System.out.println("CAPTURE_CONFIG_BATCH issuance=1 sourceIdentity=1 history=1 fixedKey=true");
+                var noteScope = SystemCollections.PDK_NOTE_SCOPES.on(f.config);
+                var noteFilter = new Document("_id.bindingVersion", owner.bindingVersion())
+                        .append("_id.namespace", owner.namespace());
+                var before = noteScope.find(noteFilter).first();
+                noteScope.updateOne(noteFilter, new Document("$inc", new Document("outgoingCarries", 1L)));
+                assertCode(() -> store.inspectSharedHistory(retained, source.id(), CanonicalHash.of(source)), IoError.DOCUMENT_UNREADABLE);
+                noteScope.replaceOne(noteFilter, before);
+                f.changeSource();
+                assertCode(() -> store.inspectSharedHistory(retained, source.id(), CanonicalHash.of(source)), IoError.PIPELINE_INTENT_FENCED);
+                assertCode(() -> store.issueForStartup(f.request, retained.canonicalChainId()), IoError.PIPELINE_INTENT_FENCED);
+            }
+        });
+    }
+
     @Test void specReadsAndWritesLeaveCatalogInspectionToTheScheduledWorker() {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var bytes = "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
