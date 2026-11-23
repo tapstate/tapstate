@@ -227,6 +227,8 @@ class NotificationTest(unittest.TestCase):
                     if label == "recovered":
                         self.assertIn("**Recovered** performance cases 1", content)
                     self.assertNotIn("<at", content)
+                    proposed = catalog.read_json(output / "next-state.json")
+                    self.assertEqual(state, proposed["previous"])
                     with patch.object(actions_watch, "urlopen", return_value=BytesIO(json.dumps({"code": code}).encode())):
                         if code == 1:
                             with self.assertRaisesRegex(ValueError, "did not accept"):
@@ -235,10 +237,11 @@ class NotificationTest(unittest.TestCase):
                         else:
                             actions_watch.send(output, "https://example.invalid")
                             state = catalog.read_json(output / "state.json")
+                            self.assertNotIn("previous", state)
+                            self.assertEqual({k: v for k, v in proposed.items() if k != "previous"}, state)
                     receipt = catalog.read_json(output / "delivery.json")
                     self.assertEqual("accepted" if code == 0 else "rejected", receipt["status"])
-                    proposed = output / ("state.json" if code == 0 else "next-state.json")
-                    self.assertEqual(catalog.digest(catalog.read_json(proposed)), receipt["intent_sha256"])
+                    self.assertEqual(catalog.digest(proposed), receipt["intent_sha256"])
             self.assertEqual({}, state["active"])
 
     def test_independent_observation_and_recovery_require_the_original_scheduled_attempt(self):
