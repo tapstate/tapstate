@@ -266,11 +266,15 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     @Override public void startCapture(String pipeline) { throw refused(); }
     @Override public void stopCapture(String pipeline,boolean purge) { throw refused(); }
 
-    synchronized void retireScope(PipelineIntentScope scope, WorkloadClaimFence ceiling) {
-        active(); var captured = sessions.values().stream().filter(session -> session.original.scope().equals(scope)).toList();
-        if (ceiling == null && !captured.isEmpty()) throw refused();
-        for (var session : captured) requireNotLater(session.original, ceiling);
-        for (var session : captured) { stop(session); forgetSession(session); }
+    void retireScope(PipelineIntentScope scope, WorkloadClaimFence ceiling) {
+        List<Session> captured;
+        synchronized (this) {
+            active();
+            captured = sessions.values().stream().filter(session -> session.original.scope().equals(scope)).toList();
+            if (ceiling == null && !captured.isEmpty()) throw refused();
+            for (var session : captured) requireNotLater(session.original, ceiling);
+        }
+        for (var session : captured) stop(session);
     }
     synchronized boolean hasScope(PipelineIntentScope scope) {
         active(); return sessions.keySet().stream().anyMatch(original -> original.scope().equals(scope));
@@ -285,7 +289,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         requireShared(original,fence);
         var owner=owners.get(original.captureId());
         if(owner==null){execution.ownership().requireEnded(fence);return;}
-        if(!original.equals(owner.prepared) || !fence.equals(owner.fence) || !owner.sessions.isEmpty()
+        if(!original.equals(owner.prepared) || !fence.equals(owner.fence) || !owner.sessions.isEmpty() || owner.stopping
                 || !owner.ended.get() && !owner.drainingReports() && needed(owner))throw refused();
         owner.finishCheckpointingForRetirement();
         owner.ended.set(true);owner.release();execution.ownership().endTenure(fence);owners.remove(original.captureId(),owner);
@@ -333,7 +337,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         @Override public void stopCapture(String pipeline,boolean purge) {
             requireId(pipeline);
             if (purge) throw refused();
-            synchronized (ScopedPipelineCaptureCoordinator.this) { var session=sessions.get(original); if(session!=null) {stop(session);forgetSession(session);} }
+            Session session;
+            synchronized (ScopedPipelineCaptureCoordinator.this) { session = sessions.get(original); }
+            if (session != null) stop(session);
         }
         @Override public PipelineCaptureBindings captureBindings() { return session().bindings; }
         @Override public ValidationCaptureRoute validationRoute(String alias,String table) {
@@ -436,7 +442,6 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         } catch (RuntimeException | Error failure) {
             try {
                 stop(session);
-                forgetSession(session);
             } catch (RuntimeException | Error cleanup) {
                 if (cleanup != failure) failure.addSuppressed(cleanup);
             }
@@ -1094,7 +1099,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private Owner owner(Session session,Source source,CaptureCacheState prepared) {
         var id=prepared.preparation().captureId(); var existing=owners.get(id);
         if(existing!=null) {
-            if(existing.drainingReports())throw new RingNotOpenYet(new CaptureId(id));
+            if (existing.stopping || existing.drainingReports()) throw new RingNotOpenYet(new CaptureId(id));
             if(existing.ended.get())throw refused();
             if(!existing.prepared.equals(prepared.preparation()))throw refused(); source.owner=existing; existing.require();
             if (!existing.lease.retain(() -> {
@@ -1127,6 +1132,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         long nextDemandCheck = System.nanoTime() + execution.renewal().toNanos();
         volatile Long reportDrainStarted;
         volatile boolean handingOff;
+        // Guarded by the coordinator monitor while physical retirement runs without it.
+        boolean stopping;
         Owner(CapturePreparation prepared,WorkloadClaim initial) { this.prepared=prepared;this.initial=initial;this.fence=WorkloadClaimFence.from(initial); }
         void finishCheckpointingForRetirement() {
             if (ended.get() || drainingReports() || physical == null || !physical.live.get()) return;
@@ -1191,6 +1198,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         final ExecutionFence original; final PipelinePreparationInputs inputs; final Instant began; final ReadMode mode; final boolean bounded,snapshot;
         final Map<String,Source> sources=new LinkedHashMap<>(); final AtomicBoolean ended=new AtomicBoolean(); final AtomicReference<io.tapstate.core.common.FailureFact> failure=new AtomicReference<>();
         PipelineCaptureBindings bindings;
+        boolean stopping;
         final AtomicReference<io.tapstate.core.common.FailureFact> openingFailure;
         Session(ExecutionFence original,PipelinePreparationInputs inputs,Instant began,ReadMode mode,AtomicReference<io.tapstate.core.common.FailureFact> openingFailure) { this.openingFailure=openingFailure; this.original=original;this.inputs=inputs;this.began=began;this.mode=mode;this.bounded=mode==ReadMode.SNAPSHOT_ONLY;this.snapshot=mode!=ReadMode.CDC_ONLY; }
         String label(String source,String table) {
@@ -1521,7 +1529,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private synchronized void maintain() {
         if(closed.get())return;
         for (var owner : List.copyOf(owners.values())) {
-            if (owner.prepared.mode() != CapturePreparation.Mode.SHARED_SRS) continue;
+            if (owner.prepared.mode() != CapturePreparation.Mode.SHARED_SRS || owner.stopping) continue;
             if (owner.ended.get()) {
                 if (owner.handingOff) {
                     try {
@@ -1613,7 +1621,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private void lost(Owner owner) {
         owner.handingOff = owner.prepared.mode() == CapturePreparation.Mode.SHARED_SRS;
         owner.ended.set(true);
-        synchronized (this) { finishLost(owner); }
+        synchronized (this) { if (!owner.stopping) finishLost(owner); }
     }
 
     private void finishLost(Owner owner) {
@@ -1641,23 +1649,60 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         owners.remove(owner.prepared.captureId(), owner);
     }
     private void stop(Session session) {
-        session.ended.set(true); Throwable first=null;
-        stores.boundedLoads().forget(session.original);
-        for(var source:session.sources.values()) {
-            if(source.run!=null)first=cleanup(first,() -> runtime.stopSnapshot(source.run));
-            if(source.guard!=null)first=cleanup(first,() -> runtime.stopOpenings(source.guard));
-            if(session.bindings!=null)first=cleanup(first,() -> buffer.release(PipelineCaptureBindings.bufferKey(session.original,source.id)));
+        synchronized (this) {
+            if (sessions.get(session.original) != session) return;
+            if (session.stopping) throw refused();
+            session.stopping = true;
+            session.ended.set(true);
         }
-        rethrow(first);
-        var unique=Collections.newSetFromMap(new IdentityHashMap<Owner,Boolean>()); session.sources.values().forEach(source -> { if(source.owner!=null)unique.add(source.owner); });
-        for(var owner:unique) {
-            owner.sessions.remove(session.original);
-            if(owner.sessions.isEmpty() && (owner.ended.get() || !needed(owner))) {
-                owner.finishCheckpointingForRetirement();
-                owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);
+        try {
+            stopSessionIo(session);
+            Set<Owner> originalOwners;
+            synchronized (this) {
+                originalOwners = Collections.newSetFromMap(new IdentityHashMap<Owner,Boolean>());
+                session.sources.values().forEach(source -> { if (source.owner != null) originalOwners.add(source.owner); });
             }
+            for (var owner : originalOwners) detachAndRetire(session, owner);
+            synchronized (this) { forgetSession(session); }
+        } finally {
+            synchronized (this) { session.stopping = false; }
+        }
+    }
+
+    private void stopSessionIo(Session session) {
+        Throwable first = null;
+        stores.boundedLoads().forget(session.original);
+        for (var source : session.sources.values()) {
+            if (source.run != null) first = cleanup(first, () -> runtime.stopSnapshot(source.run));
+            if (source.guard != null) first = cleanup(first, () -> runtime.stopOpenings(source.guard));
+            if (session.bindings != null)
+                first = cleanup(first, () -> buffer.release(PipelineCaptureBindings.bufferKey(session.original,source.id)));
         }
         rethrow(first);
+    }
+
+    private void detachAndRetire(Session session, Owner owner) {
+        long revision;
+        synchronized (this) {
+            if (owners.get(owner.prepared.captureId()) != owner) return;
+            if (owner.sessions.remove(session.original)) owner.demandRevision++;
+            if (!owner.sessions.isEmpty() || owner.stopping) return;
+            revision = owner.demandRevision;
+        }
+        if (!owner.ended.get() && needed(owner)) return;
+        synchronized (this) {
+            if (owners.get(owner.prepared.captureId()) != owner || owner.stopping
+                    || owner.demandRevision != revision || !owner.sessions.isEmpty()) return;
+            owner.stopping = true;
+        }
+        try {
+            owner.finishCheckpointingForRetirement();
+            owner.ended.set(true);
+            owner.release();
+            synchronized (this) { owners.remove(owner.prepared.captureId(), owner); }
+        } finally {
+            synchronized (this) { owner.stopping = false; }
+        }
     }
     private static Throwable cleanup(Throwable first,Runnable cleanup) {
         try { cleanup.run(); }
@@ -1703,7 +1748,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         closed.set(true);
         owners.values().forEach(owner -> owner.ended.set(true));
         for(var session:List.copyOf(sessions.values())) {
-            try {stop(session);forgetSession(session);}
+            try {stop(session);}
             catch(RuntimeException|Error failure){if(first==null)first=failure;else if(first!=failure)first.addSuppressed(failure);}
         }
         for(var owner:List.copyOf(owners.values())) {

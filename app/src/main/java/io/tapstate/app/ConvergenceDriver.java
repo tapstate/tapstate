@@ -30,6 +30,7 @@ import java.util.function.Consumer;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.function.UnaryOperator;
 import org.slf4j.Logger;
@@ -188,10 +189,13 @@ final class ConvergenceDriver {
         if (!reconcileEligible.getAsBoolean()) {
             return;
         }
-        List<String> listed = scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds();
+        Optional<PipelineIntentStore.DispatchSnapshot> dispatch = scoped == null || pipelineConvergences == null
+                ? Optional.empty() : scoped.intents().dispatchSnapshot();
+        List<String> listed = dispatch.map(PipelineIntentStore.DispatchSnapshot::pipelineIds)
+                .orElseGet(() -> scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds());
         List<String> pipelineIds;
         if (pipelineConvergences != null) {
-            dispatchConvergences(listed);
+            dispatchConvergences(listed, dispatch.map(PipelineIntentStore.DispatchSnapshot::stopping).orElseGet(Set::of));
             pipelineConvergences.retain(listed);
             // A deleted Pipeline keeps its claim and budgets until its original local pass has ended.
             var retained = new java.util.HashSet<>(listed);
@@ -232,7 +236,7 @@ final class ConvergenceDriver {
         export.forgetPipelinesOutside(pipelineIds);
     }
 
-    private void dispatchConvergences(List<String> listed) {
+    private void dispatchConvergences(List<String> listed, Set<String> stopping) {
         if (listed.isEmpty()) {
             nextRejectedPipeline = null;
             return;
@@ -240,26 +244,33 @@ final class ConvergenceDriver {
         int first = nextPipeline % listed.size();
         nextPipeline = (first + 1) % listed.size();
         int priority = nextRejectedPipeline == null ? -1 : listed.indexOf(nextRejectedPipeline);
-        if (priority >= 0 && !offerConvergence(nextRejectedPipeline)) return;
+        if (priority >= 0 && !offerConvergence(nextRejectedPipeline, stopping.contains(nextRejectedPipeline))) return;
 
         nextRejectedPipeline = null;
         for (int offset = 0; offset < listed.size(); offset++) {
             int index = (first + offset) % listed.size();
             if (index == priority) continue;
             String id = listed.get(index);
-            if (!offerConvergence(id)) {
+            if (!offerConvergence(id, stopping.contains(id))) {
                 nextRejectedPipeline = id;
                 return;
             }
         }
     }
 
-    private boolean offerConvergence(String pipelineId) {
-        return pipelineConvergences.offer(pipelineId, () -> reconcilePipeline(pipelineId))
-                != PipelineConvergences.Offer.REJECTED;
+    private boolean offerConvergence(String pipelineId, boolean stopRequested) {
+        return pipelineConvergences.offer(pipelineId, () -> {
+            if (pipelineConvergences.stopping(pipelineId)) return;
+            if (stopRequested) pipelineConvergences.beginStop(pipelineId, () -> reconcilePipeline(pipelineId, true));
+            else reconcilePipeline(pipelineId);
+        }) != PipelineConvergences.Offer.REJECTED;
     }
 
     private void reconcilePipeline(String pipelineId) {
+        reconcilePipeline(pipelineId, false);
+    }
+
+    private void reconcilePipeline(String pipelineId, boolean stopOperation) {
         if (!reconcileEligible.getAsBoolean()) return;
         // Attribute every line logged while reconciling this pipeline to it, so the logs read face can
         // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
@@ -281,6 +292,8 @@ final class ConvergenceDriver {
                     observationOrigin = reading.orElse(null);
                     snapshot = reading.map(PipelineIntentStore.ActuationReading::intent);
                 }
+                if (stopOperation && snapshot.filter(intent -> intent.desired() != null
+                        && intent.desired().targetState() == PipelineState.STOPPED).isEmpty()) return;
                 if (snapshot.isEmpty()) {
                     var pendingStart = scoped.prepareStart() == null
                             ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
@@ -298,6 +311,11 @@ final class ConvergenceDriver {
                 if (!pipelineId.equals(snapshot.get().scope().pipelineId())) {
                     throw new TapstateException(
                             IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+                }
+                if (!stopOperation && pipelineConvergences != null
+                        && snapshot.get().desired().targetState() == PipelineState.STOPPED) {
+                    pipelineConvergences.beginStop(pipelineId, () -> reconcilePipeline(pipelineId, true));
+                    return;
                 }
                 MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
                         Long.toString(snapshot.get().scope().stateGeneration()));
@@ -326,7 +344,8 @@ final class ConvergenceDriver {
                                 writeObservationNow(pipelineId, () -> publisher.publishScoped(originalPass.scope(),
                                         originalPass.state(), originalPass.observationSample(), null));
                             },
-                            () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
+                            () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent(),
+                            stopOperation);
             if (result.status() == ConvergeStatus.RECOVERING) return;
             if (periodicObservations != null && result.status() == ConvergeStatus.CONVERGED
                     && result.checkpoint().filter(checkpoint ->

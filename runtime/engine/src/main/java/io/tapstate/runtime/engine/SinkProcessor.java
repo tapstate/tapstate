@@ -185,6 +185,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // with its totals back at zero, and a start that did not move with them would describe a stream that
     // no longer exists.
     private long countingSince;
+    private StopWaitLog.Site closeSite;
 
     /** No sink-ack watermark: the order-independent or append-only path (any in-flight bound is allowed). */
     public SinkProcessor(SinkWriter writer, int maxInFlight, int maxBatchSize) {
@@ -406,6 +407,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             ack = sinkAck.forWriter(writerId(writerOf, totalOne ? 0 : context.globalProcessorIndex()));
         }
         HazelcastInstance instance = context.hazelcastInstance();
+        if (instance != null && instance.getCluster() != null) {
+            String member = instance.getCluster().getLocalMember().getUuid().toString();
+            closeSite = new StopWaitLog.Site(pipelineId, context.jobId() + "/" + context.executionId(), member, "SinkProcessor.close");
+        }
         this.failureRegistry = JobFailureRegistry.forProcessor(instance, context);
         configureJobGauges(instance);
         if (ack != null) ack.started(context.jobId(), context.executionId());
@@ -761,10 +766,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
         closed = true;
         try {
-            if (ack != null) ack.flushOnClose();
+            if (ack != null) closeStep("SinkAck.flushOnClose", ack::flushOnClose);
         } finally {
-            writer.close();
+            closeStep("SinkWriter.close", writer::close);
         }
+    }
+
+    private void closeStep(String operation, Runnable close) {
+        StopWaitLog.around(closeSite == null ? null : closeSite.at(operation), close);
     }
 
     /** Removes every settled write, surfacing the cause of a failed one so it fails the job. */

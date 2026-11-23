@@ -10,6 +10,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
 /** Native physical tails and private snapshot attachments have independent lifetimes and authority. */
@@ -25,6 +26,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private final CaptureObservation.Factory observations;
     private final Set<Tail> tails = ConcurrentHashMap.newKeySet();
     private final Set<CaptureRun> snapshots = ConcurrentHashMap.newKeySet();
+    private final Set<CaptureRun> closingSnapshots = ConcurrentHashMap.newKeySet();
+    private final Set<Runnable> closingOpenings = ConcurrentHashMap.newKeySet();
     private final Map<Runnable,Runnable> pendingCloses = new ConcurrentHashMap<>();
     private final Map<CaptureRun,Runnable> runOwners = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -295,28 +298,36 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         private ScheduledFuture<?> checkpointTask;
         private final Runnable owner;
         private final AtomicBoolean ended = new AtomicBoolean();
+        private final ReentrantLock operations = new ReentrantLock();
         private Tail(SrsCaptureWriter writer,Subscription subscription,CaptureHealth health,Runnable owner) {
             this.writer = writer; this.subscription = subscription; this.health = health; this.owner = owner;
         }
         public CaptureHealth health() { return health; }
-        public synchronized void finishCheckpointing() {
-            if (!ended.get() && health.failure().isEmpty()) writer.finishCheckpointing();
-            if (checkpointTask != null) checkpointTask.cancel(false);
+        public void finishCheckpointing() {
+            operations.lock();
+            try {
+                if (!ended.get() && health.failure().isEmpty()) writer.finishCheckpointing();
+                if (checkpointTask != null) checkpointTask.cancel(false);
+            } finally { operations.unlock(); }
         }
-        private synchronized void flushScheduled() {
+        private void flushScheduled() {
+            operations.lock();
             try {
                 if (!ended.get() && health.failure().isEmpty()) writer.flushCheckpoint();
             } catch (RuntimeException | Error failure) {
                 writer.close();
                 health.fail(failure);
-            }
+            } finally { operations.unlock(); }
         }
-        @Override public synchronized void close() {
-            if (ended.get()) return;
-            if (checkpointTask != null) checkpointTask.cancel(false);
-            writer.close(); if(subscription!=null)subscription.close(); writer.stopSources();
-            if(opening!=null)opening.run();
-            ended.set(true); tails.remove(this);
+        @Override public void close() {
+            operations.lock();
+            try {
+                if (ended.get()) return;
+                if (checkpointTask != null) checkpointTask.cancel(false);
+                writer.close(); if(subscription!=null)subscription.close(); writer.stopSources();
+                if(opening!=null)opening.run();
+                ended.set(true); tails.remove(this);
+            } finally { operations.unlock(); }
         }
     }
     private static void closeOpening(AutoCloseable opening,String captureId) {
@@ -327,12 +338,20 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private static void closePortOpening(CapturePort port,String captureId) {
         if(port instanceof AutoCloseable opening)closeOpening(opening,captureId);
     }
-    public synchronized void stopSnapshot(CaptureRun original) {
-        if (snapshots.contains(Objects.requireNonNull(original,"original"))) { original.close(); snapshots.remove(original); runOwners.remove(original); }
+    public void stopSnapshot(CaptureRun original) {
+        if (!snapshots.contains(Objects.requireNonNull(original, "original"))) return;
+        if (!closingSnapshots.add(original)) throw stillEnding(original.chainId().map(MiningChainId::value).orElse("snapshot"));
+        try {
+            if (snapshots.contains(original)) {
+                original.close();
+                snapshots.remove(original);
+                runOwners.remove(original);
+            }
+        } finally { closingSnapshots.remove(original); }
     }
     private void register(CaptureRun original,Runnable owner) {runOwners.put(original,owner);snapshots.add(original);}
     /** Retries only this opening's retained handles, even when business authorization has ended. */
-    public synchronized void stopOpenings(Runnable originalOwner) {
+    public void stopOpenings(Runnable originalOwner) {
         Objects.requireNonNull(originalOwner);Throwable first=null;
         for(var run:List.copyOf(snapshots))if(runOwners.get(run)==originalOwner)first=closeAfter(first,() -> stopSnapshot(run));
         for(var tail:List.copyOf(tails))if(tail.owner==originalOwner)first=closeAfter(first,tail::close);
@@ -357,7 +376,19 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
             @Override public void close(){closePending(close);}
         };
     }
-    private void closePending(Runnable original){original.run();pendingCloses.remove(original);}
+    private void closePending(Runnable original) {
+        if (!pendingCloses.containsKey(original)) return;
+        if (!closingOpenings.add(original)) throw stillEnding("source opening");
+        try {
+            if (pendingCloses.containsKey(original)) {
+                original.run();
+                pendingCloses.remove(original);
+            }
+        } finally { closingOpenings.remove(original); }
+    }
+    private static TapstateException stillEnding(String captureId) {
+        return new TapstateException(CaptureError.STILL_ENDING, Map.of("captureId", captureId), null);
+    }
     private Runnable guard(Runnable original) {
         Objects.requireNonNull(original,"requireActive");
         return () -> {

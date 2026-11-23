@@ -6,6 +6,9 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.*;
 import io.tapstate.spi.store.*;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
@@ -321,9 +324,44 @@ class SrsSnapshotPreparationTest {
         assertThat(f.headReads).isZero();assertThat(f.exactReads).isOne();owner.close();
     }
 
-    private static java.util.Collection<?> registered(NativeSrsCaptureRunUnit unit) throws ReflectiveOperationException {
+    @Test void aBlockedOriginalCaptureCloseLeavesAnIndependentCloseFree() throws Exception {
+        var f = new Fixture();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var fastClosed = new AtomicBoolean();
+        var first = cdcRun(() -> {
+            entered.countDown();
+            try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(interrupted);
+            }
+        });
+        var second = cdcRun(() -> fastClosed.set(true));
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(), new SrsStores(f, f, f, f), unusedMember());
+                var calls = Executors.newFixedThreadPool(2)) {
+            registered(unit).addAll(List.of(first, second));
+            var blocked = calls.submit(() -> unit.stopSnapshot(first));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                calls.submit(() -> unit.stopSnapshot(second)).get(1, TimeUnit.SECONDS);
+                assertThat(fastClosed).isTrue();
+                assertThat(blocked).isNotDone();
+                assertThat(registered(unit)).containsExactly(first);
+            } finally { release.countDown(); }
+            blocked.get(5, TimeUnit.SECONDS);
+            assertThat(registered(unit)).isEmpty();
+        }
+    }
+
+    private static CaptureRun cdcRun(Subscription source) {
+        return new CaptureRun(Optional.empty(), false, 0, Optional.empty(), Optional.of(source), new CaptureHealth());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Collection<CaptureRun> registered(NativeSrsCaptureRunUnit unit) throws ReflectiveOperationException {
         var field = NativeSrsCaptureRunUnit.class.getDeclaredField("snapshots"); field.setAccessible(true);
-        return (java.util.Collection<?>) field.get(unit);
+        return (java.util.Collection<CaptureRun>) field.get(unit);
     }
     private static com.hazelcast.core.HazelcastInstance unusedMember() {
         return (com.hazelcast.core.HazelcastInstance) java.lang.reflect.Proxy.newProxyInstance(
