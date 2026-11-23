@@ -1772,30 +1772,41 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             var checkedRetry = new AtomicBoolean();
             try (var session = client.startSession()) {
                 if (pinOperations != null) pinOperations.awaitPipelineRenewal(fence.key(), budget);
-                var options = TransactionOptions.builder().readConcern(TRANSACTION.getReadConcern())
-                        .writeConcern(TRANSACTION.getWriteConcern()).timeout(budget.remainingMillis(), TimeUnit.MILLISECONDS).build();
-                return session.withTransaction(() -> {
-                    int attempt = attempts.getAndIncrement();
-                    // The previous transaction has ended on callback retry. Commit retries
-                    // keep the original protection until the commit outcome is known.
-                    if (pinOperations != null) {
-                        pinOperations.releasePinRetry(retry.getAndSet(null));
-                        if (claimConflict.getAndSet(false) && checkedRetry.compareAndSet(false, true)) {
-                            pinOperations.awaitPipelineRenewal(fence.key(), budget);
-                            retry.set(protectPinRetry(fence, budget));
-                        }
+                for (int connectionAttempt = 0; ; connectionAttempt++) {
+                    var options = TransactionOptions.builder().readConcern(TRANSACTION.getReadConcern())
+                            .writeConcern(TRANSACTION.getWriteConcern()).timeout(budget.remainingMillis(), TimeUnit.MILLISECONDS).build();
+                    try {
+                        return session.withTransaction(() -> {
+                            int attempt = attempts.getAndIncrement();
+                            // The previous transaction has ended on callback retry. Commit retries
+                            // keep the original protection until the commit outcome is known.
+                            if (pinOperations != null) {
+                                pinOperations.releasePinRetry(retry.getAndSet(null));
+                                if (claimConflict.getAndSet(false) && checkedRetry.compareAndSet(false, true)) {
+                                    pinOperations.awaitPipelineRenewal(fence.key(), budget);
+                                    retry.set(protectPinRetry(fence, budget));
+                                }
+                            }
+                            if (attempt > 0) waitForPinRetry(attempt);
+                            requireActive.run();
+                            MongoStructureFailureScope.beginCallback();
+                            if (!runtimeStructure) requireStructure.run();
+                            requireActive.run();
+                            budget.remainingMillis();
+                            boolean result = action.apply(session);
+                            requireActive.run();
+                            budget.remainingMillis();
+                            return result;
+                        }, options);
+                    } catch (com.mongodb.MongoOperationTimeoutException unavailable) {
+                        // A pre-command connection timeout can recover within the original pin window.
+                        // Never retry an attempted write or an uncertain commit through this path.
+                        if (connectionAttempt != 0 || unavailable.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)
+                                || !MongoStructureFailureScope.provedNoCommandStarted(client)) throw unavailable;
+                        requireActive.run();
+                        budget.remainingMillis();
                     }
-                    if (attempt > 0) waitForPinRetry(attempt);
-                    requireActive.run();
-                    MongoStructureFailureScope.beginCallback();
-                    if (!runtimeStructure) requireStructure.run();
-                    requireActive.run();
-                    budget.remainingMillis();
-                    boolean result = action.apply(session);
-                    requireActive.run();
-                    budget.remainingMillis();
-                    return result;
-                }, options);
+                }
             } catch (UnchangedPin result) {
                 requireActive.run();
                 return result.accepted;

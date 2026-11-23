@@ -3969,4 +3969,111 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"normal-five", "selection-twenty", "inherited-five", "unobserved", "outlasts-window", "unknown-commit", "after-wire"})
+    void pinMustUseItsOriginalFifteenSecondWindowForAConnectionThatRecoversAtSevenSeconds(String mode) {
+        withBusiness(f -> {
+            enablePipelineClaimAdmission(f);
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "recovered-pool", refs);
+            String app = "pin-checkout-" + UUID.randomUUID();
+            var busy = new CountDownLatch(1);
+            var pinCommands = new java.util.concurrent.atomic.AtomicInteger();
+            var checkoutFailures = new java.util.concurrent.atomic.AtomicInteger();
+            var maxCheckout = new java.util.concurrent.atomic.AtomicLong();
+            var workerBudget = new java.util.concurrent.atomic.AtomicLong();
+            var activeCalls = new java.util.concurrent.atomic.AtomicInteger();
+            var listener = new com.mongodb.event.CommandListener() {
+                public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (Thread.currentThread().getName().equals("pool-holder") && event.getCommandName().equals("find")) busy.countDown();
+                    if (Thread.currentThread().getName().startsWith("mongo-snapshot-pin-io")) pinCommands.incrementAndGet();
+                }
+            };
+            var pool = new com.mongodb.event.ConnectionPoolListener() {
+                public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                    if (Thread.currentThread().getName().startsWith("mongo-snapshot-pin-io")) {
+                        checkoutFailures.incrementAndGet(); maxCheckout.accumulateAndGet(event.getElapsedTime(TimeUnit.MILLISECONDS), Math::max);
+                    }
+                }
+            };
+            var observer = new MongoStructureFailureScope.CommandObserver();
+            try (var client = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(observer)
+                    .applicationName(app).addCommandListener(listener)
+                    .applyToConnectionPoolSettings(value -> value.maxSize(1).addConnectionPoolListener(pool))
+                    .applyToClusterSettings(value -> value.serverSelectionTimeout(mode.equals("selection-twenty") || mode.equals("inherited-five") ? 20 : 5, TimeUnit.SECONDS)).build());
+                 var holder = Executors.newSingleThreadExecutor(action -> new Thread(action, "pool-holder"))) {
+                if (!mode.equals("unobserved")) observer.bind(client);
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var admin = f.client().getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                        .append("data", new Document("appName", app).append("failCommands", List.of("find"))
+                                .append("blockConnection", true).append("blockTimeMS", mode.equals("outlasts-window") ? 17000 : 7000)));
+                var held = holder.submit(() -> SystemCollections.SRS_CHAINS.on(client.getDatabase(f.database().getName()))
+                        .withTimeout(22, TimeUnit.SECONDS).find(new Document("_id", CHAIN)).first());
+                assertThat(busy.await(3, TimeUnit.SECONDS)).isTrue();
+                var operations = new MongoClaimOperations(client);
+                Runnable active = () -> {
+                    if (Thread.currentThread().getName().startsWith("mongo-snapshot-pin-io")) {
+                        int call = activeCalls.incrementAndGet();
+                        if (mode.equals("unknown-commit") && call == 3 || mode.equals("after-wire") && pinCommands.get() > 0) {
+                            var failure = new com.mongodb.MongoOperationTimeoutException("test pin timeout");
+                            if (mode.equals("unknown-commit")) failure.addLabel(com.mongodb.MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL);
+                            throw failure;
+                        }
+                        try {
+                            var current = MongoStructureFailureScope.class.getDeclaredField("CURRENT"); current.setAccessible(true);
+                            var scope = ((ThreadLocal<?>) current.get(null)).get();
+                            if (scope != null) {
+                                var field = MongoStructureFailureScope.class.getDeclaredField("budget"); field.setAccessible(true);
+                                var budget = (MongoReadBudget) field.get(scope);
+                                if (budget != null) workerBudget.compareAndSet(0, budget.remainingMillis());
+                            }
+                        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+                    }
+                };
+                var store = new MongoSrsConsumerStore(client, client.getDatabase(f.database().getName()), SCOPE,
+                        active, () -> {}, MongoSrsLease.perTransaction(), true, operations);
+                long start = System.nanoTime();
+                Boolean accepted = null; Throwable failed = null;
+                try {
+                    accepted = mode.equals("inherited-five")
+                            ? operations.call(System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> store.pinSnapshot(A, member.revision(), 0, pin, f.fenceA()))
+                            : store.pinSnapshot(A, member.revision(), 0, pin, f.fenceA());
+                } catch (Throwable failure) { failed = failure; }
+                long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                boolean holderStillBusy = !held.isDone();
+                System.out.printf("PIN_POOL mode=%s worker_budget_ms=%d elapsed_ms=%d accepted=%s cause=%s pin_wire=%d checkout_failures=%d max_checkout_ms=%d healthy_primary=%s holder_still_busy=%s%n",
+                        mode, workerBudget.get(), elapsed, accepted, failed == null ? "none" : failed.getClass().getSimpleName(), pinCommands.get(), checkoutFailures.get(), maxCheckout.get(),
+                        client.getClusterDescription().getType(), holderStillBusy);
+                held.get(22, TimeUnit.SECONDS);
+                operations.await(System.nanoTime() + TimeUnit.SECONDS.toNanos(2)); operations.closeIfIdle();
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                if (mode.equals("inherited-five")) {
+                    assertThat(workerBudget.get()).isBetween(4000L, 5000L);
+                    assertThat(failed).isNotNull(); assertThat(pinCommands).hasValue(0);
+                } else if (mode.equals("unknown-commit") || mode.equals("after-wire")) {
+                    assertThat(workerBudget.get()).isGreaterThan(14000L);
+                    assertThat(failed).isNotNull();
+                    assertThat(f.consumers().progress(A).orElseThrow().snapshot()).isNull();
+                    if (mode.equals("unknown-commit")) {
+                        assertThat(pinCommands).hasValue(0); assertThat(checkoutFailures).hasValue(0);
+                    } else {
+                        assertThat(pinCommands.get()).isGreaterThan(0); assertThat(checkoutFailures).hasValue(1);
+                    }
+                } else if (mode.equals("unobserved") || mode.equals("outlasts-window")) {
+                    assertThat(workerBudget.get()).isGreaterThan(14000L);
+                    assertThat(failed).isNotNull(); assertThat(pinCommands).hasValue(0);
+                    assertThat(checkoutFailures).hasValue(mode.equals("unobserved") ? 1 : 2);
+                    assertThat(elapsed).isLessThan(15000L);
+                } else {
+                    assertThat(workerBudget.get()).isGreaterThan(14000L);
+                    assertThat(failed).isNull(); assertThat(accepted).isTrue();
+                }
+            }
+        });
+    }
+
 }

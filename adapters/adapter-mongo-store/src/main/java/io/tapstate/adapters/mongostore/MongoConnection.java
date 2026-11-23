@@ -310,6 +310,9 @@ public final class MongoConnection implements AutoCloseable {
             throw new TapstateException(StoreError.NOT_REPLICA_SET, Map.of("target", target), null);
         }
         this.database = opened.getDatabase(databaseName);
+        for (var listener : clientSettings.getCommandListeners()) {
+            if (listener instanceof MongoStructureFailureScope.CommandObserver observer) observer.bind(opened);
+        }
         this.client = opened;
         this.verifiedSettings = clientSettings;
     }
@@ -430,6 +433,7 @@ public final class MongoConnection implements AutoCloseable {
     MongoClientSettings buildClientSettings(ConnectionString connectionString) {
         MongoClientSettings.Builder builder = MongoClientSettings.builder()
                 .addCommandListener(MongoCommandObservation.LISTENER)
+                .addCommandListener(new MongoStructureFailureScope.CommandObserver())
                 .addCommandListener(MongoStructureFailureScope.listener(() -> client, () -> database,
                         explicitDatabase != null ? SystemCollections.Database.CACHE
                                 : strictStorage ? SystemCollections.Database.CONFIG : SystemCollections.Database.STORE))

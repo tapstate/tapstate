@@ -18,6 +18,9 @@ import java.util.function.Supplier;
 
 /** Captures attribution during an operation and inspects only after its transaction has closed. */
 final class MongoStructureFailureScope {
+    private static final Set<MongoClient> OBSERVED_CLIENTS = java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>()));
+    private long startedCommands;
     private static final ThreadLocal<MongoStructureFailureScope> CURRENT = new ThreadLocal<>();
     private static final Set<String> COMMANDS = Set.of("find", "aggregate", "insert", "update", "delete", "findAndModify");
     private static final Set<Integer> STRUCTURE_ERRORS = Set.of(26, 27, 48, 85, 86, 121, 166, 171, 197, 11000);
@@ -81,6 +84,26 @@ final class MongoStructureFailureScope {
             // Supplementary diagnosis must never replace the original operation failure.
         }
         return original;
+    }
+
+    static final class CommandObserver implements CommandListener {
+        private volatile MongoClient client;
+
+        void bind(MongoClient original) {
+            if (client != null) throw new IllegalStateException("command observer already bound");
+            client = original;
+            OBSERVED_CLIENTS.add(original);
+        }
+
+        @Override public void commandStarted(CommandStartedEvent event) {
+            var scope = CURRENT.get();
+            if (scope != null && scope.client == client) scope.startedCommands++;
+        }
+    }
+
+    static boolean provedNoCommandStarted(MongoClient client) {
+        var scope = CURRENT.get();
+        return OBSERVED_CLIENTS.contains(client) && scope != null && scope.client == client && scope.startedCommands == 0;
     }
 
     static void includeOperatorDatabase(MongoClient client, MongoDatabase database) {
