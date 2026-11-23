@@ -67,12 +67,12 @@ final class NativeValidationScheduler implements AutoCloseable {
         require();
         if(scanRevision==null){
             long revision=configuration.configurationRevision();require();
-            if(Objects.equals(completedRevision,revision)){nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(1);return;}
+            if(Objects.equals(completedRevision,revision)){nextDiscovery=nanoTime.getAsLong()+TimeUnit.SECONDS.toNanos(1);return;}
             scanRevision=revision;scanFailed=false;capacityDeferred=false;
         }
         final ValidationTaskStore tasks;
         try{tasks=configuration.pollingValidationTasks(this::require);}
-        catch(TapstateException unavailable){nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(1);throw unavailable;}
+        catch(TapstateException unavailable){nextDiscovery=nanoTime.getAsLong()+TimeUnit.SECONDS.toNanos(1);throw unavailable;}
         if(pipeline==null){var found=tasks.pipelines(afterPipeline,1);if(found.isEmpty()){
             long revision=configuration.configurationRevision();require();
             synchronized(this){
@@ -80,7 +80,7 @@ final class NativeValidationScheduler implements AutoCloseable {
                         &&Objects.equals(scanRevision,revision)?revision:null;
             }
             scanRevision=null;afterPipeline=null;afterTask=null;
-            nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(completedRevision==null?0:1);return;
+            nextDiscovery=nanoTime.getAsLong()+TimeUnit.SECONDS.toNanos(completedRevision==null?0:1);return;
         }pipeline=found.getFirst();afterTask=null;}
         var current=pipeline;List<String> ids;
         try{ids=tasks.taskIds(current,afterTask,1);}catch(TapstateException failed){afterPipeline=pipeline;pipeline=null;afterTask=null;throw failed;}

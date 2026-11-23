@@ -43,8 +43,8 @@ class NativeValidationEmptyPollingTest {
         var work = mock(ValidationMemberResources.Control.class);
         when(member.admitMaintenanceControl()).thenReturn(work);
         doAnswer(call -> { ((Runnable) call.getArgument(0)).run(); return null; }).when(work).execute(any());
-        when(configuration.validationDiscoveryRevision()).thenReturn(7L);
-        when(configuration.validationTasks(any())).thenReturn(tasks);
+        when(configuration.configurationRevision()).thenReturn(7L);
+        when(configuration.pollingValidationTasks(any())).thenReturn(tasks);
         when(tasks.pipelines(null, 1)).thenReturn(List.of());
         var now = new AtomicLong(1);
         try (var scheduler = new NativeValidationScheduler(configuration, member, mock(ValidationMemberResources.class),
@@ -54,12 +54,12 @@ class NativeValidationEmptyPollingTest {
                 ReflectionTestUtils.invokeMethod(scheduler, "dispatch");
                 now.addAndGet(TimeUnit.MILLISECONDS.toNanos(100));
             }
-            verify(configuration, times(2)).validationDiscoveryRevision();
+            verify(configuration, times(2)).configurationRevision();
             verify(tasks).pipelines(null, 1);
-            when(configuration.validationDiscoveryRevision()).thenReturn(8L);
+            when(configuration.configurationRevision()).thenReturn(8L);
             ReflectionTestUtils.invokeMethod(scheduler, "dispatch");
             verify(tasks, times(2)).pipelines(null, 1);
-            verify(configuration, times(4)).validationDiscoveryRevision();
+            verify(configuration, times(4)).configurationRevision();
         }
     }
 }
