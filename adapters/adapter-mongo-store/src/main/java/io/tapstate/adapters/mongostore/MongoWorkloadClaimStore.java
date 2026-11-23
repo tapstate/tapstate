@@ -141,7 +141,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 || !key.clusterId().equals(node.owner().nodeId())) throw MongoCacheWorkloadClaimStore.claimFenced();
         var row = stored(key);
         var original = decodeStrict(row);
-        var current = read(key).orElseThrow(MongoCacheWorkloadClaimStore::claimFenced);
+        var current = readPipelineForAdmission(key).orElseThrow(MongoCacheWorkloadClaimStore::claimFenced);
         boolean sameSession = nodeBacked(row) && original.owner().equals(node.owner())
                 && Long.valueOf(node.claimGeneration()).equals(row.get(NODE_LEASE_GENERATION));
         if (current.leased() && sameSession) return WorkloadClaimAttempt.acquired(current.claim());
@@ -152,8 +152,33 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 .append(NODE_LEASE_GENERATION, node.claimGeneration());
         if (collection.replaceOne(session, row, replacement).getMatchedCount() != 1)
             throw MongoCacheWorkloadClaimStore.claimFenced();
-        var effective = read(key).filter(WorkloadClaimReading::leased).orElseThrow(MongoCacheWorkloadClaimStore::claimFenced);
+        var effective = readPipelineForAdmission(key).filter(WorkloadClaimReading::leased).orElseThrow(MongoCacheWorkloadClaimStore::claimFenced);
         return WorkloadClaimAttempt.acquired(effective.claim());
+    }
+
+    private Optional<WorkloadClaimReading> readPipelineForAdmission(WorkloadClaimKey key) {
+        if (session == null || !strict) return read(key);
+        var limit = new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), 64 * 1024));
+        var inline = new Document("$project", new Document("_id", 0).append("row", new Document("$cond",
+                java.util.Arrays.asList(limit, "$$ROOT", null))));
+        var nodeId = new Document("clusterId", key.clusterId()).append("resourceType", WorkloadClaimType.NODE_SESSION.name())
+                .append("resourceId", "$$owner");
+        var stages = List.of(new Document("$match", new Document("_id", id(key))), new Document("$limit", 1), leaseRemaining(true), inline,
+                new Document("$lookup", new Document("from", collection.getNamespace().getCollectionName())
+                        .append("let", new Document("owner", "$row.ownerNodeId"))
+                        .append("pipeline", List.of(new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", nodeId)))),
+                                new Document("$limit", 1), leaseRemaining(true), inline)).append("as", "node")));
+        var captured = collection.aggregate(session, stages).first();
+        if (captured == null) return Optional.empty();
+        if (!(captured.get("row") instanceof Document original)) return read(key);
+        var nodes = captured.getList("node", Document.class);
+        Document node = nodes.isEmpty() ? null : nodes.getFirst().get("row", Document.class);
+        if (!nodes.isEmpty() && node == null) return read(key);
+        if (nodeBacked(original)) {
+            var canonical = id(new WorkloadClaimKey(key.clusterId(), WorkloadClaimType.NODE_SESSION, original.getString("ownerNodeId")));
+            if (node == null || !canonical.equals(node.get("_id"))) return read(key);
+        }
+        return Optional.of(observedPipelineReading(original, node));
     }
 
     Optional<WorkloadClaim> acquireNewValidationExecution(WorkloadClaim previous, WorkloadOwner owner,

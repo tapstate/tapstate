@@ -216,7 +216,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireScope(original);
         if (topologyRevision != 1 || !node.owner().nodeId().equals(scope.clusterId())) throw claimFenced();
         return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> {
-            MongoCachePipelinePreparations.proveNode(session, database, scope, node);
+            MongoCachePipelinePreparations.proveNodeForClaim(session, database, scope, node);
             return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
         }));
     }

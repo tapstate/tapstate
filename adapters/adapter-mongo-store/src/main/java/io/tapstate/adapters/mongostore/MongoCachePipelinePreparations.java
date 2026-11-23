@@ -346,7 +346,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
     private Date proveNode(ClientSession session, WorkloadClaimFence node) {
         return proveNode(session, database, business, node);
     }
-    static Date proveNode(ClientSession session, MongoDatabase database, CacheBusinessScope business, WorkloadClaimFence node) {
+    static void proveNodeForClaim(ClientSession session, MongoDatabase database, CacheBusinessScope business, WorkloadClaimFence node) {
         Objects.requireNonNull(node, "node");
         if (node.key().type() != WorkloadClaimType.NODE_SESSION || !business.clusterId().equals(node.key().clusterId())
                 || !node.key().resourceId().equals(node.owner().nodeId())) throw claimFenced();
@@ -357,6 +357,10 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                 || node.topologyRevision() == Long.MAX_VALUE) throw claimFenced();
         if (claims.updateOne(session, WorkloadClaimDocuments.live(node),
                 new Document("$inc", new Document("fencedPreparationWrites", 1L))).getMatchedCount() != 1) throw claimFenced();
+    }
+    static Date proveNode(ClientSession session, MongoDatabase database, CacheBusinessScope business, WorkloadClaimFence node) {
+        proveNodeForClaim(session, database, business, node);
+        var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         // This query's $$NOW is server time from the same CACHE client/session, never client wall time.
         Document time = claims.aggregate(session, List.of(new Document("$match", new Document("_id", MongoWorkloadClaimStore.id(node.key()))),
                 new Document("$project", new Document("_id", 0).append("serverNow", "$$NOW")))).first();
