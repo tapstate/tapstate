@@ -212,7 +212,7 @@ class BoundedPipelinePreviewIT {
 
             for (String field : List.of("c_w_id", "c_d_id", "c_id")) {
                 List<Map<String, Object>> rejected = previewCompositeAssociation(control, source,
-                        "c_credit: false, " + field + ": false");
+                        "c_credit: false, " + field + ": false", "en");
                 assertThat(rejected).extracting(event -> event.get("kind"))
                         .as("invalid candidate events: %s", rejected)
                         .containsExactly("run.accepted", "compile.completed", "run.failed");
@@ -222,7 +222,17 @@ class BoundedPipelinePreviewIT {
                                 "transform", "customer__pre", "droppedField", field));
             }
 
-            List<Map<String, Object>> restored = previewCompositeAssociation(control, source, "c_credit: false");
+            String dropped = "c_credit: false, c_d_id: false";
+            var simplified = payload(previewCompositeAssociation(control, source, dropped, "zh-CN"), "run.failed");
+            var traditional = payload(previewCompositeAssociation(control, source, dropped, "zh-TW"), "run.failed");
+            var expected = Map.of("relation", "customer", "field", "c_d_id",
+                    "transform", "customer__pre", "droppedField", "c_d_id");
+            assertThat(simplified).containsEntry("code", "TS0360036").containsEntry("params", expected);
+            assertThat(traditional).containsEntry("code", "TS0360036").containsEntry("params", expected);
+            assertThat((String) simplified.get("reason")).contains("\u5173\u8054\u952e", "c_d_id");
+            assertThat((String) traditional.get("reason")).contains("\u95dc\u806f\u9375", "c_d_id");
+
+            List<Map<String, Object>> restored = previewCompositeAssociation(control, source, "c_credit: false", null);
             assertThat(restored).extracting(event -> event.get("kind"))
                     .as("restored candidate events: %s", restored)
                     .endsWith("result.completed", "run.completed");
@@ -233,7 +243,7 @@ class BoundedPipelinePreviewIT {
     }
 
     private static List<Map<String, Object>> previewCompositeAssociation(
-            ControlPlane control, Path source, String fields) {
+            ControlPlane control, Path source, String fields, String language) {
         String sourceDraft = """
                 version: tapstate/v1
                 kind: source
@@ -271,7 +281,7 @@ class BoundedPipelinePreviewIT {
                 """.formatted(fields);
         return control.preview(PIPELINE_ID, OUTPUT_ID, 1, SAMPLE_ID + "-composite",
                 List.of(new ControlPlane.PreviewDraft("source.tap.yml", sourceDraft),
-                        new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline)));
+                        new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline)), language);
     }
 
     private static void assertSampleAndCache(ControlPlane control, Path source) throws Exception {
