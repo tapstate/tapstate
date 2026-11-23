@@ -117,8 +117,8 @@ final class MongoStartConfigRead {
                 || !MongoConfigurationDomain.LAYOUT.equals(snapshot.get("layoutId"))) return Optional.empty();
         var bound = row(snapshot, "binding", "cluster");
         var setup = row(snapshot, "setup", "cluster");
-        var recovery = row(snapshot, "recovery", "cluster");
-        if (bound.isEmpty() || setup.isEmpty() || recovery.isEmpty()) return Optional.empty();
-        return Optional.of(bindings.observationBinding(scope, bound.orElseThrow(), setup.orElseThrow(), recovery.orElseThrow()));
+        var recovery = boundedRow(snapshot, "recovery", "cluster");
+        if (bound.isEmpty() || setup.isEmpty() || recovery == null) return Optional.empty();
+        return Optional.of(bindings.observationBinding(scope, bound.orElseThrow(), setup.orElseThrow(), recovery));
     }
 }
