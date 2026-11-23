@@ -1,6 +1,7 @@
 [
   {"module": "app", "class": "io.tapstate.app.CloudClusterContextCarriesTheCurrentEgressAddressIT"},
   {"module": "app", "class": "io.tapstate.app.PipelineLaunchLatencyIT"},
+  {"module": "app", "class": "io.tapstate.app.PipelineFirstStatePreparerIT", "method": "deferredStartDiagnosticsSurviveReopenAndDoNotCarryOverToRetry"},
   {"module": "app", "class": "io.tapstate.app.NativeIdlePipelineCostIT", "method": "warmNestObservationPublishesBatchedFactsAndAdvancesAfterCdc"},
   {"module": "app", "class": "io.tapstate.app.NativeValidationApiIT"},
   {"module": "app", "class": "io.tapstate.app.SourceConfigEncryptionIT"},
