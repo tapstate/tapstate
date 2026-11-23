@@ -90,6 +90,8 @@ class ScopedConvergenceDriverTest {
         if (!realOwnership) when(ownership.permit(any(PipelineIntentScope.class))).thenAnswer(call -> deny
                 ? PipelineActuationOwnership.Permit.denied()
                 : new PipelineActuationOwnership.Permit(true, claims.read(KEY).orElseThrow().claim()));
+        if (!realOwnership) when(ownership.permit(any(PipelineIntentScope.class), eq(true)))
+                .thenAnswer(call -> ownership.permit(call.<PipelineIntentScope>getArgument(0)));
         if (!realOwnership) when(ownership.enterPass(any())).thenReturn(mock(PipelineActuationOwnership.Pass.class));
         var bindings = new ConvergenceDriver.ScopedPorts(intents, views, () -> {}, pass -> {
             passes.add(pass);
@@ -1143,10 +1145,12 @@ class ScopedConvergenceDriverTest {
         @Override public Optional<PendingStart> pendingStart(String id) { return Optional.ofNullable(pending); }
         private int loads;
         private boolean hints = true;
+        private ScanCandidate candidateOverride;
         @Override public Optional<PipelineIntentSnapshot> load(String id) { throw new AssertionError("authoring load does not prove preparation readiness"); }
         @Override public Optional<PipelineIntentSnapshot> loadForActuation(String id) { loads++; if (loadFailure != null) throw loadFailure; return Optional.ofNullable(snapshot); }
         @Override public List<String> pipelineIds() { return ids; }
         @Override public List<ScanCandidate> scanCandidates() {
+            if (candidateOverride != null) return List.of(candidateOverride);
             return ids.stream().map(id -> snapshot == null || !hints || !id.equals(snapshot.scope().pipelineId())
                     ? new ScanCandidate(id, 0) : new ScanCandidate(id,
                             snapshot.desired().targetState() == PipelineState.RUNNING ? snapshot.intentRevision() : 0,
@@ -1234,6 +1238,28 @@ class ScopedConvergenceDriverTest {
                 }
                 @Override public void delete(String id) { throw new AssertionError("no ordinary delete"); }
             };
+        }
+    }
+
+    @Test void onlyTheFirstVerifiedStartClaimsTheInitialAdmissionTurn() throws Exception {
+        try (var driver = driver()) {
+            scheduledPass(driver);
+            verify(ownership, times(1)).permit(FIRST, true);
+            scheduledPass(driver);
+            verify(ownership, times(1)).permit(FIRST, true);
+            verify(ownership, times(2)).permit(FIRST);
+            assertThat(carrying).isTrue();
+        }
+    }
+
+    @Test void aNewStopIntentLoadedAfterAnOldStartHintCannotClaimInitialAdmission() throws Exception {
+        intents.candidateOverride = new PipelineIntentStore.ScanCandidate("orders", 4, FIRST, 4, PipelineState.RUNNING);
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 5, new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var driver = driver()) {
+            scheduledPass(driver);
+            verify(ownership, never()).permit(FIRST, true);
+            verify(ownership).permit(FIRST);
+            assertThat(views.state(FIRST).read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(PipelineState.STOPPED));
         }
     }
 }

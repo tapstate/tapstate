@@ -1645,4 +1645,145 @@ class MongoCachePipelinePreparationsIT {
         });
     }
 
+    @org.junit.jupiter.api.RepeatedTest(2)
+    void aPreparedUnexecutedRunMustAcquireItsOriginalClaimWithinTheSameTenSecondWindowDespiteOldStopBacklog() {
+        withFixture(f -> {
+            boolean priority = true;
+            var grant = f.issue(); var reservation = f.preparations().reserveFirst(grant, TTL);
+            f.configuration.preparations().complete(f.preparations().seed(reservation, f.configuration.preparations(), AT));
+            var targetKey = reservation.claim().key();
+            f.claims().updateOne(new Document("_id", MongoWorkloadClaimStore.id(targetKey)),
+                    new Document("$set", new Document("leaseUntil", new java.util.Date(System.currentTimeMillis() - 198000))));
+            var oldScope = new PipelineIntentScope(f.scope.clusterId(), f.scope.bindingVersion(), f.scope.cacheIncarnation(), "old-stop", 1);
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.cacheDatabase).insertOne(new Document("_id", oldScope.pipelineId())
+                    .append("scope", MongoPipelinePreparationFacts.scope(oldScope)).append("stateJson", "STOPPED")
+                    .append("epoch", 0L).append("runtimeWriteFence", 1L).append("touchMillis", AT.toEpochMilli()));
+            var oldKey = new WorkloadClaimKey(oldScope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, oldScope.pipelineId());
+            new MongoWorkloadClaimStore(f.claims()).acquire(oldKey, OWNER, 1, TTL);
+            f.claims().updateOne(new Document("_id", MongoWorkloadClaimStore.id(oldKey)), new Document("$set",
+                    new Document("pipelineScope", MongoPipelinePreparationFacts.scope(oldScope)).append("pipelinePreparation",
+                            MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(), PipelineCachePreparations.Phase.PREPARED))));
+            var held = new CountDownLatch(1); var release = new CountDownLatch(1); var once = new AtomicBoolean(true);
+            var order = new java.util.concurrent.CopyOnWriteArrayList<String>(); var delay = new AtomicBoolean();
+            var clientRef = new java.util.concurrent.atomic.AtomicReference<MongoClient>();
+            var targetThread = new java.util.concurrent.atomic.AtomicLong(-1); var targetCommands = new AtomicInteger();
+            var entered = new AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!delay.get()) return;
+                    if (Thread.currentThread().threadId() == targetThread.get()) targetCommands.incrementAndGet();
+                    if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("cache_identity"))
+                        order.add(MongoCacheAdmissionQueue.firstCurrent(clientRef.get()) ? "foreground" : "old-stop");
+                    try { TimeUnit.MILLISECONDS.sleep(120); }
+                    catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new AssertionError(failure); }
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if (delay.get() && event.getCommandName().equals("update") && once.compareAndSet(true, false)) { held.countDown(); await(release); }
+                }
+            };
+            try (var observed = cacheClient(listener); var callers = Executors.newFixedThreadPool(15)) {
+                clientRef.set(observed); observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var operations = new MongoClaimOperations(observed);
+                MongoCacheAdmissionQueue.bind(observed, f.cacheDatabase.getName(), f.business(), operations);
+                var store = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.cacheDatabase.getName()), f.business(), ACTIVE, null, operations);
+                java.util.concurrent.Callable<io.tapstate.spi.store.WorkloadClaimAttempt> oldAcquire = () -> store.withClaimAcquisitionDeadline(oldKey,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(29), ACTIVE, () -> store.acquirePipeline(oldScope, OWNER, 1, TTL));
+                delay.set(true);
+                var first = callers.submit(oldAcquire); assertThat(held.await(3, TimeUnit.SECONDS)).isTrue();
+                var backlog = new java.util.ArrayList<java.util.concurrent.Future<io.tapstate.spi.store.WorkloadClaimAttempt>>();
+                for (int i = 0; i < 11; i++) backlog.add(callers.submit(oldAcquire));
+                long settle = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (MongoCacheAdmissionQueue.waiting(observed, f.cacheDatabase.getName(), f.business(), false) != 11 && System.nanoTime() < settle) Thread.sleep(1);
+                assertThat(MongoCacheAdmissionQueue.waiting(observed, f.cacheDatabase.getName(), f.business(), false)).isEqualTo(11);
+                long started = System.nanoTime(); long deadline = started + TimeUnit.SECONDS.toNanos(10);
+                var target = callers.submit(() -> {
+                    java.util.function.Supplier<io.tapstate.spi.store.WorkloadClaimAttempt> acquire = () -> store.withClaimAcquisitionDeadline(targetKey, deadline, ACTIVE,
+                            () -> { entered.set(true); targetThread.set(Thread.currentThread().threadId()); return store.acquirePipeline(f.scope, OWNER, 1, TTL); });
+                    return store.withInitialPipelineAcquisition(targetKey, deadline, ACTIVE, acquire);
+                });
+                settle = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (MongoCacheAdmissionQueue.waiting(observed, f.cacheDatabase.getName(), f.business(), priority) != (priority ? 1 : 12) && System.nanoTime() < settle) Thread.sleep(1);
+                release.countDown();
+                io.tapstate.spi.store.WorkloadClaimAttempt result = null; Throwable failure = null;
+                try { result = target.get(11, TimeUnit.SECONDS); }
+                catch (java.util.concurrent.ExecutionException refused) { failure = refused.getCause(); }
+                long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                delay.set(false);
+                assertThat(first.get(3, TimeUnit.SECONDS).acquired()).isTrue();
+                int completed = 0; for (var pending : backlog) if (pending.get(5, TimeUnit.SECONDS).acquired()) completed++;
+                operations.await(System.nanoTime() + TimeUnit.SECONDS.toNanos(2)); operations.closeIfIdle(); MongoCacheAdmissionQueue.unbind(observed);
+                System.out.printf("PREPARED_CLAIM_BACKLOG priority=%s deadline_ms=10000 elapsed_ms=%d entered=%s target_wire=%d old_stop_completed=%d order=%s failure=%s acquired=%s%n",
+                        priority, elapsed, entered.get(), targetCommands.get(), completed + 1, order, failure == null ? "none" : failure.getClass().getSimpleName(), result != null && result.acquired());
+                assertThat(completed).isEqualTo(11);
+                assertThat(failure).isNull(); assertThat(result).isNotNull(); assertThat(result.acquired()).isTrue();
+                assertThat(result.claim().executionGeneration()).isZero();
+                assertThat(result.claim().claimGeneration()).isGreaterThan(reservation.claim().claimGeneration());
+                assertThat(elapsed).isLessThan(10000);
+            } finally { release.countDown(); }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"live-owner", "retired", "scope-mismatch", "expired-budget"})
+    void initialAcquisitionSchedulingCannotWeakenOriginalAuthorityOrItsDeadline(String scenario) {
+        withFixture(f -> {
+            var grant = f.issue(); var reservation = f.preparations().reserveFirst(grant, TTL);
+            f.configuration.preparations().complete(f.preparations().seed(reservation, f.configuration.preparations(), AT));
+            var key = reservation.claim().key();
+            f.claims().updateOne(new Document("_id", MongoWorkloadClaimStore.id(key)),
+                    new Document("$set", new Document("leaseUntil", new java.util.Date(System.currentTimeMillis() - 198000))));
+            if (scenario.equals("live-owner")) {
+                var foreign = new WorkloadOwner("foreign-node", "foreign-boot");
+                assertThat(new MongoWorkloadClaimStore(f.claims()).acquire(key, foreign, 1, TTL).acquired()).isTrue();
+            }
+            if (scenario.equals("retired")) SystemCollections.CACHE_IDENTITY.on(f.cacheDatabase).updateOne(
+                    new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "RETIRED")));
+            var original = f.claim();
+            var requested = scenario.equals("scope-mismatch") ? new PipelineIntentScope(f.scope.clusterId(), f.scope.bindingVersion(),
+                    f.scope.cacheIncarnation(), f.scope.pipelineId(), f.scope.stateGeneration() + 1) : f.scope;
+            var operations = new MongoClaimOperations(f.cacheClient);
+            MongoCacheAdmissionQueue.bind(f.cacheClient, f.cacheDatabase.getName(), f.business(), operations);
+            var store = new MongoCacheWorkloadClaimStore(f.cacheClient, f.cacheDatabase, f.business(), ACTIVE, null, operations);
+            var entered = new AtomicBoolean();
+            try {
+                long deadline = System.nanoTime() + (scenario.equals("expired-budget") ? -1 : TimeUnit.SECONDS.toNanos(10));
+                java.util.concurrent.Callable<io.tapstate.spi.store.WorkloadClaimAttempt> request = () -> store.withInitialPipelineAcquisition(
+                        key, deadline, ACTIVE, () -> { entered.set(true); return store.acquirePipeline(requested, OWNER, 1, TTL); });
+                if (scenario.equals("live-owner")) assertThat(request.call().acquired()).isFalse();
+                else assertThatThrownBy(request::call).isInstanceOf(TapstateException.class);
+                if (scenario.equals("expired-budget")) assertThat(entered).isFalse();
+                assertThat(f.claim()).isEqualTo(original);
+            } finally { operations.await(System.nanoTime() + TimeUnit.SECONDS.toNanos(2)); operations.closeIfIdle(); MongoCacheAdmissionQueue.unbind(f.cacheClient); }
+        });
+    }
+
+    @Test void aSupersededQueuedInitialClaimStillHonorsItsOriginalAdmissionGuardWithoutSendingCommands() {
+        withFixture(f -> {
+            var grant = f.issue(); var reservation = f.preparations().reserveFirst(grant, TTL);
+            f.configuration.preparations().complete(f.preparations().seed(reservation, f.configuration.preparations(), AT));
+            var held = new CountDownLatch(1); var release = new CountDownLatch(1);
+            var operations = new MongoClaimOperations(f.cacheClient);
+            MongoCacheAdmissionQueue.bind(f.cacheClient, f.cacheDatabase.getName(), f.business(), operations);
+            var store = new MongoCacheWorkloadClaimStore(f.cacheClient, f.cacheDatabase, f.business(), ACTIVE, null, operations);
+            var valid = new AtomicBoolean(true); var entered = new AtomicBoolean();
+            try (var callers = Executors.newFixedThreadPool(2)) {
+                var existing = callers.submit(() -> store.withClaimAcquisitionDeadline(reservation.claim().key(),
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(10), ACTIVE, () -> {
+                            held.countDown(); await(release); return store.acquirePipeline(f.scope, OWNER, 1, TTL);
+                        }));
+                assertThat(held.await(2, TimeUnit.SECONDS)).isTrue();
+                var target = callers.submit(() -> store.withInitialPipelineAcquisition(reservation.claim().key(),
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(10), () -> {
+                            if (!valid.get()) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, java.util.Map.of(), null);
+                        }, () -> { entered.set(true); return store.acquirePipeline(f.scope, OWNER, 1, TTL); }));
+                long settle = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (MongoCacheAdmissionQueue.waiting(f.cacheClient, f.cacheDatabase.getName(), f.business(), true) != 1 && System.nanoTime() < settle) Thread.sleep(1);
+                assertThat(MongoCacheAdmissionQueue.waiting(f.cacheClient, f.cacheDatabase.getName(), f.business(), true)).isEqualTo(1);
+                valid.set(false);
+                assertThatThrownBy(() -> target.get(2, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+                assertThat(entered).isFalse();
+                release.countDown(); assertThat(existing.get(2, TimeUnit.SECONDS).acquired()).isTrue();
+            } finally { release.countDown(); operations.await(System.nanoTime() + TimeUnit.SECONDS.toNanos(2)); operations.closeIfIdle(); MongoCacheAdmissionQueue.unbind(f.cacheClient); }
+        });
+    }
 }
