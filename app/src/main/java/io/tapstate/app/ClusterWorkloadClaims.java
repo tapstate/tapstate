@@ -36,9 +36,9 @@ final class ClusterWorkloadClaims {
         return call(action, Long.MAX_VALUE);
     }
     private <T>T call(java.util.function.Supplier<T> action, long budgetNanos){
-        return call(action, budgetNanos, false);
+        return call(action, budgetNanos, null);
     }
-    private <T>T call(java.util.function.Supplier<T> action, long budgetNanos, boolean renewal){
+    private <T>T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey renewal){
         if(admission==null)return action.get();
         if(!admission.enter())throw ThreeLayerStorePort.refused();
         try {
@@ -47,7 +47,7 @@ final class ClusterWorkloadClaims {
                 long deadline = budgetNanos == Long.MAX_VALUE ? admission.deadlineNanos()
                         : Math.min(admission.deadlineNanos(), System.nanoTime() + budgetNanos);
                 Runnable active = () -> { if (!admission.accepting()) throw ThreeLayerStorePort.refused(); };
-                result = renewal ? bounded.withRenewalDeadline(deadline, active, action)
+                result = renewal != null ? bounded.withRenewalDeadline(renewal, deadline, active, action)
                         : bounded.withDeadline(deadline, active, action);
             } else result = action.get();
             if(!admission.current())throw ThreeLayerStorePort.refused();
@@ -130,7 +130,7 @@ final class ClusterWorkloadClaims {
                 || !current.clusterId().equals(expected.key().clusterId())
                 || current.revision() < expected.topologyRevision()
                 || expected.executionGeneration() == 0 && current.revision() != expected.topologyRevision()) return Optional.empty();
-        return call(()->store.renew(expected, ttl), budgetNanos, true);
+        return call(()->store.renew(expected, ttl), budgetNanos, expected.key());
     }
 
     /**
@@ -144,12 +144,12 @@ final class ClusterWorkloadClaims {
 
     Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl, long budgetNanos) {
         return membership.singleControlEligible(expected)
-                ? call(() -> store.renew(expected, ttl), budgetNanos, true) : Optional.empty();
+                ? call(() -> store.renew(expected, ttl), budgetNanos, expected.key()) : Optional.empty();
     }
 
     Optional<WorkloadClaimReading> confirmPipelineRenewal(PipelineIntentScope scope, WorkloadClaim expected, long budgetNanos) {
         if (!membership.businessEligible() && !membership.singleControlEligible(expected)) return Optional.empty();
-        return call(() -> store.readPipeline(scope), budgetNanos, true);
+        return call(() -> store.readPipeline(scope), budgetNanos, expected.key());
     }
 
     /** Read-only reporting proof for the exact retained SINGLE execution, never a business grant. */

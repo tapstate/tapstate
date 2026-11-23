@@ -26,6 +26,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.LongSupplier;
@@ -87,6 +89,7 @@ final class PipelineActuationOwnership {
     private final LongSupplier nanoTime;
     private final boolean fenced;
     private final Map<String, Held> held = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Set<WorkloadClaimKey> dispatchedRenewals = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final Map<String, Control> controls = new HashMap<>();
     /** Local scheduling order only; neither a lease deadline nor an authority token. */
     private long leaseProofSequence;
@@ -802,7 +805,11 @@ final class PipelineActuationOwnership {
      * A definitive refusal drops the claim. A timed-out scoped renewal can retry the same fence before
      * the last confirmed lease deadline.
      */
-    void renewDue() {
+    void renewDue() { renewDueWith(null); }
+
+    void dispatchDueRenewals(Executor dispatcher) { renewDueWith(Objects.requireNonNull(dispatcher)); }
+
+    private void renewDueWith(Executor dispatcher) {
         if (nodeSession != null) return;
         if (businessScope != null) {
             long now = nanoTime.getAsLong();
@@ -816,8 +823,9 @@ final class PipelineActuationOwnership {
             for (Held state : due) {
                 long dispatch = nanoTime.getAsLong();
                 var lease = state.scopedLease.get();
-                if (lease != null && !lease.retry() && earlierRecoveryNeedsTurn(lease, dispatch)) return;
-                if (!renewScoped(state, dispatch)) return;
+                if (lease == null || lease.inFlight() || dispatchedRenewals.contains(lease.expected().key())) continue;
+                if (!lease.retry() && earlierRecoveryNeedsTurn(lease, dispatch)) return;
+                if (dispatcher == null ? !renewScoped(state, dispatch) : !dispatchRenewal(dispatcher, state, lease)) return;
             }
             return;
         }
@@ -830,12 +838,27 @@ final class PipelineActuationOwnership {
         }
     }
 
+    private boolean dispatchRenewal(Executor dispatcher, Held state, ScopedLease lease) {
+        var key = lease.expected().key();
+        if (!dispatchedRenewals.add(key)) return true;
+        try {
+            dispatcher.execute(() -> {
+                try { renewScoped(state, nanoTime.getAsLong()); }
+                finally { dispatchedRenewals.remove(key); }
+            });
+            return true;
+        } catch (RejectedExecutionException full) {
+            dispatchedRenewals.remove(key);
+            return false;
+        }
+    }
+
     /** A retry with an earlier cutoff may become due while this batch is executing. */
     private boolean earlierRecoveryNeedsTurn(ScopedLease ordinary, long now) {
         for (Held other : held.values()) {
             var recovery = other.scopedLease.get();
             if (recovery != null && recovery.retry() && !recovery.inFlight() && !recovery.lost()
-                    && recovery.deadline() - now > 0 && recovery.deadline() - ordinary.deadline() < 0
+                    && !dispatchedRenewals.contains(recovery.expected().key()) && recovery.deadline() - now > 0 && recovery.deadline() - ordinary.deadline() < 0
                     && recovery.due() - now <= RENEW_RETRY_NANOS && stillHeld(other, recovery)) return true;
         }
         return false;

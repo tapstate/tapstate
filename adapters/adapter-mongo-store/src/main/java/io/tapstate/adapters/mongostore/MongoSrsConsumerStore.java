@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoException;
 import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
@@ -50,6 +51,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -1306,7 +1308,8 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(snapshot, "snapshot");
         requireRevision(membershipRevision); requireRevision(expectedProgressRevision); String chain = context.key().miningChainId();
         var pipeline = pipelineAccess(context, fence);
-        return changingTheConsumer(() -> pinTransaction(context.key(), session -> {
+        var claimConflict = new AtomicBoolean();
+        return changingTheConsumer(() -> pinTransaction(context.key(), fence, claimConflict, session -> {
             // Reserve the chain before reading its model and cursor facts.
             var root = chains.reserveSnapshotPin(session, chain);
             new MongoCacheBusinessIdentity(database, scope).requireReady(session);
@@ -1325,7 +1328,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     || before.models().entrySet().stream().anyMatch(entry -> !entry.getValue().equals(snapshot.models().get(entry.getKey()))))) throw unavailable(chain);
             validateSnapshot(session, context, snapshot);
             if (snapshot.equals(before)) {
-                pipeline.proveConsumerClaim(session, true);
+                provePinClaim(pipeline, session, claimConflict);
                 throw new UnchangedPin(true);
             }
             if (held.revision() >= Long.MAX_VALUE - 1) throw unavailable(chain);
@@ -1339,27 +1342,49 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             // An exhausted chain fence can still answer a replay above, but cannot publish a new pin.
             if (root == null) chains.replace(session, view.root(), new Document(view.root()));
             // Keep the exact claim write in this transaction without blocking renewals during preparation.
-            pipeline.proveConsumerClaim(session, true);
+            provePinClaim(pipeline, session, claimConflict);
             return true;
         }));
     }
-    private boolean pinTransaction(SrsConsumerKey key, Function<ClientSession, Boolean> action) {
-        var budget = MongoReadBudget.until(System.nanoTime() + PIN_BUDGET);
-        if (pinOperations == null) return executePinTransaction(action, budget);
-        return pinOperations.snapshotPin(key, budget.deadlineNanos(), original -> executePinTransaction(action, original));
+    private static void provePinClaim(MongoCachePipelineAccess pipeline, ClientSession session, AtomicBoolean claimConflict) {
+        try {
+            pipeline.proveConsumerClaim(session, true);
+        } catch (MongoException failure) {
+            claimConflict.set(failure.getCode() == 112 && failure.hasErrorLabel(MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL));
+            throw failure;
+        }
     }
 
-    private boolean executePinTransaction(Function<ClientSession, Boolean> action, MongoReadBudget budget) {
+    private boolean pinTransaction(SrsConsumerKey key, WorkloadClaimFence fence, AtomicBoolean claimConflict,
+            Function<ClientSession, Boolean> action) {
+        var budget = MongoReadBudget.until(System.nanoTime() + PIN_BUDGET);
+        if (pinOperations == null) return executePinTransaction(fence, claimConflict, action, budget);
+        return pinOperations.snapshotPin(key, budget.deadlineNanos(),
+                original -> executePinTransaction(fence, claimConflict, action, original));
+    }
+
+    private boolean executePinTransaction(WorkloadClaimFence fence, AtomicBoolean claimConflict,
+            Function<ClientSession, Boolean> action, MongoReadBudget budget) {
         return MongoStructureFailureScope.inspectOnFailure(client, budget, () -> StoreIo.call(() -> {
             requireActive.run();
             var attempts = new AtomicInteger();
+            var retry = new AtomicReference<MongoClaimOperations.PinRetry>();
+            var checkedRetry = new AtomicBoolean();
             try (var session = client.startSession()) {
+                if (pinOperations != null) pinOperations.awaitPipelineRenewal(fence.key(), budget);
                 var options = TransactionOptions.builder().readConcern(TRANSACTION.getReadConcern())
                         .writeConcern(TRANSACTION.getWriteConcern()).timeout(budget.remainingMillis(), TimeUnit.MILLISECONDS).build();
                 return session.withTransaction(() -> {
                     int attempt = attempts.getAndIncrement();
-                    // Only a transient transaction reruns this callback. An ambiguous commit
-                    // retries the commit itself, so it does not repeat the reservation.
+                    // The previous transaction has ended on callback retry. Commit retries
+                    // keep the original protection until the commit outcome is known.
+                    if (pinOperations != null) {
+                        pinOperations.releasePinRetry(retry.getAndSet(null));
+                        if (claimConflict.getAndSet(false) && checkedRetry.compareAndSet(false, true)) {
+                            pinOperations.awaitPipelineRenewal(fence.key(), budget);
+                            retry.set(protectPinRetry(fence, budget));
+                        }
+                    }
                     if (attempt > 0) waitForPinRetry(attempt);
                     requireActive.run();
                     MongoStructureFailureScope.beginCallback();
@@ -1377,8 +1402,28 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             } catch (RuntimeException failure) {
                 requireActive.run();
                 throw failure;
+            } finally {
+                if (pinOperations != null) pinOperations.releasePinRetry(retry.get());
             }
         }));
+    }
+
+    private MongoClaimOperations.PinRetry protectPinRetry(WorkloadClaimFence fence, MongoReadBudget budget) {
+        long sampledAt = System.nanoTime();
+        try {
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(budget.database(database)));
+            var row = claims.readWithRemainingLease(fence.key());
+            if (row == null || MongoWorkloadClaimStore.nodeBacked(row)) return null;
+            var observed = MongoWorkloadClaimStore.observedReading(row);
+            if (!observed.leased() || !fence.equals(WorkloadClaimFence.from(observed.claim()))) return null;
+            long leaseDeadline = sampledAt + observed.leaseRemaining().toNanos();
+            return pinOperations.protectPinRetry(fence, budget.deadlineNanos(), leaseDeadline);
+        } catch (TapstateException failure) {
+            // This sample only admits scheduling protection. The original transaction
+            // still makes the authoritative scope and lease decision.
+            budget.remainingMillis();
+            return null;
+        }
     }
 
     private static void waitForPinRetry(int attempt) {

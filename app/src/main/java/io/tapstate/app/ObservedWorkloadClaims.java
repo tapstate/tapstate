@@ -23,6 +23,9 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
                 Supplier<T> operation) {
             return bounded.withNodeSessionDeadline(key, deadline, active, operation);
         }
+        public <T> T withRenewalDeadline(WorkloadClaimKey key, long deadline, Runnable active, Supplier<T> operation) {
+            return bounded.withRenewalDeadline(key, deadline, active, operation);
+        }
         @Override public Optional<WorkloadClaimReading> confirmNodeSession(WorkloadClaimKey key,
                 long deadline, Runnable active) {
             return super.call(false, () -> bounded.confirmNodeSession(key, deadline, active));

@@ -52,7 +52,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Real transactions over an explicitly prepared business fixture; production capture is not exercised. */
 @RequiresDocker
 class MongoSrsConsumerStoreIT {
-    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final CacheBusinessScope SCOPE = new CacheBusinessScope("cluster-a", 1, "cache-a");
     private static final String CHAIN = "chain-a";
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
@@ -1082,6 +1083,279 @@ class MongoSrsConsumerStoreIT {
             f.consumers().attach(A, member.revision(), Set.of("orders"), f.fenceA()).orElseThrow(); before = cursor(f, A);
             assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isFalse(); assertThat(cursor(f, A)).isEqualTo(before);
             assertThatThrownBy(() -> f.consumers().pinSnapshot(A, member.revision() + 1, 1, pin, f.fenceB())).satisfies(MongoSrsConsumerStoreIT::fenced);
+        });
+    }
+
+    @org.junit.jupiter.api.RepeatedTest(3)
+    void pinWaitsForTheActualSameKeyRenewalBeforeOpeningItsSnapshot() {
+        withBusiness(f -> {
+            enablePipelineClaimAdmission(f);
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "seam", refs);
+            var active = new CountDownLatch(1);
+            var resume = new CountDownLatch(1);
+            var firstMongo = new CountDownLatch(1);
+            var commands = new java.util.concurrent.atomic.AtomicInteger();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (event.getCommand().containsKey("startTransaction")) firstMongo.countDown();
+                    if ("commitTransaction".equals(event.getCommandName())) commands.incrementAndGet();
+                }
+            };
+            var operations = new MongoClaimOperations(f.client());
+            var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {}, null, operations);
+            try (var observed = pinClient(listener); var executor = Executors.newFixedThreadPool(2)) {
+                var store = coordinatedPinStore(f, observed, operations);
+                var held = executor.submit(() -> authority.withRenewalDeadline(f.pipelineA().key(),
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> {}, () -> {
+                            active.countDown();
+                            awaitPinTestBarrier(resume);
+                            return authority.renew(f.pipelineA(), Duration.ofSeconds(30));
+                        }));
+                try {
+                    assertThat(active.await(5, TimeUnit.SECONDS)).isTrue();
+                    var call = new CountDownLatch(1);
+                    var pending = executor.submit(() -> {
+                        call.countDown();
+                        return store.pinSnapshot(A, member.revision(), 0, pin, f.fenceA());
+                    });
+                    assertThat(call.await(5, TimeUnit.SECONDS)).isTrue();
+                    assertThat(firstMongo.await(250, TimeUnit.MILLISECONDS)).isFalse();
+                    assertThat(renewPinTestLease(authority, f.pipelineB(), 30)).isPresent();
+                    resume.countDown();
+                    assertThat(held.get(5, TimeUnit.SECONDS)).isPresent();
+                    assertThat(pending.get(5, TimeUnit.SECONDS)).isTrue();
+                } finally {
+                    resume.countDown();
+                }
+                assertThat(commands).hasValue(1);
+                assertThat(f.consumers().progress(A)).hasValueSatisfying(value -> {
+                    assertThat(value.snapshot()).isEqualTo(pin);
+                    assertThat(value.revision()).isOne();
+                });
+            } finally {
+                operations.closeIfIdle();
+            }
+        });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"true,false", "true,true", "false,false"})
+    void pinProtectsOnlyTheNextAttemptAndLeavesRenewalAloneWhenLeaseIsShort(boolean enoughSlack, boolean unknownCommit) {
+        withBusiness(f -> {
+            enablePipelineClaimAdmission(f);
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "seam", refs);
+            var operations = new MongoClaimOperations(f.client());
+            var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {}, null, operations);
+            var attempted = new java.util.concurrent.atomic.AtomicInteger();
+            var commits = new java.util.concurrent.atomic.AtomicInteger();
+            var conflicts = new java.util.concurrent.atomic.AtomicInteger();
+            var deferred = new java.util.concurrent.atomic.AtomicInteger();
+            var commitDeferred = new java.util.concurrent.atomic.AtomicInteger();
+            var commitCommands = new java.util.ArrayList<org.bson.BsonDocument>();
+            var otherRenewed = new java.util.concurrent.atomic.AtomicBoolean();
+            var error = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+            var reserved = new java.util.HashSet<Integer>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    var name = event.getCommandName();
+                    if ("findAndModify".equals(name) && "srs_chains".equals(event.getCommand().getString(name).getValue())) {
+                        reserved.add(event.getRequestId());
+                    }
+                    if ("commitTransaction".equals(name)) commitCommands.add(event.getCommand().clone());
+                    if ("commitTransaction".equals(name) && enoughSlack) {
+                        try {
+                            assertNotStarted(() -> renewPinTestLease(authority, f.pipelineA(), 30));
+                            commitDeferred.incrementAndGet();
+                        } catch (AssertionError | RuntimeException unexpected) {
+                            error.compareAndSet(null, unexpected);
+                        }
+                    }
+                }
+
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if ("commitTransaction".equals(event.getCommandName()) && !event.getResponse().containsKey("writeConcernError"))
+                        commits.incrementAndGet();
+                    if (!reserved.remove(event.getRequestId())) return;
+                    try {
+                        switch (attempted.incrementAndGet()) {
+                            case 1 -> assertThat(renewPinTestLease(authority, f.pipelineA(), enoughSlack ? 30 : 10)).isPresent();
+                            case 2 -> {
+                                if (enoughSlack) {
+                                    assertNotStarted(() -> renewPinTestLease(authority, f.pipelineA(), 30));
+                                    deferred.incrementAndGet();
+                                    assertThat(renewPinTestLease(authority, f.pipelineB(), 30)).isPresent();
+                                    otherRenewed.set(true);
+                                } else {
+                                    assertThat(renewPinTestLease(authority, f.pipelineA(), 30)).isPresent();
+                                }
+                            }
+                            default -> { }
+                        }
+                    } catch (AssertionError | RuntimeException unexpected) {
+                        error.compareAndSet(null, unexpected);
+                    }
+                }
+
+                @Override public void commandFailed(com.mongodb.event.CommandFailedEvent event) {
+                    if (event.getThrowable() instanceof com.mongodb.MongoException failure && failure.getCode() == 112)
+                        conflicts.incrementAndGet();
+                }
+            };
+            try (var observed = pinClient(listener)) {
+                var store = coordinatedPinStore(f, observed, operations);
+                var admin = f.client().getDatabase("admin");
+                if (unknownCommit) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1))
+                        .append("data", new Document("appName", "tapstate-pin-coordination")
+                                .append("failCommands", List.of("commitTransaction"))
+                                .append("writeConcernError", new Document("code", 64).append("errmsg", "test commit acknowledgement lost"))
+                                .append("errorLabels", List.of("UnknownTransactionCommitResult"))));
+                try {
+                    assertThat(store.pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+                } finally {
+                    if (unknownCommit) admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+                assertThat(error.get()).isNull();
+                assertThat(attempted).hasValue(enoughSlack ? 2 : 3);
+                assertThat(conflicts).hasValue(enoughSlack ? 1 : 2);
+                assertThat(commits).hasValue(1);
+                assertThat(deferred).hasValue(enoughSlack ? 1 : 0);
+                int commitAttempts = unknownCommit ? 2 : 1;
+                assertThat(commitDeferred).hasValue(enoughSlack ? commitAttempts : 0);
+                assertThat(commitCommands).hasSize(commitAttempts).allSatisfy(command -> {
+                    assertThat(command.getDocument("lsid")).isEqualTo(commitCommands.getFirst().getDocument("lsid"));
+                    assertThat(command.getNumber("txnNumber")).isEqualTo(commitCommands.getFirst().getNumber("txnNumber"));
+                });
+                assertThat(otherRenewed.get()).isEqualTo(enoughSlack);
+                assertThat(renewPinTestLease(authority, f.pipelineA(), 30)).isPresent();
+                assertThat(f.consumers().progress(A)).hasValueSatisfying(value -> {
+                    assertThat(value.snapshot()).isEqualTo(pin);
+                    assertThat(value.revision()).isOne();
+                });
+                System.out.printf("PIN_PRODUCTION_RETRY enough_slack=%s attempts=%d conflicts=%d pin_commits=%d deferred=%d%n",
+                        enoughSlack, attempted.get(), conflicts.get(), commits.get(), deferred.get());
+            } finally {
+                operations.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void pinWaitsForTheSameKeyMongoTransactionAfterTheRenewalWorkerExits() {
+        withBusiness(f -> {
+            enablePipelineClaimAdmission(f);
+            var pin = new SrsSnapshotPin(1, "seam", publishSnapshotModels(f, Set.of("orders")));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var operations = new MongoClaimOperations(f.client());
+            var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {}, null, operations);
+            var opened = new CountDownLatch(1);
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (event.getCommand().containsKey("startTransaction")) opened.countDown();
+                }
+            };
+            try (var observed = pinClient(listener); var executor = Executors.newSingleThreadExecutor()) {
+                authority.withRenewalDeadline(f.pipelineA().key(), System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> {},
+                        () -> operations.pipelineRenewal(f.pipelineA().key(), () -> {
+                            var session = f.client().startSession();
+                            session.startTransaction();
+                            operations.own(session);
+                            // The application call exits while exact Mongo transaction ownership survives.
+                            return new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()))
+                                    .inStrictSession(session).renewBeforeReads(f.pipelineA(), Duration.ofSeconds(30)).orElseThrow();
+                        }));
+                var started = new CountDownLatch(1);
+                var task = executor.submit(() -> {
+                    started.countDown();
+                    return coordinatedPinStore(f, observed, operations).pinSnapshot(A, member.revision(), 0, pin, f.fenceA());
+                });
+                assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+                boolean openedBeforeRecovery = opened.await(250, TimeUnit.MILLISECONDS);
+                assertThat(renewPinTestLease(authority, f.pipelineB(), 30)).isPresent();
+                // The next same-key renewal uses the existing exact-session recovery.
+                assertThat(renewPinTestLease(authority, f.pipelineA(), 30)).isPresent();
+                assertThat(task.get(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(openedBeforeRecovery).as("pin opens only after Mongo renewal ownership is resolved").isFalse();
+                assertThat(f.consumers().progress(A)).hasValueSatisfying(value -> assertThat(value.revision()).isOne());
+            } finally {
+                operations.closeIfIdle();
+            }
+        });
+    }
+
+    private static void enablePipelineClaimAdmission(Fixture f) {
+        SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                new Document("$set", new Document("claimAdmissionFence", 0L)));
+    }
+
+    private static MongoClient pinClient(com.mongodb.event.CommandListener listener) {
+        return MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                .applicationName("tapstate-pin-coordination").addCommandListener(listener).build());
+    }
+
+    private static MongoSrsConsumerStore coordinatedPinStore(Fixture f, MongoClient client, MongoClaimOperations operations) {
+        return new MongoSrsConsumerStore(client, client.getDatabase(f.database().getName()), SCOPE,
+                () -> {}, () -> {}, MongoSrsLease.perTransaction(), true, operations);
+    }
+
+    private static Optional<io.tapstate.spi.store.WorkloadClaim> renewPinTestLease(MongoCacheWorkloadClaimStore claims,
+            io.tapstate.spi.store.WorkloadClaim original, int seconds) {
+        return claims.withRenewalDeadline(original.key(), System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> {},
+                () -> claims.renew(original, Duration.ofSeconds(seconds)));
+    }
+
+    private static void assertNotStarted(Runnable renewal) {
+        assertThatThrownBy(renewal::run).isInstanceOfSatisfying(io.tapstate.spi.store.WorkloadClaimRenewalException.class,
+                failure -> assertThat(failure.reason()).isEqualTo(io.tapstate.spi.store.WorkloadClaimRenewalException.Reason.NOT_STARTED));
+    }
+
+    private static void awaitPinTestBarrier(CountDownLatch latch) {
+        try {
+            assertThat(latch.await(5, TimeUnit.SECONDS)).isTrue();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+    }
+
+    @Test void cacheRetirementCannotCommitBetweenPinAuthorityProofAndPinCommit() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "seam", refs);
+            var attempted = new java.util.concurrent.atomic.AtomicBoolean();
+            var retirementCode = new java.util.concurrent.atomic.AtomicInteger(-1);
+            var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (!"commitTransaction".equals(event.getCommandName()) || !attempted.compareAndSet(false, true)) return;
+                    try (var session = f.client().startSession()) {
+                        session.startTransaction();
+                        new MongoCacheBusinessIdentity(f.database(), SCOPE).retire(session, "retire-before-pin-commit");
+                        session.commitTransaction();
+                        retirementCode.set(0);
+                    } catch (com.mongodb.MongoException expected) {
+                        retirementCode.set(expected.getCode());
+                    } catch (Throwable unexpected) {
+                        failure.set(unexpected);
+                    }
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                assertThat(runtimeConsumer(observed, observed.getDatabase(f.database().getName()))
+                        .pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+                assertThat(failure.get()).isNull();
+                assertThat(attempted).isTrue();
+                assertThat(retirementCode).hasValue(112);
+            }
         });
     }
 

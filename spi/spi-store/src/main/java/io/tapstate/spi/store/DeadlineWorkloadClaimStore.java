@@ -22,6 +22,11 @@ public interface DeadlineWorkloadClaimStore extends WorkloadClaimStore {
         return withDeadline(deadlineNanos, requireActive, operation);
     }
 
+    /** Reserves a renewal lane for the original claim key before its callback can start. */
+    default <T> T withRenewalDeadline(WorkloadClaimKey key, long deadlineNanos, Runnable requireActive, Supplier<T> operation) {
+        return withRenewalDeadline(deadlineNanos, requireActive, operation);
+    }
+
     /** Bounds a node-session renewal independently of Pipeline claim work. */
     default <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadlineNanos, Runnable requireActive,
             Supplier<T> operation) {

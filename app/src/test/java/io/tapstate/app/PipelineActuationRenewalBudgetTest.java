@@ -65,6 +65,42 @@ class PipelineActuationRenewalBudgetTest {
         }
     }
 
+    @Test void theDispatcherRenewsADifferentPipelineWhileTheOriginalCallIsStillBlocked() throws Exception {
+        try (var io = new ControlledIo(); var dispatchers = Executors.newFixedThreadPool(2)) {
+            var owner = io.owner();
+            var a = seedOne(io, owner, IDS.getFirst());
+            var b = seedOne(io, owner, IDS.get(1));
+            var aEntered = new CountDownLatch(1);
+            var blockA = new CountDownLatch(1);
+            var bFinished = new CountDownLatch(1);
+            var aAttempts = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(call -> call.<Supplier<?>>getArgument(3).get())
+                    .when(io.store).withRenewalDeadline(any(WorkloadClaimKey.class), anyLong(), any(), any());
+            doAnswer(call -> {
+                var expected = call.<WorkloadClaim>getArgument(0);
+                if (expected.key().equals(a.key())) {
+                    aAttempts.incrementAndGet();
+                    aEntered.countDown();
+                    assertThat(blockA.await(4, TimeUnit.SECONDS)).isTrue();
+                }
+                io.raw.clockAt(io.epoch.plusMillis(500));
+                var result = io.raw.renew(expected, call.getArgument(1));
+                if (expected.key().equals(b.key())) bFinished.countDown();
+                return result;
+            }).when(io.store).renew(any(), any());
+            io.makeDue();
+            try {
+                owner.dispatchDueRenewals(dispatchers);
+                assertThat(aEntered.await(2, TimeUnit.SECONDS)).isTrue();
+                assertThat(bFinished.await(2, TimeUnit.SECONDS)).isTrue();
+                assertThat(io.raw.read(b.key()).orElseThrow().claim().leaseUntil()).isAfter(b.leaseUntil());
+                owner.dispatchDueRenewals(dispatchers);
+                assertThat(blockA.getCount()).isOne();
+                assertThat(aAttempts).hasValue(1);
+            } finally { blockA.countDown(); }
+        }
+    }
+
     @Test void anEarlierRecoveryGetsTheNextTurnBeforeOrdinaryRenewals() throws Exception {
         try (var io = new ControlledIo()) {
             var interval = Duration.ofSeconds(10);
@@ -487,6 +523,8 @@ class PipelineActuationRenewalBudgetTest {
                     .when(store).withDeadline(anyLong(), any(), any());
             doAnswer(call -> bounded(renewalWorker, call.getArgument(0), call.getArgument(1), call.getArgument(2)))
                     .when(store).withRenewalDeadline(anyLong(), any(), any());
+            doAnswer(call -> store.withRenewalDeadline(call.<Long>getArgument(1), call.getArgument(2), call.getArgument(3)))
+                    .when(store).withRenewalDeadline(any(WorkloadClaimKey.class), anyLong(), any(), any());
             doAnswer(call -> { awaitQuiescence(call.getArgument(0));return null; })
                     .when(store).awaitQuiescence(anyLong());
             when(store.acquirePipeline(any(), any(), anyLong(), any())).thenAnswer(call -> {

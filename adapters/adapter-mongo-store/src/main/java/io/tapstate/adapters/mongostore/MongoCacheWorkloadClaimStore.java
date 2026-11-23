@@ -86,6 +86,14 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return StoreIo.call(() -> operations.renew(deadline,active,operation));
     }
 
+    @Override public <T> T withRenewalDeadline(WorkloadClaimKey key, long deadline, Runnable active,
+            java.util.function.Supplier<T> operation) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION)
+            throw new IllegalArgumentException("a Pipeline renewal lane requires a Pipeline claim key");
+        return StoreIo.call(() -> operations.renew(key, deadline, active, operation));
+    }
+
     @Override public <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadline, Runnable active,
             java.util.function.Supplier<T> operation) {
         requireKey(key);
@@ -278,7 +286,10 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(), command);
         });
         try {
-            return operations.pipelineRenewal(expected.key(), () -> renewClaim(expected, ttl));
+            return operations.pipelineRenewal(expected.key(), () -> {
+                operations.requireRenewalTurn(WorkloadClaimFence.from(expected));
+                return renewClaim(expected, ttl);
+            });
         } catch (TapstateException failure) {
             LOG.log(System.Logger.Level.DEBUG,
                     "Pipeline renewal last Mongo command {0}, claim={1}, execution={2}, command={3}, result={4}",
