@@ -1231,4 +1231,58 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"held", "ended", "expired", "takeover", "checkpoint", "scope", "missing-projection", "retired", "node-held", "node-ended", "node-expired"})
+    void stoppedTerminalRecheckIsReadOnlyAndRequiresTheOriginalDurableEvidence(String scenario) {
+        withFixture(f -> {
+            var claimTable = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+            var nodeOwner = new WorkloadOwner(SCOPE.clusterId(), "node-backed-boot");
+            var nodeKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, nodeOwner.nodeId());
+            boolean nodeBacked = scenario.startsWith("node-");
+            if (nodeBacked) {
+                var node = new MongoWorkloadClaimStore(claimTable).acquire(nodeKey, nodeOwner, 1, Duration.ofSeconds(30)).claim();
+                claimTable.updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)), new Document("$set",
+                        new Document("ownerNodeId", nodeOwner.nodeId()).append("ownerBootId", nodeOwner.bootId())
+                                .append("leaseUntil", new Date(-1)).append(MongoWorkloadClaimStore.NODE_LEASE_GENERATION, node.claimGeneration())));
+            }
+            var original = nodeBacked ? new WorkloadClaimFence(KEY, nodeOwner, f.fence().claimGeneration(),
+                    f.fence().executionGeneration(), f.fence().topologyRevision()) : f.fence();
+            var states = f.domain().pipelineStates(SCOPE, original, ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "STOPPED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            f.domain().pipelineObservations(SCOPE, original, ACTIVE).save(observation(PipelineState.STOPPED), 1);
+            var checkpoint = states.read("orders").orElseThrow();
+            var claims = f.domain().workloadClaims(BUSINESS);
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+            boolean ended = scenario.equals("ended") || scenario.equals("node-ended");
+            switch (scenario) {
+                case "ended", "node-ended" -> assertThat(claims.release(claims.read(KEY).orElseThrow().claim())).isTrue();
+                case "node-expired" -> table.updateOne(new Document("_id", MongoWorkloadClaimStore.id(nodeKey)),
+                        new Document("$set", new Document("leaseUntil", new Date(1))));
+                case "expired" -> table.updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                        new Document("$set", new Document("leaseUntil", new Date(1))));
+                case "takeover" -> {
+                    assertThat(claims.release(claims.read(KEY).orElseThrow().claim())).isTrue();
+                    assertThat(claims.acquirePipeline(SCOPE, new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).acquired()).isTrue();
+                }
+                case "checkpoint" -> assertThat(states.compareAndSwap("orders", 1, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+                case "scope" -> replaceScope(f.database(), scope(2));
+                case "missing-projection" -> SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).deleteMany(new Document());
+                case "retired" -> f.domain().retireBusiness(BUSINESS, "retire-terminal-test", ACTIVE);
+                default -> { }
+            }
+            var before = snapshot(f.database());
+            if (scenario.equals("scope") || scenario.equals("retired")) {
+                assertCode(() -> f.domain().stoppedCheckpointUnchanged(SCOPE, checkpoint, original, ended, ACTIVE), IoError.CACHE_BUSINESS_FENCED);
+            } else {
+                assertThat(f.domain().stoppedCheckpointUnchanged(SCOPE, checkpoint, original, ended, ACTIVE))
+                        .isEqualTo(scenario.equals("held") || scenario.equals("ended") || scenario.equals("node-held") || scenario.equals("node-ended"));
+                if (scenario.equals("held") || scenario.equals("node-held") || scenario.equals("node-expired"))
+                    assertThat(f.domain().stoppedCheckpointUnchanged(SCOPE, checkpoint, original, true, ACTIVE)).isFalse();
+                if (scenario.equals("ended") || scenario.equals("node-ended"))
+                    assertThat(f.domain().stoppedCheckpointUnchanged(SCOPE, checkpoint, original, false, ACTIVE)).isFalse();
+            }
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
 }

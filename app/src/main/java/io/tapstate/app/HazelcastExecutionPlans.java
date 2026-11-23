@@ -101,6 +101,22 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
         }
         throw ThreeLayerStorePort.refused();
     }
+    /** Strict absence proof; topology errors and unscoped historical values remain unknown. */
+    boolean terminalAt(io.tapstate.spi.store.PipelineIntentScope scope, io.tapstate.spi.store.WorkloadClaimFence ceiling) {
+        Object held = member.<String,Object>getMap(MAP_NAME).get(scope.pipelineId());
+        if (held == null) return true;
+        if (!(held instanceof ScopedPlan plan) || plan.live()) return false;
+        return originalOrPrior(plan.original(), scope, ceiling);
+    }
+
+    static boolean originalOrPrior(ExecutionFence prior, io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence ceiling) {
+        if (prior.scope() == null || !sameBusiness(prior, new ExecutionFence(scope, ceiling))
+                || prior.scope().stateGeneration() > scope.stateGeneration()) return false;
+        ScopedPipelineCaptureCoordinator.requireNotLater(prior, ceiling);
+        return true;
+    }
+
     private static boolean sameBusiness(ExecutionFence left, ExecutionFence right) {
         return left.scope() != null && right.scope() != null && left.pipelineId().equals(right.pipelineId())
                 && left.scope().clusterId().equals(right.scope().clusterId())

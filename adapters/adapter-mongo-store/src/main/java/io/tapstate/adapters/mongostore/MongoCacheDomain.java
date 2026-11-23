@@ -738,6 +738,34 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 (session,state)->MongoStateStore.toCheckpoint(state));
     }
 
+    /** Read-only evidence for a Stop already completed by this process; never grants execution authority. */
+    public boolean stoppedCheckpointUnchanged(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.core.lifecycle.CheckpointDoc original, io.tapstate.spi.store.WorkloadClaimFence fence,
+            boolean leaseEnded, Runnable active) {
+        Objects.requireNonNull(original); Objects.requireNonNull(fence); Objects.requireNonNull(active);
+        if (fence.key().type() != io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION
+                || !scope.clusterId().equals(fence.key().clusterId()) || !scope.pipelineId().equals(fence.key().resourceId())) return false;
+        var access = pipelineAccess(scope, null, active);
+        return access.observationTransaction(session -> {
+            var state = access.state(session, true);
+            if (!original.equals(MongoStateStore.toCheckpoint(state))
+                    || io.tapstate.core.lifecycle.StateJson.parse(original.stateJson()) != io.tapstate.core.lifecycle.PipelineState.STOPPED) return false;
+            var id = MongoCachePipelineObservationStore.claimKey(access);
+            var reading = MongoCachePipelineObservationStore.reading(session, access, state,
+                    MongoCachePipelineObservationStore.claims(session, access, java.util.List.of(id)).get(id));
+            if (!fence.equals(io.tapstate.spi.store.WorkloadClaimFence.from(MongoWorkloadClaimStore.decodeStrict(reading.claim())))) return false;
+            if (leaseEnded) {
+                // The caller retains the completed release receipt in this process. The store
+                // proves only its exact original tuple remains unleased; expiry is not a receipt.
+                if (MongoWorkloadClaimStore.nodeBacked(reading.claim()) || reading.live()) return false;
+            } else if (!reading.live()) return false;
+            var row = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(database).find(session,
+                    new org.bson.Document("_id", reading.key())).first();
+            return MongoCachePipelineObservationStore.select(reading, row, null)
+                    .filter(value -> value.state() == io.tapstate.core.lifecycle.PipelineState.STOPPED).isPresent();
+        });
+    }
+
     /** A write view retains exactly the original claim; a later pass opens its own view. */
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {

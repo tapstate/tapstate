@@ -45,6 +45,12 @@ final class HazelcastOperatorReadiness {
     private static final String RETIREMENT_CONTEXT = "tapstate.pipeline-retirement";
     private static final String SHARED_PREVIEW_CONTEXT = "tapstate.shared-srs-preview";
     private record LocalRetirement(ScopedPipelineCaptureCoordinator captures, Runnable active) {}
+    private static final String TERMINAL_CONTEXT = "tapstate.pipeline-terminal-read";
+    private record LocalTerminal(java.util.function.Predicate<PipelineIntentScope> settled, Runnable active) {}
+    static void bindTerminalRead(HazelcastInstance member, java.util.function.Predicate<PipelineIntentScope> settled, Runnable active) {
+        if (member.getUserContext().putIfAbsent(TERMINAL_CONTEXT,
+                new LocalTerminal(Objects.requireNonNull(settled), Objects.requireNonNull(active))) != null) throw fenced();
+    }
     private record LocalSharedPreview(SharedSrsPreviewMember preview,ScopedPipelineCaptureCoordinator captures) {}
     static void bindRetirement(HazelcastInstance member, ScopedPipelineCaptureCoordinator captures, Runnable active) {
         if (member.getUserContext().putIfAbsent(RETIREMENT_CONTEXT, new LocalRetirement(captures, active)) != null) throw fenced();
@@ -204,6 +210,24 @@ final class HazelcastOperatorReadiness {
         }
         active.run(); if (!before.identities().equals(snapshot(scope.pipelineId()).identities())) throw fenced(); return List.copyOf(result);
     }
+    void requireTerminal(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
+        if (original.key().type() != io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION
+                || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId())) throw fenced();
+        active.run();
+        var before = snapshot(scope.pipelineId());
+        if (before.members().isEmpty()) throw fenced();
+        long deadline = System.nanoTime() + timeout.toNanos();
+        var replies = member.getExecutorService(EXECUTOR).submitToMembers(new CollectTerminal(scope, before.identities()), before.members().values());
+        for (var target : before.members().entrySet()) {
+            active.run();
+            var reply = answer(scope.pipelineId(), target.getKey(), replies.get(target.getValue()), deadline);
+            if (reply == null || !before.identities().get(target.getKey()).equals(reply.identity())) throw fenced();
+            if (reply.refusalCode() != null) throw refused(scope.pipelineId(), target.getKey(), reply.refusalCode());
+        }
+        active.run();
+        if (!before.identities().equals(snapshot(scope.pipelineId()).identities())) throw fenced();
+    }
+
     private static void requireOriginal(OperatorRunManifest original) {
         Objects.requireNonNull(original,"original");
         if (!(original.executionIdentity() instanceof ExecutionFence fence) || fence.scope() == null
@@ -358,6 +382,33 @@ final class HazelcastOperatorReadiness {
             } catch (TapstateException refused) { return new Collected(actual,List.of(),refused.code().code()); }
         }
     }
+    /** A distinct task requires every member to support the complete read-only terminal check. */
+    static final class CollectTerminal implements Callable<Result>, Serializable, HazelcastInstanceAware {
+        private final PipelineIntentScope scope;
+        private final Map<String,Identity> expected;
+        private transient HazelcastInstance member;
+        CollectTerminal(PipelineIntentScope scope, Map<String,Identity> expected) {
+            this.scope = scope; this.expected = Map.copyOf(expected);
+        }
+        @Override public void setHazelcastInstance(HazelcastInstance member) { this.member = member; }
+        @Override public Result call() {
+            Identity actual = null;
+            try {
+                actual = identity(member.getCluster().getLocalMember());
+                if (!actual.equals(expected.get(actual.nodeId()))
+                        || !(member.getUserContext().get(RETIREMENT_CONTEXT) instanceof LocalRetirement retirement)
+                        || !(member.getUserContext().get(TERMINAL_CONTEXT) instanceof LocalTerminal terminal)) throw fenced();
+                retirement.active().run(); terminal.active().run();
+                for (var job : member.getJet().getJobs())
+                    if (scope.pipelineId().equals(job.getName()) && !job.getStatus().isTerminal()) throw fenced();
+                if (retirement.captures().hasPipelineWork(scope.pipelineId()) || !terminal.settled().test(scope)
+                        || io.tapstate.runtime.engine.OperatorMapBindings.resolve(member, true).hasPipelineWork(scope.pipelineId())) throw fenced();
+                retirement.active().run(); terminal.active().run();
+                return new Result(actual, null);
+            } catch (TapstateException refused) { return new Result(actual, refused.code().code()); }
+        }
+    }
+
     /** Carries coordinates as data; it is not a transported grant or an enum serialization. */
     private record Ceiling(String cluster,String pipeline,String node,String boot,long claim,long execution,long topology) implements Serializable {
         static Ceiling from(WorkloadClaimFence original) {

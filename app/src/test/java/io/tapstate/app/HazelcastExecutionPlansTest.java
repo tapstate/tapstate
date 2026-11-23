@@ -57,4 +57,23 @@ class HazelcastExecutionPlansTest {
     private static ExecutionPlan plan(long execution) {
         return new ExecutionPlan("pipeline", 1L, execution, 1L, List.of("node"), List.of(), Instant.EPOCH.plusSeconds(execution));
     }
+    @Test void explicitlyRetiredPriorStateGenerationIsNotAStillLiveOrNewOwnerPlan() {
+        var plans = new HazelcastExecutionPlans(member);
+        String id = "terminal-" + UUID.randomUUID();
+        var oldScope = new PipelineIntentScope("cluster", 1, "incarnation", id, 1);
+        var scope = new PipelineIntentScope("cluster", 1, "incarnation", id, 2);
+        var old = new ExecutionFence(id, 2, 2, oldScope, "old", "boot-old", 1L);
+        var ceiling = new io.tapstate.spi.store.WorkloadClaimFence(
+                new io.tapstate.spi.store.WorkloadClaimKey("cluster", io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, id),
+                new io.tapstate.spi.store.WorkloadOwner("current", "boot"), 3, 3, 2);
+        var recorder = plans.forRun(old, () -> {});
+        recorder.record(new ExecutionPlan(id, 2L, 2L, 1L, List.of("old"), List.of(), Instant.EPOCH));
+        assertThat(plans.terminalAt(scope, ceiling)).isFalse();
+        assertThat(recorder.forgetIfPresent(id)).isTrue();
+        assertThat(plans.terminalAt(scope, ceiling)).isTrue();
+        var previousCeiling = new io.tapstate.spi.store.WorkloadClaimFence(ceiling.key(), ceiling.owner(), 1, 1, 1);
+        assertThatThrownBy(() -> plans.terminalAt(scope, previousCeiling)).isInstanceOf(TapstateException.class);
+        assertThat(plans.terminalAt(new PipelineIntentScope("cluster", 1, "other", id, 2), ceiling)).isFalse();
+    }
+
 }

@@ -41,6 +41,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         void attempting(OperatorRunManifest original) {
             if (pending.putIfAbsent(original.pipelineId(),original) != null) throw fenced();
         }
+        boolean hasPending(String pipeline) { return pending.containsKey(pipeline); }
         void returned(OperatorRunManifest original) { pending.remove(original.pipelineId(),original); }
         void observed(String pipeline,OperatorRunManifest actual) {
             var original = pending.get(pipeline);

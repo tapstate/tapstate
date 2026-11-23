@@ -280,6 +280,10 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
         for (var session : captured) stop(session);
     }
+    boolean hasPipelineWork(String pipeline) {
+        active();
+        return startingOrActiveCaptures.stream().anyMatch(original -> original.pipelineId().equals(pipeline));
+    }
     synchronized boolean hasScope(PipelineIntentScope scope) {
         active(); return sessions.keySet().stream().anyMatch(original -> original.scope().equals(scope));
     }
