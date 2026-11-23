@@ -30,7 +30,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final com.mongodb.client.MongoDatabase database;
     private final MongoClaimOperations claimOperations;
     private final MongoStructureProof structures = new MongoStructureProof();
-    private volatile boolean observationMetadataEligible;
+    private volatile Set<SystemCollections> inspectedCollections = Set.of();
     private final MongoSrsControlProofs srsControlProofs = new MongoSrsControlProofs();
     private final Duration rateRetention;
     private final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
@@ -276,7 +276,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         businessActive();
         final long inspectionGeneration;
         synchronized (structures) {
-            observationMetadataEligible = false;
+            inspectedCollections = Set.of();
             structures.clear();
             inspectionGeneration = structures.currentGeneration();
         }
@@ -307,13 +307,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
             }
         }
         businessActive();
-        var observationNames = MongoPipelineObservationRead.COLLECTIONS.stream()
-                .map(SystemCollections::collectionName).collect(java.util.stream.Collectors.toSet());
+        var eligible = java.util.EnumSet.copyOf(required);
+        eligible.removeIf(table -> table.kind() != SystemCollections.Kind.COLLECTION
+                || result.stream().anyMatch(difference -> database.getName().equals(difference.database())
+                        && table.physicalNames().contains(difference.collection())));
         synchronized (structures) {
-            if (structures.currentGeneration() == inspectionGeneration)
-                observationMetadataEligible = required.containsAll(MongoPipelineObservationRead.COLLECTIONS)
-                        && result.stream().noneMatch(difference -> database.getName().equals(difference.database())
-                                && observationNames.contains(difference.collection()));
+            if (structures.currentGeneration() == inspectionGeneration) inspectedCollections = Set.copyOf(eligible);
         }
         return List.copyOf(result);
     }
@@ -515,13 +514,31 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         active.run();
         Runnable verifyStructure = () -> {};
         var lease = MongoSrsLease.selected();
-        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease);
+        boolean batchRuntime = runtime && !"transaction".equals(System.getProperty(MongoSrsLease.VALIDATION_PROPERTY));
+        java.util.function.BooleanSupplier relations = batchRuntime ? this::canBatchSrsControlSnapshot : () -> false;
+        java.util.function.BooleanSupplier readiness = batchRuntime ? this::canBatchSrsControlReadiness : () -> false;
+        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease, relations, readiness,
+                batchRuntime ? this::canBatchSrsReclaimReferences : () -> false);
         return new io.tapstate.spi.store.SrsStores(
                 new MongoSrsChainStore(client, database, expected, active, verifyStructure, lease,srsControlProofs), models,
                 new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease),
                 new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(),
-                        runtime, srsControlProofs, () -> false, () -> false, claimOperations));
+                        runtime, srsControlProofs, relations, readiness, claimOperations));
+    }
+
+    private boolean canBatchSrsControlSnapshot() {
+        return MongoReadBudget.supportsSnapshotReads(client) && inspectedCollections.containsAll(List.of(
+                SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS));
+    }
+
+    private boolean canBatchSrsControlReadiness() {
+        return inspectedCollections.containsAll(List.of(SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS));
+    }
+
+    private boolean canBatchSrsReclaimReferences() {
+        return inspectedCollections.containsAll(List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS,
+                SystemCollections.SRS_LOG_BOUNDS));
     }
 
     @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,
@@ -823,7 +840,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
         public boolean updateExisting(io.tapstate.core.lifecycle.Observation observation, long epoch) {
             access.requireObservationActive();
-            if (!observationMetadataEligible || !structures.stands(MongoStructureProof.Kind.OBSERVATION, proof)) return false;
+            if (!inspectedCollections.containsAll(MongoPipelineObservationRead.COLLECTIONS) || !structures.stands(MongoStructureProof.Kind.OBSERVATION, proof)) return false;
             try {
                 return new MongoCachePipelineObservationStore(access).updateExisting(observation, epoch);
             } catch (RuntimeException failure) {
@@ -841,15 +858,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         access.requireObservationActive();
         if (!MongoReadBudget.supportsSnapshotReads(client)
                 || "transaction".equals(System.getProperty(MongoSrsLease.VALIDATION_PROPERTY))) return java.util.Optional.empty();
-        if (!observationMetadataEligible) return java.util.Optional.empty();
+        if (!inspectedCollections.containsAll(MongoPipelineObservationRead.COLLECTIONS)) return java.util.Optional.empty();
         try {
-            var proof = structures.audit(MongoStructureProof.Kind.OBSERVATION, () -> observationMetadataEligible);
+            var proof = structures.audit(MongoStructureProof.Kind.OBSERVATION, () -> inspectedCollections.containsAll(MongoPipelineObservationRead.COLLECTIONS));
             if (!structures.stands(MongoStructureProof.Kind.OBSERVATION, proof)) return java.util.Optional.empty();
             var facts = new MongoPipelineObservationRead(client, database, access).read(Map.copyOf(sources));
             access.requireObservationActive();
             return facts.map(value -> new ObservationRead(value, access, proof));
         } catch (RuntimeException failure) {
-            observationMetadataEligible = false;
             structures.clear();
             access.requireObservationActive();
             if (failure instanceof TapstateException coded && coded.code() == IoError.DOCUMENT_TOO_LARGE)

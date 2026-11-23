@@ -343,7 +343,7 @@ class MongoCachePipelineStoresIT {
         });
     }
 
-    @Test void bulkObservationRetainsTheStorageDiagnosticWhenStructureVerificationFails() {
+    @Test void bulkObservationRetainsTheStorageDiagnosticWhenItsWriteFails() {
         withFixture(f -> {
             assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE)
                     .compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
@@ -351,7 +351,7 @@ class MongoCachePipelineStoresIT {
             var entry = new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), ACTIVE, sample, 1);
             var admin = f.admin().getDatabase("admin");
             admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
-                    .append("data", new Document("failCommands", List.of("listCollections")).append("errorCode", 2)));
+                    .append("data", new Document("failCommands", List.of("update")).append("errorCode", 2)));
             try {
                 assertThatThrownBy(() -> f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(sample, 1))
                         .isInstanceOfSatisfying(TapstateException.class, failure ->

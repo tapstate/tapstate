@@ -586,6 +586,7 @@ class MongoSrsConsumerStoreIT {
             var db=f.database();var binding=new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
                     MONGO.getReplicaSetUrl(db.getName()),db.getName(),null);
             try(var domain=MongoCacheDomain.connect(binding,Duration.ofSeconds(5),"control-proof")){
+                inspectRuntimeCatalog(domain);
                 var oldActive=new java.util.concurrent.atomic.AtomicBoolean(true);
                 var first=domain.runtimeSrs(SCOPE,()->{if(!oldActive.get())throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}).consumers();
                 var expected=first.controlSnapshot(CHAIN).orElseThrow();oldActive.set(false);
@@ -674,6 +675,7 @@ class MongoSrsConsumerStoreIT {
             var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
                     MONGO.getReplicaSetUrl(database), database, null);
             try (var domain = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "control-snapshot-cursor")) {
+                inspectRuntimeCatalog(domain);
                 var reader = domain.runtimeSrs(SCOPE, () -> {}).consumers();
                 var expected = reader.controlSnapshot(CHAIN).orElseThrow();
                 assertThat(expected.cursors().getFirst().cdcStartPosition()).isEqualTo(pin.sourcePosition());
@@ -681,10 +683,8 @@ class MongoSrsConsumerStoreIT {
                 MongoCommandObservation.COLLECTIONS.set((command, collection) -> reads.add(command + ":" + collection));
                 try { assertThat(reader.controlSnapshot(CHAIN)).contains(expected); }
                 finally { MongoCommandObservation.COLLECTIONS.remove(); }
-                assertThat(reads).containsOnlyOnce("aggregate:cache_identity");
-                if (batched) assertThat(reads).doesNotContain("find:cache_identity", "find:schema_migrations",
-                        "find:srs_chains", "find:srs_consumers", "find:srs_consumer_offsets");
-                else assertThat(reads).contains("find:cache_identity", "find:schema_migrations",
+                if (batched) assertThat(reads).containsExactly("aggregate:cache_identity");
+                else assertThat(reads).containsExactly("aggregate:cache_identity", "aggregate:cache_identity", "aggregate:srs_chains",
                         "find:srs_chains", "find:srs_consumers", "find:srs_consumer_offsets");
             }
         });
@@ -707,6 +707,7 @@ class MongoSrsConsumerStoreIT {
                     MONGO.getReplicaSetUrl(database), database, null);
             try (var domain = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "control-snapshot-attach");
                     var worker = Executors.newSingleThreadExecutor()) {
+                inspectRuntimeCatalog(domain);
                 var reader = domain.runtimeSrs(SCOPE, () -> {}).consumers();
                 var reading = new CountDownLatch(1);
                 var release = new CountDownLatch(1);
@@ -3725,8 +3726,15 @@ class MongoSrsConsumerStoreIT {
         SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
                 new Document("$set", new Document("claimAdmissionFence", 0L)));
         var db = f.database().getName();
-        return MongoCacheDomain.connect(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+        var domain = MongoCacheDomain.connect(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
                 MONGO.getReplicaSetUrl(db), db, null), Duration.ofSeconds(5), "runtime-reclaim-relations");
+        inspectRuntimeCatalog(domain);
+        return domain;
+    }
+
+    private static void inspectRuntimeCatalog(MongoCacheDomain domain) {
+        domain.inspectStructure(new io.tapstate.spi.store.CacheAuthScope(SCOPE.clusterId(), SCOPE.bindingVersion(),
+                StorageBinding.Mode.OP, SCOPE.cacheIncarnation(), 1), new MongoReadBudget(Duration.ofSeconds(10)));
     }
 
     private static SrsModelKey publishReclaimSuccessor(Fixture f) {
@@ -3931,7 +3939,9 @@ class MongoSrsConsumerStoreIT {
             }
             var auth = new io.tapstate.spi.store.CacheAuthScope(SCOPE.clusterId(), SCOPE.bindingVersion(),
                     StorageBinding.Mode.OP, SCOPE.cacheIncarnation(), 1);
-            try (var domain = openRuntimeReclaim(f)) {
+            var databaseName = f.database().getName();
+            try (var domain = MongoCacheDomain.connect(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                    MONGO.getReplicaSetUrl(databaseName), databaseName, null), Duration.ofSeconds(5), "observation-inspection-test")) {
                 var commands = new ArrayList<String>();
                 MongoCommandObservation.CURRENT.set(commands::add);
                 try { assertThat(domain.readObservation(scope, f.fenceA(), selected, () -> {})).isEmpty(); }

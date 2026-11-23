@@ -1042,7 +1042,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     private Optional<SrsConsumerProgress> progress(SrsConsumerContext context, boolean forObservation) {
         Objects.requireNonNull(context, "context");
-        return transaction(session -> progress(session, context, forObservation));
+        return readSnapshot(session -> progress(session, context, forObservation));
     }
 
     Optional<ConsumerOffset> admittedObservationCursor(SrsConsumerContext context) {

@@ -70,7 +70,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
             Runnable requireStructure,MongoSrsLease appendLease,MongoSrsControlProofs proofs){
         this.controlProofs=proofs;
         this.appendLease = Objects.requireNonNull(appendLease, "appendLease");
-        this.controlLease = requireStructure instanceof MongoStructureProof.Check ? appendLease.fork() : MongoSrsLease.perTransaction();
+        this.controlLease = appendLease.fork();
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
@@ -111,7 +111,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                 if (hasRetainedFacts(session, chain)) throw unproven(chain);
                 return Optional.empty();
             }
-            return Optional.of(readState(session,row,false));
+            return Optional.of(readState(session,row,true));
         });
     }
     @Override public SrsChainState requestTables(String chain, Set<String> tables, WorkloadClaimFence fence) {
