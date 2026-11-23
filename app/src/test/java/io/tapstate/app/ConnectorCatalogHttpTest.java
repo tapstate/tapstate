@@ -7,14 +7,37 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ConnectorCatalogHttpTest {
+    @Test
+    void aDirectoryBeforeTheManifestMustBeEmpty() throws IOException {
+        assertThat(ConnectorCatalogHttp.authentication(jarWithLeadingDirectory(new byte[0]))).isEqualTo("Beta");
+        assertThatThrownBy(() -> ConnectorCatalogHttp.authentication(jarWithLeadingDirectory(new byte[]{1})))
+                .isInstanceOf(IOException.class).hasMessage("Connector directory entry contains data");
+    }
+
+    private static byte[] jarWithLeadingDirectory(byte[] contents) throws IOException {
+        var bytes = new ByteArrayOutputStream();
+        try (var zip = new ZipOutputStream(bytes)) {
+            zip.putNextEntry(new ZipEntry("META-INF/"));
+            zip.write(contents);
+            zip.closeEntry();
+            zip.putNextEntry(new ZipEntry("META-INF/MANIFEST.MF"));
+            zip.write("Manifest-Version: 1.0\r\nAuthentication: Beta\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+            zip.closeEntry();
+        }
+        return bytes.toByteArray();
+    }
+
     @Test
     void aPublishedArtifactCanBeProbedForAvailabilityAndStageWithoutDownloadingItsBody() throws Exception {
         var manifest = new Manifest();

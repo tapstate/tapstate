@@ -62,7 +62,11 @@ final class ConnectorCatalogHttp implements ConnectorReleaseCatalog.Fetch {
     static String authentication(byte[] prefix) throws IOException {
         try (var zip = new ZipInputStream(new ByteArrayInputStream(prefix))) {
             var entry = zip.getNextEntry();
-            while (entry != null && entry.isDirectory()) entry = zip.getNextEntry();
+            while (entry != null && entry.isDirectory()) {
+                // Advancing would drain the current entry, so check that it is empty first.
+                if (zip.read() != -1) throw new IOException("Connector directory entry contains data");
+                entry = zip.getNextEntry();
+            }
             if (entry == null || !"META-INF/MANIFEST.MF".equalsIgnoreCase(entry.getName())) return null;
             byte[] manifest = zip.readNBytes(MANIFEST_PREFIX_BYTES + 1);
             if (manifest.length > MANIFEST_PREFIX_BYTES) throw new IOException("Connector manifest exceeds its size limit");
