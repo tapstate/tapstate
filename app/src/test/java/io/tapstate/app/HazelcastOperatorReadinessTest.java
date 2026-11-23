@@ -457,4 +457,23 @@ class HazelcastOperatorReadinessTest {
         @Override public boolean complete() { return false; }
     }
 
+    @Test void anUnreturnedTerminalMemberUsesAtMostFiveSecondsThenRefusesTheOptimization() {
+        var f = new MockMembers();
+        var unanswered = new CompletableFuture<HazelcastOperatorReadiness.Result>();
+        f.answers.put(f.a, unanswered);
+        var original = new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, SCOPE.pipelineId()),
+                new WorkloadOwner("a", "boot-a"), 3, 4, 1);
+        long start = System.nanoTime();
+        assertThatThrownBy(() -> new HazelcastOperatorReadiness(f.member, Duration.ofSeconds(60))
+                .requireTerminal(SCOPE, original, () -> {}))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ActuationError.OPERATOR_STATE_UNAVAILABLE_ON_MEMBER);
+                    assertThat(failure.args()).containsEntry("reason", "timeout");
+                });
+        long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        assertThat(elapsed).isBetween(4500L, 10000L);
+        System.out.printf("STOPPED_TERMINAL_BUDGET configured_ms=60000 elapsed_ms=%d unanswered=true fallback=timeout%n", elapsed);
+        assertThat(unanswered.isDone()).isFalse();
+    }
+
 }

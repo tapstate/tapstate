@@ -216,7 +216,7 @@ final class HazelcastOperatorReadiness {
         active.run();
         var before = snapshot(scope.pipelineId());
         if (before.members().isEmpty()) throw fenced();
-        long deadline = System.nanoTime() + timeout.toNanos();
+        long deadline = System.nanoTime() + Math.min(timeout.toNanos(), TimeUnit.SECONDS.toNanos(5));
         var replies = member.getExecutorService(EXECUTOR).submitToMembers(new CollectTerminal(scope, before.identities()), before.members().values());
         for (var target : before.members().entrySet()) {
             active.run();
