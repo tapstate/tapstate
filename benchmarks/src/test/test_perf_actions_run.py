@@ -103,6 +103,15 @@ class ActionsRunTest(unittest.TestCase):
         with patch.object(actions_run.time, "time", return_value=started + 3600):
             self.assertEqual(21000, actions_run.remaining_seconds(timing, reserve=600))
 
+    def test_workflow_clock_skew_does_not_extend_budget_or_refuse_preparation(self):
+        run = {"created_at": "2026-11-23T07:25:45Z", "run_started_at": "2026-11-23T07:25:44Z"}
+        timing = actions_run.run_timing(run, None)
+        self.assertEqual(0, timing["queue_seconds"])
+        self.assertEqual(-1, timing["start_minus_creation_seconds"])
+        self.assertEqual("2026-11-23T07:25:44+00:00", timing["started_at"])
+        self.assertEqual(int(actions_run.timestamp(run["run_started_at"]).timestamp()) + 25200,
+                         timing["deadline_epoch_seconds"])
+
     def test_report_indexes_only_same_attempt_artifacts_and_retains_expired_batches(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -419,6 +428,29 @@ class ActionsRunTest(unittest.TestCase):
                 actions_watch.send(output, "https://example.invalid/fixture")
             self.assertTrue((output / "state.json").exists())
             self.assertFalse((output / "next-state.json").exists())
+
+    def test_http_rate_limit_leaves_the_intent_retryable(self):
+        now = datetime.fromisoformat("2026-11-21T15:00:00+00:00")
+        source = {"id": 10}
+        intent = {"id": 11, "created_at": now.isoformat()}
+        proposed = {"updated_at": now.isoformat(), "active": {"workflow": {"reason": "missing-handoff"}}}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            runner.write_json(output / "card.json", {"msg_type": "interactive"})
+            runner.write_json(output / "next-state.json", proposed)
+            rejected = HTTPError("https://example.invalid", 429, "Too Many Requests", {}, BytesIO())
+            with patch.object(actions_watch, "urlopen", side_effect=rejected):
+                with self.assertRaises(ValueError):
+                    actions_watch.send(output, "https://example.invalid")
+            receipt = catalog.read_json(output / "delivery.json")
+            with patch.object(actions_watch, "latest_artifact", side_effect=[None, (intent, source)]), \
+                    patch.object(actions_watch, "artifact", side_effect=[proposed, receipt]):
+                actual = actions_watch.latest_state("example/repo", "main", now)
+            self.assertEqual({}, actual["active"])
+            self.assertFalse((output / "state.json").exists())
+            with patch.object(actions_watch, "urlopen", return_value=BytesIO(b'{"code":0}')):
+                actions_watch.send(output, "https://example.invalid")
+            self.assertEqual(proposed, catalog.read_json(output / "state.json"))
 
     def test_delivery_intent_prevents_a_duplicate_when_state_artifact_upload_is_lost(self):
         now = datetime.fromisoformat("2026-11-21T15:00:00+00:00")

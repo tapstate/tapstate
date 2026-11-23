@@ -30,24 +30,19 @@ def observation_marker(health):
 
 def select_observation(observed, previous_marker):
     current, previous = observed
-    due = timestamp(current["due_at"])
     if previous_marker.get("due_at", "") > previous["due_at"]:
         return current
     run = previous["performance"]
     if not run:
-        nightly = previous["nightly"]
-        if (nightly and nightly["status"] == "completed"
-                and timestamp(nightly["updated_at"]) >= due
+        if (previous["status"] == "missing-handoff"
                 and previous_marker != observation_marker(previous)):
             return previous
-        return current
-    if run["status"] == "completed" and timestamp(run["updated_at"]) < due:
         return current
     if previous["status"] == "performance-running":
         return previous
     if previous["status"] == "performance-queued":
         return previous if current["status"] == "awaiting-nightly" else current
-    # Settle an overlapping older attempt once before advancing to a newer slot.
+    # Settle an unobserved older result before advancing to a newer slot.
     if previous_marker != observation_marker(previous):
         return previous
     return current

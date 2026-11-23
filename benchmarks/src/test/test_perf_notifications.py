@@ -370,6 +370,32 @@ class NotificationTest(unittest.TestCase):
                     state = catalog.read_json(output / "state.json")
             self.assertEqual({}, state["active"])
 
+    def test_unsettled_prior_slot_is_reconciled_after_the_schedule_boundary(self):
+        nightly, run, _ = scheduled(21)
+        run.update(created_at="2026-11-22T03:59:30Z", run_started_at="2026-11-22T04:00:00Z",
+                   updated_at="2026-11-22T09:59:00Z")
+        now = datetime.fromisoformat("2026-11-22T10:07:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            report = raw_results(base / "report", nightly, run, {CASE_IDS[4]: (130, 131)}, self.cases)
+            with patch.object(actions_watch, "api", side_effect=[
+                {"workflow_runs": [nightly]}, {"workflow_runs": [run]},
+            ]), patch.object(actions_watch, "artifact", return_value=report) as fetch, \
+                    patch.object(actions_watch, "latest_state",
+                                 return_value={"active": {}, "updated_at": now.isoformat()}):
+                actions_watch.prepare(base / "health", REPOSITORY, "main", now=now)
+            fetch.assert_called_once_with(REPOSITORY, run, "performance-report-1", "report.json")
+            state = catalog.read_json(base / "health/next-state.json")
+            self.assertEqual("reported", state["observation"]["status"])
+            observed = actions_health.observations(now, [nightly], [run], {run["id"]: report})
+            self.assertEqual("awaiting-nightly",
+                             actions_health.select_observation(observed, state["observation"])["status"])
+
+        nightly["updated_at"] = "2026-11-22T09:50:00Z"
+        self.assertEqual("awaiting-handoff",
+                         actions_health.assess(now - timedelta(minutes=10), [nightly], [], {})["status"])
+        self.assertEqual("missing-handoff", actions_health.assess(now, [nightly], [], {})["status"])
+
     def test_artifact_bytes_are_bound_to_original_attempt_and_verified_digest(self):
         _, run, _ = scheduled(21)
         buffer = BytesIO()

@@ -68,14 +68,16 @@ def timestamp(value):
 def run_timing(run, upstream):
     started = timestamp(run["run_started_at"])
     created = timestamp(run["created_at"])
-    if started < created:
-        raise ValueError("Workflow start precedes its creation")
+    # The Actions timestamps can be recorded in reverse order. Keep the
+    # reported start for the deadline and preserve the signed clock difference.
+    queue_seconds = (started - created).total_seconds()
     business_time = timestamp(upstream["created_at"]) if upstream else created
     deadline = int(started.timestamp()) + BUDGET_SECONDS
     return {
         "created_at": created.isoformat(),
         "started_at": started.isoformat(),
-        "queue_seconds": (started - created).total_seconds(),
+        "queue_seconds": max(0, queue_seconds),
+        "start_minus_creation_seconds": queue_seconds,
         "deadline_epoch_seconds": deadline,
         "measurement_stop_epoch_seconds": deadline - MEASUREMENT_RESERVE_SECONDS,
         "business_date": business_time.astimezone(timezone(timedelta(hours=8))).date().isoformat(),

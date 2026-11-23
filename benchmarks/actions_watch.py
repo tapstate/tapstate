@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
@@ -134,12 +135,9 @@ def prepare(output, repository, branch, *, now=None):
     candidates = [first_attempt(repository, run) for run in runs]
     reports = {}
     observed = actions_health.observations(now, nightlies, candidates, reports)
-    due = actions_health.scheduled_due(now)
     for observation in observed:
         performance = observation["performance"]
-        if observation["status"] == "report-missing" and (
-                actions_health.timestamp(observation["due_at"]) == due
-                or actions_health.timestamp(performance["updated_at"]) >= due):
+        if observation["status"] == "report-missing":
             reports[performance["id"]] = artifact(repository, performance, "performance-report-1", "report.json")
     observed = actions_health.observations(now, nightlies, candidates, reports)
     output.mkdir(parents=True)
@@ -205,6 +203,13 @@ def send(output, webhook):
     try:
         with urlopen(request, timeout=15) as response:
             receipt = json.loads(response.read(4096))
+    except HTTPError as error:
+        error.close()
+        if error.code == 429:
+            save_receipt("rejected")
+            raise ValueError("Feishu rate limit rejected the notification") from None
+        save_receipt("unknown")
+        raise ValueError("Feishu receipt unavailable") from None
     except (OSError, ValueError):
         save_receipt("unknown")
         raise ValueError("Feishu receipt unavailable") from None
