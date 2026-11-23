@@ -325,6 +325,53 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @Test void deferredStartDiagnosticsSurviveReopenAndDoNotCarryOverToRetry() {
+        withFixture(f -> {
+            var intents = f.configuration.intents();
+            var original = intents.load("flow").orElseThrow();
+            var inputs = new PipelinePreparationInputs(original.desired().revision(), Map.of(), Map.of(), List.of());
+            assertThat(intents.compareAndSetStart(f.scope, original.intentRevision(), original.desired(), inputs)).isTrue();
+            var pending = intents.pendingStart("flow").orElseThrow();
+            var fields = Map.<String, Object>of("id", "doc-42", "field", "revision");
+            var driver = ConvergenceDriver.scoped(null,
+                    org.mockito.Mockito.mock(io.tapstate.runtime.scheduler.ObservationPublisher.class),
+                    null, null, () -> true, PipelineActuationOwnership.single(),
+                    new ConvergenceDriver.ScopedPorts(intents, f.cache, ACTIVE, pass -> null, pass -> null,
+                            ignored -> {}, PipelineAlertFeed.none(), start -> {
+                                throw new TapstateException(IoError.DOCUMENT_UNREADABLE, fields, null);
+                            }, null));
+            driver.reconcile();
+            var rows = f.configDatabase.getCollection("pipeline_intents");
+            var filter = new Document("_id", "flow");
+            assertThat(rows.find(filter).first()).containsEntry("startFailureParams", new Document(fields));
+
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster-a")) {
+                var bound = org.mockito.Mockito.mock(StorageRuntime.Bound.class);
+                org.mockito.Mockito.when(bound.preparation()).thenReturn(reopened.bindings().cachePreparation().orElseThrow());
+                var port = new ThreeLayerStorePort(reopened, bound, ignored -> {}, (scope, captured) -> {}, true);
+                var failure = port.observations().read("flow").orElseThrow().failure();
+                assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+                assertThat(failure.params()).isEqualTo(fields);
+                assertThat(port.pipelineCatalogStates(List.of("flow")).get("flow").observation().orElseThrow().failure())
+                        .isEqualTo(failure);
+
+                var retry = reopened.intents();
+                var failed = retry.load("flow").orElseThrow();
+                assertThat(retry.compareAndSetStart(f.scope, failed.intentRevision(), failed.desired(), inputs)).isTrue();
+                assertThat(rows.find(filter).first()).doesNotContainKeys("startFailure", "startFailureParams");
+                assertThat(port.observations().read("flow")).isEmpty();
+                intents.failStart(pending, IoError.DOCUMENT_UNREADABLE, fields);
+                assertThat(retry.pendingStart("flow")).isPresent();
+                retry.failStart(retry.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE);
+                assertThat(rows.find(filter).first()).containsEntry("startFailure", "DOCUMENT_UNREADABLE")
+                        .doesNotContainKey("startFailureParams");
+                var historical = port.observations().read("flow").orElseThrow().failure();
+                assertThat(historical.code()).isEqualTo(failure.code());
+                assertThat(historical.params()).isEmpty();
+            }
+        });
+    }
+
     @Test void reopeningClientsCannotReissueAnAuthorityWhoseCacheHistoryIsAbsent() {
         withFixture(f -> {
             var issued = f.configuration.preparations().issueFirstCreate(f.scope, f.node);

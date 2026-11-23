@@ -722,7 +722,7 @@ final class ConvergenceDriver implements AutoCloseable {
         } catch (TapstateException failure) {
             if (!(failure.code() instanceof IoError error) || (error != IoError.DOCUMENT_UNREADABLE
                     && error != IoError.PIPELINE_STATE_REBUILD_REQUIRED && error != IoError.PIPELINE_INTENT_FENCED)) throw failure;
-            scoped.intents().failStart(pending, error);
+            scoped.intents().failStart(pending, error, failure.args());
             return false;
         }
     }

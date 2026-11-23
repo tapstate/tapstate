@@ -246,6 +246,74 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void deferredRejectionsExposeOnlyCompleteBoundedDocumentIdentifiers() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            var desired = intent(PipelineState.RUNNING, false, false, null);
+            var inputs = new io.tapstate.spi.store.PipelinePreparationInputs(HASH, Map.of(), Map.of(), List.of());
+            var valid = Map.<String, Object>of("id", "orders v2/archive:2026", "field", "source[0].tables[1].name");
+            assertThat(store.compareAndSetStart(scope, 0, desired, inputs)).isTrue();
+            store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE, valid);
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailureParams())
+                    .isEqualTo(valid);
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), false).get("flow").startFailure()).isEmpty();
+            assertThat(domain.pipelineDisplayHeaders(List.of(), true)).isEmpty();
+
+            var rows = SystemCollections.PIPELINE_INTENTS.on(database);
+            var filter = new Document("_id", "flow");
+            var original = rows.find(filter).first();
+            rows.updateOne(filter, new Document("$set", new Document("startFailureParams", new Document("id", "incomplete"))));
+            assertThatThrownBy(() -> store.load("flow")).satisfies(MongoPipelineIntentStoreIT::unreadable);
+            var malformed = domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+            assertThat(malformed.startFailure()).isEmpty();
+            assertThat(malformed.intentFailure()).hasValueSatisfying(MongoPipelineIntentStoreIT::unreadable);
+            rows.replaceOne(filter, original);
+
+            var mappings = SystemCollections.OPERATOR_GENERATIONS.on(database);
+            var currentMapping = mappings.find(filter).first();
+            mappings.updateOne(filter, new Document("$set", new Document("stateGeneration", 2L)));
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailure()).isEmpty();
+            mappings.replaceOne(filter, currentMapping);
+
+            assertThat(store.compareAndSetStart(scope, 1, desired, inputs)).isTrue();
+            store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", "mongodb://credential.invalid/private", "field", "revision"));
+            var rejection = domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+            assertThat(rejection.startFailure()).contains(IoError.DOCUMENT_UNREADABLE);
+            assertThat(rejection.startFailureParams()).isEmpty();
+            assertThat(SystemCollections.PIPELINE_INTENTS.on(database).find().first())
+                    .doesNotContainKey("startFailureParams");
+        });
+    }
+
+    @Test
+    void rejectedDiagnosticValuesKeepTheGenericFailure() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            var desired = intent(PipelineState.RUNNING, false, false, null);
+            var inputs = new io.tapstate.spi.store.PipelinePreparationInputs(HASH, Map.of(), Map.of(), List.of());
+            long revision = 0;
+            for (var params : List.<Map<String, Object>>of(
+                    Map.of("id", " ", "field", "revision"),
+                    Map.of("id", "a".repeat(257), "field", "revision"),
+                    Map.of("id", "\u00e9".repeat(129), "field", "revision"),
+                    Map.of("id", "bad\nline", "field", "revision"),
+                    Map.of("id", "bad\u2028line", "field", "revision"),
+                    Map.of("id", "bad\u2029line", "field", "revision"),
+                    Map.of("id", "document", "field", "body:raw=value"),
+                    Map.of("id", "document", "field", 1))) {
+                assertThat(store.compareAndSetStart(scope, revision++, desired, inputs)).isTrue();
+                store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE, params);
+                var rejection = domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+                assertThat(rejection.startFailure()).contains(IoError.DOCUMENT_UNREADABLE);
+                assertThat(rejection.startFailureParams()).isEmpty();
+            }
+            assertThat(store.remove(scope, revision)).isTrue();
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailure()).isEmpty();
+        });
+    }
+
+    @Test
     void stopThenStartCoalescesIntoOneLatestValueWithTheOriginalOneTimeStamp() {
         withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
