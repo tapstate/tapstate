@@ -273,9 +273,13 @@ class PipelineLaunchLatencyIT {
                         var restarted=request(http,origin,cookie,"POST","/api/pipelines/" + running + ":start",Map.of(),200,observation -> {
                             assertThat(observation.get("complete")).isEqualTo(true);
                             var collections=(Map<?,?>)observation.get("collections");
-                            assertThat(((Number)collections.get("find:" + io.tapstate.adapters.mongostore.SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName())).intValue())
-                                    .as("the real HTTP restart reads only the current Pipeline's cursor batch").isEqualTo(1);
+                            String chains = io.tapstate.adapters.mongostore.SystemCollections.SRS_CHAINS.collectionName();
+                            assertThat(collections.get("aggregate:" + chains))
+                                    .as("restart must batch the chain, its memberships and its cursors once").isEqualTo(1);
+                            var callers = (Map<?, ?>) observation.get("callers");
+                            assertThat(callers.get("other:aggregate:MongoSrsConsumerStore.startProgressRows")).isEqualTo(1);
                             assertThat(collections.keySet().stream().map(Object::toString).toList()).doesNotContain(
+                                    "find:" + io.tapstate.adapters.mongostore.SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName(),
                                     "find:" + io.tapstate.adapters.mongostore.SystemCollections.SRS_MODELS.collectionName(),
                                     "find:" + io.tapstate.adapters.mongostore.SystemCollections.SRS_EVENTS.collectionName());
                         });
