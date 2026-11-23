@@ -37,6 +37,22 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ScopedPipelineActuationOwnershipTest {
+    @Test void aLocalWriterLeaseIsBoundToItsExactRunAndOriginalDeadline() {
+        var owner = ownership();
+        var tenure = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var first = owner.beginExecution(FIRST, tenure);
+        assertThat(first.allowed()).isTrue();
+        assertThat(owner.hasLocalWriterLease(first.fence())).isTrue();
+
+        var second = owner.beginExecution(FIRST, first.claimFence());
+        assertThat(second.allowed()).isTrue();
+        assertThat(owner.hasLocalWriterLease(first.fence())).isFalse();
+        assertThat(owner.hasLocalWriterLease(second.fence())).isTrue();
+
+        nanos.set(TTL.toNanos());
+        assertThat(owner.hasLocalWriterLease(second.fence())).isFalse();
+    }
+
     @Test void aBlockedAlertEvaluationDoesNotDelayAnUnrelatedHeldPermit() throws Exception {
         var owner = ownership();
         var other = new PipelineIntentScope(BUSINESS.clusterId(), BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "other", 1);

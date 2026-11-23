@@ -290,16 +290,19 @@ final class ConvergenceDriver implements AutoCloseable {
                 if (snapshot.isEmpty()) {
                     var pendingStart = scoped.prepareStart() == null
                             ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
-                    if (pendingStart.isPresent()) {
-                        PipelineDiagnostics.intent(pendingStart.orElseThrow().intent());
-                        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PREPARATION)) {
-                            prepareStart(pendingStart.orElseThrow());
-                        }
+                    if (pendingStart.isEmpty()) {
+                        if (scoped.resumeRebuild() != null) scoped.resumeRebuild().accept(pipelineId);
+                        return;
                     }
-                    else if (scoped.resumeRebuild() != null) {
-                        scoped.resumeRebuild().accept(pipelineId);
+                    var pending = pendingStart.orElseThrow();
+                    PipelineDiagnostics.intent(pending.intent());
+                    try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PREPARATION)) {
+                        if (!prepareStart(pending)) return;
                     }
-                    return;
+                    // The same scan can consume the prepared intent only if CONFIG still identifies it.
+                    snapshot = PipelineDiagnostics.measure(pipelineId, Phase.PIPELINE_INTENT,
+                            () -> scoped.intents().loadForActuation(pipelineId).filter(pending.intent()::equals));
+                    if (snapshot.isEmpty()) return;
                 }
                 PipelineDiagnostics.intent(snapshot.orElseThrow());
                 if (snapshot.get().deleted()) return;
@@ -436,14 +439,16 @@ final class ConvergenceDriver implements AutoCloseable {
     void awaitStopped(long deadline) { passes.awaitStopped(deadline); }
     @Override public void close() { passes.close(); }
 
-    private void prepareStart(PipelineIntentStore.PendingStart pending) {
+    private boolean prepareStart(PipelineIntentStore.PendingStart pending) {
         try {
             scoped.requireActive().run();
             scoped.prepareStart().accept(pending);
+            return true;
         } catch (TapstateException failure) {
             if (!(failure.code() instanceof IoError error) || (error != IoError.DOCUMENT_UNREADABLE
                     && error != IoError.PIPELINE_STATE_REBUILD_REQUIRED && error != IoError.PIPELINE_INTENT_FENCED)) throw failure;
             scoped.intents().failStart(pending, error);
+            return false;
         }
     }
 

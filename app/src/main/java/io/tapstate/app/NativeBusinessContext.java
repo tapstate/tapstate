@@ -510,8 +510,12 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                         WorkloadClaimFence.from(node), membership, claims, cluster.pipelineClaimTtl(cloud.cloud()),
                         cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
             }
-            return PipelineActuationOwnership.scoped(owner.original.preparation().businessScope(), node.owner(), membership, claims,
+            var ownership = PipelineActuationOwnership.scoped(owner.original.preparation().businessScope(), node.owner(), membership, claims,
                     cluster.pipelineClaimTtl(cloud.cloud()), cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
+            if (!cloud.cloud() && cluster.getProfile() == ClusterProperties.Profile.SINGLE) {
+                owner.memberStorage.authorization().useLocalWriterLease(ownership::hasLocalWriterLease);
+            }
+            return ownership;
         }
         @Bean(destroyMethod = "close") ActuationClaimRenewer actuationClaimRenewer(PipelineActuationOwnership ownership, ClusterProperties cluster,
                 CloudRuntimeSettings cloud) {

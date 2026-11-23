@@ -473,9 +473,11 @@ final class MongoCachePipelineAccess {
         requirePreparedClaim(session, row);
         return row;
     }
-    void requirePreparedClaim(ClientSession session,Document row){
+    void requirePreparedClaim(ClientSession session,Document row){ requirePreparedClaim(row); }
+
+    void requirePreparedClaim(Document row) {
         if (row == null) throw MongoCachePipelinePreparations.rebuild(scope);
-        new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row);
+        MongoWorkloadClaimStore.decodeStrict(row);
         try {
             if (!(row.get(PIPELINE_SCOPE) instanceof Document stored)) throw unreadable(CLAIM_SCOPE_UNREADABLE);
             var decoded = MongoPipelinePreparationFacts.scope(stored);

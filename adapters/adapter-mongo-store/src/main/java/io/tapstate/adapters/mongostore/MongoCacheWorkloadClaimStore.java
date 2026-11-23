@@ -194,7 +194,35 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
         requireScope(original);
         var key = pipelineKey(original);
-        return operations.pipelineRenewal(key, () -> transaction((session, budget) -> {
+        return operations.pipelineRenewal(key, () -> {
+            var observed = readPipelineAuthority(original, key);
+            return observed == null ? readPipelineTransaction(original, key) : Optional.of(observed);
+        });
+    }
+
+    private WorkloadClaimReading readPipelineAuthority(PipelineIntentScope original, WorkloadClaimKey key) {
+        if (!MongoBindingReadFacts.supported(client) || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
+        var budget = operations.budget();
+        return MongoStructureFailureScope.inspectOnFailure(client, budget, () -> StoreIo.call(() -> {
+            if (budget == null) operations.requireAdmission();
+            operations.check();
+            requireActive.run();
+            var selected = (budget == null ? database : budget.database(database))
+                    .withReadPreference(ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
+            var facts = MongoPipelineProofFacts.readAuthority(selected, original, key);
+            requireActive.run();
+            operations.check();
+            if (facts == null || MongoWorkloadClaimStore.nodeBacked(facts.claim())) return null;
+            MongoCacheBusinessIdentity.requireObservedAdmission(facts.identity(), facts.schema(), scope);
+            var access = new MongoCachePipelineAccess(client, database, original, null, requireActive);
+            access.validateState(facts.checkpoint());
+            access.requirePreparedClaim(facts.claim());
+            return MongoWorkloadClaimStore.observedReading(facts.claim());
+        }));
+    }
+
+    private Optional<WorkloadClaimReading> readPipelineTransaction(PipelineIntentScope original, WorkloadClaimKey key) {
+        return transaction((session, budget) -> {
             var identity = new MongoCacheBusinessIdentity(database, scope);
             var access = new MongoCachePipelineAccess(client, database, original, null, requireActive);
             var store = raw.inStrictSession(session);
@@ -217,7 +245,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             var row = store.readWithRemainingLease(key);
             access.requirePreparedClaim(session, row);
             return Optional.of(store.reading(row));
-        }, null));
+        }, null);
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());

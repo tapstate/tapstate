@@ -77,6 +77,7 @@ class ScopedConvergenceDriverTest {
     private MetricsExport metricsExport = MetricsExport.none();
     private final java.util.concurrent.atomic.AtomicLong nanoTime = new java.util.concurrent.atomic.AtomicLong();
     private RebuildAdmission rebuildPolicy = RebuildAdmission.never();
+    private Consumer<PipelineIntentStore.PendingStart> deferredStart;
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -107,7 +108,7 @@ class ScopedConvergenceDriverTest {
                     pendingCleanup=false; carrying.set(false);
                 }
             };
-        }, pass -> rebuildPolicy, ids -> retained.add(List.copyOf(ids)), alertFeed);
+        }, pass -> rebuildPolicy, ids -> retained.add(List.copyOf(ids)), alertFeed, deferredStart, null);
         StateStore poisonState = mock(StateStore.class, call -> { throw new AssertionError("unscoped state accessed"); });
         ObservationStore poisonObservations = mock(ObservationStore.class, call -> { throw new AssertionError("unscoped observation accessed"); });
         var poisonDesired = mock(io.tapstate.spi.store.DesiredStore.class,
@@ -364,6 +365,25 @@ class ScopedConvergenceDriverTest {
 
     @Test void aRefusedStartPermitDoesNotGiveAwayTheReservedSlotOnRetry() throws Exception {
         assertStartAdmitted(true);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void aPreparedStartContinuesInTheSamePassOnlyForItsOriginalIntent(boolean replaced) {
+        var original = snapshot(FIRST);
+        intents.snapshot = null;
+        intents.pending = new PipelineIntentStore.PendingStart(original,
+                mock(io.tapstate.spi.store.PipelinePreparationInputs.class));
+        deferredStart = pending -> {
+            assertThat(pending.intent()).isEqualTo(original);
+            intents.snapshot = replaced ? new PipelineIntentSnapshot(FIRST, original.intentRevision() + 1,
+                    new DesiredState("orders", PipelineState.STOPPED, "original")) : original;
+        };
+        try (var driver = driver()) {
+            driver.reconcile();
+            assertThat(carrying.get()).isEqualTo(!replaced);
+            assertThat(passes).hasSize(replaced ? 0 : 1);
+        }
     }
 
     @Test void pendingStartsCannotTakeEverySlotFromPeriodicWork() throws Exception {
@@ -850,6 +870,8 @@ class ScopedConvergenceDriverTest {
     private static final class Intents implements PipelineIntentStore {
         private PipelineIntentSnapshot snapshot = snapshot(FIRST);
         private RuntimeException loadFailure;
+        private PendingStart pending;
+        @Override public Optional<PendingStart> pendingStart(String id) { return Optional.ofNullable(pending); }
         private int loads;
         private boolean hints = true;
         @Override public Optional<PipelineIntentSnapshot> load(String id) { throw new AssertionError("authoring load does not prove preparation readiness"); }

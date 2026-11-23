@@ -109,6 +109,28 @@ class ScopedExecutionAuthorizationTest {
         }
     }
 
+    @Test void aCommittedLocalRenewalCanBridgeAStaleReaderForTheOriginalWriter() {
+        var original = WorkloadClaimFence.from(run());
+        var fence = new ExecutionFence(FIRST, original);
+        try (var guard = guard(Duration.ofSeconds(1))) {
+            assertThat(guard.require(fence)).isEqualTo(original);
+            var writer = guard.localProofGuard(fence);
+            when(store.readPipeline(FIRST)).thenThrow(new TapstateException(IoError.STORE_UNAVAILABLE,
+                    Map.of("detail", "MongoOperationTimeoutException"), null));
+            var local = new AtomicBoolean(true);
+            guard.useLocalWriterLease(current -> fence.equals(current) && local.get());
+            nanos.set(TTL.plusMillis(1).toNanos());
+            writer.run();
+            local.set(false);
+            assertThatThrownBy(writer::run).isInstanceOfSatisfying(TapstateException.class,
+                    refusal -> assertThat(refusal.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            local.set(true);
+            nodeActive.set(false);
+            assertThatThrownBy(writer::run).isInstanceOfSatisfying(TapstateException.class,
+                    refusal -> assertThat(refusal.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        }
+    }
+
     @Test void writerRecoveryStopsAtTheLastProvedLeaseDeadline() {
         var original = WorkloadClaimFence.from(run());
         var fence = new ExecutionFence(FIRST, original);

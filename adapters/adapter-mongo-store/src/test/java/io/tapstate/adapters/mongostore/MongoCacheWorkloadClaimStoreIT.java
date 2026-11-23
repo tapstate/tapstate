@@ -309,6 +309,10 @@ class MongoCacheWorkloadClaimStoreIT {
                 @Override public void commandStarted(CommandStartedEvent event) {
                     var target = event.getCommand().get(event.getCommandName());
                     commands.add(event.getCommandName() + ":" + (target != null && target.isString() ? target.asString().getValue() : "-"));
+                    if (event.getCommandName().equals("aggregate")) {
+                        assertThat(event.getCommand().getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
+                        assertThat(event.getCommand().containsKey("txnNumber")).isFalse();
+                    }
                 }
             };
             try (var observed = client(listener)) {
@@ -316,7 +320,7 @@ class MongoCacheWorkloadClaimStoreIT {
                 commands.clear();
                 var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
                 assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(expected);
-                assertThat(commands).containsExactly("find:cache_identity", "aggregate:schema_migrations", "commitTransaction:-");
+                assertThat(commands).containsExactly("aggregate:cache_identity");
             }
         });
     }
@@ -343,6 +347,7 @@ class MongoCacheWorkloadClaimStoreIT {
         withBusiness(f -> {
             var claim = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
             var joinReads = new AtomicInteger();
+            var snapshots = new AtomicInteger();
             var scalarReads = new AtomicInteger();
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) {
@@ -350,6 +355,8 @@ class MongoCacheWorkloadClaimStoreIT {
                     var command = event.getCommand();
                     if ("aggregate".equals(name) && "schema_migrations".equals(command.getString(name).getValue()))
                         joinReads.incrementAndGet();
+                    if ("aggregate".equals(name) && "cache_identity".equals(command.getString(name).getValue()))
+                        snapshots.incrementAndGet();
                     if ("find".equals(name) && "pipeline_state".equals(command.getString(name).getValue()))
                         scalarReads.incrementAndGet();
                 }
@@ -370,7 +377,8 @@ class MongoCacheWorkloadClaimStoreIT {
                                 .locale("en").collationStrength(com.mongodb.client.model.CollationStrength.PRIMARY).build()));
                 state.insertOne(original);
                 assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(claim);
-                assertThat(joinReads).hasValue(2);
+                assertThat(snapshots).hasValue(2);
+                assertThat(joinReads).hasValue(1);
                 assertThat(scalarReads).hasValue(1);
 
                 state.deleteOne(new Document("_id", "orders"));
@@ -392,7 +400,7 @@ class MongoCacheWorkloadClaimStoreIT {
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) {
                     if (!event.getCommandName().equals("aggregate")
-                            || !event.getCommand().getString("aggregate").getValue().equals(SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName())) return;
+                            || !event.getCommand().getString("aggregate").getValue().equals(SystemCollections.CACHE_IDENTITY.collectionName())) return;
                     sessions.put(Thread.currentThread().threadId(), event.getCommand().getDocument("lsid").toJson());
                     if (selected.compareAndSet(false, true)) { entered.countDown(); await(release); }
                 }

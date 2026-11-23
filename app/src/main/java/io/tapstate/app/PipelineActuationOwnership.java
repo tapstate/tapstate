@@ -1233,6 +1233,25 @@ final class PipelineActuationOwnership {
         return state == null || state.claim == null ? 0 : state.claim.executionGeneration();
     }
 
+    /** The exact committed Pipeline lease already held on this member. This guard performs no store I/O. */
+    boolean hasLocalWriterLease(ExecutionFence fence) {
+        var scope = fence.scope();
+        if (scope == null || !accepts(scope) || closing || !membership.businessEligible()) return false;
+        var state = held.get(scope.pipelineId());
+        if (state == null || !scope.equals(state.scope)) return false;
+        var lease = state.scopedLease.get();
+        if (lease == null || lease.lost() || nanoTime.getAsLong() - lease.deadline() >= 0) return false;
+        var claim = lease.expected();
+        var current = state.claim;
+        return current != null && WorkloadClaimFence.from(current).equals(WorkloadClaimFence.from(claim))
+                && claim.claimGeneration() == fence.claimGeneration()
+                && claim.executionGeneration() == fence.executionGeneration()
+                && claim.topologyRevision() == fence.topologyRevision()
+                && claim.owner().nodeId().equals(fence.ownerNodeId())
+                && claim.owner().bootId().equals(fence.ownerBootId())
+                && !closing && held.get(scope.pipelineId()) == state && state.scopedLease.get() == lease;
+    }
+
     /** A store-side proof for the named run, never substituting a replacement's generations. */
     synchronized WorkloadClaimFence completionFence(ExecutionFence run) {
         if (run == null) {

@@ -452,7 +452,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return strict ? decodeStrict(document) : decode(document);
     }
 
-    private static WorkloadClaim decodeStrict(Document document) {
+    static WorkloadClaim decodeStrict(Document document) {
         try {
             for (String field : List.of("claimGeneration", "executionGeneration", "topologyRevision")) {
                 if (!(document.get(field) instanceof Long value) || value < 0 || (field.equals("claimGeneration") && value == 0)) throw unreadableClaim();
