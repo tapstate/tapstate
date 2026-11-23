@@ -229,6 +229,52 @@ class PdkCapturePortTest {
         assertThat(got.get(1).after()).containsEntry("id", 2L);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void snapshotRetriesFromAnAcceptedOffsetOrAnExplicitlyReplayableTable(boolean withOffset, @TempDir Path dir)
+            throws Exception {
+        String key = "tapstate.snapshot.retry." + System.nanoTime();
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var preparations = new java.util.concurrent.atomic.AtomicInteger();
+        System.getProperties().put(key, calls);
+        System.getProperties().put(key + ".prepare", preparations);
+        try {
+            var jar = Synthetic.retryingSnapshotSource(dir, key, withOffset);
+            var expected = withOffset ? List.of(1L, 2L) : List.of(1L, 1L, 2L);
+            try (var port = new PdkCapturePort(provisioner(jar, "synthetic.RetryingSnapshotSource", null))
+                    .withReadRetries(operation -> new io.tapstate.core.common.RetryPolicy(true,
+                            Duration.ofMillis(1), Duration.ofSeconds(5)))
+                    .withReplayableSnapshotTables("t1"::equals)) {
+                var ids = new ArrayList<>();
+                try (var batch = port.snapshotOnly(config("t1"))) {
+                    while (batch.hasNext()) ids.add(batch.next().after().get("id"));
+                }
+                assertThat(ids).containsExactlyElementsOf(expected);
+                assertThat(calls).hasValue(2);
+                assertThat(preparations).hasValue(1);
+                ids.clear();
+                try (var session = port.snapshotSession(config("t1")); var batch = session.read("t1")) {
+                    while (batch.hasNext()) ids.add(batch.next().after().get("id"));
+                }
+                assertThat(ids).containsExactlyElementsOf(expected);
+                assertThat(calls).hasValue(4);
+                assertThat(preparations).hasValue(2);
+                if (!withOffset) {
+                    port.withReplayableSnapshotTables(table -> false);
+                    try (var batch = port.snapshotOnly(config("t1"))) {
+                        assertThat(batch.next().after()).containsEntry("id", 1L);
+                        assertThatThrownBy(batch::hasNext).hasRootCauseInstanceOf(java.io.IOException.class);
+                    }
+                    assertThat(calls).hasValue(5);
+                    assertThat(preparations).hasValue(2);
+                }
+            }
+        } finally {
+            System.getProperties().remove(key);
+            System.getProperties().remove(key + ".prepare");
+        }
+    }
+
     /**
      * A snapshot is read as it is taken, not collected first: with one row taken, the connector has handed
      * over a few of its batches and is waiting, not the whole table.

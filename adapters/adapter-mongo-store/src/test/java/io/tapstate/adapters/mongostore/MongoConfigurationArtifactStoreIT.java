@@ -42,6 +42,31 @@ class MongoConfigurationArtifactStoreIT {
     private static final DslParser PARSER = new DslParser();
 
     @Test
+    void clusterRetrySettingsKeepAnAtomicRevisionAndInheritIndividualOverrides() {
+        withConfigurationStore((ignored, database) -> {
+            var store = new MongoRetrySettingsStore(database, "retry-cluster", () -> {});
+            var defaults = io.tapstate.spi.store.RetrySettingsStore.DEFAULT;
+            assertThat(store.read().revision()).isZero();
+            assertThat(store.read().policy("snapshot-read")).isEqualTo(defaults);
+            var overrides = Map.of("snapshot-read",
+                    new io.tapstate.spi.store.RetrySettingsStore.OperationOverride(false, null, Duration.ofHours(4)));
+            var version = store.replace(0, defaults, overrides).orElseThrow();
+            assertThat(version.revision()).isEqualTo(1);
+            assertThat(store.replace(0, defaults, Map.of())).isEmpty();
+            var reopened = new MongoRetrySettingsStore(database, "retry-cluster", () -> {}).read();
+            assertThat(reopened).isEqualTo(version);
+            assertThat(reopened.policy("snapshot-read").enabled()).isFalse();
+            assertThat(reopened.policy("snapshot-read").interval()).isEqualTo(defaults.interval());
+            assertThat(reopened.policy("snapshot-read").maxDuration()).isEqualTo(Duration.ofHours(4));
+            assertThat(reopened.policy("stream-read")).isEqualTo(defaults);
+            var disabled = store.replace(1, defaults.disabled(), Map.of("stream-read",
+                    new io.tapstate.spi.store.RetrySettingsStore.OperationOverride(true, null, null))).orElseThrow();
+            assertThat(disabled.policy("stream-read").enabled()).isFalse();
+            assertThat(SystemCollections.CONFIG_RETRY_SETTINGS.on(database).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
     void reusableAuthoringDefinitionsRetainTheirExistingStoreContract() {
         List<Resource> definitions = List.of(
                 PARSER.parse("version: tapstate/v1\nkind: transform\nid: reusable_filter\ntype: filter\nexpr: \"true\"\n"),

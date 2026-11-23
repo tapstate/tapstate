@@ -370,6 +370,31 @@ final class Synthetic {
     }
 
     /** Batch-reads two snapshot rows and streams an insert / update / delete; a full source connector. */
+    static Path retryingSnapshotSource(Path dir, String counter, boolean withOffset) {
+        String offset = withOffset ? "1L" : "null";
+        String firstRow = "evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r1));";
+        String register = "functions.supportErrorHandleFunction((context, method, failure) -> {"
+                + "  if (method != io.tapdata.pdk.apis.functions.PDKMethod.SOURCE_BATCH_READ) throw new AssertionError(method);"
+                + "  return io.tapdata.pdk.apis.functions.connection.RetryOptions.create().needRetry(false).beforeRetryMethod(() -> "
+                + "     ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + ".prepare\")).incrementAndGet());"
+                + "});"
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  int call = ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + "\")).incrementAndGet();"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + row("r1", 1)
+                + row("r2", 2)
+                + "  if (call % 2 == 1) {" + firstRow
+                + "    consumer.accept(evs, " + offset + "); throw new java.io.IOException(\"transient snapshot fault\");"
+                + "  }"
+                + "  if (!java.util.Objects.equals(" + offset + ", offset)) throw new IllegalStateException(\"wrong retry offset\");"
+                + (withOffset ? "" : firstRow)
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r2));"
+                + "  consumer.accept(evs, " + (withOffset ? "2L" : "null") + ");"
+                + "});"
+                + "functions.supportTimestampToStreamOffset((context, time) -> 0L);";
+        return SyntheticJar.compileToJar(dir, "synthetic.RetryingSnapshotSource", source("RetryingSnapshotSource", "", register));
+    }
+
     static Path emittingSource(Path dir) {
         String register = ""
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"

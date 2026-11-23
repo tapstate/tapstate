@@ -1125,6 +1125,14 @@
         "Do not delete reports, restore an earlier snapshot over newer running facts, change CACHE bindings or claims, clear state or trigger automatic retries to regain compatibility. Preserve the existing cadence, latest replacement and cleanup boundaries.",
         "No new production writes to LEGACY observation resources and no modification of their stored format or recovery entry. Historical records without a captured diagnostic remain readable without invented causes."
       ]
+    },
+    "operation-retry-policy-v1": {
+      "goal": "Restore the active cluster retry policy with its original CONFIG backup and cluster identity.",
+      "entry": "Read the singleton from the original verified CONFIG database or save it through the authorized cluster settings API.",
+      "prerequisites": [
+        "Version 1 stores a revision, a global enabled flag, interval and maximum duration, and optional overrides keyed by registered operation.",
+        "An unconfigured cluster uses enabled, 60 seconds between attempts, and an 8 hour retry window."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -1371,6 +1379,10 @@
     "cache-runtime-diagnostic-projection-v3": {
       "atomicDomain": "CACHE",
       "fencing": "Preserve the exact clusterId/bindingVersion/cacheIncarnation/pipelineId/stateGeneration, epoch, claimGeneration/executionGeneration/topologyRevision and node/boot run key. Writes retain the existing active guard and structure checks followed by a single-document atomic monotonic observedAt update; do not claim live ownership is re-proven in the write transaction. Reads retain their existing CACHE observation transaction and state/claim checks. CONFIG is not a CACHE fence. Read-only views cannot mutate."
+    },
+    "operation-retry-policy-v1": {
+      "atomicDomain": "CONFIG",
+      "fencing": "A save conditionally replaces the complete singleton against its original revision in the bound CONFIG database. All override fields and the revision are committed together. Runtime attempts use the published policy without writing to CONFIG."
     }
   },
   "resources": [
@@ -4470,6 +4482,30 @@
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationControlStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationIndependentPreparationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.retry_settings",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "retry_settings"
+      ],
+      "responsibility": "Persist the current cluster retry policy and registered operation overrides.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRetrySettingsStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRetrySettingsStore"
+      ],
+      "recovery": "operation-retry-policy-v1",
+      "consistency": "operation-retry-policy-v1",
+      "growth": "At most one small document per original CONFIG cluster. One optional record per registered operation, each with at most three scalar overrides. No attempt history, active timers or execution state.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
       ]
     }
   ]

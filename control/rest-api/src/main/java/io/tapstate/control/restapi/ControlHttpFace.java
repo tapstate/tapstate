@@ -59,7 +59,7 @@ import java.util.Map;
         PipelineDeletionController.class,
         PipelineLayoutController.class,
         PipelineDraftController.class,
-        AiProviderController.class, PipelineAssistantController.class,
+        AiProviderController.class, PipelineAssistantController.class, RetrySettingsController.class,
         PipelinePreviewController.class, ValidationConfigurationController.class, ValidationReportController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,

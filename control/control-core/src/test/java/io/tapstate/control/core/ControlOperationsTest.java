@@ -21,6 +21,7 @@ class ControlOperationsTest {
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.select", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
+                        "retry-settings.get", "retry-settings.replace",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "system.version",
                         "artifact.apply",
@@ -232,7 +233,7 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(88);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())
-                && !"ai-provider.select".equals(op.id())
+                && !"ai-provider.select".equals(op.id()) && !op.id().startsWith("retry-settings.")
                 && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
@@ -242,6 +243,9 @@ class ControlOperationsTest {
                 .containsEntry(Frontend.REST, Maturity.CURRENT).doesNotContainKey(Frontend.CLI);
         assertThat(registry.resolve("ai-provider.select").exposure())
                 .containsEntry(Frontend.REST, Maturity.CURRENT).containsOnlyKeys(Frontend.REST);
+        assertThat(registry.resolve("retry-settings.get").scope()).isEqualTo(Scope.ADMIN);
+        assertThat(registry.resolve("retry-settings.replace").scope()).isEqualTo(Scope.ADMIN);
+        assertThat(registry.resolve("retry-settings.replace").audited()).isTrue();
     }
 
     @Test
@@ -290,6 +294,7 @@ class ControlOperationsTest {
                         "validation.report", "validation.roots", "validation.root", "validation.schedule-disable",
                         "alert.rule-preview", "alert.route-preview", "alert.catalog", "alert.resources", "alert.center", "alert.detail", "alert.deliveries", "alert.health", "alert.configuration.list", "alert.configuration.save", "alert.configuration.retire", "alert.preview", "alert.test", "alert.test-result", "alert.retry",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.select", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
+                        "retry-settings.get", "retry-settings.replace",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "sample-source.list", "sample-source.install", "state-store.connect",
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",

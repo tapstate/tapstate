@@ -622,6 +622,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         @Override public void close() { if (!closed) { closed = true; connection.close(); } }
     }
 
+    public io.tapstate.spi.store.RetrySettingsStore retrySettings() {
+        requireOpen();
+        return new MongoRetrySettingsStore(connection.database(), clusterId, this::requireOpen);
+    }
+
     public io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettings() {
         requireOpen();
         return new MongoConfigurationAiProviderSettingsStore(connection.client(), connection.database(), clusterId,
