@@ -167,13 +167,29 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         }
     }
 
-    private static ConnectionRejection connectionRejection(Throwable failure) {
-        if (Thread.currentThread().isInterrupted() || !hasNoSuppressed(failure)) {
-            return null;
-        }
+    static boolean authenticationRejected(Throwable failure) {
+        Throwable candidate = connectionFailureCandidate(failure);
+        if (candidate == null) return false;
+        String type = candidate.getClass().getName();
+        boolean declared = type.equals("io.tapdata.exception.TapPdkUserPwdInvalidEx");
+        boolean retryable = type.equals("io.tapdata.exception.TapPdkRetryableEx");
+        Throwable driver = declared || retryable ? candidate.getCause() : candidate;
+        if (declared && driver == null) return true;
+        if (!hasNoSuppressed(driver) || !(driver instanceof SQLException sql)) return false;
+        return declared || driver instanceof java.sql.SQLInvalidAuthorizationSpecException
+                || isSqlConnectionRejection(sql.getSQLState(), false);
+    }
+
+    private static Throwable connectionFailureCandidate(Throwable failure) {
+        if (Thread.currentThread().isInterrupted() || !hasNoSuppressed(failure)) return null;
         // The JDBC version probe sometimes adds an untyped RuntimeException around a PDK refusal.
         Throwable candidate = failure.getClass() == RuntimeException.class ? failure.getCause() : failure;
-        if (!hasNoSuppressed(candidate)) return null;
+        return hasNoSuppressed(candidate) ? candidate : null;
+    }
+
+    private static ConnectionRejection connectionRejection(Throwable failure) {
+        Throwable candidate = connectionFailureCandidate(failure);
+        if (candidate == null) return null;
         String type = candidate.getClass().getName();
         boolean authentication = type.equals("io.tapdata.exception.TapPdkUserPwdInvalidEx");
         boolean retryable = type.equals("io.tapdata.exception.TapPdkRetryableEx");

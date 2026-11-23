@@ -15,6 +15,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 class RedactingLogConverterTest {
 
     @Test
+    void defaultTextPatternIncludesSafeDiagnosticAndProgrammerFrames() {
+        LoggerContext context = new LoggerContext();
+        try {
+            RedactingLogConverter.redactor(context).replace("source", java.util.List.of("sentinel-password", "rawMessage"));
+            PatternLayout layout = new PatternLayout();
+            layout.setContext(context);
+            layout.getInstanceConverterMap().put("redact", RedactingLogConverter::new);
+            layout.setPattern("%redact(%m%n%ex){}%nopex");
+            layout.start();
+            LoggingEvent event = new LoggingEvent(getClass().getName(), context.getLogger("test.safe"),
+                    Level.ERROR, "safe primary", null, null);
+            event.addKeyValuePair(new org.slf4j.event.KeyValuePair("diagnostic", java.util.Map.of(
+                    "rawMessage", "sentinel-password", "stackTrace", "example.Worker.run(Worker.java:42)",
+                    "cause", java.util.Map.of("rawMessage", "nested sentinel-password"))));
+            assertThat(layout.doLayout(event)).contains("safe primary", "diagnostic=", "nested ********",
+                    "example.Worker.run(Worker.java:42)").doesNotContain("sentinel-password");
+        } finally {
+            context.stop();
+        }
+    }
+
+    @Test
     void preservesExceptionDetailsAndNewlineAfterACredentialFreeMongoUri() {
         LoggerContext context = new LoggerContext();
         try {

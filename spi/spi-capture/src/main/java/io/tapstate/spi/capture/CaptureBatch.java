@@ -11,6 +11,11 @@ import java.util.Optional;
  */
 public interface CaptureBatch extends Iterator<Envelope>, AutoCloseable {
 
+    /** A process-local failure captured by this reader; unrelated failures retain their own attribution. */
+    default io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
+    }
+
     /**
      * The position a change tail must resume from to join this snapshot without a gap: sampled when the
      * batch was opened, before its first row was read. Every change made while the snapshot runs

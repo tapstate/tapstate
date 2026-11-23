@@ -46,7 +46,7 @@ class PatternSourceAdmissionIT {
             var refusal = control.startExpectingRefusal(PIPELINE);
 
             assertThat(refusal.status()).isEqualTo(409);
-            assertThat(refusal.code()).isEqualTo("actuation.source-schema-not-discovered");
+            assertThat(refusal.code()).isEqualTo("TS0360004");
             assertThat(refusal.params()).containsEntry("source", "src_file");
             requireNoRuntime(cache);
             assertThat(SystemCollections.OPERATOR_GENERATIONS.on(configuration).find(new Document("_id", PIPELINE)).first()).isEqualTo(mapping);

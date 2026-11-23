@@ -32,6 +32,10 @@ final class TargetTapTable {
         TapTable table = bare(target.name());
         int keyPos = 1;
         for (TargetField field : target.fields()) {
+            if (field.isDeferredDecimal()) {
+                // A flexible target prepares the table without a declaration for this column.
+                continue;
+            }
             TapField column = new TapField(field.name(), field.type());
             var number = field.numericType();
             if (field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL && number == null) {

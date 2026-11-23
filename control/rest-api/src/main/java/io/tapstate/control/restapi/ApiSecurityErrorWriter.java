@@ -27,11 +27,20 @@ final class ApiSecurityErrorWriter {
     }
 
     void write(HttpServletResponse response, TapstateErrorCode code, Map<String, Object> args) throws IOException {
-        MessageCatalog.Rendered rendered = catalog.render(code, args);
+        write(response, code, args, java.util.Locale.ENGLISH);
+    }
+
+    void write(HttpServletRequest request, HttpServletResponse response, TapstateErrorCode code,
+            Map<String, Object> args) throws IOException {
+        write(response, code, args, ApiExceptionHandler.localeFor(request));
+    }
+
+    private void write(HttpServletResponse response, TapstateErrorCode code, Map<String, Object> args,
+            java.util.Locale locale) throws IOException {
         response.setStatus(ApiExceptionHandler.statusFor(code).value());
         response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
-        json.writeValue(response.getOutputStream(), new ApiError(code.code(), new TreeMap<>(args), rendered.message()));
+        json.writeValue(response.getOutputStream(), ApiError.render(code, args, Map.of(), catalog, locale));
     }
 
     void unauthenticated(HttpServletResponse response) throws IOException {
@@ -40,13 +49,14 @@ final class ApiSecurityErrorWriter {
 
     void unauthenticated(HttpServletRequest request, HttpServletResponse response) throws IOException {
         ApiExceptionHandler.markCloudError(request, ControlError.UNAUTHENTICATED);
-        unauthenticated(response);
+        write(request, response, ControlError.UNAUTHENTICATED, Map.of());
     }
 
     void forbidden(HttpServletRequest request, HttpServletResponse response, String operation, String required)
             throws IOException {
         ApiExceptionHandler.markCloudError(request, ControlError.FORBIDDEN);
-        forbidden(response, operation, required);
+        write(request, response, ControlError.FORBIDDEN,
+                Map.of("op", operation, "required", required.toLowerCase(Locale.ROOT)));
     }
 
     void forbidden(HttpServletResponse response, String operation, String required) throws IOException {

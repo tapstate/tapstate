@@ -40,7 +40,7 @@ class StartFromTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> {
                     TapstateException ce = (TapstateException) e;
-                    assertThat(ce.code().code()).isEqualTo("capture.start-from-unparsable");
+                    assertThat(ce.code().code()).isEqualTo("TS0350010");
                     assertThat(ce.args()).containsEntry("value", "yesterday");
                 });
     }
@@ -63,7 +63,7 @@ class StartFromTest {
                     .isInstanceOf(TapstateException.class)
                     .satisfies(e -> {
                         TapstateException ce = (TapstateException) e;
-                        assertThat(ce.code().code()).isEqualTo("capture.start-from-unparsable");
+                        assertThat(ce.code().code()).isEqualTo("TS0350010");
                         assertThat(ce.args()).containsEntry("value", unusable);
                     });
         }

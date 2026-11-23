@@ -138,13 +138,13 @@ final class ThreeLayerStorePort implements StorePort {
             io.tapstate.core.model.SourceResource source, SourceCaptureResolution canonical, boolean requireAttachment,
             Supplier<SrsStores> stores, boolean verifyMissingCapture) {
         active();
-        if(pipeline.sources().stream().anyMatch(reference -> reference.id().equals(source.id())
-                && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs())
+        if(pipeline.sourceReference(canonical.sourceId()) instanceof io.tapstate.core.model.SourceRef.Spec spec
+                && Boolean.FALSE.equals(spec.srs())
                 || pipeline.settings()!=null && pipeline.settings().readMode()==io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY)
             return Optional.of(canonical);
         var original=scope(pipeline.id());
         var binding = configuration.intents().connectorBindings().load(original)
-                .flatMap(value -> value.find(source.id(), io.tapstate.core.model.PipelineNode.Purpose.CAPTURE)).orElse(null);
+                .flatMap(value -> value.find(canonical.sourceId(), io.tapstate.core.model.PipelineNode.Purpose.CAPTURE)).orElse(null);
         String capture = binding == null ? io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value())
                 : binding.captureId();
         if (capture == null) throw refused();
@@ -161,10 +161,10 @@ final class ThreeLayerStorePort implements StorePort {
         if(fixed.mode()!=CapturePreparation.Mode.SHARED_SRS || !business().equals(fixed.scope()) || !capture.equals(fixed.captureId())
                 || binding == null && !canonical.chainId().value().equals(fixed.canonicalChainId())
                 || binding != null && !binding.chainId().equals(fixed.chainId())
-                || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),source.config())))throw refused();
+                || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),canonical.config().settings())))throw refused();
         var topology=stores.get().consumers().attached(fixed.chainId());
         var reader=topology.consumers().stream().filter(member -> member.context().key().pipelineId().equals(pipeline.id())
-                && member.context().key().sourceId().equals(source.id())).findFirst();
+                && member.context().key().sourceId().equals(canonical.sourceId())).findFirst();
         active();if(!original.equals(scope(pipeline.id())))throw refused();
         if(reader.isEmpty() && requireAttachment)return Optional.empty();
         if(reader.isPresent() && reader.orElseThrow().context().stateGeneration()!=original.stateGeneration())throw refused();
@@ -446,7 +446,9 @@ final class ThreeLayerStorePort implements StorePort {
     }
     private static Optional<Observation> startFailure(String pipeline, MongoConfigurationDomain.PipelineDisplayHeader header) {
         return header.startFailure().map(code -> new Observation(pipeline, PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
-                new io.tapstate.core.lifecycle.ObservationFailure(code.code(), Map.of()), null, List.of()));
+                new io.tapstate.core.lifecycle.ObservationFailure(code.code(),
+                        code == io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED ? Map.of("pipeline", pipeline) : Map.of()),
+                null, List.of()));
     }
     private Optional<Observation> readObservation(String pipeline, PipelineIntentScope original) {
         var preparation = configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
@@ -509,10 +511,13 @@ final class ThreeLayerStorePort implements StorePort {
                 if (!(reference instanceof io.tapstate.core.model.SourceRef.Spec spec) || spec.srs()) continue;
                 var source = StoredArtifacts.requireSource(configuration.artifacts(), reference.id());
                 var key = source.srs() == null ? null : source.srs().key();
-                if (!chain.equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(source.connector(), source.config(), key, pipeline.id(), source.id()))) continue;
+                var settings = io.tapstate.core.model.PipelineSourceConfig.settings(reference, source);
+                var overrides = io.tapstate.core.model.PipelineSourceConfig.overrides(reference, source);
+                if (!chain.equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(
+                        source.connector(), settings, key, pipeline.id(), reference.binding(), overrides))) continue;
                 if (unprepared(pipeline.id())) return Optional.empty();
-                var tables = PipelineTableSelection.resolve(pipeline, source, SourceDiscovery.model(this, source));
-                var channel = DirectChannelPreparation.of(scope(pipeline.id()), source, mode,
+                var tables = PipelineTableSelection.resolve(pipeline, reference, source, SourceDiscovery.model(this, source));
+                var channel = DirectChannelPreparation.of(scope(pipeline.id()), source, reference, mode,
                         pipeline.settings() == null ? null : pipeline.settings().startFrom(), tables);
                 var original = bound.cache().directChannels(business(), this::active).load(channel.context());
                 return Optional.of(original);

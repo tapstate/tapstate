@@ -21,6 +21,12 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ScopedPipelineCaptureCoordinatorTest {
+    private static CaptureRun healthyCaptureRun() {
+        var run = mock(CaptureRun.class);
+        when(run.health()).thenReturn(new io.tapstate.runtime.srs.CaptureHealth());
+        return run;
+    }
+
     @Test void validationRouteUsesTheOriginalAliasMembershipAndCurrentRemoteCapture() {
         try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)){
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
@@ -256,7 +262,7 @@ class ScopedPipelineCaptureCoordinatorTest {
     @Test void anOldCallbackResumedAfterReleaseCannotRecreateItsHandoff() throws Exception {
         try(var f=new Fixture()) {
             var output=new AtomicReference<CaptureHandoff>();
-            doAnswer(call -> { output.set(call.getArgument(3));return mock(CaptureRun.class); }).when(f.runtime).beginSnapshotOnly(any(),anyLong(),any(),any(),any());
+            doAnswer(call -> { output.set(call.getArgument(3));return healthyCaptureRun(); }).when(f.runtime).beginSnapshotOnly(any(),anyLong(),any(),any(),any());
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL); run.startCapture("flow",f.snapshot(),f.models());
             var bindings=run.captureBindings(); var entered=new CountDownLatch(1); var resume=new CountDownLatch(1);
             when(f.authorization.requireCapture(any(),any())).thenAnswer(call -> {
@@ -460,6 +466,15 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void aRetiredSharedTailKeepsItsOriginalSafeFailureFact() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report = pendingTailFailure(f, null, true);
+            var fact = report.held().tail().health().failureFact().orElseThrow();
+            assertThat(fact.publicFailure()).isNotNull();
+            assertThat(report.held().run().captureFailureFact("flow")).get().isSameAs(fact);
+        }
+    }
+
     @Test void steadySharedMaintenanceUsesOneRetentionSnapshotForTheTailCheck() {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var held = ownedShared(f);
@@ -510,17 +525,72 @@ class ScopedPipelineCaptureCoordinatorTest {
                     new SrsConsumerStore.RetentionConsumer(peer, Map.of()));
             var oldSnapshot = new SrsConsumerStore.RetentionSnapshot(old, members);
             var newSnapshot = new SrsConsumerStore.RetentionSnapshot(opened, members);
-            when(stores.consumers().retentionSnapshot(held.chain()))
-                    .thenAnswer(call -> Optional.of(chain.get() == old ? oldSnapshot : newSnapshot));
             var refreshed = new CountDownLatch(1);
             doAnswer(call -> {
                 if (chain.get() == opened) refreshed.countDown();
                 return null;
             }).when(f.runtime).retain(eq(BUSINESS), eq(held.chain()), eq(fence), any());
+            when(stores.consumers().retentionSnapshot(held.chain()))
+                    .thenAnswer(call -> Optional.of(chain.get() == old ? oldSnapshot : newSnapshot));
 
             assertThat(refreshed.await(5, TimeUnit.SECONDS)).isTrue();
             verify(f.runtime).startTail(eq(BUSINESS), eq(opened), eq(fence), any(), any(), any(), any(), anyBoolean());
             verify(f.runtime, never()).retain(eq(BUSINESS), eq(held.chain()), eq(fence), any(), same(oldSnapshot));
+        }
+    }
+
+    @Test void unavailableRetentionSnapshotKeepsTheHealthyTailAndRetriesCleanup() throws InterruptedException {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var failures = new AtomicInteger();
+            var retained = new CountDownLatch(2);
+            doAnswer(call -> {
+                if (failures.get() > 0) retained.countDown();
+                return null;
+            }).when(f.runtime).retain(eq(BUSINESS), eq(held.chain()),
+                    eq(WorkloadClaimFence.from(held.claim())), any());
+            when(stores.consumers().retentionSnapshot(held.chain())).thenAnswer(call -> {
+                failures.incrementAndGet();
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "snapshot unavailable"), null);
+            });
+
+            assertThat(retained.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(failures).hasValueGreaterThanOrEqualTo(2);
+            assertThat(held.run().captureFailure("flow")).isEmpty();
+            verify(f.ownership, never()).release(held.claim());
+            verify(held.tail(), never()).close();
+            verify(f.runtime, times(1)).startTail(any(), any(), any(), any(), any(), any(), any(), anyBoolean());
+        }
+    }
+
+    @Test void unavailableRetentionSnapshotStillRejectsALostCaptureOwner() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var fenced = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            when(stores.consumers().retentionSnapshot(held.chain())).thenAnswer(call -> {
+                when(f.authorization.requireCapture(any(), any())).thenThrow(fenced);
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "snapshot unavailable"), null);
+            });
+
+            verify(f.ownership, timeout(3000)).release(held.claim());
+            assertThat(held.run().captureFailure("flow")).contains(fenced);
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = IoError.class,
+            names = {"WORKLOAD_CLAIM_FENCED", "CACHE_BUSINESS_FENCED", "DOCUMENT_UNREADABLE"})
+    void retentionSnapshotFencesAndDamagedFactsStillEndTheCapture(IoError code) {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var failure = new TapstateException(code, Map.of(), null);
+            when(stores.consumers().retentionSnapshot(held.chain())).thenThrow(failure);
+
+            verify(f.ownership, timeout(3000)).release(held.claim());
+            assertThat(held.run().captureFailure("flow")).contains(failure);
         }
     }
 
@@ -572,6 +642,9 @@ class ScopedPipelineCaptureCoordinatorTest {
         return pendingTailFailure(f,null);
     }
     private static PendingReport pendingTailFailure(Fixture f,CountDownLatch allowClose) {
+        return pendingTailFailure(f, allowClose, false);
+    }
+    private static PendingReport pendingTailFailure(Fixture f,CountDownLatch allowClose,boolean typedFact) {
     var port=mock(PdkCapturePort.class,RETURNS_SELF);f.portOverride.set(port);
     var runtime=mock(PipelineAlertRuntime.class);var storage=mock(StorageBinding.class);
     when(storage.defaultSourceId()).thenReturn("other");
@@ -595,7 +668,12 @@ class ScopedPipelineCaptureCoordinatorTest {
     var ioClosed=new CountDownLatch(1);
     doAnswer(call->{observer.close();drive.close();ioClosed.countDown();if(allowClose!=null)allowClose.await();return null;}).when(held.tail()).close();
     var failure=new TapstateException(ConnectorError.CAPTURE_FAILED,Map.of("connector","fixture","detail","connection failed"),null);
-    var health=held.tail().health();health.recording(mock(CaptureListener.class)).onError(failure);
+    var health=held.tail().health();
+    if (typedFact) health.recording(mock(CaptureListener.class)).onFailure(new io.tapstate.core.common.FailureFact(
+            failure, Map.of("code", failure.code().code(), "rawMessage", "redacted original"),
+            new io.tapstate.core.common.FailureFact.PublicFailure(failure.code().code(),
+                    Map.of("connector", "fixture", "detail", "connection failed"))));
+    else health.recording(mock(CaptureListener.class)).onError(failure);
     assertThat(health.failure()).contains(failure);
     try {assertThat(ioClosed.await(3,TimeUnit.SECONDS)).isTrue();}
     catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
@@ -719,7 +797,9 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(f.authorization.requireLocal(ORIGINAL)).thenThrow(new TapstateException(
                     io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "flow"), null));
             assertThat(f.authorization.require(ORIGINAL)).isEqualTo(PIPELINE);
+            clearInvocations(f.authorization);
             assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            verify(f.authorization).requireLocal(ORIGINAL);
             verify(publisher, times(2)).publishScoped(SCOPE, state, observations, null);
             verifyNoInteractions(cache);
             assertThat(f.coordinator.observationSelection(ORIGINAL)).isEmpty();
@@ -734,6 +814,10 @@ class ScopedPipelineCaptureCoordinatorTest {
         return ownedShared(f,false);
     }
     private static OwnedShared ownedShared(Fixture f,boolean openPort) {
+        return ownedShared(f, openPort, run -> run.startCapture("flow", f.snapshot(), f.models()), () -> {});
+    }
+    private static OwnedShared ownedShared(Fixture f, boolean openPort,
+            java.util.function.Consumer<PipelineCaptureCoordinator> start, Runnable afterPort) {
         String canonical="mck-key",physical="srs-recovery-"+"b".repeat(64),operation=UUID.randomUUID().toString();
         String captureId=SourceCaptureIdentity.sharedCapture(canonical);
         var prepared=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SHARED_SRS,physical,captureId,
@@ -746,7 +830,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
         var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
         when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-        when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
+        when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
         when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(chain.get())));
         when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
         when(consumers.find(context.key())).thenReturn(Optional.of(membership));
@@ -770,11 +854,30 @@ class ScopedPipelineCaptureCoordinatorTest {
         doNothing().when(f.runtime).retain(any(),anyString(),any(),any());
         var tail=mock(NativeSrsCaptureRunUnit.Tail.class);when(tail.health()).thenReturn(new CaptureHealth());
         doAnswer(call->{
-            if(openPort){f.tailGuard.set(call.getArgument(6));java.util.function.Function<SrsCaptureWriter,CapturePort> factory=call.getArgument(5);factory.apply(mock(SrsCaptureWriter.class));}
+            if(openPort){f.tailGuard.set(call.getArgument(6));java.util.function.Function<SrsCaptureWriter,CapturePort> factory=call.getArgument(5);factory.apply(mock(SrsCaptureWriter.class));afterPort.run();}
             return tail;
         }).when(f.runtime).startTail(any(),any(),any(),any(),any(),any(),any(),anyBoolean());
-        var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+        var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);start.accept(run);
         return new OwnedShared(run, capture, tail, physical,prepared);
+    }
+
+    @Test void aSharedTailOpeningFailureBelongsOnlyToTheRunThatOpenedIt() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var failure = new TapstateException(ConnectorError.CAPTURE_FAILED,
+                    Map.of("connector", "fixture", "detail", "refused"), null);
+            var fact = io.tapstate.core.common.FailureFact.unavailable(failure);
+            var receiver = new AtomicReference<java.util.function.Consumer<io.tapstate.core.common.FailureFact>>();
+            var port = mock(PdkCapturePort.class, RETURNS_SELF);
+            doAnswer(call -> { receiver.set(call.getArgument(0)); return port; }).when(port).withOpeningFailure(any());
+            f.portOverride.set(port);
+            var held = ownedShared(f, true,
+                    run -> assertThatThrownBy(() -> run.startCapture("flow", f.snapshot(), f.models())).isSameAs(failure),
+                    () -> { receiver.get().accept(fact); throw failure; });
+            var other = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            assertThat(other.openingFailureFact("flow", failure).diagnostic()).isEmpty();
+            assertThat(held.run().openingFailureFact("flow", failure)).isSameAs(fact);
+            assertThat(held.run().openingFailureFact("flow", failure).diagnostic()).isEmpty();
+        }
     }
 
     @Test void aTrustedReplacementUsesPhysicalRingsWhileKeepingCanonicalCaptureNotesAndHistory() {
@@ -791,7 +894,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
             var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
             when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-            when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
+            when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
             when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(chain.get())));
             when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
             when(consumers.find(context.key())).thenReturn(Optional.of(membership));
@@ -826,7 +929,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             verify(f.notes,never()).open(new RequiredNoteOwner(1,"pdk.chain."+physical,RequiredNoteOwner.Kind.CHAIN,physical,0));
             verify(f.ownership).acquire(new CaptureId(captureId));
             verify(f.runtime).startTail(eq(BUSINESS),any(),eq(WorkloadClaimFence.from(capture)),any(),any(),any(),any(),eq(true));
-            verify(f.configuration).inspectSharedHistory(eq(prepared),eq("input"),anyString());
+            verify(f.configuration).inspectSharedHistory(eq(prepared),eq("input"),anyString(),eq("flow"),anyString());
         }
     }
 
@@ -846,7 +949,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var retained=new SrsConsumerProgress(context,1,1,cursor,null);
             var consumers=mock(SrsConsumerStore.class);var chains=mock(SrsChainStore.class);
             when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-            when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
+            when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
             when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(originalChain)));
             when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
             when(consumers.find(context.key())).thenReturn(Optional.of(membership));
@@ -877,7 +980,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             doAnswer(call -> {
                 Runnable guard=call.getArgument(5);guard.run();
                 java.util.function.Consumer<SrsFreshFullReceipt> callback=call.getArgument(8);callback.accept(receipt);
-                return mock(CaptureRun.class);
+                return healthyCaptureRun();
             }).when(f.runtime).beginSnapshot(any(),any(),eq(2L),any(),any(),any(),eq(full),any(),any());
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
             var binding=run.captureBindings().logged().get("input");
@@ -981,7 +1084,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                     SourceCaptureIdentity.physical(f.source.connector(),f.source.config()),UUID.randomUUID().toString());
             when(f.configuration.read(BUSINESS,captureId)).thenReturn(Optional.of(prepared));
             var origin=ConnectorNoteOrigin.capture("mongodb","a".repeat(64),f.source.config());
-            when(f.configuration.inspectSharedOrigin(eq(BUSINESS),eq("input"),anyString())).thenReturn(Optional.of(origin));
+            when(f.configuration.inspectSharedOrigin(eq(BUSINESS),eq("input"),anyString(),anyString(),anyString())).thenReturn(Optional.of(origin));
             when(f.connectors.resolveRetained(any(),any(),eq(origin))).thenCallRealMethod();
             var key=f.streamingProgress.get().snapshot().models().get("orders");
             var pinned=new SourceTable("orders",List.of(new SourceField("old-sample","STRING(100)")),List.of(),List.of());
@@ -990,7 +1093,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var pass=mock(PipelineConvergencePass.class);when(pass.scope()).thenReturn(SCOPE);
             var captured=f.models();
             var planning=f.coordinator.retainedPlanningModels(pass,f.snapshot(),captured);
-            assertThat(planning.model(f.source).tables()).containsExactly(pinned);
+            assertThat(planning.modelForBinding("input", f.source).tables()).containsExactly(pinned);
             assertThat(captured.model(f.source).tables()).containsExactly(observed);
             assertThat(f.models().model(f.source).tables()).containsExactly(observed);
             verify(srs.models(),never()).publishedForNewSnapshot(anyString(),anyMap());
@@ -1053,7 +1156,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var prepared=new CapturePreparation(BUSINESS,bounded?CapturePreparation.Mode.SNAPSHOT_ONLY:CapturePreparation.Mode.SHARED_SRS,"mck-key",id,SourceCaptureIdentity.physical(source.connector(),source.config()),UUID.randomUUID().toString());
             capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id),bounded?OWNER:new WorkloadOwner("remote","remote-boot"),1,0,1,Instant.now().plusSeconds(60));
             when(configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-            if (!bounded) when(configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,false));
+            if (!bounded) when(configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,false));
             var cached = new CaptureCacheState(prepared, WorkloadClaimFence.from(capture),
                     bounded ? Optional.empty() : Optional.of(streamingChain()));
             when(cache.load(prepared)).thenReturn(cached);
@@ -1130,7 +1233,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                 java.util.function.Function<SrsSnapshotPreparation, CapturePort> ports = call.getArgument(3);
                 ports.apply(preparation);
                 CaptureHandoff output = call.getArgument(4); output.loaded("orders");
-                return mock(CaptureRun.class);
+                return healthyCaptureRun();
             }).when(runtime).beginSnapshot(any(), any(), anyLong(), any(), any(), any());
         }
 

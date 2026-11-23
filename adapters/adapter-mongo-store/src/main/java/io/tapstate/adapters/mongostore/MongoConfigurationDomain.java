@@ -765,6 +765,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return pipelineStates;
     }
 
+    public java.util.Optional<io.tapstate.spi.store.PipelineStateMapping> pipelineState(String pipelineId, java.time.Duration budget) {
+        requireOpen();
+        return ((MongoPipelineStateMappings) pipelineStates).read(pipelineId,new MongoReadBudget(budget));
+    }
+
     public io.tapstate.spi.store.PipelineRetirements retirements() {
         requireOpen();return new MongoPipelineRetirements(connection.client(),connection.database(),clusterId,bindings,artifacts,
                 (MongoRequiredNoteStore)requiredNotes,this::requireOpen);
@@ -772,6 +777,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public void requireRetiredPipelinePredecessor(io.tapstate.spi.store.PipelineIntentScope current, io.tapstate.spi.store.PipelineIntentScope earlier) {
         requireOpen(); new MongoPipelineStatePreparations(connection.client(),connection.database(),clusterId,bindings,artifacts,this::requireOpen)
                 .requireRetiredPredecessor(current,earlier);
+    }
+
+    public void requireCompletedStopPurge(io.tapstate.spi.store.PipelineIntentSnapshot purge,
+            String operation, io.tapstate.spi.store.WorkloadClaimFence node) {
+        ((MongoPipelineStateRebuilds) rebuilds()).requireCompletedStopPurge(purge, operation, node);
     }
 
     public io.tapstate.spi.store.CaptureStatePreparations capturePreparations() {
@@ -1159,6 +1169,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return bindings;
     }
 
+    public record ObservationCapture(String sourceId, String captureId) {
+        public ObservationCapture {
+            Objects.requireNonNull(sourceId, "sourceId");
+            Objects.requireNonNull(captureId, "captureId");
+        }
+    }
+
     public record ObservationConfiguration(io.tapstate.core.model.PipelineResource pipeline,
             Map<String, io.tapstate.core.model.SourceResource> sources,
             Map<String, io.tapstate.spi.store.CapturePreparation> captures) {
@@ -1171,21 +1188,19 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     private final MongoStructureProof observationStructures = new MongoStructureProof();
-    private volatile boolean observationCollations;
     public ObservationCheck observationConfiguration(io.tapstate.spi.store.PipelineIntentStore.ActuationReading before,
-            String defaultSource, Map<String, String> sources) {
+            String defaultSource, Map<String, ObservationCapture> sources) {
         requireOpen();
         if (before.configurationRevision().isEmpty() || sources.isEmpty() || sources.size() > 4
                 || !MongoReadBudget.supportsSnapshotReads(connection.client())) return ObservationCheck.fallback();
         try {
-            observationStructures.require(MongoStructureProof.Kind.OBSERVATION, () -> {
-                observationCollations = MongoCacheMetadataStructure.simpleCollations(connection.database(), MongoPipelineObservationConfig.COLLECTIONS);
-                if (observationCollations) {
-                    bindings.verifyObservationIndex();
-                    MongoCapturePreparationFacts.verify(connection.database());
-                }
+            boolean admitted = observationStructures.permits(MongoStructureProof.Kind.OBSERVATION, () -> {
+                if (!MongoCacheMetadataStructure.simpleCollations(connection.database(), MongoPipelineObservationConfig.COLLECTIONS)) return false;
+                bindings.verifyObservationIndex();
+                MongoCapturePreparationFacts.verify(connection.database());
+                return true;
             });
-            if (!observationCollations) return ObservationCheck.fallback();
+            if (!admitted) return ObservationCheck.fallback();
             var facts = new MongoPipelineObservationConfig(connection.client(), connection.database(), bindings, artifacts)
                     .read(before, defaultSource, sources);
             requireOpen();

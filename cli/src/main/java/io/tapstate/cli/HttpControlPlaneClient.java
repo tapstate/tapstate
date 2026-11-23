@@ -66,6 +66,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     private final Duration probeTimeout;
     private final Duration heavyTimeout;
     private final RequestBudget connectionBudget;
+    private final Duration streamPingInterval;
+    private final Duration streamPongTimeout;
     private HttpClient httpClient;
     private final HttpControlClient sharedClient;
 
@@ -83,6 +85,19 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     private HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, RequestBudget connectionBudget) {
+        this(probeTimeout, heavyTimeout, connectionBudget, Duration.ofSeconds(5), Duration.ofSeconds(15));
+    }
+
+    HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, Duration pingInterval, Duration pongTimeout) {
+        this(probeTimeout, heavyTimeout, RequestBudget.HEAVY, pingInterval, pongTimeout);
+    }
+
+    private HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, RequestBudget connectionBudget,
+            Duration pingInterval, Duration pongTimeout) {
+        if (pingInterval.isNegative() || pingInterval.isZero() || pongTimeout.isNegative() || pongTimeout.isZero())
+            throw new IllegalArgumentException("stream liveness budgets must be positive");
+        this.streamPingInterval = pingInterval;
+        this.streamPongTimeout = pongTimeout;
         this.probeTimeout = probeTimeout;
         this.heavyTimeout = heavyTimeout;
         this.connectionBudget = connectionBudget;
@@ -1250,7 +1265,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             Rejection r = rejection(response.body(), "The server refused to read the start checks.");
             // A server released before start checks has no such resource at all: its 404 carries no code of
             // ours, which is what tells it apart from a pipeline this server does not have.
-            if (response.statusCode() == 404 && !r.code().startsWith("lifecycle.")) {
+            if (response.statusCode() == 404 && !r.code().startsWith("lifecycle.")
+                    && !io.tapstate.core.common.LifecycleErrorDefinitions.UNKNOWN_PIPELINE.code().equals(r.code())) {
                 return new StartChecksOutcome.NotSupported();
             }
             return new StartChecksOutcome.Rejected(r.code(), r.params(), r.message());
@@ -1896,7 +1912,12 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // The message is the server's rendering of that code; when it is absent the code still names
             // the diagnosis, so it stands in rather than the whole read degrading to unreachable.
             String message = failure.get("message") instanceof String rendered ? rendered : code;
-            return new StatusOutcome.Found(id, state, code, message, ageMillis);
+            var params = new LinkedHashMap<String, Object>();
+            if (failure.get("params") instanceof Map<?, ?> supplied) {
+                supplied.forEach((key, value) -> { if (key instanceof String name) params.put(name, value); });
+            }
+            return new StatusOutcome.Found(id, state, code, message, ageMillis, params,
+                    io.tapstate.core.common.RuntimeDiagnosticProjection.read(failure.get("diagnostic")));
         }
         return null;
     }
@@ -2188,7 +2209,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         && line.get("timestampMillis") instanceof Number ts
                         && line.get("level") instanceof String level
                         && line.get("message") instanceof String message) {
-                    parsed.add(new RemoteLogLine(ts.longValue(), level, message));
+                    parsed.add(new RemoteLogLine(ts.longValue(), level, message, io.tapstate.core.common.RuntimeDiagnosticProjection.read(line.get("diagnostic"))));
                 }
             }
             return new LogsOutcome.Found(id, parsed);
@@ -2210,7 +2231,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return stream(wsUri(baseUrl, "/api/pipelines/" + pipelineId + "/status/watch"), credential, stop, frame -> {
             StatusOutcome decoded = statusFound(frame);
             if (decoded instanceof StatusOutcome.Found found) {
-                sink.state(found.pipelineId(), found.state(), found.failureCode(), found.failureMessage());
+                sink.state(found);
             }
         });
     }
@@ -2291,11 +2312,12 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
         CountDownLatch closed = new CountDownLatch(1);
         AtomicReference<String> refusal = new AtomicReference<>();
+        var liveness = new StreamLiveness(streamPingInterval, streamPongTimeout, closed);
         WebSocket ws;
         try {
             ws = client().newWebSocketBuilder()
                     .header("Authorization", "Bearer " + credential)
-                    .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
+                    .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal, liveness))
                     .join();
         } catch (RuntimeException handshakeFailed) {
             // join() wraps a refused (401/403) or unreachable handshake in a CompletionException (a
@@ -2303,7 +2325,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             sleepUnlessStopped(RECONNECT_BACKOFF, stop);
             return null;
         }
-        awaitClosedOrStop(closed, stop);
+        awaitClosedOrStop(closed, stop, ws, liveness);
         ws.abort();
         if (refusal.get() != null) {
             return refusal.get();
@@ -2332,9 +2354,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     /** Waits until the connection closes or {@code stop} is signalled, whichever comes first. */
-    private static void awaitClosedOrStop(CountDownLatch closed, BooleanSupplier stop) {
+    private static void awaitClosedOrStop(CountDownLatch closed, BooleanSupplier stop, WebSocket socket, StreamLiveness liveness) {
         try {
             while (!stop.getAsBoolean()) {
+                liveness.tick(socket, System.nanoTime());
                 if (closed.await(STOP_POLL.toMillis(), TimeUnit.MILLISECONDS)) {
                     return;
                 }
@@ -2369,11 +2392,20 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         private final CountDownLatch closed;
         private final AtomicReference<String> refusal;
         private final StringBuilder partial = new StringBuilder();
+        private final StreamLiveness liveness;
 
-        StreamListener(Consumer<String> onFrame, CountDownLatch closed, AtomicReference<String> refusal) {
+        StreamListener(Consumer<String> onFrame, CountDownLatch closed, AtomicReference<String> refusal, StreamLiveness liveness) {
             this.onFrame = onFrame;
             this.closed = closed;
             this.refusal = refusal;
+            this.liveness = liveness;
+        }
+
+        @Override
+        public CompletionStage<?> onPong(WebSocket socket, java.nio.ByteBuffer payload) {
+            liveness.pong(payload, System.nanoTime());
+            socket.request(1);
+            return null;
         }
 
         @Override

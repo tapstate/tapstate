@@ -1,0 +1,9 @@
+{
+  "TS0250001": {"message": "No Pipeline draft with id '{id}' exists.", "solution": "Create the draft or list Pipeline drafts to find an existing id."},
+  "TS0250002": {"message": "A Pipeline draft with id '{id}' already exists.", "solution": "Choose a different Pipeline id, or edit the existing draft."},
+  "TS0250003": {"message": "Pipeline draft '{id}' requires its current revision for this operation.", "solution": "Read the draft, then retry with its revision in If-Match."},
+  "TS0250004": {"message": "Pipeline draft '{id}' changed after it was read.", "solution": "Read the current draft and retry with its new revision."},
+  "TS0250005": {"message": "Pipeline draft '{id}' cannot be compiled: {reason}.", "solution": "Fix the draft at the reported location, then preview or publish it again."},
+  "TS0250006": {"message": "Pipeline draft '{id}' cannot change authoring mode after creation.", "solution": "Keep the existing draft mode, or create a new draft with the desired mode."},
+  "TS0250007": {"message": "Pipeline draft '{id}' is based on an artifact that changed after it was read.", "solution": "Read the current Pipeline and draft, then retry the publish operation."}
+}

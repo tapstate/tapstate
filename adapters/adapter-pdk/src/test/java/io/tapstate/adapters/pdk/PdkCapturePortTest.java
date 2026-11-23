@@ -328,6 +328,25 @@ class PdkCapturePortTest {
     }
 
     @Test
+    void snapshotInitializationKeepsTheOriginalVmErrorOutsideCodedFailures(@TempDir Path dir) throws Exception {
+        String channel = "tapstate.test.fatal-init." + java.util.UUID.randomUUID();
+        var fatal = new OutOfMemoryError("simulated initialization exhaustion");
+        System.getProperties().put(channel, fatal);
+        try {
+            Path jar = Synthetic.fatalInitSource(dir, channel);
+            try (var port = new PdkCapturePort(provisioner(jar, "synthetic.FatalInitSource", null))) {
+                assertThatThrownBy(() -> port.snapshot(config("t1"))).isSameAs(fatal);
+                try (var session = port.snapshotSession(config("t1"))) {
+                    assertThatThrownBy(() -> session.read("t1")).isSameAs(fatal);
+                    assertThat(session.failureFact(fatal).diagnostic()).isEmpty();
+                }
+            }
+        } finally {
+            System.getProperties().remove(channel);
+        }
+    }
+
+    @Test
     void snapshotWithoutExplicitStreamsInitsTheConnectorExactlyOnce(@TempDir Path dir) throws Exception {
         // Empty streams means "every stream": the drive discovers the stream names and reads them. It
         // must init the connector once, not once for discovery and again for the read — the connector
@@ -668,7 +687,7 @@ class PdkCapturePortTest {
         }).isInstanceOf(TapstateException.class)
                 .satisfies(error -> {
                     TapstateException refusal = (TapstateException) error;
-                    assertThat(refusal.code().code()).isEqualTo("connector.logminer-identifier-too-long");
+                    assertThat(refusal.code().code()).isEqualTo("TS0060019");
                     assertThat(refusal.args())
                             .containsEntry("connector", "oracle")
                             .containsEntry("kind", "schema")

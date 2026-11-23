@@ -75,12 +75,12 @@ final class PipelineConnectorExecutions {
                 value.effective(), List.of())).orElse(Selection.EMPTY);
     }
 
-    Binding recoveryBinding(PipelineIntentScope scope, Node source, String sourceHash, Runnable guard) {
+    Binding recoveryBinding(PipelineIntentScope scope, Node source, String sourceHash, String pipelineHash, Runnable guard) {
         if (!(connectors instanceof LocalConnectorArtifacts)) return null;
         var fixed = notes.guardedBy(guard);
         var privateScope = fixed.open(source.privateOwner(scope));
         var required = fixed.origin(privateScope);
-        var original = captures.guardedBy(guard).inspectSharedOrigin(business(scope), source.id(), sourceHash);
+        var original = captures.guardedBy(guard).inspectSharedOrigin(business(scope), source.id(), sourceHash, scope.pipelineId(), pipelineHash);
         if (original.isEmpty() || original.orElseThrow().equals(required)) return null;
         var ref = connectors.resolveRetained(fixed, privateScope, required);
         String chain = SourceCaptureIdentity.versionedSharedChain(source.canonicalSharedChain(), ref.contentHash(), null);

@@ -148,8 +148,50 @@ class DefaultSourceVerificationTest {
         var f = new Fixture(); f.test(ConnectionTestResult.Outcome.PASSED); f.clock.now++;
         assertThatThrownBy(() -> f.service(ignored -> f.result(ConnectionTestResult.Outcome.PASSED))
                 .test("views", "mongodb", Map.of("uri", "mongodb://other:27017/wrong"), "admin"))
-                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(failure.args()).containsOnlyKeys("reason");
+                    assertThat(failure.args().get("reason")).isEqualTo("connection settings differ from the stored Source");
+                    assertThat(failure.getMessage()).doesNotContain(URI, "mongodb://other:27017/wrong");
+                });
         assertThat(f.verification.snapshot().status()).isEqualTo(DefaultSourceVerification.Status.PASSED);
+    }
+    @Test void aDifferentInflightConfigurationIsExplainedWithoutReplacingTheOriginalTest() throws Exception {
+        var f = new Fixture();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var probes = new AtomicInteger();
+        var service = f.service(ignored -> {
+            probes.incrementAndGet();
+            entered.countDown();
+            try {
+                if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("release missing");
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(interrupted);
+            }
+            return f.result(ConnectionTestResult.Outcome.PASSED);
+        });
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var original = executor.submit(() -> service.test("views", "mongodb", f.current.get().config(), "admin"));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> service.test("views", "mongodb",
+                        Map.of("uri", "mongodb://different:private-other@localhost/wrong"), "admin"))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                            assertThat(failure.args()).containsOnlyKeys("reason");
+                            assertThat(failure.args().get("reason")).isEqualTo("another connection test is using different settings");
+                            assertThat(failure.getMessage()).doesNotContain(URI, "private-other");
+                        });
+                assertThat(probes).hasValue(1);
+                assertThat(f.verification.snapshot().status()).isEqualTo(DefaultSourceVerification.Status.CHECKING);
+            } finally {
+                release.countDown();
+            }
+            assertThat(original.get(5, TimeUnit.SECONDS).outcome()).isEqualTo(ConnectionTestReport.Outcome.PASSED);
+            assertThat(f.verification.snapshot().status()).isEqualTo(DefaultSourceVerification.Status.PASSED);
+        }
     }
     @Test void unrelatedSourceTestsDoNotReplaceTheManagedTargetObservation() {
         var f = new Fixture(); f.test(ConnectionTestResult.Outcome.PASSED);

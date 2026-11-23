@@ -26,6 +26,7 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.PipelineSourceConfig;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -131,7 +132,7 @@ final class StoreBackedDagSource implements DagSource {
 
     private final StorePort storePort;
     private final ArtifactStore artifactStore;
-    private final Function<SourceResource,SourceModel> modelInputs;
+    private final java.util.function.BiFunction<String, SourceResource, SourceModel> modelInputs;
     private final SinkWriterBinder sinkWriterBinder;
     private final TargetModelResolver targetModelResolver;
     private final NestSettings nestSettings;
@@ -263,7 +264,7 @@ final class StoreBackedDagSource implements DagSource {
         if(pass!=null)models=capturedStartGuard.planningModels(pass,snapshot,models);
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
-                requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads, CapturedStartGuard.NONE, initialReceipts);
+                requireMarkedStore, members, parallelismBudget, records, models::modelForBinding, boundedLoads, CapturedStartGuard.NONE, initialReceipts);
         captured.validateStart(pipelineId);
         PreparedOperators operators = pass == null ? null : captured.prepareOperators(pipeline,defaultDatabase,pass);
         NestCapacity capacity = operators == null ? captured.capacityOf(pipelineId) : NestCapacity.none();
@@ -283,11 +284,12 @@ final class StoreBackedDagSource implements DagSource {
         boolean bounded = pipeline.settings() != null && pipeline.settings().readMode() == ReadMode.SNAPSHOT_ONLY;
         for (var reference : pipeline.sources()) {
             var source = StoredArtifacts.requireSource(artifacts(), reference.id());
-            var selection = SourceCaptureResolution.forPipeline(pipeline, source, models.model(source));
+            var selection = SourceCaptureResolution.forPipeline(pipeline, reference, source, models.modelForBinding(reference.binding(), source));
             if (selection.isEmpty()) continue;
             boolean shared = !bounded && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs();
-            nodes.add(new PipelineConnectorExecutions.Node(source.id(), PipelineNode.Purpose.CAPTURE,
-                    source.connector(), source.config(), shared ? selection.orElseThrow().chainId().value() : null));
+            nodes.add(new PipelineConnectorExecutions.Node(reference.binding(), PipelineNode.Purpose.CAPTURE,
+                    source.connector(), PipelineSourceConfig.settings(reference, source),
+                    shared ? selection.orElseThrow().chainId().value() : null));
         }
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             var source = StoredArtifacts.requireSource(artifacts(), ViewTargetResolver.resolve(view, viewStoreId()).sourceId());
@@ -389,7 +391,8 @@ final class StoreBackedDagSource implements DagSource {
                     pipeline, FromClause.list(view.from()), sourceKeyByTable, sourceKeysById,
                     sourceVertices, stepIds));
         }
-        targetModelResolver.requireAllDiscovered(sourceIds);
+        targetModelResolver.requireAllDiscovered(sourceIds.stream()
+                .map(binding -> pipeline.sourceReference(binding).id()).distinct().toList());
     }
 
     StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder) {
@@ -473,12 +476,14 @@ final class StoreBackedDagSource implements DagSource {
             io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
             java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard) {
         this(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,requireMarkedStore,members,
-                parallelismBudget,modelRecords,modelInputs,boundedLoads,capturedStartGuard,(fence,ack) -> ack);
+                parallelismBudget,modelRecords,(binding, source) -> modelInputs.apply(source),
+                boundedLoads,capturedStartGuard,(fence,ack) -> ack);
     }
     private StoreBackedDagSource(StorePort storePort,SinkWriterBinder sinkWriterBinder,NestSettings nestSettings,
             StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
             boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
-            io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords,
+            java.util.function.BiFunction<String, SourceResource, SourceModel> modelInputs,
             java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard,
             java.util.function.BiFunction<ExecutionFence,SinkAckFactory,SinkAckFactory> initialReceipts) {
         this.initialReceipts=Objects.requireNonNull(initialReceipts);
@@ -488,7 +493,7 @@ final class StoreBackedDagSource implements DagSource {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
-        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore, this.modelInputs);
+        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore, source -> this.modelInputs.apply(null, source));
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
         this.modelRecords = Objects.requireNonNull(modelRecords, "modelRecords");
@@ -546,8 +551,8 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, SourceVertex> vertices = sourceVertices(pipeline);
         for (Map.Entry<String, SourceVertex> entry : vertices.entrySet()) {
             SourceVertex vertex = entry.getValue();
-            SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
-            SourceModel discovered = modelInputs.apply(source);
+            SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.artifactId());
+            SourceModel discovered = modelInputs.apply(vertex.sourceId(), source);
             SourceTable table = discovered == null ? null : discovered.tables().stream()
                     .filter(candidate -> candidate.name().equals(vertex.table())).findFirst().orElse(null);
             if (table == null) {
@@ -557,7 +562,7 @@ final class StoreBackedDagSource implements DagSource {
             List<FieldSchema> fields = table.fields().stream()
                     .map(field -> new FieldSchema(field.name(), field.dataType())).toList();
             selected.add(new PreviewSourceTable(entry.getKey(), source.id(), source.connector(),
-                    source.config(), new TableSchema(table.name(), fields), table));
+                    vertex.resolution().config().settings(), new TableSchema(table.name(), fields), table));
         }
         return List.copyOf(selected);
     }
@@ -844,7 +849,7 @@ final class StoreBackedDagSource implements DagSource {
         FrontierBinding frontier = frontierBinding(sourceVertices);
         PipelineResource builtPipeline = new PipelineResource(
                 pipeline.id(), pipeline.metadata(),
-                pipeline.sources().stream().filter(ref -> sourceKeysById.containsKey(ref.id())).toList(),
+                pipeline.sources().stream().filter(ref -> sourceKeysById.containsKey(ref.binding())).toList(),
                 pipeline.transforms(), pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental());
         List<String> planned = List.copyOf(members.get());
         ExecutionShape shape =
@@ -993,7 +998,7 @@ final class StoreBackedDagSource implements DagSource {
     private Map<String, BatchSpec> nodeBatches(PipelineResource pipeline, Map<String, SourceVertex> sourceVertices) {
         Map<String, BatchSpec> batches = new LinkedHashMap<>();
         sourceVertices.forEach((key, vertex) -> batches.put(key,
-                batchOrDefaults(StoredArtifacts.requireSource(artifacts(), vertex.sourceId()).execution())));
+                batchOrDefaults(StoredArtifacts.requireSource(artifacts(), vertex.artifactId()).execution())));
         if (pipeline.transforms() != null) {
             pipeline.transforms().forEach(step -> batches.put(step.id(), batchOrDefaults(step.execution())));
         }
@@ -1047,7 +1052,7 @@ final class StoreBackedDagSource implements DagSource {
     private Map<String, ExecutionSpec> sourceExecutions(Map<String, SourceVertex> sourceVertices) {
         Map<String, ExecutionSpec> executions = new LinkedHashMap<>();
         sourceVertices.forEach((key, vertex) -> {
-            ExecutionSpec execution = StoredArtifacts.requireSource(artifacts(), vertex.sourceId()).execution();
+            ExecutionSpec execution = StoredArtifacts.requireSource(artifacts(), vertex.artifactId()).execution();
             if (execution != null) {
                 executions.put(key, execution);
             }
@@ -1171,7 +1176,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private record SourceVertex(
-            String pipelineId, String sourceId, String table, SourceCaptureResolution resolution, String stream) {
+            String pipelineId, String sourceId, String artifactId, String table, SourceCaptureResolution resolution, String stream) {
         String consumerId() {
             return SrsConsumerId.of(pipelineId, sourceId).value();
         }
@@ -1190,8 +1195,8 @@ final class StoreBackedDagSource implements DagSource {
         List<String> copied = new ArrayList<>();
         var discoveredBySource = new LinkedHashMap<String, Map<String, SourceTable>>();
         for (SourceVertex vertex : sourceVertices.values()) {
-            var tables = discoveredBySource.computeIfAbsent(vertex.sourceId(), id -> {
-                SourceModel discovered = modelInputs.apply(StoredArtifacts.requireSource(artifacts(), id));
+            var tables = discoveredBySource.computeIfAbsent(vertex.sourceId(), binding -> {
+                SourceModel discovered = modelForVertex(vertex);
                 var byName = new LinkedHashMap<String, SourceTable>();
                 if (discovered != null) discovered.tables().forEach(table -> byName.putIfAbsent(table.name(), table));
                 return byName;
@@ -1222,17 +1227,18 @@ final class StoreBackedDagSource implements DagSource {
     private List<String> copySourceSchemas(PipelineResource pipeline) {
         String pipelineId = pipeline.id();
         List<String> copied = new ArrayList<>();
-        for (String sourceId : pipeline.sourceIds()) {
+        for (var ref : pipeline.sources()) {
+            String sourceId = ref.id();
             if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
                 throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceModel discovered = modelInputs.apply(source);
+            SourceModel discovered = modelInputs.apply(ref.binding(), source);
             // Applying an undiscovered source records nothing, including when discovery is needed
             // to expand an omitted or regex table selector. A start still requires capture resolution.
             if (discovered == null) {
                 continue;
             }
-            copied.addAll(sourceSchemaCopy.copyBatch(pipelineId, sourceId,
+            copied.addAll(sourceSchemaCopy.copyBatch(pipelineId, ref.binding(),
                     SourceTableSelection.resolve(source, discovered).stream()
                             .map(table -> discoveredTable(discovered, table)).filter(Objects::nonNull).toList()));
         }
@@ -1354,44 +1360,47 @@ final class StoreBackedDagSource implements DagSource {
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline, boolean skipUndiscovered,
             Map<String, List<TapstateException>> failures) {
         Map<String, SourceVertex> vertices = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sourceIds()) {
+        for (String binding : pipeline.sourceBindings()) {
+            var ref = pipeline.sourceReference(binding);
             try {
-                addSourceVertices(pipeline, sourceId, skipUndiscovered, vertices, failures);
+                addSourceVertices(pipeline, ref, skipUndiscovered, vertices, failures);
             } catch (TapstateException unavailable) {
                 if (failures == null) throw unavailable;
-                failures.computeIfAbsent(sourceId, ignored -> new ArrayList<>()).add(unavailable);
+                failures.computeIfAbsent(binding, ignored -> new ArrayList<>()).add(unavailable);
             }
         }
         Map<String, Long> counts = vertices.values().stream().collect(java.util.stream.Collectors.groupingBy(
                 SourceVertex::table, java.util.stream.Collectors.counting()));
         vertices.replaceAll((key, vertex) -> counts.get(vertex.table()) > 1
-                ? new SourceVertex(vertex.pipelineId(), vertex.sourceId(), vertex.table(), vertex.resolution(),
+                ? new SourceVertex(vertex.pipelineId(), vertex.sourceId(), vertex.artifactId(), vertex.table(), vertex.resolution(),
                         vertex.sourceId() + "." + vertex.table())
                 : vertex);
         return vertices;
     }
 
-    private void addSourceVertices(PipelineResource pipeline, String sourceId, boolean skipUndiscovered,
+    private void addSourceVertices(PipelineResource pipeline, io.tapstate.core.model.SourceRef ref, boolean skipUndiscovered,
             Map<String, SourceVertex> vertices, Map<String, List<TapstateException>> failures) {
+        String sourceId = ref.id();
         if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
             throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
         SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-        SourceModel discovered = modelInputs.apply(source);
+        SourceModel discovered = modelInputs.apply(ref.binding(), source);
         if (skipUndiscovered && discovered == null) return;
         Optional<SourceCaptureResolution> selected;
         if (failures == null) {
-            selected = SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+            selected = SourceCaptureResolution.forPipeline(pipeline, ref, source, discovered);
         } else {
             SourceTableSelection.Names names = SourceTableSelection.forOutputNames(source, discovered);
-            if (!names.unresolved().isEmpty()) failures.put(sourceId, new ArrayList<>(names.unresolved()));
-            selected = SourceCaptureResolution.forSelectedTables(pipeline, source,
-                    PipelineTableSelection.forOutputNames(pipeline, source, names.tables()));
+            if (!names.unresolved().isEmpty()) failures.put(ref.binding(), new ArrayList<>(names.unresolved()));
+            selected = SourceCaptureResolution.forSelectedTables(pipeline, ref, source,
+                    PipelineTableSelection.forOutputNames(pipeline, ref, names.tables()));
         }
         if (selected.isEmpty()) return;
         SourceCaptureResolution resolution = selected.orElseThrow();
+        String binding = ref.binding();
         for (String table : resolution.tables()) {
-            String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
-            vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution, table));
+            String key = resolution.tables().size() == 1 ? binding : binding + "." + table;
+            vertices.put(key, new SourceVertex(pipeline.id(), binding, sourceId, table, resolution, table));
         }
     }
 
@@ -1403,13 +1412,19 @@ final class StoreBackedDagSource implements DagSource {
         return byTable;
     }
 
+    private SourceModel modelForVertex(SourceVertex vertex) {
+        return modelInputs.apply(vertex.sourceId(), StoredArtifacts.requireSource(artifacts(), vertex.artifactId()));
+    }
+
     /** Keeps each discovered model attached to the stream that reads that source's table. */
     private Map<String, TargetTable> sourceTargets(Map<String, SourceVertex> vertices) {
         Map<String, Map<String, TargetTable>> bySource = new LinkedHashMap<>();
         Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (SourceVertex vertex : vertices.values()) {
-            TargetTable target = bySource.computeIfAbsent(vertex.sourceId(), targetModelResolver::resolveAll)
-                    .get(vertex.table());
+            TargetTable target = bySource.computeIfAbsent(vertex.sourceId(), binding -> {
+                SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.artifactId());
+                return TargetModelResolver.resolveAll(source, modelInputs.apply(binding, source));
+            }).get(vertex.table());
             if (target != null) {
                 targets.put(vertex.stream(), target);
             }
@@ -1568,12 +1583,16 @@ final class StoreBackedDagSource implements DagSource {
                 published.put(stream, publishedAs(base, produced, atTheSource(
                         pipelineId, stream, sourceVertices, sourceColumns)));
             } else if (produced != null) {
-                // Unknown lineage cannot preserve source attributes or secondary uniqueness. A decimal
-                // type token also declares bounds, so it cannot survive a script that may replace it.
+                // A script may rewrite any field. Preserve a non-key decimal description as a
+                // candidate, without declaring the result of the script to be a decimal.
                 published.put(stream, TargetModelResolver.keyedOn(new TargetTable(base.name(), base.fields().stream()
-                        .map(field -> new TargetField(field.name(),
-                                field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL
-                                        ? null : field.type(), field.primaryKey(), field.inferredType()))
+                        .map(field -> {
+                            boolean decimal = field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL;
+                            return decimal && !field.primaryKey() && field.numericType() != null
+                                    ? TargetField.deferredDecimal(field.name(), field.numericType())
+                                    : new TargetField(field.name(), decimal ? null : field.type(),
+                                            field.primaryKey(), field.inferredType());
+                        })
                         .toList(), List.of()), base.fields().stream().filter(TargetField::primaryKey)
                         .map(TargetField::name).toList()));
             }
@@ -1761,7 +1780,7 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> keysByTable = sourceKeyByTable(vertices);
         Map<String, List<String>> keysBySource = sourceKeysById(vertices);
         Set<String> steps = stepIds(pipeline);
-        boolean incomplete = keysBySource.size() < pipeline.sourceIds().size();
+        boolean incomplete = keysBySource.size() < pipeline.sourceBindings().size();
         Map<String,io.tapstate.spi.store.DerivedSchema> sourceModels = vertices.isEmpty() ? Map.of() : modelRecords.latestMany(pipelineId,vertices.values().stream()
                 .map(vertex -> SourceSchemaCopy.nodeId(vertex.sourceId(),vertex.table())).collect(java.util.stream.Collectors.toSet()));
         Function<SourceVertex,NodeColumns> copied = vertex -> {
@@ -1868,8 +1887,8 @@ final class StoreBackedDagSource implements DagSource {
      * a source having moved.
      */
     private NodeColumns discoveredColumns(SourceVertex vertex) {
-        SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
-        SourceModel discovered = modelInputs.apply(source);
+        SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.artifactId());
+        SourceModel discovered = modelInputs.apply(vertex.sourceId(), source);
         SourceTable table = discovered == null ? null : discoveredTable(discovered, vertex.table());
         return table == null ? null : NodeColumns.known(SourceSchemaCopy.columnsOf(table));
     }
@@ -2325,7 +2344,7 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = new LinkedHashMap<>();
         for (SourceVertex vertex : sourceVertices(pipeline).values()) {
             boolean direct = pipeline.sources().stream().anyMatch(ref ->
-                    ref.id().equals(vertex.sourceId())
+                    ref.binding().equals(vertex.sourceId())
                             && ref instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs());
             progress.put(vertex.stream(), new StoreBackedSinkAckFactory.SourceProgress(
                     vertex.resolution().chainId().value(), vertex.consumerId(),
@@ -2418,7 +2437,9 @@ final class StoreBackedDagSource implements DagSource {
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)
                                 .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests())).withSnapshotEpochs(snapshotEpochs),
-                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)))
+                joinBinding(compiledJoins, manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest),
+                        manifest != null && manifest.executionIdentity() instanceof ExecutionFence scoped && scoped.scope() != null
+                                ? scoped.scope().stateGeneration() : 0))
                 .withAggregate(aggregateBinding);
     }
 
@@ -2492,8 +2513,7 @@ final class StoreBackedDagSource implements DagSource {
             for (String key : upstreams(ref, keysByTable, keysBySource, vertices, stepIds)) {
                 SourceVertex vertex = vertices.get(key);
                 if (vertex != null) {
-                    SourceTable table = Optional.ofNullable(modelInputs.apply(
-                                    StoredArtifacts.requireSource(artifacts(), vertex.sourceId())))
+                    SourceTable table = Optional.ofNullable(modelForVertex(vertex))
                             .map(model -> discoveredTable(model, vertex.table())).orElse(null);
                     byStream.put(vertex.stream(), table);
                 }
@@ -3083,7 +3103,7 @@ final class StoreBackedDagSource implements DagSource {
         return recordedForAll && storePort.meta().writerRun(chain, consumerId).isEmpty();
     }
 
-    /** The source artifacts whose rows can reach one terminal reference. */
+    /** The input bindings whose rows can reach one terminal reference. */
     private static Set<String> sourceIdsReaching(
             PipelineResource pipeline,
             FromClause from,
@@ -3420,15 +3440,15 @@ final class StoreBackedDagSource implements DagSource {
      * <p>A pipeline with no join step compiles nothing and asks nothing of the schema store.
      */
     private JoinBinding joinBinding(Map<String,CompiledJoin> byStep) {
-        return joinBinding(byStep,JoinStoresBinding.onTheCluster());
+        return joinBinding(byStep, JoinStoresBinding.onTheCluster(), 0);
     }
-    private JoinBinding joinBinding(Map<String,CompiledJoin> byStep,JoinStoresBinding stores) {
+    private JoinBinding joinBinding(Map<String, CompiledJoin> byStep, JoinStoresBinding stores, long stateGeneration) {
         return new JoinBinding(
                 step -> compiledJoin(byStep, step).plan(),
                 step -> compiledJoin(byStep, step).factKeyColumns(),
                 step -> compiledJoin(byStep, step).dimensionRowKeyColumns(),
                 stores,
-                new LoggingDimensionRowDisplacedAlert());
+                new LoggingDimensionRowDisplacedAlert(stateGeneration));
     }
 
     /**
@@ -3613,7 +3633,7 @@ final class StoreBackedDagSource implements DagSource {
         if (sourceTable == null) {
             return List.of();
         }
-        return Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),sourceTable.sourceId())))
+        return Optional.ofNullable(modelForVertex(sourceTable))
                 .flatMap(model -> model.tables().stream()
                         .filter(t -> t.name().equals(sourceTable.table())).findFirst())
                 .map(t -> t.fields().stream()
@@ -3826,7 +3846,7 @@ final class StoreBackedDagSource implements DagSource {
         }
         String resolvedTable = table;
         String physicalTable = sourceTable.table();
-        return Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),sourceTable.sourceId())))
+        return Optional.ofNullable(modelForVertex(sourceTable))
                 .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(physicalTable)).findFirst())
                 .map(discovered -> new NestTable(
                         resolvedTable,
@@ -3898,7 +3918,7 @@ final class StoreBackedDagSource implements DagSource {
             return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
                     source.recoveryAfter().get(vertex.table()),source.snapshotEpoch(),new ScopedSrsReadCursorPublisherFactory(source.run(),vertex.table()),
                     order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
-                    readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.sourceId())));
+                    readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.artifactId())));
         }
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
@@ -3925,7 +3945,7 @@ final class StoreBackedDagSource implements DagSource {
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
-                readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.sourceId())));
+                readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.artifactId())));
     }
 
     private static Map<String,Long> snapshotEpochs(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
@@ -3945,7 +3965,7 @@ final class StoreBackedDagSource implements DagSource {
             else {
                 var resolution=vertex.resolution().onPhysicalChain(source.canonicalChainId(),source.run().miningChainId());
                 bindings.require(vertex.sourceId(),resolution.chainId().value(),vertex.table());
-                result.put(key,new SourceVertex(vertex.pipelineId(),vertex.sourceId(),vertex.table(),resolution,vertex.stream()));
+                result.put(key,new SourceVertex(vertex.pipelineId(),vertex.sourceId(),vertex.artifactId(),vertex.table(),resolution,vertex.stream()));
             }
         });
         return java.util.Collections.unmodifiableMap(result);
@@ -4210,7 +4230,7 @@ final class StoreBackedDagSource implements DagSource {
         var models = new HashMap<SourceResource, Optional<SourceModel>>();
         var captured = new StoreBackedDagSource(storePort, sinkWriterBinder, nestSettings, storeReachability,
                 sourcePlacement, catalogArtifacts, requireMarkedStore, members, parallelismBudget, modelRecords,
-                source -> models.computeIfAbsent(source, value -> Optional.ofNullable(modelInputs.apply(value))).orElse(null));
+                source -> models.computeIfAbsent(source, value -> Optional.ofNullable(modelInputs.apply(null, value))).orElse(null));
         return definition -> captured.outputNameDetails(definition, resources);
     }
 
@@ -4321,7 +4341,7 @@ final class StoreBackedDagSource implements DagSource {
                 .add(vertex.sourceId()));
         Set<String> qualified = new HashSet<>();
         owners.forEach((table, sources) -> {
-            if (sources.size() > 1 || !partial.failures.isEmpty() && pipeline.sourceIds().size() > 1)
+            if (sources.size() > 1 || !partial.failures.isEmpty() && pipeline.sourceBindings().size() > 1)
                 qualified.add(table);
         });
         return Set.copyOf(qualified);
@@ -4339,7 +4359,7 @@ final class StoreBackedDagSource implements DagSource {
             return Set.of();
         }
         return partial.vertices.values().stream().filter(vertex -> streams.contains(vertex.stream()))
-                .map(vertex -> new PipelineInputs.Input(vertex.sourceId(), vertex.table()))
+                .map(vertex -> new PipelineInputs.Input(vertex.artifactId(), vertex.table()))
                 .collect(java.util.stream.Collectors.toUnmodifiableSet());
     }
 
@@ -4367,7 +4387,7 @@ final class StoreBackedDagSource implements DagSource {
                     SourceVertex direct = vertices.values().stream().filter(vertex -> vertex.stream().equals(entry.getKey())).findFirst().orElse(null);
                     Set<PipelineInputs.Input> reached = partial.unresolvedTargetPossible(sync, entry.getValue().name()) ? Set.of() : direct == null
                             ? inputLineage(pipeline, partial, FromClause.list(FromRef.literal(entry.getKey())))
-                            : Set.of(new PipelineInputs.Input(direct.sourceId(), direct.table()));
+                            : Set.of(new PipelineInputs.Input(direct.artifactId(), direct.table()));
                     inputs.merge(identity, reached, (previous, next) -> {
                         if (previous.isEmpty() || next.isEmpty()) return Set.of();
                         Set<PipelineInputs.Input> combined = new LinkedHashSet<>(previous);
@@ -4403,7 +4423,7 @@ final class StoreBackedDagSource implements DagSource {
                     .collect(java.util.stream.Collectors.toUnmodifiableSet());
             keys = sourceKeyByTable(vertices);
             sources = sourceKeysById(vertices);
-            pipeline.sourceIds().forEach(id -> sources.putIfAbsent(id, List.of()));
+            pipeline.sourceBindings().forEach(id -> sources.putIfAbsent(id, List.of()));
             steps = stepIds(pipeline);
         }
 
@@ -4527,8 +4547,8 @@ final class StoreBackedDagSource implements DagSource {
                         else if (token.startsWith(source + ".")) {
                             String table = token.substring(source.length() + 1);
                             if (!hasKnownTable(source, table) && maySelect(source, table)) unavailable.add(source);
-                        } else if (!steps.contains(token) && !pipeline.sourceIds().contains(token)
-                                && pipeline.sourceIds().stream().noneMatch(id -> token.startsWith(id + "."))
+                        } else if (!steps.contains(token) && !pipeline.sourceBindings().contains(token)
+                                && pipeline.sourceBindings().stream().noneMatch(id -> token.startsWith(id + "."))
                                 && !hasKnownTable(source, token) && maySelect(source, token)) unavailable.add(source);
                     }
                 }
@@ -4551,15 +4571,15 @@ final class StoreBackedDagSource implements DagSource {
             // This symbolic vertex is request-local name evidence, never a runnable capture binding.
             String marker = source + "." + table;
             Map<String, SourceVertex> possible = new LinkedHashMap<>(vertices);
-            possible.put(marker, new SourceVertex(pipeline.id(), source, table, null, marker));
+            possible.put(marker, new SourceVertex(pipeline.id(), source, pipeline.sourceReference(source).id(), table, null, marker));
             Map<String, Long> counts = possible.values().stream().collect(java.util.stream.Collectors.groupingBy(
                     SourceVertex::table, java.util.stream.Collectors.counting()));
             possible.replaceAll((key, vertex) -> counts.get(vertex.table()) > 1
-                    ? new SourceVertex(vertex.pipelineId(), vertex.sourceId(), vertex.table(), vertex.resolution(),
+                    ? new SourceVertex(vertex.pipelineId(), vertex.sourceId(), vertex.artifactId(), vertex.table(), vertex.resolution(),
                             vertex.sourceId() + "." + vertex.table()) : vertex);
             Map<String, String> possibleKeys = sourceKeyByTable(possible);
             Map<String, List<String>> possibleSources = sourceKeysById(possible);
-            pipeline.sourceIds().forEach(id -> possibleSources.putIfAbsent(id, List.of()));
+            pipeline.sourceBindings().forEach(id -> possibleSources.putIfAbsent(id, List.of()));
             try {
                 Set<String> streams = streamsReaching(pipeline, ((ServeBlock.Inline) pipeline.serve()).from(),
                         possibleKeys, possibleSources, possible, steps);
@@ -4606,9 +4626,9 @@ final class StoreBackedDagSource implements DagSource {
                     throw entry.getValue().getFirst();
                 }
             }
-            if (steps.contains(token) || pipeline.sourceIds().contains(token)) return;
+            if (steps.contains(token) || pipeline.sourceBindings().contains(token)) return;
             int dot = token.indexOf('.');
-            if (dot > 0 && pipeline.sourceIds().contains(token.substring(0, dot))) return;
+            if (dot > 0 && pipeline.sourceBindings().contains(token.substring(0, dot))) return;
             requireUnambiguousUnavailableSources(token);
         }
 
@@ -4628,7 +4648,7 @@ final class StoreBackedDagSource implements DagSource {
 
         private boolean maySelect(String sourceId, String table) {
             if (!PipelineTableSelection.references(pipeline, sourceId, table)) return false;
-            SourceResource source = failedDefinitions.computeIfAbsent(sourceId, id -> artifacts().get(id)
+            SourceResource source = failedDefinitions.computeIfAbsent(sourceId, id -> artifacts().get(pipeline.sourceReference(id).id())
                     .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)).orElse(null);
             if (source == null || source.tables() == null) return true;
             for (TableRef selector : source.tables()) {

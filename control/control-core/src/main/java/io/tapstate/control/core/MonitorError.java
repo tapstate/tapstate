@@ -2,6 +2,8 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.MonitorErrorDefinitions;
 
 import java.util.Set;
 
@@ -22,37 +24,22 @@ public enum MonitorError implements TapstateErrorCode {
      * {@code pipeline} is the id the caller asked to observe. Catalog status reads can still return a known
      * pipeline's {@code NEW} state before its first observation.
      */
-    NO_OBSERVATION("monitor.no-observation", Set.of("pipeline")),
+    NO_OBSERVATION(MonitorErrorDefinitions.NO_OBSERVATION),
 
     /** A history cursor could not be parsed, verified, or matched to the repeated query. */
-    INVALID_CURSOR("monitor.invalid-cursor", Set.of("operation", "reason")),
+    INVALID_CURSOR(MonitorErrorDefinitions.INVALID_CURSOR),
 
     /** A valid history cursor is older than the bounded continuation lifetime. */
-    CURSOR_EXPIRED("monitor.cursor-expired", Set.of("operation")),
+    CURSOR_EXPIRED(MonitorErrorDefinitions.CURSOR_EXPIRED),
 
     /** A history query crossed one of its independently counted runtime budgets. */
-    QUERY_BUDGET_EXCEEDED("monitor.query-budget-exceeded", Set.of("operation", "budget", "limit"));
+    QUERY_BUDGET_EXCEEDED(MonitorErrorDefinitions.QUERY_BUDGET_EXCEEDED);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    MonitorError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    MonitorError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

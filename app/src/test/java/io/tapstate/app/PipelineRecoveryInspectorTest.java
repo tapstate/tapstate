@@ -28,6 +28,7 @@ class PipelineRecoveryInspectorTest {
     private final PipelineRecoveryInspector inspector;
     private SourceModel actualModel;
     private int probes;
+    private final List<SourceResource> probedSources = new ArrayList<>();
     PipelineRecoveryInspectorTest() {
         when(configuration.cacheRecoveries()).thenReturn(recoveries);when(configuration.preparations()).thenReturn(preparations);
         when(configuration.bindings()).thenReturn(bindings);when(configuration.intents()).thenReturn(intents);
@@ -42,7 +43,7 @@ class PipelineRecoveryInspectorTest {
         ConnectorProvisioner connectors=id -> new ConnectorRef(List.of(),"fixture.Connector","2.0.8",null,null,hashes.get(id),false);
         inspector=new PipelineRecoveryInspector(configuration,store,connectors,(id,hash) -> {
             assertThat(hash).isEqualTo(hashes.get(id));return new ConnectorCapabilities(functions.get(id));
-        },(item,hash) -> {probes++;return actualModel==null?store.schemas().get(item.id()).orElseThrow().model():actualModel;},() -> {});
+        },(item,hash) -> {probes++;probedSources.add(item);return actualModel==null?store.schemas().get(item.id()).orElseThrow().model():actualModel;},() -> {});
     }
     private PipelineResource pipeline(OnFullLoad policy,ReadMode mode) {
         return new PipelineResource("flow",null,List.of(SourceRef.spec("src",true)),null,null,
@@ -128,6 +129,35 @@ class PipelineRecoveryInspectorTest {
                 failure -> assertThat(failure.code()).isEqualTo(ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED));
         assertThat(store.schemas().get("src")).contains(cached);verifyNoInteractionsExceptReads();
     }
+    @Test void recoveryUsesLocalSettingsButBindsChecksToAuthoredArtifacts() {
+        var original = pipeline(OnFullLoad.CLEAR, null);
+        var pipeline = new PipelineResource(original.id(), original.metadata(),
+                List.of(new SourceRef.Spec("src", true, Map.of("preImage", false))),
+                original.transforms(), original.view(), original.serve(), original.settings(), original.experimental());
+        store.artifacts().save(pipeline);
+        var source = (SourceResource) store.artifacts().get("src").orElseThrow();
+        var effective = PipelineSourceConfig.settings(pipeline, source);
+        var captures = configuration.capturePreparations();
+        when(captures.inspectSharedOrigin(any(), eq("src"), eq(CanonicalHash.of(source)),
+                eq("flow"), eq(CanonicalHash.of(pipeline))))
+                .thenReturn(Optional.of(ConnectorNoteOrigin.capture("mysql", hashes.get("mysql"), effective)));
+        stopped();
+        var result = inspector.inspect(AUTH, SELECT);
+        assertThat(probedSources).singleElement().satisfies(probed ->
+                assertThat(probed.config()).containsEntry("preImage", false).containsEntry("host", "source.invalid"));
+        assertThat(result.privateContexts().get("pdk.state.flow.capture.src").config()).isEqualTo(effective);
+        assertThat(result.inputs().sourceHashes()).containsEntry("src", CanonicalHash.of(source));
+        assertThat(result.inputs().pipelineHash()).isEqualTo(CanonicalHash.of(pipeline));
+        assertThat(source.config()).doesNotContainKey("preImage");
+        verify(captures).inspectSharedOrigin(any(), eq("src"), eq(CanonicalHash.of(source)),
+                eq("flow"), eq(CanonicalHash.of(pipeline)));
+        when(captures.inspectSharedOrigin(any(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(Optional.of(ConnectorNoteOrigin.capture("mysql", hashes.get("mysql"), source.config())));
+        assertThatThrownBy(() -> inspector.inspect(AUTH, SELECT)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_ORIGIN_MISMATCH));
+        verifyNoInteractionsExceptReads();
+    }
+
     private void verifyNoInteractionsExceptReads() {
         verify(preparations,never()).issueFirstCreate(any(),any());verify(preparations,never()).complete(any());
         verify(intents,never()).compareAndSet(any(),anyLong(),any());

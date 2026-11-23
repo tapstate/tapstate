@@ -137,7 +137,8 @@ final class AuthService {
     }
 
     private static String safeLoginCode(String code) {
-        return "control.auth-failed".equals(code) ? code : "unknown";
+        return io.tapstate.core.common.RequestErrorDefinitions.AUTH_FAILED.code().equals(code)
+                || "control.auth-failed".equals(code) ? code : "unknown";
     }
 
     record ActiveSession(URI seed, String accessToken, AuthSessionRecord record) {

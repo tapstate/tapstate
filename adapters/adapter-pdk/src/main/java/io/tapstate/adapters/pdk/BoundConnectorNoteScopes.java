@@ -14,6 +14,7 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
     private final boolean batchSharedStartup;
     private final String logicalPrimary;
     private final String physicalPrimary;
+    private final long logStateGeneration;
 
     BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active) {
         this(store, opener, active, false);
@@ -21,14 +22,20 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
 
     BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active,
             boolean batchSharedStartup) {
-        this(store, opener, active, batchSharedStartup, null, null);
+            this(store, opener, active, batchSharedStartup, 0);
     }
 
     BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active,
-            boolean batchSharedStartup, String logicalPrimary, String physicalPrimary) {
-        this.batchSharedStartup = batchSharedStartup;
-        this.logicalPrimary = logicalPrimary;
-        this.physicalPrimary = physicalPrimary;
+                boolean batchSharedStartup, long logStateGeneration) {
+            this(store, opener, active, batchSharedStartup, null, null, logStateGeneration);
+    }
+
+    BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active,
+                boolean batchSharedStartup, String logicalPrimary, String physicalPrimary, long logStateGeneration) {
+            this.batchSharedStartup = batchSharedStartup;
+            this.logicalPrimary = logicalPrimary;
+            this.physicalPrimary = physicalPrimary;
+            this.logStateGeneration = logStateGeneration;
         this.originalStore = Objects.requireNonNull(store, "store");
         this.opener = Objects.requireNonNull(opener, "opener");
         this.active = Objects.requireNonNull(active, "active");
@@ -36,6 +43,7 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
     }
 
     @Override public boolean batchSharedStartup() { return batchSharedStartup; }
+    @Override public long logStateGeneration() { return logStateGeneration; }
     @Override public RequiredNoteStore store() { return guardedStore; }
     @Override public void requireActive() { active.run(); }
     @Override public RequiredNoteScope open(String namespace) {
@@ -51,7 +59,7 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
         Objects.requireNonNull(additionalGuard, "additionalGuard");
         return new BoundConnectorNoteScopes(originalStore, opener, () -> {
             active.run(); additionalGuard.run();
-        }, batchSharedStartup, logicalPrimary, physicalPrimary);
+        }, batchSharedStartup, logicalPrimary, physicalPrimary, logStateGeneration);
     }
 
     /** A release must retain the exact primary scope captured with its connector origin. */
@@ -61,10 +69,11 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
         if (scopes instanceof BoundConnectorNoteScopes bound) {
             return new BoundConnectorNoteScopes(bound.originalStore,
                     requested -> namespace.equals(requested) ? original : bound.opener.apply(requested), bound.active,
-                    false, bound.logicalPrimary, bound.physicalPrimary);
+                    false, bound.logicalPrimary, bound.physicalPrimary, bound.logStateGeneration);
         }
         // A custom provider owns its own checks; preserve its public contract when it cannot be unwrapped.
-        return ConnectorNoteScopes.of(scopes.store(),
-                requested -> namespace.equals(requested) ? original : scopes.open(requested), scopes::requireActive);
+        return ConnectorNoteScopes.forCapture(scopes.store(),
+                requested -> namespace.equals(requested) ? original : scopes.open(requested), scopes::requireActive,
+                false, scopes.logStateGeneration());
     }
 }

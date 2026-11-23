@@ -137,7 +137,7 @@ class MongoPipelineObservationReadTest {
         }
         when(fixture.aggregate.first()).thenReturn(root);
         var tables = changed.equals("tables") ? Set.of("other") : Set.of("orders");
-        var source = new MongoCacheDomain.ObservationSource(changed.equals("epoch") ? 1 : 0, tables);
+        var source = new MongoCacheDomain.ObservationSource("input", changed.equals("epoch") ? 1 : 0, tables);
         var result = fixture.reader.read(Map.of(RUN, source));
         if (changed.equals("current")) {
             assertThat(result).isPresent();
@@ -154,7 +154,7 @@ class MongoPipelineObservationReadTest {
     }
 
     private static MongoCacheDomain.ObservationSource source(Set<String> tables) {
-        return new MongoCacheDomain.ObservationSource(1, tables);
+        return new MongoCacheDomain.ObservationSource("input", 1, tables);
     }
 
     private static Document root() {

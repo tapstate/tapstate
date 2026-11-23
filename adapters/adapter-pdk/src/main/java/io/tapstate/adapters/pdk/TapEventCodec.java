@@ -560,16 +560,21 @@ public final class TapEventCodec {
     }
 
     static TapEvent encode(Envelope env, PdkValueConversions conversions, Map<String, TapField> targetFields) {
+        return encode(env, conversions, targetFields, targetFields);
+    }
+
+    static TapEvent encode(Envelope env, PdkValueConversions conversions, Map<String, TapField> beforeFields,
+            Map<String, TapField> afterFields) {
         return switch (env.op()) {
             case INSERT, READ -> TapInsertRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), conversions, targetFields))
+                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), conversions, afterFields))
                     .removedFields(dropped(env));
             case UPDATE -> TapUpdateRecordEvent.create()
                     .table(env.src()).referenceTime(env.ts())
-                    .before(mutable(env.before(), conversions, targetFields)).after(mutable(env.after(), conversions, targetFields))
+                    .before(mutable(env.before(), conversions, beforeFields)).after(mutable(env.after(), conversions, afterFields))
                     .removedFields(dropped(env));
             case DELETE -> TapDeleteRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), conversions, targetFields));
+                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), conversions, beforeFields));
             case DDL -> encodeDdl(env);
         };
     }

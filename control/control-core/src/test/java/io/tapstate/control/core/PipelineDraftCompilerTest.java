@@ -9,6 +9,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TableRename;
 import io.tapstate.core.model.TransformBody;
@@ -58,6 +59,52 @@ class PipelineDraftCompilerTest {
                 List.of(new io.tapstate.core.model.SyncElement(
                         "atlas_customer_orders", "atlas", io.tapstate.core.model.WriteMode.UPSERT,
                         new RenameSpec(Map.of("orders", "customer_orders"), null, null, null), null)), null, null));
+    }
+
+    @Test
+    void compilesIndependentOverridesForWizardTablesOfTheSameSource() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft configured = new PipelineDraft(template.pipelineId(), template.schemaVersion(),
+                template.revision(), template.mode(), template.name(), template.description(), null,
+                new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(), wizard.output(),
+                        Map.of("orders", Map.of("preImage", true), "policy", Map.of("preImage", false))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(configured);
+
+        assertThat(compiled.sourceIds()).containsExactly("crm", "crm", "crm");
+        assertThat(compiled.sourceBindings()).doesNotHaveDuplicates();
+        var root = compiled.sources().get(0);
+        var policy = compiled.sources().get(1);
+        assertThat(root.nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", true));
+        assertThat(policy.nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", false));
+        assertThat(compiled.sources().get(2).nodeConfig()).isEmpty();
+        var nest = compiled.transforms().stream().filter(step -> step.id().endsWith("__nest")).findFirst().orElseThrow();
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("orders", FromRef.literal(root.binding() + ".orders"));
+        var policyStep = compiled.transforms().stream().filter(step -> step.id().equals("policy__pre")).findFirst().orElseThrow();
+        assertThat(policyStep.from()).isEqualTo(FromClause.list(FromRef.literal(policy.binding() + ".policies")));
+    }
+
+    @Test
+    void reportsAnUnselectedRelatedSourceAtValidationAndPublication() {
+        var template = wizardDraft();
+        var wizard = template.wizard();
+        var relation = wizard.related().getFirst();
+        var missingSource = new PipelineDraft.Related(relation.id(), relation.parentId(), null,
+                relation.table(), relation.relation(), relation.preTransforms());
+        var incomplete = new PipelineDraft(template.pipelineId(), template.schemaVersion(),
+                template.revision(), template.mode(), template.name(), template.description(), null,
+                new PipelineDraft.Wizard(wizard.root(), List.of(missingSource), wizard.transforms(), wizard.output()),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        assertThatThrownBy(() -> compiler.compileCandidate(incomplete))
+                .isInstanceOf(IllegalArgumentException.class).hasMessage("wizard field must be non-blank: related source");
+        assertThatThrownBy(() -> compiler.compile(incomplete))
+                .isInstanceOf(IllegalArgumentException.class).hasMessage("wizard field must be non-blank: related source");
     }
 
     @Test
@@ -403,6 +450,29 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void scopesGraphSelectorsToSeparatelyConfiguredSameSourceNodes() {
+        var graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("input-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("input-items", "source", "crm", "/items_.*/", Map.of(), Map.of()),
+                new PipelineDraft.Node("combined", "union", null, null,
+                        Map.of("from", List.of("orders", "/items_.*/")), Map.of())),
+                List.of(new PipelineDraft.Edge("root-edge", "input-orders", "combined"),
+                        new PipelineDraft.Edge("items-edge", "input-items", "combined")),
+                new PipelineDraft.Viewport(0, 0, 1),
+                Map.of("input-orders", Map.of("preImage", true), "input-items", Map.of("preImage", false)));
+
+        var pipeline = compiler.compile(dagDraft(graph));
+        var orders = pipeline.sources().get(0);
+        var items = pipeline.sources().get(1);
+        assertThat(orders.binding()).isNotEqualTo(items.binding());
+        assertThat(orders.nodeConfig()).containsEntry("preImage", true);
+        assertThat(items.nodeConfig()).containsEntry("preImage", false);
+        assertThat(((FromClause.Flow) pipeline.transforms().getFirst().from()).refs())
+                .containsExactly(FromRef.literal(orders.binding() + ".orders"),
+                        FromRef.regex(java.util.regex.Pattern.quote(items.binding()) + "\\.items_.*"));
+    }
+
+    @Test
     void compilesCanvasGraphIntoViewAndTargetPublication() {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
                 new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
@@ -415,7 +485,7 @@ class PipelineDraftCompilerTest {
                         new PipelineDraft.Edge("source-to-filter", "source-orders", "active-orders"),
                         new PipelineDraft.Edge("filter-to-view", "active-orders", "orders-view"),
                         new PipelineDraft.Edge("filter-to-target", "active-orders", "warehouse-orders")),
-                new PipelineDraft.Viewport(0, 0, 1));
+                new PipelineDraft.Viewport(0, 0, 1), Map.of("source-orders", Map.of("preImage", false)));
         PipelineDraft draft = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG,
                 "Orders", "", graph, null, null, null, null,
                 java.time.Instant.parse("2026-09-21T00:00:00Z"),
@@ -424,6 +494,7 @@ class PipelineDraftCompilerTest {
         PipelineResource compiled = compiler.compile(draft);
 
         assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm");
+        assertThat(compiled.sources().getFirst().nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", false));
         assertThat(compiled.transforms()).extracting(Step::id).containsExactly("active-orders");
         assertThat(compiled.view()).isEqualTo(new ViewBlock.Inline(
                 "orders_view", io.tapstate.core.model.FromRef.literal("active-orders"), null, null));
@@ -711,13 +782,14 @@ class PipelineDraftCompilerTest {
         assertThat(map.experimental()).containsEntry("field-mode", "permissive");
     }
 
-    @Test
-    void targetRenameAfterANestUsesTheConfiguredRootTable() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void targetRenameAfterANestUsesTheConfiguredRootTable(boolean reopened) {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
-                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of("sourceAlias", "input_orders")),
                 new PipelineDraft.Node("items", "source", "mysql", "order_items", Map.of(), Map.of()),
                 new PipelineDraft.Node("nest", "nest", null, null, Map.of(
-                        "from", Map.of("orders", "mysql.orders", "items", "mysql.order_items"),
+                        "from", Map.of("orders", reopened ? "input_orders.orders" : "mysql.orders", "items", "mysql.order_items"),
                         "root", Map.of("from", "orders", "key", List.of("id"), "embed", List.of())),
                         Map.of("stepId", "assembled")),
                 new PipelineDraft.Node("target", "target", "mongo", "orders_archive", Map.of(), Map.of())),
@@ -732,13 +804,14 @@ class PipelineDraftCompilerTest {
                 .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
     }
 
-    @Test
-    void targetRenameAfterAJoinUsesTheSqlFactTable() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void targetRenameAfterAJoinUsesTheSqlFactTable(boolean reopened) {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
-                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of("sourceAlias", "input_orders")),
                 new PipelineDraft.Node("customers", "source", "mysql", "customers", Map.of(), Map.of()),
                 new PipelineDraft.Node("join", "join", null, null, Map.of(
-                        "from", Map.of("o", "mysql.orders", "c", "mysql.customers"),
+                        "from", Map.of("o", reopened ? "input_orders.orders" : "mysql.orders", "c", "mysql.customers"),
                         "engine", "builtin",
                         "sql", "SELECT o.id FROM o LEFT JOIN c ON o.customer_id = c.id"),
                         Map.of("stepId", "joined-orders")),
@@ -752,6 +825,22 @@ class PipelineDraftCompilerTest {
 
         assertThat(serve.sync().getFirst().rename())
                 .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void acceptsAnExplicitBindingEqualToThePhysicalSourceIdAfterAReplacement() {
+        var graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "input_orders", "orders", Map.of(),
+                        Map.of("sourceAlias", "input_orders")),
+                new PipelineDraft.Node("view", "view", null, null, Map.of("primaryKey", "id"), Map.of())),
+                List.of(new PipelineDraft.Edge("input-view", "source", "view")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        var compiled = compiler.compile(dagDraft(graph));
+
+        assertThat(compiled.sources())
+                .containsExactly(SourceRef.of("input_orders", null, Map.of(), "input_orders"));
+        assertThat(((ViewBlock.Inline) compiled.view()).from()).isEqualTo(FromRef.literal("input_orders.orders"));
     }
 
     @Test

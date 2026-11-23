@@ -73,10 +73,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     private CapturePort observedPort(SourceBindingSnapshot identity,ConfiguredCaptureRun notes,CaptureConfig config,
             String domain,Runnable guard,Runnable local,io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer snapshot,
-            io.tapstate.adapters.pdk.PdkCapturePort.StreamPreparer stream){
+            io.tapstate.adapters.pdk.PdkCapturePort.StreamPreparer stream,
+            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure){
         CapturePort port=ports.open(notes,config,guard,snapshot,stream);
-        return identity!=null&&port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk
-                ?pdk.withOperationObserver(operations.open(identity,domain,guard,local)):port;
+        if (port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk) {
+            pdk.withOpeningFailure(openingFailure);
+            if (identity != null) pdk.withOperationObserver(operations.open(identity,domain,guard,local));
+        }
+        return port;
     }
     private final Map<ExecutionFence,Session> sessions=new LinkedHashMap<>();
     // Retiring a run can check its capture while holding a CACHE transaction, without waiting on maintenance.
@@ -162,28 +166,29 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var source = StoredArtifacts.requireSource(artifacts, reference.id());
         if (!source.connector().equals("mongodb")) return result;
         var selected =
-                SourceCaptureResolution.forPipeline(pipeline, source, discovered.model(source));
+                SourceCaptureResolution.forPipeline(pipeline, reference, source, discovered.model(source));
         if (selected.isEmpty()) return result;
         var scope = pass.scope();
         var canonical = selected.orElseThrow().chainId().value();
         var held = connectorExecutions == null ? null : connectorExecutions.effective(scope,
-                () -> pass.requirePipeline(scope.pipelineId())).binding(source.id(), PipelineNode.Purpose.CAPTURE);
+                () -> pass.requirePipeline(scope.pipelineId())).binding(reference.binding(), PipelineNode.Purpose.CAPTURE);
         var prepared = stores.configuration().read(stores.scope(),
                 held == null ? SourceCaptureIdentity.sharedCapture(canonical) : held.captureId());
         if (prepared.isEmpty()) return result;
         var original = prepared.orElseThrow();
-        requirePlanningPreparation(original, canonical, source);
+        requirePlanningPreparation(original, canonical, io.tapstate.core.model.PipelineSourceConfig.effective(reference, source));
         var notes = stores.notes().guardedBy(() -> { active(); pass.requirePipeline(scope.pipelineId()); });
         var token = notes.open(PipelineConnectorExecutions.chainOwner(scope, original.canonicalChainId()));
-        var origin = held == null ? stores.configuration().inspectSharedOrigin(stores.scope(), source.id(),
-                io.tapstate.core.model.canonical.CanonicalHash.of(source))
+        var origin = held == null ? stores.configuration().inspectSharedOrigin(stores.scope(), reference.binding(),
+                io.tapstate.core.model.canonical.CanonicalHash.of(source), pipeline.id(),
+                io.tapstate.core.model.canonical.CanonicalHash.of(StoredArtifacts.requirePipeline(artifacts, pipeline.id())))
                 .orElseThrow(() -> new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null)) : notes.origin(token);
         if (held != null && !held.sha256().equals(origin.artifactHash())) throw refused();
         var artifact = connectors.resolveRetained(notes, token, origin);
         if (!origin.artifactHash().equals(artifact.contentHash())
                 || !origin.equals(
                         io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture(
-                                source.connector(), origin.artifactHash(), source.config())))
+                                source.connector(), origin.artifactHash(), io.tapstate.core.model.PipelineSourceConfig.settings(reference, source))))
             throw refused();
         if (io.tapstate.adapters.pdk.PdkSourceModelComparison.forVerifiedArtifact(
                         source.connector(), artifact)
@@ -198,7 +203,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                 });
         var context =
                 new SrsConsumerContext(
-                        new SrsConsumerKey(original.chainId(), scope.pipelineId(), source.id()),
+                        new SrsConsumerKey(original.chainId(), scope.pipelineId(), reference.binding()),
                         scope.stateGeneration());
         var membership = srs.consumers().find(context.key());
         if (membership.isEmpty()
@@ -211,7 +216,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if (progress.membershipRevision() != membership.orElseThrow().revision()) throw refused();
         if (progress.snapshot() == null) return result;
         return result.withRetainedTables(
-                source, retainedTables(srs, progress.snapshot(), original, scope));
+                reference.binding(), source, retainedTables(srs, progress.snapshot(), original, scope));
     }
 
     private void requirePlanningPreparation(
@@ -313,6 +318,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         private final PipelineIntentScope commandScope;
         private final WorkloadClaimFence command;
         private final ExecutionFence original;
+        private final AtomicReference<io.tapstate.core.common.FailureFact> openingFailure = new AtomicReference<>();
         Run(PipelineIntentScope commandScope,WorkloadClaimFence command,ExecutionFence original) {
             this.commandScope=commandScope; this.command=command; this.original=original;
         }
@@ -320,7 +326,13 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         @Override public void startCapture(String pipeline,ArtifactStore captured,SourceModelSnapshot models) {
             requireId(pipeline);
             if (!original.scope().equals(commandScope) || !claim(original).equals(command)) throw refused();
+            openingFailure.set(null);
             start(this,captured,models);
+        }
+        @Override public io.tapstate.core.common.FailureFact openingFailureFact(String pipeline, Throwable failure) {
+            requireId(pipeline);
+            var fact = openingFailure.getAndSet(null);
+            return fact != null && fact.cause() == failure ? fact : new io.tapstate.core.common.FailureFact(failure);
         }
         @Override public void stopCapture(String pipeline,boolean purge) {
             requireId(pipeline);
@@ -333,13 +345,16 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
         @Override public boolean isCapturing(String pipeline) { requireId(pipeline); synchronized(ScopedPipelineCaptureCoordinator.this) { return sessions.containsKey(original); } }
         @Override public Optional<Throwable> captureFailure(String pipeline) {
+            return captureFailureFact(pipeline).map(io.tapstate.core.common.FailureFact::cause);
+        }
+        @Override public Optional<io.tapstate.core.common.FailureFact> captureFailureFact(String pipeline) {
             requireId(pipeline); synchronized(ScopedPipelineCaptureCoordinator.this) {
                 var held=sessions.get(original); if(held==null)return Optional.empty();
                 if(held.failure.get()!=null)return Optional.of(held.failure.get());
                 for(var source:held.sources.values())if(source.owner!=null && source.owner.physical!=null) {
-                    var failure=source.owner.physical.tail.health().failure();if(failure.isPresent())return failure;
+                    var failure=source.owner.physical.tail.health().failureFact();if(failure.isPresent())return failure;
                 }
-                return held.sources.values().stream().filter(source -> source.run!=null).map(source -> source.run.failure()).flatMap(Optional::stream).findFirst();
+                return held.sources.values().stream().filter(source -> source.run!=null).map(source -> source.run.health().failureFact()).flatMap(Optional::stream).findFirst();
             }
         }
         @Override public boolean loadDelivered(String pipeline) { requireId(pipeline); var held=current(); if(held==null || !held.snapshot || held.sources.isEmpty())return true;
@@ -414,7 +429,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 pipeline.settings() == null || pipeline.settings().readMode() == null
                         ? ReadMode.SNAPSHOT_AND_CDC
                         : pipeline.settings().readMode();
-        var session = new Session(run.original, inputs, execution.clock().instant(), mode);
+        var session = new Session(run.original, inputs, execution.clock().instant(), mode, run.openingFailure);
         if (connectorExecutions != null)
             session.selection = connectorExecutions.selection(run.original.scope(), () -> requirePipeline(run.original));
         sessions.put(run.original, session);
@@ -441,37 +456,32 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             Map<String, SourceResource> sourceDefinitions,
             SourceModelSnapshot models,
             WorkloadClaimFence node) {
-        for (var definition : sourceDefinitions.values()) {
-            prepareSource(session, pipeline, definition, models, node);
+        for (String binding : pipeline.sourceBindings()) {
+            var reference = pipeline.sourceReference(binding);
+            prepareSource(session, pipeline, reference, sourceDefinitions.get(reference.id()), models, node);
         }
     }
 
     private void prepareSource(
             Session session,
             PipelineResource pipeline,
+            SourceRef reference,
             SourceResource definition,
             SourceModelSnapshot models,
             WorkloadClaimFence node) {
-        var frozenModel = models.model(definition);
-        var selected = SourceCaptureResolution.forPipeline(pipeline, definition, frozenModel);
+        var frozenModel = models.modelForBinding(reference.binding(), definition);
+        var selected = SourceCaptureResolution.forPipeline(pipeline, reference, definition, frozenModel);
         if (selected.isEmpty()) return;
-        boolean shared =
-                !session.bounded
-                        && pipeline.sources().stream()
-                                .anyMatch(
-                                        ref ->
-                                                ref.id().equals(definition.id())
-                                                        && ref instanceof SourceRef.Spec spec
-                                                        && spec.srs().booleanValue());
-        var binding = session.selection.binding(definition.id(), PipelineNode.Purpose.CAPTURE);
+        boolean shared = !session.bounded && reference instanceof SourceRef.Spec spec && Boolean.TRUE.equals(spec.srs());
+        var binding = session.selection.binding(reference.binding(), PipelineNode.Purpose.CAPTURE);
         if (binding == null && shared && connectorExecutions != null && stores.recoveryPinned().test(session.original.scope())) {
             var selectedSource = selected.orElseThrow();
             binding = connectorExecutions.recoveryBinding(session.original.scope(),
-                    new PipelineConnectorExecutions.Node(definition.id(), PipelineNode.Purpose.CAPTURE,
-                            definition.connector(), definition.config(), selectedSource.chainId().value()),
-                    session.inputs.sourceHashes().get(definition.id()), () -> requireSession(session));
+                    new PipelineConnectorExecutions.Node(reference.binding(), PipelineNode.Purpose.CAPTURE,
+                            definition.connector(), io.tapstate.core.model.PipelineSourceConfig.settings(reference, definition), selectedSource.chainId().value()),
+                    session.inputs.sourceHashes().get(reference.binding()), session.inputs.pipelineHash(), () -> requireSession(session));
         }
-        var previous = session.selection.previous(definition.id(), PipelineNode.Purpose.CAPTURE);
+        var previous = session.selection.previous(reference.binding(), PipelineNode.Purpose.CAPTURE);
         var opportunity = binding == null || binding.captureId() == null ? null
                 : stores.configuration().read(stores.scope(), binding.captureId()).orElse(null);
         boolean switching = previous != null && shared && !binding.chainId().equals(previous.chainId());
@@ -480,7 +490,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 : new CapturePreparationRequest.SharedArtifact(binding.sha256(),
                         switching ? session.selection.intentRevision() : null);
         var request = new CapturePreparationRequest(session.original.scope(), claim(session.original),
-                node, definition.id(), session.inputs, artifact);
+                node, reference.binding(), session.inputs, artifact);
         var issued = opportunity == null || switching ? stores.configuration().issueFirstCreate(request)
                 : new CaptureCreationResult.AlreadyIssued(opportunity);
         var fixed = issued instanceof CaptureCreationResult.Issued first
@@ -505,7 +515,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                         selected.orElseThrow().chainId().value(),
                                         prepared.preparation().chainId())
                         : selected.orElseThrow();
-        var source = new Source(definition.id(), resolution, shared, frozenModel);
+        var source = new Source(reference.binding(), resolution, shared, frozenModel, reference.id());
         source.canonicalChain = selected.orElseThrow().chainId().value();
         source.artifact = binding;
         source.previousArtifact = previous;
@@ -513,7 +523,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 || !binding.chainId().equals(prepared.preparation().chainId())))
             throw refused();
         session.sources.put(source.id, source);
-        source.identity=sourceIdentities.apply(source.id).filter(identity->identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
+        source.identity=sourceIdentities.apply(definition.id()).filter(identity->identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
         source.prepared = prepared.preparation();
         source.owner = owner(session, source, prepared);
         if (shared) {
@@ -529,7 +539,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private void attachSharedSource(Session session, Source source, boolean newHistory) {
         if (!newHistory) {
             var history = stores.configuration().inspectSharedHistory(
-                    source.prepared, source.id, session.inputs.sourceHashes().get(source.id));
+                    source.prepared, source.id, session.inputs.sourceHashes().get(source.id),
+                    session.original.pipelineId(), session.inputs.pipelineHash());
             if (!source.prepared.equals(history.preparation())) throw refused();
             source.positionEditsRestricted = history.positionEditsRestricted();
         }
@@ -894,10 +905,10 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
         try {
             if (stores.sources().supportsAdmittedCaptureStartup()) {
-                var opened = stores.sources().withCaptureStartup(stores.scope(), () -> ensureTail(source.owner, true));
+                var opened = stores.sources().withCaptureStartup(stores.scope(), () -> ensureTail(source.owner, true, session.openingFailure::set));
                 if (opened != null && session.snapshot && session.original.equals(opened.original()))
                     source.tailOpening = opened;
-            } else ensureTail(source.owner);
+            } else ensureTail(source.owner, false, session.openingFailure::set);
         } catch (SrsBaselineModelMismatch mismatch) {
             if (!session.snapshot
                     || retained.snapshot() != null
@@ -1049,7 +1060,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                             preparation -> {
                                 source.snapshotEpoch = preparation.request().snapshotEpoch();
                                 source.readTables = Set.copyOf(preparation.stillOwed());
-                                return observedPort(source.identity,notes,fixedConfig,source.prepared.captureId()+":snapshot:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),preparation::prepare,null);
+                                return observedPort(source.identity,notes,fixedConfig,source.prepared.captureId()+":snapshot:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),preparation::prepare,null,session.openingFailure::set);
                             },
                             output,
                             buffer.capacity(),
@@ -1057,7 +1068,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             source.direct = source.channels.load(source.direct.context());
             direct.put(source.id, DirectSourceRun.of(session.original, source.direct));
         } else {
-            var port = observedPort(source.identity,notes,config,source.prepared.captureId()+":direct:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),null,null);
+            var port = observedPort(source.identity,notes,config,source.prepared.captureId()+":direct:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),null,null,session.openingFailure::set);
             source.run =
                     session.bounded
                             ? runtime.beginSnapshotOnly(config, epoch, port, output, guard)
@@ -1149,7 +1160,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                 requireSnapshotModels(source, actual, comparison);
                                 preparation.prepare(request, seam, actual, comparison);
                             },
-                            null);
+                            null, session.openingFailure::set);
                 };
         if (source.freshFull == null)
             source.run =
@@ -1173,7 +1184,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                             session.began,
                             receipt -> {
                                 guard.run();
-                                startPreparedTail(source.owner, receipt.chain());
+                                startPreparedTail(source.owner, receipt.chain(), source.owner.configured, session.openingFailure::set);
                                 guard.run();
                                 logged.put(
                                         source.id,
@@ -1252,7 +1263,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     private static final class Source {
         Runnable guard;boolean sampled;SourceBindingSnapshot identity;
-        final String id; final SourceCaptureResolution selected;final boolean shared;boolean positionEditsRestricted; final Map<String,Long> rows=new ConcurrentHashMap<>();
+        final String id;
+        final String sourceId;
+        final SourceCaptureResolution selected;final boolean shared;boolean positionEditsRestricted; final Map<String,Long> rows=new ConcurrentHashMap<>();
         final Set<String> completed=ConcurrentHashMap.newKeySet();
         final Map<String,SourceTable> expectedModels;
         final Map<String,Long> estimates = new LinkedHashMap<>();
@@ -1261,8 +1274,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         String canonicalChain;
         ConnectorRunBindings.Binding artifact, previousArtifact;
         SrsConsumerProgress handoff;
-        Source(String id,SourceCaptureResolution selected,boolean shared,SourceModel frozen) {
-            this.id=id;this.selected=selected;this.shared=shared;
+        Source(String id,SourceCaptureResolution selected,boolean shared,SourceModel frozen,String sourceId) {
+            this.id=id;this.sourceId=sourceId;this.selected=selected;this.shared=shared;
             if(frozen==null)expectedModels=null;
             else {
                 var fixed=new LinkedHashMap<String,SourceTable>();
@@ -1289,12 +1302,13 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     private static final class Session {
         final ExecutionFence original; final PipelinePreparationInputs inputs; final Instant began; final ReadMode mode; final boolean bounded,snapshot;
-        final Map<String,Source> sources=new LinkedHashMap<>(); final AtomicBoolean ended=new AtomicBoolean(); final AtomicReference<Throwable> failure=new AtomicReference<>();
+        final Map<String,Source> sources=new LinkedHashMap<>(); final AtomicBoolean ended=new AtomicBoolean(); final AtomicReference<io.tapstate.core.common.FailureFact> failure=new AtomicReference<>();
         PipelineCaptureBindings bindings;
         PipelineConnectorExecutions.Selection selection = PipelineConnectorExecutions.Selection.EMPTY;
-        Session(ExecutionFence original,PipelinePreparationInputs inputs,Instant began,ReadMode mode) { this.original=original;this.inputs=inputs;this.began=began;this.mode=mode;this.bounded=mode==ReadMode.SNAPSHOT_ONLY;this.snapshot=mode!=ReadMode.CDC_ONLY; }
+        final AtomicReference<io.tapstate.core.common.FailureFact> openingFailure;
+        Session(ExecutionFence original,PipelinePreparationInputs inputs,Instant began,ReadMode mode,AtomicReference<io.tapstate.core.common.FailureFact> openingFailure) { this.openingFailure=openingFailure; this.original=original;this.inputs=inputs;this.began=began;this.mode=mode;this.bounded=mode==ReadMode.SNAPSHOT_ONLY;this.snapshot=mode!=ReadMode.CDC_ONLY; }
         String label(String source,String table) {
-            return sources.values().stream().filter(item -> item.selected.tables().contains(table)).count()>1?source+"."+table:table;
+            return PipelineTableSelection.label(source, table, sources.values().stream().map(item -> item.selected.tables()));
         }
     }
     record ObservationSelection(ExecutionFence execution, Map<SrsConsumerRun, io.tapstate.adapters.mongostore.MongoCacheDomain.ObservationSource> sources,
@@ -1310,7 +1324,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var preparations = new LinkedHashMap<String, CapturePreparation>();
         for (var source : held.sources.values()) {
             tables.put(source.consumer, new io.tapstate.adapters.mongostore.MongoCacheDomain.ObservationSource(
-                    source.snapshotEpoch, Set.copyOf(source.selected.tables())));
+                    source.sourceId, source.snapshotEpoch, Set.copyOf(source.selected.tables())));
             preparations.put(source.id, source.prepared);
         }
         return Optional.of(new ObservationSelection(original, Map.copyOf(tables), Map.copyOf(preparations)));
@@ -1343,7 +1357,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 if (rows == null && source.readTables.contains(table)) rows = 0L;
                 stages.put(label, new InitialLoad.Table(InitialLoad.Stage.LANDED, rows, source.estimates.get(table)));
                 var ack = cursor.sinkAckedByTable().get(table);
-                if (ack != null && ack.token() != null) positions.put(table, ack.token());
+                if (ack != null && ack.token() != null) positions.put(label, ack.token());
             }
         }
         if (!observationSessionCurrent(held)) return Optional.empty();
@@ -1482,10 +1496,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             return observed.consumers();
         }
     }
-    private void ensureTail(Owner owner) { ensureTail(owner, false); }
-
-    private ConfiguredCaptureRun ensureTail(Owner owner, boolean admitted) {
-        return ensureTail(owner, tailStores(owner), admitted, null);
+    private ConfiguredCaptureRun ensureTail(Owner owner, boolean admitted,
+            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
+        return ensureTail(owner, tailStores(owner), admitted, null, openingFailure);
     }
 
     private SrsStores tailStores(Owner owner) {
@@ -1496,7 +1509,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
 
     private ConfiguredCaptureRun ensureTail(Owner owner, SrsStores current, boolean admitted,
-            SrsConsumerStore.RetentionSnapshot snapshot) {
+            SrsConsumerStore.RetentionSnapshot snapshot,
+            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
         String chainId = owner.prepared.chainId();
         var consumers = current.consumers();
         var requested = new TreeSet<String>();
@@ -1553,24 +1567,25 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             opened = current.chains().load(chainId).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         }
         owner.configured = configured.retained();
-        startPreparedTail(owner, opened, configured);
+        startPreparedTail(owner, opened, configured, openingFailure);
         return configured.startupArtifact() == null ? null : configured;
     }
 
-    private void startPreparedTail(Owner owner, SrsChainState opened) {
-        startPreparedTail(owner, opened, owner.configured);
-    }
-
-    private void startPreparedTail(Owner owner, SrsChainState opened, ConfiguredCaptureRun opening) {
+    private void startPreparedTail(Owner owner, SrsChainState opened, ConfiguredCaptureRun opening,
+            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
         owner.require();if(owner.physical!=null || owner.configured==null || !opened.miningChainId().equals(owner.prepared.chainId()))throw refused();
-        var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes());
+        var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes(),owner.config.nodeConfig());
         var start=opened.resumeToken()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.resumeToken()));
         var physical=new Physical(owner);owner.physical=physical;var notes=owner.configured;
+        var captured = new AtomicReference<io.tapstate.core.common.FailureFact>();
         java.util.function.Function<io.tapstate.runtime.srs.SrsCaptureWriter, CapturePort> open = writer -> {
             CapturePort port=ports.open(opening,config,physical.guard,null,actual -> writer.prepare(actual,notes.modelComparison(config,stores.notes(),connectors,physical.guard)));
-            if(owner.identity!=null && port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk){
-                physical.reports=operations.open(owner.identity,owner.prepared.captureId()+":stream",physical::requireReport,physical::requireReportLocal);
-                return pdk.withOperationObserver(physical.reports);
+            if(port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk){
+                pdk.withOpeningFailure(captured::set);
+                if (owner.identity != null) {
+                    physical.reports=operations.open(owner.identity,owner.prepared.captureId()+":stream",physical::requireReport,physical::requireReportLocal);
+                    pdk.withOperationObserver(physical.reports);
+                }
             }
             return port;
         };
@@ -1579,8 +1594,13 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     ? runtime.startTail(stores.scope(), opened, owner.fence, config, start, open, physical.guard, owner.positionEditsRestricted)
                     : runtime.startTail(stores.scope(), opened, owner.fence, config, start, open, physical.guard, owner.positionEditsRestricted, true);
         } catch(RuntimeException|Error failure) {
+            var fact = captured.get();
+            if (fact != null && fact.cause() == failure) openingFailure.accept(fact);
             try {physical.close();owner.physical=null;}catch(RuntimeException|Error cleanup){if(cleanup!=failure)failure.addSuppressed(cleanup);}
             throw failure;
+        } finally {
+            // A shared physical tail must not retain a pipeline's opening receiver.
+            captured.set(null);
         }
     }
     private RingNotOpenYet awaiting(Source source) {
@@ -1635,14 +1655,15 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 }
                 continue;
             }
+            var openingFailure = new AtomicReference<io.tapstate.core.common.FailureFact>();
             try {
                 owner.require();
                 if(owner.drainingReports()){
                     if(needed(owner))continue;
                     owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);continue;
                 }
-                var failure=owner.physical==null?Optional.<Throwable>empty():owner.physical.tail.health().failure();
-                if (failure.isPresent() && duringHandoff(owner, failure.orElseThrow())) return;
+                var failure=owner.physical==null?Optional.<io.tapstate.core.common.FailureFact>empty():owner.physical.tail.health().failureFact();
+                if (failure.isPresent() && duringHandoff(owner, failure.orElseThrow().cause())) return;
                 if(failure.isPresent()){
                     for(var session:sessions.values())if(session.sources.values().stream().anyMatch(source->source.owner==owner))session.failure.compareAndSet(null,failure.orElseThrow());
                     owner.reportDrainStarted=reportClock.getAsLong();
@@ -1651,31 +1672,46 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     if(needed(owner))continue;
                     owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);continue;
                 }
-                maintainTail(owner);
+                maintainTail(owner, openingFailure::set);
             }
             catch(RuntimeException|Error failure) {
                 // The loss callback is waiting for this monitor to detach the old shared owner.
                 if (duringHandoff(owner, failure)) return;
-                for(var session:sessions.values())if(session.sources.values().stream().anyMatch(source -> source.owner==owner))session.failure.compareAndSet(null,failure);
+                var captured = openingFailure.get();
+                var fact = captured != null && captured.cause() == failure
+                        ? captured : new io.tapstate.core.common.FailureFact(failure);
+                for(var session:sessions.values())if(session.sources.values().stream().anyMatch(source -> source.owner==owner))session.failure.compareAndSet(null,fact);
                 owner.ended.set(true);try {owner.release();owners.remove(owner.prepared.captureId(),owner);}
                 catch(RuntimeException|Error ending){if(ending!=failure)failure.addSuppressed(ending);}
             }
         }
         for(var session:List.copyOf(sessions.values()))if(session.failure.get()==null && !session.ended.get())for(var source:session.sources.values())if(source.shared && (source.owner==null || source.owner.ended.get() && !source.owner.handingOff)) {
+            var openingFailure = new AtomicReference<io.tapstate.core.common.FailureFact>();
             try {
                 requireSession(session);
                 if(source.foreign!=null)try {execution.authorization().requireCapture(stores.scope(),source.foreign);continue;}catch(TapstateException expired) { /* Re-read this same prepared capture before any takeover. */ }
                 var prepared=stores.preparations().load(source.prepared);source.owner=owner(session,source,prepared);
-                if(source.owner!=null){source.owner.positionEditsRestricted|=source.positionEditsRestricted;source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id)).sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));ensureTail(source.owner);}
-            }catch(RuntimeException|Error failure){session.failure.compareAndSet(null,failure);}
+                if(source.owner!=null){source.owner.positionEditsRestricted|=source.positionEditsRestricted;source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id)).sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));ensureTail(source.owner, false, openingFailure::set);}
+            }catch(RuntimeException|Error failure){
+                var captured = openingFailure.get();
+                session.failure.compareAndSet(null, captured != null && captured.cause() == failure
+                        ? captured : new io.tapstate.core.common.FailureFact(failure));
+            }
         }
     }
-    private void maintainTail(Owner owner) {
+    private void maintainTail(Owner owner,
+            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
         var current = tailStores(owner);
         String chainId = owner.prepared.chainId();
-        var snapshot = current.consumers().retentionSnapshot(chainId).orElse(null);
+        SrsConsumerStore.RetentionSnapshot snapshot = null;
+        try {
+            snapshot = current.consumers().retentionSnapshot(chainId).orElse(null);
+        } catch (TapstateException unavailable) {
+            if (unavailable.code() != IoError.STORE_UNAVAILABLE) throw unavailable;
+            owner.require();
+        }
         var original = owner.physical;
-        ensureTail(owner, current, false, snapshot);
+        ensureTail(owner, current, false, snapshot, openingFailure);
         try {
             // An epoch change replaces the physical tail. Read retention floors again for the new epoch.
             if (snapshot != null && owner.physical == original)
@@ -1710,7 +1746,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
         for (var session : sessions.values()) for (var source : session.sources.values()) {
             if (source.owner == owner && !source.shared) {
-                session.failure.compareAndSet(null, refused());
+                session.failure.compareAndSet(null, new io.tapstate.core.common.FailureFact(refused()));
                 if (source.run != null) failure = cleanup(failure, () -> runtime.stopSnapshot(source.run));
             }
         }

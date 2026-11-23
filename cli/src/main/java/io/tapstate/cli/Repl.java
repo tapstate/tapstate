@@ -161,10 +161,14 @@ final class Repl {
      * The refusal a resume gets when the pipeline's definition was edited while it ran. Matched by code
      * rather than by message: the message is prose for a person, and this is a branch.
      */
-    private static final String INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
+    private static final String INCOMPATIBLE_REVISION =
+            io.tapstate.core.common.LifecycleErrorDefinitions.INCOMPATIBLE_REVISION.code();
+    private static final String LEGACY_INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
 
     private static final Set<String> BUSY_CODES =
-            Set.of("connector.instances-busy", "connector.instance-limit-reached");
+            Set.of("connector.instances-busy", "connector.instance-limit-reached",
+                    io.tapstate.core.common.ConnectorErrorDefinitions.INSTANCES_BUSY.code(),
+                    io.tapstate.core.common.ConnectorErrorDefinitions.INSTANCE_LIMIT_REACHED.code());
 
     /** The word that keeps everything, and the words that only say "do not ask me". */
     private static final String KEEP_STATE = "--keep-state";
@@ -326,7 +330,8 @@ final class Repl {
     /** Whether this verb can be routed to the control plane when a context resolves. */
     static boolean isOnlineVerb(String verb) {
         return ONLINE_VERBS.contains(verb) || Cli.LIVE_VIEW_VERBS.contains(verb)
-                || Cli.COMPOSITE_VERBS.contains(verb) || verb.equals("auth") || verb.equals("context");
+                || Cli.COMPOSITE_VERBS.contains(verb) || verb.equals(Cli.DATA_BROWSER_VERB)
+                || verb.equals("auth") || verb.equals("context");
     }
 
     /** The live-view verb this line opens with, or null when it opens with something else. */
@@ -1787,7 +1792,8 @@ final class Repl {
                 }
                 LifecycleOutcome resumed = drive("resume", id, null);
                 if (resumed instanceof LifecycleOutcome.Rejected rejected
-                        && INCOMPATIBLE_REVISION.equals(rejected.code())) {
+                        && (INCOMPATIBLE_REVISION.equals(rejected.code())
+                        || LEGACY_INCOMPATIBLE_REVISION.equals(rejected.code()))) {
                     // The one refusal worth more than its own text. Carrying on runs the pipeline as it
                     // was when it paused, and the definition has been edited since -- so the refusal is
                     // right, and "try again" is the one thing that will never work. What the caller
@@ -2239,7 +2245,7 @@ final class Repl {
                 }
                 case GetOutcome.Absent ignored -> {
                     if (format != OutputFormat.TEXT) {
-                        return renderDeleteErrorDocument(format, "artifact.not-found",
+                        return renderDeleteErrorDocument(format, io.tapstate.core.common.ArtifactErrorDefinitions.NOT_FOUND.code(),
                                 "no artifact with id '" + target + "' is stored");
                     }
                     err.println("not found: " + target);
@@ -2367,14 +2373,14 @@ final class Repl {
         int status = renderRejection(rejected.code(), rejected.message(), rejected.params());
         PrintWriter err = commandLine.getErr();
         switch (rejected.code()) {
-            case "artifact.in-use" -> {
+            case "TS0240004", "artifact.in-use" -> {
                 Object referrers = rejected.params().get("referrers");
                 if (referrers != null) {
                     err.println("  still referenced by: " + renderReferrers(referrers));
                     err.println("  remove those first, or keep this resource.");
                 }
             }
-            case "artifact.pipeline-not-stopped" -> {
+            case "TS0240005", "artifact.pipeline-not-stopped" -> {
                 Object actual = rejected.params().get("actual");
                 Object desired = rejected.params().get("desired");
                 if (actual != null || desired != null) {
@@ -2386,9 +2392,9 @@ final class Repl {
                             + "` and wait for it to settle.");
                 }
             }
-            case "artifact.version-conflict" ->
+            case "TS0240003", "artifact.version-conflict" ->
                     err.println("  it changed since you read it; read it again and redo the removal.");
-            case "artifact.reclaim-incomplete" -> {
+            case "TS0240006", "artifact.reclaim-incomplete" -> {
                 // Not a refusal: the resource is gone. Saying "retry" here — the next step every other
                 // branch implies — sends the operator at a removal that can now only answer not-found,
                 // and the residue that does need clearing goes unmentioned.
@@ -2882,7 +2888,8 @@ final class Repl {
             ConnectorRegisterOutcome outcome = withFailover(
                     () -> controlPlane.register(session.landingNode(), session.credential(), artifact),
                     o -> o instanceof ConnectorRegisterOutcome.Unreachable);
-            outcomes.add(new BatchEntry.Attempted(name, outcome));
+            outcomes.add(new BatchEntry.Attempted(name, outcome,
+                    outcome instanceof ConnectorRegisterOutcome.TimedOut ? hostPort(session.landingNode()) : null));
             if (outcome instanceof ConnectorRegisterOutcome.Unreachable) {
                 break;   // failover found no healthy member; the server is gone, so stop uploading the rest
             }
@@ -2900,7 +2907,7 @@ final class Repl {
     private sealed interface BatchEntry {
         String artifact();
 
-        record Attempted(String artifact, ConnectorRegisterOutcome outcome) implements BatchEntry {
+        record Attempted(String artifact, ConnectorRegisterOutcome outcome, String timeoutServer) implements BatchEntry {
         }
 
         record Unreadable(String artifact, String message) implements BatchEntry {
@@ -3061,7 +3068,8 @@ final class Repl {
                         row.put("newlyRegistered", connector.newlyRegistered());
                     }
                     case ConnectorRegisterOutcome.Rejected rejected -> row.put("error", errorObject(rejected.code(), rejected.message()));
-                    case ConnectorRegisterOutcome.TimedOut ignored -> row.put("error", errorObject("cli.request-timed-out", "the request timed out before the server answered"));
+                    case ConnectorRegisterOutcome.TimedOut ignored -> row.put("error", errorObject(CliError.REQUEST_TIMED_OUT.code(), MessageCatalog.bundled().render(
+                            CliError.REQUEST_TIMED_OUT, Map.of(SERVER_PARAM, attempted.timeoutServer())).message()));
                     case ConnectorRegisterOutcome.Unreachable ignored -> row.put("error", errorObject(null, "the server is unreachable"));
                 }
             }
@@ -3598,6 +3606,9 @@ final class Repl {
         if (!code.isEmpty() || !message.isEmpty()) {
             out.println(indent + (code + " " + message).strip());
         }
+        if (node.get("rawMessage") instanceof String raw && !raw.equals(message)) {
+            out.println(indent + raw);
+        }
         if (node.get("solution") instanceof String solution) {
             out.println(indent + solution);
         }
@@ -4051,8 +4062,9 @@ final class Repl {
 
     private int renderMalformedRequest(String reason) {
         Map<String, Object> args = Map.of(REASON_PARAM, reason);
-        String message = MessageCatalog.bundled().render("control.malformed-request", args).message();
-        return renderRejection("control.malformed-request", message, args);
+        String code = io.tapstate.core.common.RequestErrorDefinitions.MALFORMED_REQUEST.code();
+        String message = MessageCatalog.bundled().render(code, args).message();
+        return renderRejection(code, message, args);
     }
 
     private static void renderHistory(PrintWriter out, HistoryOutcome.Found history) {
@@ -4245,7 +4257,14 @@ final class Repl {
 
     /** One tailed line as {@code <iso-timestamp> <level> <message>}. */
     private static String renderLogLine(RemoteLogLine line) {
-        return Instant.ofEpochMilli(line.timestampMillis()) + "  " + line.level() + "  " + line.message();
+        String heading = Instant.ofEpochMilli(line.timestampMillis()) + "  " + line.level() + "  " + line.message();
+        if (line.diagnostic().isEmpty()) return heading;
+        var text = new java.io.StringWriter();
+        var out = new PrintWriter(text);
+        out.println(heading);
+        renderConnectionDiagnostic(out, line.diagnostic(), "  ");
+        out.flush();
+        return text.toString().stripTrailing();
     }
 
     /**
@@ -4285,16 +4304,19 @@ final class Repl {
             // again after a move is a re-poll, and a watcher who just saw the connection move is owed it.
             return streamAcrossMembers(frames, () -> controlPlane.watchStatus(
                     session.landingNode(), session.credential(), id,
-                    (pipelineId, state, failureCode, failureMessage) -> {
-                        frames.incrementAndGet();
-                        out.println(pipelineId + "  " + state.toLowerCase(Locale.ROOT));
-                        if (failureCode != null) {
-                            // Mirrors the one-shot `status` read: a failed state that cannot say what failed
-                            // sends the watcher hunting through logs instead of the frame that just reported it.
-                            // This frame arrived over an open stream, not a refusal, so it renders to stdout.
-                            renderStatusFailure(failureCode, failureMessage);
+                    new StatusStream() {
+                        @Override public void state(String pipelineId, String state, String failureCode, String failureMessage) {
+                            state(new StatusOutcome.Found(pipelineId, state, failureCode, failureMessage));
                         }
-                        out.flush();
+                        @Override public void state(StatusOutcome.Found found) {
+                            frames.incrementAndGet();
+                            out.println(found.pipelineId() + "  " + found.state().toLowerCase(Locale.ROOT));
+                            if (found.failureCode() != null) {
+                                renderStatusFailure(found.failureCode(), found.failureMessage());
+                                renderConnectionDiagnostic(out, found.diagnostic(), "  ");
+                            }
+                            out.flush();
+                        }
                     },
                     this::isStreamCancelled), code -> renderStreamRefusal(code, id));
         } finally {
@@ -4343,9 +4365,8 @@ final class Repl {
             }
             barren = frames.get() > before ? 0 : barren + 1;
             if (barren >= MAX_BARREN_ATTACHES) {
-                PrintWriter err = commandLine.getErr();
-                err.println("stopped: no cluster member is serving this stream");
-                err.flush();
+                printDiagnostic(commandLine.getErr(), CliError.STREAM_NO_FRAMES,
+                        Map.of("attempts", MAX_BARREN_ATTACHES));
                 return Cli.EXIT_DIAGNOSTIC;
             }
             if (!failover()) {
@@ -4768,13 +4789,13 @@ final class Repl {
      * is applied, because the server would refuse the same way later — after the sources were written.
      * Carried as the canonical code string, the way every server code reaches this ring.
      */
-    private static final String CONNECTOR_NOT_REGISTERED = "connector.not-registered";
+    private static final String CONNECTOR_NOT_REGISTERED = io.tapstate.core.common.ConnectorErrorDefinitions.NOT_REGISTERED.code();
     /**
      * The server's code for a connector that could not complete its connection test, carried as a
      * string for the same reason: it is the server's word, and a preflight that reports a check the
      * connector failed without a code of its own reports it under the code the server would have used.
      */
-    private static final String CONNECTOR_TEST_FAILED = "connector.test-failed";
+    private static final String CONNECTOR_TEST_FAILED = io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED.code();
 
     /** The pipeline state under which there is nothing left to start, as the server spells it. */
     private static final String RUNNING = "RUNNING";
@@ -4976,6 +4997,7 @@ final class Repl {
     private final class UpRun {
         private final Path workspace;
         private final OutputFormat format;
+        private final List<URI> originalSeeds;
         /** Whether this run made the connection, in which case the connect's probe was the reachability check. */
         private final boolean connectedHere;
         private List<UpDraft> drafts = List.of();
@@ -4994,6 +5016,7 @@ final class Repl {
         UpRun(Path workspace, OutputFormat format, boolean connectedHere, boolean yes) {
             this.workspace = workspace;
             this.format = format;
+            this.originalSeeds = List.copyOf(session.seeds());
             this.connectedHere = connectedHere;
             this.yes = yes;
         }
@@ -5033,8 +5056,8 @@ final class Repl {
                 return read;
             }
             if (!connectedHere && !landingAnswers()) {
-                return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()), CliError.CONNECT_FAILED,
-                        Map.of(SEEDS_PARAM, hostPort(session.landingNode())));
+                return failure(UpCmd.STAGE_PREFLIGHT, failureTarget(session.landingNode()), CliError.CONNECT_FAILED,
+                        Map.of(SEEDS_PARAM, failureTarget(session.landingNode())));
             }
             Set<String> local = sources().stream().map(UpDraft::id).collect(Collectors.toSet());
             for (UpDraft pipeline : pipelines()) {
@@ -5051,11 +5074,11 @@ final class Repl {
                         .filter(connector -> "registered".equals(connector.origin()))
                         .map(CatalogConnector::id).collect(Collectors.toSet());
                 case ConnectorListOutcome.Rejected rejected -> {
-                    return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()),
+                    return failure(UpCmd.STAGE_PREFLIGHT, failureTarget(session.landingNode()),
                             rejected.code(), rejected.message(), Map.of());
                 }
                 case ConnectorListOutcome.Unreachable ignored -> {
-                    return unreachable(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()));
+                    return unreachable(UpCmd.STAGE_PREFLIGHT, failureTarget(session.landingNode()));
                 }
             }
             for (UpDraft source : sources()) {
@@ -5120,7 +5143,7 @@ final class Repl {
                 }
                 case ConnectionTestOutcome.TimedOut ignored -> {
                     return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CliError.REQUEST_TIMED_OUT,
-                            Map.of(SERVER_PARAM, hostPort(session.landingNode())));
+                            Map.of(SERVER_PARAM, failureTarget(session.landingNode())));
                 }
                 case ConnectionTestOutcome.Unreachable ignored -> {
                     return unreachable(UpCmd.STAGE_PREFLIGHT, source.id());
@@ -5262,7 +5285,7 @@ final class Repl {
                     }
                     case ConnectionDiscoverSchemaOutcome.TimedOut ignored -> {
                         return failure(UpCmd.STAGE_DISCOVER, id, CliError.REQUEST_TIMED_OUT,
-                                Map.of(SERVER_PARAM, hostPort(session.landingNode())));
+                                Map.of(SERVER_PARAM, failureTarget(session.landingNode())));
                     }
                     case ConnectionDiscoverSchemaOutcome.Unreachable ignored -> {
                         return unreachable(UpCmd.STAGE_DISCOVER, id);
@@ -5290,15 +5313,19 @@ final class Repl {
                     continue;
                 }
                 String target;
+                URI attemptedEndpoint = session.landingNode();
                 StartFlow.Result result = flow.start(id, new StartFlow.Answering(yes, List.of(), format, true));
+                URI resultingEndpoint = session.landingNode();
                 switch (result.attempt()) {
                     case StartAttempt.Started started -> {
                         target = started.targetState();
                         if (started.checks() != null) {
                             startChecks.put(id, started.checks().raw());
-                            started.checks().findings().stream()
-                                    .filter(finding -> StartChecks.WARN.equals(finding.behavior()))
-                                    .forEach(finding -> note(id, "start check: " + finding.message()));
+                            for (var finding : started.checks().findings()) {
+                                if (StartChecks.WARN.equals(finding.behavior())) {
+                                    note(id, "start check: " + finding.message());
+                                }
+                            }
                         }
                     }
                     case StartAttempt.Stopped stopped -> {
@@ -5312,12 +5339,13 @@ final class Repl {
                     case StartAttempt.Rejected rejected -> {
                         return failure(UpCmd.STAGE_START, id, rejected.code(), rejected.message(), rejected.params());
                     }
-                    case StartAttempt.Unreachable unreachable when unreachable.sent() -> {
-                        return failure(UpCmd.STAGE_START, id, CliError.START_MAY_HAVE_GONE_AHEAD,
-                                Map.of("pipeline", id, "server", hostPort(session.landingNode())));
-                    }
-                    case StartAttempt.Unreachable ignored -> {
-                        return unreachable(UpCmd.STAGE_START, id);
+                    case StartAttempt.Unreachable unreachable -> {
+                        if (unreachable.sent()) {
+                            return failure(UpCmd.STAGE_START, id, CliError.START_MAY_HAVE_GONE_AHEAD,
+                                    Map.of("pipeline", id, "server", failureTarget(
+                                            resultingEndpoint == null ? attemptedEndpoint : resultingEndpoint)));
+                        }
+                        return unreachable(UpCmd.STAGE_START, id, resultingEndpoint);
                     }
                     case null -> {
                         return Cli.EXIT_DIAGNOSTIC;
@@ -5361,7 +5389,17 @@ final class Repl {
 
         /** A stage that could not reach the server, after failover had its say. */
         private int unreachable(String stage, String on) {
-            return failure(stage, on, CliError.CONNECT_FAILED, Map.of(SEEDS_PARAM, hostPort(session.landingNode())));
+            return unreachable(stage, on, session.landingNode());
+        }
+
+        private int unreachable(String stage, String on, URI attemptedEndpoint) {
+            return failure(stage, on, CliError.CONNECT_FAILED, Map.of(SEEDS_PARAM, failureTarget(attemptedEndpoint)));
+        }
+
+        /** A failed request may have cleared the live session before its diagnostic is rendered. */
+        private String failureTarget(URI attemptedEndpoint) {
+            return attemptedEndpoint != null ? hostPort(attemptedEndpoint)
+                    : originalSeeds.stream().map(Repl::hostPort).collect(Collectors.joining(", "));
         }
 
         /** A stage failed on a code raised on this side, rendered from the catalog. */
@@ -5663,8 +5701,24 @@ final class Repl {
         out.println(Ansi.AUTO.string("@|bold why:|@") + " " + answer.message());
         out.println("  kind       " + answer.kind());
         out.println("  freshness  " + answer.freshness().toLowerCase(Locale.ROOT));
-        answer.evidence().forEach(reading -> out.println("  read       "
-                + reading.source() + "." + reading.field() + " = " + evidenceValue(reading.value())));
+        answer.evidence().forEach(reading -> {
+            Object value = reading.value();
+            if ("failure".equals(reading.field()) && value instanceof Map<?, ?> failure
+                    && failure.containsKey("diagnostic")) {
+                Map<Object, Object> primary = new java.util.LinkedHashMap<>(failure);
+                primary.remove("diagnostic");
+                value = primary;
+            }
+            out.println("  read       " + reading.source() + "." + reading.field() + " = "
+                    + evidenceValue(value));
+            if ("failure".equals(reading.field()) && reading.value() instanceof Map<?, ?> failure) {
+                Map<String, Object> diagnostic = io.tapstate.core.common.RuntimeDiagnosticProjection.read(
+                        failure.get("diagnostic"));
+                if (!diagnostic.isEmpty()) {
+                    renderConnectionDiagnostic(out, diagnostic, "    ");
+                }
+            }
+        });
         if (answer.next() != null) {
             out.println("  next       " + answer.next().message() + " [" + answer.next().action() + "]");
         }
@@ -5904,16 +5958,14 @@ final class Repl {
         if (!session.isConnected()) {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
-        PrintWriter err = commandLine.getErr();
-        err.println("request failed: " + hostPort(requestTarget) + " is unreachable");
-        err.flush();
+        printDiagnostic(commandLine.getErr(), CliError.REQUEST_FAILED,
+                Map.of(SERVER_PARAM, hostPort(requestTarget)));
         return Cli.EXIT_DIAGNOSTIC;
     }
 
     /**
-     * Reports that a request reached the landing node but the server did not answer within the verb's
-     * timeout window — a distinct, coded outcome from {@link #reportRequestFailed()}, since the server is
-     * busy rather than gone and a heavy verb (a large register) may even have completed there already.
+     * Reports that no response arrived within the verb's timeout window. The deadline alone does not
+     * establish whether the server received or completed the operation.
      */
     private int reportRequestTimedOut() {
         if (!session.isConnected()) {
@@ -6030,7 +6082,7 @@ final class Repl {
      * {@code POST /auth/login}, and on success stores the returned bearer credential. Login requires an
      * established connection (authenticating is decoupled from connecting) and a username operand — both
      * absences are benign usage lines, not coded errors. A server refusal renders the server's coded
-     * message (a bad credential is {@code control.auth-failed}, revealing nothing about which half was
+     * message (a bad credential is {@code TS0210002}, revealing nothing about which half was
      * wrong); an unreachable landing node is a benign transient line. The member set for failover is the
      * seeds until membership discovery lands.
      */
@@ -6208,10 +6260,8 @@ final class Repl {
                 return true;
             }
         }
+        printDiagnostic(commandLine.getErr(), CliError.CONNECTION_LOST, Map.of());
         session.disconnect();
-        PrintWriter err = commandLine.getErr();
-        err.println("connection lost: no reachable cluster member");
-        err.flush();
         return false;
     }
 

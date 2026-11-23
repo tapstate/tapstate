@@ -50,7 +50,7 @@ public final class LoginService {
 
     /**
      * Verifies the credentials and returns a signed session token on success. Throws the shared
-     * {@code control.auth-failed} error — with no identifying argument — when the user is absent or
+     * {@code TS0210002} error — with no identifying argument — when the user is absent or
      * the password does not match.
      */
     public String login(String username, String password) {

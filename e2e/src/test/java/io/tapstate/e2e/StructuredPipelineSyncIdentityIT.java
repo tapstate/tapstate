@@ -84,7 +84,7 @@ class StructuredPipelineSyncIdentityIT {
                 assertThat(assertIdentity(control.sourceRequest("GET", path, null, null, 200),
                         id, identities.get(index))).isEqualTo(updatedEtag);
                 assertThat(json(control.sourceRequest("PUT", path, input, etag, 412).body()))
-                        .containsEntry("code", "pipeline.version-conflict");
+                        .containsEntry("code", "TS0230005");
 
                 Document key = new Document("_id", id);
                 Document stored = pipelines.find(key).first();
@@ -104,7 +104,7 @@ class StructuredPipelineSyncIdentityIT {
                         assertThat(pipelines.updateOne(key, new Document("$set", corruption)).getMatchedCount())
                                 .isEqualTo(1);
                         Map<String, Object> error = json(control.sourceRequest("GET", path, null, null, 500).body());
-                        assertThat(error).containsEntry("code", "io.document-unreadable");
+                        assertThat(error).containsEntry("code", "TS0480004");
                         assertThat(((Map<?, ?>) error.get("params")).get("field")).isEqualTo("body");
                     } finally {
                         pipelines.replaceOne(key, stored);
@@ -117,7 +117,7 @@ class StructuredPipelineSyncIdentityIT {
             Map<String, Object> collision = pipeline("sync_collision", List.of(
                     Map.of("source", "views"), Map.of("id", "sync_1", "source", "views")));
             assertThat(json(control.sourceRequest("POST", "/api/pipelines", collision, null, 400).body()))
-                    .containsEntry("code", "dsl.duplicate-id");
+                    .containsEntry("code", "TS0010012");
             control.sourceRequest("GET", "/api/pipelines/sync_collision", null, null, 404);
         }
     }

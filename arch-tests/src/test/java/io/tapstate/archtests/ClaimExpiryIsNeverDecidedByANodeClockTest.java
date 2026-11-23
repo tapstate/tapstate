@@ -82,7 +82,7 @@ class ClaimExpiryIsNeverDecidedByANodeClockTest {
         String ownership = "io.tapstate.app.PipelineActuationOwnership";
         String claim = "io.tapstate.spi.store.WorkloadClaim";
         var auditedReads = Map.of(
-                ownership + ".permit(java.lang.String, " + ownership + "$Held)", 3L,
+                ownership + ".permit(java.lang.String, " + ownership + "$Held, boolean)", 3L,
                 ownership + ".renewScoped(" + ownership + "$Held, long)", 4L,
                 ownership + ".advanceScopedProof(" + ownership + "$Held, " + claim + ")", 2L,
                 "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore.withLease(" + claim

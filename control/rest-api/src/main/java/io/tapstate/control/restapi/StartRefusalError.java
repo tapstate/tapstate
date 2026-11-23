@@ -5,7 +5,7 @@ import io.tapstate.control.core.StartCheckReport;
 import io.tapstate.control.core.StartOutcome;
 
 import java.util.List;
-import java.util.Map;
+import com.fasterxml.jackson.annotation.JsonUnwrapped;
 
 /**
  * The body of a start that did not go ahead: every field of a coded error, in the same places, and beside
@@ -15,6 +15,6 @@ import java.util.Map;
  * and a message that says by itself how to answer; a client that knows start checks reads the report.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-record StartRefusalError(String code, Map<String, Object> params, String message, StartCheckReport startChecks,
-        List<StartOutcome.Applied> decisionsApplied) {
+record StartRefusalError(@JsonUnwrapped ApiError error,
+        StartCheckReport startChecks, List<StartOutcome.Applied> decisionsApplied) {
 }

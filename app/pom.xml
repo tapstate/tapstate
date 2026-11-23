@@ -31,6 +31,7 @@
   <properties>
     <mainClass>io.tapstate.app.Bootstrap</mainClass>
     <tapstate.it.jvmArgs></tapstate.it.jvmArgs>
+    <aws.sdk.version>2.55.10</aws.sdk.version>
   </properties>
 
   <dependencyManagement>
@@ -42,10 +43,30 @@
         <type>pom</type>
         <scope>import</scope>
       </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${aws.sdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
     </dependencies>
   </dependencyManagement>
 
   <dependencies>
+    <dependency><groupId>software.amazon.awssdk</groupId><artifactId>auth</artifactId></dependency>
+    <dependency><groupId>software.amazon.awssdk</groupId><artifactId>http-auth-aws</artifactId></dependency>
+    <!-- Resolves workload credentials for the AWS web-identity provider. -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>sts</artifactId>
+      <scope>runtime</scope>
+      <exclusions>
+        <exclusion><groupId>software.amazon.awssdk</groupId><artifactId>apache5-client</artifactId></exclusion>
+        <exclusion><groupId>software.amazon.awssdk</groupId><artifactId>netty-nio-client</artifactId></exclusion>
+      </exclusions>
+    </dependency>
+    <dependency><groupId>software.amazon.awssdk</groupId><artifactId>url-connection-client</artifactId><scope>runtime</scope></dependency>
     <!-- The schedule parser stays in the assembly implementation behind the pure validation contract. -->
     <dependency>
       <groupId>com.cronutils</groupId>

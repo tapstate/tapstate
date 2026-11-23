@@ -138,6 +138,6 @@ class TheCapacityAPipelineWroteIsWhatItRunsOnTest {
         // rounded up by the time it is enforced. Reachable from an artifact now that an author can write
         // it, so the coded refusal has to survive the trip rather than be swallowed on the way.
         assertThatThrownBy(() -> settingsFor(pipelineOf(nestStep("doc", 10, null)), NestSettings.defaults()))
-                .hasMessageContaining("nest.memory-budget-below-partition-count");
+                .hasMessageContaining("TS0490015");
     }
 }

@@ -53,7 +53,7 @@ class DataBrowserCriteriaMatchTest {
         assertThatThrownBy(() -> match("price\\usd", DataBrowserCriteria.Operator.EQ, 1))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test

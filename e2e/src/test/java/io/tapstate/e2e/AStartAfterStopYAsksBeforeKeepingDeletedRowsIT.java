@@ -244,7 +244,7 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
         ControlPlane.StartAnswer asked = control.start(PIPELINE, List.of(), null);
 
         assertThat(asked.status()).as("the bare start, answered %s", asked.body()).isEqualTo(409);
-        assertThat(asked.body().get("code")).isEqualTo("lifecycle.start-needs-confirmation");
+        assertThat(asked.body().get("code")).isEqualTo("TS0280006");
         Map<String, Object> question = asked.findings().stream()
                 .filter(finding -> findingKey.equals(finding.get("key")))
                 .findFirst()

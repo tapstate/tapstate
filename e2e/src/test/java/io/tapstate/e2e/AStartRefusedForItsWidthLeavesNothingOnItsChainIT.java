@@ -65,7 +65,7 @@ class AStartRefusedForItsWidthLeavesNothingOnItsChainIT {
             Await.until("the start asking for more processors than any member runs to be refused",
                     Duration.ofMinutes(2), () -> control.failureCode(REFUSED).isPresent(),
                     () -> "refused=" + control.state(REFUSED) + ", logs=" + control.logs(REFUSED));
-            assertThat(control.failureCode(REFUSED)).contains("actuation.no-safe-parallelism");
+            assertThat(control.failureCode(REFUSED)).contains("TS0360028");
 
             for (int batch = 1; batch <= BATCHES; batch++) {
                 files.cdc(sourceAddress, TABLE, CdcOp.INSERT, BATCH_SIZE);

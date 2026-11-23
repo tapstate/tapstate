@@ -1,0 +1,152 @@
+{
+  "TS0490001": {
+    "message": "The embeds under {embedPath} join on different parent fields: {fields}.",
+    "solution": "Have every embed under one parent join on the same parent field; that field is the parent's identity."
+  },
+  "TS0490002": {
+    "message": "The embeds under {embedPath} join on {fields}, which does not identify its rows; its key is {parentKey}.",
+    "solution": "Join on the parent's key. If the row above is the one pointing at this table, name that table's own key on its side of on: - the direction is read from which side identifies a row, and neither side does here. Without that, a field that merely refers to another table makes every row sharing a value one identity."
+  },
+  "TS0490003": {
+    "message": "Embeds {embedPathA} and {embedPathB} both target the path {path}.",
+    "solution": "Give each embed a path of its own, or one silently overwrites the other in the document."
+  },
+  "TS0490004": {
+    "message": "Flat embeds under {parentPath} reuse alias {alias}, so their pathless state identity is the same.",
+    "solution": "Give each flat embed a distinct alias in the nest from map, even when two aliases read the same upstream stream."
+  },
+  "TS0490005": {
+    "message": "Flat embed {embedPath} contributes fields {fields}, already occupied by {occupiedBy}.",
+    "solution": "Rename or drop the conflicting child fields before the nest, or use an object or array embed with its own path. Flat fields never overwrite a parent or sibling field by declaration order."
+  },
+  "TS0490006": {
+    "message": "The nest rooted at {rootAlias} has no key: it declares none, and its stream offers neither a primary key nor a single unique index to take one from.",
+    "solution": "Declare root.key: it is the identity children are grouped under, and the assembled document has none without it. A root over a table that already declares one need not repeat it."
+  },
+  "TS0490007": {
+    "message": "Nothing identifies a row of {embedPath}: it declares no key, and table {table} has no primary key or unique index to take one from.",
+    "solution": "Declare key on that level, naming the columns that identify one of its rows. Without an identity, rows cannot be told apart and updates pile up as duplicates."
+  },
+  "TS0490008": {
+    "message": "Nothing settles what identifies a row of {embedPath}: it declares no key, and table {table} has no primary key but several unique indexes: {candidates}.",
+    "solution": "Declare key on that level to say which columns identify a row; choosing for you would settle it on whichever index the source reported first."
+  },
+  "TS0490009": {
+    "message": "{embedPath} is a row this document points at rather than one grouped under it, and it carries embeds of its own: {children}.",
+    "solution": "Move those embeds to a level the document holds, or join {table} the other way round so its rows hang under this document instead of being pointed at."
+  },
+  "TS0490010": {
+    "message": "This nest compiles to {vertices} resolver vertices, past the limit of {limit}.",
+    "solution": "Flatten the tree or split the pipeline: every vertex takes a thread of its own."
+  },
+  "TS0490011": {
+    "message": "This pipeline draws from {chains} chains, past the limit of {limit}.",
+    "solution": "Split the pipeline: each table it reads spends one of the axes a bound can travel on."
+  },
+  "TS0490012": {
+    "message": "Root {rootAlias} is append-only, and embed {embedPath} tracks structural key changes.",
+    "solution": "Use an upsert root, or turn key tracking off: moving a subtree holds emissions back until it lands, which append-only forbids."
+  },
+  "TS0490013": {
+    "message": "A nest writing {rootCollection} cannot pass its snapshot reads straight to the sink.",
+    "solution": "Let the nest assemble snapshot reads like any other change; passing them through writes unassembled rows."
+  },
+  "TS0490014": {
+    "message": "Flat embed {embedPath} matched {rows} live rows for one parent document.",
+    "solution": "Make the child-to-parent join one-to-one, reverse a many-to-one relationship so the parent points at one shared row, or use an array embed for a one-to-many relationship. Flat never chooses an arbitrary matching row."
+  },
+  "TS0490015": {
+    "message": "A nest was asked to hold {entries} entries in memory, spread across {partitions} partitions.",
+    "solution": "Ask for at least as many entries as there are partitions: the budget is spent per partition, so anything smaller is rounded up to one entry each and holds the partition count whatever it was set to."
+  },
+  "TS0490016": {
+    "message": "Nest state {namespace} is already configured to hold {configured} entries in memory on this process, and this pipeline asks for {requested}.",
+    "solution": "Restart the process to pick up the new budget: what a state map holds is settled the first time that map is configured and cannot be changed while the process runs, so restarting the pipeline alone would leave it on the earlier number."
+  },
+  "TS0490017": {
+    "message": "Nest state {namespace} is already routed to database {configured} on this process, and this pipeline asks for {requested}.",
+    "solution": "Stop every writer and restart the server before changing this nest's state database. Migrate operator state and dead letters first, or purge the pipeline state and run a full replay."
+  },
+  "TS0490018": {
+    "message": "Nest {stepId} stored its state under {recorded}, and now compiles to {compiled}.",
+    "solution": "Stop the pipeline and start it again rather than resuming: renaming an embed path or inserting a level leaves the stored state where nothing reads it, and the new paths start empty beside documents that are not."
+  },
+  "TS0490019": {
+    "message": "Document {rootKey} holds {elements} elements, past the per-document limit of {limit}.",
+    "solution": "Raise the limit if the data really is this wide, or narrow what the nest embeds."
+  },
+  "TS0490020": {
+    "message": "Row {identity} behind embed {refPath} is referenced by {referrers} rows, past the per-row limit of {limit}.",
+    "solution": "One change to that row rewrites that many documents, which is what this bounds - it is not a limit on storage, so widening how the references are held does not lift it. Raise the limit if the data really is this wide, or embed the row from the other side so the change travels with one document instead of all of them."
+  },
+  "TS0490021": {
+    "message": "Key {key} of nest state {namespace} holds {pending} changes waiting for something that has not arrived, past the limit of {limit}.",
+    "solution": "Check whether the parent rows are simply late or are never coming - a load reading children before their parents fills these queues and empties them again, where a broken reference fills them for good. Raise the limit if the wait is real and this deep."
+  },
+  "TS0490022": {
+    "message": "Document {key} of nest state {namespace} keeps {tombstones} records of deleted elements that cannot be dropped yet, past the limit of {limit}.",
+    "solution": "A record of a deletion is kept only until a restart could no longer replay the deletion, so this many means the durable position is not advancing - find what is holding the frontier back rather than raising the limit, which only buys time."
+  },
+  "TS0490023": {
+    "message": "Rows on their way to {address} have parked {changes} changes, past the limit of {limit}.",
+    "solution": "These rows are in no document while they sit there and the durable position is held below the change that moved them, so this is worth looking at rather than only raising. Reaching it usually means the half of the move that collects them is not being worked - check that side before raising the limit."
+  },
+  "TS0490024": {
+    "message": "An event of chain {chain} in {bucket} at {order} hangs from a row that is gone, and was handed over after {heldFor} rather than placed in a document.",
+    "solution": "A dangling reference in the source is normal and nothing was lost - the event was never going to appear in any document. A long wait means the reference has dangled all along; a short one means the parent row was deleted while its children were still arriving."
+  },
+  "TS0490025": {
+    "message": "Nest namespace {namespace} completed {backfills} cold loader callbacks for {accesses} logical state accesses; cold key share {share}, {millis} per callback; {entries} of {stored} entries are in memory ({resident}).",
+    "solution": "Inspect cold-key traffic, backend latency and batching. Increase the in-memory entry budget only when the measured working set and available memory justify it."
+  },
+  "TS0490026": {
+    "message": "Stream {alias} tracks structural key changes, but the row an update of source table {table} replaces does not carry {columns}.",
+    "solution": "Configure that source to send whole row images rather than minimal ones - on MySQL that is binlog_row_image=FULL, on PostgreSQL a full replica identity on the table - or turn key tracking off for that stream. A minimal image sends the columns identifying the row and nothing else, so the earlier row arrives without the one this compares and reads as a row that used to hang under nothing."
+  },
+  "TS0490027": {
+    "message": "Stream {alias} behind embed {refPath} sent an update carrying no earlier row, so where that row pointed before is not known.",
+    "solution": "Rows pointing at an embedded row are recorded against it, and taking that record back out needs the row the update replaces. Configure that stream's source to send before images - on most databases that is a full replica identity on the table. Without them a re-pointed row stays recorded against the row it left, which is then never reclaimed and counts for ever against the per-row reference limit."
+  },
+  "TS0490029": {
+    "message": "The embed at {embedPath} is one its parent points at, so it holds at most one row and cannot carry rollup fields.",
+    "solution": "Read the referenced row's columns directly, for example in a rollup field one level up: `=after.<path>.<column>`."
+  },
+  "TS0490030": {
+    "message": "Rollup field `{field}` on {level} is already taken by {other}.",
+    "solution": "Rename the rollup field. Columns, embed paths, flat fields and rollup fields share one namespace per level, and none overwrites another by declaration order."
+  },
+  "TS0490031": {
+    "message": "The {part} expression for rollup field `{field}` failed validation.",
+    "solution": "Arguments, orderings and filters read the element as `after`: its own columns, its references' columns (`after.<path>.<column>`) and its child levels' rollup fields. Check the names against the discovered model with `tapstate desc`.",
+    "technicalParams": [
+      "reason"
+    ]
+  },
+  "TS0490032": {
+    "message": "Rollup field `{field}` sums or averages `{expression}`, whose numeric type nothing resolved.",
+    "solution": "Discover the source so the column has a type, or compute over a column whose type is known. A sum's type is fixed when the pipeline is applied, so it is never guessed from the values."
+  },
+  "TS0490033": {
+    "message": "Rollup field `{field}` of document {root} does not fit in {type}.",
+    "solution": "The value is not rounded or wrapped. Check the source rows for an outlier; a total that truly needs more digits than a decimal(38) holds cannot be a rollup field."
+  },
+  "TS0490034": {
+    "message": "Rollup field `{field}` of document {root} met a {actual} value where its column was declared {declared}.",
+    "solution": "The value is not coerced. Fix the row, or rediscover the source if the column's declared type has changed."
+  },
+  "TS0490035": {
+    "message": "Rollup field `{field}` of document {root} is the {from} value that `type: {to}` cannot hold exactly.",
+    "solution": "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal)."
+  },
+  "TS0490036": {
+    "message": "Rollup field `{field}` of document {root} could not evaluate `{expression}`.",
+    "solution": "Check the element's values against what the expression expects; a field the element does not carry reads as null, any other failure stops the document rather than guessing.",
+    "technicalParams": [
+      "reason"
+    ]
+  },
+  "TS0490028": {
+    "message": "Embed {embedPath} lists orOn alternatives, and one of them matches on {fields}, which identifies its parent ({parentKey}).",
+    "solution": "Use orOn only where the parent points at one shared row, such as a location looked up by code or by hub id. An embed that gathers several rows under its parent matches on one condition; give it a single on."
+  }
+}

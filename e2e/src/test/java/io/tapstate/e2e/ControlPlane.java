@@ -114,8 +114,8 @@ final class ControlPlane {
     boolean alertCenterAvailable() {
         var response = send(authed("/api/alerts/center", "{\"limit\":1}"));
         String code = codeOf(response.body());
-        if ("control.storage-unavailable".equals(code)) return false;
-        if ("io.document-unreadable".equals(code)) {
+        if ("TS0210030".equals(code)) return false;
+        if ("TS0480004".equals(code) || "io.document-unreadable".equals(code)) {
             var params = paramsOf(response.body());
             if ("alert-store".equals(params.get("id")) && "schema-capability".equals(params.get("field"))) {
                 return false;
@@ -201,6 +201,19 @@ final class ControlPlane {
     /** Reads admission through the same native snapshot used by the application. */
     Map<?, ?> storageStatus() {
         var response = send(authed("/api/storage/status", "{}"));
+        return readStorageStatus(response);
+    }
+
+    Optional<Map<?, ?>> storageStatusDuringStartup() {
+        var response = send(authed("/api/storage/status", "{}"));
+        if (response.statusCode() == 503
+                && io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        return Optional.of(readStorageStatus(response));
+    }
+
+    private static Map<?, ?> readStorageStatus(HttpResponse<String> response) {
         expect(response, 200, "read native storage admission");
         return (Map<?, ?>) JsonReader.parse(response.body());
     }
@@ -959,6 +972,17 @@ final class ControlPlane {
         expect(send(authedDelete(id, expectedContentHash)), 204, "delete " + id);
     }
 
+    /** Returns false only when the current server refuses the deletion with its workload claim fence. */
+    boolean deleteArtifactWhenClaimAvailable(String id, String expectedContentHash) {
+        var response = send(authedDelete(id, expectedContentHash));
+        if (response.statusCode() == 500
+                && io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED.code().equals(codeOf(response.body()))) {
+            return false;
+        }
+        expect(response, 204, "delete " + id);
+        return true;
+    }
+
     /**
      * Attempts a removal the product is expected to refuse, and returns the refusal it answered with. A
      * null {@code expectedContentHash} sends no {@code If-Match} at all, which is the unconditional
@@ -1422,7 +1446,7 @@ final class ControlPlane {
 
     private static boolean refusedAsAlreadyRunning(String body) {
         return JsonReader.parse(body) instanceof Map<?, ?> refusal
-                && "lifecycle.illegal-transition".equals(refusal.get("code"))
+                && "TS0280001".equals(refusal.get("code"))
                 && refusal.get("params") instanceof Map<?, ?> params
                 && PipelineState.RUNNING.name().equals(params.get("from"));
     }

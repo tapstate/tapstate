@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "group_totals",
+      "operator": "aggregate"
+    }
+  ],
+  "inputs": {
+    "records": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "required_fields": {
+        "id": "integer primary key",
+        "value": "integer"
+      }
+    }
+  },
+  "parameters": {
+    "allow_manual_mix_override": true,
+    "group_count": 8,
+    "group_key": "input id modulo group count",
+    "protected_fields": [
+      "id"
+    ],
+    "target_tables": [
+      "group_totals"
+    ]
+  },
+  "expected": {
+    "readback": [
+      "Independently group the source rows by input id modulo the group count, then compare every target group key, row count and sum of value.",
+      "Updates change a group's sum, inserts add members, and deletes retract members. A group with no remaining input rows is absent."
+    ]
+  },
+  "completion": {
+    "target_unit": "target group row or write",
+    "evidence": "Observe settled target writes separately from source capture counts. Verify expected grouped output against independent target readback."
+  }
+}

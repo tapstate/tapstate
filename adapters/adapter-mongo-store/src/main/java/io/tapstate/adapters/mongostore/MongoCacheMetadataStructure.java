@@ -113,7 +113,7 @@ final class MongoCacheMetadataStructure {
 
     static boolean simpleCollations(MongoDatabase database, List<SystemCollections> tables) {
         var names = tables.stream().map(SystemCollections::collectionName).toList();
-        var found = database.listCollections().filter(new Document("name", new Document("$in", names))).into(new java.util.ArrayList<>());
+        var found = MongoCollectionMetadata.matching(database, names);
         // An absent optional collection has no collation and contributes no rows.
         return found.stream().allMatch(row -> {
             var options = row.get("options", Document.class);

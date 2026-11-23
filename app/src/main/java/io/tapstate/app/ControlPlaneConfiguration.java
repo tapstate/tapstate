@@ -436,7 +436,9 @@ class ControlPlaneConfiguration {
                         // state is the only copy of what its totals come from and its size is known
                         // from the definition before anything is deployed.
                         new AggregateSizingAdvisories()),
-                derivation, livePipelines, attribution, stateDatabasePolicy);
+                derivation, livePipelines, attribution, stateDatabasePolicy,
+                stateDatabasePolicy == StateDatabasePolicy.CLOUD ? DeploymentProfile.CLOUD : DeploymentProfile.ON_PREM,
+                connectorCatalogView::detail);
     }
 
     /** Preserves the direct assembly seam used by focused on-prem wiring tests. */
@@ -981,8 +983,10 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    PipelineLogQueryService pipelineLogQueryService(LogSink logSink) {
-        return new PipelineLogQueryService(logSink);
+    PipelineLogQueryService pipelineLogQueryService(LogSink logSink, ObjectProvider<NativeBusinessContext> business) {
+        var nativeContext = business.getIfAvailable();
+        return nativeContext == null ? new PipelineLogQueryService(logSink)
+                : PipelineLogQueryService.scoped(logSink, nativeContext::pipelineLogWindow);
     }
 
     @Bean

@@ -141,8 +141,8 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
             return token;
         };
         var scopes = startupArtifact == null
-                ? ConnectorNoteScopes.forBoundRun(notes, primaryName, primary, global, requireRun)
-                : ConnectorNoteScopes.forSharedStartup(notes, opener, requireRun);
+                ? ConnectorNoteScopes.forBoundRun(notes, primaryName, primary, global, requireRun, original.scope().stateGeneration())
+                : ConnectorNoteScopes.forCapture(notes, opener, requireRun, true, original.scope().stateGeneration());
         var openingArtifact = new java.util.concurrent.atomic.AtomicReference<>(startupArtifact);
         ConnectorProvisioner exact=id -> {
             requireRun.run(); if (!connectorId.equals(id)) throw unavailable();

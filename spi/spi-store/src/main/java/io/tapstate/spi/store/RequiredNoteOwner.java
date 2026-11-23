@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.model.PipelineNode;
 import java.util.Objects;
+import java.util.Optional;
 
 /** Immutable logical identity of necessary connector notes inside one storage binding. */
 public record RequiredNoteOwner(long bindingVersion, String namespace, Kind kind, String ownerId,
@@ -29,6 +30,13 @@ public record RequiredNoteOwner(long bindingVersion, String namespace, Kind kind
     /** Whether this private identity belongs to the fixed connector purpose. */
     public boolean hasPurpose(PipelineNode.Purpose purpose) {
         return kind == Kind.PIPELINE && namespace.startsWith(pipelinePrefix(ownerId, purpose));
+    }
+
+    public Optional<PipelineNode> pipelineNode(PipelineNode.Purpose purpose) {
+        return hasPurpose(purpose)
+                ? Optional.of(new PipelineNode(ownerId,
+                        namespace.substring(pipelinePrefix(ownerId, purpose).length())))
+                : Optional.empty();
     }
 
     private static String pipelinePrefix(String ownerId, PipelineNode.Purpose purpose) {

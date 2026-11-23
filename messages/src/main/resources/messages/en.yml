@@ -712,18 +712,12 @@ connector.ambiguous-registration:
 connector.registration-conflict:
   message: "Connector '{connector}' is already registered under artifact {existing}; a different artifact {incoming} was refused."
   solution: "Keep a single registered artifact per connector id; unregister the existing artifact before registering a different one."
-connector.download-target-changed:
-  message: "The download target for connector '{connector}' has changed."
-  solution: "Review the current version and confirm the new target."
 connector.cloud-upload-disabled:
   message: "Manual connector uploads are unavailable in Cloud clusters."
   solution: "Use a connector bundled with the Cloud runtime image."
 connector.load-failed:
   message: "Connector '{connector}' could not be loaded."
   solution: "Check the connector jar and its dependencies are present and readable."
-connector.local-artifact-unavailable:
-  message: "Connector '{connector}' requires local artifact {hash}, which is missing or unreadable."
-  solution: "Restore the original connector JAR under that hash, then retry from the retained position."
 connector.class-not-found:
   message: "Connector '{connector}' entry class '{class}' was not found or is not a connector."
   solution: "Check the connector id resolves to a connector jar that declares this entry class."
@@ -1423,6 +1417,11 @@ control.ai-overloaded:
 
 control.ai-provider-auth-failed:
   message: "The AI provider rejected this credential. Update the API key or its model permissions."
+
+control.ai-managed-provider-auth-failed:
+  message: "Tapstate-managed AI authentication failed. Contact your Tapstate administrator."
+control.ai-managed-provider-input-limit:
+  message: "The request exceeds the managed AI input limit. Start a new conversation or select fewer tables."
 
 start-check.target-empty:
   message: "{target} on {connection} is empty, so the full load starts from nothing."

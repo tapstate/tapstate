@@ -30,6 +30,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class McpOperationExecutorTest {
 
+    @Test
+    void artifactWarningsAreReadableWithoutTurningSuccessfulOperationsIntoErrors() throws Exception {
+        HttpServer server = server(exchange -> answer(exchange, 200, """
+                {"valid":true,"diagnostics":[],"outcomes":[{"id":"orders","change":"CREATED"}],
+                 "warnings":[{"code":"TS0010032","params":{"pipeline":"orders","setting":"parallelism","instead":"node.parallelism"}},
+                             {"code":"future.warning","params":{"detail":"keep"},"message":"Server explanation"}]}
+                """));
+        try (HttpControlClient client = new HttpControlClient()) {
+            var executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+            for (String operation : List.of("artifact.validate", "artifact.apply")) {
+                var result = executor.execute(ControlOperations.registry().resolve(operation), Map.of());
+                assertThat(result.error()).isFalse();
+                assertThat(result.body()).containsEntry("valid", true).containsEntry("diagnostics", List.of())
+                        .containsEntry("outcomes", List.of(Map.of("id", "orders", "change", "CREATED")));
+                var warnings = (List<?>) result.body().get("warnings");
+                var known = (Map<?, ?>) warnings.getFirst();
+                assertThat(known.get("code")).isEqualTo("TS0010032");
+                assertThat(known.get("message")).isEqualTo("Pipeline orders sets parallelism, which no longer decides anything; nothing reads it.");
+                assertThat(known.get("solution").toString()).contains("node.parallelism");
+                assertThat(warnings.get(1)).isEqualTo(Map.of("code", "future.warning",
+                        "params", Map.of("detail", "keep"), "message", "Server explanation"));
+            }
+        } finally { server.stop(0); }
+    }
+
     @Test void storageToolsPostTheSameSharedBodyAndNeverPutSecretsInUrls() throws Exception {
         var paths = new ArrayList<String>(); var requests = new ArrayList<Object>();
         HttpServer server = server(exchange -> {
@@ -314,7 +339,7 @@ class McpOperationExecutorTest {
     @Test
     void sourceListPreservesServerErrorsInsteadOfProjectingThem() throws Exception {
         HttpServer server = server(exchange -> answer(exchange, 400,
-                "{\"code\":\"control.malformed-request\",\"message\":\"bad page\"}"));
+                "{\"code\":\"TS0210001\",\"message\":\"bad page\"}"));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
@@ -322,7 +347,7 @@ class McpOperationExecutorTest {
             McpResult result = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.malformed-request");
+            assertThat(result.body()).containsEntry("code", "TS0210001");
         } finally {
             server.stop(0);
         }
@@ -343,8 +368,8 @@ class McpOperationExecutorTest {
             McpResult missingItems = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
             McpResult missingConnector = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
 
-            assertThat(missingItems.body()).containsEntry("code", "mcp.invalid-server-response");
-            assertThat(missingConnector.body()).containsEntry("code", "mcp.invalid-server-response");
+            assertThat(missingItems.body()).containsEntry("code", "TS0260003");
+            assertThat(missingConnector.body()).containsEntry("code", "TS0260003");
         } finally {
             server.stop(0);
         }
@@ -374,10 +399,10 @@ class McpOperationExecutorTest {
 
             assertThat(floatingPoint.error()).isFalse();
             assertThat(paths).containsExactly("/api/pipelines:artifacts?limit=2&offset=1");
-            assertThat(fractional.body()).containsEntry("code", "control.malformed-request");
-            assertThat(text.body()).containsEntry("code", "control.malformed-request");
-            assertThat(negativeOffset.body()).containsEntry("code", "control.malformed-request");
-            assertThat(largeOffset.body()).containsEntry("code", "control.malformed-request");
+            assertThat(fractional.body()).containsEntry("code", "TS0210001");
+            assertThat(text.body()).containsEntry("code", "TS0210001");
+            assertThat(negativeOffset.body()).containsEntry("code", "TS0210001");
+            assertThat(largeOffset.body()).containsEntry("code", "TS0210001");
         } finally {
             server.stop(0);
         }
@@ -449,7 +474,7 @@ class McpOperationExecutorTest {
             McpResult result = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of("id", "orders"));
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.unreachable");
+            assertThat(result.body()).containsEntry("code", "TS0210005");
         }
     }
 
@@ -685,12 +710,13 @@ class McpOperationExecutorTest {
         }
     }
 
-    @Test
-    void aRefusedArtifactDeleteIsStillReportedAsTheServerStatedIt() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0240003", "artifact.version-conflict"})
+    void aRefusedArtifactDeleteIsStillReportedAsTheServerStatedIt(String code) throws Exception {
         // The body added above must not swallow a refusal into a success: a delete the server rejected
         // reported as {"removed": true} is worse than the empty body it replaced.
         HttpServer server = server(exchange -> answer(exchange, 409,
-                "{\"code\":\"artifact.version-conflict\",\"message\":\"it changed\"}"));
+                JsonWriter.write(Map.of("code", code, "message", "it changed"))));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
@@ -699,7 +725,7 @@ class McpOperationExecutorTest {
                     Map.of("id", "orders", "expectedContentHash", "a".repeat(64)));
 
             assertThat(result.error()).isTrue();
-            assertThat(JsonWriter.write(result.body())).contains("artifact.version-conflict");
+            assertThat(JsonWriter.write(result.body())).contains(code);
             // Asserted non-empty first: "does not contain" is satisfied by a body that carries nothing
             // at all, which is the outcome this whole test exists to rule out.
             assertThat(result.body()).isNotEmpty().doesNotContainKey("removed");
@@ -869,7 +895,7 @@ class McpOperationExecutorTest {
                     new Operation("test.unsupported", Scope.READ, false, null, Map.of()), Map.of());
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.malformed-request");
+            assertThat(result.body()).containsEntry("code", "TS0210001");
         }
     }
 
@@ -882,8 +908,8 @@ class McpOperationExecutorTest {
             McpResult missing = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of());
             McpResult blank = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of("id", " "));
 
-            assertThat(missing.body()).containsEntry("code", "control.malformed-request");
-            assertThat(blank.body()).containsEntry("code", "control.malformed-request");
+            assertThat(missing.body()).containsEntry("code", "TS0210001");
+            assertThat(blank.body()).containsEntry("code", "TS0210001");
             assertThat(missing.error()).isTrue();
             assertThat(blank.error()).isTrue();
         }
@@ -960,7 +986,7 @@ class McpOperationExecutorTest {
     private static void assertSourceDraftUnavailable(
             int connectorStatus, String connectorBody, String draftBody) throws Exception {
         assertThat(sourceDraftResult(connectorStatus, connectorBody, draftBody).body())
-                .containsEntry("code", "mcp.connector-spec-unavailable");
+                .containsEntry("code", "TS0260001");
     }
 
     private static void answer(HttpExchange exchange, int status, String body) throws IOException {

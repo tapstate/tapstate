@@ -19,8 +19,8 @@ class ExplanationCatalogTest {
 
     @Test
     void carriedFailureCodesUseTheErrorCatalog() {
-        assertThat(EN.render("monitor.no-observation", Map.of("pipeline", "orders")))
+        assertThat(EN.render("TS0400001", Map.of("pipeline", "orders")))
                 .contains("orders")
-                .doesNotContain("monitor.no-observation");
+                .doesNotContain("TS0400001");
     }
 }

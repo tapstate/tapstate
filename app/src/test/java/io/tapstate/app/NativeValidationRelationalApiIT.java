@@ -245,7 +245,7 @@ class NativeValidationRelationalApiIT {
                     if(nested.equals("array"))assertThatThrownBy(()->post(http,write,"evaluate",selection("full_column","FULL_COLUMN")))
                             .isInstanceOfSatisfying(org.springframework.web.client.HttpClientErrorException.class,refused->{
                                 assertThat(refused.getStatusCode().value()).isEqualTo(400);
-                                assertThat(refused.getResponseBodyAsString()).contains("validation.rule-unsupported","native-nested-codec-expansion-unproven","payload");
+                                assertThat(refused.getResponseBodyAsString()).contains("TS0300007","native-nested-codec-expansion-unproven","payload");
                             });
                     else{
                         var input=selection("full_column","FULL_COLUMN");var evaluated=post(http,write,"evaluate",input);
@@ -305,7 +305,7 @@ class NativeValidationRelationalApiIT {
                                 var failure=(Map<?,?>)value;
                                 assertThat(failure.get("mapping")).isEqualTo("orders");
                                 assertThat(failure.get("side")).isEqualTo("SOURCE");
-                                assertThat(((Map<?,?>)failure.get("failure")).get("code")).isEqualTo("validation.read-failed");
+                                assertThat(((Map<?,?>)failure.get("failure")).get("code")).isEqualTo("TS0300015");
                             });
                             assertThat(StoredArtifacts.requireSource(artifacts,"input").config()).isEqualTo(source);
                         }else assertThat(report).containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("rootCount","0");

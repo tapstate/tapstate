@@ -14,12 +14,15 @@ import org.springframework.core.annotation.Order;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.ProviderManager;
+import org.springframework.security.config.ObjectPostProcessor;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.annotation.web.configurers.HeadersConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AuthenticationFilter;
 import org.springframework.security.web.context.SecurityContextHolderFilter;
+import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
 import org.springframework.security.web.util.matcher.DispatcherTypeRequestMatcher;
 import org.springframework.security.web.util.matcher.NegatedRequestMatcher;
@@ -77,7 +80,7 @@ class RestApiSecurityConfiguration {
                             jakarta.servlet.http.HttpServletResponse response, jakarta.servlet.FilterChain chain)
                             throws jakarta.servlet.ServletException, java.io.IOException {
                         try { installations.getObject().requireManagementRequest(request); }
-                        catch (io.tapstate.core.common.TapstateException refused) { errors.write(response, refused.code(), refused.args()); return; }
+                        catch (io.tapstate.core.common.TapstateException refused) { errors.write(request, response, refused.code(), refused.args()); return; }
                         chain.doFilter(request, response);
                     }
                 }, SecurityContextHolderFilter.class)
@@ -100,6 +103,7 @@ class RestApiSecurityConfiguration {
 
         http
                 .securityMatcher(PathPatternRequestMatcher.pathPattern("/api/**"))
+                .headers(RestApiSecurityConfiguration::writeApiHeadersEagerly)
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
@@ -120,6 +124,17 @@ class RestApiSecurityConfiguration {
                         .permitAll()
                         .anyRequest().access(authorization));
         return http.build();
+    }
+
+    static void writeApiHeadersEagerly(HeadersConfigurer<HttpSecurity> headers) {
+        // Set headers before an asynchronous response can begin streaming on another thread.
+        headers.withObjectPostProcessor(new ObjectPostProcessor<HeaderWriterFilter>() {
+            @Override
+            public <O extends HeaderWriterFilter> O postProcess(O filter) {
+                filter.setShouldWriteHeadersEagerly(true);
+                return filter;
+            }
+        });
     }
 
     @Bean

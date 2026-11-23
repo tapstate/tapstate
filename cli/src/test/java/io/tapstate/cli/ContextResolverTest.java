@@ -63,7 +63,7 @@ class ContextResolverTest {
 
         assertThatThrownBy(() -> resolver.resolve("temporary:8080", "explicit", workspace))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-source-conflict"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330053"));
         assertThat(Files.readString(home.resolve(".tapstate/config.yaml"))).isEqualTo(before);
     }
 
@@ -100,7 +100,7 @@ class ContextResolverTest {
 
         assertThatThrownBy(() -> resolver.resolve(null, null, workspace))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-not-found"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330051"));
     }
 
     @Test
@@ -111,7 +111,7 @@ class ContextResolverTest {
 
         assertThatThrownBy(() -> resolver.resolve(null, "missing", workspace))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-not-found"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330051"));
     }
 
     private static void assertNamed(Optional<ResolvedContext> resolution, String name,

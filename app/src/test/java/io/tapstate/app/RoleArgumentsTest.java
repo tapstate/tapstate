@@ -43,7 +43,7 @@ class RoleArgumentsTest {
     void unsupportedEqualsFormIsCoded() {
         assertThatThrownBy(() -> RoleArguments.parse(new String[] {"--role=api"}))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("role.unsupported");
+                    assertThat(e.code().code()).isEqualTo("TS0320001");
                     assertThat(e.args()).containsEntry("role", "api");
                 });
     }
@@ -52,7 +52,7 @@ class RoleArgumentsTest {
     void unsupportedSeparatedFormIsCoded() {
         assertThatThrownBy(() -> RoleArguments.parse(new String[] {"--role", "engine"}))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("role.unsupported");
+                    assertThat(e.code().code()).isEqualTo("TS0320001");
                     assertThat(e.args()).containsEntry("role", "engine");
                 });
     }
@@ -67,7 +67,7 @@ class RoleArgumentsTest {
     void roleFlagWithoutAValueIsCodedAsEmpty() {
         assertThatThrownBy(() -> RoleArguments.parse(new String[] {"--role"}))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("role.unsupported");
+                    assertThat(e.code().code()).isEqualTo("TS0320001");
                     assertThat(e.args()).containsEntry("role", "");
                 });
     }
@@ -77,7 +77,7 @@ class RoleArgumentsTest {
         // the --role= form: substring after '=' yields "", a distinct branch from the bare flag
         assertThatThrownBy(() -> RoleArguments.parse(new String[] {"--role="}))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("role.unsupported");
+                    assertThat(e.code().code()).isEqualTo("TS0320001");
                     assertThat(e.args()).containsEntry("role", "");
                 });
     }
@@ -88,7 +88,7 @@ class RoleArgumentsTest {
         // coded unsupported-role rather than being silently swallowed
         assertThatThrownBy(() -> RoleArguments.parse(new String[] {"--role", "--server.port=8080"}))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("role.unsupported");
+                    assertThat(e.code().code()).isEqualTo("TS0320001");
                     assertThat(e.args()).containsEntry("role", "--server.port=8080");
                 });
     }

@@ -37,7 +37,7 @@ class APackagedRootImagesArePublicWithoutAuthenticationIT {
                             .timeout(Duration.ofSeconds(10)).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertThat(api.statusCode()).isEqualTo(401);
-            assertThat(api.body()).contains("control.unauthenticated");
+            assertThat(api.body()).contains("TS0210003");
         }
     }
 }

@@ -110,7 +110,7 @@ class ValidationStaticRestrictionsTest {
                 new ValidationStaticRestrictions.Limits(10, 10, 1, 65536),
                 new ValidationStaticRestrictions.Limits(10, 10, 10, 300))) {
             assertThatThrownBy(() -> ValidationStaticRestrictions.inspect(declarations, limits))
-                    .isInstanceOf(TapstateException.class).hasMessageContaining("validation.value-limit-exceeded");
+                    .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300012");
         }
         var multiple = declarations("""
                 transforms:

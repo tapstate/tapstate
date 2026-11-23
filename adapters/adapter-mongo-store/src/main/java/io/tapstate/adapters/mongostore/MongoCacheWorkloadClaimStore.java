@@ -36,6 +36,7 @@ import java.util.function.BiFunction;
 /** One fixed business scope; no claim transition uses another client or an unbound transaction. */
 final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.DeadlineWorkloadClaimStore {
     private static final System.Logger LOG = System.getLogger(MongoCacheWorkloadClaimStore.class.getName());
+    private static final String CLUSTER_ID = "clusterId";
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
@@ -137,62 +138,76 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
         });
     }
-    private record PipelineReading(Document state,Document claim,Document node) { }
-    @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original){
-        var key=pipelineKey(original);
-        return pipelineReading(original,true,observed->{
-            if(!original.equals(decodeScope(observed.claim(),key)))throw claimFenced();
-            return Optional.of(MongoWorkloadClaimStore.observedPipelineReading(observed.claim(),observed.node()));
-        },()->transaction(false,original,(store,session)->{
-            var retained=storedScope(session,key);if(retained!=null&&!retained.equals(original))throw claimFenced();return store.read(key);
+    @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
+        requireScope(original);
+        var key = pipelineKey(original);
+        return operations.pipelineRenewal(key, () -> StoreIo.call(() -> {
+            try {
+                return readPipelineFacts(original, key);
+            } catch (RuntimeException failure) {
+                operations.structures.clear();
+                requireActive.run();
+                throw failure;
+            }
         }));
     }
-    io.tapstate.core.lifecycle.CheckpointDoc readCheckpoint(PipelineIntentScope original){
-        return pipelineReading(original,false,observed->MongoStateStore.toCheckpoint(observed.state()),()->{
-            var access=new MongoCachePipelineAccess(client,database,original,null,requireActive);
-            return access.transaction(session->MongoStateStore.toCheckpoint(access.state(session)));
+
+    private Optional<WorkloadClaimReading> readPipelineFacts(PipelineIntentScope original, WorkloadClaimKey key) {
+        if (operations.budget() == null) operations.requireAdmission();
+        requireActive.run();
+        requireValidationAuthority();
+        if (!MongoReadBudget.supportsSnapshotReads(client)) {
+            return readPipelineTransaction(original, key);
+        }
+        var budget = operations.budget();
+        if (budget != null) operations.check();
+        var db = budget == null ? database : budget.database(database);
+        var access = new MongoCachePipelineAccess(client, database, original, null, requireActive);
+        try (var session = client.startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())) {
+            requirePipelineReadingStructure(db, access, budget);
+            var observed = StoreIo.call(() ->
+                    SystemCollections.CACHE_IDENTITY.on(db).aggregate(session, pipelineReadingStages(original, key)).first());
+            MongoCacheBusinessIdentity.requireObservedAdmission(observed, observedRow(observed, "schema"), scope);
+            access.validateState(observedRow(observed, "state"));
+            var claim = observedRow(observed, "claim");
+            access.requirePreparedClaim(session, claim);
+            if (!original.equals(decodeScope(claim, key))) throw claimFenced();
+            var reading = MongoWorkloadClaimStore.observedPipelineReading(claim, observedRow(observed, "node"));
+            requireActive.run();
+            requireValidationAuthority();
+            if (budget != null) operations.check();
+            return Optional.of(reading);
+        } catch (TapstateException failure) {
+            if (failure.code() != IoError.DOCUMENT_TOO_LARGE) throw failure;
+        }
+        return readPipelineTransaction(original, key);
+    }
+
+    private Optional<WorkloadClaimReading> readPipelineTransaction(PipelineIntentScope original, WorkloadClaimKey key) {
+        return transaction(false, original, (store, session) -> {
+            var retained = storedScope(session, key);
+            if (retained != null && !retained.equals(original)) throw claimFenced();
+            return store.read(key);
         });
     }
-    private <T> T pipelineReading(PipelineIntentScope original,boolean includeNode,java.util.function.Function<PipelineReading,T> read,java.util.function.Supplier<T> legacy){
-        requireScope(original);var key=pipelineKey(original);
-        java.util.function.Supplier<T> operation=()->StoreIo.call(()->{
-            try{
-                if(includeNode&&operations.budget()==null)operations.requireAdmission();
-                requireActive.run();requireValidationAuthority();
-                if(!MongoReadBudget.supportsSnapshotReads(client))return legacy.get();
-                if (!includeNode) {
-                    operations.structures.require(MongoStructureProof.Kind.CHECKPOINT_READ, () ->
-                            operations.checkpointSimpleCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
-                                    SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS,
-                                    SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_WORKLOAD_CLAIMS)));
-                    if (!operations.checkpointSimpleCollations) return legacy.get();
-                }
-                var budget=operations.budget();if(budget!=null)operations.check();
-                var db=budget==null?database:budget.database(database);
-                var access=new MongoCachePipelineAccess(client,database,original,null,requireActive);
-                try(var session=client.startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())){
-                    if(includeNode)requirePipelineReadingStructure(db, access, budget);
-                    var stages=new java.util.ArrayList<Document>();
-                    stages.add(new Document("$match",new Document("_id","cluster")));
-                    stages.add(observedLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS,"schema","business",false));
-                    stages.add(observedLookup(SystemCollections.CACHE_PIPELINE_STATE,"state",original.pipelineId(),false));
-                    stages.add(observedLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS,"claim",MongoWorkloadClaimStore.id(key),includeNode));
-                    var nodeId=new Document("clusterId",scope.clusterId()).append("resourceType",WorkloadClaimType.NODE_SESSION.name()).append("resourceId","$$owner");
-                    if(includeNode)stages.add(new Document("$lookup",new Document("from",SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())
-                            .append("let",new Document("owner",new Document("$arrayElemAt",List.of("$claim.ownerNodeId",0))))
-                            .append("pipeline",List.of(new Document("$match",new Document("$expr",new Document("$eq",List.of("$_id",nodeId)))),MongoWorkloadClaimStore.leaseRemaining(true)))
-                            .append("as","node")));
-                    var observed=SystemCollections.CACHE_IDENTITY.on(db).aggregate(session,stages).first();
-                    MongoCacheBusinessIdentity.requireObservedAdmission(observed,observedRow(observed,"schema"),scope);
-                    if(!includeNode)requirePipelineReadingStructure(db, access, budget);
-                    var state=observedRow(observed,"state");
-                    access.validateState(state);var claim=observedRow(observed,"claim");access.requirePreparedClaim(session,claim);
-                    T result=read.apply(new PipelineReading(state,claim,includeNode?observedRow(observed,"node"):null));
-                    requireActive.run();requireValidationAuthority();if(budget!=null)operations.check();return result;
-                }
-            }catch(RuntimeException failure){operations.structures.clear();requireActive.run();throw failure;}
-        });
-        return includeNode?operations.pipelineRenewal(key,operation):operation.get();
+
+    private List<Document> pipelineReadingStages(PipelineIntentScope original, WorkloadClaimKey key) {
+        var nodeId = new Document(CLUSTER_ID, scope.clusterId())
+                .append("resourceType", WorkloadClaimType.NODE_SESSION.name()).append("resourceId", "$$owner");
+        var nodeFilter = match(new Document("$expr", new Document("$eq", List.of("$_id", nodeId))));
+        var node = new Document("$lookup", new Document("from", SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())
+                .append("let", new Document("owner", new Document("$arrayElemAt", List.of("$claim.ownerNodeId", 0))))
+                .append("pipeline", List.of(nodeFilter, MongoWorkloadClaimStore.leaseRemaining(true)))
+                .append("as", "node"));
+        return List.of(match(new Document("_id", "cluster")),
+                observedLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business", false),
+                observedLookup(SystemCollections.CACHE_PIPELINE_STATE, "state", original.pipelineId(), false),
+                observedLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", MongoWorkloadClaimStore.id(key), true),
+                node);
+    }
+
+    private static Document match(Document filter) {
+        return new Document("$match", filter);
     }
     private void requirePipelineReadingStructure(MongoDatabase db, MongoCachePipelineAccess access, MongoReadBudget budget) {
         operations.structures.require(MongoStructureProof.Kind.CLAIMS, () -> requireCollection(db));
@@ -200,7 +215,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
 
     private static Document observedLookup(SystemCollections table,String name,Object id,boolean lease){
-        var stages=new java.util.ArrayList<Document>();stages.add(new Document("$match",new Document("_id",id)));
+        var stages=new java.util.ArrayList<Document>();stages.add(match(new Document("_id",id)));
         if(lease)stages.add(MongoWorkloadClaimStore.leaseRemaining(true));
         return new Document("$lookup",new Document("from",table.collectionName()).append("pipeline",stages).append("as",name));
     }
@@ -378,7 +393,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         try {
             if (!(row.get("pipelineScope") instanceof Document value) || !(value.get("bindingVersion") instanceof Long binding)
                     || !(value.get("stateGeneration") instanceof Long generation)) throw unreadableScope();
-            var decoded = new PipelineIntentScope(value.getString("clusterId"), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
+            var decoded = new PipelineIntentScope(value.getString(CLUSTER_ID), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
             if (!value.equals(scopeDocument(decoded)) || !key.resourceId().equals(decoded.pipelineId()) || !key.clusterId().equals(decoded.clusterId())
                     || !scope.equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadableScope();
             if (MongoCachePipelinePreparations.phase(row, decoded) != io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED) throw claimFenced();
@@ -387,7 +402,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
 
     private static Document scopeDocument(PipelineIntentScope value) {
-        return new Document("clusterId", value.clusterId()).append("bindingVersion", value.bindingVersion())
+        return new Document(CLUSTER_ID, value.clusterId()).append("bindingVersion", value.bindingVersion())
                 .append("cacheIncarnation", value.cacheIncarnation()).append("pipelineId", value.pipelineId()).append("stateGeneration", value.stateGeneration());
     }
     private static WorkloadClaimKey pipelineKey(PipelineIntentScope value) { return new WorkloadClaimKey(value.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, value.pipelineId()); }

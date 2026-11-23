@@ -65,6 +65,76 @@ class SnapshotPhaseTest {
         return Envelope.read(id, src, Map.of("id", id), Map.of());
     }
 
+    @Test void aSnapshotFailureKeepsItsOwnerFactWhenCleanupAlsoFails() {
+        var primary = new IllegalStateException("snapshot failed");
+        var cleanup = new IllegalStateException("cleanup failed");
+        var closes = new java.util.concurrent.atomic.AtomicInteger();
+        var safe = new io.tapstate.core.common.FailureFact.PublicFailure("code", Map.of("detail", "[redacted]"));
+        var fact = new io.tapstate.core.common.FailureFact(primary, Map.of("message", "safe snapshot"), safe);
+        var batch = new FakeBatch(List.of(), "seam") {
+            @Override public boolean hasNext() { throw primary; }
+            @Override public void close() { if (closes.incrementAndGet() == 1) throw cleanup; }
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) { return fact; }
+        };
+        var load = SnapshotPhase.open(new FakePort(batch), config(), "chain", PIPE, List.of("orders"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+        assertThatThrownBy(() -> load.read(event -> {}, table -> {})).isSameAs(primary);
+        assertThat(primary.getSuppressed()).containsExactly(cleanup);
+        assertThat(load.failureFact(primary)).isSameAs(fact);
+        assertThat(load.failureFact(cleanup).diagnostic()).isEmpty();
+        load.close();
+        assertThat(closes).hasValue(2);
+    }
+
+    @Test void aFatalSnapshotOrCleanupFailureIsNeverHiddenByAnOrdinaryFailure() {
+        for (boolean fatalRead : List.of(false, true)) {
+            var fatal = new OutOfMemoryError("fatal fixture");
+            var ordinary = new IllegalStateException("ordinary fixture");
+            var batch = new FakeBatch(List.of(), "seam") {
+                @Override public boolean hasNext() { if (fatalRead) throw fatal; throw ordinary; }
+                @Override public void close() { if (fatalRead) throw ordinary; throw fatal; }
+            };
+            var load = SnapshotPhase.open(new FakePort(batch), config(), "chain", PIPE, List.of("orders"), 1L,
+                    new RecordingMeta(new ArrayList<>()));
+            assertThatThrownBy(() -> load.read(event -> {}, table -> {})).isSameAs(fatal);
+            assertThat(fatal.getSuppressed()).containsExactly(ordinary);
+        }
+    }
+
+    @Test void aFailureInDiagnosticCaptureStillClosesTheBatch() {
+        var readFailure = new IllegalStateException("read failed");
+        var projectionFailure = new AssertionError("projection failed");
+        var cleanupFailure = new IllegalStateException("close failed");
+        var batch = new FakeBatch(List.of(), "seam") {
+            @Override public boolean hasNext() { throw readFailure; }
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+                throw projectionFailure;
+            }
+            @Override public void close() { throw cleanupFailure; }
+        };
+        var load = SnapshotPhase.open(new FakePort(batch), config(), "chain", PIPE, List.of("orders"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+        assertThatThrownBy(() -> load.read(event -> {}, table -> {})).isSameAs(projectionFailure);
+        assertThat(readFailure.getSuppressed()).containsExactly(cleanupFailure);
+    }
+
+    @Test void aBackgroundSnapshotPublishesTheSameSafeFact() throws Exception {
+        var primary = new IllegalStateException("snapshot failed");
+        var fact = new io.tapstate.core.common.FailureFact(primary, Map.of("message", "safe snapshot"),
+                new io.tapstate.core.common.FailureFact.PublicFailure("code", Map.of("detail", "[redacted]")));
+        var batch = new FakeBatch(List.of(), "seam") {
+            @Override public boolean hasNext() { throw primary; }
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) { return fact; }
+        };
+        var load = SnapshotPhase.open(new FakePort(batch), config(), "chain", PIPE, List.of("orders"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+        var health = new CaptureHealth();
+        var background = new BackgroundLoad(load, CaptureHandoff.of(row -> {}), Optional::empty, health, "snapshot-fact-test");
+        background.start();
+        assertThat(background.awaitFinished(java.time.Duration.ofSeconds(3))).isTrue();
+        assertThat(health.failureFact()).containsSame(fact);
+    }
+
     @Test
     void drainsTheSnapshotBatchStraightToTheSinkInOrder() {
         List<Envelope> rows = List.of(row(1), row(2), row(3));
@@ -93,6 +163,23 @@ class SnapshotPhaseTest {
         assertThat(port.configs).singleElement().satisfies(read -> {
             assertThat(read.streams()).containsExactly("orders");
             assertThat(read.node()).isEqualTo(new PipelineNode("orders_pipeline", "orders_source"));
+        });
+    }
+
+    @Test
+    void narrowedSnapshotKeepsTheLocalOverrideAndItsKeyedCaptureIdentity() {
+        FakePort port = new FakePort(new FakeBatch(List.of(row(1)), "p0"));
+        var overrides = Map.<String, Object>of("preImage", false);
+        var config = new CaptureConfig("mysql", Map.of("host", "shared", "preImage", false),
+                List.of("orders", "customers"), new PipelineNode(PIPE, "source"), null, overrides);
+        SnapshotPhase.run(port, config, "chain", PIPE, List.of("orders"),
+                1L, new RecordingMeta(new ArrayList<>()), e -> {});
+        assertThat(port.configs).singleElement().satisfies(read -> {
+            assertThat(read.streams()).containsExactly("orders");
+            assertThat(read.settings()).containsEntry("preImage", false).containsEntry("host", "shared");
+            assertThat(read.nodeConfig()).isEqualTo(overrides);
+            assertThat(MiningChainId.resolve(read, "shared-key")).isEqualTo(MiningChainId.resolve(config, "shared-key"));
+            assertThat(MiningChainId.resolve(read, "shared-key")).isNotEqualTo(MiningChainId.ofKey("shared-key"));
         });
     }
 
@@ -795,7 +882,7 @@ class SnapshotPhaseTest {
     }
 
     /** A bounded snapshot batch over a fixed list of events; records whether it was closed. */
-    private static final class FakeBatch implements CaptureBatch {
+    private static class FakeBatch implements CaptureBatch {
         private final Iterator<Envelope> events;
         private final String seam;
         boolean closed;

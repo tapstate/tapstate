@@ -1,0 +1,176 @@
+{
+  "TS0060001": {
+    "message": "Connector '{connector}' could not complete its connection test: {detail}",
+    "solution": "Review the cause and check the connector configuration before trying again."
+  },
+  "TS0060002": {
+    "message": "Target '{table}' cannot preserve source identity '{field}' as '{preserved}': {reason}.",
+    "solution": "Check the configured source identity field, the target generated identity and the complete logical matching key. Existing fields and business constraints are never overwritten."
+  },
+  "TS0060003": {
+    "message": "Connector '{connector}' could not check identity constraints for target '{table}': {detail}.",
+    "solution": "Check target access and metadata permissions, then retry. An unavailable identity check does not authorize a write."
+  },
+  "TS0060004": {
+    "message": "No connector '{connector}' is registered.",
+    "solution": "Register the connector's artifact \u2014 or place it in the connector seed directory \u2014 before using it."
+  },
+  "TS0060005": {
+    "message": "Connector '{connector}' resolves to more than one registered artifact: {artifacts}.",
+    "solution": "Keep a single registered artifact per connector id; selecting among connector versions is not supported."
+  },
+  "TS0060006": {
+    "message": "Connector '{connector}' is already registered under artifact {existing}; a different artifact {incoming} was refused.",
+    "solution": "Keep a single registered artifact per connector id; unregister the existing artifact before registering a different one."
+  },
+  "TS0060007": {
+    "message": "Manual connector uploads are unavailable in Cloud clusters.",
+    "solution": "Use a connector bundled with the Cloud runtime image."
+  },
+  "TS0060008": {
+    "message": "Runtime registration supports these connectors today: {official}. '{connector}' is not among them yet.",
+    "solution": "Register one of the connectors listed above. The supported set grows as connectors complete certification, so an artifact refused here is not necessarily faulty."
+  },
+  "TS0060009": {
+    "message": "Connector '{connector}' could not be loaded.",
+    "solution": "Check the connector jar and its dependencies are present and readable."
+  },
+  "TS0060010": {
+    "message": "Connector '{connector}' has invalid server TLS trust material or conflicting TLS settings.",
+    "solution": "Provide a valid CA certificate bundle with server verification enabled and no client private key."
+  },
+  "TS0060011": {
+    "message": "Connector '{connector}' could not remove its temporary TLS material.",
+    "solution": "Inspect the owning process file permissions before retrying cleanup."
+  },
+  "TS0060012": {
+    "message": "Connector '{connector}' entry class '{class}' was not found or is not a connector.",
+    "solution": "Check the connector id resolves to a connector jar that declares this entry class."
+  },
+  "TS0060013": {
+    "message": "Connector artifact '{artifact}' could not be read.",
+    "solution": "Check the artifact is a complete, readable connector jar (ZIP archive); download it again if it is truncated or corrupt."
+  },
+  "TS0060014": {
+    "message": "No connector class found in artifact '{artifact}'.",
+    "solution": "Check the jar is a PDK connector: it must contain a class annotated with @TapConnectorClass."
+  },
+  "TS0060015": {
+    "message": "Artifact '{artifact}' declares more than one connector class: {classes}.",
+    "solution": "Register one connector per artifact; split unrelated connectors into separate jars."
+  },
+  "TS0060016": {
+    "message": "Connector artifact '{artifact}' names spec '{spec}' but the jar does not contain it.",
+    "solution": "Check the connector build packages the spec resource named by its @TapConnectorClass annotation."
+  },
+  "TS0060017": {
+    "message": "Connector artifact '{artifact}' spec '{spec}' does not identify the connector: {detail}.",
+    "solution": "Ensure the spec resource is valid JSON and declares the connector id under properties.id."
+  },
+  "TS0060018": {
+    "message": "Connection setting '{field}' of connector '{connector}' must be a {expected}, but its value is '{value}'.",
+    "solution": "Give '{field}' a {expected} the connector can read, or remove it if the connection does not need it."
+  },
+  "TS0060019": {
+    "message": "Oracle LogMiner connector '{connector}' cannot capture {kind} identifier '{identifier}' because it is longer than {limit} characters.",
+    "solution": "Use an Oracle schema, table and column name no longer than {limit} characters, or select another supported Oracle capture mode."
+  },
+  "TS0060020": {
+    "message": "Oracle LogMiner connector '{connector}' did not finish initialization and schema discovery within {timeout} and was stopped.",
+    "solution": "Check that the Oracle source is reachable and responsive, or increase the LogMiner preflight timeout if discovery is expected to take longer."
+  },
+  "TS0060021": {
+    "message": "Connector '{connector}' requires PDK API level {required} but this engine provides level {provided}.",
+    "solution": "Use a connector build compatible with API level {provided}, or upgrade the engine."
+  },
+  "TS0060022": {
+    "message": "Connector '{connector}' declares PDK API version {version}, which this engine build does not recognize.",
+    "solution": "Use a connector built against a PDK API version this engine registers, or add {version} to the Tapstate-side level table if it is API-compatible."
+  },
+  "TS0060023": {
+    "message": "Connector '{connector}' produced an event that could not be projected: {detail}.",
+    "solution": "This is a bridge-level projection failure between the connector and the event envelope."
+  },
+  "TS0060024": {
+    "message": "Connector '{connector}' failed while reading: {detail}.",
+    "solution": "Check the source is reachable and the connection settings are correct."
+  },
+  "TS0060025": {
+    "message": "Testing '{connector}' exceeded {timeout}; inspect its current result before an explicit retry.",
+    "solution": "Check the target and retry explicitly when the original test resources have ended."
+  },
+  "TS0060026": {
+    "message": "Connector '{connector}' could not discover its schema.",
+    "solution": "Check that the source database is reachable and the connection settings are correct, then refresh the schema.",
+    "technicalParams": ["detail"]
+  },
+  "TS0060027": {
+    "message": "Connector '{connector}' could not write data to the target.",
+    "solution": "Check the target connection, permissions and write settings. Review the original error in technical details before retrying.",
+    "technicalParams": ["detail"]
+  },
+  "TS0060028": {
+    "message": "Connector '{connector}' failed while reading the store: {detail}.",
+    "solution": "Check the store is reachable and the connection settings are correct."
+  },
+  "TS0060029": {
+    "message": "Snapshot preparation for connector `{connector}` could not complete: {reason}.",
+    "solution": "Keep the saved recovery state and use a capture runtime that can durably accept the session metadata and stream position before reading rows."
+  },
+  "TS0060030": {
+    "message": "Reading '{connector}' stopped before it finished, so the rows it returned are incomplete.",
+    "solution": "The read was interrupted rather than refused; run it again."
+  },
+  "TS0060031": {
+    "message": "Connector '{connector}' does not provide '{capability}', which this read needs.",
+    "solution": "Read a source whose connector provides this capability, or use a verb that does not need it."
+  },
+  "TS0060032": {
+    "message": "Every connection to '{connector}' was still busy after {timeout}.",
+    "solution": "Another read of this connection is still running; retry, or narrow the read so it finishes sooner."
+  },
+  "TS0060033": {
+    "message": "This host already holds its limit of {limit} live connector connections and all of them are busy.",
+    "solution": "Wait for a running read to finish, or reduce how many connections are being read at once."
+  },
+  "TS0060034": {
+    "message": "Reading '{connector}' took longer than {timeout} and was stopped.",
+    "solution": "Narrow the read with a filter or a smaller limit, or check the store is not overloaded."
+  },
+  "TS0060035": {
+    "message": "This connector tried to keep a value of type {type}, which cannot be stored.",
+    "solution": "Report this against the connector: it is the connector's own state that cannot be held, not anything in your pipeline."
+  },
+  "TS0060036": {
+    "message": "A note this connector kept for itself cannot be read back: {detail}.",
+    "solution": "If this followed a downgrade, run the build that wrote it. Otherwise clear the pipeline's state to start the connector fresh, which makes it read its source from the beginning."
+  },
+  "TS0060037": {
+    "message": "Connector '{connector}' produced a stream position that could not be recorded: {detail}.",
+    "solution": "Without a recordable position this source can only be read from the present; report the connector build that produced it."
+  },
+  "TS0060038": {
+    "message": "Connector '{connector}' could not read back the recorded stream position: {detail}.",
+    "solution": "Read the source from the beginning again, or set an explicit start point, so a fresh position is recorded."
+  },
+  "TS0060039": {
+    "message": "Connector '{connector}' could not be told how far it may release its change log: {detail}.",
+    "solution": "The change stream keeps running and this is retried shortly; until it succeeds the source keeps change log it could already release. Check the source is reachable and the connection settings are correct."
+  },
+  "TS0060040": {
+    "message": "Connector '{connector}' could not let go of what it set up on its source to read changes ({resources}): {detail}.",
+    "solution": "The pipeline's state was cleared anyway. Remove what is named here on the source by hand; for a PostgreSQL replication slot, run pg_drop_replication_slot with its name once no session is using it. Until then the source keeps change log for it."
+  },
+  "TS0060041": {
+    "message": "Schema discovery for {connector} timed out while waiting for the database.",
+    "solution": "Check that the database is running and that the connector can reach its host and port, then refresh the schema."
+  },
+  "TS0060042": {
+    "message": "Schema discovery for {connector} was rejected by the database's authentication checks.",
+    "solution": "Check the data source username, password and authentication settings, then refresh its schema. If the credentials are correct, ask the database administrator to check the account."
+  },
+  "TS0060043": {
+    "message": "Connector '{connector}' requires local artifact {hash}, which is missing or unreadable.",
+    "solution": "Restore the original connector JAR under that hash, then retry from the retained position."
+  }
+}

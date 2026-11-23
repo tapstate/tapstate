@@ -31,6 +31,21 @@ import org.junit.jupiter.api.Test;
 class ValidationCaptureHintRegistryTest {
     private static final ValidationCaptureHintTap.Limits WORK = new ValidationCaptureHintTap.Limits(1000, 1, 1_048_576);
 
+    @Test void captureDiagnosticSurvivesTheInstalledValidationForwarder() {
+        var health = new io.tapstate.runtime.srs.CaptureHealth();
+        var failure = new IllegalStateException("original capture failure");
+        try (var registry = registry(2)) {
+            var listener = registry.install(health.recording((events, position) -> {}));
+            var safe = new io.tapstate.core.common.FailureFact.PublicFailure("code", Map.of("detail", "[redacted]"));
+            listener.onFailure(new io.tapstate.core.common.FailureFact(failure, Map.of("message", "safe capture fact"), safe));
+            assertThat(health.failureFact()).hasValueSatisfying(fact -> {
+                assertThat(fact.cause()).isSameAs(failure);
+                assertThat(fact.publicFailure()).isSameAs(safe);
+                assertThat(fact.diagnostic()).containsEntry("message", "safe capture fact");
+            });
+        }
+    }
+
     @Test
     void existingListenerReceivesChangesAcrossRegistrationAndRetirement() {
         var calls = new AtomicInteger(); var token = Optional.of(new SourcePosition("opaque"));

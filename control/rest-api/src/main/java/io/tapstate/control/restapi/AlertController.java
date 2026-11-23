@@ -57,6 +57,6 @@ class AlertController {
         byte[] body = request.getInputStream().readNBytes(64 * 1024 + 1);
         if (body.length > 64 * 1024) throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "alert request exceeds limit"), null);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
-                .body(dispatcher.dispatch(op, verified.original(), StorageControlController.decode(body)));
+                .body(dispatcher.dispatch(op, verified.original(), StorageControlController.decode(body), ApiExceptionHandler.localeFor(request)));
     }
 }

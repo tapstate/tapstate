@@ -54,9 +54,9 @@ def check(workflows, contexts, inputs):
         'matrix IDs must come from the actual emitted plan'
     build = ci.get('build', '')
     assert build, 'required check build must exist'
-    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('snapshot-lock', 'test-shards', 'build', 'image-smoke')]
+    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('shard-plan', 'snapshot-lock', 'test-shards', 'build', 'image-smoke')]
     assert all(len(value) == 1 for value in versions) and len({value[0] for value in versions}) == 1, \
-        'test, build and image jobs must use the same Java version'
+        'contract, test, build and image jobs must use the same Java version'
     maven_setup = 'run: bash .github/scripts/setup-ci-maven.sh'
     first_maven_steps = {
         'snapshot-lock': 'name: Resolve the reactor',
@@ -267,6 +267,8 @@ for original, replacement in [
     ('export MAVEN_ARGS="$MAVEN_ARGS -nsu"', 'echo test-updates-not-suppressed'),
     ('python3 .github/scripts/ci-snapshot-lock-smoke.py', 'echo snapshot-smoke-removed'),
     ("java-version: '21.0.13+9.0.LTS'", "java-version: '21.0.12+8.0.LTS'"),
+    ("java-version: '21.0.13+9.0.LTS'\n          cache: maven",
+     "java-version: '21.0.12+8.0.LTS'\n          cache: maven"),
     ('Verify exact Java build', 'Missing exact Java build'),
     ('bash .github/scripts/setup-ci-maven.sh', 'echo missing-maven-setup'),
     (MAVEN_ARGS, ''),
