@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.lifecycle.DesiredState;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -44,6 +45,11 @@ public interface PipelineIntentStore {
 
     default void failStart(PendingStart pending, IoError error) {
         throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
+    /** Records an optional public diagnostic for the same pending start and under the same fence. */
+    default void failStart(PendingStart pending, IoError error, Map<String, Object> params) {
+        failStart(pending, error);
     }
 
     /** Only the current native full-recovery permission may publish its first RUNNING intent. */

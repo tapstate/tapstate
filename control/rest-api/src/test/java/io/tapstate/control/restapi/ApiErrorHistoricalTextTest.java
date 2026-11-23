@@ -32,4 +32,17 @@ class ApiErrorHistoricalTextTest {
                 "message", "original captured text");
         assertThat(ApiError.localizeDiagnostic(other, catalog, Locale.SIMPLIFIED_CHINESE)).isEqualTo(other);
     }
+
+    @Test
+    void completeStoredFactsRenderTheDocumentAndFieldInStatus() {
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0480004",
+                Map.of("id", "doc-42", "field", "revision"));
+        var catalog = MessageCatalog.bundled();
+        for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+            var result = ApiError.from(failure, catalog, locale);
+            assertThat(result.code()).isEqualTo(failure.code());
+            assertThat(result.params()).isEqualTo(failure.params());
+            assertThat(result.message()).contains("doc-42", "revision");
+        }
+    }
 }
