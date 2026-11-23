@@ -289,6 +289,12 @@ final class ControlPlane {
      */
     List<Map<String, Object>> preview(
             String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts) {
+        return preview(pipelineId, outputId, rootLimit, sampleId, drafts, null);
+    }
+
+    List<Map<String, Object>> preview(
+            String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts,
+            String language) {
         List<Map<String, String>> encodedDrafts = drafts.stream()
                 .map(draft -> Map.of("source", draft.source(), "content", draft.content()))
                 .toList();
@@ -298,7 +304,7 @@ final class ControlPlane {
         request.put("rootLimit", rootLimit);
         request.put("sampleId", sampleId);
         request.put("drafts", encodedDrafts);
-        HttpResponse<String> response = send(authed("/api/artifacts:preview", JsonWriter.write(request)));
+        HttpResponse<String> response = sourceResponse("POST", "/api/artifacts:preview", request, null, language);
         expect(response, 200, "preview Pipeline " + pipelineId);
         String contentType = response.headers().firstValue("content-type").orElse("");
         if (!contentType.startsWith("application/x-ndjson")) {

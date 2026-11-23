@@ -22,6 +22,9 @@ enum ActuationError implements TapstateErrorCode {
     /** A bounded Pipeline preview could not be completed without weakening its read or size guarantees. */
     PREVIEW_REFUSED(ActuationErrorDefinitions.PREVIEW_REFUSED),
 
+    /** A Map removed a field required to match rows during bounded preview. */
+    PREVIEW_ASSOCIATION_KEY_DROPPED(ActuationErrorDefinitions.PREVIEW_ASSOCIATION_KEY_DROPPED),
+
     /** A start named a pipeline id with no stored artifact to run: {@code pipeline} is the id given. */
     PIPELINE_NOT_FOUND(ActuationErrorDefinitions.PIPELINE_NOT_FOUND),
 
