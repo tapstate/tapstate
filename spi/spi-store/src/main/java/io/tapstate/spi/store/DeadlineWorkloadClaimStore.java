@@ -17,6 +17,18 @@ public interface DeadlineWorkloadClaimStore extends WorkloadClaimStore {
     /** Rechecks the original thread-safe admission guard before work and commit, including retries. */
     <T> T withDeadline(long deadlineNanos,Runnable requireActive,Supplier<T> operation);
 
+    /** Runs one original claim acquisition without taking a renewal or proof worker while it waits. */
+    default <T> T withClaimAcquisition(WorkloadClaimKey key, Runnable requireActive, Supplier<T> operation) {
+        requireActive.run();
+        return operation.get();
+    }
+
+    /** An acquisition's queue, actual session and retries share the caller's original deadline. */
+    default <T> T withClaimAcquisitionDeadline(WorkloadClaimKey key, long deadlineNanos, Runnable requireActive,
+            Supplier<T> operation) {
+        return withDeadline(deadlineNanos, requireActive, operation);
+    }
+
     /** Scoped Pipeline renewal can use a separate execution lane. */
     default <T> T withRenewalDeadline(long deadlineNanos, Runnable requireActive, Supplier<T> operation) {
         return withDeadline(deadlineNanos, requireActive, operation);

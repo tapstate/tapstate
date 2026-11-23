@@ -533,6 +533,8 @@ class ScopedPipelineActuationOwnershipTest {
         var deadlines=new java.util.ArrayList<Long>();
         doAnswer(call->{deadlines.add(call.getArgument(0));((Runnable)call.getArgument(1)).run();return ((java.util.function.Supplier<?>)call.getArgument(2)).get();})
                 .when(bounded).withDeadline(anyLong(),any(),any());
+        org.mockito.Mockito.doCallRealMethod().when(bounded).withClaimAcquisition(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.doCallRealMethod().when(bounded).withClaimAcquisitionDeadline(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
         var observed=ObservedWorkloadClaims.observe(bounded,(write,failure)->{});
         var owner=PipelineActuationOwnership.scoped(BUSINESS,OWNER,membership,new ClusterWorkloadClaims(observed,membership),TTL,RENEW,nanos::get);
         var permit=owner.permit(FIRST);var run=owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));

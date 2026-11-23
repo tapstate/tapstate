@@ -148,6 +148,9 @@ class PipelineActuationRenewalChurnTest {
             assertThat(names.stream().map(String::hashCode).distinct().count()).isEqualTo(1);
             store = (WorkloadClaimStore) Proxy.newProxyInstance(WorkloadClaimStore.class.getClassLoader(),
                     new Class<?>[]{DeadlineWorkloadClaimStore.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("withClaimAcquisition") || method.getName().equals("withClaimAcquisitionDeadline")) {
+                            return java.lang.reflect.InvocationHandler.invokeDefault(proxy, method, args);
+                        }
                         if (method.getName().equals("withDeadline") || method.getName().equals("withRenewalDeadline")) {
                             int offset = args[0] instanceof WorkloadClaimKey ? 1 : 0;
                             return bounded((long) args[offset], args.length - offset == 3 ? (Runnable) args[offset + 1] : () -> {},

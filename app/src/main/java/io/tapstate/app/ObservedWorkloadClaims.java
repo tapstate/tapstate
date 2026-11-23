@@ -19,6 +19,12 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
         Bounded(DeadlineWorkloadClaimStore bounded,BiConsumer<Boolean,Throwable> observer){super(bounded,observer);this.bounded=bounded;}
         public <T>T withDeadline(long deadline,Runnable active,Supplier<T> operation){return bounded.withDeadline(deadline,active,operation);}
         public <T>T withRenewalDeadline(long deadline,Runnable active,Supplier<T> operation){return bounded.withRenewalDeadline(deadline,active,operation);}
+        @Override public <T> T withClaimAcquisition(WorkloadClaimKey key, Runnable active, Supplier<T> operation) {
+            return bounded.withClaimAcquisition(key, active, operation);
+        }
+        @Override public <T> T withClaimAcquisitionDeadline(WorkloadClaimKey key, long deadline, Runnable active, Supplier<T> operation) {
+            return bounded.withClaimAcquisitionDeadline(key, deadline, active, operation);
+        }
         @Override public <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadline, Runnable active,
                 Supplier<T> operation) {
             return bounded.withNodeSessionDeadline(key, deadline, active, operation);

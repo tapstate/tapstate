@@ -521,6 +521,8 @@ class PipelineActuationRenewalBudgetTest {
         private ControlledIo() {
             doAnswer(call -> bounded(worker, call.getArgument(0), call.getArgument(1), call.getArgument(2)))
                     .when(store).withDeadline(anyLong(), any(), any());
+            org.mockito.Mockito.doCallRealMethod().when(store).withClaimAcquisition(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+            org.mockito.Mockito.doCallRealMethod().when(store).withClaimAcquisitionDeadline(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
             doAnswer(call -> bounded(renewalWorker, call.getArgument(0), call.getArgument(1), call.getArgument(2)))
                     .when(store).withRenewalDeadline(anyLong(), any(), any());
             doAnswer(call -> store.withRenewalDeadline(call.<Long>getArgument(1), call.getArgument(2), call.getArgument(3)))
