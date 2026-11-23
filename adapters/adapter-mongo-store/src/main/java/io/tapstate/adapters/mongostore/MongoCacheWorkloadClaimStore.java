@@ -223,10 +223,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
         requireScope(original);
         var key = pipelineKey(original);
-        return operations.pipelineRenewal(key, () -> {
-            var observed = readPipelineAuthority(original, key);
-            return observed == null ? readPipelineTransaction(original, key) : Optional.of(observed);
-        });
+        try {
+            return StoreIo.call(() -> operations.pipelineRenewal(key, () -> {
+                var observed = readPipelineAuthority(original, key);
+                return observed == null ? readPipelineTransaction(original, key) : Optional.of(observed);
+            }));
+        } catch (RuntimeException failure) {
+            operations.structures.clear();
+            throw failure;
+        }
     }
 
     private WorkloadClaimReading readPipelineAuthority(PipelineIntentScope original, WorkloadClaimKey key) {

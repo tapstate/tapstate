@@ -94,7 +94,11 @@ final class MongoCachePipelineAccess {
     }
 
     CheckpointDoc readCheckpoint(MongoStructureProof structures) {
-        return transaction(session -> MongoStateStore.toCheckpoint(state(session, true)));
+        try { return transaction(session -> MongoStateStore.toCheckpoint(state(session, true))); }
+        catch (RuntimeException failure) {
+            if (structures != null) structures.clear();
+            throw failure;
+        }
     }
 
     Document startupSnapshot(List<Document> stages) {

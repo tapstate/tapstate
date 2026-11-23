@@ -165,6 +165,7 @@ boot.node-id-in-use	TS0310028
 boot.node-session-lost	TS0310029
 boot.web-development-confirmation-required	TS0310030
 boot.web-development-artifact-invalid	TS0310031
+boot.migration-mode-conflict	TS0310032
 role.unsupported	TS0320001
 cli.artifact-exists	TS0330001
 cli.demo-workspace-exists	TS0330002
@@ -346,6 +347,8 @@ store.storage-connection-unsupported	TS0470015
 store.invalid-history-retention	TS0470016
 store.history-retention-mismatch	TS0470017
 store.tls-trust-invalid	TS0470018
+store.config-component-identity-required	TS0470019
+store.config-component-identity-unverified	TS0470020
 io.store-unavailable	TS0480001
 io.store-quota-exceeded	TS0480002
 io.store-unauthorized	TS0480003

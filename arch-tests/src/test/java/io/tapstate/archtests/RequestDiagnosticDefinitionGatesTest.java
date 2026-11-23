@@ -58,6 +58,9 @@ class RequestDiagnosticDefinitionGatesTest {
         assertThat(baseline).hasSize(454).contains("control.malformed-request").doesNotContain("TS0210001");
         // This identity landed on main after the immutable migration snapshot.
         assertThat(baseline.add("actuation.sync-output-identity-unresolved")).isTrue();
+        // These retained startup and upgrade identities were introduced after the frozen snapshot.
+        for (String legacy : java.util.List.of("boot.migration-mode-conflict", "store.config-component-identity-required",
+                "store.config-component-identity-unverified")) assertThat(baseline.add(legacy)).isTrue();
         var aggregateBaseline = readCodes("legacy-error-codes-before-aggregate-migration.golden");
         assertThat(aggregateBaseline).hasSize(33).doesNotContainAnyElementsOf(baseline);
         baseline.addAll(aggregateBaseline);
@@ -73,7 +76,7 @@ class RequestDiagnosticDefinitionGatesTest {
             assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
             assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
         }
-        assertThat(replacements).hasSize(490);
+        assertThat(replacements).hasSize(493).contains("TS0310032", "TS0470019", "TS0470020");
         baseline.addAll(replacements);
         // Existing migrated contracts stay present; new product identities are append-only.
         assertThat(readCodes("error-codes.golden")).containsAll(baseline);
