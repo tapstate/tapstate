@@ -189,13 +189,32 @@ class MongoSinkPreparationStoreIT {
             store.complete(store.begin(left),new SinkPreparationStore.Result(false));assertThat(store.load(right).revision()).isZero();
         });
     }
-    @ParameterizedTest @ValueSource(strings={"table","index"})
-    void ordinaryOpenDoesNotRepairMissingStructure(String damage) {
+    @ParameterizedTest @ValueSource(strings = {"table", "index"})
+    void ordinaryTargetWritesDoNotInspectOrInstallMissingStructure(String damage) {
         withFixture(f -> {
-            if(damage.equals("table"))f.rows().drop();else f.rows().dropIndex("sink_preparation_scope");
-            assertThatThrownBy(() -> f.store().prepareTargets(List.of(f.input("orders")))).isInstanceOf(TapstateException.class);
-            if(damage.equals("table")) assertThat(f.cache.listCollectionNames().into(new ArrayList<>())).doesNotContain("sink_preparations");
-            else assertThat(f.rows().listIndexes().into(new ArrayList<>())).noneMatch(index -> "sink_preparation_scope".equals(index.get("name")));
+            if (damage.equals("table")) f.rows().drop();
+            else f.rows().dropIndex("sink_preparation_scope");
+            var operations = new ArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            operations.add(event.getCommandName());
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                var access = new MongoCachePipelineAccess(client, client.getDatabase(f.cache.getName()), f.scope, f.fence, ACTIVE);
+                var store = new MongoSinkPreparationStore(access);
+                var input = f.input("orders");
+                store.prepareTargets(List.of(input));
+                assertThat(store.load(input).phase()).isEqualTo(SinkPreparationStore.Phase.PREPARING);
+                assertThat(operations).contains("insert", "commitTransaction")
+                        .doesNotContain("listCollections", "listIndexes", "create", "createIndexes", "collMod");
+            }
+            // MongoDB can create the collection on insert. The missing managed index still needs explicit repair.
+            assertThat(f.rows().countDocuments()).isOne();
+            assertThat(f.rows().listIndexes().into(new ArrayList<>()))
+                    .noneMatch(index -> "sink_preparation_scope".equals(index.get("name")));
         });
     }
     @Test void guardLossAfterActualReservationRollsBackReceiptClaimAndCheckpoint() {
