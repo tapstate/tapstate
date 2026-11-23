@@ -68,6 +68,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         return startTail(scope, opened, originalCapture, config, start, ports, requireActive, priorCacheHistory, false);
     }
 
+    @SuppressWarnings("java:S2095") // The original owner keeps the registered tail through any pending close.
     public Tail startTail(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
             CaptureConfig config, CaptureStart start, Function<SrsCaptureWriter, CapturePort> ports,
             Runnable requireActive, boolean priorCacheHistory, boolean skipEmptyStartupAck) {

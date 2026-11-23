@@ -1591,7 +1591,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
     }
 
-    private void awaitMismatchClose(Owner owner, Runnable release, Throwable mismatch) {
+    private synchronized void awaitMismatchClose(Owner owner, Runnable release, Throwable mismatch) {
         CompletableFuture<Void> reservation = reserveOwnerOperation(owner);
         var closedTail = new CompletableFuture<Void>();
         ownerOperations.execute(() -> {
