@@ -4263,4 +4263,99 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {1, 3, 4})
+    void exactRecoveryReservationsLeaveOnlyTheProvenSpareSlotsForConcurrentRealTransactions(int reservedCount) {
+        withBusiness(f -> {
+            var operations = new MongoClaimOperations(f.client());
+            var reserved = new java.util.HashSet<io.tapstate.spi.store.WorkloadClaimKey>();
+            for (int i = 0; i < reservedCount; i++) reserved.add(new io.tapstate.spi.store.WorkloadClaimKey(
+                    SCOPE.clusterId(), io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "recover-" + i));
+            var start = new CountDownLatch(1); var release = new CountDownLatch(1);
+            var accepted = new java.util.concurrent.atomic.AtomicInteger(); var refused = new java.util.concurrent.atomic.AtomicInteger();
+            var active = new java.util.concurrent.atomic.AtomicInteger(); var maximum = new java.util.concurrent.atomic.AtomicInteger();
+            try (var caller = Executors.newFixedThreadPool(6)) {
+                var futures = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+                for (int i = 0; i < 6; i++) {
+                    var key = new io.tapstate.spi.store.WorkloadClaimKey(SCOPE.clusterId(), io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "ordinary-" + i);
+                    futures.add(caller.submit(() -> {
+                        awaitPinTestBarrier(start);
+                        try {
+                            operations.renew(key, reserved, System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> {},
+                                    () -> operations.pipelineRenewal(key, () -> {
+                                        var session = f.client().startSession(); var owned = operations.own(session);
+                                        try {
+                                            session.startTransaction();
+                                            SystemCollections.CACHE_IDENTITY.on(f.database()).find(session, new Document("_id", "cluster")).first();
+                                            maximum.accumulateAndGet(active.incrementAndGet(), Math::max); accepted.incrementAndGet();
+                                            awaitPinTestBarrier(release);
+                                            active.decrementAndGet();
+                                            return true;
+                                        } finally { operations.abort(owned, operations.budget()); }
+                                    }));
+                        } catch (io.tapstate.spi.store.WorkloadClaimRenewalException failure) {
+                            assertThat(failure.reason()).isEqualTo(io.tapstate.spi.store.WorkloadClaimRenewalException.Reason.NOT_STARTED);
+                            refused.incrementAndGet();
+                        }
+                    }));
+                }
+                start.countDown();
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(3)).untilAsserted(() -> {
+                    assertThat(accepted).hasValue(4 - reservedCount);
+                    assertThat(refused).hasValue(2 + reservedCount);
+                });
+                var recoveryFutures = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+                try (var recoveryCallers = Executors.newFixedThreadPool(reservedCount)) {
+                    for (var key : reserved) recoveryFutures.add(recoveryCallers.submit(() -> operations.renew(key,
+                            System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> {}, () -> operations.pipelineRenewal(key, () -> {
+                                var session = f.client().startSession(); var owned = operations.own(session);
+                                try {
+                                    session.startTransaction();
+                                    SystemCollections.CACHE_IDENTITY.on(f.database()).find(session, new Document("_id", "cluster")).first();
+                                    maximum.accumulateAndGet(active.incrementAndGet(), Math::max);
+                                    awaitPinTestBarrier(release); active.decrementAndGet(); return true;
+                                } finally { operations.abort(owned, operations.budget()); }
+                            }))));
+                    org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).untilAsserted(() -> assertThat(active).hasValue(4));
+                    assertThat(maximum).hasValue(4);
+                    assertThat(operations.nodeSession(System.nanoTime() + TimeUnit.SECONDS.toNanos(2), () -> {},
+                            () -> f.database().runCommand(new Document("ping", 1)).getDouble("ok"))).isEqualTo(1d);
+                    release.countDown();
+                    for (var future : recoveryFutures) future.get(2, TimeUnit.SECONDS);
+                }
+                for (var future : futures) future.get(2, TimeUnit.SECONDS);
+                System.out.printf("RECOVERY_CAPACITY reserved=%d ordinary=%d refused=%d actual_max_txns=%d node_progress=true%n", reservedCount, accepted.get(), refused.get(), maximum.get());
+            } finally { release.countDown(); operations.await(System.nanoTime() + TimeUnit.SECONDS.toNanos(2)); operations.closeIfIdle(); }
+        });
+    }
+
+    @Test void unresolvedOriginalRenewalTransactionReservesOneSlotWithoutDoubleCountingItsRecoveryKey() {
+        withBusiness(f -> {
+            enablePipelineClaimAdmission(f);
+            var operations = new MongoClaimOperations(f.client());
+            var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {}, null, operations);
+            var retained = operations.renew(f.pipelineA().key(), System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> {},
+                    () -> operations.pipelineRenewal(f.pipelineA().key(), () -> {
+                        var session = f.client().startSession(); var owned = operations.own(session);
+                        session.startTransaction();
+                        SystemCollections.CACHE_IDENTITY.on(f.database()).find(session, new Document("_id", "cluster")).first();
+                        return owned;
+                    }));
+            var extras = new java.util.HashSet<io.tapstate.spi.store.WorkloadClaimKey>();
+            for (int i = 0; i < 3; i++) extras.add(new io.tapstate.spi.store.WorkloadClaimKey(SCOPE.clusterId(), io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "recover-" + i));
+            try {
+                var entered = new java.util.concurrent.atomic.AtomicBoolean();
+                assertNotStarted(() -> authority.withRenewalDeadline(f.pipelineB().key(), extras,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> {}, () -> { entered.set(true); return authority.renew(f.pipelineB(), java.time.Duration.ofSeconds(30)); }));
+                assertThat(entered).isFalse();
+                var deduplicated = new java.util.HashSet<>(extras); deduplicated.remove(deduplicated.iterator().next()); deduplicated.add(f.pipelineA().key());
+                assertThat(authority.withRenewalDeadline(f.pipelineB().key(), deduplicated,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(5), () -> {}, () -> authority.renew(f.pipelineB(), java.time.Duration.ofSeconds(30)))).isPresent();
+                System.out.println("RECOVERY_UNRESOLVED different_keys=4 refused_without_callback=true same_key_dedup=3 ordinary_renewed=true");
+            } finally {
+                operations.call(System.nanoTime() + TimeUnit.SECONDS.toNanos(3), () -> {}, () -> { operations.abort(retained, operations.budget()); return true; });
+                operations.await(System.nanoTime() + TimeUnit.SECONDS.toNanos(2)); operations.closeIfIdle();
+            }
+        });
+    }
 }
