@@ -21,7 +21,8 @@ class ConnectorCatalogHttpTest {
     @Test
     void aDirectoryBeforeTheManifestMustBeEmpty() throws IOException {
         assertThat(ConnectorCatalogHttp.authentication(jarWithLeadingDirectory(new byte[0]))).isEqualTo("Beta");
-        assertThatThrownBy(() -> ConnectorCatalogHttp.authentication(jarWithLeadingDirectory(new byte[]{1})))
+        byte[] jar = jarWithLeadingDirectory(new byte[]{1});
+        assertThatThrownBy(() -> ConnectorCatalogHttp.authentication(jar))
                 .isInstanceOf(IOException.class).hasMessage("Connector directory entry contains data");
     }
 
