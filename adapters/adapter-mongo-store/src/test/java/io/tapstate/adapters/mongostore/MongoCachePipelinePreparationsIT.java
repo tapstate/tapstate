@@ -91,6 +91,128 @@ class MongoCachePipelinePreparationsIT {
         });
     }
 
+    @Test void admittedFirstPreparationUsesOneBoundedVacancyReadPerTransaction() {
+        withFixture(f -> {
+            var commands = new ArrayList<org.bson.BsonDocument>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    commands.add(event.getCommand().clone());
+                }
+            };
+            try (var observed = cacheClient(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var store = new MongoCachePipelinePreparations(observed, observed.getDatabase(f.cacheDatabase.getName()),
+                        f.business(), ACTIVE, true);
+                var grant = f.issue();
+                commands.clear();
+                var reserved = store.reserveFirst(grant, TTL);
+                var reservationCommands = List.copyOf(commands);
+                commands.clear();
+                var receipt = store.seed(reserved, f.configuration.preparations(), AT);
+                var seedCommands = List.copyOf(commands);
+                System.out.println("FIRST_PREPARATION reserve=" + reservationCommands.size() + " seed=" + seedCommands.size());
+                System.out.println("FIRST_PREPARATION_RESERVE " + reservationCommands.stream().map(command -> command.getFirstKey()).toList());
+                System.out.println("FIRST_PREPARATION_SEED " + seedCommands.stream().map(command -> command.getFirstKey()).toList());
+                assertThat(reservationCommands).hasSize(8);
+                assertThat(seedCommands).hasSize(9);
+                for (var batch : List.of(reservationCommands, seedCommands)) {
+                    var vacancy = batch.stream().filter(command -> command.containsKey("aggregate")
+                            && command.getArray("pipeline").size() > 3).toList();
+                    assertThat(vacancy).hasSize(1);
+                    assertThat(vacancy.getFirst()).containsKeys("lsid", "txnNumber");
+                    var stages = vacancy.getFirst().getArray("pipeline");
+                    assertThat(stages.getValues().subList(2, stages.size())).allSatisfy(stage -> {
+                        var lookup = stage.asDocument().getDocument("$lookup").getArray("pipeline");
+                        int offset = lookup.size() - 2;
+                        assertThat(lookup.get(offset).asDocument().getNumber("$limit").intValue()).isEqualTo(1);
+                        assertThat(lookup.get(offset + 1).asDocument().getDocument("$project").getNumber("_id").intValue()).isZero();
+                    });
+                }
+                assertThat(f.configuration.preparations().complete(receipt).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+                assertThat(f.state()).containsEntry("stateJson", "NEW").containsEntry("epoch", 0L);
+            }
+        });
+    }
+
+    @Test void anOversizedOriginalClaimRetainsTheOriginalSeedChecks() {
+        withFixture(f -> {
+            var store = new MongoCachePipelinePreparations(f.cacheClient, f.cacheDatabase, f.business(), ACTIVE, true);
+            var grant = f.issue();
+            var reserved = store.reserveFirst(grant, TTL);
+            f.claims().updateOne(pipelineFilter(f.scope), new Document("$set", new Document("extra", "x".repeat(70 * 1024))));
+            var receipt = store.seed(reserved, f.configuration.preparations(), AT);
+            assertThat(f.configuration.preparations().complete(receipt).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+            assertThat(f.claim()).containsEntry("extra", "x".repeat(70 * 1024));
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"state,false", "inventory,false", "offset,false", "batch,false", "sink,false",
+            "state,true", "inventory,true", "offset,true", "batch,true", "sink,true"})
+    void aForeignCaseInsensitiveCollectionCannotHideExistingBirthFacts(String collection, boolean seeding) {
+        withFixture(f -> {
+            var store = new MongoCachePipelinePreparations(f.cacheClient, f.cacheDatabase, f.business(), ACTIVE, true);
+            var grant = f.issue();
+            var reservation = seeding ? store.reserveFirst(grant, TTL) : null;
+            var scope = MongoPipelinePreparationFacts.scope(f.scope);
+            scope.put("pipelineId", "FLOW");
+            var table = switch (collection) {
+                case "state" -> SystemCollections.CACHE_PIPELINE_STATE;
+                case "inventory" -> SystemCollections.CACHE_OPERATOR_CLEANUP;
+                case "offset" -> SystemCollections.DIRECT_CHANNEL_OFFSETS;
+                case "batch" -> SystemCollections.DIRECT_BATCHES;
+                case "sink" -> SystemCollections.CACHE_SINK_PREPARATIONS;
+                default -> throw new AssertionError(collection);
+            };
+            var id = switch (collection) {
+                case "state" -> (Object) "FLOW";
+                case "inventory" -> scope;
+                case "offset", "sink" -> new Document("scope", scope);
+                case "batch" -> new Document("channel", new Document("scope", scope));
+                default -> throw new AssertionError(collection);
+            };
+            table.on(f.cacheDatabase).drop();
+            f.cacheDatabase.createCollection(table.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                    .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                            .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            table.on(f.cacheDatabase).insertOne(new Document("_id", id));
+            var before = f.snapshot();
+            if (seeding) assertCode(() -> store.seed(reservation, f.configuration.preparations(), AT), IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            else assertCode(() -> store.reserveFirst(grant, TTL), IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void populatedSiblingFactsRetainTheOriginalCollectionQueries(boolean directSibling) {
+        withFixture(f -> {
+            for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_OPERATOR_CLEANUP,
+                    SystemCollections.CACHE_SINK_PREPARATIONS)) table.on(f.cacheDatabase).insertOne(new Document("_id", "peer"));
+            if (directSibling) for (var table : List.of(SystemCollections.DIRECT_CHANNEL_OFFSETS, SystemCollections.DIRECT_BATCHES))
+                table.on(f.cacheDatabase).insertOne(new Document("_id", "peer"));
+            var commands = new ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var observed = cacheClient(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var store = new MongoCachePipelinePreparations(observed, observed.getDatabase(f.cacheDatabase.getName()), f.business(), ACTIVE, true);
+                var grant = f.issue();
+                commands.clear();
+                var reserved = store.reserveFirst(grant, TTL);
+                int reserve = commands.size();
+                commands.clear();
+                var receipt = store.seed(reserved, f.configuration.preparations(), AT);
+                int seed = commands.size();
+                System.out.println("POPULATED_FIRST_PREPARATION direct=" + directSibling + " reserve=" + reserve + " seed=" + seed);
+                assertThat(reserve).isEqualTo(directSibling ? 13 : 11);
+                assertThat(seed).isEqualTo(directSibling ? 14 : 12);
+                assertThat(f.configuration.preparations().complete(receipt).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+            }
+        });
+    }
+
     @Test void invocationIsConsumedBeforeTheCacheGuardAndCannotBeRepeatedAfterReentry() {
         withFixture(f -> {
             var grant = f.issue();

@@ -82,9 +82,12 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                 if(MongoPipelineRetirementFacts.sameBusiness(result.scope(),preparation.scope()) && result.cache().isPresent())
                     return reserveRetired(session,preparation,inputs,result.cache().orElseThrow(),node,serverNow,ttl);
             } else if(preparation.scope().stateGeneration()!=1)throw rebuild(preparation.scope());
-            if (claimRow(session, preparation.scope()) != null || stateRow(session, preparation.scope()) != null || inventoryExists(session, preparation.scope())) throw rebuild(preparation.scope());
-            MongoPipelineSourcePreparations.requireEmpty(session,database,preparation.scope());
-            MongoSinkPreparationStore.requireEmpty(session,database,preparation.scope());
+            if (admitted) requireVacant(session, preparation.scope(), true);
+            else {
+                if (claimRow(session, preparation.scope()) != null || stateRow(session, preparation.scope()) != null || inventoryExists(session, preparation.scope())) throw rebuild(preparation.scope());
+                MongoPipelineSourcePreparations.requireEmpty(session,database,preparation.scope());
+                MongoSinkPreparationStore.requireEmpty(session,database,preparation.scope());
+            }
             var key = pipelineKey(preparation.scope());
             Document row = new Document("_id", MongoWorkloadClaimStore.id(key)).append("clusterId", key.clusterId())
                     .append("resourceType", key.type().name()).append("resourceId", key.resourceId())
@@ -145,7 +148,9 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         // Cross-domain validation is deliberately outside the CACHE transaction and its retry callback.
         requireIssued.run();
         transaction(original.scope(), false, () -> {}, session -> {
-            Document row = requireOriginal(session, original.scope(), original.preparationId());
+            var birth = admitted ? readBirthFacts(session, original.scope(), false) : null;
+            Document row = requireOriginal(session, original.scope(), original.preparationId(),
+                    birth == null || birth.original() == null ? claimRow(session, original.scope()) : birth.original());
             var inputs = admitted ? MongoPipelineSourcePreparations.retained(row, original.scope())
                     : MongoPipelineSourcePreparations.retained(session,database,original.scope());
             WorkloadClaim claim = admitted ? raw(session).decodeStored(row)
@@ -156,8 +161,12 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                 return null;
             }
             requireInitialClaim(claim, original.scope(), admitted ? row : claimRow(session, original.scope()));
-            requireUnseeded(session,original.scope(),row);
-            MongoSinkPreparationStore.requireEmpty(session,database,original.scope());
+            boolean vacant = birth != null && birth.original() != null && retiredBirth(row, original.scope()).isEmpty();
+            if (vacant) requireVacant(session, original.scope(), birth.probes(), false);
+            else {
+                requireUnseeded(session,original.scope(),row);
+                MongoSinkPreparationStore.requireEmpty(session,database,original.scope());
+            }
             Document filter = WorkloadClaimDocuments.live(original.claim())
                     .append("pipelineScope", MongoPipelinePreparationFacts.scope(original.scope()))
                     .append("pipelinePreparation", marker(original.preparationId(), Phase.RESERVED));
@@ -175,7 +184,8 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
             }
             if (admitted) MongoOperatorInventory.insertInitial(session, database, original.scope(), original.preparationId());
             else MongoOperatorInventory.prepareInitial(session, database, original.scope(), original.preparationId());
-            MongoPipelineSourcePreparations.seedInitial(session,database,original.scope(),inputs);
+            if (!vacant || !inputs.directChannels().isEmpty())
+                MongoPipelineSourcePreparations.seedInitial(session,database,original.scope(),inputs);
             MongoSnapshotStateStore.seedInitial(session,database,original.scope());
             return null;
         });
@@ -243,7 +253,10 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
     }
 
     private Document requireOriginal(ClientSession session, PipelineIntentScope scope, String preparationId) {
-        Document row = claimRow(session, scope);
+        return requireOriginal(session, scope, preparationId, claimRow(session, scope));
+    }
+
+    private Document requireOriginal(ClientSession session, PipelineIntentScope scope, String preparationId, Document row) {
         if (row == null) throw rebuild(scope);
         if (admitted) raw(session).decodeStored(row);
         else if (raw(session).read(pipelineKey(scope)).isEmpty()) throw new java.util.NoSuchElementException("No value present");
@@ -365,6 +378,54 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         Objects.requireNonNull(original, "original");
         if (original.phase() != PipelinePreparation.Phase.ISSUED) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
     }
+    private record BirthFacts(Document original, Document probes) {}
+
+    /** Presence is captured in the original write transaction; each lookup returns at most one boolean. */
+    private void requireVacant(ClientSession session, PipelineIntentScope scope, boolean includeClaim) {
+        requireVacant(session, scope, readBirthFacts(session, scope, includeClaim).probes(), includeClaim);
+    }
+
+    private void requireVacant(ClientSession session, PipelineIntentScope scope, Document captured, boolean includeClaim) {
+        if (captured == null) throw rebuild(scope);
+        // A populated namespace retains its own query collation at the original collection boundary.
+        for (var entry : vacancyFilters(scope, includeClaim).entrySet()) {
+            if (!captured.getList(entry.getKey().collectionName(), Document.class).isEmpty()
+                    && (entry.getKey() == SystemCollections.CACHE_WORKLOAD_CLAIMS
+                    || entry.getKey().on(database).find(session, entry.getValue()).first() != null)) throw rebuild(scope);
+        }
+    }
+
+    private java.util.Map<SystemCollections, Document> vacancyFilters(PipelineIntentScope scope, boolean includeClaim) {
+        var filters = new java.util.LinkedHashMap<SystemCollections, Document>();
+        if (includeClaim) filters.put(SystemCollections.CACHE_WORKLOAD_CLAIMS,
+                new Document("_id", MongoWorkloadClaimStore.id(pipelineKey(scope))));
+        filters.put(SystemCollections.CACHE_PIPELINE_STATE, new Document("_id", scope.pipelineId()));
+        filters.put(SystemCollections.CACHE_OPERATOR_CLEANUP, new Document("_id", MongoPipelinePreparationFacts.scope(scope)));
+        filters.put(SystemCollections.DIRECT_CHANNEL_OFFSETS, new Document("_id.scope", MongoPipelinePreparationFacts.scope(scope)));
+        filters.put(SystemCollections.DIRECT_BATCHES, new Document("_id.channel.scope", MongoPipelinePreparationFacts.scope(scope)));
+        filters.put(SystemCollections.CACHE_SINK_PREPARATIONS, MongoSinkPreparationStore.scopeFilter(scope));
+        return filters;
+    }
+
+    private BirthFacts readBirthFacts(ClientSession session, PipelineIntentScope scope, boolean includeClaim) {
+        var filters = vacancyFilters(scope, includeClaim);
+        var stages = new java.util.ArrayList<Document>();
+        if (includeClaim) stages.add(new Document("$limit", 1));
+        else stages.add(new Document("$match", new Document("_id", MongoWorkloadClaimStore.id(pipelineKey(scope)))));
+        stages.add(new Document("$project", new Document("_id", 0).append("original", new Document("$cond", List.of(
+                new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), 64 * 1024)), "$$ROOT", false)))));
+        filters.forEach((table, filter) -> {
+            var probe = new java.util.ArrayList<Document>();
+            if (table == SystemCollections.CACHE_WORKLOAD_CLAIMS) probe.add(new Document("$match", filter));
+            probe.add(new Document("$limit", 1));
+            probe.add(new Document("$project", new Document("_id", 0).append("present", new Document("$literal", true))));
+            stages.add(new Document("$lookup", new Document("from", table.collectionName())
+                    .append("as", table.collectionName()).append("pipeline", probe)));
+        });
+        var captured = claims.aggregate(session, stages).first();
+        return new BirthFacts(captured != null && captured.get("original") instanceof Document original ? original : null, captured);
+    }
+
     private boolean inventoryExists(ClientSession session, PipelineIntentScope scope) {
         return SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first() != null;
     }
