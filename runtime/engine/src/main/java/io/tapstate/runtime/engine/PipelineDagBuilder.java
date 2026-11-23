@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.dsl.aggregate.AggregateDefinition;
 import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.lifecycle.AwaitedLoad;
+import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
@@ -673,12 +674,10 @@ public final class PipelineDagBuilder {
     /**
      * Draws a sink that runs the same number of writers on every member, and the router in front of it.
      *
-     * <p>The router takes the sink's rows over a distributed edge keyed by where each row lands - its target
-     * table and its key there - so every router instance hears every upstream processor's bounds, and one key's
-     * rows reach one instance in the order they were read. From the router a keyed table's snapshot rows go to
-     * whichever writer has room, and everything else to the writer its key belongs to, over the same key. Both
-     * vertices are as wide as the sink was worked out to be, and both refuse an execution on any other member
-     * count.
+     * <p>The router takes the sink's rows over a distributed edge partitioned by target table or row key.
+     * A keyed table's snapshot rows then go to whichever writer has room. Changes follow the same partition
+     * on both edges to keep their order. By default, a target table's changes stay together so updates can
+     * change keys. Both vertices use the sink's planned width and refuse any other member count.
      *
      * <p>A writer takes rows from every router instance over both edges, so it goes by bounds, combined over
      * the two edges - each of which carries every chain the sink receives.
@@ -690,7 +689,8 @@ public final class PipelineDagBuilder {
         String name = sink.name();
         Map<String, SinkTarget> targets = shape.sinkTargetsOf(name);
         int local = shape.localOf(name);
-        com.hazelcast.function.FunctionEx<Object, Object> byTarget = RoutingKeys.forSink(name, targets);
+        boolean orderChangesByTable = shape.nodes().get(name).origin() == NodeParallelism.Origin.NODE_DEFAULT;
+        var byTarget = RoutingKeys.forSink(name, targets, orderChangesByTable);
         Vertex router = dag.newVertex(ROUTE_VERTEX_PREFIX + name, SinkRouter.metaSupplier(targets, axes,
                         chains == null ? null : chains.perOrdinal(sink.upstream()), shape.plannedMembers()))
                 .localParallelism(local);

@@ -20,9 +20,9 @@ import java.util.Set;
  * <p>A snapshot row of a keyed target table goes to whichever writer has room: a load's rows may land in any
  * order, and handing them out as writers free up is what lets every writer take part rather than leaving a
  * slow one with a fixed share of the table. Every other row - a change, a row of a table with no key, a schema
- * change, word that a chain got past positions with nothing to deliver - goes to the writer its target table
- * and key belong to, so one row's changes are applied on one writer in the order they were read. The two ways
- * are two outbound edges, and a row takes exactly one of them.
+ * change, word that a chain got past positions with nothing to deliver - takes the partitioned edge. For a
+ * default sink, all changes of one table go to one writer. An explicitly widened sink partitions changes by
+ * row key. A row takes exactly one of the two outbound edges.
  *
  * <p>Rows reach it over a distributed edge keyed the same way, so every instance hears every upstream
  * processor's bounds and speaks for every chain the sink receives. It combines them edge by edge, over the

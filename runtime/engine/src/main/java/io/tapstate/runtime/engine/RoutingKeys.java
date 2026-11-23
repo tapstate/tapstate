@@ -21,12 +21,12 @@ import java.util.Map;
  * converted value by what it holds rather than by its carrier. It is prefixed with the stream, so two tables
  * that happen to hold the same key values are routed independently.
  *
- * <p>Three things are not routed by a row key, and none of them silently. A schema change belongs to the whole
+ * <p>For an edge partitioned by row, a schema change belongs to the whole
  * stream and goes by the stream alone. Word that a chain got past positions with nothing to deliver belongs
  * to no row and goes to one fixed processor, as a hand-off rather than a copy per processor. And a change whose
  * key cannot be read, or that moves its row from one key to another, ends the run with a code: there is no
- * processor it could be sent to that keeps every change of both keys in order, and sending it to any one of
- * them anyway is how a row's changes come to be applied out of order with nothing reporting it.
+ * processor it could be sent to that keeps every change of both keys in order. A default sink routes changes
+ * by target table instead, so both keys already share a writer.
  */
 final class RoutingKeys {
 
@@ -60,22 +60,23 @@ final class RoutingKeys {
             throw new IllegalStateException("stream '" + stream + "' reached node '" + node
                     + "' with no key to route it by");
         }
-        return lane(stream, rowKey(node, stream, columns, event));
+        return lane(stream, rowKey(node, stream, columns, event, true));
     }
 
     /**
      * The routing function for the edges into and within the sink {@code node}, whose streams write the
-     * targets given. A row goes by the table it lands in and its key there, never by the stream it came in
-     * on, so rows of two source tables written into one target table meet on one writer when their keys
-     * are the same. A row of a table with no key, and a schema change, goes by the table alone: the table is
-     * then written serially, on one writer, while the sink's other tables are not held to it.
+     * targets given. A row goes by its target table and, where partitioned by row, its key in that table.
+     * Default sinks send all changes for each target table to one writer so an update can move between keys.
+     * Keyed snapshot rows are still partitioned by key on the way to the router, which spreads them to the writers.
      */
-    static FunctionEx<Object, Object> forSink(String node, Map<String, SinkTarget> targetsByStream) {
+    static FunctionEx<Object, Object> forSink(String node, Map<String, SinkTarget> targetsByStream,
+            boolean orderChangesByTable) {
         Map<String, SinkTarget> targets = new LinkedHashMap<>(targetsByStream);
-        return item -> sinkKeyOf(node, targets, item);
+        return item -> sinkKeyOf(node, targets, orderChangesByTable, item);
     }
 
-    static Object sinkKeyOf(String node, Map<String, SinkTarget> targetsByStream, Object item) {
+    private static Object sinkKeyOf(String node, Map<String, SinkTarget> targetsByStream,
+            boolean orderChangesByTable, Object item) {
         if (item instanceof SettledPositions) {
             return SETTLED_POSITIONS_LANE;
         }
@@ -89,22 +90,24 @@ final class RoutingKeys {
         if (event.op() == Op.DDL || !target.keyed()) {
             return lane(target.table(), "");
         }
-        return lane(target.table(), rowKey(node, event.src(), target.keyColumns(), event));
+        boolean byTable = orderChangesByTable && event.op() != Op.READ;
+        String key = rowKey(node, event.src(), target.keyColumns(), event, !byTable);
+        return lane(target.table(), byTable ? "" : key);
     }
 
     /**
      * The key {@code columns} spell on the row {@code event} changes, read off its later image or, for a
-     * removal, its earlier one. A key that cannot be read, or a change that moves its row to another key, ends
-     * the run with a code - see the class comment.
+     * removal, its earlier one. A missing key ends the run with a code, as does a key move on a row-partitioned edge.
      */
-    private static String rowKey(String node, String stream, List<String> columns, Envelope event) {
+    private static String rowKey(String node, String stream, List<String> columns, Envelope event,
+            boolean rejectKeyChange) {
         Map<String, Object> image = event.op() == Op.DELETE ? event.before() : event.after();
         JoinKey key = keyFrom(image, columns);
         if (key == null) {
             throw new TapstateException(EngineError.ROUTING_KEY_MISSING,
                     Map.of("node", node, "stream", stream, "columns", String.join(", ", columns)), null);
         }
-        if (event.op() == Op.UPDATE) {
+        if (rejectKeyChange && event.op() == Op.UPDATE) {
             // Only where the earlier image carries the whole key can a move be told from no move at all: a
             // change whose earlier image is partial or absent says nothing about its old key.
             JoinKey earlier = keyFrom(event.before(), columns);
