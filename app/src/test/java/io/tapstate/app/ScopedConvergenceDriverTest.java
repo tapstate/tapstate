@@ -140,6 +140,111 @@ class ScopedConvergenceDriverTest {
                 sampler, metricsExport, eligible::get, ownership, bindings, periodicObservations, pipelineConvergences, nanoTime::get);
     }
 
+    @org.junit.jupiter.api.RepeatedTest(2)
+    void aNeverAdmittedFinalRetriesWithoutRepeatingAcknowledgedHistory() throws Exception {
+        repairRejectedFinal("queue");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"rules-changed","producer-changed","new-stop","history-invalid",
+            "accepted-timer","source-missing","source-late","source-after-check","unknown-commit","jet-changed",
+            "checkpoint-changed","new-run","purge","restart"})
+    void unprovenFinalRecoveryKeepsTheCompleteConvergencePath(String mode) throws Exception {
+        repairRejectedFinal(mode);
+    }
+
+    private void repairRejectedFinal(String mode) throws Exception {
+        var f=this;var a=new PipelineAlertRuntimeTest();var catalog=io.tapstate.core.alerting.BuiltinAlarmTypes.catalog();
+        var alarmScope=AlertEvaluationHostTest.definition("pipeline.failed").header().identity().scope();
+        var rules=new ArrayList<io.tapstate.core.alerting.AlertConfiguration.Definition>();var providers=new java.util.HashSet<String>();
+        for(var type:catalog.types()){
+            var header=io.tapstate.core.alerting.AlertConfiguration.Header.create(io.tapstate.core.alerting.AlertConfiguration.Identity.create(io.tapstate.core.alerting.AlertConfiguration.Kind.RULE,alarmScope,"builtin-"+type.id()),io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM,java.time.Instant.now(),"operator");
+            rules.add(new io.tapstate.core.alerting.AlertConfiguration.Rule(header,"Rule",type.id(),type.version(),new io.tapstate.core.alerting.AlertConfiguration.Resources(type.resourceKinds(),true,java.util.Set.of()),type.validatedParameters(Map.of()),null,true,null).validated(catalog).enrolled(null));providers.add(type.providerId());
+        }
+        when(a.fixture.store.evaluationRules(any(),org.mockito.ArgumentMatchers.anyInt())).thenReturn(new io.tapstate.spi.store.AlertStore.DefinitionPage(rules,null));
+        var blocked=new java.util.concurrent.CountDownLatch(2);var release=new java.util.concurrent.CountDownLatch(1);var targetCommits=new java.util.concurrent.atomic.AtomicInteger();var unknown=new java.util.concurrent.atomic.AtomicBoolean(mode.equals("unknown-commit"));var rechecks=new java.util.concurrent.atomic.AtomicInteger();var lateEntered=new java.util.concurrent.CountDownLatch(1);var lateRelease=new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(call->{if(!mode.equals("unknown-commit")){blocked.countDown();assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}return Optional.ofNullable(a.rows.get(call.getArgument(0)));}).when(a.fixture.store).state(any(),any());
+        org.mockito.Mockito.doAnswer(call->{io.tapstate.spi.store.AlertStore.Commit c=call.getArgument(0);var change=c.state();if(change.after().snapshot().rule().key().resource().kind().equals("pipeline"))targetCommits.incrementAndGet();a.rows.put(change.after().snapshot().rule().key(),new io.tapstate.spi.store.AlertStore.Stored<>(change.revision()+1,change.after()));if(change.after().snapshot().rule().key().resource().kind().equals("pipeline")&&unknown.getAndSet(false))throw new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","UnknownTransactionCommitResult"),null);return io.tapstate.spi.store.AlertStore.Outcome.STAGED;}).when(a.fixture.store).commit(any());
+        var receipt=new java.util.concurrent.atomic.AtomicReference<TerminalPublication.Receipt>();var publication=new java.util.concurrent.atomic.AtomicReference<TerminalPublication>();
+        var evaluator=new AlertEvaluationHost(a.fixture.store,catalog,io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM,java.time.Clock.systemUTC(),"queue-witness",()->{});
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(a.fixture.store,evaluator,catalog,null,null,providers),f.intents,(scope,claim)->Optional.of(()->{}),()->{},java.time.Clock.systemUTC());
+            var writer=new ProcessObservationWriter(mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class),false);
+            var stopWorkers=new PipelineConvergences(1,2)) {
+            f.pipelineConvergences=stopWorkers;
+            when(f.ownership.finishStoppedRelease("orders")).thenReturn(true);
+            f.observationWrites=writer;f.nativeSampling=mock(NativeObservationSampling.class);f.sampleMetrics=true;
+            f.sampler=mock(io.tapstate.runtime.scheduler.RateSampler.class);when(f.sampler.idle(any())).thenReturn(true);
+            f.stoppedRecheck=(processed,checkpoint,original,tenure)->{rechecks.incrementAndGet();
+                if(mode.equals("source-after-check")&&rechecks.get()==1){
+                    var source=runtime.pipelineGuard(new ExecutionFence(FIRST,WorkloadClaimFence.from(f.claims.read(KEY).orElseThrow().claim())),()->{throw ThreeLayerStorePort.refused();});
+                    runtime.resourceInput(new io.tapstate.core.alerting.AlarmKey.Resource("source","owned-after-check","one"),"source.connection-failed",1,"producer",source,()->{},new io.tapstate.core.alerting.AlertInput.Operational(java.time.Instant.now(),"a".repeat(64),io.tapstate.core.alerting.OperationalEvidence.Capability.INITIALIZE,false,"b".repeat(64),null));source.close();org.awaitility.Awaitility.await().until(()->runtime.health().queuedInputs()==0);
+                }
+                if(mode.equals("jet-changed"))return false;assertThat(processed).isEqualTo(f.intents.snapshot);f.views.check(processed.scope(),original,()->{});return checkpoint.equals(f.views.pipelineStates(FIRST,original,()->{}).read("orders").orElseThrow());};
+            f.intents.snapshot=new PipelineIntentSnapshot(FIRST,4,new DesiredState("orders",PipelineState.STOPPED,"original"));
+            f.alertFeed=new PipelineAlertFeed(){
+                public void expecting(PipelineConvergencePass p){runtime.expecting(p);}
+                public void published(PipelineConvergencePass p,Observation o,Throwable t){runtime.published(p,o,t);}
+                public void unavailable(PipelineConvergencePass p){runtime.unavailable(p);}
+                public void retain(java.util.Collection<String> ids){runtime.retain(ids);}
+                public boolean needsFrequentTerminalSamples(PipelineIntentScope scope){return runtime.needsFrequentTerminalSamples(scope);}
+                public boolean needsFrequentTerminalSamples(PipelineIntentScope scope,PipelineState state){return runtime.needsFrequentTerminalSamples(scope,state);}
+                public boolean needsFreshTerminalMetrics(PipelineIntentScope scope){return runtime.needsFreshTerminalMetrics(scope);}
+                public TerminalPublication.Receipt terminalPublished(PipelineConvergencePass p,TerminalPublication t,Observation o,Throwable x,boolean measured){publication.set(t);var r=runtime.terminalPublished(p,t,o,x,measured);receipt.set(r);return r;}
+            };
+            runtime.tick();org.awaitility.Awaitility.await().until(()->runtime.health().queuedInputs()==0);
+            try(var driver=f.driver()) {
+                var local=mock(PipelineActuationOwnership.Pass.class);when(f.ownership.enterPass(FIRST)).thenReturn(local);
+                var handed=mock(PipelineActuationOwnership.StopRelease.class);when(handed.status()).thenReturn(PipelineActuationOwnership.StopReleaseStatus.CONFIRMED);
+                when(local.relinquishStopped(eq(FIRST),any())).thenReturn(handed);
+                var originalClaim=f.claims.read(KEY).orElseThrow().claim();f.claims.advanceExecution(originalClaim,7,java.util.Set.of("node")).orElseThrow();
+                if(!mode.equals("unknown-commit"))for(int i=0;i<64;i++)runtime.resourceInput(new io.tapstate.core.alerting.AlarmKey.Resource("source","independent-"+i,"one"),"source.connection-failed",1,"producer",()->{},new io.tapstate.core.alerting.AlertInput.Operational(java.time.Instant.now(),"a".repeat(64),io.tapstate.core.alerting.OperationalEvidence.Capability.INITIALIZE,false,"b".repeat(64),null));
+                if(!mode.equals("unknown-commit")){assertThat(blocked.await(2,TimeUnit.SECONDS)).isTrue();assertThat(runtime.health().queuedInputs()).isEqualTo(64);}
+                if(mode.equals("source-missing")){
+                    var fence=WorkloadClaimFence.from(f.claims.read(KEY).orElseThrow().claim());
+                    var source=runtime.pipelineGuard(new ExecutionFence(FIRST,fence),()->{});
+                    runtime.resourceInput(new io.tapstate.core.alerting.AlarmKey.Resource("source","owned-source","one"),"source.connection-failed",1,"producer",source,()->{},new io.tapstate.core.alerting.AlertInput.Operational(java.time.Instant.now(),"a".repeat(64),io.tapstate.core.alerting.OperationalEvidence.Capability.INITIALIZE,false,"b".repeat(64),null));source.close();
+                }
+                driver.reconcile();org.awaitility.Awaitility.await().until(()->receipt.get()!=null&&!stopWorkers.stopping("orders"));writer.flush();if(mode.equals("unknown-commit"))org.awaitility.Awaitility.await().until(()->runtime.health().queuedInputs()==0);var history=writer.terminalHistory(publication.get(),null);
+                int measured=(int)f.views.writes.stream().filter(w->w.kind().equals("observation")).count();int historyCount=(int)f.views.writes.stream().filter(w->w.kind().equals("rate")).count();
+                assertThat(history.status()).isEqualTo(TerminalPublication.Status.COMPLETE);assertThat(receipt.get().status()).isEqualTo(TerminalPublication.Status.FAILED);assertThat(targetCommits).hasValue(mode.equals("unknown-commit")?1:0);verify(local,never()).relinquishStopped(any(),any());
+                release.countDown();org.awaitility.Awaitility.await().until(()->runtime.health().queuedInputs()==0);
+                if(mode.equals("source-late")){
+                    var source=runtime.pipelineGuard(new ExecutionFence(FIRST,WorkloadClaimFence.from(f.claims.read(KEY).orElseThrow().claim())),()->{lateEntered.countDown();try{assertThat(lateRelease.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}});
+                    runtime.resourceInput(new io.tapstate.core.alerting.AlarmKey.Resource("source","late-owned-source","one"),"source.connection-failed",1,"producer",source,()->{},new io.tapstate.core.alerting.AlertInput.Operational(java.time.Instant.now(),"a".repeat(64),io.tapstate.core.alerting.OperationalEvidence.Capability.INITIALIZE,false,"b".repeat(64),null));source.close();assertThat(lateEntered.await(2,TimeUnit.SECONDS)).isTrue();
+                }
+                if(mode.equals("rules-changed")){
+                    var r=(io.tapstate.core.alerting.AlertConfiguration.Rule)rules.getFirst();var edited=new io.tapstate.core.alerting.AlertConfiguration.Rule(r.header().next(java.time.Instant.now(),"operator"),"Edited",r.typeId(),r.typeVersion(),r.resources(),r.parameters(),r.severityOverride(),r.enabled(),r.metric()).validated(catalog).enrolled(null);var changed=new ArrayList<>(rules);changed.set(0,edited);when(a.fixture.store.evaluationRules(any(),org.mockito.ArgumentMatchers.anyInt())).thenReturn(new io.tapstate.spi.store.AlertStore.DefinitionPage(changed,null));runtime.tick();org.awaitility.Awaitility.await().until(()->runtime.health().queuedInputs()==0);
+                }
+                if(mode.equals("producer-changed")){var current=f.claims.read(KEY).orElseThrow().claim();f.claims.advanceExecution(current,7,java.util.Set.of("node")).orElseThrow();}
+                if(mode.equals("new-run"))f.intents.snapshot=new PipelineIntentSnapshot(FIRST,5,new DesiredState("orders",PipelineState.RUNNING,"original"));
+                if(mode.equals("purge"))f.intents.snapshot=new PipelineIntentSnapshot(FIRST,5,new DesiredState("orders",PipelineState.STOPPED,"original",true));
+                if(mode.equals("checkpoint-changed")){var cp=f.views.state(FIRST).read("orders").orElseThrow();f.views.state(FIRST).compareAndSwap("orders",cp.epoch(),StateJson.of(PipelineState.STOPPED),T0.plusSeconds(1));}
+                if(mode.equals("new-stop"))f.intents.snapshot=new PipelineIntentSnapshot(FIRST,5,new DesiredState("orders",PipelineState.STOPPED,"original"));
+                if(mode.equals("history-invalid"))writer.expecting(f.passes.getFirst());
+                if(mode.equals("accepted-timer")){for(int turn=0;turn<4&&targetCommits.get()==0;turn++){runtime.tick();org.awaitility.Awaitility.await().until(()->runtime.health().queuedInputs()==0);}assertThat(targetCommits.get()).isPositive();}
+                f.nanoTime.set(Duration.ofSeconds(31).toNanos());var rescanning=mode.equals("restart")?f.driver():driver;int beforeLoads=f.intents.loads;rescanning.schedule();org.awaitility.Awaitility.await().until(()->!stopWorkers.stopping("orders")&&(!mode.equals("new-run")||f.carrying.get()));writer.flush();if(mode.equals("new-run"))awaitPasses(rescanning);
+                if(mode.equals("source-late")){verify(local,never()).relinquishStopped(any(),any());lateRelease.countDown();}
+                org.awaitility.Awaitility.await().until(()->runtime.health().queuedInputs()==0);
+                int measuredAfter=(int)f.views.writes.stream().filter(w->w.kind().equals("observation")).count();int historiesAfter=(int)f.views.writes.stream().filter(w->w.kind().equals("rate")).count();
+                if(mode.equals("queue")) {
+                    assertThat(measuredAfter).as("only the unadmitted final alert needs retry").isEqualTo(measured);
+                    assertThat(historiesAfter).isEqualTo(historyCount);assertThat(history.status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+                    verify(local,never()).relinquishStopped(any(),any());
+                    driver.schedule();org.awaitility.Awaitility.await().untilAsserted(()->verify(local).relinquishStopped(eq(FIRST),any()));
+                    assertThat(rechecks.get()).isGreaterThanOrEqualTo(2);
+                } else if(mode.equals("new-run")){
+                    assertThat(f.carrying).isTrue();assertThat(f.intents.loads).isGreaterThan(beforeLoads);assertThat(history.status()).isEqualTo(TerminalPublication.Status.FAILED);verify(local,never()).relinquishStopped(any(),any());
+                } else if(mode.equals("purge")){
+                    assertThat(f.intents.loads).isGreaterThan(beforeLoads);verify(local,never()).relinquishStopped(any(),any());
+                } else {
+                    assertThat(measuredAfter).as(mode+" retains the complete old path").isEqualTo(measured+1);
+                    assertThat(historiesAfter).isEqualTo(historyCount+1);verify(local,never()).relinquishStopped(any(),any());
+                }
+                if(rescanning!=driver)rescanning.close();
+            }finally{release.countDown();lateRelease.countDown();}
+        }
+    }
+
     @Test void reusedTerminalProjectionFeedsLifecycleAlertsButDoesNotInventMetricHistory() {
         intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
                 new DesiredState("orders", PipelineState.STOPPED, "original"));
@@ -1185,6 +1290,7 @@ class ScopedConvergenceDriverTest {
         }
         @Override public io.tapstate.spi.store.RateHistoryStore pipelineRateHistory(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
             var writer = mock(io.tapstate.spi.store.RateHistoryStore.class);
+            org.mockito.Mockito.doCallRealMethod().when(writer).appendWithin(any(io.tapstate.core.lifecycle.RateSample.class), any(Duration.class));
             org.mockito.Mockito.doAnswer(call -> { check(scope, original, active); writes.add(new Write("rate", scope, original)); rates.append(call.getArgument(0)); return null; })
                     .when(writer).append(any(io.tapstate.core.lifecycle.RateSample.class)); return writer;
         }
