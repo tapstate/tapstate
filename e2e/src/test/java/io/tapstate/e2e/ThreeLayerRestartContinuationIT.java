@@ -17,6 +17,9 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
 import io.tapstate.testsupport.RequiresDocker;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -386,7 +389,7 @@ class ThreeLayerRestartContinuationIT {
                     mongo.update(source, TABLE, Map.of("id", 2L), Map.of("seq", 222L));
                     mongo.delete(source, TABLE, Map.of("id", 3L));
                     Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
-                            () -> first.tail().contains("Node session lost:"), first::tail);
+                            () -> recordedNodeSessionLoss(first.output()), first::tail);
                     assertThat(first.isAlive()).isTrue();
                     if (!together) {
                         assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
@@ -526,6 +529,14 @@ class ThreeLayerRestartContinuationIT {
                 "--tapstate.cluster.id=" + cluster, "--tapstate.cluster.node-id=restart-node",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--SDK_STATUS_SENDER_ENABLED=false", "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds")));
+    }
+
+    private static boolean recordedNodeSessionLoss(Path output) {
+        try (var lines = Files.lines(output)) {
+            return lines.anyMatch(line -> line.contains("Node session lost:"));
+        } catch (IOException e) {
+            throw new UncheckedIOException("could not read server output at " + output, e);
+        }
     }
 
     private static ControlPlane login(RealProcessServer server) {

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -51,7 +52,9 @@ class PipelineDraftAuthoringRoundTripIT {
                     .containsEntry("name", "Orders editor draft")
                     .containsEntry("description", "Persisted independently of compiled DSL")
                     .containsEntry("revision", 1L);
-            assertThat(saved.get("graph")).isEqualTo(graph);
+            Map<String, Object> persistedGraph = new HashMap<>(graph);
+            persistedGraph.put("sourceNodeConfigs", Map.of());
+            assertThat(saved.get("graph")).isEqualTo(persistedGraph);
 
             Map<String, Object> status = control.pipelineStatus(PIPELINE_ID);
             assertThat(status).containsEntry("state", "NEW")
