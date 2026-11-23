@@ -261,6 +261,12 @@ final class ConvergenceDriver implements AutoCloseable {
                 var candidate = candidates.get(index);
                 if (!asynchronous) passes.runInline(candidate.pipelineId(), () -> reconcilePipeline(candidate));
                 else if (!prioritizeStarts) passes.submit(candidate.pipelineId(), () -> reconcilePipeline(candidate));
+                else if (pipelineConvergences != null && candidate.targetState() == PipelineState.STOPPED) {
+                    // A blocked intent read belongs to the isolated Stop worker too. The worker
+                    // still reloads the current intent before admitting any Stop operation.
+                    if (periodicDue(candidate)) pipelineConvergences.beginStop(candidate.pipelineId(),
+                            () -> reconcilePipeline(candidate, true));
+                }
                 else if (isNewStart(candidate)) passes.submitStart(candidate.pipelineId(), () -> reconcilePipeline(candidate));
                 else periodic[index] = true;
             }

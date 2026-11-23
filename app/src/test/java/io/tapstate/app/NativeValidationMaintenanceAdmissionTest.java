@@ -23,8 +23,8 @@ class NativeValidationMaintenanceAdmissionTest {
     @Test void emptyDiscoveryOnlyRepeatsWhenConfigurationChanges() {
         var configuration = mock(MongoConfigurationDomain.class);
         var tasks = mock(ValidationTaskStore.class);
-        when(configuration.validationTasks(any())).thenReturn(tasks);
-        when(configuration.validationDiscoveryRevision()).thenReturn(7L);
+        when(configuration.pollingValidationTasks(any())).thenReturn(tasks);
+        when(configuration.configurationRevision()).thenReturn(7L);
         when(tasks.pipelines(null, 1)).thenReturn(List.of());
         try (var process = new ValidationMemberResources()) {
             var member = process.bind("cluster", "node", "boot", 4, () -> {});
@@ -33,11 +33,11 @@ class NativeValidationMaintenanceAdmissionTest {
                     Clock.systemUTC(), mock(ValidationSchedule.Calculator.class), () -> {})) {
                 for (int i = 0; i < 5; i++) ReflectionTestUtils.invokeMethod(scheduler, "scan");
                 verify(tasks).pipelines(null, 1);
-                verify(configuration).validationTasks(any());
-                when(configuration.validationDiscoveryRevision()).thenReturn(8L);
+                verify(configuration).pollingValidationTasks(any());
+                when(configuration.configurationRevision()).thenReturn(8L);
                 ReflectionTestUtils.invokeMethod(scheduler, "scan");
                 verify(tasks, times(2)).pipelines(null, 1);
-                verify(configuration).validationTasks(any());
+                verify(configuration, times(2)).pollingValidationTasks(any());
             }
         }
     }
@@ -45,8 +45,8 @@ class NativeValidationMaintenanceAdmissionTest {
     @Test void aConfigurationChangeDuringDiscoveryCannotBeRememberedAsCompleted() {
         var configuration = mock(MongoConfigurationDomain.class);
         var tasks = mock(ValidationTaskStore.class);
-        when(configuration.validationTasks(any())).thenReturn(tasks);
-        when(configuration.validationDiscoveryRevision()).thenReturn(7L, 8L, 8L, 8L, 8L);
+        when(configuration.pollingValidationTasks(any())).thenReturn(tasks);
+        when(configuration.configurationRevision()).thenReturn(7L, 8L, 8L, 8L, 8L);
         when(tasks.pipelines(null, 1)).thenReturn(List.of());
         try (var process = new ValidationMemberResources()) {
             var member = process.bind("cluster", "node", "boot", 4, () -> {});
@@ -105,7 +105,7 @@ class NativeValidationMaintenanceAdmissionTest {
     @Test void historyDoesNotRediscoverAnEmptyTaskSetUntilConfigurationChanges() {
         var configuration = mock(MongoConfigurationDomain.class);
         var tasks = mock(ValidationTaskStore.class);
-        when(configuration.validationTasks(any())).thenReturn(tasks);
+        when(configuration.pollingValidationTasks(any())).thenReturn(tasks);
         when(configuration.validationDiscoveryRevision()).thenReturn(7L);
         when(tasks.pipelines(null, 1)).thenReturn(List.of());
         try (var process = new ValidationMemberResources()) {
@@ -119,7 +119,7 @@ class NativeValidationMaintenanceAdmissionTest {
                 when(configuration.validationDiscoveryRevision()).thenReturn(8L);
                 history.scan();
                 verify(tasks, times(2)).pipelines(null, 1);
-                verify(configuration).validationTasks(any());
+                verify(configuration, times(2)).pollingValidationTasks(any());
             }
         }
     }

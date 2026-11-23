@@ -149,7 +149,8 @@ class PipelineActuationRenewalChurnTest {
             store = (WorkloadClaimStore) Proxy.newProxyInstance(WorkloadClaimStore.class.getClassLoader(),
                     new Class<?>[]{DeadlineWorkloadClaimStore.class}, (proxy, method, args) -> {
                         if (method.getName().equals("withDeadline") || method.getName().equals("withRenewalDeadline")) {
-                            return bounded((long) args[0], args.length == 3 ? (Runnable) args[1] : () -> {},
+                            int offset = args[0] instanceof WorkloadClaimKey ? 1 : 0;
+                            return bounded((long) args[offset], args.length - offset == 3 ? (Runnable) args[offset + 1] : () -> {},
                                     (Supplier<?>) args[args.length - 1]);
                         }
                         if (method.getName().equals("awaitQuiescence")) { await((long) args[0]);return null; }
