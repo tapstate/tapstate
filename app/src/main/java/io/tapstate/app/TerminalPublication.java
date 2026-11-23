@@ -13,6 +13,8 @@ record TerminalPublication(PipelineIntentScope scope, long intentRevision, long 
         Status status();
         default boolean seal() { return false; }
         default void reopen() { }
+        default boolean rejectedWithoutAdmission() { return false; }
+        default Receipt retryRejected() { return null; }
     }
     static Receipt complete() { return new Receipt() {
         public Status status() { return Status.COMPLETE; }

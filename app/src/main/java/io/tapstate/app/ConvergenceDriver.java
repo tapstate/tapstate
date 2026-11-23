@@ -345,7 +345,9 @@ final class ConvergenceDriver implements AutoCloseable {
 
     private boolean checkStopped(String pipeline, TerminalPass hint) {
         var evidence = hint.stopped();
-        if (evidence.status() == TerminalPublication.Status.FAILED
+        boolean retryRejected = hint.release()==null && evidence.history().status()==TerminalPublication.Status.COMPLETE
+                && evidence.alerts().status()==TerminalPublication.Status.FAILED && evidence.alerts().rejectedWithoutAdmission();
+        if (evidence.status() == TerminalPublication.Status.FAILED && !retryRejected
                 || periodicObservations != null && !periodicObservations.idle(pipeline)) return false;
         try (var local = actuation.enterPass(hint.scope())) {
             if (terminalPasses.get(pipeline) != hint) return false;
@@ -354,6 +356,13 @@ final class ConvergenceDriver implements AutoCloseable {
             if (release != null && release.status() != PipelineActuationOwnership.StopReleaseStatus.CONFIRMED) return false;
             var tenure = release == null ? StoppedTerminalRecheck.Tenure.HELD : StoppedTerminalRecheck.Tenure.ENDED;
             if (!scoped.stoppedRecheck().unchanged(evidence.intent(), evidence.checkpoint(), evidence.claim(), tenure)) return false;
+            if(retryRejected){
+                if(evidence.history().status()!=TerminalPublication.Status.COMPLETE)return false;
+                var retried=evidence.alerts().retryRejected();if(retried==null)return false;
+                var repaired=new StoppedEvidence(evidence.intent(),evidence.checkpoint(),evidence.claim(),evidence.history(),retried);
+                terminalPasses.replace(pipeline,hint,new TerminalPass(hint.scope(),hint.revision(),hint.target(),hint.actual(),nanoTime.getAsLong(),repaired,null));
+                return true;
+            }
             if (release == null && evidence.status() == TerminalPublication.Status.COMPLETE) {
                 if (periodicObservations != null && !periodicObservations.idle(pipeline)
                         || sampler != null && !sampler.idle(hint.scope()) || !evidence.history().seal()) return false;

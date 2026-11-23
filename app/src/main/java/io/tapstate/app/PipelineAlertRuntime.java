@@ -227,17 +227,46 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     PipelineGuard pipelineGuard(ExecutionFence original, Runnable guard) { return new PipelineGuard(original, guard); }
 
+    private record RejectedFinal(Observation observation, AlarmDiagnostics.SafeTrace trace,
+            List<AlertConfiguration.Rule> rules,long sequence,boolean measured,int bytes) { }
     private final class TerminalAlerts implements TerminalPublication.Receipt {
         final Slot slot;
         final TerminalPublication publication;
         final RuleSnapshot snapshot;
         final PipelineState actual;
         final long interruptions, freshnessSequence;
-        volatile boolean completed, invalid, admitted;
+        volatile boolean completed, invalid, admitted, capacityRejected;
+        final boolean initiallyContinuous;
+        volatile RejectedFinal rejectedInput;
+        boolean ownRejectedReplay;
         TerminalAlerts(Slot slot, TerminalPublication publication, PipelineState actual) {
             this.slot = slot; this.publication = publication; this.actual = actual;
             snapshot = rules.get(); interruptions = slot.interruptions.get();
+            initiallyContinuous = !slot.discontinuous();
             freshnessSequence = slot.freshnessSequence.getAndIncrement();
+        }
+        public boolean rejectedWithoutAdmission() {
+            synchronized(slot.pending){return eligibleRejection();}
+        }
+        private boolean eligibleRejection() {
+            var input=rejectedInput;
+            return capacityRejected && !admitted && input!=null && initiallyContinuous && !closed.get()
+                    && actual==PipelineState.STOPPED && slots.get(publication.scope().pipelineId())==slot && slot.terminal==this
+                    && !slot.admission.failed && slot.admission.idle() && !slot.scheduled && slot.pending.isEmpty()
+                    && snapshot.equals(rules.get()) && !needsFrequentTerminalSamples(publication.scope(),actual)
+                    && slot.interruptions.get()==interruptions+1 && slot.sequence.get()==input.sequence()+1
+                    && slot.freshnessSequence.get()==freshnessSequence+1;
+        }
+        public TerminalPublication.Receipt retryRejected() {
+            synchronized(slot.pending){
+                if(!eligibleRejection())return null;
+                var input=rejectedInput;rejectedInput=null;
+                var next=new TerminalAlerts(slot,publication,actual);next.ownRejectedReplay=true;slot.terminal=next;
+                enqueuePublication(slot,input.observation(),input.trace(),input.rules(),
+                        ()->slots.get(publication.scope().pipelineId())==slot&&slot.terminal==next,
+                        input.sequence(),input.measured(),next,input.bytes());
+                return next;
+            }
         }
         public void reopen() {
             if(slots.get(publication.scope().pipelineId())==slot && slot.terminal==this)slot.admission.reopen();
@@ -330,7 +359,16 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         var trace = (diagnostics == null ? AlarmDiagnosticCapture.capture(cause, List.of(), failure -> failure instanceof TapstateException coded
                 ? Optional.of(coded.code().code()) : Optional.empty()) : diagnostics.pipeline(cause,observation.failure())).orElse(null);
         var capturedRules = (terminal == null ? rules.get() : terminal.snapshot).definitions();
-        submit(slot, bytes + 16 * 1024, () -> {
+        enqueuePublication(slot,original,trace,capturedRules,current,sequence,measured,terminal,bytes+16*1024);
+    }
+    private void enqueuePublication(Slot slot,Observation original,AlarmDiagnostics.SafeTrace trace,
+            List<AlertConfiguration.Rule> capturedRules,BooleanSupplier current,long sequence,boolean measured,
+            TerminalAlerts terminal,int bytes) {
+        if(terminal!=null) {
+            var lifecycle=new Observation(original.pipelineId(),original.state(),Map.of(),Map.of(),Map.of(),null,original.observedAt(),List.of());
+            terminal.rejectedInput=new RejectedFinal(lifecycle,trace,capturedRules,sequence,measured,bytes);
+        }
+        submit(slot, bytes, () -> {
             if (!current.getAsBoolean()) return;
             try {
                 publishCurrent(slot, original, trace, capturedRules, current, sequence, measured, terminal);
@@ -338,7 +376,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             } catch (TapstateException refused) {
                 if (current.getAsBoolean()) throw refused;
             }
-        },()->{if(terminal!=null)terminal.invalid=true;},terminal);
+        },()->{if(terminal!=null){terminal.invalid=true;if(!terminal.capacityRejected)terminal.rejectedInput=null;}},terminal);
     }
 
     private void publishCurrent(Slot slot, Observation original, AlarmDiagnostics.SafeTrace trace,
@@ -351,7 +389,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         for (var rule : matching(slot, capturedRules)) {
             var binding = binding(slot, rule,proved);
             if (rule.typeId().equals("pipeline.observation-stale") || !measured && rule.metric() != null) continue;
-            if (slot.discontinuous()) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
+            if (slot.discontinuous() && !(terminal!=null&&terminal.ownRejectedReplay&&slot.interruptions.get()==terminal.interruptions)) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
             AlertInput input = rule.metric() != null ? new AlertInput.Metric(original)
                     : new AlertInput.Conditions(original.observedAt(), slot.producer.intent().desired().targetState() != PipelineState.RUNNING
                             ? AlertSignal.Condition.UNKNOWN : original.state() == PipelineState.FAILED
@@ -878,9 +916,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private boolean submitReserved(Slot slot,int bytes,Supplier<Runnable> action,Runnable refused,int taskLimit,TerminalAlerts terminal) {
         if(slot!=null && !slot.admission.enter()){refused.run();return false;}
         if (closed.get()) {if(slot!=null)slot.admission.leave();refused.run(); return false; }
-        if (queuedTasks.incrementAndGet() > taskLimit) { queuedTasks.decrementAndGet();if(slot!=null)slot.admission.leave(); if(taskLimit==QUEUE_SIZE)reject(slot, "queue-capacity"); refused.run(); return false; }
+        if (queuedTasks.incrementAndGet() > taskLimit) { queuedTasks.decrementAndGet();if(slot!=null)slot.admission.leave(); if(taskLimit==QUEUE_SIZE){if(terminal!=null)terminal.capacityRejected=true;reject(slot, "queue-capacity");} refused.run(); return false; }
         int retained = queuedBytes.addAndGet(bytes);
-        if (retained > MAX_QUEUED_BYTES) { queuedTasks.decrementAndGet(); queuedBytes.addAndGet(-bytes);if(slot!=null)slot.admission.leave(); reject(slot, "queue-byte-budget"); refused.run(); return false; }
+        if (retained > MAX_QUEUED_BYTES) { queuedTasks.decrementAndGet(); queuedBytes.addAndGet(-bytes);if(slot!=null)slot.admission.leave(); if(terminal!=null)terminal.capacityRejected=true;reject(slot, "queue-byte-budget"); refused.run(); return false; }
         Work work = new Work(slot, bytes, action.get(), refused);
         if (slot == null) {
             try { workers.execute(work); } catch (RejectedExecutionException full) { work.cancel(); }
@@ -888,7 +926,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             boolean start;
             synchronized (slot.pending) {
                 slot.pending.addLast(work);
-                if(terminal!=null)terminal.admitted=true;
+                if(terminal!=null){terminal.admitted=true;terminal.rejectedInput=null;}
                 start = !slot.scheduled; slot.scheduled = true;
             }
             if (start) dispatch(slot);
