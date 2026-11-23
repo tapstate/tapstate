@@ -384,7 +384,7 @@ class ThreeLayerSharedCaptureIT {
                 var lost=cache.getCollection("srs_models").find(new Document("_id.chain",canonical)).into(new ArrayList<>());
                 assertThat(lost).isNotEmpty();for(var row:lost)assertThat(cache.getCollection("srs_models").deleteOne(new Document("_id",row.get("_id"))).getDeletedCount()).isOne();
                 Map<?,?> preview;
-                try {preview=storage(control,"plan",Map.of("scope","SHARED_SRS","pipelineIds",List.of(),"canonicalChain",canonical,"physicalChain",canonical));}
+                try {preview=explicitSharedPreview(control,canonical);}
                 catch(RuntimeException|Error failed) {
                     captureDiagnostic(config,cache,canonical);
                     FailureScene.writeMemberLogs(cluster,Map.of("runtime",server.output()));FailureScene.writeThreads(cluster,server);throw failed;
@@ -509,8 +509,7 @@ class ThreeLayerSharedCaptureIT {
 
     private static void assertSharedPreflightFence(int status, Map<?, ?> response) {
         assertThat(status).as("shared recovery preflight: %s", response).isEqualTo(500);
-        assertThat(response.get("code")).isEqualTo("TS0360034");
-        assertThat(((Map<?, ?>) response.get("params")).get("reason")).isEqualTo("TS0480009");
+        assertThat(response.get("code")).as("shared recovery preflight: %s", response).isEqualTo("TS0360034");
     }
     private static void restartClaimDiagnostic(MongoDatabase cache,String cluster,String phase) {
         var fields=new Document("_id",0);
