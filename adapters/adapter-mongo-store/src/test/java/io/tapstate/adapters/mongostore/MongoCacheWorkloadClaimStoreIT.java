@@ -301,6 +301,20 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
+    @Test void renewalCannotRepairAnArrayContainingALeaseDate() {
+        withBusiness(f -> {
+            var store = f.domain().workloadClaims(SCOPE);
+            var claim = store.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+            var filter = new Document("_id", MongoWorkloadClaimStore.id(claim.key()));
+            var invalid = List.of(java.util.Date.from(claim.leaseUntil()));
+            table.updateOne(filter, new Document("$set", new Document("leaseUntil", invalid)));
+            assertThatThrownBy(() -> store.renew(claim, TTL)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(table.find(filter).first().get("leaseUntil")).isEqualTo(invalid);
+        });
+    }
+
     @Test void aPipelineProofReadsItsDependentFactsInOneSnapshot() {
         withBusiness(f -> {
             var expected = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();

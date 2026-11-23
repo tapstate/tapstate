@@ -181,12 +181,13 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         Objects.requireNonNull(expected, "expected"); positive(ttl);
         if (session == null || !strict) throw new IllegalStateException("renewal-first requires a strict caller transaction");
         var update = List.of(new Document("$set", new Document("leaseUntil", leaseUntil(ttl))));
-        var before = collection.findOneAndUpdate(session, liveExpected(expected, expected.topologyRevision()), update,
-                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.BEFORE));
-        if (before == null) { validateExisting(expected.key()); return Optional.empty(); }
-        // Validate the preimage: reading only the renewed document could silently repair a corrupt lease.
-        read(before);
-        var row = collection.find(session, new Document("_id", id(expected.key()))).first();
+        // Check the only field this write replaces before updating it. All other fields
+        // are validated on the postimage and a failed validation aborts the transaction.
+        var live = liveExpected(expected, expected.topologyRevision()).append("$expr",
+                new Document("$eq", List.of(new Document("$type", "$leaseUntil"), "date")));
+        var row = collection.findOneAndUpdate(session, live, update,
+                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+        if (row == null) { validateExisting(expected.key()); return Optional.empty(); }
         return Optional.of(new Renewal(read(row), row));
     }
 
