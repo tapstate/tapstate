@@ -765,6 +765,7 @@ jobs:
           CLOUD_IMAGE: ${{ steps.image.outputs.image }}
           CLOUD_IMAGE_TAG: ${{ steps.image.outputs.tag }}
           CLOUD_IMAGE_DIGEST: ${{ needs.release-images.outputs.cloud_digest }}
+          CLOUD_MANAGED_BEDROCK: ${{ needs.release-images.outputs.cloud_managed_bedrock }}
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |

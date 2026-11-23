@@ -24,6 +24,8 @@ on:
         value: ${{ jobs.server-image.outputs.boot_jar_sha256 }}
       cloud_digest:
         value: ${{ jobs.cloud-image.outputs.digest }}
+      cloud_managed_bedrock:
+        value: ${{ jobs.cloud-image.outputs.managed_bedrock }}
       cloud_sealed_context:
         value: ${{ jobs.cloud-image.outputs.sealed_context }}
 
@@ -300,6 +302,7 @@ jobs:
       contents: read
     outputs:
       digest: ${{ steps.verify.outputs.digest }}
+      managed_bedrock: ${{ steps.verify.outputs.managed_bedrock }}
       sealed_context: ${{ steps.seal.outputs.context }}
     steps:
       - uses: actions/checkout@v4
@@ -397,6 +400,16 @@ jobs:
             "$RUNNER_TEMP/cloud-layout/index.json")"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          # The provenance check above binds both image platforms to this Boot JAR.
+          # Historical release commits can lack the runtime's managed AI configuration.
+          python3 - "app/target/app-${{ inputs.release-version }}-boot.jar" >> "$GITHUB_OUTPUT" <<'PY'
+          import sys
+          from zipfile import ZipFile
+
+          with ZipFile(sys.argv[1]) as boot_jar:
+              managed = "BOOT-INF/classes/io/tapstate/app/ManagedAiConfiguration.class" in boot_jar.namelist()
+          print("managed_bedrock=" + str(managed).lower())
+          PY
       - name: verify the paired on-prem OCI provenance without rebuilding it
         shell: bash
         run: |
