@@ -568,6 +568,86 @@ class ProcessObservationWriterTest {
                 Map.of("recordCount", 1L), Map.of(), null), ignored -> append.run());
     }
 
+    @Test void terminalHistoryWaitsForActualAppendAndRejectsLateSamples() throws Exception {
+        var entered = new CountDownLatch(1);var release = new CountDownLatch(1);
+        try (var writer = new ProcessObservationWriter(mock(MongoCacheDomain.class), false);
+                var caller = Executors.newSingleThreadExecutor()) {
+            var pass = pass("orders");
+            var terminal = new TerminalPublication(pass.scope(), 1, 7, pass.claim(), AT);
+            var receipt = writer.terminalHistory(terminal, new ProcessObservationWriter.History("orders", AT, 128, () -> {}, remaining -> { entered.countDown();try { if (!release.await(3, TimeUnit.SECONDS)) throw new AssertionError("history was not released"); } catch (InterruptedException interrupted) { throw new AssertionError(interrupted); } }));
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.PENDING);
+            var flush = caller.submit(writer::flush);
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.PENDING);
+            assertThat(writer.terminalHistory(new TerminalPublication(pass("other").scope(), 1, 7, pass("other").claim(), AT), null).status())
+                    .isEqualTo(TerminalPublication.Status.COMPLETE);
+            release.countDown();flush.get(2, TimeUnit.SECONDS);
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+            assertThat(writer.terminalHistory(terminal, null)).isSameAs(receipt);
+            writer.offerHistory(new ProcessObservationWriter.History("orders", AT.plusSeconds(1), 128, () -> {}, remaining -> {}));
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+        } finally { release.countDown(); }
+    }
+
+    @Test void terminalHistoryCannotConfirmFailedDroppedOrSupersededEvidence() {
+        try (var writer = new ProcessObservationWriter(mock(MongoCacheDomain.class), false)) {
+            var pass = pass("orders");var terminal = new TerminalPublication(pass.scope(), 1, 7, pass.claim(), AT);
+            var failed = writer.terminalHistory(terminal, new ProcessObservationWriter.History("orders", AT, 128, () -> {}, remaining -> { throw StorageRuntime.unavailable(); }));
+            writer.flush();assertThat(failed.status()).isEqualTo(TerminalPublication.Status.FAILED);
+            var retried = writer.terminalHistory(terminal, new ProcessObservationWriter.History("orders", AT, 128, () -> {}, remaining -> {}));
+            writer.flush();assertThat(retried.status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+            var newer = new TerminalPublication(pass.scope(), 2, 8, pass.claim(), AT.plusSeconds(1));
+            assertThat(writer.terminalHistory(newer, null).status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+            assertThat(retried.status()).isEqualTo(TerminalPublication.Status.FAILED);
+            writer.retain(List.of());assertThat(writer.terminalHistory(newer, null).status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+        }
+        try (var writer = new ProcessObservationWriter(mock(MongoCacheDomain.class), false)) {
+            for (int index = 0; index < 768; index++) writer.offerHistory(new ProcessObservationWriter.History("queued-" + index, AT, 128, () -> {}, remaining -> {}));
+            var pass = pass("orders");var terminal = new TerminalPublication(pass.scope(), 1, 7, pass.claim(), AT);
+            assertThat(writer.terminalHistory(terminal, new ProcessObservationWriter.History("orders", AT, 128, () -> {}, remaining -> {})).status())
+                    .isEqualTo(TerminalPublication.Status.FAILED);
+        }
+    }
+
+    @Test void sealedHistoryRefusesAnOldProducerUntilANormalPassReopensIt() {
+        try (var writer = new ProcessObservationWriter(mock(MongoCacheDomain.class), false)) {
+            var original = pass("orders");var terminal = new TerminalPublication(original.scope(), 1, 7, original.claim(), AT);
+            var writes = new AtomicInteger();
+            var receipt = writer.terminalHistory(terminal, new ProcessObservationWriter.History("orders", AT, 128, () -> {}, remaining -> writes.incrementAndGet()));
+            assertThat(receipt.seal()).isFalse();writer.flush();assertThat(receipt.seal()).isTrue();
+            writer.offerHistory(new ProcessObservationWriter.History("orders", AT.plusSeconds(1), 128, () -> {}, remaining -> writes.incrementAndGet()));
+            writer.flush();assertThat(writes).hasValue(1);assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+            writer.expecting(original);
+            writer.offerHistory(new ProcessObservationWriter.History("orders", AT.plusSeconds(2), 128, () -> {}, remaining -> writes.incrementAndGet()));
+            writer.flush();assertThat(writes).hasValue(2);assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+        }
+    }
+
+    @Test void aPartialSealCanBeReopenedWithoutReplayingItsCompletedAppend() {
+        try(var writer=new ProcessObservationWriter(mock(MongoCacheDomain.class),false)) {
+            var pass=pass("orders");var writes=new AtomicInteger();
+            var receipt=writer.terminalHistory(new TerminalPublication(pass.scope(),1,7,pass.claim(),AT),
+                    new ProcessObservationWriter.History("orders",AT,128,()->{},remaining->writes.incrementAndGet()));
+            writer.flush();assertThat(receipt.seal()).isTrue();receipt.reopen();receipt.reopen();writer.flush();
+            assertThat(writes).hasValue(1);
+            writer.offerHistory(new ProcessObservationWriter.History("orders",AT.plusSeconds(1),128,()->{},remaining->writes.incrementAndGet()));
+            writer.flush();assertThat(writes).hasValue(2);assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+        }
+    }
+
+    @Test void aFatalPriorBatchCannotGrantATerminalHistoryReceipt() throws Exception {
+        var cache=mock(MongoCacheDomain.class);var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        when(cache.writeObservations(anyList())).thenAnswer(call->{entered.countDown();assertThat(release.await(3,TimeUnit.SECONDS)).isTrue();throw new AssertionError("original writer invariant");});
+        try(var writer=new ProcessObservationWriter(cache,false);var caller=Executors.newSingleThreadExecutor()) {
+            writer.submit(stage(writer,"orders",1),()->{},()->{});var flush=caller.submit(writer::flush);
+            assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();var pass=pass("orders");
+            var receipt=writer.terminalHistory(new TerminalPublication(pass.scope(),1,7,pass.claim(),AT),null);
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.PENDING);release.countDown();
+            assertThatThrownBy(()->flush.get(2,TimeUnit.SECONDS)).hasRootCauseInstanceOf(AssertionError.class);
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+        }finally{release.countDown();}
+    }
+
     private static ProcessObservationWriter.Stage stage(ProcessObservationWriter writer, String pipeline, long count) {
         var stage = writer.stage(pass(pipeline));
         stage.wrap(mock(ObservationStore.class)).save(new Observation(pipeline, PipelineState.RUNNING,

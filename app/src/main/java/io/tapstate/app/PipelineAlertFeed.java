@@ -15,6 +15,8 @@ interface PipelineAlertFeed {
             published(pass, observation, null);
         }
     }
+    default TerminalPublication.Receipt terminalPublished(PipelineConvergencePass pass, TerminalPublication terminal,
+            Observation observation, Throwable cause, boolean measured) { return TerminalPublication.failed(); }
     void unavailable(PipelineConvergencePass pass);
     default void publishedIfExpected(PipelineConvergencePass pass, Observation observation, Throwable originalFailure) {
         published(pass, observation, originalFailure);
@@ -34,6 +36,8 @@ interface PipelineAlertFeed {
             public boolean needsFreshTerminalMetrics(io.tapstate.spi.store.PipelineIntentScope scope) { return false; }
             public void expecting(PipelineConvergencePass pass) { }
             public void published(PipelineConvergencePass pass, Observation observation, Throwable failure) { }
+            public TerminalPublication.Receipt terminalPublished(PipelineConvergencePass pass, TerminalPublication terminal,
+                    Observation observation, Throwable cause, boolean measured) { return TerminalPublication.complete(); }
             public void unavailable(PipelineConvergencePass pass) { }
             public void retain(Collection<String> ids) { }
             public boolean needsFrequentTerminalSamples(io.tapstate.spi.store.PipelineIntentScope scope) { return false; }

@@ -45,6 +45,8 @@ final class ProcessObservationWriter implements AutoCloseable {
     private final Map<String, Long> historyAttempts = new LinkedHashMap<>();
     private final Set<String> activePipelines = new HashSet<>();
     private final Map<String, Integer> waitingBarriers = new HashMap<>();
+    private final Map<String, Integer> activeHistory = new HashMap<>();
+    private final Map<String, TerminalHistory> terminals = new HashMap<>();
     private final java.util.function.LongSupplier nanoTime;
     private long historySequence;
     private final AtomicBoolean drainingHistory = new AtomicBoolean();
@@ -105,12 +107,74 @@ final class ProcessObservationWriter implements AutoCloseable {
         }
     }
 
+    private final class TerminalHistory implements TerminalPublication.Receipt {
+        final TerminalPublication publication;
+        boolean appended, failed, sealed;
+        TerminalHistory(TerminalPublication publication) { this.publication = publication; }
+        public void reopen() {
+            synchronized (pending) { if (terminals.get(publication.scope().pipelineId()) == this) sealed = false; }
+        }
+        public boolean seal() {
+            synchronized (pending) {
+                if (status() != TerminalPublication.Status.COMPLETE) return false;
+                sealed = true;return true;
+            }
+        }
+        public TerminalPublication.Status status() {
+            synchronized (pending) {
+                String id = publication.scope().pipelineId();
+                if (closed || failed || terminals.get(id) != this) return TerminalPublication.Status.FAILED;
+                if (!appended || activePipelines.contains(id) || pending.containsKey(id)
+                        || activeHistory.containsKey(id) || pendingHistory.stream().anyMatch(sample -> sample.pipeline().equals(id)))
+                    return TerminalPublication.Status.PENDING;
+                return TerminalPublication.Status.COMPLETE;
+            }
+        }
+    }
+
+    void expecting(PipelineConvergencePass pass) {
+        synchronized (pending) { terminals.remove(pass.scope().pipelineId()); }
+    }
+
+    /** The terminal append returns only after storage acknowledges it; ordinary sampler enqueueing is not a receipt. */
+    TerminalPublication.Receipt terminalHistory(TerminalPublication publication, History sample) {
+        String id = publication.scope().pipelineId();
+        synchronized (pending) {
+            if (closed || sample != null && (!id.equals(sample.pipeline()) || !publication.observedAt().equals(sample.observedAt())))
+                return TerminalPublication.failed();
+            var previous = terminals.get(id);
+            if (previous != null && previous.publication.equals(publication)
+                    && previous.status() != TerminalPublication.Status.FAILED) return previous;
+            if (previous == null && terminals.size() >= MAX_ENTRIES) return TerminalPublication.failed();
+            var receipt = new TerminalHistory(publication);
+            terminals.put(id, receipt);
+            if (sample == null) receipt.appended = true;
+            else {
+                var tracked = new History(sample.pipeline(), sample.observedAt(), sample.bytes(), sample.requireActive(), remaining -> {
+                    sample.append().accept(remaining);
+                    synchronized (pending) { receipt.appended = true; }
+                });
+                if (pending.size() + pendingHistory.size() + inFlight >= MAX_ENTRIES
+                        || retainedBytes + tracked.bytes() > MAX_BYTES || !enqueueHistory(tracked)) receipt.failed = true;
+            }
+            return receipt;
+        }
+    }
+
+    private void failTerminal(String pipeline) {
+        synchronized (pending) { var terminal = terminals.get(pipeline); if (terminal != null && !terminal.sealed) terminal.failed = true; }
+    }
+
     boolean submit(Stage stage, Runnable committed, Runnable failed) {
         return submit(stage, committed, null, failed);
     }
 
     boolean submit(Stage stage, Runnable committed, History sampled, Runnable failed) {
         if (stage.observation == null) return true;
+        boolean sealed;
+        synchronized (pending) { var terminal = terminals.get(stage.pipeline());sealed = terminal != null && terminal.sealed; }
+        if (sealed) { failed.run();return false; }
+        failTerminal(stage.pipeline());
         stage.committed.add(committed);
         stage.sampled = sampled == null ? null : sampled.guardedBy(stage.original);
         stage.failed = failed;
@@ -119,7 +183,8 @@ final class ProcessObservationWriter implements AutoCloseable {
         synchronized (pending) {
             Stage previous = pending.get(stage.pipeline());
             long nextBytes = retainedBytes - (previous == null ? 0 : previous.bytes) + stage.bytes;
-            accepted = !closed && nextBytes <= MAX_BYTES
+            var terminal = terminals.get(stage.pipeline());
+            accepted = !closed && (terminal == null || !terminal.sealed) && nextBytes <= MAX_BYTES
                     && (previous != null || pending.size() + pendingHistory.size() + inFlight < MAX_ENTRIES);
             if (accepted) {
                 pending.put(stage.pipeline(), stage);
@@ -137,6 +202,9 @@ final class ProcessObservationWriter implements AutoCloseable {
     void offerHistory(History sample) {
         if (sample == null) return;
         synchronized (pending) {
+            var terminal = terminals.get(sample.pipeline());
+            if (terminal != null && terminal.sealed) return;
+            failTerminal(sample.pipeline());
             if (closed) return;
             if (pending.size() + pendingHistory.size() + inFlight < MAX_ENTRIES
                     && retainedBytes + sample.bytes() <= MAX_BYTES && enqueueHistory(sample)) {
@@ -172,7 +240,7 @@ final class ProcessObservationWriter implements AutoCloseable {
                 if (closed || nanoTime.getAsLong() - deadline >= 0) throw StorageRuntime.unavailable();
                 activePipelines.add(pipeline);
                 Stage removed = pending.remove(pipeline);
-                if (removed != null) retainedBytes -= removed.bytes;
+                if (removed != null) { retainedBytes -= removed.bytes; failTerminal(pipeline); }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 throw StorageRuntime.unavailable();
@@ -189,6 +257,7 @@ final class ProcessObservationWriter implements AutoCloseable {
                 Stage stage = iterator.next().getValue();
                 if (!pipelines.contains(stage.pipeline())) {
                     retainedBytes -= stage.bytes;
+                    failTerminal(stage.pipeline());
                     iterator.remove();
                 }
             }
@@ -196,10 +265,12 @@ final class ProcessObservationWriter implements AutoCloseable {
             while (history.hasNext()) {
                 History sample = history.next();
                 if (!pipelines.contains(sample.pipeline())) {
+                    failTerminal(sample.pipeline());
                     releaseHistory(sample);
                     history.remove();
                 }
             }
+            terminals.keySet().retainAll(pipelines);
             var attempts = historyAttempts.keySet().iterator();
             while (attempts.hasNext()) {
                 String pipeline = attempts.next();
@@ -253,6 +324,8 @@ final class ProcessObservationWriter implements AutoCloseable {
         List<History> history = new ArrayList<>();
         try {
             writeObservations(batch, history);
+        } catch (Error fatal) {
+            batch.forEach(stage -> failTerminal(stage.pipeline()));throw fatal;
         } finally {
             handoffHistory(batch, history);
         }
@@ -270,7 +343,7 @@ final class ProcessObservationWriter implements AutoCloseable {
             if (closed) return;
             // Each completed Stage already reserved one entry and the bytes of its compact sample.
             for (History sample : history) {
-                if (!enqueueHistory(sample)) dropped++;
+                if (!enqueueHistory(sample)) { failTerminal(sample.pipeline()); dropped++; }
             }
         }
         if (dropped > 0) LOG.warn("History write capacity is exhausted; dropped {} committed observation samples", dropped);
@@ -311,6 +384,7 @@ final class ProcessObservationWriter implements AutoCloseable {
                         try {
                             stage.active.run();
                         } catch (RuntimeException guardFailure) {
+                            failTerminal(stage.pipeline());
                             stage.failed.run();
                             throw guardFailure;
                         }
@@ -318,10 +392,12 @@ final class ProcessObservationWriter implements AutoCloseable {
                         if (stage.sampled != null) history.add(stage.sampled);
                     } else {
                         LOG.warn("Could not publish the observation of pipeline {}", stage.pipeline(), failure);
+                        failTerminal(stage.pipeline());
                         stage.failed.run();
                     }
                 });
             } catch (RuntimeException failure) {
+                failTerminal(stage.pipeline());
                 LOG.warn("Observation follow-up failed for pipeline {}", stage.pipeline(), failure);
             }
         }
@@ -342,18 +418,21 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     private void appendHistory(History sample, long deadline) {
+        var appended = new AtomicBoolean();
         try {
             if (rememberHistoryAttempt(sample.pipeline())) inPipeline(sample.pipeline(), () -> {
                 sample.requireActive().run();
                 long remaining = deadline - nanoTime.getAsLong();
-                if (remaining > 0) sample.append().accept(Duration.ofNanos(remaining));
+                if (remaining > 0) { sample.append().accept(Duration.ofNanos(remaining)); appended.set(true); }
             });
         } catch (RuntimeException failure) {
             LOG.warn("Could not sample the history of pipeline {}", sample.pipeline(), failure);
         } finally {
             synchronized (pending) {
+                if (!appended.get()) failTerminal(sample.pipeline());
                 releaseHistory(sample);
                 inFlight--;
+                activeHistory.computeIfPresent(sample.pipeline(), (id, count) -> count == 1 ? null : count - 1);
             }
         }
     }
@@ -367,6 +446,7 @@ final class ProcessObservationWriter implements AutoCloseable {
             }
             if (first != null) {
                 pendingHistory.remove(first);
+                activeHistory.merge(first.pipeline(), 1, Integer::sum);
                 inFlight++;
             }
             return first;
