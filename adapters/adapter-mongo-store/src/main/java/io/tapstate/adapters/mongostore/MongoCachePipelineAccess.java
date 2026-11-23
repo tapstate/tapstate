@@ -92,16 +92,26 @@ final class MongoCachePipelineAccess {
             var snapshot = database.withReadPreference(com.mongodb.ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
             var receipt = MongoPipelineProofFacts.readSinkReceipt(snapshot, scope, original.key(), receiptId);
             requireActive.run();
-            if (receipt != null) validateReceiptAuthority(receipt.authority());
+            if (receipt != null) validateAuthority(receipt.authority());
             return receipt;
         }));
     }
 
-    private void validateReceiptAuthority(MongoPipelineProofFacts.Authority facts) {
+    private void validateAuthority(MongoPipelineProofFacts.Authority facts) {
         var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
         MongoCacheBusinessIdentity.requireObservedAdmission(facts.identity(), facts.schema(), business);
         validateState(facts.checkpoint());
         requirePreparedClaim(facts.claim());
+    }
+
+    private Document preparedState(ClientSession session, MongoPipelineProofFacts.Authority facts) {
+        if (facts != null) {
+            validateAuthority(facts);
+            return facts.checkpoint();
+        }
+        var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+        new MongoCacheBusinessIdentity(database, business).requireAdmissionState(session);
+        return state(session, true);
     }
 
     <T> T changeSinkReceipt(Document id,
@@ -110,15 +120,7 @@ final class MongoCachePipelineAccess {
             return metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, true, session -> action.apply(session, null));
         var result = transaction(TRANSACTION, false, session -> {
             var receipt = MongoPipelineProofFacts.readSinkReceipt(session, database, scope, original.key(), id);
-            Document current;
-            if (receipt == null) {
-                var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
-                new MongoCacheBusinessIdentity(database, business).requireAdmissionState(session);
-                current = state(session, true);
-            } else {
-                validateReceiptAuthority(receipt.authority());
-                current = receipt.authority().checkpoint();
-            }
+            var current = preparedState(session, receipt == null ? null : receipt.authority());
             proveClaim(session, true);
             updateState(session, current, new Document(), false);
             return action.apply(session, receipt);
@@ -331,7 +333,9 @@ final class MongoCachePipelineAccess {
     private <T> T metadataTransaction(SystemCollections table, MongoDatabase target, boolean mutation,
             Function<ClientSession, T> action, boolean recoverPublicationCheckout) {
         if(authoringModels!=null)authoringModels.requireActive();
-        T result = transaction(TRANSACTION, true, session -> {
+        boolean batch = !unpreparedModels && original != null && authoringModels == null
+                && database.getName().equals(target.getName()) && MongoBindingReadFacts.supported(client);
+        T result = transaction(TRANSACTION, !batch, session -> {
             if (unpreparedModels) {
                 if (table != SystemCollections.CACHE_DERIVED_SCHEMAS || !database.getName().equals(target.getName())) throw fenced();
                 requireUnpreparedModels(session);
@@ -343,7 +347,9 @@ final class MongoCachePipelineAccess {
                 }
                 return action.apply(session);
             }
-            Document current = state(session, true);
+            Document current = batch
+                    ? preparedState(session, MongoPipelineProofFacts.readAuthority(session, database, scope, original.key()))
+                    : state(session, true);
             if (!database.getName().equals(target.getName())) {
                 var inventory = MongoOperatorInventory.require(session, database, scope);
                 if (inventory.getList("databases", Document.class).stream()

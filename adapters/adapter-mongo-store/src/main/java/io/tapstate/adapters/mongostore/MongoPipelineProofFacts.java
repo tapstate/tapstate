@@ -40,6 +40,11 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
         return authority(captured);
     }
 
+    static Authority readAuthority(ClientSession session, MongoDatabase database, PipelineIntentScope scope, WorkloadClaimKey key) {
+        var stages = authorityStages(scope, key);
+        return authority(SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, stages).collation(SIMPLE).first());
+    }
+
     record SinkReceipt(Authority authority, Document row) {}
 
     static SinkReceipt readSinkReceipt(MongoDatabase snapshot, PipelineIntentScope scope, WorkloadClaimKey key,

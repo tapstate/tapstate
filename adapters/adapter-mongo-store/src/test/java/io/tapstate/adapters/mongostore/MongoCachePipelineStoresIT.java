@@ -56,6 +56,34 @@ class MongoCachePipelineStoresIT {
     private static final Runnable ACTIVE = () -> {};
     private static final Instant AT = Instant.parse("2026-10-18T00:00:00Z");
 
+    @Test void preparedMetadataReadsKeepTheSameSnapshotAndWriteFences() {
+        withFixture(f -> {
+            var commands = new java.util.ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var observed = client(listener)) {
+                var database = observed.getDatabase(f.database().getName());
+                database.runCommand(new Document("ping", 1));
+                var access = new MongoCachePipelineAccess(observed, database, SCOPE, f.fence(), ACTIVE);
+                var store = new MongoCacheDerivedSchemaStore(access);
+                commands.clear();
+                assertThat(store.latestMany(SCOPE.pipelineId(), java.util.Set.of("source.orders"))).isEmpty();
+                var read = java.util.List.copyOf(commands);
+                commands.clear();
+                store.record(SCOPE.pipelineId(), "source.orders", java.util.Map.of("id", "bigint"), "sql", "input", "source");
+                var write = java.util.List.copyOf(commands);
+                System.out.println("PREPARED_METADATA read=" + read + " write=" + write);
+                assertThat(read).containsExactly("aggregate", "find", "commitTransaction");
+                assertThat(write).containsExactly("aggregate", "update", "update", "find", "update", "commitTransaction");
+                SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("businessPhase", "RETIRED")));
+                assertCode(() -> store.latestMany(SCOPE.pipelineId(), java.util.Set.of("source.orders")),
+                        IoError.CACHE_BUSINESS_FENCED);
+            }
+        });
+    }
+
     @Test void startCheckpointReadsAdmissionStateAndClaimTogether() {
         withFixture(f -> {
             var expected = f.domain().pipelineStates(SCOPE).read(SCOPE.pipelineId()).orElseThrow();

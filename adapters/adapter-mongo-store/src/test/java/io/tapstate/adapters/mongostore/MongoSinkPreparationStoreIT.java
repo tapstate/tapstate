@@ -378,7 +378,7 @@ class MongoSinkPreparationStoreIT {
                 commands.clear();
                 preparations.verifySources(f.scope, inputs);
                 assertThat(sinks.hasPreparedModels()).isTrue();
-                assertThat(commands).hasSize(15);
+                assertThat(commands).hasSize(13);
                 assertThat(commands.stream().filter(e -> e.name().equals("commitTransaction"))).hasSize(2);
                 commands.clear();
                 assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE)).isTrue();
