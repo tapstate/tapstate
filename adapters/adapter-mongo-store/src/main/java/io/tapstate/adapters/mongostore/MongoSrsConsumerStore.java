@@ -503,11 +503,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 requireActive.run(); MongoCachePipelinePreparations.proveNode(session, database, scope, node);
                 if (!changed) return null;
                 // End the original tenures in this same transaction: a delayed writer cannot recreate its old run roster.
+                var claimWriter = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database))
+                        .inStrictSession(session);
                 for (var reader : originals.entrySet()) {
                     var filter = WorkloadClaimDocuments.livePipeline(session, database, reader.getValue()).append("pipelineScope", MongoPipelinePreparationFacts.scope(reader.getKey()))
                             .append("pipelinePreparation.phase", "PREPARED");
-                    if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, filter,
-                            List.of(new Document("$set", new Document("leaseUntil", "$$NOW")))).getMatchedCount() != 1) throw fenced();
+                    if (!claimWriter.revokePipelineLease(filter)) throw fenced();
                 }
                 return null;
             });

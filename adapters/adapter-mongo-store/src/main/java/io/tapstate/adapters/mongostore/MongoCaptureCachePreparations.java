@@ -45,11 +45,11 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
                     .append("capturePreparation",MongoCapturePreparationFacts.row(admitted.replacement()))
                     .append("fencedChainWrites",originalCapture.getLong("fencedChainWrites")+1);
             if(claims.replaceOne(session,originalCapture,replacement).getMatchedCount()!=1)throw history(previous);
+            var claimWriter = new MongoWorkloadClaimStore(claims).inStrictSession(session);
             for(int i=1;i<observed.claims().size();i++) {
                 var row=observed.claims().get(i);
                 if(!(row.get("fencedConsumerWrites") instanceof Long writes) || writes<1 || writes>=Long.MAX_VALUE-1)throw history(previous);
-                if(claims.updateOne(session,row,new Document("$set",new Document("leaseUntil",new Date(0)))
-                        .append("$inc",new Document("fencedConsumerWrites",1L))).getMatchedCount()!=1)throw history(previous);
+                if (!claimWriter.revokeSharedConsumerLease(row)) throw history(previous);
             }
             consumers.retireSharedRecovery(session,observed,admitted.plan(),admitted.replacement().chainId());
             roots.insertOne(session,MongoSrsChainStore.initialRow(scope,admitted.replacement().chainId(),observed.root().getString("retention"),next));

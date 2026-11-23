@@ -108,10 +108,8 @@ final class MongoCacheBusinessIdentity {
                 .getMatchedCount() != 1) {
             throw new IllegalStateException("cache retirement changed within its transaction snapshot");
         }
-        // Address the canonical key, including claims whose duplicated payload fields are damaged.
-        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateMany(session,
-                new Document("_id.clusterId", scope.clusterId()),
-                List.of(new Document("$set", new Document("leaseUntil", "$$NOW"))));
+        new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session)
+                .revokeCacheLeases(scope.clusterId());
     }
 
     private Document identityFilter() {

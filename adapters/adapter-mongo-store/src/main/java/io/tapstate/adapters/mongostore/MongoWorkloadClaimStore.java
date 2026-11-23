@@ -198,8 +198,46 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         Objects.requireNonNull(expected, "expected");
         validateExisting(expected.key());
         Document filter = expected(expected);
-        Document expired = new Document("$set", new Document("leaseUntil", "$$NOW"));
-        return findOneAndUpdate(filter, List.of(expired), false) != null;
+        return findOneAndUpdate(filter, expireLease(), false) != null;
+    }
+
+    Document insertPipelineReservation(Document fields, Date now, Duration ttl) {
+        var row = new Document(fields).append("leaseUntil", leaseUntil(now, ttl));
+        collection.insertOne(session, row);
+        return row;
+    }
+
+    boolean issuePipelineLease(Document expected, Document fields, Date now, Duration ttl) {
+        var updated = new Document(fields).append("leaseUntil", leaseUntil(now, ttl));
+        return collection.updateOne(session, expected, new Document("$set", updated)).getMatchedCount() == 1;
+    }
+
+    boolean retirePipelineLease(Document expected, Document fields) {
+        var retired = new Document(fields).append("leaseUntil", new Date(0));
+        return collection.updateOne(session, expected, new Document("$set", retired)).getMatchedCount() == 1;
+    }
+
+    boolean revokeSharedConsumerLease(Document expected) {
+        var update = new Document("$set", new Document("leaseUntil", new Date(0)))
+                .append("$inc", new Document("fencedConsumerWrites", 1L));
+        return collection.updateOne(session, expected, update).getMatchedCount() == 1;
+    }
+
+    boolean revokePipelineLease(Document expected) {
+        return collection.updateOne(session, expected, expireLease()).getMatchedCount() == 1;
+    }
+
+    void revokeCacheLeases(String clusterId) {
+        // Use the canonical key, including claims with damaged duplicated fields.
+        collection.updateMany(session, new Document("_id.clusterId", clusterId), expireLease());
+    }
+
+    private static List<Document> expireLease() {
+        return List.of(new Document("$set", new Document("leaseUntil", "$$NOW")));
+    }
+
+    private static Date leaseUntil(Date now, Duration ttl) {
+        return Date.from(now.toInstant().plusMillis(ttl.toMillis()));
     }
 
     @Override

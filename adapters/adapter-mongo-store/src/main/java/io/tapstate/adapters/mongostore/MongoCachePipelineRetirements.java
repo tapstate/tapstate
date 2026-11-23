@@ -47,7 +47,8 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
             var request=isolated.orElseThrow(MongoCachePipelineRetirements::fenced);
             if(!request.claim().key().equals(declared.claim().key()) || request.claim().claimGeneration()<declared.claim().claimGeneration()
                     || request.claim().executionGeneration()<declared.claim().executionGeneration() || request.epoch()<declared.epoch())throw fenced();
-            var claim=new MongoWorkloadClaimStore(claims).inStrictSession(session).decodeStored(row);
+            var claimWriter = new MongoWorkloadClaimStore(claims).inStrictSession(session);
+            var claim = claimWriter.decodeStored(row);
             if(!request.claim().equals(WorkloadClaimFence.from(claim)) || !MongoPipelinePreparationFacts.scope(scope).equals(row.get("pipelineScope"))
                     || MongoCachePipelinePreparations.phase(row,scope)!=PipelineCachePreparations.Phase.PREPARED
                     || !original.previousPreparation().preparationId().equals(row.get("pipelinePreparation",Document.class).get("preparationId")))throw fenced();
@@ -63,10 +64,10 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
             var expected=WorkloadClaimDocuments.live(request.claim());expected.remove("$expr");
             expected.append("pipelineScope",MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation",row.get("pipelinePreparation"));
             var values=new Document("ownerNodeId",retiredClaim.owner().nodeId()).append("ownerBootId",retiredClaim.owner().bootId())
-                    .append("claimGeneration",retiredClaim.claimGeneration()).append("leaseUntil",new Date(0))
+                    .append("claimGeneration",retiredClaim.claimGeneration())
                     .append("pipelinePreparation",MongoCachePipelinePreparations.marker(retired.preparationId(),PipelineCachePreparations.Phase.RETIRED))
                     .append("pipelineRetirement",MongoPipelineRetirementFacts.cache(retired));
-            if(claims.updateOne(session,expected,new Document("$set",values)).getMatchedCount()!=1)throw fenced();
+            if (!claimWriter.retirePipelineLease(expected, values)) throw fenced();
             if(SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session,new Document("_id",scope.pipelineId()).append("scope",state.get("scope"))
                             .append("epoch",state.get("epoch")).append("runtimeWriteFence",state.get("runtimeWriteFence")),
                     new Document("$set",new Document("stateJson",StateJson.of(PipelineState.STOPPED)).append("epoch",epoch).append("runtimeWriteFence",write))).getMatchedCount()!=1)throw fenced();

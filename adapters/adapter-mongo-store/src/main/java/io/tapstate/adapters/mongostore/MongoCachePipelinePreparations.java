@@ -89,16 +89,15 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                 MongoSinkPreparationStore.requireEmpty(session,database,preparation.scope());
             }
             var key = pipelineKey(preparation.scope());
-            Document row = new Document("_id", MongoWorkloadClaimStore.id(key)).append("clusterId", key.clusterId())
+            Document fields = new Document("_id", MongoWorkloadClaimStore.id(key)).append("clusterId", key.clusterId())
                     .append("resourceType", key.type().name()).append("resourceId", key.resourceId())
                     .append("ownerNodeId", node.owner().nodeId()).append("ownerBootId", node.owner().bootId())
                     .append("claimGeneration", 1L).append("executionGeneration", 0L).append("topologyRevision", node.topologyRevision())
-                    .append("leaseUntil", Date.from(serverNow.toInstant().plusMillis(ttl.toMillis())))
                     .append("pipelineScope", MongoPipelinePreparationFacts.scope(preparation.scope()))
                     .append("pipelinePreparation", marker(preparation.preparationId(), Phase.RESERVED))
                     .append("pipelineSources",MongoPipelineSourcePreparations.encode(inputs))
                     .append("sinkPreparations",MongoSinkPreparationStore.initial(preparation.preparationId()));
-            claims.insertOne(session, row);
+            Document row = raw(session).insertPipelineReservation(fields, serverNow, ttl);
             return new Reservation(preparation.scope(), preparation.preparationId(), Phase.RESERVED,
                     WorkloadClaimFence.from(admitted ? raw(session).decodeStored(row) : raw(session).read(key).orElseThrow().claim()));
         });
@@ -322,10 +321,10 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         expected.append("pipelineScope",MongoPipelinePreparationFacts.scope(previous.scope())).append("pipelineRetirement",MongoPipelineRetirementFacts.cache(previous))
                 .append("pipelinePreparation",marker(previous.preparationId(),Phase.RETIRED));
         var values=new Document("ownerNodeId",node.owner().nodeId()).append("ownerBootId",node.owner().bootId())
-                .append("claimGeneration",previous.claim().claimGeneration()+1).append("leaseUntil",Date.from(now.toInstant().plusMillis(ttl.toMillis())))
+                .append("claimGeneration",previous.claim().claimGeneration()+1)
                 .append("pipelineScope",MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation",marker(preparation.preparationId(),Phase.RESERVED))
                 .append("pipelineSources",MongoPipelineSourcePreparations.encode(inputs)).append("sinkPreparations",MongoSinkPreparationStore.initial(preparation.preparationId()));
-        if(claims.updateOne(session,expected,new Document("$set",values)).getMatchedCount()!=1)throw claimFenced();
+        if (!raw(session).issuePipelineLease(expected, values, now, ttl)) throw claimFenced();
         return new Reservation(scope,preparation.preparationId(),Phase.RESERVED,WorkloadClaimFence.from(raw(session).read(pipelineKey(scope)).orElseThrow().claim()));
     }
     private java.util.Optional<io.tapstate.spi.store.PipelineRetiredState> retiredBirth(Document row,PipelineIntentScope scope) {
