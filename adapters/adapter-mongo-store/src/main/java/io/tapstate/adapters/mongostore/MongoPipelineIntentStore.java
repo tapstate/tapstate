@@ -563,9 +563,13 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
                 var heldBindings = currentConnectorBindings(generation, scope)
                         .orElse(new ConnectorRunBindings(scope, 0, List.of(), null));
                 var unfinished = heldBindings.handoff();
-                if (!heldBindings.scope().equals(scope) || unfinished != null
-                        && (unfinished.phase() != ConnectorRunBindings.Phase.REQUESTED || unfinished.intentRevision() == revision))
-                    throw fenced();
+                if (!heldBindings.scope().equals(scope)) throw fenced();
+                if (unfinished != null) {
+                    if (unfinished.phase() != ConnectorRunBindings.Phase.REQUESTED) throw fenced();
+                    // Deferred preparation can record a rejection before any connector handoff is prepared.
+                    if (unfinished.intentRevision() == revision && (current == null || startFailure(current).isEmpty()))
+                        throw fenced();
+                }
                 var nextBindings = new ConnectorRunBindings(scope, heldBindings.effectiveIntentRevision(), heldBindings.effective(),
                         new ConnectorRunBindings.Handoff(revision + 1, ConnectorRunBindings.Phase.REQUESTED, List.of(), List.of()));
                 MongoPipelineStateMappings.writeConnectorBindings(session, database, generation, nextBindings);

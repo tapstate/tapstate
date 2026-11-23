@@ -93,6 +93,8 @@ class MongoPipelineIntentStoreIT {
             var published = bindings.publish(original);
             assertThat(published.effectiveIntentRevision()).isEqualTo(1);
             assertThat(published.handoff().phase()).isEqualTo(ConnectorRunBindings.Phase.PUBLISHED);
+            assertThatThrownBy(() -> store.compareAndSetExplicitStart(scope, 1,
+                    intent(PipelineState.RUNNING, false, false, null))).satisfies(MongoPipelineIntentStoreIT::fenced);
             assertThat(store.compareAndSet(scope, 1, intent(PipelineState.PAUSED, false, false, null))).isTrue();
             assertThatThrownBy(() -> bindings.abort(scope, 1)).satisfies(MongoPipelineIntentStoreIT::fenced);
             assertThatThrownBy(() -> bindings.complete(scope, 2)).satisfies(MongoPipelineIntentStoreIT::fenced);
@@ -146,7 +148,8 @@ class MongoPipelineIntentStoreIT {
 
             var mappings = SystemCollections.OPERATOR_GENERATIONS.on(database);
             var currentMapping = mappings.find(filter).first();
-            mappings.updateOne(filter, new Document("$set", new Document("stateGeneration", 2L)));
+            mappings.updateOne(filter, new Document("$set", new Document("stateGeneration", 2L))
+                    .append("$unset", new Document("connectorBindings", "")));
             assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailure()).isEmpty();
             mappings.replaceOne(filter, currentMapping);
 
@@ -178,7 +181,10 @@ class MongoPipelineIntentStoreIT {
                     Map.of("id", "document", "field", "body:raw=value"),
                     Map.of("id", "document", "field", 1))) {
                 assertThat(store.compareAndSetStart(scope, revision++, desired, inputs)).isTrue();
-                store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE, params);
+                var pending = store.pendingStart("flow").orElseThrow();
+                assertThatThrownBy(() -> store.compareAndSetStart(scope, pending.intent().intentRevision(), desired, inputs))
+                        .satisfies(MongoPipelineIntentStoreIT::fenced);
+                store.failStart(pending, IoError.DOCUMENT_UNREADABLE, params);
                 var rejection = domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
                 assertThat(rejection.startFailure()).contains(IoError.DOCUMENT_UNREADABLE);
                 assertThat(rejection.startFailureParams()).isEmpty();
