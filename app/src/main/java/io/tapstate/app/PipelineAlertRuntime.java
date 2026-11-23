@@ -233,7 +233,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         final RuleSnapshot snapshot;
         final PipelineState actual;
         final long interruptions, freshnessSequence;
-        volatile boolean completed, invalid;
+        volatile boolean completed, invalid, admitted;
         TerminalAlerts(Slot slot, TerminalPublication publication, PipelineState actual) {
             this.slot = slot; this.publication = publication; this.actual = actual;
             snapshot = rules.get(); interruptions = slot.interruptions.get();
@@ -338,7 +338,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             } catch (TapstateException refused) {
                 if (current.getAsBoolean()) throw refused;
             }
-        });
+        },()->{if(terminal!=null)terminal.invalid=true;},terminal);
     }
 
     private void publishCurrent(Slot slot, Observation original, AlarmDiagnostics.SafeTrace trace,
@@ -440,7 +440,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
 
     private boolean pipelineTimerOffer(Slot slot, List<AlertConfiguration.Rule> capturedRules, long round) {
         var terminal = slot.terminal;
-        if (slot.admission.sealed() || terminal != null && terminal.completed && !terminal.invalid
+        if (slot.admission.sealed() || terminal != null && !terminal.invalid
+                && (terminal.completed || terminal.admitted && terminal.status() == TerminalPublication.Status.PENDING)
                 && terminal.actual == PipelineState.STOPPED && terminal.snapshot.equals(rules.get())
                 && !needsFrequentTerminalSamples(terminal.publication.scope(), PipelineState.STOPPED)) return true;
         if (!slot.tickQueued.compareAndSet(false, true)) return true;
@@ -864,15 +865,17 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if(observed.plus(rule.maxGap()).isBefore(op.observedAt()))return "continuity-gap";
         return null;
     }
-    private void submit(Slot slot, int bytes, Runnable action) { submit(slot, bytes, action, () -> { }); }
     private void submit(Slot slot, int bytes, Runnable action, Runnable refused) {
-        if(!inputAdmission.enter()){refused.run();return;}
-        try {submitAdmitted(slot,bytes,action,refused);}finally{inputAdmission.leave();}
+        submit(slot,bytes,action,refused,null);
     }
-    private void submitAdmitted(Slot slot, int bytes, Runnable action, Runnable refused) {
-        submitReserved(slot, bytes, () -> action, refused, QUEUE_SIZE);
+    private void submit(Slot slot,int bytes,Runnable action,Runnable refused,TerminalAlerts terminal) {
+        if(!inputAdmission.enter()){refused.run();return;}
+        try {submitReserved(slot,bytes,()->action,refused,QUEUE_SIZE,terminal);}finally{inputAdmission.leave();}
     }
     private boolean submitReserved(Slot slot, int bytes, Supplier<Runnable> action, Runnable refused, int taskLimit) {
+        return submitReserved(slot,bytes,action,refused,taskLimit,null);
+    }
+    private boolean submitReserved(Slot slot,int bytes,Supplier<Runnable> action,Runnable refused,int taskLimit,TerminalAlerts terminal) {
         if(slot!=null && !slot.admission.enter()){refused.run();return false;}
         if (closed.get()) {if(slot!=null)slot.admission.leave();refused.run(); return false; }
         if (queuedTasks.incrementAndGet() > taskLimit) { queuedTasks.decrementAndGet();if(slot!=null)slot.admission.leave(); if(taskLimit==QUEUE_SIZE)reject(slot, "queue-capacity"); refused.run(); return false; }
@@ -884,7 +887,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         } else {
             boolean start;
             synchronized (slot.pending) {
-                slot.pending.addLast(work); start = !slot.scheduled; slot.scheduled = true;
+                slot.pending.addLast(work);
+                if(terminal!=null)terminal.admitted=true;
+                start = !slot.scheduled; slot.scheduled = true;
             }
             if (start) dispatch(slot);
         }
