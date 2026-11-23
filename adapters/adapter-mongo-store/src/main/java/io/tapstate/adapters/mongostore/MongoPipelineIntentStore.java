@@ -81,8 +81,18 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         return transaction(session -> loadInTransaction(session, pipelineId));
     }
     Optional<PipelineIntentSnapshot> loadInTransaction(ClientSession session, String pipelineId) {
-        return Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first()).map(row -> decodeCurrent(session, row));
+        return loadInTransaction(session, pipelineId, null);
     }
+
+    /** The optional cache identity must come from the host audit in this transaction callback. */
+    Optional<PipelineIntentSnapshot> loadInTransaction(ClientSession session, String pipelineId,
+            io.tapstate.spi.store.CachePreparation checkedCache) {
+        if (checkedCache != null && !session.hasActiveTransaction())
+            throw new IllegalStateException("checked cache identity requires the original transaction");
+        return Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first())
+                .map(row -> decodeCurrent(session, row, checkedCache));
+    }
+
     Optional<PipelineIntentSnapshot> loadRetainedInTransaction(ClientSession session, String pipelineId) {
         return Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first()).map(this::decode);
     }
@@ -575,15 +585,20 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
 
     private boolean matchesCurrentCache(ClientSession session, PipelineIntentScope expected) {
-        var preparation = bindings.cachePreparationForTransaction(session);
-        if (preparation.isEmpty()) return false;
-        var current = preparation.get().businessScope();
+        return bindings.cachePreparationForTransaction(session).filter(value -> sameCache(value, expected)).isPresent();
+    }
+    private static boolean sameCache(io.tapstate.spi.store.CachePreparation preparation, PipelineIntentScope expected) {
+        var current = preparation.businessScope();
         return current.clusterId().equals(expected.clusterId()) && current.bindingVersion() == expected.bindingVersion()
                 && current.cacheIncarnation().equals(expected.cacheIncarnation());
     }
     private PipelineIntentSnapshot decodeCurrent(ClientSession session, Document row) {
+        return decodeCurrent(session, row, null);
+    }
+    private PipelineIntentSnapshot decodeCurrent(ClientSession session, Document row, io.tapstate.spi.store.CachePreparation checkedCache) {
         var snapshot = decode(row);
-        if (!matchesCurrentCache(session, snapshot.scope())) throw unreadable();
+        boolean matches = checkedCache == null ? matchesCurrentCache(session, snapshot.scope()) : sameCache(checkedCache, snapshot.scope());
+        if (!matches) throw unreadable();
         return snapshot;
     }
     private static Document header(PipelineIntentScope scope, long revision, boolean deleted) {

@@ -62,12 +62,7 @@ final class MongoAlertStateStore {
         requireContext(session, key);
         Document head = heads.find(session, new Document("_id", MongoAlertStateCodec.key(key))).first();
         if (head == null) {
-            Document original = new Document("_id.alarm", MongoAlertStateCodec.key(key));
-            if (episodes.find(session, original).limit(1).first() != null
-                    || transitions.find(session, original).limit(1).first() != null) {
-                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                        Map.of("id", "alert-state", "field", "missing-head"), null);
-            }
+            requireAbsentHistory(session,key);
             requireActive.run(); return Optional.empty();
         }
         Object pointer = head.get("episodeNumber");
@@ -76,6 +71,15 @@ final class MongoAlertStateStore {
         var decoded = MongoAlertStateCodec.read(key, head, episode);
         requireActive.run();
         return Optional.of(decoded);
+    }
+
+    private void requireAbsentHistory(ClientSession session,AlarmKey key) {
+            Document original = new Document("_id.alarm", MongoAlertStateCodec.key(key));
+            if (episodes.find(session, original).limit(1).first() != null
+                    || transitions.find(session, original).limit(1).first() != null) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", "alert-state", "field", "missing-head"), null);
+            }
     }
 
     /** expectedRevision zero means a genuinely new head, never a replacement for retained history. */
@@ -131,11 +135,23 @@ final class MongoAlertStateStore {
     Optional<MongoAlertStateEnvelope.Stored> loadEnvelope(ClientSession session, AlarmKey key) {
         requireContext(session, key);
         Document head = heads.find(session, new Document("_id", MongoAlertStateCodec.key(key))).first();
-        if (head == null) { load(session, key); return Optional.empty(); }
+        if (head == null) { requireAbsentHistory(session,key); requireActive.run(); return Optional.empty(); }
         Object pointer = head.get("episodeNumber");
         Document episode = pointer == null ? null : episodes.find(session, new Document("_id",
                 new Document("alarm", MongoAlertStateCodec.key(key)).append("number", pointer))).first();
         var result = MongoAlertStateEnvelope.read(key, head, episode); requireActive.run(); return Optional.of(result);
+    }
+
+    private Optional<MongoAlertStateEnvelope.Stored> loadEnvelope(ClientSession session,AlarmKey key,MongoAlertWriteFacts facts) {
+        requireContext(session,key);
+        var head=facts.row(SystemCollections.ALERT_INSTANCES,MongoAlertStateCodec.key(key));
+        if(head==null){
+            if(!facts.empty(SystemCollections.ALERT_EPISODES)||!facts.empty(SystemCollections.ALERT_TRANSITIONS))requireAbsentHistory(session,key);
+            requireActive.run();return Optional.empty();
+        }
+        Object pointer=head.get("episodeNumber");
+        var episode=pointer==null?null:facts.row(SystemCollections.ALERT_EPISODES,new Document("alarm",MongoAlertStateCodec.key(key)).append("number",pointer));
+        var result=MongoAlertStateEnvelope.read(key,head,episode);requireActive.run();return Optional.of(result);
     }
 
     /** Decode one bounded page from its original transaction; fetch all pointed episodes once. */
@@ -177,7 +193,13 @@ final class MongoAlertStateStore {
             io.tapstate.core.alerting.AlertStateRecord.Head candidate,
             List<io.tapstate.core.alerting.AlertStateRecord.Transition> changes,
             io.tapstate.core.alerting.AlertSignal diagnosticSignal, java.time.Clock clock) {
-        try { return stageEnvelope(session,revision,before,candidate,changes,diagnosticSignal,clock); }
+        return compareAndSetEnvelope(session,revision,before,candidate,changes,diagnosticSignal,clock,null);
+    }
+
+    Stage compareAndSetEnvelope(ClientSession session,long revision,io.tapstate.core.alerting.AlertStateRecord.Head before,
+            io.tapstate.core.alerting.AlertStateRecord.Head candidate,List<io.tapstate.core.alerting.AlertStateRecord.Transition> changes,
+            io.tapstate.core.alerting.AlertSignal diagnosticSignal,java.time.Clock clock,MongoAlertWriteFacts facts) {
+        try { return stageEnvelope(session,revision,before,candidate,changes,diagnosticSignal,clock,facts); }
         catch (OwnershipWindowClosed expired) { return Stage.CONFLICT; }
     }
 
@@ -190,10 +212,16 @@ final class MongoAlertStateStore {
             io.tapstate.core.alerting.AlertStateRecord.Head candidate,
             List<io.tapstate.core.alerting.AlertStateRecord.Transition> changes,
             io.tapstate.core.alerting.AlertSignal diagnosticSignal, java.time.Clock clock) {
+        return stageEnvelope(session,revision,before,candidate,changes,diagnosticSignal,clock,null);
+    }
+
+    private Stage stageEnvelope(ClientSession session,long revision,io.tapstate.core.alerting.AlertStateRecord.Head before,
+            io.tapstate.core.alerting.AlertStateRecord.Head candidate,List<io.tapstate.core.alerting.AlertStateRecord.Transition> changes,
+            io.tapstate.core.alerting.AlertSignal diagnosticSignal,java.time.Clock clock,MongoAlertWriteFacts facts) {
         Objects.requireNonNull(candidate, "candidate"); Objects.requireNonNull(clock, "clock");
         AlarmKey key = candidate.snapshot().rule().key(); requireContext(session, key);
         if (revision < 0 || revision == Long.MAX_VALUE || (revision == 0) != (before == null)) { throw new IllegalArgumentException("invalid state revision"); }
-        var actual = loadEnvelope(session, key);
+        var actual = facts==null?loadEnvelope(session,key):loadEnvelope(session,key,facts);
         if (actual.isPresent() && actual.get().value().equals(candidate) && actual.get().revision() == revision + 1) { return Stage.UNCHANGED; }
         if (before == null ? actual.isPresent() : actual.isEmpty() || actual.get().revision() != revision || !actual.get().value().equals(before)) { return Stage.CONFLICT; }
         if (before != null && before.equals(candidate) && changes.isEmpty()) { return Stage.UNCHANGED; }

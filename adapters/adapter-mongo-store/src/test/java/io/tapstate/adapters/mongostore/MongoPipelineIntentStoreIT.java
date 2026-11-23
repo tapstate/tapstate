@@ -73,6 +73,52 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void anAlertMayReuseOnlyTheMatchingCacheIdentityAlreadyAuditedInItsTransaction() {
+        withConfiguration((domain, database, scope) -> {
+            var desired = readyForActuation(domain, database, scope);
+            var material = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var cipher = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+            var commands = new ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var client = MongoClients.create(MongoClientSettings.builder().applyConnectionString(
+                    new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build());
+                 var session = client.startSession()) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var db = client.getDatabase(database.getName());
+                var bindings = new MongoStorageBindingStore(client, db, cipher);
+                var store = new MongoPipelineIntentStore(client, db, scope.clusterId(), bindings);
+                var previous = session.withTransaction(() -> {
+                    var audited = bindings.cachePreparationForTransaction(session).orElseThrow();
+                    commands.clear();
+                    var expected = store.loadInTransaction(session, scope.pipelineId());
+                    assertThat(expected).contains(new PipelineIntentSnapshot(scope, 1, desired));
+                    int unshared = commands.size();
+                    commands.clear();
+                    assertThat(store.loadInTransaction(session, scope.pipelineId(), audited)).isEqualTo(expected);
+                    assertThat(commands).containsExactly("find");
+                    assertThat(unshared).isGreaterThan(commands.size());
+                    var auth = audited.authScope();
+                    for (var foreign : List.of(
+                            new io.tapstate.spi.store.CacheAuthScope("foreign", auth.bindingVersion(), auth.mode(), auth.cacheIncarnation(), auth.authGeneration()),
+                            new io.tapstate.spi.store.CacheAuthScope(auth.clusterId(), auth.bindingVersion()+1, auth.mode(), auth.cacheIncarnation(), auth.authGeneration()),
+                            new io.tapstate.spi.store.CacheAuthScope(auth.clusterId(), auth.bindingVersion(), auth.mode(), "other", auth.authGeneration()))) {
+                        var mismatch = new io.tapstate.spi.store.CachePreparation(audited.operationId(), foreign);
+                        assertThatThrownBy(() -> store.loadInTransaction(session, scope.pipelineId(), mismatch))
+                                .satisfies(MongoPipelineIntentStoreIT::unreadable);
+                        assertThat(store.loadInTransaction(session, "absent", mismatch)).isEmpty();
+                    }
+                    System.out.printf("ALERT_INTENT_READ unshared=%d audited=1 originalScope=true%n", unshared);
+                    return audited;
+                });
+                assertThatThrownBy(() -> store.loadInTransaction(session, scope.pipelineId(), previous))
+                        .isInstanceOf(IllegalStateException.class);
+            }
+        });
+    }
+
+    @Test
     void actuationUsesOneSnapshotCommandAndReloadsTheLatestIntent() {
         withConfiguration((domain, database, scope) -> {
             var node = new io.tapstate.spi.store.WorkloadClaimFence(

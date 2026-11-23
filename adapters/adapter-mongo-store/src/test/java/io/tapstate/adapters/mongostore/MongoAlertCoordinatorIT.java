@@ -5,6 +5,7 @@ import io.tapstate.core.alerting.*;
 import io.tapstate.core.alerting.AlertConfiguration.*;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.spi.store.*;
 import io.tapstate.spi.store.AlertStore.*;
 import io.tapstate.testsupport.RequiresDocker;
@@ -20,6 +21,39 @@ import static org.assertj.core.api.Assertions.*;
 
 @RequiresDocker
 class MongoAlertCoordinatorIT {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"source","global","recovery","key","schema","foreign-collision"})
+    void runtimeWriteFactsPreserveTheOriginalAuthorityFailure(String damage) {
+        withStore(f->{
+            var facts=businessFacts(f);bindForPolling(f);
+            var business=f.domain.bindings().cachePreparation().orElseThrow().businessScope();
+            var producer=new PipelineIntentSnapshot(new PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),"original-pipeline",1),1,new DesiredState("original-pipeline",io.tapstate.core.lifecycle.PipelineState.STOPPED,"definition"));
+            var command=new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,facts.head,List.of(),null,new EvaluationProof(producer,()->{})),List.of(),List.of());
+            switch(damage){
+                case "source" -> SystemCollections.SOURCES.on(f.db).deleteOne(new Document("_id","views"));
+                case "global" -> SystemCollections.PDK_NOTE_SCOPES.on(f.db).deleteMany(new Document());
+                case "recovery" -> SystemCollections.STORAGE_RECOVERY.on(f.db).insertOne(new Document("_id","foreign"));
+                case "key" -> SystemCollections.CLUSTER_KEYS.on(f.db).deleteMany(new Document());
+                case "schema" -> SystemCollections.SCHEMA_MIGRATIONS.on(f.db).deleteMany(new Document());
+                case "foreign-collision" -> {
+                    SystemCollections.PIPELINES.on(f.db).drop();
+                    f.db.createCollection(SystemCollections.PIPELINES.collectionName(),new com.mongodb.client.model.CreateCollectionOptions()
+                            .collation(com.mongodb.client.model.Collation.builder().locale("en").collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                    SystemCollections.PIPELINES.on(f.db).insertOne(new Document("_id","VIEWS").append("kind","pipeline"));
+                }
+                default -> throw new AssertionError(damage);
+            }
+            var original=org.assertj.core.api.Assertions.catchThrowable(()->f.store.commitAsCaller(command,f.access));
+            var optimized=org.assertj.core.api.Assertions.catchThrowable(()->f.store.commit(command));
+            assertThat(original).isInstanceOf(TapstateException.class);
+            assertThat(optimized).isInstanceOfSatisfying(TapstateException.class,error->{
+                assertThat(error.code()).isEqualTo(((TapstateException)original).code());
+                assertThat(error.args()).isEqualTo(((TapstateException)original).args());
+            });
+            assertThat(SystemCollections.ALERT_INSTANCES.on(f.db).countDocuments()).isZero();
+        });
+    }
+
     @Test void staleBackgroundPlanRefusesBeforeHostReadsOrSharedWrites() {
         withStore(f -> {
             var facts = businessFacts(f);

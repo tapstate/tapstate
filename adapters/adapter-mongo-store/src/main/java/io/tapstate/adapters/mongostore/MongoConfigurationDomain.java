@@ -1793,6 +1793,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", field), null);
     }
 
+    boolean fenceAlertKey(ClientSession session,String keyId,Document checkedKey) {
+        requireOpen();
+        if(!session.hasActiveTransaction())throw new IllegalStateException("original transaction required");
+        return configurationKey.fenceWrite(new SourceConfigWriteScope(session),keyId,checkedKey);
+    }
+
     String alertReadKeyId(Document row) {
         requireOpen();
         return configurationKey.requireCurrent(row).activeKeyId();
@@ -1855,7 +1861,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
         @Override
         public boolean fenceWrite(SourceConfigWriteScope scope, String keyId) {
-            SourceConfigCipher observed = decode(keys.find(scope.session(), new Document("_id", "cluster")).first());
+            return fenceWrite(scope,keyId,keys.find(scope.session(), new Document("_id", "cluster")).first());
+        }
+
+        private boolean fenceWrite(SourceConfigWriteScope scope,String keyId,Document checkedKey) {
+            SourceConfigCipher observed = decode(checkedKey);
             if (!cipher.activeKeyId().equals(keyId) || !keyId.equals(observed.activeKeyId())) throw invalidKey();
             return keys.updateOne(scope.session(), new Document("_id", "cluster").append("keyId", keyId),
                     new Document("$inc", new Document("sourceWriteFence", 1L))).getModifiedCount() == 1;

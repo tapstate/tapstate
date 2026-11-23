@@ -499,6 +499,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return read(session).loaded();
     }
 
+    boolean supportsAlertWriteFacts() { return MongoBindingReadFacts.supported(client); }
+
     TransactionFacts readForTransaction(ClientSession session) {
         return read(session);
     }

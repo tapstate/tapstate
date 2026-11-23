@@ -161,8 +161,17 @@ final class MongoAlertConfigurationStore {
         var identity = expected.header().identity(); requireScope(identity.scope());
         if (!expected.header().active()) { return false; }
         var actual = load(session, identity.kind(), identity.id());
-        if (actual.isEmpty() || !sameCommand(expected,actual.orElseThrow().definition())) { return false; }
-        long original = actual.orElseThrow().writeFence(); long next = increment(original);
+        return actual.isPresent() && fenceChecked(session,expected,actual.orElseThrow());
+    }
+
+    /** Reuse only a definition decoded in this same transaction callback; retain its protected-row CAS. */
+    boolean fenceChecked(ClientSession session, Definition expected, MongoAlertConfigurationCodec.Stored actual) {
+        Objects.requireNonNull(expected, "expected");
+        expected = normalized(expected);
+        var identity = expected.header().identity(); requireScope(identity.scope());
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("original transaction required");
+        if (!expected.header().active() || !sameCommand(expected,actual.definition())) { return false; }
+        long original = actual.writeFence(); long next = increment(original);
         Document filter = new Document("_id", MongoAlertConfigurationCodec.key(scope, identity.id()))
                 .append("incarnation", identity.incarnation()).append("recordRevision", expected.header().revision())
                 .append("writeFence", original);
