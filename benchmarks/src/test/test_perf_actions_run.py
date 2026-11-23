@@ -534,7 +534,7 @@ class ActionsRunTest(unittest.TestCase):
                 output = root / f"poll-{index}"
                 with patch.object(actions_watch, "trusted_artifacts", return_value=[({}, source)]), \
                         patch.object(actions_watch, "api", side_effect=[
-                            {"workflow_runs": [nightly]}, {"workflow_runs": [completed]},
+                            {"workflow_runs": [nightly]}, {"workflow_runs": [completed]}, completed,
                         ]), patch.object(actions_watch, "artifact", side_effect=lambda _, __, name, ___:
                                          prior if name == "performance-health-observation" else {}):
                     actions_watch.prepare(output, "example/repo", "main", now=now + timedelta(minutes=10))
@@ -566,3 +566,43 @@ class ActionsRunTest(unittest.TestCase):
                 self.assertEqual(active, loaded["active"])
                 self.assertEqual(pending, loaded["pending"])
                 self.assertNotIn("previous", loaded)
+
+    def test_empty_report_inventory_can_follow_a_rerun_started_after_the_run_listing(self):
+        run = {"id": 21}
+        with patch.object(actions_watch, "artifact", return_value={}), \
+                patch.object(actions_watch, "api", side_effect=[
+                    {"run_attempt": 2}, {"artifacts": []}, {"jobs": [
+                        {"name": "report", "steps": [{"name": "Upload the report", "conclusion": "success"}]},
+                    ]},
+                ]) as api:
+            self.assertEqual(({}, True), actions_watch.read_scheduled_report("example/repo", run, False))
+            self.assertEqual(3, api.call_count)
+
+    def test_report_download_error_does_not_block_cancellation_of_another_slot(self):
+        now = datetime.fromisoformat("2026-11-23T15:00:00+00:00")
+        nightlies = []
+        runs = []
+        for day in (22, 23):
+            nightlies.append({"id": day, "event": "schedule", "run_attempt": 1, "status": "completed",
+                              "created_at": f"2026-11-{day}T10:00:00Z", "updated_at": f"2026-11-{day}T11:00:00Z"})
+            runs.append({"id": day + 100, "event": "workflow_run", "run_attempt": 1,
+                         "status": "in_progress" if day == 22 else "completed",
+                         "created_at": f"2026-11-{day}T11:00:01Z", "run_started_at": f"2026-11-{day}T11:00:02Z",
+                         "updated_at": f"2026-11-{day}T12:00:00Z", "display_title": f"Pipeline Performance | Nightly {day}/1"})
+        forbidden = subprocess.CalledProcessError(1, "gh", stderr=b"gh: forbidden (HTTP 403)\n")
+        receipt = {"run_attempt": 1, "requested_at": now.isoformat()}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "health"
+            with patch.object(actions_watch, "api", side_effect=[
+                {"workflow_runs": nightlies}, {"workflow_runs": runs},
+            ]), patch.object(actions_watch, "trusted_artifacts", return_value=[]), \
+                    patch.object(actions_watch, "read_scheduled_report", side_effect=forbidden), \
+                    patch.object(actions_watch, "stop_expiring_run", return_value=receipt) as cancel:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    actions_watch.prepare(output, "example/repo", "main", now=now)
+            cancel.assert_called_once_with("example/repo", runs[0], now)
+            check = catalog.read_json(output / "health.json")
+            self.assertEqual(receipt, check["budget_cancellations"]["122"])
+            self.assertEqual([123], [item["run_id"] for item in check["report_errors"]])
+            self.assertEqual("report-unreadable", check["observations"][0]["status"])
+            self.assertFalse((output / "card.json").exists())

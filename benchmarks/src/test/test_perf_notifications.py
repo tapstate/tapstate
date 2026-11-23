@@ -141,6 +141,8 @@ class NotificationTest(unittest.TestCase):
                 return {"workflow_runs": [nightly]}
             if path.startswith("workflows/pipeline-performance"):
                 return {"workflow_runs": [performance]}
+            if path == f"runs/{performance['id']}":
+                return performance
             self.fail(f"Unexpected Actions request: {path}")
 
         with patch.object(actions_watch, "api", side_effect=query), \
@@ -391,10 +393,10 @@ class NotificationTest(unittest.TestCase):
                 actions_watch.prepare(base / "health", REPOSITORY, "main", now=now)
             fetch.assert_called_once_with(REPOSITORY, run, "performance-report-1", "report.json")
             state = catalog.read_json(base / "health/next-state.json")
-            self.assertEqual("reported", state["observation"]["status"])
+            self.assertEqual(["reported"], [slot["status"] for slot in state["settled_slots"].values()])
             observed = actions_health.observations(now, [nightly], [run], {run["id"]: report})
             self.assertEqual("awaiting-nightly",
-                             actions_health.select_observation(observed, state["observation"])["status"])
+                             actions_health.select_observation(observed, state["settled_slots"])["status"])
 
         nightly["updated_at"] = "2026-11-22T09:50:00Z"
         self.assertEqual("awaiting-handoff",
@@ -441,7 +443,7 @@ class NotificationTest(unittest.TestCase):
                         self.assertFalse((output / "card.json").exists())
                         state = catalog.read_json(output / "state.json")
                         self.assertEqual(active, state["active"])
-                        self.assertEqual(status, state["observation"]["status"])
+                        self.assertEqual([status], [slot["status"] for slot in state["settled_slots"].values()])
                     else:
                         card = catalog.read_json(output / "card.json")
                         self.assertIn("Report for this attempt missing", card["card"]["elements"][0]["content"])
@@ -569,6 +571,36 @@ class NotificationTest(unittest.TestCase):
                 after_rejection = actions_watch.latest_state(REPOSITORY, "main", now)
             self.prepare(root / "same-after-rejection", {}, nightly, run, now, after_rejection)
             self.assertFalse((root / "same-after-rejection/card.json").exists())
+
+    def test_queued_prior_slot_can_settle_after_a_newer_alert_without_replay(self):
+        older_nightly, older_run, _ = scheduled(21)
+        newer_nightly, _, _ = scheduled(22)
+        newer_nightly.update(created_at="2026-11-22T10:01:00Z", updated_at="2026-11-22T11:00:00Z")
+        now = datetime.fromisoformat("2026-11-22T12:00:00+00:00")
+        queued = {**older_run, "status": "queued", "run_started_at": None}
+        complete = {**older_run, "run_started_at": "2026-11-22T12:01:00Z", "updated_at": "2026-11-22T12:05:00Z"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            late_report = raw_results(root / "prior-report", older_nightly, complete, {CASE_IDS[4]: (130, 132)}, self.cases)
+            state = {"active": {}, "updated_at": now.isoformat()}
+            for index, (run, expected) in enumerate((
+                (queued, "Performance handoff missing"), (complete, "Suspected regression"), (complete, None),
+            )):
+                output = root / f"poll-{index}"
+                with patch.object(actions_watch, "api", side_effect=[
+                    {"workflow_runs": [newer_nightly, older_nightly]}, {"workflow_runs": [run]},
+                ]), patch.object(actions_watch, "artifact", return_value=late_report), \
+                        patch.object(actions_watch, "latest_state", return_value=state):
+                    actions_watch.prepare(output, REPOSITORY, "main", now=now + timedelta(minutes=10 * index))
+                self.assertEqual(expected is not None, (output / "card.json").is_file())
+                if expected:
+                    card = catalog.read_json(output / "card.json")["card"]["elements"][0]["content"]
+                    self.assertIn(expected, card)
+                    self.assertNotIn("**Recovered** Workflow", card)
+                    with patch.object(actions_watch, "urlopen", return_value=BytesIO(b'{"code":0}')):
+                        actions_watch.send(output, "https://example.invalid")
+                    state = catalog.read_json(output / "state.json")
+            self.assertEqual("missing-handoff", state["active"]["workflow"]["reason"])
 
     def test_artifact_bytes_are_bound_to_original_attempt_and_verified_digest(self):
         _, run, _ = scheduled(21)

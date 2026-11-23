@@ -28,10 +28,9 @@ def observation_marker(health):
             "run_id": run["id"] if run else None, "report_available": health["report"] is not None}
 
 
-def select_observation(observed, previous_marker):
+def select_observation(observed, settled_slots):
     current, previous = observed
-    if previous_marker.get("due_at", "") > previous["due_at"]:
-        return current
+    previous_marker = settled_slots.get(previous["due_at"])
     run = previous["performance"]
     if not run:
         if (previous["status"] == "missing-handoff"
