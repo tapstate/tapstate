@@ -63,6 +63,29 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void deferredRejectionsExposeOnlyCompleteBoundedDocumentIdentifiers() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            var desired = intent(PipelineState.RUNNING, false, false, null);
+            var inputs = new io.tapstate.spi.store.PipelinePreparationInputs(HASH, Map.of(), Map.of(), List.of());
+            var valid = Map.<String, Object>of("id", "doc-42", "field", "revision");
+            assertThat(store.compareAndSetStart(scope, 0, desired, inputs)).isTrue();
+            store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE, valid);
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailureParams())
+                    .isEqualTo(valid);
+
+            assertThat(store.compareAndSetStart(scope, 1, desired, inputs)).isTrue();
+            store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", "mongodb://credential.invalid/private", "field", "revision"));
+            var rejection = domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+            assertThat(rejection.startFailure()).contains(IoError.DOCUMENT_UNREADABLE);
+            assertThat(rejection.startFailureParams()).isEmpty();
+            assertThat(SystemCollections.PIPELINE_INTENTS.on(database).find().first())
+                    .doesNotContainKey("startFailureParams");
+        });
+    }
+
+    @Test
     void stopThenStartCoalescesIntoOneLatestValueWithTheOriginalOneTimeStamp() {
         withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
