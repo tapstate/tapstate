@@ -391,6 +391,18 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         if (!MongoBindingReadFacts.supported(client)) return cachePreparationForTransaction(session);
         var stages = MongoStartConfigRead.root();
         stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
+        appendAdmittedPreparation(stages);
+        var row = identity.aggregate(session, stages).first();
+        var bound = MongoStartConfigRead.boundedRow(row, "binding", SINGLETON_ID);
+        var stage = MongoStartConfigRead.boundedRow(row, "setup", SINGLETON_ID);
+        var recovery = MongoStartConfigRead.boundedRow(row, "recovery", SINGLETON_ID);
+        if (row != null && row.get("root") instanceof Document root && SINGLETON_ID.equals(root.get("_id"))
+                && bound != null && stage != null && recovery != null)
+            return admittedObservationFacts(root, stage, bound, null, recovery).preparation();
+        return admittedFacts(session, false).preparation();
+    }
+
+    static void appendAdmittedPreparation(List<Document> stages) {
         var bindingFields = new Document("clusterId", 1).append("layoutId", 1).append(BINDING_VERSION, 1)
                 .append("installationId", 1).append("operationId", 1).append("generation", 1)
                 .append("mode", 1).append("defaultSourceId", 1).append("candidateHash", 1);
@@ -400,14 +412,6 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                         new Document("$project", new Document("value", MongoStartConfigRead.boundedValue()))))));
         stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_SETUP, "setup", SINGLETON_ID));
         stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_RECOVERY, "recovery", SINGLETON_ID));
-        var row = identity.aggregate(session, stages).first();
-        var bound = MongoStartConfigRead.boundedRow(row, "binding", SINGLETON_ID);
-        var stage = MongoStartConfigRead.boundedRow(row, "setup", SINGLETON_ID);
-        var recovery = MongoStartConfigRead.boundedRow(row, "recovery", SINGLETON_ID);
-        if (row != null && row.get("root") instanceof Document root && SINGLETON_ID.equals(root.get("_id"))
-                && bound != null && stage != null && recovery != null)
-            return admittedObservationFacts(root, stage, bound, null, recovery).preparation();
-        return admittedFacts(session, false).preparation();
     }
 
     record AdmittedFacts(Optional<CachePreparation> preparation, Document version) {}

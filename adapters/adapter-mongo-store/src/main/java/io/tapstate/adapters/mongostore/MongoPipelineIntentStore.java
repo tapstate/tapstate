@@ -381,7 +381,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (row == null) throw fenced();
     }
 
-    private static Document pendingFilter(PendingStart pending) {
+    static Document pendingFilter(PendingStart pending) {
         var original = pending.intent();
         var scope = original.scope();
         return new Document("_id", scope.pipelineId()).append("intentRevision", original.intentRevision())

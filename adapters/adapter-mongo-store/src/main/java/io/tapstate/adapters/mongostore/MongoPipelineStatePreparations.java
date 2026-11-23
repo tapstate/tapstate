@@ -98,8 +98,7 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
                 || !originalNode.key().resourceId().equals(originalNode.owner().nodeId())) throw fenced();
         String preparationId = UUID.randomUUID().toString();
         Issuance result = transaction(session -> {
-            if (pending != null) MongoPipelineIntentStore.requirePending(session, database, pending);
-            Document row = requireCurrent(session, scope, pending != null, pending == null);
+            Document row = requireCurrent(session, scope, pending != null, pending == null, pending);
             if (recovery != null) recovery.require(session,client,database);
             PipelinePreparation previous = MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId);
             if (previous.phase() != PipelinePreparation.Phase.UNASSIGNED) {
@@ -285,9 +284,8 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
             io.tapstate.spi.store.PipelineIntentStore.PendingStart pending) {
         Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(preparationId, "preparationId");
         transaction(session -> {
-            if (pending != null) MongoPipelineIntentStore.requirePending(session, database, pending);
             var current = MongoPipelinePreparationFacts.decode(scope.pipelineId(),
-                    requireCurrent(session, scope, pending != null, true), clusterId);
+                    requireCurrent(session, scope, pending != null, true, pending), clusterId);
             if (current.phase() != PipelinePreparation.Phase.ISSUED || !scope.equals(current.scope())
                     || !preparationId.equals(current.preparationId())) throw fenced();
             return null;
@@ -310,8 +308,7 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         PipelineIntentScope scope = Objects.requireNonNull(receipt.scope(), "scope");
         String preparationId = Objects.requireNonNull(receipt.preparationId(), "preparationId");
         return transaction(session -> {
-            if (pending != null) MongoPipelineIntentStore.requirePending(session, database, pending);
-            Document row = requireCurrent(session, scope, pending != null, true);
+            Document row = requireCurrent(session, scope, pending != null, true, pending);
             var current = MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId);
             if (current.phase() == PipelinePreparation.Phase.UNASSIGNED || !scope.equals(current.scope())
                     || !preparationId.equals(current.preparationId())) throw fenced();
@@ -328,14 +325,50 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     }
 
     private Document requireCurrent(ClientSession session, PipelineIntentScope scope, boolean admitted, boolean requirePipeline) {
-        var cache = (admitted ? bindings.admittedCachePreparation(session) : bindings.cachePreparationForTransaction(session)).orElseThrow(MongoPipelineStatePreparations::fenced).businessScope();
+        return requireCurrent(session, scope, admitted, requirePipeline, null);
+    }
+
+    private Document requireCurrent(ClientSession session, PipelineIntentScope scope, boolean admitted, boolean requirePipeline,
+            io.tapstate.spi.store.PipelineIntentStore.PendingStart pending) {
+        Document captured = pending == null ? null : deferredCurrent(session, pending);
+        if (pending != null && captured == null) MongoPipelineIntentStore.requirePending(session, database, pending);
+        var cache = (captured != null ? bindings.admittedObservationFacts(
+                MongoStartConfigRead.boundedRow(captured, "identity", "cluster"),
+                MongoStartConfigRead.boundedRow(captured, "setup", "cluster"),
+                MongoStartConfigRead.boundedRow(captured, "binding", "cluster"), null,
+                MongoStartConfigRead.boundedRow(captured, "recovery", "cluster")).preparation()
+                : admitted ? bindings.admittedCachePreparation(session) : bindings.cachePreparationForTransaction(session))
+                .orElseThrow(MongoPipelineStatePreparations::fenced).businessScope();
         if (!clusterId.equals(scope.clusterId()) || !cache.clusterId().equals(scope.clusterId())
                 || cache.bindingVersion() != scope.bindingVersion() || !cache.cacheIncarnation().equals(scope.cacheIncarnation())) throw fenced();
-        Document row = mappings.find(session, new Document("_id", scope.pipelineId())).first();
+        Document row = captured == null ? mappings.find(session, new Document("_id", scope.pipelineId())).first()
+                : MongoStartConfigRead.boundedRow(captured, "mapping", scope.pipelineId());
         PipelineStateMapping mapping = MongoPipelineStateMappings.decode(scope.pipelineId(), row);
         if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE || mapping.stateGeneration() != scope.stateGeneration()
-                || requirePipeline && pipelines.find(session, new Document("_id", scope.pipelineId())).first() == null) throw fenced();
+                || requirePipeline && (captured == null ? pipelines.find(session, new Document("_id", scope.pipelineId())).first()
+                        : MongoStartConfigRead.boundedRow(captured, "pipeline", scope.pipelineId())) == null) throw fenced();
         return row;
+    }
+
+    /** Only positive exact rows replace point proofs in this transaction callback. */
+    private Document deferredCurrent(ClientSession session, io.tapstate.spi.store.PipelineIntentStore.PendingStart pending) {
+        if (!MongoBindingReadFacts.supported(client)) return null;
+        String pipelineId = pending.intent().scope().pipelineId();
+        var stages = new java.util.ArrayList<Document>();
+        stages.add(new Document("$match", MongoPipelineIntentStore.pendingFilter(pending)));
+        stages.add(new Document("$limit", 1));
+        stages.add(new Document("$project", new Document("_id", 1)));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.CONFIG_CLUSTER_IDENTITY, "identity", "cluster"));
+        MongoStorageBindingStore.appendAdmittedPreparation(stages);
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", pipelineId));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.PIPELINES, "pipeline", pipelineId));
+        var captured = SystemCollections.PIPELINE_INTENTS.on(database).aggregate(session, stages).first();
+        if (captured == null || !pipelineId.equals(captured.get("_id"))) return null;
+        for (String slot : java.util.List.of("identity", "binding", "setup", "recovery", "mapping", "pipeline")) {
+            Object id = slot.equals("mapping") || slot.equals("pipeline") ? pipelineId : "cluster";
+            if (MongoStartConfigRead.boundedRow(captured, slot, id) == null) return null;
+        }
+        return captured;
     }
 
     private void replaceAnnex(ClientSession session, PipelineIntentScope scope, Document original, PipelinePreparation next) {

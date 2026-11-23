@@ -134,6 +134,183 @@ class MongoCachePipelinePreparationsIT {
         });
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {0, 100})
+    void deferredConfigPreparationCapturesOnePositiveSnapshotPerPhase(int siblings) {
+        withFixture(f -> {
+            var peers = new ArrayList<io.tapstate.core.model.Resource>();
+            for (int i = 0; i < siblings; i++) peers.add(new io.tapstate.core.model.PipelineResource(
+                    "peer-" + i, null, List.of(), null, null, null, null, null));
+            if (!peers.isEmpty()) f.configuration.artifacts().saveAll(peers);
+            var pending = deferredStart(f);
+            assertThat(f.claim()).isNull(); assertThat(f.state()).isNull();
+            long version = f.version();
+            var commands = new ArrayList<String>();
+            var driverNanos = new java.util.concurrent.atomic.AtomicLong();
+            var listener = new CommandListener() {
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    driverNanos.addAndGet(event.getElapsedTime(TimeUnit.NANOSECONDS));
+                }
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    var target = event.getCommand().get(event.getCommandName());
+                    commands.add(event.getCommandName() + ":" + (target != null && target.isString() ? target.asString().getValue() : "-"));
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(CONFIG.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var configuration = observedPreparation(f, observed);
+                commands.clear(); driverNanos.set(0);
+                long started = System.nanoTime();
+                var grant = ((FirstPipelineCreationResult.Issued) configuration.issueDeferred(pending, f.node)).creation();
+                long issueDriverMillis = TimeUnit.NANOSECONDS.toMillis(driverNanos.get());
+                long issueMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                var issue = List.copyOf(commands);
+                var reserved = f.preparations().reserveFirst(grant, TTL);
+                commands.clear(); driverNanos.set(0);
+                started = System.nanoTime();
+                var receipt = f.preparations().seedDeferred(reserved, configuration, pending, AT);
+                long checkDriverMillis = TimeUnit.NANOSECONDS.toMillis(driverNanos.get());
+                long checkAndCacheMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                var check = List.copyOf(commands);
+                commands.clear(); driverNanos.set(0);
+                started = System.nanoTime();
+                assertThat(configuration.completeDeferred(pending, receipt).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+                long completeDriverMillis = TimeUnit.NANOSECONDS.toMillis(driverNanos.get());
+                long completeMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                var complete = List.copyOf(commands);
+                System.out.printf("DEFERRED_CONFIG_DRIVER siblings=%d issue_ms=%d check_ms=%d complete_ms=%d%n",
+                        siblings, issueDriverMillis, checkDriverMillis, completeDriverMillis);
+                System.out.printf("DEFERRED_CONFIG_WALL siblings=%d issue_ms=%d check_and_cache_seed_ms=%d complete_ms=%d%n",
+                        siblings, issueMillis, checkAndCacheMillis, completeMillis);
+                System.out.printf("DEFERRED_CONFIG_PHASES issue=%d check=%d complete=%d total=%d issue_commands=%s check_commands=%s complete_commands=%s%n",
+                        issue.size(), check.size(), complete.size(), issue.size() + check.size() + complete.size(), issue, check, complete);
+                assertThat(issue.size() + check.size() + complete.size()).isLessThanOrEqualTo(13);
+                assertThat(f.configuration.intents().loadForActuation("flow")).isPresent();
+                assertThat(f.state()).containsEntry("stateJson", "NEW").containsEntry("epoch", 0L);
+                assertThat(f.version()).isEqualTo(version);
+            }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"issue,revision", "check,revision", "complete,revision",
+            "issue,failure", "check,failure", "complete,failure", "issue,replacement", "check,replacement", "complete,replacement",
+            "issue,mapping", "check,mapping", "complete,mapping", "issue,reset", "check,reset", "complete,reset"})
+    void deferredPreparationRetainsOriginalRefusalsAndPendingErrorPriority(String phase, String change) {
+        withFixture(f -> {
+            var pending = deferredStart(f);
+            var configuration = f.configuration.preparations();
+            FirstPipelineCreation grant = phase.equals("issue") ? null
+                    : ((FirstPipelineCreationResult.Issued) configuration.issueDeferred(pending, f.node)).creation();
+            var reserved = grant == null ? null : f.preparations().reserveFirst(grant, TTL);
+            var receipt = phase.equals("complete") ? f.preparations().seedDeferred(reserved, configuration, pending, AT) : null;
+            var intents = SystemCollections.PIPELINE_INTENTS.on(f.configDatabase);
+            switch (change) {
+                case "revision" -> intents.updateOne(new Document("_id", "flow"), new Document("$inc", new Document("intentRevision", 1L)));
+                case "failure" -> intents.updateOne(new Document("_id", "flow"), new Document("$set", new Document("startFailure", "PIPELINE_INTENT_FENCED")));
+                case "replacement" -> intents.updateOne(new Document("_id", "flow"), new Document("$set", new Document("stateGeneration", 2L)));
+                case "mapping" -> SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).updateOne(new Document("_id", "flow"),
+                        new Document("$set", new Document("stateGeneration", 2L)));
+                case "reset" -> SystemCollections.CONFIG_CLUSTER_IDENTITY.on(f.configDatabase).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("bindingVersion", 0L)));
+                default -> throw new AssertionError(change);
+            }
+            if (java.util.Set.of("revision", "failure", "replacement").contains(change))
+                SystemCollections.STORAGE_SETUP.on(f.configDatabase).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("generation", "invalid")));
+            var beforeMapping = SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find().into(new ArrayList<>());
+            var beforeCache = f.snapshot();
+            Runnable rejected = switch (phase) {
+                case "issue" -> () -> configuration.issueDeferred(pending, f.node);
+                case "check" -> () -> configuration.requireIssuedDeferred(pending, grant.preparation().preparationId());
+                case "complete" -> () -> configuration.completeDeferred(pending, receipt);
+                default -> throw new AssertionError(phase);
+            };
+            assertCode(rejected::run, IoError.PIPELINE_INTENT_FENCED);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find().into(new ArrayList<>())).isEqualTo(beforeMapping);
+            assertThat(f.snapshot()).isEqualTo(beforeCache);
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"large-mapping", "foreign-pipeline-collation"})
+    void deferredPreparationFallsBackForLargeOrCollatingPositiveRows(String condition) {
+        withFixture(f -> {
+            var pending = deferredStart(f);
+            var configuration = f.configuration.preparations();
+            var grant = ((FirstPipelineCreationResult.Issued) configuration.issueDeferred(pending, f.node)).creation();
+            var reserved = f.preparations().reserveFirst(grant, TTL);
+            if (condition.equals("large-mapping")) {
+                SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).updateOne(new Document("_id", "flow"),
+                        new Document("$set", new Document("large", "x".repeat(70 * 1024))));
+            } else {
+                var table = SystemCollections.PIPELINES.on(f.configDatabase);
+                var original = table.find().first(); table.drop();
+                f.configDatabase.createCollection(SystemCollections.PIPELINES.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                        .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                                .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                original.put("_id", "FLOW"); table.insertOne(original);
+            }
+            var receipt = f.preparations().seedDeferred(reserved, configuration, pending, AT);
+            assertThat(configuration.completeDeferred(pending, receipt).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+            assertThat(f.state()).containsEntry("stateJson", "NEW");
+        });
+    }
+
+    @Test void aDeferredIssueRetryCannotReuseAReplacedPendingIntent() {
+        withFixture(f -> {
+            var pending = deferredStart(f);
+            var failures = new AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandFailed(CommandFailedEvent event) {
+                    if (event.getThrowable() instanceof com.mongodb.MongoException failure && failure.getCode() == 112) {
+                        failures.incrementAndGet();
+                        SystemCollections.PIPELINE_INTENTS.on(f.configDatabase).updateOne(new Document("_id", "flow"),
+                                new Document("$inc", new Document("intentRevision", 1L)));
+                    }
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(CONFIG.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                var configuration = observedPreparation(f, observed);
+                try (var admin = MongoClients.create(CONFIG.getReplicaSetUrl())) {
+                    admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                            .append("data", new Document("failCommands", List.of("update")).append("errorCode", 112)
+                                    .append("errorLabels", List.of("TransientTransactionError"))));
+                    try { assertCode(() -> configuration.issueDeferred(pending, f.node), IoError.PIPELINE_INTENT_FENCED); }
+                    finally { admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+                }
+                assertThat(failures).hasValue(1);
+                assertThat(f.configuration.preparations().read("flow").orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+                assertThat(f.claim()).isNull(); assertThat(f.state()).isNull();
+            }
+        });
+    }
+
+    private static MongoPipelineStatePreparations observedPreparation(Fixture f, MongoClient observed) {
+        var database = observed.getDatabase(f.configDatabase.getName());
+        String material = SystemCollections.CLUSTER_KEYS.on(f.configDatabase).find().first().getString("material");
+        var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+        var bindings = new MongoStorageBindingStore(observed, database, ciphers);
+        return new MongoPipelineStatePreparations(observed, database, "cluster-a", bindings,
+                new MongoConfigurationArtifactStore(observed, database, ciphers), ACTIVE);
+    }
+
+    private static io.tapstate.spi.store.PipelineIntentStore.PendingStart deferredStart(Fixture f) {
+        var source = new SourceResource("input", null, "mysql", Map.of("host", "source.invalid"), null,
+                List.of(io.tapstate.core.model.TableRef.literal("orders")), null, null);
+        var pipeline = new io.tapstate.core.model.PipelineResource("flow", null,
+                List.of(io.tapstate.core.model.SourceRef.spec("input", true)), null, null, null, null, null);
+        f.configuration.artifacts().saveAll(List.of(source, pipeline));
+        var inputs = io.tapstate.spi.store.PipelinePreparationInputs.of(f.scope, pipeline, Map.of("input", source),
+                Map.of("input", java.util.Set.of("orders")));
+        var current = f.configuration.intents().load("flow").orElseThrow();
+        assertThat(f.configuration.intents().compareAndSetStart(f.scope, current.intentRevision(),
+                new DesiredState("flow", PipelineState.RUNNING, CanonicalHash.of(pipeline), false), inputs)).isTrue();
+        return f.configuration.intents().pendingStart("flow").orElseThrow();
+    }
+
     @Test void anOversizedOriginalClaimRetainsTheOriginalSeedChecks() {
         withFixture(f -> {
             var store = new MongoCachePipelinePreparations(f.cacheClient, f.cacheDatabase, f.business(), ACTIVE, true);
