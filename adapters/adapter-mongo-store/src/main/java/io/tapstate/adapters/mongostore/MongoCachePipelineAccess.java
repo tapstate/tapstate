@@ -92,15 +92,39 @@ final class MongoCachePipelineAccess {
             var snapshot = database.withReadPreference(com.mongodb.ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
             var receipt = MongoPipelineProofFacts.readSinkReceipt(snapshot, scope, original.key(), receiptId);
             requireActive.run();
-            if (receipt != null) {
-                var facts = receipt.authority();
-                var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
-                MongoCacheBusinessIdentity.requireObservedAdmission(facts.identity(), facts.schema(), business);
-                validateState(facts.checkpoint());
-                requirePreparedClaim(facts.claim());
-            }
+            if (receipt != null) validateReceiptAuthority(receipt.authority());
             return receipt;
         }));
+    }
+
+    private void validateReceiptAuthority(MongoPipelineProofFacts.Authority facts) {
+        var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+        MongoCacheBusinessIdentity.requireObservedAdmission(facts.identity(), facts.schema(), business);
+        validateState(facts.checkpoint());
+        requirePreparedClaim(facts.claim());
+    }
+
+    <T> T changeSinkReceipt(Document id,
+            java.util.function.BiFunction<ClientSession, MongoPipelineProofFacts.SinkReceipt, T> action) {
+        if (original == null || unpreparedModels || authoringModels != null || !MongoBindingReadFacts.supported(client))
+            return metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, true, session -> action.apply(session, null));
+        var result = transaction(TRANSACTION, false, session -> {
+            var receipt = MongoPipelineProofFacts.readSinkReceipt(session, database, scope, original.key(), id);
+            Document current;
+            if (receipt == null) {
+                var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+                new MongoCacheBusinessIdentity(database, business).requireAdmissionState(session);
+                current = state(session, true);
+            } else {
+                validateReceiptAuthority(receipt.authority());
+                current = receipt.authority().checkpoint();
+            }
+            proveClaim(session, true);
+            updateState(session, current, new Document(), false);
+            return action.apply(session, receipt);
+        });
+        requireActive.run();
+        return result;
     }
 
     <T> T stateTransaction(boolean mutation, Function<ClientSession, T> action) {

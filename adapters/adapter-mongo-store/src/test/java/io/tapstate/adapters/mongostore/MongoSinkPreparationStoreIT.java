@@ -51,7 +51,6 @@ class MongoSinkPreparationStoreIT {
             var input = f.input("orders");
             var control = f.store();
             control.prepareTargets(List.of(input));
-            var ready = control.complete(control.begin(input), new SinkPreparationStore.Result(true));
             var commands = new ArrayList<org.bson.BsonDocument>();
             var settings = com.mongodb.MongoClientSettings.builder()
                     .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
@@ -64,6 +63,15 @@ class MongoSinkPreparationStoreIT {
                 client.getDatabase("admin").runCommand(new Document("ping",1));
                 var access = new MongoCachePipelineAccess(client,client.getDatabase(f.cache.getName()),f.scope,f.fence,ACTIVE);
                 var store = new MongoSinkPreparationStore(access);
+                commands.clear();
+                var attempt = store.begin(input);
+                var beginCommands = commands.stream().map(org.bson.BsonDocument::getFirstKey).toList();
+                commands.clear();
+                var ready = store.complete(attempt, new SinkPreparationStore.Result(true));
+                var completeCommands = commands.stream().map(org.bson.BsonDocument::getFirstKey).toList();
+                System.out.println("SINK_TRANSITIONS begin=" + beginCommands + " complete=" + completeCommands);
+                assertThat(beginCommands).containsExactly("aggregate", "update", "update", "update", "commitTransaction");
+                assertThat(completeCommands).isEqualTo(beginCommands);
                 commands.clear();
                 assertThat(store.load(input)).isEqualTo(ready);
                 assertThat(store.loadMany(List.of(input))).containsExactly(ready);

@@ -44,9 +44,16 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
 
     static SinkReceipt readSinkReceipt(MongoDatabase snapshot, PipelineIntentScope scope, WorkloadClaimKey key,
             Document receiptId) {
+        return readSinkReceipt(null, snapshot, scope, key, receiptId);
+    }
+
+    static SinkReceipt readSinkReceipt(ClientSession session, MongoDatabase database, PipelineIntentScope scope,
+            WorkloadClaimKey key, Document receiptId) {
         var stages = authorityStages(scope, key);
         stages.add(lookup(SystemCollections.CACHE_SINK_PREPARATIONS, "receipt", receiptId, false));
-        var captured = SystemCollections.CACHE_IDENTITY.on(snapshot).aggregate(stages).collation(SIMPLE).first();
+        var table = SystemCollections.CACHE_IDENTITY.on(database);
+        var query = session == null ? table.aggregate(stages) : table.aggregate(session, stages);
+        var captured = query.collation(SIMPLE).first();
         var facts = authority(captured);
         if (facts == null) return null;
         var receipt = row(captured, "receipt");
