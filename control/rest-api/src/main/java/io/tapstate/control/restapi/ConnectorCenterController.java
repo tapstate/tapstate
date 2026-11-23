@@ -1,11 +1,13 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.ConnectorCenter.InstallationFailure;
 import io.tapstate.control.core.ConnectorCenterService;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.ConnectorUsageQuery;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.RequestParam;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.messages.MessageCatalog;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -14,19 +16,22 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.io.IOException;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /** HTTP projection of the connector catalog and local installation operations. */
 @RestController
 final class ConnectorCenterController {
     private final ObjectProvider<ConnectorCenterService> services;
+    private final MessageCatalog catalog;
     private ConnectorUsageQuery usage;
 
     @Autowired(required = false)
     void connectorUsage(ConnectorUsageQuery usage) { this.usage = usage; }
 
-    ConnectorCenterController(ObjectProvider<ConnectorCenterService> services) {
+    ConnectorCenterController(ObjectProvider<ConnectorCenterService> services, MessageCatalog catalog) {
         this.services = services;
+        this.catalog = catalog;
     }
 
     @Verb("connector-center.list")
@@ -62,14 +67,14 @@ final class ConnectorCenterController {
         MalformedRequest.requireText(id, "a connector id is required");
         if (expectedSha256 != null && !expectedSha256.matches("[a-f0-9]{64}"))
             throw MalformedRequest.rejecting("a lowercase SHA-256 is required", null);
-        return service().download(id, expectedSha256, AuthenticatedCaller.subject());
+        return installation(service().download(id, expectedSha256, AuthenticatedCaller.subject()));
     }
 
     @Verb("connector-center.operation")
     @GetMapping("/connector-center/operations/{operationId}")
     Map<String, Object> operation(@PathVariable("operationId") String operationId) {
         MalformedRequest.requireText(operationId, "an installation operation id is required");
-        return service().operation(operationId);
+        return installation(service().operation(operationId));
     }
 
     @Verb("connector-center.upload")
@@ -80,10 +85,23 @@ final class ConnectorCenterController {
         var service = service();
         String principal = AuthenticatedCaller.subject();
         try {
-            return service.upload(request.getInputStream(), request.getContentLengthLong(), expectedConnectorId, principal);
+            return installation(service.upload(request.getInputStream(), request.getContentLengthLong(), expectedConnectorId, principal));
         } catch (IOException unreadable) {
             throw MalformedRequest.rejecting("the connector artifact could not be read", null);
         }
+    }
+
+    private Map<String, Object> installation(Map<String, Object> status) {
+        if (!(status.get("failure") instanceof InstallationFailure failure)) return status;
+        // An installation can fail to reach its artifact while this Tapstate server remains available.
+        var rendered = ControlError.UNREACHABLE.code().equals(failure.code()) ? null
+                : catalog.renderAvailable(failure.code(), failure.params(), ApiExceptionHandler.requestLocale()).orElse(null);
+        var error = new ApiError(failure.code(), failure.params(),
+                rendered == null ? null : rendered.message(),
+                rendered == null ? null : rendered.solution(), Map.of());
+        var response = new LinkedHashMap<>(status);
+        response.put("failure", error.fields());
+        return response;
     }
 
     private ConnectorCenterService service() {

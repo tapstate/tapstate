@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.ConnectorCenter;
+import io.tapstate.control.core.ConnectorCenter.InstallationFailure;
 import io.tapstate.control.core.ConnectorCenterService;
 import io.tapstate.control.core.ConnectorUsageQuery;
 import io.tapstate.control.core.ControlError;
@@ -86,13 +87,26 @@ class ConnectorCenterControllerTest {
             assertThat(center.length).isEqualTo(artifact.length);
             assertThat(center.download).isEqualTo("mongodb");
             assertThat(center.operation).isEqualTo("original-operation");
+
+            var uploadFailure = mvc.perform(get("/api/connector-center/operations/invalid-jar")
+                    .header("Accept-Language", "en")).andExpect(status().isOk()).andReturn().getResponse();
+            assertThat(uploadFailure.getContentAsString(java.nio.charset.StandardCharsets.UTF_8))
+                    .contains("No connector class found in artifact", "TapConnectorClass", "errorCode", "TS0060014");
+            var localizedFailure = mvc.perform(get("/api/connector-center/operations/invalid-jar")
+                    .header("Accept-Language", "zh-CN")).andExpect(status().isOk()).andReturn().getResponse();
+            assertThat(localizedFailure.getContentAsString(java.nio.charset.StandardCharsets.UTF_8))
+                    .contains("\u6ca1\u6709\u8fde\u63a5\u5668\u7c7b");
+            var downloadFailure = mvc.perform(get("/api/connector-center/operations/download-failed"))
+                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+            assertThat(downloadFailure).contains(ControlError.UNREACHABLE.code())
+                    .doesNotContain("Tapstate Server is unreachable");
         }
     }
 
     @Test
     void aLegacyAssemblyWithoutTheCenterReportsItsCodedUnavailableState() {
         var services = new DefaultListableBeanFactory().getBeanProvider(ConnectorCenterService.class);
-        var controller = new ConnectorCenterController(services);
+        var controller = new ConnectorCenterController(services, io.tapstate.messages.MessageCatalog.bundled());
         assertThatThrownBy(controller::list).isInstanceOfSatisfying(TapstateException.class,
                 failure -> assertThat(failure.code()).isEqualTo(ControlError.UNREACHABLE));
     }
@@ -134,7 +148,18 @@ class ConnectorCenterControllerTest {
             this.expectedSha256 = expectedSha256;
             return Map.of("id", "original-operation");
         }
-        @Override public Map<String, Object> operation(String id) { operation = id; return Map.of("stage", "installing"); }
+        @Override public Map<String, Object> operation(String id) {
+            operation = id;
+            return switch (id) {
+                case "invalid-jar" -> failed("TS0060014", Map.of("artifact", "JAR"));
+                case "download-failed" -> failed(ControlError.UNREACHABLE.code(), Map.of());
+                default -> Map.of("stage", "installing");
+            };
+        }
+
+        private static Map<String, Object> failed(String code, Map<String, Object> params) {
+            return Map.of("state", "FAILED", "errorCode", code, "failure", new InstallationFailure(code, params));
+        }
         @Override public Map<String, Object> upload(InputStream artifact, long contentLength, String expectedConnectorId) {
             try {
                 uploaded = artifact.readAllBytes();

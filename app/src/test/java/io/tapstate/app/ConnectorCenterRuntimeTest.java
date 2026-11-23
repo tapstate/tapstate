@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpServer;
 import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.adapters.pdk.LocalConnectorArtifacts;
 import io.tapstate.control.core.ConnectorCatalogError;
+import io.tapstate.control.core.ConnectorCenter.InstallationFailure;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.common.TapstateException;
@@ -122,6 +123,7 @@ class ConnectorCenterRuntimeTest {
             try (var center = new ConnectorCenterRuntime(remote, local, false)) {
                 assertThat(complete(center, center.download(ID, DOWNLOAD_HASH)))
                         .containsEntry("state", "FAILED").containsEntry("errorCode", ControlError.UNREACHABLE.code())
+                        .containsEntry("failure", new InstallationFailure(ControlError.UNREACHABLE.code(), Map.of()))
                         .doesNotContainKey("sha256");
             }
         } finally {
@@ -171,11 +173,13 @@ class ConnectorCenterRuntimeTest {
     @Test
     void failedUploadsReleaseTheirSlotsAndBoundTheOperationHistory() {
         var local = mock(LocalConnectorArtifacts.class);
-        var failure = new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", ID), null);
+        var failure = new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
+                Map.of("artifact", "/private/install/.connector-123.jar"), null);
         when(local.stage(any(), any())).thenThrow(failure);
         try (var center = new ConnectorCenterRuntime(mock(ConnectorCatalogBackground.class), local, false)) {
             var first = center.upload(new ByteArrayInputStream(ARTIFACT), ARTIFACT.length, null);
-            assertThat(first).containsEntry("state", "FAILED").containsEntry("errorCode", failure.code().code());
+            assertThat(first).containsEntry("state", "FAILED").containsEntry("errorCode", failure.code().code())
+                    .containsEntry("failure", new InstallationFailure(failure.code().code(), Map.of("artifact", "JAR")));
             for (int i = 0; i < 127; i++) {
                 assertThat(center.upload(new ByteArrayInputStream(ARTIFACT), ARTIFACT.length, null))
                         .containsEntry("state", "FAILED");

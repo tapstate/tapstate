@@ -16,10 +16,12 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.concurrent.ExecutorService;
 
@@ -28,6 +30,10 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
     private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(ConnectorCenterRuntime.class);
     private static final int MAX_ACTIVE = 4;
     private static final int MAX_OPERATIONS = 128;
+    private static final Set<String> PUBLIC_TOKEN_PARAMS = Set.of(
+            "connector", "version", "hash", "existing", "incoming", "expected", "actual");
+    private static final Pattern PUBLIC_TOKEN = Pattern.compile("[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}");
+    private static final Pattern PUBLIC_CONNECTOR_LIST = Pattern.compile("[a-zA-Z0-9_., -]{1,1024}");
     private final ConnectorCatalogBackground remote;
     private final LocalConnectorArtifacts local;
     private final boolean cloud;
@@ -142,7 +148,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
             } catch (IOException failure) {
                 operation.fail(ControlError.UNREACHABLE.code());
             } catch (TapstateException failure) {
-                operation.fail(failure.code().code());
+                operation.fail(failure);
             } catch (RuntimeException bug) {
                 operation.fail(ControlError.UNREACHABLE.code());
                 LOG.error("Connector download operation failed", bug);
@@ -159,7 +165,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
         try {
             staged = local.stage(artifact, amount -> operation.bytes = amount);
         } catch (TapstateException failed) {
-            operation.fail(failed.code().code());
+            operation.fail(failed);
             return operation.view();
         }
         operation.phase = "INSTALLING";
@@ -168,7 +174,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
                 try (staged) {
                     install(operation, staged, Origin.UPLOAD, expectedConnectorId, null);
                 } catch (TapstateException failure) {
-                    operation.fail(failure.code().code());
+                    operation.fail(failure);
                 } catch (RuntimeException bug) {
                     operation.fail(ControlError.UNREACHABLE.code());
                     LOG.error("Connector upload operation failed", bug);
@@ -231,7 +237,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
         private volatile long total;
         private volatile String connector;
         private volatile String hash;
-        private volatile String error;
+        private volatile InstallationFailure error;
         private volatile String pdkApiVersion;
         private volatile boolean newlyRegistered;
 
@@ -245,7 +251,27 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
         }
 
         void fail(String code) {
-            error = code;
+            fail(new InstallationFailure(code, Map.of()));
+        }
+
+        void fail(TapstateException failure) {
+            var params = new LinkedHashMap<String, Object>();
+            // Artifact parameters come from a staging path rather than a name chosen for public display.
+            failure.args().forEach((key, value) -> {
+                if ("artifact".equals(key)) {
+                    params.put(key, "JAR");
+                } else if (value instanceof String text
+                        && ((PUBLIC_TOKEN_PARAMS.contains(key) && PUBLIC_TOKEN.matcher(text).matches()
+                                && !text.endsWith(".jar"))
+                            || ("official".equals(key) && PUBLIC_CONNECTOR_LIST.matcher(text).matches()))) {
+                    params.put(key, text);
+                }
+            });
+            fail(new InstallationFailure(failure.code().code(), params));
+        }
+
+        private void fail(InstallationFailure failure) {
+            error = failure;
             phase = "FAILED";
         }
 
@@ -257,7 +283,11 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
             if (total >= 0) status.put("totalBytes", total);
             if (connector != null) status.put("connectorId", connector);
             if (hash != null) status.put("sha256", hash);
-            if (error != null) status.put("errorCode", error);
+            var failure = error;
+            if (failure != null) {
+                status.put("errorCode", failure.code());
+                status.put("failure", failure);
+            }
             if (pdkApiVersion != null) status.put("pdkApiVersion", pdkApiVersion);
             if ("INSTALLED".equals(phase)) status.put("newlyRegistered", newlyRegistered);
             return status;
