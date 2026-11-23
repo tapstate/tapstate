@@ -4614,7 +4614,7 @@ final class StoreBackedDagSource implements DagSource {
             if(notes==null || provisioner==null)throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
             var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
             if(artifacts!=null) {
-                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBinding)
+                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBindingForSinkStartup)
                         .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));
                 if(identity.isPresent())run=run.withSource(identity.orElseThrow());
             }
@@ -4640,7 +4640,7 @@ final class StoreBackedDagSource implements DagSource {
             if(notes==null || provisioner==null)throw new IllegalStateException("configured sampled targets require their original binder");
             var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
             if(artifacts!=null) {
-                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBinding)
+                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBindingForSinkStartup)
                         .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));
                 if(identity.isPresent())run=run.withSource(identity.orElseThrow());
             }

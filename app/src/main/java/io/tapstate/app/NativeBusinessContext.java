@@ -656,7 +656,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock,
                 NodeSessionLease node,CloudRuntimeSettings cloud){
             ScopedSinkStateProvider.of(member).observeOperations((run,config,slot,guard,local)->{
-                var source=owner.configuration.artifacts().sourceBinding(owner.original.binding().defaultSourceId());
+                String sourceId = owner.original.binding().defaultSourceId();
+                var source = owner.configuration.sourceBindingForSinkStartup(sourceId);
                 org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).debug("Target monitoring identity [source={},captured={},connector={},settings={},binding={}]",source.isPresent(),run.source()!=null,
                         source.map(value->value.source().connector().equals(config.connectorId())).orElse(false),
                         source.map(value->value.source().config().equals(config.settings())).orElse(false),

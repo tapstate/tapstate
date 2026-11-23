@@ -231,6 +231,11 @@ public interface ArtifactStore {
                 Map.of("id", id), null);
     }
 
+    /** Captures the current target Source for sink startup, retaining the ordinary read contract. */
+    default Optional<SourceBindingSnapshot> sourceBindingForSinkStartup(String id) {
+        return sourceBinding(id);
+    }
+
     /** Verified deployment-owned target identity; absent only for a store without a storage binding. */
     default Optional<String> managedDefaultSourceId() { return Optional.empty(); }
 

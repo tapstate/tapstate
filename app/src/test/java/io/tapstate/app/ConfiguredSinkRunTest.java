@@ -88,6 +88,52 @@ class ConfiguredSinkRunTest {
             assertThat(receipts.rows.values()).allSatisfy(row -> assertThat(row.phase()).isEqualTo(SinkPreparationStore.Phase.READY));
         }finally{member.shutdown();}
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void bothBinderBranchesUseTheStartupSourceBinding(boolean sampled) {
+        var notes = notes();
+        var ref = new ConnectorRef(List.of(), "not.loaded", "2.0.8", null, null, HASH, false);
+        ConnectorProvisioner provisioner = id -> ref;
+        var artifacts = mock(ArtifactStore.class);
+        var source = new io.tapstate.core.model.SourceResource("views", null, "demo", Map.of(), null, null, null, null);
+        var binding = new SourceBindingSnapshot(source, io.tapstate.core.model.canonical.CanonicalHash.of(source),
+                new SourceBindingIdentity(source.id(), UUID.randomUUID().toString(), 1));
+        when(artifacts.managedDefaultSourceId()).thenReturn(Optional.of("views"));
+        when(artifacts.sourceBinding("views")).thenReturn(Optional.of(binding));
+        when(artifacts.sourceBindingForSinkStartup("views")).thenReturn(Optional.of(binding));
+        var provider = mock(ScopedSinkStateProvider.class);
+        when(provider.observeOriginal(any(), any(), eq("assessment"), any(), any()))
+                .thenReturn(io.tapstate.spi.capture.SourceOperationObserver.NONE);
+        try (var local = mockStatic(ScopedSinkStateProvider.class)) {
+            local.when(ScopedSinkStateProvider::local).thenReturn(provider);
+            var binder = new StoreBackedDagSource.PdkSinkWriterBinder(notes, provisioner, ignored -> false, artifacts);
+            var original = factory();
+            PdkSinkWriterFactory bound;
+            if (sampled) {
+                var receipts = mock(SinkPreparationStore.class);
+                var inputs = new PipelinePreparationInputs(HASH, Map.of("input", "b".repeat(64)),
+                        Map.of("input", Set.of("orders")), List.of());
+                var snapshots = Map.of("input", new PipelineCaptureBindings.SnapshotOnlySource("chain", Set.of("orders"), 1));
+                var plan = new StoreBackedDagSource.TargetPreparations(receipts,
+                        new PipelineCaptureBindings(FENCE, Map.of(), Map.of(), snapshots, true, inputs, Set.of("input")));
+                plan.observeOrigins("orders", Set.of("input"));
+                when(receipts.retainedModels(anyCollection(), any(), anyBoolean(), eq(inputs))).thenReturn(Map.of());
+                when(receipts.resolveModels(anyList(), eq(inputs))).thenAnswer(call -> call.getArgument(0));
+                bound = (PdkSinkWriterFactory) binder.scoped(original, FENCE, plan, () -> {});
+                assertThat(plan.inputs).hasSize(1);
+                assertThat(plan.models).hasSize(1);
+            } else {
+                var roster = new ArrayList<SinkPreparationStore.Input>();
+                bound = (PdkSinkWriterFactory) binder.scoped(original, FENCE, roster, () -> {});
+                assertThat(roster).hasSize(1);
+            }
+            assertThat(bound.targets()).containsExactlyEntriesOf(original.targets());
+            verify(artifacts).sourceBindingForSinkStartup("views");
+            verify(artifacts, never()).sourceBinding(anyString());
+            verify(provider).observeOriginal(any(), any(), eq("assessment"), any(), any());
+        }
+    }
+
     @Test void theCoordinateDtoCarriesNoSettingsAndChecksBindingPurposeAndStateGeneration()throws Exception {
         var config=new SinkConfig("demo",Map.of("password","secret-sentinel"),WriteMode.UPSERT,DdlPolicy.FAIL,null,NODE);
         var notes=notes();var ref=new ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,HASH,false);

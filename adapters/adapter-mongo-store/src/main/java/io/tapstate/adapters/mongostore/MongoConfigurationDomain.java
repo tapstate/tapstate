@@ -893,6 +893,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 .requireRetiredPredecessor(current,earlier);
     }
 
+    public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBindingForSinkStartup(String sourceId) {
+        requireOpen();
+        var result = artifacts.sourceBindingForSinkStartup(sourceId);
+        requireOpen();
+        return result;
+    }
+
     public io.tapstate.spi.store.CaptureStatePreparations capturePreparations() {
         requireOpen();return new MongoCaptureStatePreparations(connection.client(),connection.database(),clusterId,bindings,artifacts,this::requireOpen);
     }

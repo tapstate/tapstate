@@ -559,8 +559,45 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBinding(String id) {
+        return ordinarySourceBinding(id, new MongoReadBudget(java.time.Duration.ofSeconds(5)));
+    }
+
+    @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBindingForSinkStartup(String id) {
         Objects.requireNonNull(id, "id");
         var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return ordinarySourceBinding(id, budget);
+        return StoreIo.call(() -> {
+            var stages = MongoStartConfigRead.root();
+            var bounded = new Document("$cond", List.of(
+                    new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), 64 * 1024)), "$$ROOT", false));
+            stages.add(new Document("$project", new Document("identity", bounded)));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.SCHEMA_MIGRATIONS, "schema", "config",
+                    new Document("value", bounded)));
+            MongoStartConfigRead.addArtifacts(stages, List.of(id));
+            var selected = budget.database(database).withReadConcern(ReadConcern.SNAPSHOT);
+            var captured = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(selected).aggregate(stages).first();
+            var identity = captured != null && captured.get("identity") instanceof Document value ? value : null;
+            var schema = MongoStartConfigRead.row(captured, "schema", "config")
+                    .filter(value -> value.get("value") instanceof Document).map(value -> value.get("value", Document.class));
+            var resources = MongoStartConfigRead.artifacts(captured, List.of(id));
+            if (identity == null || schema.isEmpty() || resources.isEmpty() || resources.orElseThrow().size() != 1)
+                return ordinarySourceBinding(id, budget);
+            var state = MongoSourceIdentitySchema.read(identity, schema.orElseThrow(), ciphers.current().activeKeyId());
+            if (state == null || state.phase() != MongoSourceIdentitySchema.Phase.READY)
+                throw MongoSourceIdentitySchema.unavailable(id);
+            var stored = resources.orElseThrow().getFirst();
+            if (!"source".equals(stored.get("kind"))) return Optional.empty();
+            MongoSourceIdentity.read(stored);
+            var cipher = ciphers.refresh(budget);
+            var source = (SourceResource) new EncryptedArtifactCodec(cipher).decode(stored);
+            budget.requireRemaining();
+            return Optional.of(new io.tapstate.spi.store.SourceBindingSnapshot(source, stored.getString("contentHash"),
+                    MongoSourceIdentity.read(stored).binding()));
+        });
+    }
+
+    private Optional<io.tapstate.spi.store.SourceBindingSnapshot> ordinarySourceBinding(String id, MongoReadBudget budget) {
+        Objects.requireNonNull(id, "id");
         Document stored = budget.transaction(client, session -> {
             var state = MongoSourceIdentitySchema.read(session, database, ciphers.current().activeKeyId());
             if (state == null || state.phase() != MongoSourceIdentitySchema.Phase.READY) {

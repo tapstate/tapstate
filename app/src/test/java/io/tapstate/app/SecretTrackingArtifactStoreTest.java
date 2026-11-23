@@ -58,6 +58,22 @@ class SecretTrackingArtifactStoreTest {
         org.mockito.Mockito.verify(delegate, org.mockito.Mockito.never()).get(org.mockito.ArgumentMatchers.anyString());
     }
 
+    @Test void sinkStartupBindingReadKeepsTheNativePathAndRegistersSecrets() {
+        var delegate = org.mockito.Mockito.mock(ArtifactStore.class);
+        org.mockito.Mockito.when(delegate.listStored()).thenReturn(List.of());
+        var source = source("views", "sink-startup-secret");
+        var binding = new io.tapstate.spi.store.SourceBindingSnapshot(source,
+                io.tapstate.core.model.canonical.CanonicalHash.of(source),
+                new io.tapstate.spi.store.SourceBindingIdentity(source.id(), java.util.UUID.randomUUID().toString(), 1));
+        org.mockito.Mockito.when(delegate.sourceBindingForSinkStartup("views")).thenReturn(Optional.of(binding));
+        var redactor = new SecretRedactor();
+        var decorated = tracking(delegate, redactor);
+        assertThat(decorated.sourceBindingForSinkStartup("views")).contains(binding);
+        assertThat(redactor.redact("sink-startup-secret")).isEqualTo("********");
+        org.mockito.Mockito.verify(delegate).sourceBindingForSinkStartup("views");
+        org.mockito.Mockito.verify(delegate, org.mockito.Mockito.never()).sourceBinding(org.mockito.ArgumentMatchers.anyString());
+    }
+
     @Test void productionReadDecorationPreservesManagedTargetAuthority() {
         var delegate = new RecordingStore(); delegate.managed = "views";
         delegate.save(new SourceResource("views", null, "mongodb", Map.of("uri", "mongodb://host/master"), null, null, null, null));

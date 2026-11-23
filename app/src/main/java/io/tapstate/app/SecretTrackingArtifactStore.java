@@ -129,6 +129,10 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return trackedRead(() -> delegate.sourceBinding(id), value -> value.stream().map(binding -> binding.source()));
     }
 
+    @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBindingForSinkStartup(String id) {
+        return trackedRead(() -> delegate.sourceBindingForSinkStartup(id), value -> value.stream().map(binding -> binding.source()));
+    }
+
     @Override public Optional<String> managedDefaultSourceId() { return delegate.managedDefaultSourceId(); }
 
     /** Registers only sources that were committed by the native publication. */
