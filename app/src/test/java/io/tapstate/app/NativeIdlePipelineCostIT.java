@@ -103,6 +103,12 @@ class NativeIdlePipelineCostIT {
                     if (measure) {
                         measureIdle(raw, results);
                     } else {
+                        // The batched observation path requires the deferred inspection to have completed.
+                        var runtime = app.getBean(StorageRoot.class).runtime();
+                        var original = runtime.current().orElseThrow();
+                        assertThat(runtime.requireConfiguration().inspectStructure(new MongoReadBudget(Duration.ofSeconds(30)))).isEmpty();
+                        assertThat(original.cache().inspectStructure(original.preparation().authScope(),
+                                new MongoReadBudget(Duration.ofSeconds(30)))).isEmpty();
                         verifyWarmObservations(raw, storage);
                     }
                     var health=NativeAppStorage.business(app).getBean(PipelineAlertRuntime.class).health();
