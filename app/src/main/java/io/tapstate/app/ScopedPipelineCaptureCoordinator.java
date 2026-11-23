@@ -363,7 +363,6 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         @Override public void startCapture(String pipeline,ArtifactStore captured,SourceModelSnapshot models) {
             requireId(pipeline);
             if (!original.scope().equals(commandScope) || !claim(original).equals(command)) throw refused();
-            openingFailure.set(null);
             start(this,captured,models);
         }
         @Override public io.tapstate.core.common.FailureFact openingFailureFact(String pipeline, Throwable failure) {
@@ -409,7 +408,13 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             requireId(pipeline); var held=current(); return held==null?null:initialLoadReading(held,plan,at);
         }
         private Session current() { synchronized(ScopedPipelineCaptureCoordinator.this) { return sessions.get(original); } }
-        private Session session() { var session=current(); if(session==null || session.bindings==null)throw refused(); return session; }
+        private Session session() {
+            synchronized (ScopedPipelineCaptureCoordinator.this) {
+                var session = sessions.get(original);
+                if (session == null || session.starting || session.bindings == null) throw refused();
+                return session;
+            }
+        }
         private void requireId(String pipeline) { if(!original.pipelineId().equals(pipeline))throw refused(); }
     }
     /** Exact original session only; a current claim never relabels an old alias binding. */
@@ -417,6 +422,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var held=sessions.get(original);if(held==null)throw refused();return route(held,alias,table);
     }
     private ValidationCaptureRoute route(Session held,String alias,String table) {
+        if (held.starting || held.bindings == null) throw refused();
         requireSession(held);var source=held.sources.get(alias);
         if(held.bounded||source==null||!source.selected.tables().contains(table))throw refused();
         var state=stores.preparations().control(source.prepared,table);
@@ -454,7 +460,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     if (failed != null) failed.ended.set(true);
                 }
             } finally {
-                if (!sessions.containsKey(run.original)) startingOrActiveCaptures.remove(run.original);
+                var original = sessions.get(run.original);
+                if (original == null) startingOrActiveCaptures.remove(run.original);
+                else if (!alreadyPresent) original.starting = false;
             }
         }
         if (failed != null) {
@@ -481,9 +489,10 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                         run.original.scope(), authored, pipeline, sourceDefinitions);
         var existing = sessions.get(run.original);
         if (existing != null) {
-            if (!existing.inputs.equals(inputs)) throw refused();
+            if (existing.starting || existing.stopping || existing.ended.get() || !existing.inputs.equals(inputs)) throw refused();
             return;
         }
+        run.openingFailure.set(null);
         var mode =
                 pipeline.settings() == null || pipeline.settings().readMode() == null
                         ? ReadMode.SNAPSHOT_AND_CDC
@@ -860,7 +869,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             WorkloadClaimFence node,
             ArtifactStore artifacts,
             PipelineResource authored) {
-        if (source.owner == null) return;
+        Owner originalOwner = source.owner;
+        if (originalOwner == null) return;
         if (source.owner.config == null) {
             source.owner.origin = session.original;
             source.owner.config =
@@ -877,12 +887,22 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     source.tailOpening = opened;
             } else ensureTail(source.owner, false, session.openingFailure::set);
         } catch (SrsBaselineModelMismatch mismatch) {
+            var failedTail = originalOwner.physical;
+            if (failedTail != null) {
+                awaitMismatchClose(originalOwner, () -> closeFailedTail(originalOwner, failedTail, mismatch), mismatch);
+            }
             if (!session.snapshot
+                    || hostClosing
+                    || sessions.get(session.original) != session
+                    || source.owner != originalOwner
+                    || owners.get(originalOwner.prepared.captureId()) != originalOwner
                     || retained.snapshot() != null
                     || before.pendingFreshFull() != null
                     || !source.prepared.chainId().equals(mismatch.chainId())
                     || source.owner.physical != null
                     || mismatch.getSuppressed().length != 0) throw mismatch;
+            requireSession(session);
+            originalOwner.require();
             var full =
                     stores.completedFull()
                             .find(
@@ -1131,7 +1151,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                             session.began,
                             receipt -> {
                                 guard.run();
-                                startPreparedTail(source.owner, receipt.chain(), source.owner.configured, session.openingFailure::set);
+                                startPreparedTail(source.owner, receipt.chain(), source.owner.configured, session.openingFailure::set, false);
                                 guard.run();
                                 logged.put(
                                         source.id,
@@ -1185,6 +1205,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         // Guarded by the coordinator monitor while physical retirement runs without it.
         boolean stopping;
         CompletableFuture<Void> operationAttempt;
+        boolean maintenanceRetirementPending;
         Owner(CapturePreparation prepared,WorkloadClaim initial) { this.prepared=prepared;this.initial=initial;this.fence=WorkloadClaimFence.from(initial); }
         void finishCheckpointingForRetirement() {
             if (ended.get() || drainingReports() || physical == null || !physical.live.get()) return;
@@ -1249,6 +1270,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         final ExecutionFence original; final PipelinePreparationInputs inputs; final Instant began; final ReadMode mode; final boolean bounded,snapshot;
         final Map<String,Source> sources=new LinkedHashMap<>(); final AtomicBoolean ended=new AtomicBoolean(); final AtomicReference<io.tapstate.core.common.FailureFact> failure=new AtomicReference<>();
         PipelineCaptureBindings bindings;
+        boolean starting = true;
         boolean stopping;
         final AtomicReference<io.tapstate.core.common.FailureFact> openingFailure;
         Session(ExecutionFence original,PipelinePreparationInputs inputs,Instant began,ReadMode mode,AtomicReference<io.tapstate.core.common.FailureFact> openingFailure) { this.openingFailure=openingFailure; this.original=original;this.inputs=inputs;this.began=began;this.mode=mode;this.bounded=mode==ReadMode.SNAPSHOT_ONLY;this.snapshot=mode!=ReadMode.CDC_ONLY; }
@@ -1261,7 +1283,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     synchronized Optional<ObservationSelection> observationSelection(ExecutionFence original) {
         var held = sessions.get(original);
-        if (held == null || !held.snapshot || held.bounded || held.sources.isEmpty() || held.bindings == null
+        if (held == null || held.starting || !held.snapshot || held.bounded || held.sources.isEmpty() || held.bindings == null
                 || held.sources.values().stream().anyMatch(source -> !source.shared || source.prepared == null
                         || source.consumer == null || source.snapshotEpoch < 1)) return Optional.empty();
         if (!observationSessionCurrent(held)) return Optional.empty();
@@ -1402,7 +1424,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         final Runnable guard = new NativeSrsCaptureRunUnit.RetainedTailOpening() {
             @Override public void run() { require(); }
             @Override public boolean retainFailedTail(Throwable failure) {
-                return Thread.holdsLock(ScopedPipelineCaptureCoordinator.this) && !(failure instanceof SrsBaselineModelMismatch);
+                return Thread.holdsLock(ScopedPipelineCaptureCoordinator.this);
             }
         };
         SourceOperationObserver reports=SourceOperationObserver.NONE;
@@ -1457,7 +1479,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     private ConfiguredCaptureRun ensureTail(Owner owner, boolean admitted,
             java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
-        return ensureTail(owner, tailStores(owner), admitted, null, openingFailure);
+        return ensureTail(owner, tailStores(owner), admitted, null, openingFailure, true);
     }
 
     private SrsStores tailStores(Owner owner) {
@@ -1469,7 +1491,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private ConfiguredCaptureRun ensureTail(Owner owner, SrsStores current, boolean admitted,
             SrsConsumerStore.RetentionSnapshot snapshot,
-            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
+            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure, boolean recoverMismatch) {
         String chainId = owner.prepared.chainId();
         var consumers = current.consumers();
         var requested = new TreeSet<String>();
@@ -1519,21 +1541,23 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             opened = current.chains().load(chainId).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         }
         owner.configured = configured.retained();
-        startPreparedTail(owner, opened, configured, openingFailure);
+        startPreparedTail(owner, opened, configured, openingFailure, recoverMismatch);
         return configured.startupArtifact() == null ? null : configured;
     }
 
     private void startPreparedTail(Owner owner, SrsChainState opened, ConfiguredCaptureRun opening,
-            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
+            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure, boolean recoverMismatch) {
         owner.require();if(owner.physical!=null || owner.configured==null || !opened.miningChainId().equals(owner.prepared.chainId()))throw refused();
         var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes(),owner.config.nodeConfig());
         var start=opened.resumeToken()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.resumeToken()));
         var physical=new Physical(owner);owner.physical=physical;var notes=owner.configured;
         var captured = new AtomicReference<io.tapstate.core.common.FailureFact>();
+        boolean lockedStartup = Thread.holdsLock(this);
         java.util.function.Function<io.tapstate.runtime.srs.SrsCaptureWriter, CapturePort> open = writer -> {
             CapturePort port=ports.open(opening,config,physical.guard,null,actual -> writer.prepare(actual,notes.modelComparison(config,stores.notes(),connectors,physical.guard)));
             if(port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk){
                 pdk.withOpeningFailure(captured::set);
+                if (lockedStartup) pdk.withDeferredPreflightClose(SrsBaselineModelMismatch.class::isInstance);
                 if (owner.identity != null) {
                     physical.reports=operations.open(owner.identity,owner.prepared.captureId()+":stream",physical::requireReport,physical::requireReportLocal);
                     pdk.withOperationObserver(physical.reports);
@@ -1548,21 +1572,45 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         } catch(RuntimeException|Error failure) {
             var fact = captured.get();
             if (fact != null && fact.cause() == failure) openingFailure.accept(fact);
-            Runnable release = () -> {
-                try { physical.close(); owner.physical = null; }
-                catch (RuntimeException | Error cleanup) {
-                    if (cleanup != failure) failure.addSuppressed(cleanup);
-                }
-            };
-            // This typed preflight refusal has already retired its provisional tail in the run unit.
-            // The same start can inspect a fresh full receipt only after clearing this local handle.
-            boolean retiredPreflight = failure instanceof SrsBaselineModelMismatch && failure.getSuppressed().length == 0;
-            if (Thread.holdsLock(this) && !retiredPreflight) scheduleOwnerOperation(owner, release);
+            // Only the first preflight may resume. Its caller will wait after the native opening has unwound.
+            if (recoverMismatch && failure instanceof SrsBaselineModelMismatch) throw failure;
+            Runnable release = () -> closeFailedTail(owner, physical, failure);
+            if (lockedStartup) scheduleOwnerOperation(owner, release);
             else release.run();
             throw failure;
         } finally {
             // A shared physical tail must not retain a pipeline's opening receiver.
             captured.set(null);
+        }
+    }
+
+    private void closeFailedTail(Owner owner, Physical physical, Throwable failure) {
+        try { physical.close(); owner.physical = null; }
+        catch (RuntimeException | Error cleanup) {
+            if (cleanup != failure) failure.addSuppressed(cleanup);
+        }
+    }
+
+    private void awaitMismatchClose(Owner owner, Runnable release, Throwable mismatch) {
+        CompletableFuture<Void> reservation = reserveOwnerOperation(owner);
+        var closedTail = new CompletableFuture<Void>();
+        ownerOperations.execute(() -> {
+            try { release.run(); }
+            finally {
+                synchronized (this) {
+                    closedTail.complete(null);
+                    notifyAll();
+                }
+            }
+        });
+        // Keep the original owner's reservation while the coordinator monitor is released.
+        try {
+            while (!closedTail.isDone()) wait();
+            finishOwnerOperation(owner, reservation);
+        } catch (InterruptedException interrupted) {
+            closedTail.whenComplete((ignored, failure) -> finishOwnerOperation(owner, reservation));
+            mismatch.addSuppressed(StorageRuntime.unavailable());
+            Thread.currentThread().interrupt();
         }
     }
     private RingNotOpenYet awaiting(Source source) {
@@ -1603,7 +1651,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private synchronized void maintain() {
         if(closed.get())return;
-        for(var session:List.copyOf(sessions.values()))if(session.failure.get()==null && !session.ended.get())for(var source:session.sources.values())if(source.shared && (source.owner==null || source.owner.ended.get() && !source.owner.handingOff)) {
+        for(var session:List.copyOf(sessions.values()))if(!session.starting && session.failure.get()==null && !session.ended.get())for(var source:session.sources.values())if(source.shared && (source.owner==null || source.owner.ended.get() && !source.owner.handingOff)) {
             var openingFailure = new AtomicReference<io.tapstate.core.common.FailureFact>();
             try {
                 requireSession(session);
@@ -1624,7 +1672,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             }
         }
         for (var owner : List.copyOf(owners.values())) {
-            if (owner.prepared.mode() == CapturePreparation.Mode.SHARED_SRS && (!owner.ended.get() || owner.handingOff))
+            if (owner.prepared.mode() == CapturePreparation.Mode.SHARED_SRS
+                    && (!owner.ended.get() || owner.handingOff || owner.maintenanceRetirementPending))
                 scheduleOwnerOperation(owner, () -> maintainOwner(owner));
         }
     }
@@ -1655,11 +1704,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private void maintainOwner(Owner owner) {
         if (owner.ended.get()) {
-            try { finishLost(owner); }
+            try {
+                if (owner.handingOff) finishLost(owner);
+                else if (owner.maintenanceRetirementPending) retireMaintainedOwner(owner);
+            }
             catch (RuntimeException unavailable) {
                 String reason = unavailable instanceof TapstateException coded
                         ? coded.code().code() : unavailable.getClass().getSimpleName();
-                LOG.warn("Capture handoff cleanup deferred for {} [{}]", owner.prepared.captureId(), reason);
+                LOG.warn("Capture cleanup deferred for {} [{}]", owner.prepared.captureId(), reason);
             }
             return;
         }
@@ -1706,7 +1758,10 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
 
     private void retireMaintainedOwner(Owner owner) {
-        owner.ended.set(true);
+        synchronized (this) {
+            owner.maintenanceRetirementPending = true;
+            owner.ended.set(true);
+        }
         owner.release();
         synchronized (this) { owners.remove(owner.prepared.captureId(), owner); }
     }
@@ -1723,7 +1778,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             owner.require();
         }
         var original = owner.physical;
-        ensureTail(owner, current, false, snapshot, openingFailure);
+        ensureTail(owner, current, false, snapshot, openingFailure, false);
         try {
             // An epoch change replaces the physical tail. Read retention floors again for the new epoch.
             if (snapshot != null && owner.physical == original)
@@ -1786,9 +1841,13 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
     }
     private void stop(Session session) {
+        stop(session, null);
+    }
+
+    private void stop(Session session, Long shutdownDeadline) {
         synchronized (this) {
             if (sessions.get(session.original) != session) return;
-            if (session.stopping) throw refused();
+            if (session.starting || session.stopping) throw refused();
             session.stopping = true;
             session.ended.set(true);
         }
@@ -1799,7 +1858,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 originalOwners = Collections.newSetFromMap(new IdentityHashMap<Owner,Boolean>());
                 session.sources.values().forEach(source -> { if (source.owner != null) originalOwners.add(source.owner); });
             }
-            for (var owner : originalOwners) detachAndRetire(session, owner);
+            for (var owner : originalOwners) detachAndRetire(session, owner, shutdownDeadline);
             synchronized (this) { forgetSession(session); }
         } finally {
             synchronized (this) { session.stopping = false; }
@@ -1818,7 +1877,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         rethrow(first);
     }
 
-    private void detachAndRetire(Session session, Owner owner) {
+    private void detachAndRetire(Session session, Owner owner, Long shutdownDeadline) {
         CompletableFuture<Void> retirement;
         for (;;) {
             CompletableFuture<Void> preceding;
@@ -1832,7 +1891,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     break;
                 }
             }
-            waitForOwner(preceding);
+            if (shutdownDeadline == null) waitForOwner(preceding);
+            else ShutdownAwait.future(preceding, shutdownDeadline);
         }
         try {
             if (!owner.ended.get() && needed(owner)) return;
@@ -1896,11 +1956,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             long deadline = ShutdownAwait.deadline();
             ShutdownAwait.executor(ownerOperations, deadline);
             for (var attempt : active) ShutdownAwait.future(attempt, deadline);
-            closeRetained();
+            closeRetained(deadline);
         }
     }
 
-    private void closeRetained() {
+    private void closeRetained(long deadline) {
         List<Owner> capturedOwners;
         List<Session> capturedSessions;
         synchronized (this) {
@@ -1909,18 +1969,39 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
         Throwable first = null;
         if (!closed.get()) {
-            for (var owner : capturedOwners) first = cleanup(first, owner::finishCheckpointingForRetirement);
+            for (var owner : capturedOwners)
+                first = cleanup(first, () -> withShutdownOwner(owner, deadline, owner::finishCheckpointingForRetirement));
         }
         closed.set(true);
         capturedOwners.forEach(owner -> owner.ended.set(true));
-        for (var session : capturedSessions) first = cleanup(first, () -> stop(session));
+        for (var session : capturedSessions) first = cleanup(first, () -> stop(session, deadline));
         for (var owner : capturedOwners) {
-            synchronized (this) {
-                if (owners.get(owner.prepared.captureId()) != owner || sessions.values().stream()
-                        .anyMatch(session -> session.sources.values().stream().anyMatch(source -> source.owner == owner))) continue;
-            }
-            first = cleanup(first, () -> retireMaintainedOwner(owner));
+            first = cleanup(first, () -> withShutdownOwner(owner, deadline, () -> {
+                synchronized (this) {
+                    if (sessions.values().stream().anyMatch(session -> session.sources.values().stream()
+                            .anyMatch(source -> source.owner == owner))) return;
+                }
+                retireMaintainedOwner(owner);
+            }));
         }
         rethrow(first);
+    }
+
+    private void withShutdownOwner(Owner owner, long deadline, Runnable operation) {
+        CompletableFuture<Void> reservation;
+        for (;;) {
+            CompletableFuture<Void> preceding;
+            synchronized (this) {
+                if (owners.get(owner.prepared.captureId()) != owner) return;
+                preceding = owner.operationAttempt;
+                if (preceding == null) {
+                    reservation = reserveOwnerOperation(owner);
+                    break;
+                }
+            }
+            ShutdownAwait.future(preceding, deadline);
+        }
+        try { operation.run(); }
+        finally { finishOwnerOperation(owner, reservation); }
     }
 }

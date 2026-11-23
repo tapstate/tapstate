@@ -5,7 +5,9 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.*;
 import io.tapstate.spi.store.*;
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -187,6 +189,46 @@ class SrsSnapshotPreparationTest {
                 assertThat(run.cdcSubscription()).isEmpty();
                 unit.stopOpenings(ownerGuard);
             } finally { completion.complete(null); unit.stopSnapshot(run); }
+        }
+    }
+
+    @Test void abandoningANativeLoadWhileItsSessionClosesDoesNotFailItsHealth() throws Exception {
+        var f = new Fixture();
+        f.nativeRings = true;
+        var rowEntered = new CountDownLatch(1);
+        var closing = new CountDownLatch(1);
+        var allowReaderToFinish = new CompletableFuture<Void>();
+        var allowClose = new CompletableFuture<Void>();
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(), new SrsStores(f, f, f, f), unusedMember());
+                var caller = Executors.newSingleThreadExecutor()) {
+            var run = unit.beginSnapshot(RUN, config(), 7, owner -> {
+                var port = new Port(f, owner);
+                port.closeEntered = closing;
+                port.beforeSessionClose = allowClose::join;
+                return port;
+            }, CaptureHandoff.of(row -> {
+                rowEntered.countDown();
+                allowReaderToFinish.join();
+            }), () -> {});
+            try {
+                assertThat(rowEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                var abandoning = caller.submit(run::abandonLoad);
+                assertThat(closing.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(abandoning).isNotDone();
+                allowReaderToFinish.complete(null);
+                boolean finishedWhileClosing = run.awaitLoaded(Duration.ofMillis(500));
+                assertThat(run.failure()).as("snapshot health while its original session close is held").isEmpty();
+                assertThat(finishedWhileClosing).isFalse();
+                allowClose.complete(null);
+                abandoning.get(5, TimeUnit.SECONDS);
+                assertThat(run.awaitLoaded(Duration.ofSeconds(5))).isTrue();
+                assertThat(run.failure()).isEmpty();
+                assertThat(f.closedSessions).isOne();
+                assertThat(pendingCloseCount(unit)).isZero();
+            } finally {
+                allowReaderToFinish.complete(null);
+                allowClose.complete(null);
+            }
         }
     }
 
@@ -380,6 +422,7 @@ class SrsSnapshotPreparationTest {
         final Fixture f; final SrsSnapshotPreparation owner; List<String> selected; boolean prepared,skipPreparation,failBatchClose; RuntimeException sameFailure,sessionFailure;
         java.util.concurrent.CompletableFuture<Void> closeCompletion;
         java.util.concurrent.CountDownLatch closeEntered;
+        Runnable beforeSessionClose;
         Runnable beforePendingClose;
         RuntimeException readFailure;
         Port(Fixture f,SrsSnapshotPreparation owner) { this.f = f; this.owner = owner; }
@@ -404,6 +447,7 @@ class SrsSnapshotPreparationTest {
                 @Override public void close() {
                     f.closedSessions++;
                     if (closeEntered != null) closeEntered.countDown();
+                    if (beforeSessionClose != null) beforeSessionClose.run();
                     if (closeCompletion != null) {
                         if (!closeCompletion.isDone()) {
                             if (beforePendingClose != null) beforePendingClose.run();

@@ -5,6 +5,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.*;
 import io.tapstate.spi.store.*;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -27,7 +28,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private final Set<Tail> tails = ConcurrentHashMap.newKeySet();
     private final Set<CaptureRun> snapshots = ConcurrentHashMap.newKeySet();
     private final Set<CaptureRun> closingSnapshots = ConcurrentHashMap.newKeySet();
-    private final Set<Runnable> closingOpenings = ConcurrentHashMap.newKeySet();
+    private final Map<Runnable,CompletableFuture<Void>> closingOpenings = new ConcurrentHashMap<>();
     private final Map<Runnable,Runnable> pendingCloses = new ConcurrentHashMap<>();
     private final Map<CaptureRun,Runnable> runOwners = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -79,20 +80,24 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
                 var health = new CaptureHealth();
                 var owned = new Tail(writer, null, health, requireActive);
                 provisional = owned;
-                tails.add(owned);
-                var port = Objects.requireNonNull(ports.apply(writer), "prepared capture port");
-                if (port instanceof AutoCloseable opening) owned.opening = () -> closeOpening(opening, opened.captureId());
-                var source = observe(config, opened.captureId(), opened.miningChainId(), opened.epoch(), originalCapture,
-                        observation -> writer.start(port, config, start, health, observation));
-                owned.subscription = source;
-                fixed.run();
-                owned.opening = null;
-                boolean awaitingCheckpoint = opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch();
-                owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed), opened.miningChainId(),
-                        opened.epoch(), source, health, fixed, skipEmptyStartupAck && awaitingCheckpoint);
-                fixed.run();
-                owned.checkpointTask = checkpoints.scheduleWithFixedDelay(owned::flushScheduled, 10, 10, TimeUnit.SECONDS);
-                return owned;
+                // A stop can find the provisional tail before its source and task are installed.
+                owned.operations.lock();
+                try {
+                    tails.add(owned);
+                    var port = Objects.requireNonNull(ports.apply(writer), "prepared capture port");
+                    if (port instanceof AutoCloseable opening) owned.opening = () -> closeOpening(opening, opened.captureId());
+                    var source = observe(config, opened.captureId(), opened.miningChainId(), opened.epoch(), originalCapture,
+                            observation -> writer.start(port, config, start, health, observation));
+                    owned.subscription = source;
+                    fixed.run();
+                    owned.opening = null;
+                    boolean awaitingCheckpoint = opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch();
+                    owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed), opened.miningChainId(),
+                            opened.epoch(), source, health, fixed, skipEmptyStartupAck && awaitingCheckpoint);
+                    fixed.run();
+                    owned.checkpointTask = checkpoints.scheduleWithFixedDelay(owned::flushScheduled, 10, 10, TimeUnit.SECONDS);
+                    return owned;
+                } finally { owned.operations.unlock(); }
             }
         } catch (RuntimeException | Error failure) {
             if (provisional != null) {
@@ -395,13 +400,28 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     }
     private void closePending(Runnable original) {
         if (!pendingCloses.containsKey(original)) return;
-        if (!closingOpenings.add(original)) throw stillEnding("source opening");
+        var attempt = new CompletableFuture<Void>();
+        var inFlight = closingOpenings.putIfAbsent(original, attempt);
+        if (inFlight != null) throw new SnapshotSession.PendingClose(CaptureError.STILL_ENDING,
+                Map.of("captureId", "source opening"), null, inFlight);
         try {
             if (pendingCloses.containsKey(original)) {
                 original.run();
                 pendingCloses.remove(original);
             }
-        } finally { closingOpenings.remove(original); }
+        } catch (SnapshotSession.PendingClose pending) {
+            pending.completion().whenComplete((ignored, failure) -> completeClose(original, attempt, failure));
+            throw pending;
+        } catch (RuntimeException | Error failure) {
+            completeClose(original, attempt, failure);
+            throw failure;
+        }
+        completeClose(original, attempt, null);
+    }
+    private void completeClose(Runnable original, CompletableFuture<Void> attempt, Throwable failure) {
+        closingOpenings.remove(original, attempt);
+        if (failure == null) attempt.complete(null);
+        else attempt.completeExceptionally(failure);
     }
     private static TapstateException stillEnding(String captureId) {
         return new TapstateException(CaptureError.STILL_ENDING, Map.of("captureId", captureId), null);

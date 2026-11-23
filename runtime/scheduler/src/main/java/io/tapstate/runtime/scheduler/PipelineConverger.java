@@ -349,7 +349,7 @@ public final class PipelineConverger {
             return ConvergeResult.converged(current);
         }
         boolean stopBeforePublication = trackedStop && target == PipelineState.STOPPED;
-        if (stopBeforePublication && !current.stateJson().equals(targetJson)) {
+        if (stopBeforePublication && (evenIfAlreadyThere || !current.stateJson().equals(targetJson))) {
             if (!stillOriginalIntent.getAsBoolean()) return ConvergeResult.superseded();
             try {
                 actuator.stop(pipelineId, false);

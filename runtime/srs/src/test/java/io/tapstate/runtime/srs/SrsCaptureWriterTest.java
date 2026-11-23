@@ -11,6 +11,12 @@ import org.junit.jupiter.api.*;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.*;
@@ -382,6 +388,71 @@ class SrsCaptureWriterTest {
                 assertThat(blocked).isNotDone();
             } finally { allowClose.countDown(); }
             assertThatThrownBy(() -> blocked.get(5, java.util.concurrent.TimeUnit.SECONDS)).hasCause(firstFailure);
+        }
+    }
+
+    @Test void aTailClosedBeforeStartupPublicationCannotLeaveAScheduledCheckpoint() throws Exception {
+        var f = new Fixture();
+        f.actual.keySet().forEach(name -> SHARED_LOG.stores.put(f.ring(name), f.log));
+        var startupCaller = new AtomicReference<Thread>();
+        var acknowledged = new AtomicBoolean();
+        var sourceClosed = new AtomicBoolean();
+        var finalGuardEntered = new CountDownLatch(1);
+        var allowPublication = new CountDownLatch(1);
+        Runnable owner = () -> {
+            if (Thread.currentThread() != startupCaller.get() || !acknowledged.compareAndSet(true, false)) return;
+            finalGuardEntered.countDown();
+            try { assertThat(allowPublication.await(5, TimeUnit.SECONDS)).isTrue(); }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(interrupted);
+            }
+        };
+        try (var unit = new NativeSrsCaptureRunUnit(SCOPE, new SrsStores(f.chains, f.models, SHARED_LOG, unusedConsumers), member);
+                var callers = Executors.newFixedThreadPool(2)) {
+            var starting = callers.submit(() -> {
+                startupCaller.set(Thread.currentThread());
+                return unit.startTail(SCOPE, f.opened, FENCE, f.config(), CaptureStart.present(), writer -> new CapturePort() {
+                    @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                        writer.prepare(f.actual);
+                        ((CaptureStartedListener) listener).onStart(new SourcePosition("seam"));
+                        return new Subscription() {
+                            @Override public void acknowledge(SourcePosition position) { acknowledged.set(true); }
+                            @Override public void close() { sourceClosed.set(true); }
+                        };
+                    }
+                    @Override public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError(); }
+                    @Override public ConnectionReport testConnection(CaptureConfig config) { throw new AssertionError(); }
+                    @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new AssertionError(); }
+                }, owner);
+            });
+            try {
+                assertThat(finalGuardEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                var stopping = callers.submit(() -> unit.stopOpenings(owner));
+                boolean closedBeforePublication;
+                try {
+                    stopping.get(500, TimeUnit.MILLISECONDS);
+                    closedBeforePublication = sourceClosed.get();
+                } catch (TimeoutException serializedWithStartup) {
+                    closedBeforePublication = false;
+                }
+                allowPublication.countDown();
+                boolean returnedTail = true;
+                try { starting.get(5, TimeUnit.SECONDS); }
+                catch (ExecutionException failed) {
+                    assertThat(failed.getCause()).isInstanceOf(TapstateException.class);
+                    returnedTail = false;
+                }
+                stopping.get(5, TimeUnit.SECONDS);
+                assertThat(sourceClosed).isTrue();
+                unit.stopOpenings(owner);
+                var scheduler = NativeSrsCaptureRunUnit.class.getDeclaredField("checkpoints");
+                scheduler.setAccessible(true);
+                assertThat(((ScheduledThreadPoolExecutor) scheduler.get(unit)).getQueue())
+                        .as("original source closed before publication: %s; startup returned a tail: %s",
+                                closedBeforePublication, returnedTail).isEmpty();
+                if (closedBeforePublication) assertThat(returnedTail).isFalse();
+            } finally { allowPublication.countDown(); }
         }
     }
 
