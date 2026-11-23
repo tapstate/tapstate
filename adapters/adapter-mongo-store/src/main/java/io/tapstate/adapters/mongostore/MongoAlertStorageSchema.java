@@ -96,8 +96,9 @@ final class MongoAlertStorageSchema {
         return StoreIo.call(()->prepareAll(operationId,budget));
     }
     private int prepareAll(String operationId,MongoReadBudget budget) {
-        prepareOperational(operationId,budget);
-        prepareNodes(budget);
+        Document verified = prepareOperational(operationId,budget);
+        if (verified.getInteger("installedVersion") == VERSION) return VERSION;
+        prepareNodes(verified,budget);
         budget.transaction(client,session->{
             Document original=marker(session,budget);
             if(original==null)throw unreadable("missing-node-preparation");
@@ -107,26 +108,27 @@ final class MongoAlertStorageSchema {
             replaceMarker(session,original,new Document(original).append("installedVersion",DOMAIN_VERSION));
             return null;
         });
-        budget.transaction(client,session->{
+        int installed = budget.transaction(client,session->{
             Document original=marker(session,budget);
             if(original==null)throw unreadable("missing-rule-binding-preparation");
             int version=original.getInteger("installedVersion");
-            if(version==VERSION)return null;
+            if(version==VERSION)return VERSION;
             if(version!=DOMAIN_VERSION)throw unreadable("rule-binding-preparation");
             replaceMarker(session,original,new Document(original).append("installedVersion",VERSION));
-            return null;
+            return VERSION;
         });
-        return load(budget);
+        requireActive.run(); budget.remainingMillis();
+        return installed;
     }
 
     /** Explicit preparation; an already installed feature is verified without rewriting its original operation. */
-    private int prepareOperational(String operationId, MongoReadBudget budget) {
+    private Document prepareOperational(String operationId, MongoReadBudget budget) {
         requireOperation(operationId);
         Objects.requireNonNull(budget, "budget");
         return StoreIo.call(() -> {
             requireActive.run();
             Document existing = verifiedMarker(budget);
-            if (existing != null && existing.getInteger("installedVersion")>=OPERATIONAL_VERSION) { return existing.getInteger("installedVersion"); }
+            if (existing != null && existing.getInteger("installedVersion")>=OPERATIONAL_VERSION) { return existing; }
             try (var session = client.startSession()) {
                 session.withTransaction(() -> {
                     requireActive.run();
@@ -167,12 +169,11 @@ final class MongoAlertStorageSchema {
                         .timeout(budget.remainingMillis(), TimeUnit.MILLISECONDS).build());
             }
             prepareQueries(operationId, budget);
-            int installed = load(budget); requireActive.run(); budget.remainingMillis(); return installed;
+            Document installed = verifiedMarker(budget); requireActive.run(); budget.remainingMillis(); return installed;
         });
     }
 
-    private void prepareNodes(MongoReadBudget budget) {
-        Document retained=verifiedMarker(budget);
+    private void prepareNodes(Document retained, MongoReadBudget budget) {
         if(retained==null)throw unreadable("missing-query-preparation");
         if(retained.getInteger("installedVersion")>=NODE_VERSION)return;
         budget.transaction(client,session->{
@@ -187,9 +188,12 @@ final class MongoAlertStorageSchema {
             replaceMarker(session,original,new Document(original).append(QUERY,next));return null;
         });
         for(int attempt=0;attempt<3;attempt++) {
-            Document current=verifiedMarker(budget);
+            Document current=budget.transaction(client,session -> marker(session,budget));
             if(current==null)throw unreadable("missing-query-preparation");
-            if(current.getInteger("installedVersion")>=NODE_VERSION)return;
+            if(current.getInteger("installedVersion")>=NODE_VERSION) {
+                verify(budget,Structures.READY,2);
+                return;
+            }
             Document progress=current.get(QUERY,Document.class);int cursor=progress.getInteger("nextIndex");
             if(cursor==BASE_QUERY_COUNT) {
                 MongoAlertNodeLifecycleStore.prepareNamespace(budget.database(database).withWriteConcern(WriteConcern.MAJORITY.withJournal(true)));
@@ -208,6 +212,7 @@ final class MongoAlertStorageSchema {
                 if(cursor==QUERY_INDEXES.size()){next.put("phase","READY");updated.put("installedVersion",NODE_VERSION);}
                 replaceMarker(session,original,updated);return null;
             });
+            if (cursor == QUERY_INDEXES.size()) return;
         }
         throw unreadable("node-query-progress");
     }

@@ -110,6 +110,49 @@ class MongoAlertStorageSchemaIT {
         });
     }
 
+    @Test void componentPreparationReusesOnlyTheCurrentInvocationsVerifiedStructures() {
+        withConfiguration(false, f -> {
+            SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).drop();
+            var original = schema(f).get("alerting", Document.class);
+            original.put("installedVersion", 4);
+            var query = original.get("queryPreparation", Document.class);
+            query.put("indexContractVersion", 1);
+            query.put("nextIndex", 5);
+            SystemCollections.SCHEMA_MIGRATIONS.on(f.database()).updateOne(new Document("_id", "config"),
+                    new Document("$set", new Document("alerting", original)));
+            var commands = new java.util.ArrayList<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var preparation = new MongoAlertStorageSchema(observed, observed.getDatabase(f.database().getName()),
+                        "cluster-a", original.getString("keyId"), () -> {});
+                commands.clear();
+                assertThat(preparation.prepare("same-controlled-preparation", new MongoReadBudget(Duration.ofSeconds(30))))
+                        .isEqualTo(MongoAlertStorageSchema.VERSION);
+                assertThat(commands).hasSize(73);
+                assertThat(commands.stream().filter("listCollections"::equals)).hasSize(3);
+                assertThat(commands.stream().filter("listIndexes"::equals)).hasSize(2 * MongoAlertStorageSchema.COLLECTIONS.size() - 1);
+                var completed = schema(f).get("alerting", Document.class);
+                assertThat(completed.getString("operationId")).isEqualTo(original.getString("operationId"));
+                commands.clear();
+                assertThat(preparation.prepare("completed-operation-remains-original", new MongoReadBudget(Duration.ofSeconds(30))))
+                        .isEqualTo(MongoAlertStorageSchema.VERSION);
+                assertThat(commands).hasSize(6 + MongoAlertStorageSchema.COLLECTIONS.size());
+                assertThat(commands.stream().filter("listCollections"::equals)).hasSize(1);
+                assertThat(commands.stream().filter("listIndexes"::equals)).hasSize(MongoAlertStorageSchema.COLLECTIONS.size());
+                assertThat(schema(f).get("alerting", Document.class)).isEqualTo(completed);
+                SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).drop();
+                assertUnreadable(() -> preparation.prepare("cannot-reuse-across-invocations", new MongoReadBudget(Duration.ofSeconds(30))));
+            }
+        });
+    }
+
     @Test void operationalVersionFourNeedsExplicitNodeAndDomainPreparationWithOriginalFactsPreserved() {
         withConfiguration(false,f->{
             SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).drop();
