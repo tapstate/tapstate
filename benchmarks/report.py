@@ -222,7 +222,7 @@ def metric_conditions(arm, metric):
     if metric == "endpoint_p95_nanos":
         return {"protocol": arm.get("latency_probe", {}).get("protocol"),
                 "source_clock_resolution_ms": arm.get("latency_source_clock_resolution_ms")}
-    if ".rss_" not in metric:
+    if ".rss_" not in metric and metric != "lifecycle.idle_rss_retained_kib":
         return {}
     conditions = resource_conditions(arm)
     if metric == "lifecycle.idle_rss_retained_kib":
@@ -261,7 +261,12 @@ def compare(row, baseline, environment):
         for metric, observed, source in eligible_metrics(arm):
             conditions = metric_conditions(arm, metric)
             if conditions == metric_conditions(ref, metric):
-                ratio(arm_result, metric, observed, reference_metrics.get((metric, source)), source, conditions)
+                binding = {
+                    "case": {key: row[key] for key in CASE_CONDITIONS},
+                    "arm": {key: arm.get(key) for key in ARM_CONDITIONS},
+                    **conditions,
+                }
+                ratio(arm_result, metric, observed, reference_metrics.get((metric, source)), source, binding)
         if arm_result:
             comparisons[name] = arm_result
     if not comparisons:

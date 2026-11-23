@@ -39,7 +39,7 @@ jobs:
           retention-days: 90
       - name: Deliver scheduled notifications
         env:
-          PERFORMANCE_FEISHU_WEBHOOK: ${{ secrets.NIGHTLY_FEISHU_WEBHOOK }}
+          PERFORMANCE_FEISHU_WEBHOOK: ${{ secrets.PERFORMANCE_FEISHU_WEBHOOK }}
         run: python3 -B benchmarks/actions_watch.py send "$RUNNER_TEMP/performance-health"
       - uses: actions/upload-artifact@v4
         if: always()

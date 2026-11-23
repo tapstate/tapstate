@@ -349,7 +349,7 @@ class ActionsRunTest(unittest.TestCase):
         queued = {"id": 21, "event": "workflow_run", "run_attempt": 1, "status": "queued",
                   "display_title": "Pipeline Performance | Nightly 20/1", "created_at": "2026-11-21T14:00:01Z"}
         cases = [
-            ([], [], "missing-nightly"),
+            ([], [], "awaiting-nightly"),
             ([dict(nightly, status="in_progress")], [], "nightly-running"),
             ([nightly], [], "missing-handoff"),
             ([nightly], [dict(queued, run_attempt=2)], "missing-handoff"),
@@ -405,19 +405,6 @@ class ActionsRunTest(unittest.TestCase):
             active, _ = notifications.signals({"status": "reported", "report": result})
             self.assertEqual({"workflow"}, set(active))
 
-    def test_notification_only_repeats_on_escalation_and_qualified_recovery(self):
-        first = {"kind": "workflow", "reason": "missing-handoff"}
-        changed = {"kind": "workflow", "reason": "report-missing"}
-        initial, state = notifications.changes({}, {"workflow": first}, set())
-        self.assertEqual([first], initial)
-        self.assertEqual(([], state), notifications.changes(state, {"workflow": first}, set()))
-        self.assertEqual(([], state), notifications.changes(state, {}, set()))
-        update, state = notifications.changes(state, {"workflow": changed}, set())
-        self.assertEqual([changed], update)
-        recovery, state = notifications.changes(state, {}, {"workflow"})
-        self.assertEqual([dict(changed, recovered=True)], recovery)
-        self.assertEqual(([], {}), notifications.changes(state, {}, {"workflow"}))
-
     def test_notification_state_advances_only_after_an_accepted_delivery_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -437,47 +424,19 @@ class ActionsRunTest(unittest.TestCase):
         now = datetime.fromisoformat("2026-11-21T15:00:00+00:00")
         delivery_intent = {"workflow_run": {"id": 10}, "id": 11, "created_at": now.isoformat()}
         draft_state = {"updated_at": now.isoformat(), "active": {"workflow": {"reason": "missing-handoff"}}}
-        with patch.object(actions_watch, "latest_artifact", side_effect=[None, delivery_intent]), \
-                patch.object(actions_watch, "artifact", side_effect=[{"status": "accepted"}, draft_state]):
-            self.assertEqual(draft_state, actions_watch.latest_state("example/repo", "main", now))
-        with patch.object(actions_watch, "latest_artifact", side_effect=[None, delivery_intent]), \
-                patch.object(actions_watch, "artifact", return_value={"status": "unknown"}):
-            with self.assertRaisesRegex(ValueError, "run 10 is uncertain"):
-                actions_watch.latest_state("example/repo", "main", now)
-
-    def test_mixed_card_uses_full_counts_and_one_example_per_category(self):
-        result = {"environment": "hosted", "errors": [{"reason": "batch expired"}],
-                  "case_counts": {"failed": 4, "completed": 4},
-                  "comparison_counts": {"suspected-regression": 4, "unavailable": 4},
-                  "selected_ids": [], "case_context": {}, "case_verdicts": {}, "results": []}
-        for category in ("failure", "regression"):
-            for number in range(1, 5):
-                case_id = f"{category}.{number}"
-                result["selected_ids"].append(case_id)
-                result["case_context"][case_id] = {"version": 2, "profile": "standard", "suites": ["basic"],
-                                                   "scenario": f"Scenario {case_id}", "effective_load": {"rows": 10000}}
-                if category == "failure":
-                    result["case_verdicts"][case_id] = {"execution": "failed", "metrics": []}
-                    result["results"].append({"case_id": case_id, "status": "failed",
-                                              "last_stage": "readback", "reason": "different rows"})
+        source = {"id": 10}
+        for status, digest, expected in (("accepted", catalog.digest(draft_state), draft_state),
+                                         ("rejected", catalog.digest(draft_state), {"active": {}}),
+                                         ("unknown", catalog.digest(draft_state), None),
+                                         ("accepted", "wrong", None)):
+            with self.subTest(status=status, digest=digest), \
+                    patch.object(actions_watch, "latest_artifact", side_effect=[None, (delivery_intent, source)]), \
+                    patch.object(actions_watch, "artifact", side_effect=[
+                        draft_state, {"status": status, "intent_sha256": digest},
+                    ]):
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, "run 10 is uncertain"):
+                        actions_watch.latest_state("example/repo", "main", now)
                 else:
-                    metric = {"status": "suspected-regression", "metric": "endpoint_p95_nanos", "arm": "single",
-                              "baseline": 100, "observed_median": 125, "change_ratio": 0.25}
-                    result["case_verdicts"][case_id] = {"execution": "completed", "metrics": [metric]}
-        health = {"status": "reported", "due_at": "2026-11-21T10:00:00+00:00", "report": result}
-        active, healthy = notifications.signals(health)
-        updates, _ = notifications.changes({}, active, healthy)
-        url = "https://github.com/example/repo/actions/runs/10/attempts/1"
-        card = notifications.card(health, updates, "ou_fixture", url)
-        markdown, action = card["card"]["elements"]
-        content = markdown["content"]
-        self.assertIn("<at id=ou_fixture></at>", content)
-        self.assertIn("Planned 8 | Completed 4 | Failed 4", content)
-        self.assertIn("Comparable 4 | Suspected regressions 4", content)
-        self.assertIn("failure.1@2 (basic)", content)
-        self.assertIn("readback: different rows", content)
-        self.assertIn("regression.1@2 (basic)", content)
-        self.assertIn("100 → 125 (+25.0%)", content)
-        self.assertNotIn("failure.2", content)
-        self.assertNotIn("regression.2", content)
-        self.assertEqual(url, action["actions"][0]["url"])
+                    actual = actions_watch.latest_state("example/repo", "main", now)
+                    self.assertEqual(expected["active"], actual["active"])

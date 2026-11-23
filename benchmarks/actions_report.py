@@ -327,18 +327,25 @@ def failure_summary(reason):
     return first[:240] + "..." if len(first) > 240 else first
 
 
-def execution_failures(result, repository, run_id):
-    lines = ["", "## Case execution failures", ""]
+def execution_failure_groups(result):
     groups = {}
     for row in result["results"]:
         if row["status"] not in verdict.FAILED_STATUSES:
             continue
-        failures = [(name, arm) for name, arm in report.arms_for(row).items()
-                    if arm["status"] in verdict.FAILED_STATUSES | {"timed-out"}]
+        failures = [(item["arm"], {"last_stage": "memory", "reason": item["reason"], "status": "failed"})
+                    for item in row.get("memory_failures", [])]
+        if not failures:
+            failures = [(name, arm) for name, arm in report.arms_for(row).items()
+                        if arm["status"] in verdict.FAILED_STATUSES | {"timed-out"}]
         for name, arm in failures or [("repeat", row)]:
             groups.setdefault((arm.get("last_stage") or "unavailable",
                                failure_summary(arm.get("reason") or arm["status"])), []).append((row, name, arm["status"]))
-    for (stage, reason), observations in sorted(groups.items()):
+    return sorted(groups.items())
+
+
+def execution_failures(result, repository, run_id):
+    lines = ["", "## Case execution failures", ""]
+    for (stage, reason), observations in execution_failure_groups(result):
         count = len({row["case_id"] for row, _, _ in observations})
         lines.extend(["", f"<details><summary>{cell(stage)} · {cell(reason)} — {count} cases</summary>", "",
                       "| Case | Repeat | Arm | Status | Stage | Reason | Evidence |",
@@ -365,16 +372,21 @@ def other_execution_outcomes(result, repository, run_id):
     return lines
 
 
-def regressions(result, repository, run_id):
-    lines = ["", "## Suspected performance regressions", ""]
+def regression_groups(result):
     groups = {}
-    for case_id, case in result["case_verdicts"].items():
-        for item in case["metrics"]:
+    for case_id in result["selected_ids"]:
+        for item in result["case_verdicts"].get(case_id, {}).get("metrics", []):
             if item["status"] == "suspected-regression":
                 groups.setdefault(item["metric"], []).append((case_id, item))
+    return sorted(groups.items())
+
+
+def regressions(result, repository, run_id):
+    lines = ["", "## Suspected performance regressions", ""]
+    groups = regression_groups(result)
     if groups:
         lines.append("A case may appear in more than one metric group.")
-    for metric, items in sorted(groups.items()):
+    for metric, items in groups:
         lines.extend(["", f"<details><summary>{cell(metric)} — {len({case_id for case_id, _ in items})} cases</summary>", "",
                       "| Case | Arm | Baseline | Median | Change | Source | Samples | Supporting repeats | Rules version | Evidence |",
                       "|---|---|---:|---:|---:|---|---|---:|---:|---|"])
