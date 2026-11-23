@@ -38,6 +38,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.BooleanSupplier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -78,6 +79,10 @@ class ScopedConvergenceDriverTest {
     private final java.util.concurrent.atomic.AtomicLong nanoTime = new java.util.concurrent.atomic.AtomicLong();
     private RebuildAdmission rebuildPolicy = RebuildAdmission.never();
     private Consumer<PipelineIntentStore.PendingStart> deferredStart;
+    private PipelineConvergences pipelineConvergences;
+    private PeriodicObservations periodicObservations;
+    private NativeObservationSampling nativeSampling;
+    private ProcessObservationWriter observationWrites;
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -108,7 +113,7 @@ class ScopedConvergenceDriverTest {
                     pendingCleanup=false; carrying.set(false);
                 }
             };
-        }, pass -> rebuildPolicy, ids -> retained.add(List.copyOf(ids)), alertFeed, deferredStart, null);
+        }, pass -> rebuildPolicy, ids -> retained.add(List.copyOf(ids)), alertFeed, deferredStart, null, nativeSampling, observationWrites);
         StateStore poisonState = mock(StateStore.class, call -> { throw new AssertionError("unscoped state accessed"); });
         ObservationStore poisonObservations = mock(ObservationStore.class, call -> { throw new AssertionError("unscoped observation accessed"); });
         var poisonDesired = mock(io.tapstate.spi.store.DesiredStore.class,
@@ -129,7 +134,7 @@ class ScopedConvergenceDriverTest {
                             Map.of("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true)),T0)
                             : io.tapstate.core.lifecycle.SnapshotReading.NONE;
                 }),
-                sampler, metricsExport, eligible::get, ownership, bindings, nanoTime::get);
+                sampler, metricsExport, eligible::get, ownership, bindings, periodicObservations, pipelineConvergences, nanoTime::get);
     }
 
     @Test void reusedTerminalProjectionFeedsLifecycleAlertsButDoesNotInventMetricHistory() {
@@ -684,6 +689,178 @@ class ScopedConvergenceDriverTest {
         carrying.set(true);
     }
 
+    @Test void theFirstRejectedPipelineKeepsPriorityAcrossQueueFullTicks() throws Exception {
+        var firstEntered = new java.util.concurrent.CountDownLatch(1);
+        var firstRelease = new java.util.concurrent.CountDownLatch(1);
+        var secondEntered = new java.util.concurrent.CountDownLatch(1);
+        var secondRelease = new java.util.concurrent.CountDownLatch(1);
+        var tailEntered = new java.util.concurrent.CountDownLatch(1);
+        var input = mock(PipelineIntentStore.class);
+        when(input.pipelineIds()).thenReturn(List.of("a", "b", "c"));
+        when(input.scanCandidates()).thenReturn(List.of("a", "b", "c").stream()
+                .map(id -> new PipelineIntentStore.ScanCandidate(id, 0)).toList());
+        when(input.loadForActuation(any())).thenAnswer(call -> {
+            String id = call.getArgument(0);
+            if (id.equals("a")) { firstEntered.countDown(); assertThat(firstRelease.await(5, TimeUnit.SECONDS)).isTrue(); }
+            if (id.equals("b")) { secondEntered.countDown(); assertThat(secondRelease.await(5, TimeUnit.SECONDS)).isTrue(); }
+            if (id.equals("c")) tailEntered.countDown();
+            return Optional.empty();
+        });
+        try (var work = new PipelineConvergences(1, 1)) {
+            var ports = new ConvergenceDriver.ScopedPorts(input, mock(PipelineStoreViews.class), () -> {},
+                    ignored -> { throw new AssertionError("no prepared intent"); }, ignored -> RebuildAdmission.never(), ignored -> {});
+            var driver = ConvergenceDriver.scoped(mock(PipelineConverger.class), mock(ObservationPublisher.class),
+                    null, MetricsExport.none(), () -> true, mock(PipelineActuationOwnership.class), ports, null, work);
+            try {
+                driver.reconcile();
+                assertThat(firstEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(work.pipelineIds()).containsExactlyInAnyOrder("a", "b");
+                driver.reconcile();
+                driver.reconcile();
+                assertThat(work.health().rejectedRequests()).isPositive();
+                firstRelease.countDown();
+                assertThat(secondEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(work.health().queuedPipelines()).isZero();
+                driver.reconcile();
+                assertThat(work.pipelineIds()).containsExactlyInAnyOrder("b", "c");
+                secondRelease.countDown();
+                assertThat(tailEntered.await(2, TimeUnit.SECONDS)).isTrue();
+            } finally { firstRelease.countDown(); secondRelease.countDown(); }
+        }
+    }
+
+    @Test void aQueuedPeriodicAlertIsCurrentUntilItsOriginalCheckpointChanges() throws Exception {
+        var guard = new CompletableFuture<BooleanSupplier>();
+        alertFeed = mock(PipelineAlertFeed.class);
+        org.mockito.Mockito.doAnswer(call -> {
+            guard.complete(call.getArgument(2));
+            return null;
+        }).when(alertFeed).publishedPeriodic(any(), any(), any());
+        when(ownership.proveObservationClaim(any(), any())).thenReturn(true);
+        try (var observations = new PeriodicObservations(1, 1)) {
+            periodicObservations = observations;
+            var driver = driver();
+            driver.reconcile();
+            driver.reconcile();
+
+            var queued = guard.get(5, TimeUnit.SECONDS);
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> observations.pipelineIds().isEmpty());
+            assertThat(queued.getAsBoolean()).isTrue();
+
+            observations.discard("orders");
+            var state = views.state(FIRST);
+            var running = state.read("orders").orElseThrow();
+            assertThat(state.compareAndSwap("orders", running.epoch(), StateJson.of(PipelineState.COMPLETED), T0))
+                    .isInstanceOf(CasOutcome.Applied.class);
+            assertThat(queued.getAsBoolean()).isFalse();
+        }
+    }
+
+    @Test void revokingAFrameBeforeTheStoreDispatchPreventsTheWrite() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        when(ownership.proveObservationClaim(any(), any())).thenReturn(true);
+        try (var observations = new PeriodicObservations(1, 1)) {
+            periodicObservations = observations;
+            var driver = driver();
+            driver.reconcile();
+            long before = views.writes.stream().filter(write -> write.kind().equals("observation")).count();
+            views.beforeObservationWrite = () -> {
+                entered.countDown();
+                try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+            };
+            try {
+                driver.reconcile();
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                observations.discard("orders");
+            } finally {
+                release.countDown();
+            }
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> observations.pipelineIds().isEmpty());
+            assertThat(views.writes.stream().filter(write -> write.kind().equals("observation")).count()).isEqualTo(before);
+        }
+    }
+
+    @Test void aStagedFallbackCannotPublishAfterOnlyItsOriginalEngineExecutionEnds() {
+        var execution = new java.util.concurrent.atomic.AtomicReference<ExecutionFence>();
+        onStart = pass -> {
+            advance(pass);
+            execution.set(new ExecutionFence(pass.scope(), pass.claim()));
+        };
+        nativeSampling = new NativeObservationSampling(null, null, null,
+                id -> Optional.ofNullable(execution.get()), id -> null, "orders", Clock.fixed(T0, ZoneOffset.UTC));
+        when(ownership.proveObservationClaim(any(), any())).thenReturn(true);
+        var cache = mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class);
+        when(cache.writeObservations(org.mockito.ArgumentMatchers.anyList())).thenAnswer(call -> {
+            List<io.tapstate.adapters.mongostore.MongoCacheDomain.ObservationWrite> batch = call.getArgument(0);
+            var write = batch.getFirst();
+            assertThat(batch).hasSize(1);
+            try {
+                write.active().run();
+                views.pipelineObservations(write.scope(), write.original(), write.active()).save(write.observation());
+                return java.util.Collections.singletonList(null);
+            } catch (RuntimeException refused) {
+                return List.of(refused);
+            }
+        });
+        try (var observations = new PeriodicObservations(1, 1); var writes = new ProcessObservationWriter(cache, false)) {
+            periodicObservations = observations;
+            observationWrites = writes;
+            var driver = driver();
+            driver.reconcile();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> writes.usage().pending() == 1);
+            int prior = views.writes.size();
+            assertThat(execution.get()).isNotNull();
+            execution.set(null);
+            writes.flush();
+            assertThat(views.writes.subList(prior, views.writes.size())).noneMatch(write -> write.kind().equals("observation"));
+        }
+    }
+
+    @Test void aHeldWorkerKeepsItsClaimAndBudgetUntilTheOriginalPassEnds() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        try (var work = new PipelineConvergences(1, 2)) {
+            pipelineConvergences = work;
+            onStart = pass -> {
+                entered.countDown();
+                try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new AssertionError(stopped); }
+                advance(pass);
+            };
+            var driver = driver();
+            try {
+                driver.reconcile();
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                driver.reconcile();
+                intents.ids = List.of();
+                driver.reconcile();
+                assertThat(retained).allSatisfy(ids -> assertThat(ids).contains("orders"));
+                verify(ownership, org.mockito.Mockito.atLeastOnce()).retain(List.of("orders"));
+            } finally { release.countDown(); }
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> work.pipelineIds().isEmpty());
+            driver.reconcile();
+            assertThat(passes).hasSize(1);
+            assertThat(retained.getLast()).isEmpty();
+            verify(ownership).retain(List.of());
+        }
+    }
+
+    @Test void completionKeepsItsPublicationAndFencedCleanupOrderOnTheLifecycleWorker() {
+        try (var work = new PipelineConvergences(1, 2)) {
+            pipelineConvergences = work;
+            var driver = driver();
+            driver.reconcile();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> work.pipelineIds().isEmpty());
+            views.writes.clear(); readyToComplete = true;
+            driver.reconcile();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> work.pipelineIds().isEmpty());
+            assertThat(completionTrace).containsExactly("final-observation", "completion-cas", "cleanup");
+            assertThat(views.observations(FIRST).read("orders").orElseThrow().state()).isEqualTo(PipelineState.COMPLETED);
+        }
+    }
+
     @Test void scopedCompletionPublishesBeforeItsFencedCasAndRetainsTheFinalReadingAfterCleanup() {
         var driver=driver(); driver.reconcile(); views.writes.clear(); readyToComplete=true;
         driver.reconcile();
@@ -893,6 +1070,7 @@ class ScopedConvergenceDriverTest {
 
     private static final class Intents implements PipelineIntentStore {
         private PipelineIntentSnapshot snapshot = snapshot(FIRST);
+        private List<String> ids = List.of("orders");
         private RuntimeException loadFailure;
         private PendingStart pending;
         @Override public Optional<PendingStart> pendingStart(String id) { return Optional.ofNullable(pending); }
@@ -900,12 +1078,12 @@ class ScopedConvergenceDriverTest {
         private boolean hints = true;
         @Override public Optional<PipelineIntentSnapshot> load(String id) { throw new AssertionError("authoring load does not prove preparation readiness"); }
         @Override public Optional<PipelineIntentSnapshot> loadForActuation(String id) { loads++; if (loadFailure != null) throw loadFailure; return Optional.ofNullable(snapshot); }
-        @Override public List<String> pipelineIds() { return List.of("orders"); }
+        @Override public List<String> pipelineIds() { return ids; }
         @Override public List<ScanCandidate> scanCandidates() {
-            return snapshot == null || !hints ? List.of(new ScanCandidate("orders", 0)) : List.of(
-                    new ScanCandidate("orders", snapshot.desired().targetState() == PipelineState.RUNNING
-                            ? snapshot.intentRevision() : 0, snapshot.scope(), snapshot.intentRevision(),
-                            snapshot.desired().targetState()));
+            return ids.stream().map(id -> snapshot == null || !hints || !id.equals(snapshot.scope().pipelineId())
+                    ? new ScanCandidate(id, 0) : new ScanCandidate(id,
+                            snapshot.desired().targetState() == PipelineState.RUNNING ? snapshot.intentRevision() : 0,
+                            snapshot.scope(), snapshot.intentRevision(), snapshot.desired().targetState())).toList();
         }
         @Override public PipelineIntentStore guardedBy(Runnable active) { throw new AssertionError("read-only driver"); }
         @Override public boolean compareAndSet(PipelineIntentScope scope, long revision, DesiredState desired) { throw new AssertionError("read-only driver"); }
@@ -919,6 +1097,7 @@ class ScopedConvergenceDriverTest {
         private CheckpointDoc.LeaseRecovery recovery;
         private final Map<PipelineIntentScope, InMemoryStateStore> states = new HashMap<>();
         private final Map<PipelineIntentScope, InMemoryObservationStore> projections = new HashMap<>();
+        private Runnable beforeObservationWrite = () -> {};
         private final InMemoryRateHistoryStore rates = new InMemoryRateHistoryStore();
         private final List<PipelineIntentScope> requested = new ArrayList<>();
         private final List<Write> writes = new ArrayList<>();
@@ -980,6 +1159,7 @@ class ScopedConvergenceDriverTest {
                 }
                 @Override public void save(Observation value) {
                     if (rejectPublication) throw fenced();
+                    beforeObservationWrite.run();
                     check(scope, original, active); writes.add(new Write("observation", scope, original)); observations(scope).save(value);
                     if(readyToComplete && !completionObserved && value.state()==PipelineState.RUNNING) {
                         completionObserved=true;completionTrace.add("final-observation");onFinalObservation.run();

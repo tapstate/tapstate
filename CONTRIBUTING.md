@@ -252,7 +252,9 @@ round of review when they are missed:
 - **A user-facing error carries a code; a bug crashes.** An error a user can act on — bad
   configuration, a rejected specification, a connector that will not start — is raised through the
   error-code system: a typed exception, an enum constant for the code, named parameters, and
-  catalog text (English mandatory). Never a hand-written code string, and never a bare
+  catalog text (English, Simplified Chinese and Traditional Chinese for product definitions).
+  Follow the [diagnostic maintenance guide](docs/diagnostics/README.md) for declaration,
+  lookup, validation, export, deprecation and independent history checks. Never a hand-written code string, and never a bare
   `RuntimeException` as something a user is meant to read. A programmer error is the opposite — a
   null that should not be null, an invariant that does not hold — so throw it bare and let it crash
   with a stack trace. Laundering one of those into an error code hides a defect behind a message
@@ -268,6 +270,9 @@ its own private channel — see [SECURITY.md](SECURITY.md) — and never a publi
 **A change to product source is admitted only with an end-to-end case alongside it.**
 A CI check enforces this on every pull request. It is not a coverage target: one
 smoke-level case is the floor — a case that fails if your change is reverted.
+
+See [Test placement](.github/workflows/README.md#test-placement) to choose which
+jobs run your case and record the execution evidence for review.
 
 **Write it declaratively first.** A case is a directory under `e2e/examples/`:
 

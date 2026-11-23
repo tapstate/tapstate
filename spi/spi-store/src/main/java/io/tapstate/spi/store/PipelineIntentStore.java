@@ -3,6 +3,7 @@ package io.tapstate.spi.store;
 import io.tapstate.core.lifecycle.DesiredState;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /** Configuration-owned latest intents; cache epochs are meaningful only within the captured scope. */
 public interface PipelineIntentStore {
@@ -20,6 +21,13 @@ public interface PipelineIntentStore {
         throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, java.util.Map.of(), null);
     }
 
+
+    /** The configuration revision belongs to the same snapshot as this runtime intent, when supported. */
+    record ActuationReading(PipelineIntentSnapshot intent, java.util.OptionalLong configurationRevision) {}
+
+    default Optional<ActuationReading> readForActuation(String pipelineId) {
+        return loadForActuation(pipelineId).map(intent -> new ActuationReading(intent, java.util.OptionalLong.empty()));
+    }
 
     /** Expected zero means never written; a refusal leaves the latest value and all versions unchanged. */
     boolean compareAndSet(PipelineIntentScope scope, long expectedIntentRevision, DesiredState desired);
@@ -45,6 +53,16 @@ public interface PipelineIntentStore {
 
     /** Retains only the next revision and coordinates, and removes the id from the reconcile set. */
     boolean remove(PipelineIntentScope scope, long expectedIntentRevision);
+
+    /** Scheduling hints only; the admitted pass still reads its original intent and proves ownership. */
+    record DispatchSnapshot(List<String> pipelineIds, Set<String> stopping) {
+        public DispatchSnapshot {
+            pipelineIds = List.copyOf(pipelineIds);
+            stopping = Set.copyOf(stopping);
+        }
+    }
+
+    default Optional<DispatchSnapshot> dispatchSnapshot() { return Optional.empty(); }
 
     /** Projects live ids only, without decoding intent bodies. */
     List<String> pipelineIds();

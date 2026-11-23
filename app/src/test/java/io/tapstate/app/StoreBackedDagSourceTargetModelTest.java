@@ -46,6 +46,177 @@ import org.junit.jupiter.api.Test;
 class StoreBackedDagSourceTargetModelTest {
 
     @Test
+    void aPlainMapPublishesItsRenamedPrimaryKeyToTheSyncTarget() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("ORDER_ID", io.tapstate.core.model.FieldRule.rename("id")));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)),
+                List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                        .containsExactly(tuple("ORDER_ID", true)));
+    }
+
+    @Test
+    void aPlainMapPublishesItsPureReadComputedPrimaryKeyToTheSyncTarget() {
+        Map<String, io.tapstate.core.model.FieldRule> rules = new LinkedHashMap<>();
+        rules.put("ORDER_ID", io.tapstate.core.model.FieldRule.computed("after.id"));
+        rules.put("id", io.tapstate.core.model.FieldRule.drop());
+        InMemoryStorePort store = seededProjectingPipeline(rules);
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)),
+                List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                        .containsExactly(tuple("ORDER_ID", true)));
+    }
+
+    @Test
+    void aPlainMapPublishesSameNamedPureReadComputedPrimaryKeyToTheSyncTarget() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("id", io.tapstate.core.model.FieldRule.computed("after.id")));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)),
+                List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                        .containsExactly(tuple("id", true)));
+    }
+
+    @Test
+    void aPlainMapCannotPublishOnlyTheSurvivingPartOfACompositeKey() {
+        for (var rule : List.of(io.tapstate.core.model.FieldRule.drop(),
+                io.tapstate.core.model.FieldRule.literal(0),
+                io.tapstate.core.model.FieldRule.computed("after.tenant + 1"),
+                io.tapstate.core.model.FieldRule.rename("other"))) {
+            InMemoryStorePort store = seededProjectingPipeline(
+                    Map.of("tenant", rule), io.tapstate.core.model.WriteMode.APPEND);
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("tenant", "INT"),
+                    new SourceField("other", "INT")), List.of("id", "tenant"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+            assertThat(bound).singleElement().satisfies(target -> {
+                assertThat(target.fields()).as("key rule %s", rule).noneMatch(TargetField::primaryKey);
+                assertThat(target.indexes()).as("key rule %s", rule).noneMatch(TargetIndex::unique);
+            });
+        }
+    }
+
+    @Test
+    void aPlainMapCannotPublishARenamedSubsetOfACompositeKey() {
+        for (var rule : List.of(io.tapstate.core.model.FieldRule.drop(),
+                io.tapstate.core.model.FieldRule.literal("fixed"),
+                io.tapstate.core.model.FieldRule.computed("after.region + '-copy'"),
+                io.tapstate.core.model.FieldRule.rename("other"))) {
+            Map<String, io.tapstate.core.model.FieldRule> rules = new LinkedHashMap<>();
+            rules.put("ORDER_ID", io.tapstate.core.model.FieldRule.rename("id"));
+            rules.put("region", rule);
+            InMemoryStorePort store = seededProjectingPipeline(
+                    rules, io.tapstate.core.model.WriteMode.APPEND);
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("region", "VARCHAR"),
+                    new SourceField("other", "VARCHAR")), List.of("id", "region"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+            assertThat(bound).singleElement().satisfies(target -> {
+                assertThat(target.fields()).extracting(TargetField::name)
+                        .as("key rule %s", rule).contains("ORDER_ID").doesNotContain("id");
+                assertThat(target.fields()).as("key rule %s", rule).noneMatch(TargetField::primaryKey);
+                assertThat(target.indexes()).as("key rule %s", rule).noneMatch(TargetIndex::unique);
+            });
+        }
+    }
+
+    @Test
+    void aPlainMapPublishesItsCompletelyRenamedCompositeKeyToTheSyncTarget() {
+        Map<String, io.tapstate.core.model.FieldRule> rules = new LinkedHashMap<>();
+        rules.put("ORDER_ID", io.tapstate.core.model.FieldRule.rename("id"));
+        rules.put("REGION", io.tapstate.core.model.FieldRule.rename("region"));
+        InMemoryStorePort store = seededProjectingPipeline(rules);
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("region", "VARCHAR")),
+                List.of("id", "region"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target -> {
+            assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                    .containsExactly(tuple("ORDER_ID", true), tuple("REGION", true));
+            assertThat(target.indexes()).extracting(TargetIndex::fields, TargetIndex::unique)
+                    .containsExactly(tuple(List.of("ORDER_ID", "REGION"), true));
+        });
+    }
+
+    /**
+     * The same keyless target a preview refuses still reaches a sync that matches writes on a key.
+     * Preview is not part of every run, so without this the rows are written to a target nothing can
+     * match them against - the collapse the publisher stopped producing a partial key for.
+     */
+    @Test
+    void anUpsertSyncRefusesAStreamWhosePublishedIdentityWasLost() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("tenant", io.tapstate.core.model.FieldRule.drop()));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("tenant", "INT")),
+                List.of("id", "tenant"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("TS0360035");
+    }
+
+    /** Append never matches a write to an existing row, so a key it never needs is not required. */
+    @Test
+    void anAppendSyncIsNotJudgedForAStreamWhosePublishedIdentityWasLost() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("tenant", io.tapstate.core.model.FieldRule.drop()),
+                io.tapstate.core.model.WriteMode.APPEND);
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("tenant", "INT")),
+                List.of("id", "tenant"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).noneMatch(TargetField::primaryKey));
+    }
+
+    /** A source that never declared a key lost nothing here; this refusal is about identity going away. */
+    @Test
+    void anUpsertSyncDoesNotJudgeASourceThatNeverDeclaredAKey() {
+        InMemoryStorePort store = seededProjectingPipeline(Map.of());
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("tenant", "INT")),
+                List.of(), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).noneMatch(TargetField::primaryKey));
+    }
+
+    @Test
     void boundedStringMetadataReachesTheSinkOnlyForDirectSourceValues() {
         var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
         for (boolean computed : List.of(false, true)) {
@@ -149,7 +320,7 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
-    void aScriptThatWidensADecimalCannotPublishTheSourcesDeclaredRange() {
+    void aScriptDoesNotDeclareItsSourceDecimalRangeAsAnOutputType() {
         String script = "function process(r, ctx) { r.after.amount = 100000000.00; return r; }";
         var sourceValue = new java.math.BigDecimal("1.00");
         var output = io.tapstate.adapters.transform.StatelessTransforms.js(script)
@@ -169,18 +340,20 @@ class StoreBackedDagSourceTargetModelTest {
         var decimal = new io.tapstate.core.common.NumericType(null, true, null, null,
                 new java.math.BigDecimal("-99999999.99"), new java.math.BigDecimal("99999999.99"), 10, 2);
         store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
-                new SourceField("id", "INT", io.tapstate.core.common.TapstateType.INT64),
+                new SourceField("id", "decimal(10,2)", io.tapstate.core.common.TapstateType.DECIMAL,
+                        null, decimal),
                 new SourceField("amount", "decimal(10,2)", io.tapstate.core.common.TapstateType.DECIMAL,
-                        null, decimal)), List.of("id"), List.of())));
+                        null, decimal),
+                new SourceField("unbounded", "decimal", io.tapstate.core.common.TapstateType.DECIMAL)),
+                List.of("id"), List.of())));
         List<TargetTable> bound = new ArrayList<>();
 
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
 
-        TargetField amount = bound.getFirst().fields().stream()
-                .filter(field -> field.name().equals("amount")).findFirst().orElseThrow();
-        assertThat(amount.inferredType()).isEqualTo(io.tapstate.core.common.TapstateType.DECIMAL);
-        assertThat(amount.numericType()).isNull();
-        assertThat(amount.type()).isNull();
+        assertThat(bound.getFirst().fields()).containsExactlyInAnyOrder(
+                TargetField.deferredDecimal("amount", decimal),
+                new TargetField("id", null, true, io.tapstate.core.common.TapstateType.DECIMAL),
+                new TargetField("unbounded", null, false, io.tapstate.core.common.TapstateType.DECIMAL));
     }
 
     @Test
@@ -304,7 +477,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -340,7 +513,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -357,7 +530,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -367,7 +540,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -565,7 +738,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-table-ambiguous");
+                .hasMessageContaining("TS0360009");
     }
 
     @Test
@@ -792,6 +965,12 @@ class StoreBackedDagSourceTargetModelTest {
     /** The single-source pipeline above with one projection step between the source and the sink. */
     private static InMemoryStorePort seededProjectingPipeline(
             Map<String, io.tapstate.core.model.FieldRule> rules) {
+        return seededProjectingPipeline(rules, null);
+    }
+
+    private static InMemoryStorePort seededProjectingPipeline(
+            Map<String, io.tapstate.core.model.FieldRule> rules,
+            io.tapstate.core.model.WriteMode writeMode) {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
@@ -803,7 +982,7 @@ class StoreBackedDagSourceTargetModelTest {
                         new TransformBody.MapProjection(new LinkedHashMap<>(rules)), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("project"),
-                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)),
+                        List.of(new SyncElement("sync_1", "orders_dest", writeMode, null, null)),
                         null, null),
                 null, null));
         OpenRingGenerations.forSources(store, "orders_src");

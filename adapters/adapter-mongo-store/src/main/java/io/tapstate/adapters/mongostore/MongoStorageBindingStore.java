@@ -386,19 +386,6 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return load(session).map(Loaded::cachePreparation);
     }
 
-    Optional<CachePreparation> capturedCachePreparation(ClientSession session, Document stored,
-            MongoBindingReadFacts.Facts facts, Document source, Document recovery) {
-        var cluster = facts.identity();
-        requireClusterIdentity(cluster);
-        String clusterId = cluster.getString("clusterId");
-        long version = cluster.getLong(BINDING_VERSION);
-        var state = facts.setup();
-        long generation = requireSetupIdentity(state, clusterId);
-        if (version == 0) return cachePreparationForTransaction(session);
-        return readBound(session, stored, facts, clusterId, version, state, generation, source, recovery)
-                .loaded().map(Loaded::cachePreparation);
-    }
-
     /** Rechecks the durable scope of a previously admitted runtime without reopening its connection. */
     Optional<CachePreparation> admittedCachePreparation(ClientSession session) {
         if (!MongoBindingReadFacts.supported(client)) return cachePreparationForTransaction(session);
@@ -419,18 +406,39 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         var recovery = MongoStartConfigRead.boundedRow(row, "recovery", SINGLETON_ID);
         if (row != null && row.get("root") instanceof Document root && SINGLETON_ID.equals(root.get("_id"))
                 && bound != null && stage != null && recovery != null)
-            return admittedPreparation(session, bound, root, stage, recovery);
-        var stored = bindings.find(session, new Document("_id", SINGLETON_ID)).projection(new Document("cache", 0)).first();
-        var facts = MongoBindingReadFacts.read(session, null, identity, setup, noteScopes, List.of());
-        return admittedPreparation(session, stored, facts.identity(), facts.setup(), null);
+            return admittedObservationFacts(root, stage, bound, null, recovery).preparation();
+        return admittedFacts(session, false).preparation();
     }
 
-    private Optional<CachePreparation> admittedPreparation(ClientSession session, Document stored, Document cluster,
-            Document state, Document recovery) {
+    record AdmittedFacts(Optional<CachePreparation> preparation, Document version) {}
+
+    AdmittedFacts admittedFacts(ClientSession session, boolean readVersion) {
+        if (!MongoBindingReadFacts.supported(client)) return new AdmittedFacts(cachePreparationForTransaction(session), null);
+        var stored = bindings.find(session, new Document("_id", SINGLETON_ID))
+                .projection(new Document("cache", 0)).first();
+        var facts = MongoBindingReadFacts.read(session, null, identity, setup, noteScopes, List.of(), readVersion ? versions : null);
+        return admittedFacts(facts.identity(), facts.setup(), stored, facts.version(),
+                (owner, mode, version, stage) -> MongoStorageRecoveryStore.read(session, database, owner, mode, version, stage).preparation());
+    }
+
+    boolean supportsActuationBatch() {
+        return MongoReadBudget.supportsSnapshotReads(client);
+    }
+
+    AdmittedFacts admittedObservationFacts(Document cluster, Document state, Document stored, Document version, Document recovery) {
+        return admittedFacts(cluster, state, stored, version, (owner, mode, binding, stage) ->
+                MongoStorageRecoveryStore.read(recovery, owner, mode, binding, () -> stage).preparation());
+    }
+
+    private interface RecoveryRead {
+        CachePreparation read(StorageSetupScope owner, StorageBinding.Mode mode, long version, Document stage);
+    }
+
+    private AdmittedFacts admittedFacts(Document cluster, Document state, Document stored, Document configuration, RecoveryRead recovery) {
         requireClusterIdentity(cluster);
         String clusterId = cluster.getString("clusterId");
         long version = cluster.getLong(BINDING_VERSION);
-        if (version == 0) return Optional.empty();
+        if (version == 0) return new AdmittedFacts(Optional.empty(), null);
         long generation = requireSetupIdentity(state, clusterId);
         try {
             if (stored == null || !clusterId.equals(stored.get("clusterId"))
@@ -444,12 +452,35 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
             if (!StorageBinding.defaultSourceId(mode).equals(defaultId)
                     || !(stored.get("candidateHash") instanceof String candidate)
                     || !candidate.equals(state.get("candidateHash"))) throw unreadable();
-            var current = recovery == null ? MongoStorageRecoveryStore.read(session, database, owner, mode, version, state)
-                    : MongoStorageRecoveryStore.read(recovery, owner, mode, version, () -> state);
-            return Optional.of(current.preparation());
+            return new AdmittedFacts(Optional.of(recovery.read(owner, mode, version, state)), configuration);
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) {
             throw unreadable();
         }
+    }
+
+    record AlertHostFacts(Document setup,StorageBinding binding,Document schema,Document version,Document key,
+            Boolean deliveryIntentsEmpty) { }
+    AlertHostFacts admittedAlertHost(ClientSession session) {
+        return admittedAlertHost(session, false);
+    }
+    // Alert observations check live cluster, setup, binding, and recovery facts. Their callers validate the
+    // alert schema, version, and key. Full storage admission and alert writes audit the default source and
+    // global note scope independently.
+    AlertHostFacts admittedAlertHost(ClientSession session, boolean includeDelivery) {
+        return admittedAlertHost(session, includeDelivery, null);
+    }
+
+    AlertHostFacts admittedAlertHost(ClientSession session, boolean includeDelivery, MongoReadBudget budget) {
+        if(!MongoBindingReadFacts.supported(client))return null;
+        var facts=MongoBindingReadFacts.alertHost(session,database,includeDelivery,budget);var cluster=facts.identity();
+        requireClusterIdentity(cluster);long version=cluster.getLong(BINDING_VERSION);
+        // An unbound installation retains its full original admission checks.
+        if(version==0)return null;
+        long generation=requireSetupIdentity(facts.setup(),cluster.getString("clusterId"));
+        var bound = decodeBound(facts.binding(), cluster.getString("clusterId"), version, facts.setup(), generation);
+        if (facts.recovery() == null) MongoStorageRecoveryStore.read(session, budget == null ? database : budget.database(database), bound, facts.setup());
+        else MongoStorageRecoveryStore.read(facts.recovery(), bound.setup(), bound.mode(), version, facts::setup);
+        return new AlertHostFacts(facts.setup(), bound, facts.schema(), facts.version(), facts.key(), facts.deliveryIntentsEmpty());
     }
 
     boolean belongsTo(MongoClient expectedClient, String expectedDatabase) {
@@ -513,39 +544,61 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         MongoStorageRecoveryStore.requireAbsent(session, database);
     }
 
-    private TransactionFacts readBound(ClientSession session, Document stored, MongoBindingReadFacts.Facts facts,
-            String clusterId, Long version, Document state, long currentGeneration) {
-        return readBound(session, stored, facts, clusterId, version, state, currentGeneration, null, null);
+    /** Decodes a full binding audit with facts already read in the original CONFIG snapshot. */
+    CachePreparation auditedObservationBinding(Document cluster, Document stage, Document stored, Document recovery,
+            Document source, Document global, boolean conflictingResource) {
+        requireClusterIdentity(cluster);
+        String clusterId = cluster.getString("clusterId");
+        long version = cluster.getLong(BINDING_VERSION);
+        long generation = requireSetupIdentity(stage, clusterId);
+        var binding = decodeBound(stored, clusterId, version, stage, generation);
+        requireDefaultSource(stored, source, conflictingResource);
+        requireGlobalScope(global, clusterId);
+        if (recovery == null) throw unreadable();
+        return MongoStorageRecoveryStore.read(recovery, binding.setup(), binding.mode(), version, () -> stage).preparation();
     }
 
     private TransactionFacts readBound(ClientSession session, Document stored, MongoBindingReadFacts.Facts facts,
-            String clusterId, Long version, Document state, long currentGeneration, Document capturedSource, Document capturedRecovery) {
+            String clusterId, Long version, Document state, long currentGeneration) {
+        return readBound(session,stored,facts,clusterId,version,state,currentGeneration,true);
+    }
+    private TransactionFacts readBound(ClientSession session,Document stored,MongoBindingReadFacts.Facts facts,
+            String clusterId,Long version,Document state,long currentGeneration,boolean audit) {
+        var binding = decodeBound(stored, clusterId, version, state, currentGeneration);
+        if (audit) {
+            String defaultId = binding.defaultSourceId();
+            var source = sources.find(session, new Document("_id", defaultId)).first();
+            requireDefaultSource(stored, source, facts == null ? hasOtherResource(session, defaultId) : facts.conflictingResource());
+            var global = facts == null ? noteScopes.find(session, new Document("_id", new Document(BINDING_VERSION, version)
+                    .append("namespace", "pdk.global-state"))).first() : facts.global();
+            requireGlobalScope(global, clusterId);
+        }
+        return new TransactionFacts(Optional.of(new Loaded(binding, stored.getString("candidateHash"),
+                MongoStorageRecoveryStore.read(session, database, binding, state))), state);
+    }
+
+    private void requireDefaultSource(Document stored, Document source, boolean conflictingResource) {
+        if (source == null || !DEFAULT_ROLE.equals(source.get("systemRole")) || conflictingResource
+                || !CanonicalHash.of(codec.decode(source)).equals(stored.get("sourceHash"))) throw unreadable();
+    }
+
+    private StorageBinding decodeBound(Document stored, String clusterId, Long version, Document state, long currentGeneration) {
         try {
             if (stored == null || !clusterId.equals(stored.get("clusterId"))
                     || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))
                     || !version.equals(stored.get(BINDING_VERSION))) throw unreadable();
-            StorageSetupScope scope = new StorageSetupScope(clusterId, stored.getString("installationId"),
+            var scope = new StorageSetupScope(clusterId, stored.getString("installationId"),
                     stored.getString("operationId"), stored.getLong("generation"));
-            StorageBinding.Mode mode = StorageBinding.Mode.valueOf(stored.getString("mode"));
+            var mode = StorageBinding.Mode.valueOf(stored.getString("mode"));
             String defaultId = stored.getString("defaultSourceId");
             requireBoundSetup(state, scope, version, defaultId, currentGeneration);
-            Document source = capturedSource == null ? sources.find(session, new Document("_id", defaultId)).first() : capturedSource;
-            if (source == null || !DEFAULT_ROLE.equals(source.get("systemRole"))
-                    || (facts != null ? facts.conflictingResource() : hasOtherResource(session, defaultId))
-                    || !stored.get("sourceHash").equals(CanonicalHash.of(codec.decode(source)))) throw unreadable();
             String cacheJson = ciphers.current().decrypt(bindingContext(clusterId), "cache-binding", stored.getString("cache"));
-            StorageBinding.Connection cache = decodeConnection(cacheJson);
-            String candidateHash = fingerprint(mode, cacheJson, stored.getString("sourceHash"));
-            if (!candidateHash.equals(stored.get("candidateHash")) || !candidateHash.equals(state.get("candidateHash"))) throw unreadable();
-            Document global = facts != null ? facts.global() : noteScopes.find(session, new Document("_id", new Document(BINDING_VERSION, version)
-                    .append("namespace", "pdk.global-state"))).first();
-            requireGlobalScope(global, clusterId);
-            StorageBinding binding = new StorageBinding(scope, mode, version, defaultId, cache);
-            var recovery = capturedRecovery == null ? MongoStorageRecoveryStore.read(session, database, binding, state)
-                    : MongoStorageRecoveryStore.read(capturedRecovery, scope, mode, version, () -> state);
-            return new TransactionFacts(Optional.of(new Loaded(binding, candidateHash, recovery)), state);
+            var cache = decodeConnection(cacheJson);
+            String candidate = fingerprint(mode, cacheJson, stored.getString("sourceHash"));
+            if (!candidate.equals(stored.get("candidateHash")) || !candidate.equals(state.get("candidateHash"))) throw unreadable();
+            return new StorageBinding(scope, mode, version, defaultId, cache);
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
-            // Stored or decrypted values may contain credentials. Never attach parser input or causes.
+            // Stored or decrypted values may contain credentials. Do not attach parser input or causes.
             throw unreadable();
         }
     }

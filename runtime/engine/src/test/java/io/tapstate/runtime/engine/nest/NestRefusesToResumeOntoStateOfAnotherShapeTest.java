@@ -84,7 +84,7 @@ class NestRefusesToResumeOntoStateOfAnotherShapeTest {
         assertThatThrownBy(() -> NestStateLedger.reconcile(ledger, PIPELINE, NODE, renamedLeaf.statePaths()))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.state-paths-changed");
+                .isEqualTo("TS0490018");
     }
 
     @Test
@@ -98,7 +98,7 @@ class NestRefusesToResumeOntoStateOfAnotherShapeTest {
         assertThatThrownBy(() -> NestStateLedger.reconcile(ledger, PIPELINE, NODE, renamedBranch.statePaths()))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.state-paths-changed");
+                .isEqualTo("TS0490018");
     }
 
     @Test

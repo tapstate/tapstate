@@ -391,7 +391,7 @@ case "$*" in
   *"/installation/first-admin"*)
     cat > .first-admin-request
     if [ "${FAKE_ADMIN_FAILURE:-no}" = yes ]; then
-        printf '%s\n403' '{"code":"control.bootstrap-forbidden"}'
+        printf '%s\n403' '{"code":"TS0210017"}'
     else
         touch .first-admin-created
         printf '%s\n200' '{"phase":"COMPLETE"}'
@@ -660,7 +660,7 @@ fi
 
 FAKE_ADMIN_FAILURE=yes run_phase_fakes
 if [ "$RUN_RC" -ne 0 ] && [ ! -e "$RUN/.cli-stdin" ] \
-   && printf '%s' "$RUN_OUT" | grep -q 'HTTP 403, control.bootstrap-forbidden'; then
+   && printf '%s' "$RUN_OUT" | grep -q 'HTTP 403, TS0210017'; then
   ok "reports the administrator setup refusal before driving the CLI"
 else
   bad "the administrator setup refusal was lost (rc=$RUN_RC): $RUN_OUT"
@@ -670,14 +670,18 @@ fi
 # fails 30 seconds later on "did not reach the target (0 of 5 rows)", which sends the reader to the server
 # log to investigate a pipeline that was never started. The discriminating part is that the run below
 # delivers its rows: a check that merely required a non-zero exit would pass on the row count alone.
-FAKE_CLI_OUT='error: control.auth-failed' run_phase_fakes
-unset FAKE_CLI_OUT
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'could not log in' \
-   && ! printf '%s' "$RUN_OUT" | grep -q 'did not reach the target'; then
-  ok "an auth failure is diagnosed as an auth failure, not as an empty target"
-else
-  bad "auth failure not named at the point it happened (rc=$RUN_RC): $RUN_OUT"
-fi
+for auth_code in control.auth-failed TS0210002 cli.not-authenticated TS0330021; do
+  for auth_status in 0 1; do
+    FAKE_CLI_OUT="error: $auth_code" FAKE_CLI_STATUS="$auth_status" run_phase_fakes
+    unset FAKE_CLI_OUT FAKE_CLI_STATUS
+    if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'could not log in' \
+       && ! printf '%s' "$RUN_OUT" | grep -q 'did not reach the target'; then
+      ok "auth failure $auth_code with exit $auth_status retains credential recovery guidance"
+    else
+      bad "auth failure $auth_code with exit $auth_status not named at the point it happened (rc=$RUN_RC): $RUN_OUT"
+    fi
+  done
+done
 
 FAKE_INITIAL_ENTRY=LOGIN run_phase_fakes
 if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.cli-stdin" ] && [ ! -e "$RUN/.first-admin-request" ] \

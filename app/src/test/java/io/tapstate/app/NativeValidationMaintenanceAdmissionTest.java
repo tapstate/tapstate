@@ -65,7 +65,7 @@ class NativeValidationMaintenanceAdmissionTest {
         var configuration = mock(MongoConfigurationDomain.class);
         var tasks = mock(ValidationTaskStore.class);
         when(tasks.pipelines(null, 1)).thenReturn(List.of());
-        when(configuration.validationTasks(any())).thenAnswer(call -> {
+        when(configuration.pollingValidationTasks(any())).thenAnswer(call -> {
             reads.incrementAndGet();
             assertThat(release.await(2, TimeUnit.SECONDS)).isTrue();
             return tasks;
@@ -129,7 +129,7 @@ class NativeValidationMaintenanceAdmissionTest {
         var releaseTick = new CountDownLatch(1);
         var configuration = mock(MongoConfigurationDomain.class);
         var tasks = mock(ValidationTaskStore.class);
-        when(configuration.validationTasks(any())).thenReturn(tasks);
+        when(configuration.pollingValidationTasks(any())).thenReturn(tasks);
         when(tasks.pipelines(null, 1)).thenReturn(List.of());
         try (var process = new ValidationMemberResources()) {
             var member = process.bind("cluster", "node", "boot", 4, () -> {});
@@ -149,7 +149,7 @@ class NativeValidationMaintenanceAdmissionTest {
                             assertThat(refused.args()).containsEntry("limit", "validation.metadataFrames");
                         });
                         verifyNoInteractions(tasks);
-                        verify(configuration, never()).validationTasks(any());
+                        verify(configuration, never()).pollingValidationTasks(any());
                         try (var read = member.admitMetadata(); var probe = member.admitMetadata()) {
                             assertThat(member.snapshot().metadataFrames()).isEqualTo(4);
                         }

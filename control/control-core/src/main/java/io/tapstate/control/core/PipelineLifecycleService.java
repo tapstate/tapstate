@@ -207,19 +207,20 @@ public final class PipelineLifecycleService {
         PipelineState current = currentState(prior, checkpoint);
         // Clearing retained state is meaningful after a keeping stop. A repeated keeping stop remains
         // illegal, including while a clearing operation is pending, so it cannot withdraw that decision.
-        PipelineState target = verb == LifecycleVerb.STOP && purgeState && current == PipelineState.STOPPED
-                ? PipelineState.STOPPED : LifecycleMachine.transition(current, verb);
+        boolean clearStopped = verb == LifecycleVerb.STOP && purgeState && current == PipelineState.STOPPED;
+        PipelineState target = clearStopped ? PipelineState.STOPPED : LifecycleMachine.transition(current, verb);
 
         // What the latest artifact would be assembled from, alongside what it hashes to. Both are taken off
         // the same canonical structure, so a field that moves one moves the other and the two cannot drift
         // into disagreeing about what changed.
-        String latestAssembly = verb == LifecycleVerb.START
+        boolean adoptsLatest = verb == LifecycleVerb.START || clearStopped;
+        String latestAssembly = adoptsLatest
                 ? io.tapstate.core.model.canonical.AssemblyIdentity.of(latestArtifact.resource())
                 : artifacts.assemblyIdentityOf(pipelineId).orElse(null);
 
-        // The revision the verb runs at: a fresh start adopts the latest; the other verbs carry forward the
-        // revision the pipeline is already at. A run verb (start / resume) must run at the latest applied.
-        String runRevision = verb == LifecycleVerb.START ? latest : prior.map(DesiredState::revision).orElse(latest);
+        // A clearing stop on an already stopped Pipeline prepares the latest published inputs.
+        // Other non-start verbs keep the revision of the run they are acting on.
+        String runRevision = adoptsLatest ? latest : prior.map(DesiredState::revision).orElse(latest);
 
         // A resume over an edit made while the pipeline was paused. The refusal is right whenever carrying
         // on would run the pipeline as it was against a definition that has moved; it is wrong only when
@@ -272,7 +273,7 @@ public final class PipelineLifecycleService {
         // artifact's assembly here would state that the run matches a definition nobody checked it
         // against. The next resume would then find the two equal and rebuild over a change that is not
         // safe to rebuild over. Unknown stays unknown, which costs a refusal that a start clears.
-        String runAssembly = verb == LifecycleVerb.START || reassemble
+        String runAssembly = adoptsLatest || reassemble
                 ? latestAssembly
                 : prior.map(DesiredState::assemblyRevision).orElse(null);
 

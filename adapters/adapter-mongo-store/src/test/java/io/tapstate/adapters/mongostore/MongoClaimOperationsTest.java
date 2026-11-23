@@ -154,6 +154,59 @@ class MongoClaimOperationsTest {
         }finally {release.countDown();}
     }
 
+    @Test
+    void snapshotPinSpendsItsOriginalBudgetWaitingForTheCheckpointLane() throws Exception {
+        var client = client();
+        var operations = new MongoClaimOperations(client);
+        var pipeline = "waiting-pin";
+        var key = new io.tapstate.spi.store.SrsConsumerKey("chain", pipeline, "input");
+        var holding = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var invoked = new AtomicBoolean();
+        try (var writer = Executors.newSingleThreadExecutor()) {
+            var blocked = writer.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, pipeline, () -> {
+                holding.countDown();
+                try { if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("writer was not released"); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                return true;
+            }));
+            try {
+                assertThat(holding.await(2, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> operations.snapshotPin(key, deadline(150), budget ->
+                        MongoCachePipelineStateStore.writeTransaction(client, pipeline, budget, () -> {
+                            invoked.set(true);
+                            return true;
+                        }))).isInstanceOf(TapstateException.class);
+                // The worker must relinquish its own wait while the original writer still holds the lane.
+                operations.await(deadline(1000));
+                operations.closeIfIdle();
+                assertThat(invoked).isFalse();
+                assertThat(release.getCount()).isOne();
+                assertThat(MongoCachePipelineStateStore.writeTransaction(client, "independent", () -> true)).isTrue();
+            } finally { release.countDown(); }
+            assertThat(blocked.get(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(MongoCachePipelineStateStore.writeTransaction(client, pipeline, () -> true)).isTrue();
+        } finally { release.countDown(); operations.await(deadline(2000)); operations.closeIfIdle(); }
+    }
+
+    @Test
+    void snapshotPinWorkerAcquiresItsOwnLaneAndLeavesRenewalIndependent() {
+        var client = client();
+        var operations = new MongoClaimOperations(client);
+        var key = new io.tapstate.spi.store.SrsConsumerKey("chain", "pipeline", "input");
+        var claim = new io.tapstate.spi.store.WorkloadClaimKey("cluster", io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "pipeline");
+        try (var renewer = Executors.newSingleThreadExecutor()) {
+            boolean result = operations.snapshotPin(key, deadline(2000), budget ->
+                    MongoCachePipelineStateStore.writeTransaction(client, key.pipelineId(), budget, () -> {
+                        var renewal = renewer.submit(() -> operations.renew(claim, deadline(1000), () -> {}, () ->
+                                operations.pipelineRenewal(claim, () -> true)));
+                        try { return renewal.get(1, TimeUnit.SECONDS); }
+                        catch (Exception failure) { throw new AssertionError(failure); }
+                    }));
+            assertThat(result).isTrue();
+        } finally { operations.await(deadline(2000)); operations.closeIfIdle(); }
+    }
+
     private static MongoClient client() {
         var client = mock(MongoClient.class);
         var topology = new com.mongodb.connection.ClusterDescription(

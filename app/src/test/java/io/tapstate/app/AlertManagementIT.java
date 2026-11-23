@@ -62,6 +62,29 @@ class AlertManagementIT {
             }
         });
     }
+    @Test void catalogAndOriginalEpisodeDescriptionsUseTheRequestLanguageWithoutRewritingEvidence() {
+        for(boolean cloud:List.of(false,true))AlertEvaluationHostIT.withFixture(false,cloud,f->{
+            bad(f);var management=service(f);var reader=caller(Scope.READ,ACTIVE);
+            var row=object(((List<?>)management.dispatch("alert.center",reader,Map.of()).get("rows")).getFirst());
+            var input=map("key",row.get("key"),"episode",row.get("episode"));
+            var original=management.dispatch("alert.detail",reader,input);
+            var texts=new HashSet<Object>();
+            var descriptions=io.tapstate.adapters.alerting.AlarmTypeText.english();
+            var type=BuiltinAlarmTypes.catalog().types().stream().filter(t->t.id().equals(original.get("typeId"))).findFirst().orElseThrow();
+            for(var locale:List.of(Locale.ENGLISH,Locale.SIMPLIFIED_CHINESE,Locale.TRADITIONAL_CHINESE)){
+                var detail=management.dispatch("alert.detail",reader,input,locale);
+                var expected=descriptions.describe(type,locale);
+                assertThat(detail).containsEntry("condition",expected.condition()).containsEntry("recovery",expected.recovery()).containsEntry("guidance",expected.guidance())
+                        .containsEntry("diagnostics",original.get("diagnostics")).containsEntry("episode",original.get("episode")).containsEntry("status",original.get("status"));
+                var catalog=management.dispatch("alert.catalog",reader,Map.of(),locale);
+                var descriptor=((List<?>)catalog.get("types")).stream().map(AlertHttpModel::object).filter(t->t.get("id").equals(type.id())).findFirst().orElseThrow();
+                assertThat(descriptor).containsEntry("condition",expected.condition()).containsEntry("recovery",expected.recovery()).containsEntry("guidance",expected.guidance());
+                texts.add(detail.get("condition"));
+            }
+            assertThat(texts).hasSize(3);
+            assertThat(management.dispatch("alert.detail",reader,input)).isEqualTo(original);
+        });
+    }
     @Test void readerGetsReadOnlyActiveCenterAndCannotMutateConfiguration(){
         AlertEvaluationHostIT.withFixture(f->{bad(f);var s=service(f);var before=f.store().evaluationStates(null,100).rows();
             var result=s.dispatch("alert.center",caller(Scope.READ,ACTIVE),Map.of("limit",5));assertThat(result.get("total")).isEqualTo(1L);assertThat((List<?>)result.get("rows")).hasSize(1);

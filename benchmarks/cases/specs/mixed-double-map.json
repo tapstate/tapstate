@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "first-map",
+      "operator": "map"
+    },
+    {
+      "id": "only-even",
+      "operator": "filter"
+    },
+    {
+      "id": "second-map",
+      "operator": "map"
+    },
+    {
+      "id": "script",
+      "operator": "js"
+    }
+  ],
+  "inputs": {
+    "records": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "required_fields": {
+        "id": "integer primary key",
+        "value": "integer",
+        "label": "string"
+      }
+    }
+  },
+  "parameters": {
+    "retain_percent": 50,
+    "transformations": {
+      "first-map": "value + 1",
+      "only-even": "even id",
+      "second-map": "value * 2",
+      "script": "Prefix label with js- while keeping the calculated integer."
+    }
+  },
+  "expected": {
+    "readback": [
+      "Compare selected keys and independently computed values after both Map nodes and the script.",
+      "Verify first-map sees every input, second-map sees the fixed retained half, and node identities remain distinct."
+    ]
+  },
+  "completion": {
+    "target_unit": "retained target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

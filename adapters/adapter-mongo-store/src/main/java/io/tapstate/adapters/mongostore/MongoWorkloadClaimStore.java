@@ -556,6 +556,20 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return new WorkloadClaimReading(decodeStrict(document), Duration.ofMillis(number(document, LEASE_REMAINING)));
     }
 
+    static WorkloadClaimReading observedPipelineReading(Document document,Document observedNode) {
+        var original=observedReading(document);
+        if(!nodeBacked(document))return original;
+        var fence=WorkloadClaimFence.from(original.claim());
+        if(!canUseNodeLease(fence)||!(document.get(NODE_LEASE_GENERATION) instanceof Long generation)||generation<1)throw unreadableClaim();
+        if(observedNode!=null){
+            var node=observedReading(observedNode);
+            var key=new WorkloadClaimKey(fence.key().clusterId(),WorkloadClaimType.NODE_SESSION,fence.owner().nodeId());
+            if(node.leased()&&node.claim().key().equals(key)&&node.claim().owner().equals(fence.owner())&&node.claim().claimGeneration()==generation)
+                return new WorkloadClaimReading(withLease(original.claim(),node),node.leaseRemaining());
+        }
+        return new WorkloadClaimReading(original.claim(),Duration.ZERO);
+    }
+
     WorkloadClaimReading reading(Document document) {
         if (document == null) throw unreadableClaim();
         if (strict && !(document.get(LEASE_REMAINING) instanceof Long)) throw unreadableClaim();

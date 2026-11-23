@@ -54,9 +54,21 @@ def check(workflows, contexts, inputs):
         'matrix IDs must come from the actual emitted plan'
     build = ci.get('build', '')
     assert build, 'required check build must exist'
-    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('snapshot-lock', 'test-shards', 'build', 'image-smoke')]
+    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('shard-plan', 'snapshot-lock', 'test-shards', 'build', 'image-smoke')]
     assert all(len(value) == 1 for value in versions) and len({value[0] for value in versions}) == 1, \
-        'test, build and image jobs must use the same Java version'
+        'contract, test, build and image jobs must use the same Java version'
+    maven_setup = 'run: bash .github/scripts/setup-ci-maven.sh'
+    first_maven_steps = {
+        'snapshot-lock': 'name: Resolve the reactor',
+        'test-shards': 'name: Build the reactor without running tests',
+        'build': 'name: Prepare local artifacts for report generation',
+        'image-smoke': 'bash deploy/docker/image-smoke.sh --build',
+    }
+    for role, first_step in first_maven_steps.items():
+        text = ci[role]
+        assert text.count(maven_setup) == 1, f'{role} must use the same pinned Maven setup'
+        assert 0 <= text.find('Verify exact Java build') < text.index(maven_setup) < text.find(first_step), \
+            f'{role} must set up pinned Maven before running Maven'
     for role in ('snapshot-lock', 'test-shards', 'build'):
         assert 'Verify exact Java build' in ci[role] and 'java.runtime.version' in ci[role], \
             'each receipt producer must verify the resolved Java build'
@@ -255,7 +267,10 @@ for original, replacement in [
     ('export MAVEN_ARGS="$MAVEN_ARGS -nsu"', 'echo test-updates-not-suppressed'),
     ('python3 .github/scripts/ci-snapshot-lock-smoke.py', 'echo snapshot-smoke-removed'),
     ("java-version: '21.0.13+9.0.LTS'", "java-version: '21.0.12+8.0.LTS'"),
+    ("java-version: '21.0.13+9.0.LTS'\n          cache: maven",
+     "java-version: '21.0.12+8.0.LTS'\n          cache: maven"),
     ('Verify exact Java build', 'Missing exact Java build'),
+    ('bash .github/scripts/setup-ci-maven.sh', 'echo missing-maven-setup'),
     (MAVEN_ARGS, ''),
     (MAVEN_ARGS, MAVEN_ARGS.replace('1.44', '1.32')),
     (MAVEN_ARGS, '    env:\n' + '\n'.join('      ' + line[10:] for line in MAVEN_ARGS.splitlines())),

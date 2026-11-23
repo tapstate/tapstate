@@ -186,7 +186,8 @@ class IndependentCdcRecoveryIT {
                         String[] start = firstLine(path).split(" ");
                         return start.length >= 2 && Long.parseLong(start[1]) < 3;
                     }), () -> streamText(fixture));
-            assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+            assertThat(Await.answered("the restarted Direct execution's first observation", TIMEOUT,
+                    () -> control.errorCount(ROOT_PIPELINE))).isZero();
         } finally {
             Files.writeString(fixture.signals().resolve("release"), "");
         }
@@ -348,7 +349,8 @@ class IndependentCdcRecoveryIT {
             assertThat(priority(fixture.rootTarget(), ROOT, "1"))
                     .as("the full load's newer row survives CDC replay even while Low remains retained")
                     .isEqualTo("High");
-            assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+            assertThat(Await.answered("the reloaded execution's first observation", TIMEOUT,
+                    () -> control.errorCount(ROOT_PIPELINE))).isZero();
         }
     }
 
@@ -726,7 +728,7 @@ class IndependentCdcRecoveryIT {
                             boolean ready = output.contains("Tapstate application is ready");
                             boolean occupiedPort = output.contains("Web server failed to start. Port "
                                     + server.baseUrl().getPort() + " was already in use.");
-                            if (!ready && (output.contains("boot.node-id-in-use") || occupiedPort)) {
+                            if (!ready && (output.contains("TS0310028") || output.contains("boot.node-id-in-use") || occupiedPort)) {
                                 refused.set(true); return true;
                             }
                             if (!server.isAlive()) throw new AssertionError("the prepared boot exited: " + output);

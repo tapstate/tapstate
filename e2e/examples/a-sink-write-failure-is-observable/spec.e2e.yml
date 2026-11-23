@@ -43,5 +43,5 @@ steps:
   - start
   - await: { state: FAILED }
   - await: { error_count: 1 }
-  - await: { failure_code: connector.write-failed }
+  - await: { failure_code: TS0060027 }
   - assert: { count: { tgt_file.orders: 0 } }

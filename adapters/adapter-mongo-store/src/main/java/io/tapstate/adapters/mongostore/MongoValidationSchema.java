@@ -247,6 +247,10 @@ final class MongoValidationSchema {
     }
 
     static void requireReady(MongoDatabase database, boolean configuration) {
+        requireReady(database, configuration, null);
+    }
+
+    static void requireReady(MongoDatabase database, boolean configuration, MongoStructureProof absenceProof) {
         var table = configuration ? SystemCollections.SCHEMA_MIGRATIONS : SystemCollections.CACHE_SCHEMA_MIGRATIONS;
         var schema = table.on(database).find(new Document("_id", configuration ? "config" : "business")).first();
         var startup = STARTUP.get();
@@ -255,8 +259,10 @@ final class MongoValidationSchema {
             startup.remove(database);
             throw refused();
         }
+        if (absenceProof != null) absenceProof.clear();
         if (configuration && !configurationDeclaresValidation(schema)) throw unreadable("version");
         var marker = configuration ? readyConfiguration(schema) : requireVersionTwo(schema, "READY");
+        if (configuration && Integer.valueOf(2).equals(marker.get("formatVersion")) && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw refused();
         var identity = (configuration ? SystemCollections.CONFIG_CLUSTER_IDENTITY : SystemCollections.CACHE_IDENTITY)
                 .on(database).find(new Document("_id", "cluster")).first();
         var original = scope(marker);

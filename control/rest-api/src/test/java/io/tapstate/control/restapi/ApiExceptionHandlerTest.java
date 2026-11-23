@@ -5,6 +5,14 @@ import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.control.core.MonitorError;
+import io.tapstate.control.core.ConnectorCatalogError;
+import io.tapstate.control.core.DataBrowserError;
+import io.tapstate.control.core.PipelineDraftError;
+import io.tapstate.control.core.PipelineError;
+import io.tapstate.control.core.PositionError;
+import io.tapstate.control.core.SourceError;
+import io.tapstate.core.alerting.AlertError;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.Severity;
@@ -25,6 +33,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -63,10 +75,85 @@ class ApiExceptionHandlerTest {
         } finally { security.setAuthentication(previous); }
     }
 
+    @Test
+    void migratedIoRefusalsKeepTheirExplicitStatuses() {
+        assertThat(ApiExceptionHandler.statusFor(new StubCode(io.tapstate.core.common.IoErrorDefinitions.STORE_QUOTA_EXCEEDED.code())))
+                .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        for (var definition : List.of(io.tapstate.core.common.IoErrorDefinitions.CONFIGURATION_IMPORT_REFUSED,
+                io.tapstate.core.common.IoErrorDefinitions.PIPELINE_STATE_REBUILD_REQUIRED,
+                io.tapstate.core.common.IoErrorDefinitions.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED))
+            assertThat(ApiExceptionHandler.statusFor(new StubCode(definition.code()))).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void migratedStoreRefusalsKeepTheirExplicitStatuses() {
+        for (var definition : List.of(io.tapstate.core.common.StoreErrorDefinitions.INITIALIZATION_REFUSED,
+                io.tapstate.core.common.StoreErrorDefinitions.AI_PROVIDER_SCHEMA_UNSUPPORTED))
+            assertThat(ApiExceptionHandler.statusFor(new StubCode(definition.code()))).isEqualTo(HttpStatus.CONFLICT);
+        for (var definition : List.of(io.tapstate.core.common.StoreErrorDefinitions.INVALID_URI,
+                io.tapstate.core.common.StoreErrorDefinitions.STORAGE_CONNECTION_UNSUPPORTED,
+                io.tapstate.core.common.StoreErrorDefinitions.TLS_TRUST_INVALID))
+            assertThat(ApiExceptionHandler.statusFor(new StubCode(definition.code()))).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void publishedHttpStatusesFollowTheirDefinitionsAcrossIdentityChanges() throws Exception {
+        Map<String, TapstateErrorCode> definitions = new HashMap<>();
+        for (Class<? extends Enum<?>> owner : List.of(AlertError.class, ControlError.class,
+                ArtifactError.class, ClusterError.class, ConnectorCatalogError.class, DataBrowserError.class,
+                MonitorError.class, PipelineDraftError.class, PipelineError.class, PositionError.class,
+                SourceError.class, LifecycleError.class)) {
+            for (Enum<?> value : owner.getEnumConstants())
+                definitions.put(owner.getSimpleName() + "." + value.name(), (TapstateErrorCode) value);
+        }
+        try (var input = getClass().getResourceAsStream("/http-error-status-baseline.tsv")) {
+            assertThat(input).isNotNull();
+            var rows = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))
+                    .lines().filter(line -> !line.startsWith("#") && !line.isBlank()).toList();
+            assertThat(rows).hasSize(91);
+            for (String row : rows) {
+                String[] fields = row.split("\t");
+                TapstateErrorCode code = fields[0].startsWith("literal:")
+                        ? new StubCode(fields[0].substring("literal:".length())) : definitions.get(fields[0]);
+                assertThat(code).as(fields[0]).isNotNull();
+                assertThat(ApiExceptionHandler.statusFor(code)).as(fields[0])
+                        .isEqualTo(HttpStatus.valueOf(fields[1]));
+            }
+        }
+        for (DslError code : DslError.values()) {
+            assertThat(code.code()).as(code.name()).matches("TS[0-9]{7}");
+            assertThat(ApiExceptionHandler.statusFor(code)).as(code.name()).isEqualTo(HttpStatus.BAD_REQUEST);
+        }
+    }
+
+    @Test
+    void migratedSourceSchemaRefusalKeepsItsConflictStatus() {
+        assertThat(ApiExceptionHandler.statusFor(
+                new StubCode(io.tapstate.core.common.ActuationErrorDefinitions.SOURCE_SCHEMA_NOT_DISCOVERED.code())))
+                .isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void unknownIdentitiesKeepServerFailureUnlessTheVerbAttributesTheRefusal() {
+        var failure = new TapstateException(new StubCode("TS9999999"), Map.of("detail", "safe detail"), null);
+        assertThat(handler.handle(failure).getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        var request = handler.handle(new BadRequestCodedException(failure));
+        var unavailable = handler.handle(new UnavailableCodedException(failure));
+        assertThat(request.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(unavailable.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        for (var response : List.of(request, unavailable)) {
+            assertThat(response.getBody().code()).isEqualTo("TS9999999");
+            assertThat(response.getBody().params()).containsEntry("detail", "safe detail");
+            assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+        }
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("dsl.external-validation")))
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
     @Test void defaultSourceTimeoutAndBusyAreExplicitRetryDiagnostics() {
-        assertThat(ApiExceptionHandler.statusFor(new StubCode("connector.test-timeout"))).isEqualTo(HttpStatus.GATEWAY_TIMEOUT);
-        assertThat(ApiExceptionHandler.statusFor(new StubCode("connector.instances-busy"))).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
-        var busy = new TapstateException(new StubCode("connector.instances-busy"), Map.of("connector", "mongodb", "timeout", "0s"), null);
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("TS0060025"))).isEqualTo(HttpStatus.GATEWAY_TIMEOUT);
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("TS0060032"))).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        var busy = new TapstateException(new StubCode("TS0060032"), Map.of("connector", "mongodb", "timeout", "0s"), null);
         assertThat(handler.handle(new UnavailableCodedException(busy)).getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
     }
 
@@ -166,10 +253,36 @@ class ApiExceptionHandlerTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         ApiError body = response.getBody();
-        assertThat(body.code()).isEqualTo("dsl.unknown-field");
+        assertThat(body.code()).isEqualTo("TS0010002");
         // the message is rendered from the catalog with the named args substituted, not the bare code
         assertThat(body.message()).isEqualTo("Unknown field 'snapshot_mode' at options.snapshot_mode.");
         assertThat(body.params()).containsEntry("field", "snapshot_mode").containsEntry("path", "options.snapshot_mode");
+    }
+
+    @Test
+    void aDslRefusalUsesTheRequestedLanguageAndIncludesItsNextStep() {
+        RequestAttributes previous = RequestContextHolder.getRequestAttributes();
+        try {
+            var request = new MockHttpServletRequest();
+            request.addHeader("Accept-Language", "zh-CN, en;q=0.8");
+            RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+
+            var failure = new TapstateException(DslError.MISSING_REFERENCE,
+                    Map.of("path", "transforms[0].from", "ref", "missing-table"), null);
+            ResponseEntity<ApiError> response = handler.handle(failure);
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(response.getBody().code()).isEqualTo("TS0010005");
+            assertThat(response.getBody().params()).containsEntry("ref", "missing-table")
+                    .containsEntry("path", "transforms[0].from");
+            assertThat(response.getBody().message()).contains("missing-table", "transforms[0].from")
+                    .doesNotContain("Reference '");
+            assertThat(response.getBody().solution()).contains("\u8bf7\u521b\u5efa\u8d44\u6e90", "missing-table", "transforms[0].from")
+                    .doesNotContain("Define the referenced resource");
+        } finally {
+            if (previous == null) RequestContextHolder.resetRequestAttributes();
+            else RequestContextHolder.setRequestAttributes(previous);
+        }
     }
 
     @Test
@@ -183,8 +296,8 @@ class ApiExceptionHandlerTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         ApiError body = response.getBody();
-        assertThat(body.code()).isEqualTo("control.malformed-request");
-        assertThat(body.message()).contains("a `username` is required").isNotEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
+        assertThat(body.message()).contains("a `username` is required").isNotEqualTo("TS0210001");
         assertThat(body.params()).containsEntry("reason", "a `username` is required");
     }
 
@@ -197,8 +310,8 @@ class ApiExceptionHandlerTest {
         // a coded error the surface has no client-attributable mapping for is a server-side failure (500),
         // yet still carries the structured coded body — it is not a bare, uncoded crash
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
-        assertThat(response.getBody().code()).isEqualTo("control.audit-blocked");
-        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("control.audit-blocked");
+        assertThat(response.getBody().code()).isEqualTo("TS0210015");
+        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("TS0210015");
     }
 
     @Test
@@ -207,7 +320,7 @@ class ApiExceptionHandlerTest {
                 new TapstateException(ControlError.PREVIEW_OVERLOADED, Map.of(), null));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
-        assertThat(response.getBody().code()).isEqualTo("control.preview-overloaded");
+        assertThat(response.getBody().code()).isEqualTo("TS0210014");
     }
 
     @Test
@@ -237,8 +350,8 @@ class ApiExceptionHandlerTest {
                 handler.handle(new TapstateException(MonitorError.NO_OBSERVATION, Map.of("pipeline", "pl1"), null));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(response.getBody().code()).isEqualTo("monitor.no-observation");
-        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("monitor.no-observation");
+        assertThat(response.getBody().code()).isEqualTo("TS0400001");
+        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("TS0400001");
     }
 
     @Test
@@ -247,7 +360,7 @@ class ApiExceptionHandlerTest {
                 handler.handle(new TapstateException(ControlError.BOOTSTRAP_CLOSED, Map.of(), null));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(response.getBody().code()).isEqualTo("control.bootstrap-closed");
+        assertThat(response.getBody().code()).isEqualTo("TS0210018");
     }
 
     /**
@@ -293,9 +406,9 @@ class ApiExceptionHandlerTest {
         ResponseEntity<ApiError> inUse = handler.handle(new TapstateException(
                 ArtifactError.IN_USE, Map.of("id", "src1", "referrers", List.of("pl1", "pl2")), null));
         assertThat(inUse.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(inUse.getBody().code()).isEqualTo("artifact.in-use");
+        assertThat(inUse.getBody().code()).isEqualTo("TS0240004");
         assertThat(inUse.getBody().params()).containsEntry("referrers", List.of("pl1", "pl2"));
-        assertThat(inUse.getBody().message()).isNotBlank().isNotEqualTo("artifact.in-use");
+        assertThat(inUse.getBody().message()).isNotBlank().isNotEqualTo("TS0240004");
 
         ResponseEntity<ApiError> running = handler.handle(new TapstateException(
                 ArtifactError.PIPELINE_NOT_STOPPED,
@@ -304,7 +417,7 @@ class ApiExceptionHandlerTest {
         assertThat(running.getBody().params())
                 .containsEntry("actual", "RUNNING")
                 .containsEntry("desired", "RUNNING");
-        assertThat(running.getBody().message()).isNotBlank().isNotEqualTo("artifact.pipeline-not-stopped");
+        assertThat(running.getBody().message()).isNotBlank().isNotEqualTo("TS0240005");
     }
 
     @Test
@@ -315,17 +428,17 @@ class ApiExceptionHandlerTest {
         // keeps every connector.* at 500; the register verb, which knows the uploaded artifact is the
         // client's, opts specific failures into a 400 via BadRequestCodedException instead of the code table.
         for (String code : List.of(
-                "connector.load-failed",
-                "connector.no-connector-class",
-                "connector.ambiguous-connector-class",
-                "connector.spec-not-found",
-                "connector.spec-invalid",
-                "connector.registration-conflict",
-                "connector.not-registered",
-                "connector.ambiguous-registration",
+                "TS0060009",
+                "TS0060014",
+                "TS0060015",
+                "TS0060016",
+                "TS0060017",
+                "TS0060006",
+                "TS0060004",
+                "TS0060005",
                 // Attributed to the caller by the read face, which knows the source was theirs to name;
                 // here it must stay server-side, or the same code on a resolve path would be miscalled.
-                "connector.capability-missing")) {
+                "TS0060031")) {
             assertThat(ApiExceptionHandler.statusFor(new StubCode(code))).as(code)
                     .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
         }
@@ -337,9 +450,9 @@ class ApiExceptionHandlerTest {
         // they answer 500, which tells a caller the server broke rather than that their request was
         // refused - the one thing a refusal has to be distinguishable from.
         for (String code : List.of(
-                "data-browser.invalid-limit",
-                "data-browser.connector-not-browsable",
-                "data-browser.unorderable-field")) {
+                "TS0390002",
+                "TS0390004",
+                "TS0390003")) {
             assertThat(ApiExceptionHandler.statusFor(new StubCode(code))).as(code)
                     .isEqualTo(HttpStatus.BAD_REQUEST);
         }
@@ -360,14 +473,14 @@ class ApiExceptionHandlerTest {
         // A verb boundary that knows a domain code is the client's fault in its context wraps it as a
         // BadRequestCodedException: a 400 that still renders the underlying coded body (here a connector
         // artifact refused at register), even though the code defaults to 500 globally.
-        TapstateException connectorFailure = new TapstateException(new StubCode("connector.spec-invalid"),
+        TapstateException connectorFailure = new TapstateException(new StubCode("TS0060017"),
                 Map.of("artifact", "bad.jar", "spec", "spec.json", "detail", "the spec is not valid JSON"), null);
 
         ResponseEntity<ApiError> response = handler.handle(new BadRequestCodedException(connectorFailure));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(response.getBody().code()).isEqualTo("connector.spec-invalid");
-        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("connector.spec-invalid");
+        assertThat(response.getBody().code()).isEqualTo("TS0060017");
+        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("TS0060017");
         assertThat(response.getBody().params()).containsEntry("artifact", "bad.jar");
     }
 
@@ -378,7 +491,7 @@ class ApiExceptionHandlerTest {
         ApiError body = handler.handle(e).getBody();
 
         // the wire identity is the canonical code string (ApiError.code is a String); the enum never crosses
-        assertThat(body.code()).isEqualTo("dsl.malformed-yaml");
+        assertThat(body.code()).isEqualTo("TS0010017");
     }
 
     @Test
@@ -393,11 +506,11 @@ class ApiExceptionHandlerTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         ApiError body = response.getBody();
-        assertThat(body.code()).isEqualTo("cluster.membership-unreadable");
+        assertThat(body.code()).isEqualTo("TS0370001");
         assertThat(body.message())
                 .describedAs("rendered from the catalog, not left as the bare code -- a person reading "
                         + "a failing run's output is the first caller this reaches")
-                .isNotEqualTo("cluster.membership-unreadable")
+                .isNotEqualTo("TS0370001")
                 .contains("cannot read who is in the cluster");
     }
 

@@ -62,7 +62,9 @@ class ClusterHealthProbeTest {
         assertThat(capture.get("write_cost_complete")).isEqualTo(false);
     }
 
-    @Test void observesTheExistingStatusResponseWithoutAnotherRequestOrRawParameters() throws Exception {
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"engine.job-failed", "TS0440008"})
+    void observesTheExistingStatusResponseWithoutAnotherRequestOrRawParameters(String code) throws Exception {
         AtomicInteger statuses = new AtomicInteger();
         String pipeline = "private-pipeline-sentinel", secret = "private-status-parameter-sentinel";
         HttpServer server = server(exchange -> {
@@ -70,7 +72,7 @@ class ClusterHealthProbeTest {
             if (exchange.getRequestURI().getPath().equals("/auth/login")) body = "{\"token\":\"fixture-token\"}";
             else {
                 statuses.incrementAndGet();
-                body = "{\"state\":\"FAILED\",\"failure\":{\"code\":\"engine.job-failed\",\"params\":{\"detail\":\"" + secret + "\"}}}";
+                body = "{\"state\":\"FAILED\",\"failure\":{\"code\":\"" + code + "\",\"params\":{\"detail\":\"" + secret + "\"}}}";
             }
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, bytes.length);
@@ -89,7 +91,7 @@ class ClusterHealthProbeTest {
         List<?> samples = (List<?>) capture.get("pipeline_status");
         assertThat(samples).hasSize(1);
         Map<?, ?> sample = (Map<?, ?>) samples.getFirst();
-        assertThat(sample.get("failure_code")).isEqualTo("engine.job-failed");
+        assertThat(sample.get("failure_code")).isEqualTo(code);
         assertThat(sample.get("state")).isEqualTo("FAILED");
         assertThat(sample.get("pid")).isEqualTo(678L);
         assertThat(sample.get("pipeline_sha256")).isEqualTo(ClusterHealthProbe.hash(pipeline));
@@ -97,7 +99,8 @@ class ClusterHealthProbeTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"engine-.job-failed,noncanonical", "engine--x.job-failed,noncanonical",
+    @CsvSource({"TS0000001,noncanonical", "TS0440000,noncanonical", "ts0440008,noncanonical",
+        "TS04400080,noncanonical", "TS044008,noncanonical", "engine-.job-failed,noncanonical", "engine--x.job-failed,noncanonical",
         "engine.extra.job-failed,noncanonical", "unregistered.job-failed,noncanonical",
         "connector.mongodb.read-failed,unsupported-namespace", "pdk.1001,unsupported-namespace"})
     void malformedOrUnsupportedCodesLeaveTheSameFailedStateAndAnIncompleteProjection(String code, String expected) throws Exception {

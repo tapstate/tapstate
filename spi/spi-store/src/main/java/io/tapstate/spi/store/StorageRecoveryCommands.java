@@ -66,6 +66,8 @@ public interface StorageRecoveryCommands {
     /** Returns the same current plan when its actual closure is unchanged; changed scope requires a new confirmation. */
     Plan plan(CacheAuthScope current, Manifest verified, String operationId, String previousOperationId);
     Optional<Plan> current(CacheAuthScope current);
+    /** Internal completion poll; may return empty after proving that this poll has no work. */
+    default Optional<Plan> currentForCompletion(CachePreparation current) { return current(current.authScope()); }
     Optional<Plan> find(CacheAuthScope current, String originalId);
     /** Exact original confirmation only. Publication grants no business execution or cache initialization. */
     Plan confirm(Plan original);

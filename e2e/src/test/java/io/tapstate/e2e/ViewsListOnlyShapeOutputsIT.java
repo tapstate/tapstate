@@ -130,7 +130,7 @@ class ViewsListOnlyShapeOutputsIT {
                         assertThat(((Number) row.get("documents")).longValue()).isEqualTo(1);
                     });
                     assertThat((List<?>) before.get("unresolved")).singleElement().satisfies(value ->
-                            assertThat(((Map<?, ?>) value).get("code")).isEqualTo("actuation.source-schema-not-discovered"));
+                            assertThat(((Map<?, ?>) value).get("code")).isEqualTo("TS0360004"));
                     control.discoverSchema(sameSource ? "src" : "unknown", "mongodb", Map.of("uri", sourceUri));
                     Map<?, ?> after = (Map<?, ?>) JsonReader.parse(
                             control.sourceRequest("GET", "/api/views", null, null, 200).body());
@@ -225,6 +225,9 @@ class ViewsListOnlyShapeOutputsIT {
                     assertThat(load.get("readMode")).isEqualTo("snapshot_and_cdc");
                     assertThat(((Number) ((Map<?, ?>) ((Map<?, ?>) load.get("tables")).get("orders")).get("rowsRead")).longValue()).isEqualTo(1);
                     assertThat(client.getDatabase(storage.configurationDatabase()).listCollectionNames()).doesNotContain("pipeline_observation");
+                    if (shape.equals("nest")) {
+                        awaitNestEventAgeSample(control);
+                    }
                     var response = control.sourceRequest("GET", "/api/views", null, null, 200);
                     Map<?, ?> body = (Map<?, ?>) JsonReader.parse(response.body());
                     assertThat((List<?>) body.get("unresolved")).isEmpty();
@@ -234,6 +237,13 @@ class ViewsListOnlyShapeOutputsIT {
                     assertThat(item.get("location")).isEqualTo(Map.of(
                             "storeId", "target", "database", "target_db", "collection", collection));
                     assertThat(((Number) item.get("documents")).longValue()).isEqualTo(count);
+                    if (shape.equals("nest")) {
+                        var status = (Map<?, ?>) item.get("status");
+                        assertThat(status.get("reason")).isEqualTo("observed");
+                        assertThat(status.get("eventAgeSeconds")).isInstanceOfSatisfying(Number.class,
+                                value -> assertThat(value.longValue()).isNotNegative());
+                        assertThat(status.containsKey("aggregation")).isFalse();
+                    }
                     var pipelineResponse = control.sourceRequest("GET", "/api/pipelines/p", null, null, 200);
                     Map<?, ?> pipeline = (Map<?, ?>) JsonReader.parse(pipelineResponse.body());
                     Map<?, ?> outputTargets = (Map<?, ?>) pipeline.get("outputTargets");
@@ -252,5 +262,22 @@ class ViewsListOnlyShapeOutputsIT {
                 }
             }
         }
+    }
+
+    private static void awaitNestEventAgeSample(ControlPlane control) {
+        Await.until("a target-confirmed Nest event age after both input snapshots land", Duration.ofSeconds(30), () -> {
+            var metrics = (Map<?, ?>) JsonReader.parse(control.metricsJson("p"));
+            var facts = (List<?>) metrics.get("facts");
+            boolean hasNestSample = facts != null && facts.stream().map(Map.class::cast)
+                    .filter(fact -> "tapstate.pipeline.lag".equals(fact.get("name")))
+                    .flatMap(fact -> ((List<?>) fact.get("points")).stream()).map(Map.class::cast)
+                    .anyMatch(point -> "shaped".equals(((Map<?, ?>) point.get("attributes")).get("tapstate.table.id")));
+            if (!hasNestSample) return false;
+            var snapshot = (Map<?, ?>) JsonReader.parse(control.sourceRequest(
+                    "GET", "/api/pipelines/p/snapshot", null, null, 200).body());
+            var tables = (Map<?, ?>) snapshot.get("snapshot");
+            return List.of("orders", "customers").stream().allMatch(table ->
+                    tables.get(table) instanceof Map<?, ?> progress && Boolean.TRUE.equals(progress.get("landed")));
+        }, () -> control.metricsJson("p"));
     }
 }

@@ -82,7 +82,7 @@ class StorageHttpFaceTest {
             child.registerBean(ClusterController.class,
                     () -> new ClusterController(child.getBean(ClusterTopologyService.class)));
             child.registerBean(RequestMappingHandlerMapping.class, () -> {
-                var mapping = new RequestMappingHandlerMapping();
+                var mapping = new OperationRequestMappingHandlerMapping();
                 mapping.setOrder(0);
                 mapping.setPathPrefixes(Map.of("/api", HandlerTypePredicate.forAnnotation(RestController.class)));
                 return mapping;

@@ -132,11 +132,48 @@ class ScopedEngineLifecycleActuatorTest {
         verify(engine).submitRun(eq("p"), any(), anyMap(), any(), any(OperatorRunManifest.class));
     }
 
+    @Test void failedSubmissionKeepsItsDiagnosticReadableAfterInvalidatingActuation() {
+        var failure = new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "submission refused"), null);
+        var fact = io.tapstate.core.common.FailureFact.unavailable(failure);
+        when(fixedCapture.openingFailureFact("p", failure)).thenReturn(fact);
+        when(engine.submitRun(eq("p"), any(DAG.class), anyMap(), any(NestSettings.class), any(OperatorRunManifest.class)))
+                .thenThrow(failure);
+        var actor = actuator();
+        assertThatThrownBy(() -> actor.start("p")).isSameAs(failure);
+        assertThat(actor.actuationFailureFact("p", failure)).isSameAs(fact);
+        assertThatThrownBy(() -> actor.actuationFailureFact("other", failure)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> actor.stop("p", false)).isInstanceOf(TapstateException.class);
+    }
+
     @Test void targetAcknowledgementAloneCannotCompleteAStillRunningOriginalJob() {
         boundedCapture();
         assertThat(actuator().completed("p")).isFalse();
         verify(previous,never()).cancel();
         verify(fixedCapture,never()).stopCapture(anyString(),anyBoolean());
+    }
+
+    @Test void aSuccessfulBoundedJobStillCarriesThePipelineWhileItsReceiptsArrive() {
+        boundedCapture();
+        var actor = actuator();
+        assertThat(actor.completion("p")).isEmpty();
+
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(fixedCapture.loadDelivered("p")).thenReturn(false);
+        assertThat(actor.isCarryingAJob("p")).isTrue();
+        assertThat(actor.completion("p")).isEmpty();
+
+        when(fixedCapture.loadDelivered("p")).thenReturn(true);
+        assertThat(actor.completion("p")).contains(new LifecycleActuator.Completion("71", claim(1)));
+    }
+
+    @Test void aTerminalJobWithNoBoundedCaptureDoesNotCarryThePipeline() {
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(fixedCapture.isCapturing("p")).thenReturn(true);
+
+        assertThat(actuator().isCarryingAJob("p")).isFalse();
     }
 
     private void boundedCapture() {
@@ -304,11 +341,13 @@ class ScopedEngineLifecycleActuatorTest {
         doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("capture"))).when(fixedCapture)
                 .startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
         var currentFailure = new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "p"), null);
-        when(fixedCapture.captureFailure("p")).thenReturn(Optional.of(currentFailure));
+        when(fixedCapture.captureFailureFact("p")).thenReturn(Optional.of(new io.tapstate.core.common.FailureFact(currentFailure, Map.of("message", "current capture"))));
         var actor = actuator();
         actor.start("p");
 
         assertThat(actor.failure("p")).containsSame(currentFailure);
+        assertThat(actor.failureFact("p")).hasValueSatisfying(fact ->
+                assertThat(fact.diagnostic()).containsEntry("message", "current capture"));
         verify(previous, never()).failure();
         verify(engine, never()).submitRun(anyString(), any(), anyMap(), any(), any(OperatorRunManifest.class));
     }

@@ -9,8 +9,9 @@ import java.util.function.Supplier;
 /** Completes only the original deletion; no current same-name definition or execution is adopted on retry. */
 final class PipelineDeletionCoordinator {
     /** Durable retirement checks stay outside stores; their callback guard performs only local checks. */
-    record Isolated(Optional<PipelineRetirementRequest.CacheOriginal> cache,Runnable requireRetired,Runnable requireLocal) {
-        Isolated {cache=Objects.requireNonNull(cache);Objects.requireNonNull(requireRetired);Objects.requireNonNull(requireLocal);}
+    record Isolated(Optional<PipelineRetirementRequest.CacheOriginal> cache,Runnable requireRetired,Runnable requireLocal,
+                    java.util.function.Consumer<PipelineRetirementReceipt> requireReceipt) {
+        Isolated {cache=Objects.requireNonNull(cache);Objects.requireNonNull(requireRetired);Objects.requireNonNull(requireLocal);Objects.requireNonNull(requireReceipt);}
     }
     @FunctionalInterface interface Isolation {
         Isolated isolate(PipelineRetirementRequest original,Optional<OperatorRunManifest> captured);
@@ -33,10 +34,14 @@ final class PipelineDeletionCoordinator {
         this.validation=Objects.requireNonNull(validation);
     }
     PipelineRetirementResult delete(PipelineRetirementRequest original,Optional<OperatorRunManifest> manifest) {
+        return delete(original, manifest, null);
+    }
+    PipelineRetirementResult delete(PipelineRetirementRequest original,Optional<OperatorRunManifest> manifest,
+            PipelineIntentSnapshot expectedIntent) {
         activeNode.run();var completed=configuration.completed(original.scope().pipelineId(),original.operationId());
         if(completed.isPresent())return same(original,completed.orElseThrow());
         var retired=isolation.isolate(original,manifest);retired.requireRetired().run();activeNode.run();
-        return execute(configuration.begin(original),retired);
+        return execute(expectedIntent == null ? configuration.begin(original) : configuration.begin(original,expectedIntent),retired);
     }
     Optional<PipelineRetirementResult> resume(PipelineIntentScope scope,String operationId,Optional<OperatorRunManifest> manifest) {
         activeNode.run();var completed=configuration.completed(scope.pipelineId(),operationId);
@@ -60,14 +65,16 @@ final class PipelineDeletionCoordinator {
         }
         guard.run();
         var originalConsumers=consumers.guardedBy(local);
-        var members=originalConsumers.forPipeline(original.request().scope());guard.run();
+        var members=originalConsumers.forPipeline(original.request().scope());
         for(var member:members) {
             guard.run();if(member.detached())continue;
             if (originalConsumers.detachForRetirement(original,member,currentNode,isolated.cache()).isEmpty()) throw fenced();
-            guard.run();
         }
-        guard.run();var receipt=cache.retire(original,currentNode,isolated.cache());guard.run();
-        notes.delete(original,configuration,guard,local);guard.run();return configuration.complete(receipt);
+        guard.run();
+        var receipt = cache.retire(original, currentNode, isolated.cache());
+        Runnable afterRetirement = () -> isolated.requireReceipt().accept(receipt);
+        notes.delete(original, configuration, afterRetirement, local);
+        return configuration.complete(receipt);
     }
     private PipelineRetirementResult same(PipelineRetirementRequest original,PipelineRetirementResult result) {
         if(!original.scope().equals(result.scope()) || !original.definitionHash().equals(result.definitionHash()))throw fenced();return result;

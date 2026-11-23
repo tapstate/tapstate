@@ -229,7 +229,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         var original=MongoCaptureStatePreparations.consumeFirst(invocation,targetFingerprint);
         var preparation=original.preparation();var request=original.request();String ringRetention=original.retention();requireScope(preparation);
         if(preparation.replacement())throw history(preparation);
-        return transaction(original::requireActive,session -> {
+        return checkpointTransaction(request.pipeline(), original::requireActive,session -> {
             var pipeline=new MongoCachePipelineAccess(client,database,request.pipeline(),request.originalPipeline(),() -> {active.run();original.requireActive();});
             var state=pipeline.state(session,true);pipeline.proveClaim(session,true);pipeline.updateState(session,state,new Document(),false);
             var retained=MongoPipelineSourcePreparations.retained(session,database,request.pipeline());
@@ -356,6 +356,10 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             MongoCacheWorkloadClaimStore.requireCollection(database);
             return body.apply(session);
         });
+    }
+
+    private <T> T checkpointTransaction(io.tapstate.spi.store.PipelineIntentScope pipeline, Runnable originalActive, Function<ClientSession, T> body) {
+        return MongoCachePipelineStateStore.writeTransaction(client, pipeline.pipelineId(), () -> transaction(originalActive, body));
     }
     private <T>T transaction(Runnable originalActive,Function<ClientSession,T> body) {
         return transaction(originalActive, true, body);

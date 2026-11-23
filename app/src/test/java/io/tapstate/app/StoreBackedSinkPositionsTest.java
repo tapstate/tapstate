@@ -63,6 +63,37 @@ class StoreBackedSinkPositionsTest {
     }
 
     @Test
+    void qualifiesSameTableProgressEvenBeforeBothNodesHaveAcknowledged() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = source("orders_src", "orders", "shop");
+        artifacts.save(source);
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(
+                SourceRef.of(source.id(), true, Map.of(), "left"),
+                SourceRef.of(source.id(), true, Map.of(), "right")),
+                List.of(io.tapstate.core.model.Step.inline("both",
+                        io.tapstate.core.model.FromClause.list(FromRef.literal("left.orders"), FromRef.literal("right.orders")),
+                        new io.tapstate.core.model.TransformBody.Union(), null)),
+                new ViewBlock.Inline("order_state", FromRef.literal("both"), "id", null), null, null, null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        String chain = chainOf(source);
+        store.meta().create(chain, null);
+        var reader = new StoreBackedSinkPositions(store);
+
+        store.meta().upsertConsumerOffset(chain, aliasedOffset("left", "left-position"));
+        assertThat(reader.apply(PIPELINE)).containsExactly(entry("left.orders", "left-position"));
+
+        store.meta().upsertConsumerOffset(chain, aliasedOffset("right", "right-position"));
+        assertThat(reader.apply(PIPELINE)).containsOnly(
+                entry("left.orders", "left-position"), entry("right.orders", "right-position"));
+    }
+
+    private static ConsumerOffset aliasedOffset(String binding, String token) {
+        return new ConsumerOffset(SrsConsumerId.of(PIPELINE, binding).value(), Map.of("orders", 1L), null,
+                List.of(), null, 0L, Map.of("orders", new ChainPosition(new SourceOrder(1, 1), token)),
+                ConsumerProgressKind.SRS);
+    }
+
+    @Test
     void anOldMultiTablePositionIsNotProjectedToAnUnconfirmedTable() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("crm_src", null, "fake", Map.of("host", "crm"),

@@ -54,12 +54,12 @@ final class NativeStartProgress {
     private void load() {
         if (reads!=null) return;
         var groups=new LinkedHashMap<String,List<Selection>>();
-        for (String id:pipeline.sourceIds()) {
-            var source=StoredArtifacts.requireSource(artifacts,id);
-            SourceCaptureResolution.forPipeline(pipeline,source,models.apply(source))
-                    .flatMap(canonical -> store.startPlanningDescriptor(scope,pipeline,source,canonical))
-                    .ifPresent(resolved -> groups.computeIfAbsent(resolved.chainId().value(),ignored -> new ArrayList<>())
-                            .add(new Selection(id,store.sharedStartSource(pipeline,source))));
+        for (var reference : pipeline.sources()) {
+            var source = StoredArtifacts.requireSource(artifacts, reference.id());
+            SourceCaptureResolution.forPipeline(pipeline, reference, source, models.apply(source))
+                    .flatMap(canonical -> store.startPlanningDescriptor(scope, pipeline, source, canonical))
+                    .ifPresent(resolved -> groups.computeIfAbsent(resolved.chainId().value(), ignored -> new ArrayList<>())
+                            .add(new Selection(reference.binding(), store.sharedStartSource(pipeline, reference))));
         }
         var loaded=new LinkedHashMap<String,Read>();
         for (var entry:groups.entrySet()) {

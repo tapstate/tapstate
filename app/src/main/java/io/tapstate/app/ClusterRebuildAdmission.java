@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
 import java.time.Duration;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.LongSupplier;
@@ -44,8 +45,8 @@ import org.slf4j.LoggerFactory;
  * <p>A refusal is logged with its reason, once for each reason, so a pipeline left failed says what kept
  * it there.
  *
- * <p>Not synchronized: one convergence pass at a time asks this, on a single scheduler thread with a
- * fixed delay, so passes never overlap.
+ * <p>Convergence is single-flight per Pipeline. Different Pipelines may ask concurrently; retention
+ * includes every queued or running Pipeline so it cannot remove an active pass's budget.
  */
 final class ClusterRebuildAdmission implements RebuildAdmission {
 
@@ -59,9 +60,9 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     private final long backoffNanos;
     private final long detectionWindowNanos;
     private final LongSupplier nanoTime;
-    private final Map<String, Attempts> attempts = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Attempts> attempts = new ConcurrentHashMap<>();
     /** The refusal last logged for each pipeline, so the same refusal of the same run is logged once. */
-    private final Map<String, Refusal> refusals = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Refusal> refusals = new ConcurrentHashMap<>();
 
     /** Which run a refusal was about, and why it was refused. */
     private record Refusal(long executionGeneration, PipelineActuationOwnership.Departure why) {}
@@ -230,10 +231,27 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         return false;
     }
 
+    private final Map<String, io.tapstate.spi.store.PipelineIntentScope> observedScopes = new ConcurrentHashMap<>();
+
+    void observeScope(io.tapstate.spi.store.PipelineIntentScope scope,
+            java.util.function.Supplier<java.util.Optional<io.tapstate.spi.store.PipelineStateMappings.LogWindow>> lifetime) {
+        String pipelineId = scope.pipelineId();
+        var previous = observedScopes.putIfAbsent(pipelineId, scope);
+        if (previous == null || previous.equals(scope)) return;
+        lifetime.get().filter(window -> window.lastGeneration() == scope.stateGeneration()).ifPresent(window -> {
+            if (previous.stateGeneration() < window.firstGeneration()) {
+                attempts.remove(pipelineId);
+                refusals.remove(pipelineId);
+            }
+            observedScopes.replace(pipelineId, previous, scope);
+        });
+    }
+
     /** Releases what pipelines no longer desired have spent, so a deleted one leaks no counter. */
     @Override
     public void retain(java.util.Collection<String> pipelineIds) {
         attempts.keySet().retainAll(pipelineIds);
         refusals.keySet().retainAll(pipelineIds);
+        observedScopes.keySet().retainAll(pipelineIds);
     }
 }

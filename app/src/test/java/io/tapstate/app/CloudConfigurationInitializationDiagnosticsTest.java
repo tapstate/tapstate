@@ -8,11 +8,19 @@ import io.tapstate.adapters.mongostore.MongoConfigurationBootstrap;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.StoreError;
+import io.tapstate.core.alerting.AlarmKey;
+import io.tapstate.core.alerting.AlertChannelPolicy;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StorageSetupScope;
+import io.tapstate.spi.store.StorageSetupStateStore;
 import java.time.Duration;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -22,6 +30,115 @@ import static org.mockito.Mockito.*;
 
 class CloudConfigurationInitializationDiagnosticsTest {
     private static final String OPERATION = "a9c7faf0-c2a4-437a-a698-767c515e37ec";
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aSuccessfulBootstrapConfirmsTheOriginalOperationWithoutRepeatingAlertPreparation(boolean creationGranted) {
+        var fixture = retainedConfiguration(StorageSetupStateStore.Phase.CONFIG_PREPARED);
+        var bridge = fixture.bridge();
+        var alertScope = new AlarmKey.Scope("organization", "cluster");
+        when(bridge.claimConfiguration(anyString(), anyString())).thenAnswer(call ->
+                new CloudSdkBridge.ConfigurationInitialization("cluster", OPERATION, "CLAIMED",
+                        call.getArgument(1), creationGranted));
+        when(bridge.alertScope()).thenReturn(Optional.of(alertScope));
+
+        try (var domains = mockStatic(MongoConfigurationDomain.class);
+             var bootstrap = mockStatic(MongoConfigurationBootstrap.class);
+             var initialization = fixture.initialization()) {
+            domains.when(() -> MongoConfigurationDomain.open(fixture.settings(), "cluster"))
+                    .thenThrow(new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null));
+            if (creationGranted) {
+                bootstrap.when(() -> MongoConfigurationBootstrap.prepareWithAlerts(fixture.settings(), "cluster",
+                        "cloud-cluster", OPERATION, 1, alertScope, AlertChannelPolicy.Deployment.CLOUD_MANAGED))
+                        .thenReturn(fixture.domain());
+            } else {
+                bootstrap.when(() -> MongoConfigurationBootstrap.resume(fixture.settings(), "cluster",
+                        "cloud-cluster", OPERATION, 1)).thenReturn(fixture.domain());
+            }
+
+            assertThat(initialization.open()).isSameAs(fixture.domain());
+            verify(bridge).completeConfiguration(eq(OPERATION), anyString());
+            verify(fixture.domain(), never()).resumeInitialAlertStorage(anyString());
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = StorageSetupStateStore.Phase.class, names = {"CONFIG_PREPARED", "COMPLETE"})
+    void retainedConfigurationResumesAlertsBeforeConfirmingAnUnboundSetup(StorageSetupStateStore.Phase phase) {
+        var fixture = retainedConfiguration(phase);
+        var domain = fixture.domain();
+        var bridge = fixture.bridge();
+        try (var domains = mockStatic(MongoConfigurationDomain.class);
+             var initialization = fixture.initialization()) {
+            domains.when(() -> MongoConfigurationDomain.open(fixture.settings(), "cluster")).thenReturn(domain);
+
+            assertThat(initialization.open()).isSameAs(domain);
+
+            if (phase == StorageSetupStateStore.Phase.CONFIG_PREPARED) {
+                var order = inOrder(domain, bridge);
+                order.verify(domain).resumeInitialAlertStorage(OPERATION);
+                order.verify(bridge).completeConfiguration(eq(OPERATION), anyString());
+            } else {
+                verify(domain, never()).resumeInitialAlertStorage(anyString());
+                verifyNoInteractions(bridge);
+            }
+            verify(bridge, never()).claimConfiguration(anyString(), anyString());
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = StorageSetupStateStore.Phase.class, names = {"CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"})
+    void alertPreparationFailureOnlyBlocksAnUnboundConfiguration(StorageSetupStateStore.Phase phase) {
+        boolean unbound = phase == StorageSetupStateStore.Phase.CONFIG_PREPARED;
+        var fixture = retainedConfiguration(phase);
+        var domain = fixture.domain();
+        var failure = new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "MongoCommandException code=8000", "secret", "parameter-secret-sentinel"), null);
+        doThrow(failure).when(domain).resumeInitialAlertStorage(OPERATION);
+        try (var logs = new Logs(); var domains = mockStatic(MongoConfigurationDomain.class);
+             var initialization = fixture.initialization()) {
+            domains.when(() -> MongoConfigurationDomain.open(fixture.settings(), "cluster")).thenReturn(domain);
+
+            if (unbound) {
+                assertThat(catchThrowable(initialization::open)).isSameAs(failure);
+                verify(domain).close();
+            } else {
+                assertThat(initialization.open()).isSameAs(domain);
+                verify(domain, never()).close();
+                verify(domain, never()).resumeInitialAlertStorage(anyString());
+            }
+            verifyNoInteractions(fixture.bridge());
+            if (unbound) {
+                assertThat(logs.events.list).singleElement().satisfies(event ->
+                        assertThat(event.getFormattedMessage()).contains("TS0480001", "MongoCommandException code=8000"));
+            } else {
+                assertThat(logs.events.list).isEmpty();
+            }
+            assertSafe(logs);
+        }
+    }
+
+    private static RetainedConfiguration retainedConfiguration(StorageSetupStateStore.Phase phase) {
+        var settings = new MongoConnectionSettings("mongodb://fixture/config", null, Duration.ofSeconds(1));
+        var properties = new CloudProperties();
+        properties.setBaseUrl("https://cloud.example"); properties.setToken("token-secret-sentinel");
+        properties.setClusterId("cluster"); properties.setAtlasUri(settings.uri());
+        var bridge = mock(CloudSdkBridge.class);
+        var domain = mock(MongoConfigurationDomain.class);
+        var setup = mock(StorageSetupStateStore.class);
+        var scope = new StorageSetupScope("cluster", "cloud-cluster", OPERATION, 1);
+        when(domain.setupStates()).thenReturn(setup);
+        when(setup.load()).thenReturn(new StorageSetupStateStore.Status(scope, phase,
+                phase == StorageSetupStateStore.Phase.CONFIG_PREPARED ? 0 : 1));
+        return new RetainedConfiguration(settings, CloudRuntimeSettings.resolve(properties), bridge, domain);
+    }
+
+    private record RetainedConfiguration(MongoConnectionSettings settings, CloudRuntimeSettings cloud,
+            CloudSdkBridge bridge, MongoConfigurationDomain domain) {
+        CloudConfigurationInitialization initialization() {
+            return new CloudConfigurationInitialization(settings, cloud, bridge, BootId.fresh());
+        }
+    }
 
     @Test
     void theFirstPreparationFailureRemainsDiagnosableWhenTheNextEntryCanOnlyResume() {
@@ -50,7 +167,7 @@ class CloudConfigurationInitializationDiagnosticsTest {
             assertThat(catchThrowable(initialization::open)).isSameAs(first);
             assertThat(catchThrowable(initialization::open)).isSameAs(later);
             assertThat(logs.events.list).hasSize(2);
-            assertThat(logs.events.list.get(0).getFormattedMessage()).contains("stage=prepare", "io.store-unavailable",
+            assertThat(logs.events.list.get(0).getFormattedMessage()).contains("stage=prepare", "TS0480001",
                     "MongoCommandException code=24", "creationGranted=true", "creationInvoked=true");
             assertThat(logs.events.list.get(1).getFormattedMessage()).contains("stage=resume", later.code().code());
             assertSafe(logs);
@@ -77,7 +194,7 @@ class CloudConfigurationInitializationDiagnosticsTest {
             domains.when(() -> MongoConfigurationDomain.open(settings, "cluster")).thenThrow(refusal);
             assertThat(catchThrowable(initialization::open)).isSameAs(refusal);
             assertThat(logs.events.list).singleElement().satisfies(event ->
-                    assertThat(event.getFormattedMessage()).contains("stage=claim", "io.store-unavailable", "detail=none", "creationGranted=unknown"));
+                    assertThat(event.getFormattedMessage()).contains("stage=claim", "TS0480001", "detail=none", "creationGranted=unknown"));
             assertSafe(logs);
         }
     }

@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.BootErrorDefinitions;
 
 import java.util.Set;
 
@@ -18,121 +20,106 @@ import java.util.Set;
  */
 enum BootError implements TapstateErrorCode {
 
-    MIGRATION_MODE_CONFLICT("boot.migration-mode-conflict", Set.of()),
+    MIGRATION_MODE_CONFLICT(BootErrorDefinitions.MIGRATION_MODE_CONFLICT),
 
     /** The embedded Hazelcast member could not be started (e.g. its loopback port is in use). */
-    HAZELCAST_UNAVAILABLE("boot.hazelcast-unavailable", Set.of()),
+    HAZELCAST_UNAVAILABLE(BootErrorDefinitions.HAZELCAST_UNAVAILABLE),
 
     /** A managed Cloud runtime must receive its four external settings as one complete unit. */
-    CLOUD_CONFIG_INCOMPLETE("boot.cloud-config-incomplete", Set.of()),
+    CLOUD_CONFIG_INCOMPLETE(BootErrorDefinitions.CLOUD_CONFIG_INCOMPLETE),
 
     /** The configured Global Control Plane address is not an absolute HTTP(S) base URL. */
-    CLOUD_BASE_URL_INVALID("boot.cloud-base-url-invalid", Set.of()),
+    CLOUD_BASE_URL_INVALID(BootErrorDefinitions.CLOUD_BASE_URL_INVALID),
 
     /** The managed metadata connection is not a MongoDB or MongoDB SRV connection string. */
-    CLOUD_ATLAS_URI_INVALID("boot.cloud-atlas-uri-invalid", Set.of()),
+    CLOUD_ATLAS_URI_INVALID(BootErrorDefinitions.CLOUD_ATLAS_URI_INVALID),
 
     /** A Web-bearing distribution has missing, unsupported, malformed, or conflicting metadata. */
-    WEB_PROFILE_INVALID("boot.web-profile-invalid", Set.of("reason")),
+    WEB_PROFILE_INVALID(BootErrorDefinitions.WEB_PROFILE_INVALID),
 
     /** The packaged Web profile does not match the mode selected by the external Cloud settings. */
-    WEB_PROFILE_MODE_MISMATCH("boot.web-profile-mode-mismatch", Set.of("profile", "mode")),
+    WEB_PROFILE_MODE_MISMATCH(BootErrorDefinitions.WEB_PROFILE_MODE_MISMATCH),
 
     /** Cloud Web metadata requires a safe Console URL for its artifact purpose; on-prem carries none. */
-    WEB_CONSOLE_URL_INVALID("boot.web-console-url-invalid", Set.of()),
+    WEB_CONSOLE_URL_INVALID(BootErrorDefinitions.WEB_CONSOLE_URL_INVALID),
 
     /** The optional on-prem store switch cannot disable managed Cloud metadata persistence. */
-    CLOUD_STORE_REQUIRED("boot.cloud-store-required", Set.of()),
+    CLOUD_STORE_REQUIRED(BootErrorDefinitions.CLOUD_STORE_REQUIRED),
 
     /** An existing view-store resource conflicts with the managed deployment or a concurrent refresh. */
-    CLOUD_VIEW_STORE_CONFLICT("boot.cloud-view-store-conflict", Set.of("store")),
+    CLOUD_VIEW_STORE_CONFLICT(BootErrorDefinitions.CLOUD_VIEW_STORE_CONFLICT),
 
     /** The outbound status switch is malformed; its value is deliberately not echoed. */
-    CLOUD_STATUS_CONFIG_INVALID("boot.cloud-status-config-invalid", Set.of()),
+    CLOUD_STATUS_CONFIG_INVALID(BootErrorDefinitions.CLOUD_STATUS_CONFIG_INVALID),
 
     /** An on-prem process attempted to enable managed Cloud status reporting. */
-    CLOUD_STATUS_MODE_REQUIRED("boot.cloud-status-mode-required", Set.of()),
+    CLOUD_STATUS_MODE_REQUIRED(BootErrorDefinitions.CLOUD_STATUS_MODE_REQUIRED),
 
     /** Status reporting was explicitly enabled without the real SDK-backed reporter. */
-    CLOUD_STATUS_SDK_REQUIRED("boot.cloud-status-sdk-required", Set.of()),
+    CLOUD_STATUS_SDK_REQUIRED(BootErrorDefinitions.CLOUD_STATUS_SDK_REQUIRED),
 
     /** A Cloud connector release is missing, mismatched, or cannot be fully registered and loaded. */
-    CLOUD_CONNECTORS_INVALID("boot.cloud-connectors-invalid", Set.of("connector", "reason")),
+    CLOUD_CONNECTORS_INVALID(BootErrorDefinitions.CLOUD_CONNECTORS_INVALID),
 
     /** The selected member-discovery mode is missing a required, deterministic input. */
-    DISCOVERY_CONFIG_INVALID("boot.discovery-config-invalid", Set.of("detail")),
+    DISCOVERY_CONFIG_INVALID(BootErrorDefinitions.DISCOVERY_CONFIG_INVALID),
 
     /** Cluster mode was selected without the stable cluster id that names every coordination record. */
-    CLUSTER_ID_REQUIRED("boot.cluster-id-required", Set.of()),
+    CLUSTER_ID_REQUIRED(BootErrorDefinitions.CLUSTER_ID_REQUIRED),
 
     /** The configured cluster id cannot be represented by the stable identity contract. */
-    CLUSTER_ID_INVALID("boot.cluster-id-invalid", Set.of()),
+    CLUSTER_ID_INVALID(BootErrorDefinitions.CLUSTER_ID_INVALID),
 
     /** The configured cluster id disagrees with the identity already stored for this control store. */
-    CLUSTER_ID_MISMATCH("boot.cluster-id-mismatch", Set.of("configured", "stored")),
+    CLUSTER_ID_MISMATCH(BootErrorDefinitions.CLUSTER_ID_MISMATCH),
 
     /** The selected cluster profile and bootstrap member count cannot provide its promised safety. */
-    CLUSTER_PROFILE_INVALID("boot.cluster-profile-invalid", Set.of()),
+    CLUSTER_PROFILE_INVALID(BootErrorDefinitions.CLUSTER_PROFILE_INVALID),
 
     /** Member heartbeats require positive whole-second values and a longer failure-detection window. */
-    HEARTBEAT_CONFIG_INVALID("boot.heartbeat-config-invalid", Set.of()),
+    HEARTBEAT_CONFIG_INVALID(BootErrorDefinitions.HEARTBEAT_CONFIG_INVALID),
 
     /** Cluster mode was selected without this member's stable node id. */
-    NODE_ID_REQUIRED("boot.node-id-required", Set.of()),
+    NODE_ID_REQUIRED(BootErrorDefinitions.NODE_ID_REQUIRED),
 
     /** The advertised control endpoint is missing or is not an absolute HTTP(S) URL. */
-    CONTROL_ADVERTISE_URL_INVALID("boot.control-advertise-url-invalid", Set.of()),
+    CONTROL_ADVERTISE_URL_INVALID(BootErrorDefinitions.CONTROL_ADVERTISE_URL_INVALID),
 
     /** Member exposure is allowed only through an explicit routable interface in cluster mode. */
-    MEMBER_BIND_ADDRESS_INVALID("boot.member-bind-address-invalid", Set.of()),
+    MEMBER_BIND_ADDRESS_INVALID(BootErrorDefinitions.MEMBER_BIND_ADDRESS_INVALID),
 
     /** A node-session lease with no positive lifetime could never protect a stable node id. */
-    NODE_SESSION_TTL_INVALID("boot.node-session-ttl-invalid", Set.of()),
+    NODE_SESSION_TTL_INVALID(BootErrorDefinitions.NODE_SESSION_TTL_INVALID),
 
     /** Renewal must happen before the node-session lease expires. */
-    NODE_SESSION_RENEW_INTERVAL_INVALID("boot.node-session-renew-interval-invalid", Set.of()),
+    NODE_SESSION_RENEW_INTERVAL_INVALID(BootErrorDefinitions.NODE_SESSION_RENEW_INTERVAL_INVALID),
 
     /** A business workload claim needs a positive server-time lease. */
-    WORKLOAD_CLAIM_TTL_INVALID("boot.workload-claim-ttl-invalid", Set.of()),
+    WORKLOAD_CLAIM_TTL_INVALID(BootErrorDefinitions.WORKLOAD_CLAIM_TTL_INVALID),
 
     /** Business ownership must renew before its lease expires. */
-    WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID("boot.workload-claim-renew-interval-invalid", Set.of()),
+    WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID(BootErrorDefinitions.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID),
 
     /** Cluster mode cannot reserve identities without the Mongo-backed coordination ports. */
-    COORDINATION_STORE_REQUIRED("boot.coordination-store-required", Set.of()),
+    COORDINATION_STORE_REQUIRED(BootErrorDefinitions.COORDINATION_STORE_REQUIRED),
 
     /** Another live boot already holds this stable node id. */
-    NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId")),
+    NODE_ID_IN_USE(BootErrorDefinitions.NODE_ID_IN_USE),
 
     /** The reserved identity stopped being provably owned before member startup completed. */
-    NODE_SESSION_LOST("boot.node-session-lost", Set.of()),
+    NODE_SESSION_LOST(BootErrorDefinitions.NODE_SESSION_LOST),
 
     /** A development-only embedded Web artifact needs explicit runtime confirmation. */
-    WEB_DEVELOPMENT_CONFIRMATION_REQUIRED("boot.web-development-confirmation-required", Set.of()),
+    WEB_DEVELOPMENT_CONFIRMATION_REQUIRED(BootErrorDefinitions.WEB_DEVELOPMENT_CONFIRMATION_REQUIRED),
 
     /** A development Web marker is malformed or unsupported by this runtime. */
-    WEB_DEVELOPMENT_ARTIFACT_INVALID("boot.web-development-artifact-invalid", Set.of("reason"));
+    WEB_DEVELOPMENT_ARTIFACT_INVALID(BootErrorDefinitions.WEB_DEVELOPMENT_ARTIFACT_INVALID);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    BootError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    BootError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

@@ -51,6 +51,22 @@ class DefaultSourcePdkTestTest {
         } finally { Thread.interrupted(); release.countDown(); }
     }
 
+    @Test void aCompletedTypedConnectorRefusalRemainsAFailedReport() {
+        try (var executor = executor()) {
+            var result = executor.test(CONFIG, new DefaultSourcePdkTest.Call() {
+                @Override public ConnectionTestResult run() {
+                    throw new TapstateException(ConnectorError.TEST_FAILED,
+                            Map.of("connector", "mongodb", "detail", "unavailable"), null);
+                }
+                @Override public void cancel() { throw new AssertionError("must not cancel"); }
+                @Override public boolean resourcesReleased() { return true; }
+            });
+            assertThat(result.outcome()).isEqualTo(ConnectionTestResult.Outcome.FAILED);
+            assertThat(result.items().getFirst().connectorErrorCode()).isEqualTo(ConnectorError.TEST_FAILED.code());
+            assertThat(executor.available()).isTrue();
+        }
+    }
+
     @Test void completedTestReturnsItsReportAndReleasesTheOneSlot() {
         try (var executor = executor()) {
             var result = executor.test(CONFIG, new DefaultSourcePdkTest.Call() {

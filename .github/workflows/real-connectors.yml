@@ -47,6 +47,30 @@ jobs:
         run: |
           test -n "$TAPSTATE_ATLAS_TEST_URI" || { echo "Missing required Actions secret: TAPSTATE_ATLAS_TEST_URI" >&2; exit 1; }
           test -n "$TAPSTATE_ATLAS_STANDARD_URI" || { echo "Missing required Actions secret: TAPSTATE_ATLAS_STANDARD_URI" >&2; exit 1; }
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set up the pinned reactor Maven
+        run: bash .github/scripts/setup-ci-maven.sh
+      - name: Prepare verified install plugin dependencies
+        run: |
+          set -euo pipefail
+          mvn -N -B -C -U -Dmaven.repo.local="$RUNNER_TEMP/connector-preflight-m2" -DskipTests install
+          seed="$RUNNER_TEMP/connector-maven-inputs"
+          .github/scripts/ci-maven-cache.sh collect "$seed" "$RUNNER_TEMP/connector-preflight-m2"
+          find "$seed" -type f -name '*.lastUpdated' -delete
+          cd "$RUNNER_TEMP"
+          tar -czf connector-maven-inputs.tar.gz -C "$seed" .
+          sha256sum connector-maven-inputs.tar.gz > connector-maven-inputs.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-maven-inputs
+          path: |
+            ${{ runner.temp }}/connector-maven-inputs.tar.gz
+            ${{ runner.temp }}/connector-maven-inputs.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
           name: connector-shard-plan
@@ -205,6 +229,12 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: maven
+      - name: Set up the pinned reactor Maven
+        run: bash .github/scripts/setup-ci-maven.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: connector-maven-inputs
+          path: ${{ runner.temp }}/connector-maven-inputs
       - uses: actions/download-artifact@v4
         with:
           name: connector-shard-plan
@@ -215,6 +245,12 @@ jobs:
           path: ${{ runner.temp }}/connectors
       - name: Seed isolated Maven dependencies
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - name: Seed verified install plugin dependencies
+        working-directory: ${{ runner.temp }}/connector-maven-inputs
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict connector-maven-inputs.tar.gz.sha256
+          tar -xzf connector-maven-inputs.tar.gz -C "$RUNNER_TEMP/m2"
       - name: Prepare pinned public inputs for Cloud connector witnesses
         run: |
           python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
@@ -224,7 +260,7 @@ jobs:
       - name: Run this exact connector witness shard
         # Docker 29 requires a newer API than the pinned testcontainers default.
         env:
-          MAVEN_ARGS: -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=${{ runner.temp }}/connectors
+          MAVEN_ARGS: -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=${{ runner.temp }}/connectors -Dtapstate.dummy.jar=${{ runner.temp }}/cloud-test-release/connectors/dummy-connector.jar
         run: .github/scripts/connector-witnesses.sh run --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connectors/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
       - name: Admit reports and the sweep's witness ledger
         run: .github/scripts/connector-witnesses.sh pack --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connectors/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/connector-results/$SHARD"

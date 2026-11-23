@@ -12,6 +12,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -24,8 +26,10 @@ import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.context.WebApplicationContext;
 import org.springframework.web.context.support.GenericWebApplicationContext;
+import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -73,7 +77,7 @@ class StorageHttpFaceBoundaryTest {
         assertThat(response.statusCode()).as(response.body()).isEqualTo(503);
         assertThat(response.headers().firstValue("Content-Type").orElse("")).startsWith("application/json");
         var body = (Map<?, ?>) JsonReader.parse(response.body());
-        assertThat(body.get("code")).isEqualTo("control.storage-unavailable");
+        assertThat(body.get("code")).isEqualTo("TS0210030");
         assertThat(body.get("params")).isEqualTo(Map.of());
         assertThat(response.headers().firstValue("Cache-Control")).contains("no-store");
     }
@@ -123,8 +127,7 @@ class StorageHttpFaceBoundaryTest {
         admit();
         assertThat(request("HEAD", "/api/cluster/members", "admin").statusCode()).isEqualTo(200);
         var options = request("OPTIONS", "/api/cluster/members", "admin");
-        // The existing authorization manager rejects Spring's synthetic OPTIONS handler without @Verb.
-        // Compare with the non-staged face to keep that separate behavior unchanged by this routing fix.
+        assertThat(options.statusCode()).isEqualTo(200);
         try (var baseline = new SpringApplicationBuilder(BaselineApp.class).run("--server.port=0")) {
             var uri = URI.create("http://127.0.0.1:"
                     + ((WebServerApplicationContext) baseline).getWebServer().getPort() + "/api/cluster/members");
@@ -134,6 +137,8 @@ class StorageHttpFaceBoundaryTest {
                     .isEqualTo(direct.statusCode());
             assertThat(options.headers().firstValue("Allow")).isEqualTo(direct.headers().firstValue("Allow"));
         }
+        runtime.set(null);
+        unavailable(request("OPTIONS", "/api/cluster/members", "admin"));
     }
 
     @Test void existingAuthenticationAndScopeChecksPrecedeAdmittedOperations() throws Exception {
@@ -143,6 +148,42 @@ class StorageHttpFaceBoundaryTest {
         assertThat(request("POST", "/api/storage/setup/commit", "reader", "Content-Type", "application/json").statusCode()).isEqualTo(403);
         assertThat(request("GET", "/api/runtime-image-smoke-missing", "invalid").statusCode()).isEqualTo(401);
         missing(request("GET", "/api/runtime-image-smoke-missing", "reader"));
+    }
+
+    @Test void optionsCannotDispatchABusinessHandlerSubstitutedAfterAuthorization() throws Exception {
+        var mapping = child.getBean(RequestMappingHandlerMapping.class);
+        var explicit = RequestMappingInfo.paths("/api/cluster/members").methods(RequestMethod.OPTIONS)
+                .options(mapping.getBuilderConfiguration()).build();
+        var calls = new AtomicInteger();
+        var invoked = new AtomicBoolean();
+        var controller = new Object() {
+            public void options() { invoked.set(true); }
+        };
+        var method = controller.getClass().getDeclaredMethod("options");
+        runtime.set(request -> {
+            if (calls.incrementAndGet() == 2) {
+                mapping.registerMapping(explicit, controller, method);
+            }
+            return mapping.getHandler(request);
+        });
+        try {
+            var refused = request("OPTIONS", "/api/cluster/members", "reader");
+            assertThat(refused.statusCode()).as(refused.body()).isEqualTo(403);
+            assertThat(calls.get()).isGreaterThanOrEqualTo(2);
+            assertThat(refused.headers().firstValue("Allow")).isEmpty();
+            assertThat(((Map<?, ?>) JsonReader.parse(refused.body())).get("code")).isEqualTo("TS0210004");
+            assertThat(invoked).isFalse();
+        } finally {
+            mapping.unregisterMapping(explicit);
+        }
+    }
+
+    @Test void anOptionsRouteWithdrawnBeforeDispatchStillReturnsStorageUnavailable() throws Exception {
+        var mapping = child.getBean(RequestMappingHandlerMapping.class);
+        var calls = new AtomicInteger();
+        runtime.set(request -> calls.incrementAndGet() == 1 ? mapping.getHandler(request) : null);
+        unavailable(request("OPTIONS", "/api/cluster/members", "admin"));
+        assertThat(calls.get()).isGreaterThanOrEqualTo(2);
     }
 
     @Test void minimumControlsKeepTheirOwnAuthorizationAndUnavailableDependencies() throws Exception {

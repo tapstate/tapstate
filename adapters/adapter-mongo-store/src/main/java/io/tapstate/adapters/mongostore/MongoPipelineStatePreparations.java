@@ -236,22 +236,24 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
             Map<String, io.tapstate.core.model.Resource> captured,
             Function<String, io.tapstate.core.model.Resource> uncapturedSource) {
         if (!(captured.get(scope.pipelineId()) instanceof PipelineResource pipeline)) throw fenced();
-        if (requested != null && !new java.util.HashSet<>(pipeline.sourceIds()).equals(requested.sourceHashes().keySet()))
+        if (requested != null && !new java.util.HashSet<>(pipeline.sourceBindings()).equals(requested.sourceHashes().keySet()))
             throw fenced();
         var sources = new java.util.HashMap<String,SourceResource>();
-        for (var id : pipeline.sourceIds()) {
-            var source = requested == null ? uncapturedSource.apply(id) : captured.get(id);
-            if (!(source instanceof SourceResource actual) || sources.put(id,actual) != null) throw fenced();
+        for (var id : new java.util.LinkedHashSet<>(pipeline.sourceIds())) {
+            var source = captured.get(id);
+            if (source == null) source = uncapturedSource.apply(id);
+            if (!(source instanceof SourceResource actual)) throw fenced();
+            sources.put(id, actual);
         }
         var selected = new java.util.HashMap<String,java.util.Set<String>>();
         if (requested == null) {
             var settings = pipeline.settings(); ReadMode mode = settings == null || settings.readMode() == null ? ReadMode.SNAPSHOT_AND_CDC : settings.readMode();
             if (mode != ReadMode.SNAPSHOT_ONLY && pipeline.sources().stream().anyMatch(ref -> ref instanceof SourceRef.Spec spec && !spec.srs()))
                 throw MongoPipelineSourcePreparations.identityUnproven(scope);
-            sources.keySet().forEach(id -> selected.put(id,java.util.Set.of()));
+            pipeline.sourceBindings().forEach(id -> selected.put(id,java.util.Set.of()));
         } else selected.putAll(requested.selectedTables());
         for (var entry : selected.entrySet()) {
-            var source = sources.get(entry.getKey()); if (source == null) throw fenced();
+            var source = sources.get(pipeline.sourceReference(entry.getKey()).id()); if (source == null) throw fenced();
             if (source.tables() != null) for (String table : entry.getValue()) {
                 boolean accepted;
                 try {

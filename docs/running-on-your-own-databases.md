@@ -103,10 +103,10 @@ definition - and the run then fails on the next convergence pass, so `status` is
 
 ```
 order_pipeline  failed
-reason: actuation.source-schema-not-discovered
+reason: TS0360004
   Source `src_orders` needs a discovered schema before its tables can be selected.
-why: the run failed, and said why: actuation.source-schema-not-discovered
-  read       status.failure = actuation.source-schema-not-discovered
+why: the run failed, and said why: TS0360004
+  read       status.failure = TS0360004
   next       tapstate logs order_pipeline
 moving     not known -- the run failed
 ```
@@ -139,7 +139,7 @@ lag        not published
 The reason itself is in the server's log, once per tick:
 
 ```
-io.tapstate.core.common.TapstateException: nest.embed-target-not-parent-key {embedPath=lines, ...}
+io.tapstate.core.common.TapstateException: TS0490002 {embedPath=lines, ...}
 ```
 
 So the status tells you to read the log, and how long it has been failing; the log tells you what
@@ -154,7 +154,7 @@ exception class. So what the connector says about it is written into that pipeli
 ```
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline
 2026-09-15T08:21:04.318Z  ERROR  password authentication failed for user "orders_reader"
-2026-09-15T08:21:04.502Z  WARN   Pipeline order_pipeline entered FAILED [connector.capture-failed]: its data-plane job died
+2026-09-15T08:21:04.502Z  WARN   Pipeline order_pipeline entered FAILED [TS0060024]: its data-plane job died
 ```
 
 The first line is the connector's; the second is the server's own account of the same event. You want

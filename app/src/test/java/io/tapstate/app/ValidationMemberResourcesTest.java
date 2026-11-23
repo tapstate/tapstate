@@ -170,6 +170,43 @@ class ValidationMemberResourcesTest {
             }finally{release.countDown();}
         }finally{release.countDown();}
     }
+    @Test void aQueuedControlReturnsItsOriginalRejectionWithoutAnUncaughtWorkerFailure()throws Exception{
+        var entered=new CountDownLatch(4);var release=new CountDownLatch(1);var called=new AtomicBoolean();
+        var active=new AtomicBoolean(true);var rejected=ThreeLayerStorePort.refused();
+        var uncaught=new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
+        var threads=new java.util.concurrent.CopyOnWriteArrayList<Thread>();
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{if(!active.get())throw rejected;});
+            var io=(ThreadPoolExecutor)org.springframework.test.util.ReflectionTestUtils.getField(process,"controls");
+            io.setThreadFactory(task->{var thread=new Thread(task);thread.setDaemon(true);thread.setUncaughtExceptionHandler((owner,failure)->uncaught.add(failure));threads.add(thread);return thread;});
+            for(int index=0;index<4;index++)io.execute(()->{entered.countDown();try{release.await();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();}});
+            try{
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();
+                var control=member.admitControl();control.execute(()->called.set(true));active.set(false);release.countDown();
+                assertThatThrownBy(()->control.released().toCompletableFuture().get(2,TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class).hasCause(rejected);
+                io.shutdown();assertThat(io.awaitTermination(2,TimeUnit.SECONDS)).isTrue();
+                for(var thread:threads){thread.join(2000);assertThat(thread.isAlive()).isFalse();}
+                assertThat(uncaught).isEmpty();assertThat(called).isFalse();
+                assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+            }finally{release.countDown();}
+        }finally{release.countDown();}
+    }
+    @Test void commandBodyFailuresStillReachBothTheControlResultAndTheWorkerHandler()throws Exception{
+        for(Throwable failure:List.of(ThreeLayerStorePort.refused(),new IllegalStateException("control body invariant"),new AssertionError("fatal control body"))){
+            var escaped=new CompletableFuture<Throwable>();
+            try(var process=new ValidationMemberResources()){
+                var member=process.bind("cluster","node","boot",4,()->{});
+                var io=(ThreadPoolExecutor)org.springframework.test.util.ReflectionTestUtils.getField(process,"controls");
+                io.setThreadFactory(task->{var thread=new Thread(task);thread.setDaemon(true);thread.setUncaughtExceptionHandler((owner,problem)->escaped.complete(problem));return thread;});
+                var control=member.admitControl();control.execute(()->{if(failure instanceof Error fatal)throw fatal;throw (RuntimeException)failure;});
+                assertThatThrownBy(()->control.released().toCompletableFuture().get(2,TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class).hasCause(failure);
+                assertThat(escaped.get(2,TimeUnit.SECONDS)).isSameAs(failure);
+                assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+            }
+        }
+    }
     @Test @org.junit.jupiter.api.Timeout(30) void closingAnActuallyExitedControlCannotEraseItsOriginalFatalFailure()throws Exception{
         var fatal=new AssertionError("original control body failed");
         try(var process=new ValidationMemberResources();var closer=Executors.newSingleThreadExecutor()){

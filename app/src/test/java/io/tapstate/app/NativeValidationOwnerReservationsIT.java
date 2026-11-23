@@ -408,11 +408,12 @@ class NativeValidationOwnerReservationsIT {
 
     static final class Fixture implements AutoCloseable {
         final String suffix = UUID.randomUUID().toString().replace("-", ""), configName = "owner_cfg_" + suffix, cacheName = "owner_cache_" + suffix;
+        final String processId = "native-owner-test-" + suffix;
         final com.mongodb.client.MongoClient raw = MongoClients.create(MONGO.getReplicaSetUrl());
-        final MongoConnectionSettings settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(configName), null, Duration.ofSeconds(5));
+        final MongoConnectionSettings settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(configName), null, Duration.ofSeconds(5), processId);
         final MongoConfigurationDomain configuration = MongoConfigurationBootstrap.prepare(settings, "cluster", "installation", "setup", 1);
         final StorageBinding.Connection endpoint = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, MONGO.getReplicaSetUrl(cacheName), cacheName, null);
-        final MongoCacheDomain cache = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(5), "native-owner-test");
+        final MongoCacheDomain cache = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(5), processId);
         final ValidationMemberResources process = new ValidationMemberResources(); final ValidationOwnerTimers timers = new ValidationOwnerTimers();
         final ClusterMembershipGate gate; final HazelcastInstance member; final CacheBusinessScope scope; final WorkloadClaim node;
         final NodeSessionLease nodeLease;
@@ -477,8 +478,44 @@ class NativeValidationOwnerReservationsIT {
                     () -> localGuard.run(), ownerTtl,ownerTtl.compareTo(Duration.ofSeconds(15))>=0?Duration.ofSeconds(5):ownerTtl.dividedBy(3), maxPipelines, maxOperations, handoffClock,(saved,spec)->startup.inspect(saved,spec));
         }
         @Override public void close() {
-            owners.close(); resources.close(); nodeLease.stopAndClose(member::shutdown); timers.close(); process.close(); configuration.close(); cache.close();
-            raw.getDatabase(configName).drop(); raw.getDatabase(cacheName).drop(); raw.close();
+            Throwable failure = runCleanup(null, owners::close, resources::close,
+                    () -> nodeLease.stopAndClose(member::shutdown), timers::close);
+            // Let transaction callbacks finish on their original clients before dropping the databases.
+            long deadline = ShutdownAwait.deadline();
+            failure = runCleanup(failure,
+                    () -> ShutdownAwait.executor(timers.renewals, deadline),
+                    () -> ShutdownAwait.executor(timers.deadlines, deadline),
+                    process::close, () -> process.awaitStopped(deadline),
+                    configuration::close, cache::close, this::endOpenTransactions,
+                    () -> raw.getDatabase(configName).drop(), () -> raw.getDatabase(cacheName).drop(), raw::close);
+            if (failure instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (failure instanceof Error error) {
+                throw error;
+            }
+        }
+
+        private void endOpenTransactions() {
+            try (var maintenance = new MongoConnection(new MongoConnectionSettings(settings.uri(), null, Duration.ofSeconds(5)))) {
+                maintenance.verifyConnectivity();
+                maintenance.endTransactionsLeftOpenBy(processId, Duration.ofSeconds(5));
+            }
+        }
+
+        private static Throwable runCleanup(Throwable first, Runnable... actions) {
+            for (var action : actions) {
+                try {
+                    action.run();
+                } catch (RuntimeException | Error failure) {
+                    if (first == null) {
+                        first = failure;
+                    } else if (first != failure) {
+                        first.addSuppressed(failure);
+                    }
+                }
+            }
+            return first;
         }
     }
 }

@@ -11,6 +11,7 @@ import io.tapstate.control.core.SourceTableView;
 import io.tapstate.control.core.SourceView;
 import io.tapstate.control.core.TokenAdminService;
 import io.tapstate.control.core.TokenService;
+import io.tapstate.control.core.ViewCatalogItem;
 import org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.beans.factory.ObjectProvider;
@@ -62,6 +63,7 @@ import java.util.Map;
         PipelinePreviewController.class, ValidationConfigurationController.class, ValidationReportController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,
+        AggregateStepController.class,
         ApiExceptionHandler.class})
 public class ControlHttpFace {
 
@@ -82,7 +84,13 @@ public class ControlHttpFace {
                 .addMixIn(SourceView.class, SourceScopeJson.class)
                 .addMixIn(SourceTableView.class, NonNullSourceJson.class)
                 .addMixIn(SourceDraft.SourceSrs.class, NonNullSourceJson.class)
-                .addMixIn(ConnectionTestReport.Check.class, ConnectionTestCheckJson.class);
+                .addMixIn(ConnectionTestReport.Check.class, ConnectionTestCheckJson.class)
+                .addMixIn(ViewCatalogItem.Freshness.class, ViewFreshnessJson.class);
+    }
+
+    private abstract static class ViewFreshnessJson {
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        abstract String aggregation();
     }
 
     private abstract static class ConnectionTestCheckJson {

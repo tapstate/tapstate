@@ -5,6 +5,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TableRef;
@@ -169,7 +170,7 @@ final class ReferenceClosure {
         if (p.transforms() == null) {
             return;
         }
-        Set<String> sourceIds = new LinkedHashSet<>(p.sourceIds());
+        Set<String> sourceIds = new LinkedHashSet<>(p.sourceBindings());
         Set<String> literalTables = new HashSet<>();
         for (SourceTables st : universe) {
             literalTables.addAll(st.literals);
@@ -313,20 +314,24 @@ final class ReferenceClosure {
     }
 
     private List<SourceTables> universeOf(PipelineResource p) {
-        // The universe is a SET of sources: a source listed twice contributes one table set, so a
-        // duplicate id never inflates the cross-source match count into a false ambiguity. (Rejecting
-        // a duplicate id in the source list itself is a separate concern, out of B3-6 closure scope.)
-        List<SourceTables> out = new ArrayList<>();
-        for (String sid : new LinkedHashSet<>(p.sourceIds())) {
-            out.add(tableSetOf(sources.get(sid)));     // sources resolved above
+        Map<String, SourceTables> out = new LinkedHashMap<>();
+        Map<String, SourceRef> bindings = new LinkedHashMap<>();
+        for (SourceRef ref : p.sources()) {
+            SourceRef existing = bindings.putIfAbsent(ref.binding(), ref);
+            if (existing == null) {
+                out.put(ref.binding(), tableSetOf(ref.binding(), sources.get(ref.id())));
+            } else if (existing.alias() != null || ref.alias() != null
+                    || !existing.nodeConfig().equals(ref.nodeConfig())) {
+                throw new DslException(DslError.DUPLICATE_ID, "source", 0, 0, null, Map.of("id", ref.binding()));
+            }
         }
-        return out;
+        return List.copyOf(out.values());
     }
 
-    private static SourceTables tableSetOf(SourceResource s) {
+    private static SourceTables tableSetOf(String binding, SourceResource s) {
         List<TableRef> tables = s.tables();
         if (tables == null) {
-            return new SourceTables(s.id(), Set.of(), true);    // omitted = whole source (open, §4)
+            return new SourceTables(binding, Set.of(), true);    // omitted = whole source (open, §4)
         }
         Set<String> literals = new HashSet<>();
         boolean open = false;
@@ -337,7 +342,7 @@ final class ReferenceClosure {
                 case TableRef.Regex r -> open = true;           // dynamic: new tables may join
             }
         }
-        return new SourceTables(s.id(), literals, open);
+        return new SourceTables(binding, literals, open);
     }
 
     private static FromRef viewFrom(ViewBlock v) {

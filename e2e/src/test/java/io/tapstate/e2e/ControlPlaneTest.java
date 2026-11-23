@@ -6,6 +6,7 @@ import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.IoError;
 import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
@@ -82,6 +83,76 @@ class ControlPlaneTest {
                     PIPELINE, Set.of("alpha", "beta"), Duration.ofSeconds(2)))
                     .containsEntry("beta", 99L);
             assertThat(fixture.reads.get()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void onlyStartupStorageUnavailabilityIsPending() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            AtomicInteger reads = new AtomicInteger();
+            fixture.server.createContext("/api/storage/status", exchange -> {
+                int read = reads.incrementAndGet();
+                Map<String, String> reply = switch (read) {
+                    case 1 -> Map.of("code", "TS0210030");
+                    case 2 -> Map.of("code", io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE.code());
+                    default -> Map.of("businessPhase", "READY");
+                };
+                byte[] bytes = JsonWriter.write(reply).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(read < 3 ? 503 : 200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            assertThat(fixture.control.storageStatusDuringStartup()).isEmpty();
+            assertThatThrownBy(fixture.control::storageStatusDuringStartup)
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("503");
+            assertThat(fixture.control.storageStatusDuringStartup().orElseThrow().get("businessPhase"))
+                    .isEqualTo("READY");
+        }
+    }
+
+    @Test
+    void logLifetimeDeletionRetriesTheCurrentClaimFenceForTheSameArtifact() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            var deletes = new AtomicInteger();
+            var reads = new AtomicInteger();
+            String hash = "original-hash";
+            fixture.server.createContext("/api/artifacts/" + PIPELINE, exchange -> {
+                boolean deleting = exchange.getRequestMethod().equals("DELETE");
+                if (deleting && deletes.incrementAndGet() > 1) {
+                    exchange.sendResponseHeaders(204, -1);
+                    exchange.close();
+                    return;
+                }
+                if (!deleting) reads.incrementAndGet();
+                String body = deleting ? JsonWriter.write(Map.of("code", IoError.WORKLOAD_CLAIM_FENCED.code(),
+                        "params", Map.of(), "message", "rendered"))
+                        : JsonWriter.write(Map.of("id", PIPELINE, "kind", "pipeline",
+                                "canonicalForm", "fixture", "contentHash", hash));
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(deleting ? 500 : 200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+
+            PipelineLogLifetimeIT.deleteAtRest(fixture.control, PIPELINE, hash);
+            assertThat(deletes).hasValue(2);
+            assertThat(reads).hasValue(2);
+        }
+    }
+
+    @Test
+    void logLifetimeDeletionDoesNotRetryAnUnrelatedErrorMentioningTheClaimFence() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            var calls = new AtomicInteger();
+            fixture.server.createContext("/api/artifacts/" + PIPELINE, exchange -> {
+                calls.incrementAndGet();
+                byte[] bytes = JsonWriter.write(Map.of("code", IoError.STORE_UNAVAILABLE.code(),
+                        "message", "Earlier refusal: io.workload-claim-fenced / " + IoError.WORKLOAD_CLAIM_FENCED.code()))
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(500, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            assertThatThrownBy(() -> PipelineLogLifetimeIT.deleteAtRest(fixture.control, PIPELINE, "original-hash"))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining(IoError.STORE_UNAVAILABLE.code());
+            assertThat(calls).hasValue(1);
         }
     }
 
@@ -210,7 +281,7 @@ class ControlPlaneTest {
         // failed two ways -- which is the ordinary case for anything that fails more than once.
         String body = JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of(
                 "errors.connector.write-failed", 2L,
-                "errors.engine.job-failed", 1L,
+                "errors.TS0440008", 1L,
                 "recordCount", 500L)));
 
         assertThat(ControlPlane.interpretErrorCount(200, body, PIPELINE)).contains(3L);
@@ -366,9 +437,9 @@ class ControlPlaneTest {
 
     @Test
     void readsAClientErrorAsTheRefusalItIs() {
-        assertThat(ControlPlane.interpretRefusal(400, coded("dsl.row-expression-type-unsupported"), "the batch"))
+        assertThat(ControlPlane.interpretRefusal(400, coded("TS0010021"), "the batch"))
                 .isEqualTo(new ControlPlane.Refusal(
-                        400, "dsl.row-expression-type-unsupported", Map.of("pipeline", PIPELINE)));
+                        400, "TS0010021", Map.of("pipeline", PIPELINE)));
     }
 
     /**

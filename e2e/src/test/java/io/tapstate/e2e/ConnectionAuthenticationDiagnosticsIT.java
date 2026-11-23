@@ -41,7 +41,7 @@ class ConnectionAuthenticationDiagnosticsIT {
         RealConnectorGate.require("mysql");
         var settings = SharedMySql.settings("connection_unreachable_diagnostic");
         try (var store = PreparedNativeStore.create();
-             var server = InProcessServer.startWithConnectionDiagnostics(store)) {
+             var server = InProcessServer.startPrepared(store)) {
             var control = new ControlPlane(server.baseUrl());
             store.loginAndAwaitBusiness(control);
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
@@ -90,7 +90,7 @@ class ConnectionAuthenticationDiagnosticsIT {
     void mongodbDefaultSourceRetainsItsManagedFormatAndTerminalPublication() {
         RealConnectorGate.require("mongodb");
         try (var store = PreparedNativeStore.create();
-             var server = InProcessServer.startWithConnectionDiagnostics(store);
+             var server = InProcessServer.startPrepared(store);
              var client = MongoClients.create(store.cacheUri())) {
             var control = new ControlPlane(server.baseUrl());
             store.loginAndAwaitBusiness(control);
@@ -121,7 +121,7 @@ class ConnectionAuthenticationDiagnosticsIT {
         var settings = Map.<String, Object>of("isUri", true, "uri", uri);
         var source = new io.tapstate.core.model.SourceResource("views", null, "mongodb", settings, null, null, null, null);
         try (var store = PreparedNativeStore.withBorrowedMaster(cluster, "e2e", "e2e-password", source);
-             var server = InProcessServer.startWithConnectionDiagnostics(store);
+             var server = InProcessServer.startPrepared(store);
              var client = MongoClients.create(store.cacheUri())) {
             var control = new ControlPlane(server.baseUrl());
             store.loginAndAwaitBusiness(control);
@@ -148,7 +148,7 @@ class ConnectionAuthenticationDiagnosticsIT {
         var settings = SharedPostgres.settings("connection_contact_diagnostic");
         settings.put("user", settings.remove("username"));
         settings.put("schema", "public");
-        try (var store = PreparedNativeStore.create(); var server = InProcessServer.startWithConnectionDiagnostics(store)) {
+        try (var store = PreparedNativeStore.create(); var server = InProcessServer.startPrepared(store)) {
             var control = new ControlPlane(server.baseUrl());
             store.loginAndAwaitBusiness(control);
             control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
@@ -195,7 +195,7 @@ class ConnectionAuthenticationDiagnosticsIT {
             }
             Map<?, ?> report;
             String id = "invalid_" + connector;
-            try (var server = InProcessServer.startWithConnectionDiagnostics(store)) {
+            try (var server = InProcessServer.startPrepared(store)) {
                 var control = new ControlPlane(server.baseUrl());
                 store.loginAndAwaitBusiness(control);
                 var earlier = control.sourceRequest("GET", "/api/connections/" + valid + "/test-result", null, null, 200);

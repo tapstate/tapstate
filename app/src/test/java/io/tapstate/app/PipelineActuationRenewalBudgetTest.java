@@ -466,7 +466,7 @@ class PipelineActuationRenewalBudgetTest {
             assertThat(successor.granted()).isTrue();
             var failure = owner.renewalFailure(scope(id), successor.claim()).orElseThrow();
             assertThat(failure.code().code()).isEqualTo(conflict
-                    ? "engine.execution-renewal-failed" : "engine.execution-lease-lost");
+                    ? "TS0440005" : "TS0440004");
         }
     }
 

@@ -114,7 +114,7 @@ class AcknowledgedPositionSurvivesRestartIT {
                         try {
                             return Optional.of((RealProcessServer) Tiers.REAL_PROCESS.launch(storage));
                         } catch (AssertionError startup) {
-                            if (!startup.getMessage().contains("[boot.node-id-in-use]")) throw startup;
+                            if (!startup.getMessage().contains("[TS0310028]")) throw startup;
                             return Optional.empty();
                         }
                     })) {

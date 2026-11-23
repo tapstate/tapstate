@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.control.core.ConnectionTestService;
+import io.tapstate.control.core.ConnectionTestReport;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.*;
 import java.util.List;
@@ -9,6 +10,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -29,16 +31,15 @@ class InitialSourceTestOwnershipTest {
         when(bound.binding()).thenReturn(binding); when(bindings.load()).thenReturn(Optional.of(binding));
         when(artifacts.get("views")).thenReturn(Optional.of(source));
         var entered = new CountDownLatch(1); var interrupted = new CountDownLatch(1); var release = new CountDownLatch(1);
-        var worker = new java.util.concurrent.atomic.AtomicReference<Thread>();
-        var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var caller = new AtomicReference<Thread>();
+        var backgroundFailure = new AtomicReference<Throwable>();
         doAnswer(ignored -> {
-            worker.set(Thread.currentThread());
-            Thread.currentThread().setUncaughtExceptionHandler((thread, failed) -> failure.set(failed));
+            caller.set(Thread.currentThread());
+            Thread.currentThread().setUncaughtExceptionHandler((thread, failure) -> backgroundFailure.set(failure));
             entered.countDown();
             try { if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("owner did not close its call"); }
             catch (InterruptedException cancelled) { interrupted.countDown(); Thread.currentThread().interrupt(); }
-            return io.tapstate.control.core.ConnectionTestReport.from(
-                    new ConnectionTestResult("views", "mongodb", ConnectionTestResult.Outcome.PASSED, List.of(), 1));
+            return new ConnectionTestReport("views", "mongodb", ConnectionTestReport.Outcome.PASSED, List.of(), 1);
         }).when(tests).test("views", "mongodb", source.config(), "installation:installation");
         try (var parent = new GenericApplicationContext(); var child = new GenericApplicationContext()) {
             parent.refresh(); child.registerBean(ConnectionTestService.class, () -> tests); child.refresh();
@@ -49,9 +50,9 @@ class InitialSourceTestOwnershipTest {
                 assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
                 business.close();
                 assertThat(interrupted.await(2, TimeUnit.SECONDS)).isTrue();
-                worker.get().join(2000);
-                assertThat(worker.get().isAlive()).isFalse();
-                assertThat(failure.get()).as("the completed owned call must not fail after the test returns").isNull();
+                caller.get().join(2_000);
+                assertThat(caller.get().isAlive()).isFalse();
+                assertThat(backgroundFailure.get()).isNull();
                 verify(tests).test("views", "mongodb", source.config(), "installation:installation");
                 verify(bound).requireBusiness();
                 assertThat(child.isActive()).isFalse();

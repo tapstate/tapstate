@@ -396,7 +396,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // use would pay for a second read per source on every start.
                 SourceModel discovered = modelInputs.apply(source);
                 Optional<SourceCaptureResolution> selected =
-                        SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+                        SourceCaptureResolution.forPipeline(pipeline, ref, source, discovered);
                 if (selected.isEmpty()) {
                     continue;
                 }
@@ -408,7 +408,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
                     permits.put(captureId, permitOrNotYet(pipelineId, captureId, spec));
                 }
-                plans.add(new SourcePlan(sourceId, discovered, resolution, spec, captureId));
+                plans.add(new SourcePlan(ref.binding(), discovered, resolution, spec, captureId));
             }
             requestSharedSelections(plans);
             requireRemoteSelections(pipelineId, plans, permits);
@@ -1517,7 +1517,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 for (SourceRef ref : pipeline.sources()) {
                     SourceResource source = StoredArtifacts.requireSource(captured, ref.id());
                     Optional<SourceCaptureResolution> selected = SourceCaptureResolution.forPipeline(
-                            pipeline, source, SourceDiscovery.model(storePort, source));
+                            pipeline, ref, source, SourceDiscovery.model(storePort, source));
                     if (selected.isEmpty()) {
                         continue;
                     }
@@ -1585,7 +1585,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 StartFrom.parse(startFromRaw),
                 retention,
                 MOCK_SCHEMA_VER,
-                snapshotEpoch).withConsumerId(SrsConsumerId.of(pipelineId, source.id()).value());
+                snapshotEpoch).withConsumerId(SrsConsumerId.of(pipelineId, resolution.sourceId()).value());
     }
 
     private static ReadMode readModeOf(Settings settings) {
@@ -1609,6 +1609,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public synchronized Optional<Throwable> captureFailure(String pipelineId) {
+        return captureFailureFact(pipelineId).map(io.tapstate.core.common.FailureFact::cause);
+    }
+
+    @Override
+    public synchronized Optional<io.tapstate.core.common.FailureFact> captureFailureFact(String pipelineId) {
         List<PipelineRun> runs = runsByPipeline.get(pipelineId);
         if (runs == null) {
             return Optional.empty();
@@ -1617,12 +1622,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // snapshot-only capture has no shared tail; its owner's load failure belongs to that owner alone.
         return runs.stream()
                 .map(run -> {
-                    Optional<Throwable> ownFailure = run.run.failure();
+                    var ownFailure = run.run.health().failureFact();
                     if (ownFailure.isPresent()) {
                         return ownFailure;
                     }
                     OwnedCapture shared = run.sharedTail ? ownedCaptures.get(run.captureId) : null;
-                    return shared == null ? Optional.<Throwable>empty() : shared.run.failure();
+                    return shared == null ? Optional.<io.tapstate.core.common.FailureFact>empty() : shared.run.health().failureFact();
                 })
                 .filter(Optional::isPresent)
                 .map(Optional::get)

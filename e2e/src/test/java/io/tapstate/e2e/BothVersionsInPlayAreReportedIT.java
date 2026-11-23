@@ -90,7 +90,7 @@ class BothVersionsInPlayAreReportedIT {
             // The control group for the mismatch advisory. A matched pair is the case that a comparison
             // written to warn unconditionally still passes every mismatch test it has, and fails only
             // here.
-            assertThat(run.stderr()).doesNotContain("cli.version-mismatch");
+            assertThat(run.stderr()).doesNotContain("TS0330060");
         }
     }
 
@@ -107,7 +107,7 @@ class BothVersionsInPlayAreReportedIT {
                     "stop", "ship_clear");
 
             assertThat(run.exitCode()).isEqualTo(1);
-            assertThat(run.stderr()).contains("error: cli.confirmation-needs-a-terminal")
+            assertThat(run.stderr()).contains("error: TS0330026")
                     .endsWith(", server " + reportedByTheServer + ")" + System.lineSeparator());
         }
     }

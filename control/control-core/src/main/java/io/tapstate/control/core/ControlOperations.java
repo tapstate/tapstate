@@ -33,6 +33,8 @@ public final class ControlOperations {
 
     public static final Operation AI_PROVIDER_GET = new Operation("ai-provider.get", Scope.READ, false, null, "Read the current caller provider metadata without a credential.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_REPLACE = new Operation("ai-provider.replace", Scope.WRITE, true, null, "Replace the current caller encrypted provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_SELECT = new Operation("ai-provider.select", Scope.WRITE, true, null,
+            "Select the existing workspace provider or Tapstate-managed AI.", REST_ONLY);
     public static final Operation AI_PROVIDER_DELETE = new Operation("ai-provider.delete", Scope.WRITE, true, null, "Delete the current caller provider credential.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_MODELS = new Operation("ai-provider.models", Scope.WRITE, false, null, "Discover provider model identifiers without persisting credentials.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_CHECK = new Operation("ai-provider.check", Scope.WRITE, false, null, "Test an ephemeral provider credential without persisting it.", CLI_AND_REST);
@@ -398,6 +400,16 @@ public final class ControlOperations {
     public static final Operation PIPELINE_ACCEPT_DERIVED_SCHEMA = new Operation(
             "pipeline.accept-derived-schema", Scope.WRITE, true, null, CLI_ONLY);
 
+    // A running aggregate step compared with its own rows, and written again from them. The check reads
+    // only; the repair rewrites stored totals and sends rows to the target, so it is write-scoped and
+    // audited. Both stay off the model-facing surface: what a check proves is narrow -- the totals match
+    // the rows the step holds, not the source -- and a repair is a decision about a finding, taken by the
+    // person looking at it.
+    public static final Operation PIPELINE_AGGREGATE_CHECK = new Operation(
+            "pipeline.aggregate-check", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_AGGREGATE_REPAIR = new Operation(
+            "pipeline.aggregate-repair", Scope.WRITE, true, null, CLI_ONLY);
+
     // The HTTP face projects the CLI-staged inventory; the current user read stays off MCP.
     public static final Operation AUTH_CURRENT_USER = new Operation(
             "auth.current-user", Scope.READ, false, null,
@@ -432,6 +444,7 @@ public final class ControlOperations {
             ALERT_RULE_PREVIEW, ALERT_ROUTE_PREVIEW, ALERT_RESOURCES, ALERT_CATALOG, ALERT_CENTER, ALERT_DETAIL, ALERT_DELIVERIES, ALERT_HEALTH, ALERT_CONFIGURATION_LIST, ALERT_CONFIGURATION_SAVE, ALERT_CONFIGURATION_RETIRE, ALERT_PREVIEW, ALERT_TEST, ALERT_TEST_RESULT, ALERT_RETRY,
             AI_PROVIDER_GET,
             AI_PROVIDER_REPLACE,
+            AI_PROVIDER_SELECT,
             AI_PROVIDER_DELETE,
             AI_PROVIDER_CHECK,
             AI_PROVIDER_MODELS,
@@ -503,6 +516,8 @@ public final class ControlOperations {
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,
             PIPELINE_ACCEPT_DERIVED_SCHEMA,
+            PIPELINE_AGGREGATE_CHECK,
+            PIPELINE_AGGREGATE_REPAIR,
             AUTH_CURRENT_USER,
             USER_CREATE,
             USER_PASSWD,

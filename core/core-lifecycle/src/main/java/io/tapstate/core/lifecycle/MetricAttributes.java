@@ -55,6 +55,8 @@ public final class MetricAttributes {
     public static final String NEST_MAP = "tapstate.nest.map";
     /** The namespace a join step mirrors one dimension in. */
     public static final String JOIN_NAMESPACE = "tapstate.join.namespace";
+    /** The aggregate step a reading about that step's state is about. */
+    public static final String AGGREGATE_STEP = "tapstate.aggregate.step";
     public static final String DIRECTION = "direction";
     public static final String OP = "op";
     public static final String CODE = "code";

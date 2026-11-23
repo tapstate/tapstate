@@ -10,7 +10,7 @@ public record ValidationTableFailure(String mappingId, Side side, String code, S
     public ValidationTableFailure {
         ValidationError.identifier(mappingId, "tableFailure.mapping");
         Objects.requireNonNull(side, "side");
-        if (code == null || code.length() > 96 || !code.matches("[a-z][a-z0-9.-]*"))
+        if (code == null || code.length() > 96 || !code.matches("(?:[a-z][a-z0-9.-]*|TS(?!000)[0-9]{3}(?!0000)[0-9]{4})"))
             throw ValidationError.invalid("tableFailure.code");
         if (message == null || !StandardCharsets.UTF_8.newEncoder().canEncode(message) || message.getBytes(StandardCharsets.UTF_8).length > 256)
             throw ValidationError.invalid("tableFailure.message");

@@ -10,6 +10,7 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import java.util.function.BooleanSupplier;
 import java.util.function.*;
 
 /** Bounded production feed. The two evaluation workers own no transport and never run convergence. */
@@ -89,6 +90,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private final AtomicReference<java.util.function.Consumer<AlarmKey.Resource>> resourceRetired=new AtomicReference<>(r->{});
     void resourceRetired(java.util.function.Consumer<AlarmKey.Resource> listener){resourceRetired.set(listener);}
     private final AtomicReference<Services> services=new AtomicReference<>();
+    private final CountDownLatch servicesReady = new CountDownLatch(1);
     private final Set<Services> ownedServices=ConcurrentHashMap.newKeySet();
     private final Set<Services> stoppedServices=ConcurrentHashMap.newKeySet();
     private final ShutdownAwait shutdown=new ShutdownAwait();
@@ -105,6 +107,30 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private final AtomicReference<Failure> failure = new AtomicReference<>(new Failure(null,Map.of()));
     private final AtomicReference<AlarmKey> reconciliationCursor=new AtomicReference<>();
     private boolean legacyBindingsInScan,legacyBindingsUnavailable,legacyScanComplete;
+    private record EvaluationRead(long round,long deadline,boolean complete,Map<AlarmKey,AlertStore.Stored<AlertStateRecord.Head>> rows) { }
+    private final AtomicLong evaluationRound=new AtomicLong();
+    private final AtomicReference<EvaluationRead> evaluationRead = new AtomicReference<>();
+    private record CachedState(Optional<AlertStore.Stored<AlertStateRecord.Head>> row) { }
+
+    private Optional<CachedState> loaded(long round, AlarmKey key) {
+        var read = evaluationRead.get();
+        if (read == null || read.round() != round || evaluationRound.get() != round
+                || System.nanoTime() - read.deadline() >= 0) return Optional.empty();
+        var row = read.rows().get(key);
+        return row != null || read.complete() ? Optional.of(new CachedState(Optional.ofNullable(row))) : Optional.empty();
+    }
+
+    private void tickBinding(long round, AlertEvaluationHost.Binding binding) {
+        tickBinding(round, binding, false);
+    }
+
+    private void tickBinding(long round, AlertEvaluationHost.Binding binding, boolean stoppedLifecycle) {
+        var evaluator = services.get().evaluator();
+        var cached = loaded(round, binding.key());
+        AlertEvaluationHost.requireResult(stoppedLifecycle
+                ? cached.isPresent() ? evaluator.tickStoppedPipeline(binding, cached.orElseThrow().row()) : evaluator.tickStoppedPipeline(binding)
+                : cached.isPresent() ? evaluator.tick(binding, cached.orElseThrow().row()) : evaluator.tick(binding));
+    }
     private final String runtimeId = UUID.randomUUID().toString();
 
     PipelineAlertRuntime(Supplier<Services> open, PipelineIntentStore intents,
@@ -161,7 +187,35 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void published(PipelineConvergencePass pass, Observation observation, Throwable cause, boolean measured) {
         if (pass == null || closed.get()) return;
         Slot slot = slot(pass); if (slot == null) return;
-        long sequence = slot.sequence.getAndIncrement();
+        publish(slot, slot.sequence.getAndIncrement(), observation, cause, () -> true, measured);
+    }
+    @Override public void publishedIfExpected(PipelineConvergencePass pass, Observation observation, Throwable cause) {
+        publishIfExpected(pass, observation, cause, () -> true);
+    }
+
+    @Override public void publishedPeriodic(PipelineConvergencePass pass, Observation observation, BooleanSupplier current) {
+        publishIfExpected(pass, observation, null, current);
+    }
+
+    private void publishIfExpected(PipelineConvergencePass pass, Observation observation, Throwable cause, BooleanSupplier current) {
+        if (closed.get() || !current.getAsBoolean()) return;
+        Slot slot;
+        long sequence;
+        synchronized (objectAdmission) {
+            slot = expectedSlot(pass);
+            if (slot == null) return;
+            // Consecutive intents for one incarnation share the sequence counter.
+            sequence = slot.sequence.getAndIncrement();
+        }
+        publish(slot, sequence, observation, cause, () -> current.getAsBoolean()
+                && slots.get(slot.producer.scope().pipelineId()) == slot);
+    }
+
+    private void publish(Slot slot, long sequence, Observation observation, Throwable cause, BooleanSupplier current) {
+        publish(slot, sequence, observation, cause, current, true);
+    }
+
+    private void publish(Slot slot, long sequence, Observation observation, Throwable cause, BooleanSupplier current, boolean measured) {
         int bytes = inputBytes(observation);
         if (bytes < 0 || observation.observedAt() == null || observation.observedAt().isAfter(clock.instant())) {
             reject(slot, "input-budget-or-clock"); return;
@@ -172,28 +226,51 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 ? Optional.of(coded.code().code()) : Optional.empty()) : diagnostics.pipeline(cause,observation.failure())).orElse(null);
         var capturedRules = rules.get().definitions();
         submit(slot, bytes + 16 * 1024, () -> {
-            requireCurrent(slot);
-            long interruption = slot.interruptions.get();
-            slot.actual = original.state();
-            if (slot.publication == null || original.observedAt().isAfter(slot.publication)) slot.publication = original.observedAt();
-            for (var rule : matching(slot, capturedRules)) {
-                var binding = binding(slot, rule);
-                if (rule.typeId().equals("pipeline.observation-stale") || !measured && rule.metric() != null) continue;
-                if (slot.discontinuous()) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
-                AlertInput input = rule.metric() != null ? new AlertInput.Metric(original)
-                        : new AlertInput.Conditions(original.observedAt(), slot.producer.intent().desired().targetState() != PipelineState.RUNNING
-                                ? AlertSignal.Condition.UNKNOWN : original.state() == PipelineState.FAILED
-                                ? AlertSignal.Condition.BAD : original.state() == PipelineState.RUNNING
-                                && slot.producer.intent().desired().targetState() == PipelineState.RUNNING
-                                ? AlertSignal.Condition.GOOD : AlertSignal.Condition.UNKNOWN, trace);
-                accept(binding, sequence, input);
+            if (!current.getAsBoolean()) return;
+            try {
+                publishCurrent(slot, original, trace, capturedRules, current, sequence, measured);
+            } catch (TapstateException refused) {
+                if (current.getAsBoolean()) throw refused;
             }
-            requireCurrent(slot);
-            slot.recoveredInterruption = interruption;
         });
+    }
+
+    private void publishCurrent(Slot slot, Observation original, AlarmDiagnostics.SafeTrace trace,
+            List<AlertConfiguration.Rule> capturedRules, BooleanSupplier current, long sequence, boolean measured) {
+        var proved = currentProof(slot);
+        if (!current.getAsBoolean()) return;
+        long interruption = slot.interruptions.get();
+        slot.actual = original.state();
+        if (slot.publication == null || original.observedAt().isAfter(slot.publication)) slot.publication = original.observedAt();
+        for (var rule : matching(slot, capturedRules)) {
+            var binding = binding(slot, rule,proved);
+            if (rule.typeId().equals("pipeline.observation-stale") || !measured && rule.metric() != null) continue;
+            if (slot.discontinuous()) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
+            AlertInput input = rule.metric() != null ? new AlertInput.Metric(original)
+                    : new AlertInput.Conditions(original.observedAt(), slot.producer.intent().desired().targetState() != PipelineState.RUNNING
+                            ? AlertSignal.Condition.UNKNOWN : original.state() == PipelineState.FAILED
+                            ? AlertSignal.Condition.BAD : original.state() == PipelineState.RUNNING
+                            && slot.producer.intent().desired().targetState() == PipelineState.RUNNING
+                            ? AlertSignal.Condition.GOOD : AlertSignal.Condition.UNKNOWN, trace);
+            accept(binding, sequence, input);
+        }
+        requireCurrent(slot,proved);
+        slot.recoveredInterruption = interruption;
     }
     @Override public void unavailable(PipelineConvergencePass pass) {
         if (pass != null) reject(slots.get(pass.scope().pipelineId()), "publication-unavailable");
+    }
+    @Override public void unavailableIfExpected(PipelineConvergencePass pass) {
+        synchronized (objectAdmission) {
+            var slot = expectedSlot(pass);
+            if (slot != null) reject(slot, "publication-unavailable");
+        }
+    }
+    private Slot expectedSlot(PipelineConvergencePass pass) {
+        if (pass == null || closed.get()) return null;
+        var producer = new Producer(pass.scope(), pass.claim(), pass.intent());
+        var current = slots.get(producer.scope().pipelineId());
+        return current != null && current.producer.equals(producer) ? current : null;
     }
     @Override public void retain(Collection<String> ids) {
         slots.keySet().retainAll(Set.copyOf(ids));
@@ -207,10 +284,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     void observerTick(Runnable observer){observerTick.set(Objects.requireNonNull(observer));}
     void tick() {
         if (closed.get()) return;
+        long round=evaluationRound.incrementAndGet();
         if (refreshing.compareAndSet(false, true)) {
             var previousRules = rules.get();
             submit(null, 0, () -> {
-                try { refresh(); }
+                try { refresh(round); }
                 catch (RuntimeException | Error failed) {
                     rules.compareAndSet(previousRules, new RuleSnapshot(previousRules.definitions(), false));
                     throw failed;
@@ -232,7 +310,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                     var binding=new AlertEvaluationHost.Binding(current.orElseThrow(),previous.resource(),previous.producer(),
                             previous.sourceBindingRevision(),active,()->null,previous.domainToken());
                     entryBinding.setValue(binding);
-                    AlertEvaluationHost.requireResult(services.get().evaluator().tick(binding));
+                    tickBinding(round, binding);
                 }
             }finally{slot.tickQueued.set(false);}},()->slot.tickQueued.set(false));
         }
@@ -242,10 +320,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             long sequence = slot.freshnessSequence.getAndIncrement();
             submit(slot, 0, () -> {
                 try {
-                    requireCurrent(slot);
+                    var proved=currentProof(slot);
                     long interruption=slot.interruptions.get();
                     for (var rule : matching(slot, capturedRules)) {
-                        var binding = binding(slot, rule);
+                        var binding = binding(slot, rule,proved);
                         if (!rule.enabled() || !rule.header().active()) {
                             AlertEvaluationHost.requireResult(services.get().evaluator().end(binding.key(), AlertSnapshot.EndReason.DISABLED, binding.requireCurrent()));
                         } else if (rule.typeId().equals("pipeline.observation-stale")) {
@@ -253,25 +331,25 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                             boolean expected = slot.producer.intent().desired().targetState() == PipelineState.RUNNING
                                     && slot.actual != PipelineState.COMPLETED && slot.actual != PipelineState.STOPPED
                                     && slot.actual != PipelineState.PAUSED && slot.actual != PipelineState.FAILED;
+                            var retained=loaded(round,binding.key());
                             accept(binding, sequence, new AlertInput.Freshness(now, expected, slot.expectedSince, slot.publication,
-                                    AlertEvaluationHost.seconds(rule, "startup-grace", 120), AlertEvaluationHost.seconds(rule, "max-age", 120)));
+                                    AlertEvaluationHost.seconds(rule, "startup-grace", 120), AlertEvaluationHost.seconds(rule, "max-age", 120)),
+                                    false, retained.isPresent(), retained.flatMap(CachedState::row));
                         } else {
                             if (slot.discontinuous()) accept(binding, slot.sequence.get(), new AlertInput.Discontinuity(clock.instant()));
                             boolean stoppedLifecycle = rule.typeId().equals("pipeline.failed") && rule.metric() == null
                                     && slot.actual == PipelineState.STOPPED
                                     && slot.producer.intent().desired().targetState() == PipelineState.STOPPED;
-                            AlertEvaluationHost.requireResult(stoppedLifecycle
-                                    ? services.get().evaluator().tickStoppedPipeline(binding)
-                                    : services.get().evaluator().tick(binding));
+                            tickBinding(round, binding, stoppedLifecycle);
                         }
                     }
-                    requireCurrent(slot);
+                    requireCurrent(slot,proved);
                     slot.recoveredInterruption=interruption;
                 } finally { slot.tickQueued.set(false); }
             }, () -> slot.tickQueued.set(false));
         }
     }
-    private void refresh() {
+    private void refresh(long round) {
         Failure previousFailure=failure.get();
         active.run();
         Services resolved = services.get() == null ? Objects.requireNonNull(open.get()) : services.get();
@@ -279,24 +357,26 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if(closed.get()){stop(resolved);return;}
         var all = new ArrayList<AlertConfiguration.Rule>();
         var unavailableRules=new HashSet<String>();
-        String cursor = null;
-        do {
-            var page = resolved.store().evaluationRules(cursor, 100);
-            unavailableRules.addAll(page.unavailableRules().keySet());
-            for (var definition : page.rows()) {
-                if (!(definition instanceof AlertConfiguration.Rule rule)) throw refused("rule-kind");
-                all.add(rule.validated(resolved.catalog()));
-            }
-            cursor = page.nextId();
-            if (all.size()+unavailableRules.size() > 1000 || all.size()+unavailableRules.size() == 1000 && cursor != null) throw refused("rule-snapshot-budget");
-        } while (cursor != null);
+        var after=reconciliationCursor.get();long readStarted=System.nanoTime();
+        var snapshot=resolved.store().evaluationSnapshot(after,50);
+        var page=snapshot.rules();
+        unavailableRules.addAll(page.unavailableRules().keySet());
+        for (var definition : page.rows()) {
+            if (!(definition instanceof AlertConfiguration.Rule rule)) throw refused("rule-kind");
+            all.add(rule.validated(resolved.catalog()));
+        }
+        if (all.size()+unavailableRules.size() > 1000 || all.size()+unavailableRules.size() == 1000 && page.nextId() != null) throw refused("rule-snapshot-budget");
         active.run(); synchronized(this){
             if(closed.get()){stop(resolved);return;}
             if(services.get()==null&&resolved.planner()!=null)resolved.planner().start(); if(services.get()==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services.get()==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services.set(resolved); rules.set(new RuleSnapshot(List.copyOf(all), unavailableRules.isEmpty()));
+            servicesReady.countDown();
         }
         observerTick.get().run();
         if(reconciliationCursor.get()==null)legacyBindingsInScan=false;
-        var retained = resolved.store().evaluationStates(reconciliationCursor.get(), 50);
+        var retained = snapshot.states();
+        // Node lifecycle evidence is published by the observer after the current rules are installed.
+        if (retained.rows().stream().anyMatch(row -> row.value().snapshot().rule().key().resource().kind().equals("cluster-node")))
+            retained = resolved.store().evaluationStates(after,50);
         for(var row:retained.rows())if((row.value().binding()==null||!unavailableRules.contains(row.value().binding().ruleIdentity().id()))&&retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
             if(row.value().retiredAt()==null)AlertEvaluationHost.requireResult(resolved.evaluator().end(row.value().snapshot().rule().key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,active));
             var resource=row.value().snapshot().rule().key().resource();ResourceSlot obsolete;
@@ -325,7 +405,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if(definition.isEmpty())continue;
             var binding=new AlertEvaluationHost.Binding(definition.orElseThrow(),key.resource(),head.snapshot().rule().producerIncarnation(),
                     head.binding().sourceBindingRevision(),active,()->null,AlertOperationDomain.token(head.binding().ruleIdentity().incarnation(),key));
-            var result=resolved.evaluator().tick(binding);
+            var result=resolved.evaluator().tick(binding,Optional.of(row));
             if(result==AlertEvaluationHost.Result.CONFLICT)throw refused("retained-resource-contention");
         }
         synchronized(objectAdmission) {
@@ -343,6 +423,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if(!unavailableRules.isEmpty())failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","rule-capability-unavailable")));
         else if(missing || legacyBindingsUnavailable || !legacyScanComplete)failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","input-unavailable")));
         else if (slots.values().stream().noneMatch(Slot::discontinuous)) failure.compareAndSet(previousFailure,null);
+        var rows=new HashMap<AlarmKey,AlertStore.Stored<AlertStateRecord.Head>>();
+        retained.rows().forEach(row->rows.put(row.value().snapshot().rule().key(),row));
+        evaluationRead.set(new EvaluationRead(round, readStarted + TimeUnit.SECONDS.toNanos(1),
+                after == null && retained.next() == null, Map.copyOf(rows)));
     }
     /** The original operation has already occurred; enqueueing alone is never durable acceptance. */
     void resourceInput(AlarmKey.Resource resource, String typeId, long sourceRevision, String producer,
@@ -458,7 +542,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                                 &&head.episode().diagnostics().status()!=AlertStateRecord.DiagnosticStatus.NOT_APPLICABLE)
                             &&op.observedAt().isBefore(head.snapshot().lastObservedAt().plus(healthyCoalescingWindow(head.snapshot()))))continue;
                 }
-                accept(binding, next, input, shared, cacheSample != null, before);
+                accept(binding, next, input, shared, true, before);
             }
         }finally{settled.run();}},settled,cacheSample);
     }
@@ -536,15 +620,16 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if (services.get() == null) throw refused("storage-not-ready");
         return matches;
     }
-    private AlertEvaluationHost.Binding binding(Slot slot, AlertConfiguration.Rule rule) {
+    private AlertEvaluationHost.Binding binding(Slot slot, AlertConfiguration.Rule rule,Runnable proved) {
         String producer = fingerprint(List.of(slot.producer.incarnation(),
                 rule.typeId().equals("pipeline.observation-stale") ? "freshness" : "publication", runtimeId));
         // Active state updates carry the exact intent into the CONFIG transaction. The work
-        // checks actuation before and after evaluation; intermediate guards keep local identity.
+        // shares one original bounded lease within this queued input; every commit still checks
+        // its exact intent and resource generation. Intermediate guards keep local identity.
         // Administrative END carries no producer proof, so it retains the full remote guard.
         Runnable current=rule.header().active()&&rule.enabled()?()->requireLocal(slot):()->requireCurrent(slot);
         return new AlertEvaluationHost.Binding(rule, resource(slot), producer, 0, current, () -> {
-            Runnable lease=claimProof.apply(slot.producer.scope(),slot.producer.claim()).orElseThrow(()->refused("original-lease"));
+            Runnable lease=proved;
             return new AlertStore.EvaluationProof(slot.producer.intent(),()->{
                 active.run();lease.run();if(closed.get()||slots.get(slot.producer.scope().pipelineId())!=slot)throw refused("original-producer");
             });
@@ -557,14 +642,22 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         active.run();
         if(closed.get()||slots.get(slot.producer.scope().pipelineId())!=slot)throw refused("original-producer");
     }
-    private void requireCurrent(Slot slot) {
+    private Runnable currentProof(Slot slot){
+        requireLocal(slot);
+        var proof=claimProof.apply(slot.producer.scope(),slot.producer.claim());
+        if(proof.isEmpty()||intents.loadForActuation(slot.producer.scope().pipelineId()).filter(slot.producer.intent()::equals).isEmpty())throw refused("original-producer");
+        var fixed=proof.orElseThrow();requireProof(slot,fixed);return fixed;
+    }
+    private void requireCurrent(Slot slot){currentProof(slot);}
+    private void requireProof(Slot slot,Runnable proved){
+        requireLocal(slot);
+        try{proved.run();}catch(TapstateException expired){throw refused("original-producer");}
         active.run();
-        if (closed.get() || slots.get(slot.producer.scope().pipelineId()) != slot
-                || claimProof.apply(slot.producer.scope(), slot.producer.claim()).isEmpty()
-                || intents.loadForActuation(slot.producer.scope().pipelineId()).filter(slot.producer.intent()::equals).isEmpty()) {
-            throw refused("original-producer");
-        }
-        active.run();
+    }
+    private void requireCurrent(Slot slot,Runnable proved){
+        requireProof(slot,proved);
+        if(intents.loadForActuation(slot.producer.scope().pipelineId()).filter(slot.producer.intent()::equals).isEmpty())throw refused("original-producer");
+        requireProof(slot,proved);
     }
     private void accept(AlertEvaluationHost.Binding binding, long sequence, AlertInput input) {
         accept(binding, sequence, input, false, false, Optional.empty());
@@ -695,7 +788,20 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             LOG.warn("Alert collection is degraded [{}]", refusal.code().code());
         }
     }
-    synchronized Services managementServices() {
+    Services managementServices() {
+        active.run();
+        // Management can arrive before the background rule snapshot publishes its services.
+        if (!closed.get() && services.get() == null) {
+            try {
+                if (!servicesReady.await(5, TimeUnit.SECONDS)) {
+                    throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+                }
+            }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+            }
+        }
         active.run();
         if (closed.get() || services.get() == null) throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
         return services.get();
@@ -741,6 +847,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void close() { requestStop(); }
     private CompletableFuture<Void> requestStop() {
         closed.set(true);inputAdmission.stop();
+        servicesReady.countDown();
         var proposed=new CompletableFuture<Void>();
         var existing=stopping.compareAndExchange(null,proposed);
         if(existing!=null)return existing;

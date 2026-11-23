@@ -328,6 +328,25 @@ class PdkCapturePortTest {
     }
 
     @Test
+    void snapshotInitializationKeepsTheOriginalVmErrorOutsideCodedFailures(@TempDir Path dir) throws Exception {
+        String channel = "tapstate.test.fatal-init." + java.util.UUID.randomUUID();
+        var fatal = new OutOfMemoryError("simulated initialization exhaustion");
+        System.getProperties().put(channel, fatal);
+        try {
+            Path jar = Synthetic.fatalInitSource(dir, channel);
+            try (var port = new PdkCapturePort(provisioner(jar, "synthetic.FatalInitSource", null))) {
+                assertThatThrownBy(() -> port.snapshot(config("t1"))).isSameAs(fatal);
+                try (var session = port.snapshotSession(config("t1"))) {
+                    assertThatThrownBy(() -> session.read("t1")).isSameAs(fatal);
+                    assertThat(session.failureFact(fatal).diagnostic()).isEmpty();
+                }
+            }
+        } finally {
+            System.getProperties().remove(channel);
+        }
+    }
+
+    @Test
     void snapshotWithoutExplicitStreamsInitsTheConnectorExactlyOnce(@TempDir Path dir) throws Exception {
         // Empty streams means "every stream": the drive discovers the stream names and reads them. It
         // must init the connector once, not once for discovery and again for the read — the connector
@@ -668,7 +687,7 @@ class PdkCapturePortTest {
         }).isInstanceOf(TapstateException.class)
                 .satisfies(error -> {
                     TapstateException refusal = (TapstateException) error;
-                    assertThat(refusal.code().code()).isEqualTo("connector.logminer-identifier-too-long");
+                    assertThat(refusal.code().code()).isEqualTo("TS0060019");
                     assertThat(refusal.args())
                             .containsEntry("connector", "oracle")
                             .containsEntry("kind", "schema")
@@ -937,6 +956,41 @@ class PdkCapturePortTest {
             release.countDown();assertThat(ended.await(5,TimeUnit.SECONDS)).isTrue();
             if ((Object)port instanceof AutoCloseable close) close.close();
             for(String key:List.of(".entered",".release",".ended"))System.getProperties().remove(channel+key);
+        }
+    }
+
+    @Test void aHostDeferredPreflightRetainsItsExactConnectorUntilTheHostClosesIt(@TempDir Path dir) throws Exception {
+        String channel = "preflight-deferred-" + java.util.UUID.randomUUID();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var ended = new CountDownLatch(1);
+        System.getProperties().put(channel + ".entered", entered);
+        System.getProperties().put(channel + ".release", release);
+        System.getProperties().put(channel + ".ended", ended);
+        var provisions = new java.util.concurrent.atomic.AtomicInteger();
+        var ref = new ConnectorRef(List.of(Synthetic.gatedStopSource(dir, channel)), "synthetic.GatedStopSource", "2.0.8", null);
+        var original = new TapstateException(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE,
+                Map.of("chain", "original", "table", "t1", "version", "0"), null);
+        var port = new PdkCapturePort(id -> { provisions.incrementAndGet(); return ref; })
+                .withDeferredPreflightClose(failure -> failure == original)
+                .withStreamPreparation(actual -> { throw original; });
+        try (var callers = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            try {
+                assertThatThrownBy(() -> port.cdc(config("t1"), CaptureStart.present(), (events, position) -> {})).isSameAs(original);
+                assertThat(original.getSuppressed()).isEmpty();
+                assertThat(entered.getCount()).isOne();
+                var closing = callers.submit(port::close);
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(closing).isNotDone();
+                release.countDown();
+                closing.get(5, TimeUnit.SECONDS);
+                assertThat(ended.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(provisions).hasValue(1);
+            } finally {
+                release.countDown();
+                port.close();
+                for (String key : List.of(".entered", ".release", ".ended")) System.getProperties().remove(channel + key);
+            }
         }
     }
 

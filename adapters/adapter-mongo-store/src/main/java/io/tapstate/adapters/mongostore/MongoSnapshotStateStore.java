@@ -164,10 +164,10 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
                 .append("retainedFloor",0L).append("command",null).append("captures",List.of());
     }
     private static Document id(PipelineIntentScope scope) { return MongoPipelinePreparationFacts.scope(scope); }
-    private static Document countId(PipelineIntentScope scope,String source,String table) {
+    static Document countId(PipelineIntentScope scope,String source,String table) {
         return new Document("scope",id(scope)).append("source",OperatorStateText.encode(source)).append("table",OperatorStateText.encode(table));
     }
-    private static void requireCount(Document row,Document key) {
+    static void requireCount(Document row,Document key) {
         if (!row.keySet().equals(Set.of("_id","formatVersion","snapshotEpoch","rows")) || !key.equals(row.get("_id"))
                 || !Integer.valueOf(1).equals(row.get("formatVersion")) || !(row.get("snapshotEpoch") instanceof Long epoch) || epoch<1 || epoch==Long.MAX_VALUE
                 || !(row.get("rows") instanceof Long rows) || rows<0) throw unreadable();

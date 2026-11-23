@@ -447,10 +447,11 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     }
 
     private static Document graphDocument(PipelineDraft.Graph graph) {
-        return new Document("nodes", graph.nodes().stream().map(MongoPipelineDraftStore::nodeDocument).toList())
+        Document document = new Document("nodes", graph.nodes().stream().map(MongoPipelineDraftStore::nodeDocument).toList())
                 .append("edges", graph.edges().stream().map(MongoPipelineDraftStore::edgeDocument).toList())
                 .append("viewport", new Document("x", graph.viewport().x()).append("y", graph.viewport().y())
                         .append("zoom", graph.viewport().zoom()));
+        return withSourceNodeConfigs(document, graph.sourceNodeConfigs());
     }
 
     private static Document nodeDocument(PipelineDraft.Node node) {
@@ -464,11 +465,31 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     }
 
     private static Document wizardDocument(PipelineDraft.Wizard wizard) {
-        return new Document("root", wizard.root() == null ? null : rootDocument(wizard.root()))
+        Document document = new Document("root", wizard.root() == null ? null : rootDocument(wizard.root()))
                 .append("related", wizard.related().stream().map(MongoPipelineDraftStore::relatedDocument).toList())
                 .append("transforms", wizard.transforms().stream().map(MongoPipelineDraftStore::transformDocument).toList())
                 .append("output", wizard.output() == null ? null
                         : new Document("kind", wizard.output().kind()).append("config", new Document(wizard.output().config())));
+        return withSourceNodeConfigs(document, wizard.sourceNodeConfigs());
+    }
+
+    private static Document withSourceNodeConfigs(Document payload, Map<String, Map<String, Object>> configs) {
+        if (!configs.isEmpty()) {
+            Document fields = new Document();
+            configs.forEach((id, config) -> fields.put(id, new Document(config)));
+            payload.put("sourceNodeConfigs", fields);
+        }
+        return payload;
+    }
+
+    private static Map<String, Map<String, Object>> sourceNodeConfigs(Document payload) {
+        Document configs = payload.get("sourceNodeConfigs", Document.class);
+        if (configs == null) {
+            return Map.of();
+        }
+        Map<String, Map<String, Object>> result = new LinkedHashMap<>();
+        configs.forEach((id, fields) -> result.put(id, MongoCatalogStore.normalizeMap((Document) fields)));
+        return result;
     }
 
     private static Document rootDocument(PipelineDraft.Root root) {
@@ -481,11 +502,19 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         PipelineDraft.Relation relation = related.relation();
         List<Document> pairs = relation.on().stream().map(pair -> new Document("childField", pair.childField())
                 .append("parentField", pair.parentField())).toList();
+        Document relationDocument = new Document("on", pairs).append("shape", relation.shape().name().toLowerCase())
+                .append("path", relation.path()).append("key", relation.key())
+                .append("arrayKey", relation.arrayKey());
+        // Written only when present, so a relation without rollup fields keeps the stored shape it always had.
+        if (relation.rollup() != null) {
+            relationDocument.append("rollup", new Document(relation.rollup()));
+        }
+        if (relation.trackKeyChanges() != null) {
+            relationDocument.append("trackKeyChanges", relation.trackKeyChanges());
+        }
         return new Document("id", related.id()).append("parentId", related.parentId())
                 .append("sourceId", related.sourceId()).append("table", related.table())
-                .append("relation", new Document("on", pairs).append("shape", relation.shape().name().toLowerCase())
-                        .append("path", relation.path()).append("key", relation.key())
-                        .append("arrayKey", relation.arrayKey()))
+                .append("relation", relationDocument)
                 .append("preTransforms", related.preTransforms().stream().map(MongoPipelineDraftStore::transformDocument).toList());
     }
 
@@ -502,7 +531,7 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 d.getString("id"), d.getString("source"), d.getString("target"))).toList();
         Document viewport = document.get("viewport", Document.class);
         return new PipelineDraft.Graph(nodes, edges, new PipelineDraft.Viewport(viewport.getDouble("x"),
-                viewport.getDouble("y"), viewport.getDouble("zoom")));
+                viewport.getDouble("y"), viewport.getDouble("zoom")), sourceNodeConfigs(document));
     }
 
     private static PipelineDraft.Wizard wizard(Document document) {
@@ -514,7 +543,8 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 : new PipelineDraft.Root(root.getString("id"), root.getString("sourceId"),
                         root.getString("table"), strings(root.get("key")), transforms(root.get("preTransforms"))),
                 documents(document, "related").stream().map(MongoPipelineDraftStore::related).toList(),
-                transforms(document.get("transforms")), output(document.get("output", Document.class)));
+                transforms(document.get("transforms")), output(document.get("output", Document.class)),
+                sourceNodeConfigs(document));
     }
 
     private static PipelineDraft readDraft(Document document) {
@@ -558,7 +588,10 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 document.getString("sourceId"), document.getString("table"), new PipelineDraft.Relation(on,
                         PipelineDraft.Shape.valueOf(relation.getString("shape").toUpperCase()),
                         relation.getString("path"), strings(relation.get("key")),
-                        strings(relation.get("arrayKey"))),
+                        strings(relation.get("arrayKey")),
+                        relation.get("rollup") instanceof Document rollup
+                                ? MongoCatalogStore.normalizeMap(rollup) : null,
+                        relation.get("trackKeyChanges") instanceof Boolean track ? track : null),
                 transforms(document.get("preTransforms")));
     }
 

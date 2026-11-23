@@ -1,0 +1,6 @@
+{
+  "TS0320001": {
+    "message": "\u4e0d\u652f\u6301 --role \u503c {role}\u3002",
+    "solution": "L1 \u5728\u4e00\u4e2a\u8fdb\u7a0b\u4e2d\u8fd0\u884c\u6574\u4e2a\u5e73\u53f0\uff1b\u4f7f\u7528 --role=all\uff08\u9ed8\u8ba4\u503c\uff09\u3002"
+  }
+}

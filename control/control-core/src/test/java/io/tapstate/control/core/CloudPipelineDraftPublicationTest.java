@@ -55,6 +55,30 @@ class CloudPipelineDraftPublicationTest {
     }
 
     @Test
+    void documentPreviewCompilesTheSamePipelineWithoutScanningUnrelatedArtifacts() {
+        var fixture = new Fixture(true, PipelineDraft.Mode.WIZARD);
+        String dsl = WRITER.write(fixture.service.preview("orders", 1));
+        var draft = new ArtifactDraft(null, dsl);
+        var expected = fixture.apply.planPreviewWorkspace(List.of(draft));
+        fixture.artifacts.save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: transform
+                id: unrelated
+                type: filter
+                expr: "true"
+                """));
+        fixture.artifacts.useSlice = true;
+        fixture.artifacts.scans = 0;
+
+        var compiled = fixture.apply.planPreviewWorkspace(List.of(draft));
+
+        assertThat(fixture.artifacts.scans).as("document preview must not scan unrelated artifacts").isZero();
+        assertThat(fixture.artifacts.sliceReads).isEqualTo(1);
+        assertThat(compiled.plan()).isEqualTo(expected.plan());
+        assertThat(compiled.resources()).containsExactlyInAnyOrderElementsOf(expected.resources());
+    }
+
+    @Test
     void publicationPassesThePlannedSourceSchemaToDerivation() {
         var reads = new LinkedHashMap<String, Integer>();
         var model = new io.tapstate.spi.store.DiscoveredSourceModel("mongo_input", "mongodb", NOW.toEpochMilli(),

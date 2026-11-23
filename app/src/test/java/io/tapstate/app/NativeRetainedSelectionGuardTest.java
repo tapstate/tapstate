@@ -122,7 +122,7 @@ class NativeRetainedSelectionGuardTest {
             when(configuration.cacheRecoveries()).thenReturn(summaries);
             when(pass.scope()).thenReturn(scope);
             when(pass.claim()).thenReturn(fence);
-            recovery = new NativePipelineRecovery(configuration, auth, mock(StorePort.class), preparer,
+            recovery = new NativePipelineRecovery(configuration, new CachePreparation("operation", auth), mock(StorePort.class), preparer,
                     mock(ConnectorProvisioner.class), mock(Engine.class), captures, mock(ExecutionAuthorization.class),
                     () -> {}, () -> true, mock(PipelineStoreViews.class));
         }

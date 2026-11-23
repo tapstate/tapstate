@@ -1,0 +1,76 @@
+package io.tapstate.core.catalog;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.function.BiPredicate;
+
+/**
+ * One of the two config forms a connector's own spec declares, and the reader for what it declares.
+ *
+ * <p>Both forms are the connector's own declaration, and they say different things about the same
+ * authored value:
+ *
+ * <ul>
+ *   <li>the <b>connection</b> form ({@code configOptions.connection}) is what a connection is authored
+ *       against — where the database is and how to reach it;</li>
+ *   <li>the <b>node</b> form ({@code configOptions.node}) belongs to one use of that connection inside
+ *       a pipeline — how this read or this write behaves. A connector reads these off the node config
+ *       the host hands it, and nowhere else.</li>
+ * </ul>
+ *
+ * <p>The form a name is declared in determines which PDK config map exposes it. Both forms are read
+ * from the parsed specification the connector shipped.
+ */
+public enum ConnectorForm {
+
+    CONNECTION("connection"),
+    NODE("node");
+
+    /** The key this form is declared under inside the spec's {@code configOptions} object. */
+    private final String key;
+
+    ConnectorForm(String key) {
+        this.key = key;
+    }
+
+    /**
+     * Every leaf item this form declares, keyed by the name the connector reads that value under, and
+     * empty when there is nothing to read it from — no spec, a spec that is not an object, or one
+     * declaring no such form. Connectors are free to ship one form and not the other, and the synthetic
+     * connectors carry no spec at all.
+     */
+    public Map<String, Map<?, ?>> itemsIn(Map<?, ?> specRoot) {
+        return itemsIn(specRoot, (name, item) -> true);
+    }
+
+    /** Collects leaves while excluding any rejected group and all of its descendants. */
+    public Map<String, Map<?, ?>> itemsIn(Map<?, ?> specRoot, BiPredicate<String, Map<?, ?>> include) {
+        Map<String, Map<?, ?>> items = new LinkedHashMap<>();
+        if (specRoot.get("configOptions") instanceof Map<?, ?> configOptions
+                && configOptions.get(key) instanceof Map<?, ?> form
+                && form.get("properties") instanceof Map<?, ?> properties) {
+            collect(properties, items, include);
+        }
+        return items;
+    }
+
+    /**
+     * Collects the form's leaves, flattening container nodes: a form groups fields under a node of its
+     * own (a titled section, an optional-fields block), while the connector still reads them by their
+     * leaf name.
+     */
+    private static void collect(Map<?, ?> properties, Map<String, Map<?, ?>> out,
+            BiPredicate<String, Map<?, ?>> include) {
+        for (Map.Entry<?, ?> entry : properties.entrySet()) {
+            if (!(entry.getKey() instanceof String name) || !(entry.getValue() instanceof Map<?, ?> item)) {
+                continue; // a non-object property value is a malformed form item — skip it, don't guess
+            }
+            if (!include.test(name, item)) continue;
+            if (!"array".equals(item.get("type")) && item.get("properties") instanceof Map<?, ?> nested) {
+                collect(nested, out, include);
+            } else {
+                out.put(name, item);
+            }
+        }
+    }
+}

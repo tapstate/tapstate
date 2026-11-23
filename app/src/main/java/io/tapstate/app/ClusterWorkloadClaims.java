@@ -38,7 +38,11 @@ final class ClusterWorkloadClaims {
     private <T>T call(java.util.function.Supplier<T> action, long budgetNanos){
         return call(action, budgetNanos, null);
     }
-    private <T>T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey renewal){
+    private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey renewal) {
+        return call(action, budgetNanos, renewal, true);
+    }
+    private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey renewal,
+            boolean requireCurrentResult) {
         if(admission==null)return action.get();
         if(!admission.enter())throw ThreeLayerStorePort.refused();
         try {
@@ -50,7 +54,7 @@ final class ClusterWorkloadClaims {
                 result = renewal != null ? bounded.withRenewalDeadline(renewal, deadline, active, action)
                         : bounded.withDeadline(deadline, active, action);
             } else result = action.get();
-            if(!admission.current())throw ThreeLayerStorePort.refused();
+            if (requireCurrentResult && !admission.current()) throw ThreeLayerStorePort.refused();
             return result;
         }
         finally{admission.leave();}
@@ -79,17 +83,25 @@ final class ClusterWorkloadClaims {
     Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
             long topologyRevision, Duration ttl) {
         return membership.businessEligible()
-                ? call(()->Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl))) : Optional.empty();
+                // Return a known grant for fenced cleanup even when local admission expires.
+                ? call(() -> Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl)),
+                        Long.MAX_VALUE, null, false) : Optional.empty();
     }
 
     Optional<WorkloadClaimAttempt> acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node,
             long topologyRevision) {
         return membership.businessEligible()
-                ? call(() -> Optional.of(store.acquireNodeBackedPipeline(scope, node, topologyRevision))) : Optional.empty();
+                ? call(() -> Optional.of(store.acquireNodeBackedPipeline(scope, node, topologyRevision)),
+                        Long.MAX_VALUE, null, false) : Optional.empty();
     }
 
     Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
         return membership.businessEligible() ? call(()->store.readPipeline(scope)) : Optional.empty();
+    }
+
+    /** Reads the fixed cleanup scope without turning local ineligibility into a missing store row. */
+    Optional<WorkloadClaimReading> readPipelineForRelease(PipelineIntentScope scope) {
+        return call(() -> store.readPipeline(scope));
     }
 
     /**

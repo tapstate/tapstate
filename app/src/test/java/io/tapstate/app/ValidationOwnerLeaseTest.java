@@ -13,12 +13,16 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 class ValidationOwnerLeaseTest {
     private static final Duration TTL = Duration.ofSeconds(30);
@@ -76,6 +80,43 @@ class ValidationOwnerLeaseTest {
             assertThat(lease.lossReason()).isEqualTo(ValidationOwnerLease.LossReason.EXPIRED);
             assertThat(store.read(KEY).orElseThrow().claim().owner()).isEqualTo(A);
             assertThat(stopped).hasValue(1);
+        }
+    }
+
+    @Test void aSlowAcquisitionDoesNotPostponeTheFirstRenewalPastItsProof() {
+        var store = new InMemoryWorkloadClaimStore();
+        var claim = acquire(store, A);
+        var time = new AtomicLong();
+        var stopped = new AtomicInteger();
+        var calls = new AtomicInteger();
+        var firstRenewal = new AtomicReference<Runnable>();
+        var renewals = mock(ScheduledExecutorService.class);
+        var deadlines = mock(ScheduledExecutorService.class);
+        doAnswer(invocation -> {
+            Runnable action = invocation.getArgument(0);
+            long delay = invocation.getArgument(1);
+            TimeUnit unit = invocation.getArgument(3);
+            firstRenewal.set(() -> {
+                var elapsed = Duration.ofNanos(unit.toNanos(delay));
+                time.addAndGet(elapsed.toNanos());
+                store.elapse(elapsed);
+                action.run();
+            });
+            return mock(ScheduledFuture.class);
+        }).when(renewals).scheduleWithFixedDelay(any(Runnable.class), anyLong(), anyLong(), any(TimeUnit.class));
+        try (var lease = new ValidationOwnerLease("orders", claim, 0, TTL, time::get, () -> true,
+                expected -> { calls.incrementAndGet(); return store.renew(expected, TTL); },
+                store::release, reason -> stopped.incrementAndGet())) {
+            // Acquisition and execution advancement consume the original request's proof time.
+            var acquisition = TTL.minusSeconds(1);
+            time.set(acquisition.toNanos());
+            store.elapse(acquisition);
+            lease.maintain(renewals, deadlines, Duration.ofSeconds(10), Duration.ofMillis(250));
+            assertThat(firstRenewal.get()).isNotNull();
+            firstRenewal.get().run();
+            assertThat(calls).hasValue(1);
+            assertThat(lease.authorized()).isTrue();
+            assertThat(stopped).hasValue(0);
         }
     }
 

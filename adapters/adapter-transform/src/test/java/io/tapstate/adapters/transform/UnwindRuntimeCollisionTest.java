@@ -25,7 +25,7 @@ class UnwindRuntimeCollisionTest {
                 new Envelope(Op.READ, 1L, "orders", null, row, null)));
         assertThat(failure).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) failure).code().code())
-                .isEqualTo("dsl.unwind-column-already-exists");
+                .isEqualTo("TS0010027");
         assertThat(row).containsEntry("region", "eu");
     }
 }

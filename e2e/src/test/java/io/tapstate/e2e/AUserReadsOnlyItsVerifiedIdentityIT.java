@@ -94,7 +94,7 @@ class AUserReadsOnlyItsVerifiedIdentityIT {
 
     private static void assertAnonymous(HttpResponse<String> response) {
         assertThat(response.statusCode()).isEqualTo(401);
-        assertThat(object(response).get("code")).isEqualTo("control.unauthenticated");
+        assertThat(object(response).get("code")).isEqualTo("TS0210003");
         assertThat(response.body()).doesNotContain(USER, PASSWORD, "cyxt_");
     }
 }

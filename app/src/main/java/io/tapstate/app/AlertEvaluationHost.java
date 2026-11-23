@@ -72,7 +72,7 @@ final class AlertEvaluationHost {
             binding.requireCurrent().run();
             Instant now = clock.instant();
             var retained = retry == 0 && stateLoaded ? cachedState : store.state(binding.key(), read);
-            if(stateLoaded)sequence=retained.map(v->Math.incrementExact(v.value().snapshot().lastSequence())).orElse(0L);
+            if(stateLoaded && !(input instanceof AlertInput.Freshness))sequence=retained.map(v->Math.incrementExact(v.value().snapshot().lastSequence())).orElse(0L);
             var before = retained.map(AlertStore.Stored::value).orElse(null);
             if (before != null && before.retiredAt() != null) return Result.IGNORED;
             if(input instanceof AlertInput.Operational op && op.domainToken()!=null) {
@@ -185,20 +185,31 @@ final class AlertEvaluationHost {
     }
 
     Result tick(Binding binding) {
-        return tick(binding, false);
+        return tick(binding, false, () -> store.state(binding.key(), read));
     }
 
-    /** A freshly confirmed stopped intent makes this lifecycle condition inapplicable, not a new sample. */
+    Result tick(Binding binding, Optional<AlertStore.Stored<AlertStateRecord.Head>> loaded) {
+        return tick(binding, false, () -> loaded);
+    }
+
+    /** A freshly confirmed stopped intent is not a new lifecycle sample. */
     Result tickStoppedPipeline(Binding binding) {
         if (!binding.definition().typeId().equals("pipeline.failed") || binding.definition().metric() != null)
             throw new IllegalArgumentException("stopped housekeeping requires a pipeline failure rule");
-        return tick(binding, true);
+        return tick(binding, true, () -> store.state(binding.key(), read));
     }
 
-    private Result tick(Binding binding, boolean stopped) {
+    Result tickStoppedPipeline(Binding binding, Optional<AlertStore.Stored<AlertStateRecord.Head>> loaded) {
+        if (!binding.definition().typeId().equals("pipeline.failed") || binding.definition().metric() != null)
+            throw new IllegalArgumentException("stopped housekeeping requires a pipeline failure rule");
+        return tick(binding, true, () -> loaded);
+    }
+
+    private Result tick(Binding binding, boolean stopped,
+            java.util.function.Supplier<Optional<AlertStore.Stored<AlertStateRecord.Head>>> firstRead) {
         for (int retry = 0; retry < 3; retry++) {
             binding.requireCurrent().run();
-            var retained = store.state(binding.key(), read);
+            var retained = retry == 0 ? firstRead.get() : store.state(binding.key(), read);
             if (retained.isEmpty()) return Result.IGNORED;
             var before = retained.orElseThrow().value();
             if (before.retiredAt() != null) return Result.IGNORED;

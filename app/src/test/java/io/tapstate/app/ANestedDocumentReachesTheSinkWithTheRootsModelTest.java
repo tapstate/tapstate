@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.core.model.PipelineNode;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.dsl.DslParser;
@@ -27,10 +28,14 @@ import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -115,6 +120,278 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
     }
 
     /**
+     * A root fed through a map rather than straight from its table - the shape a soft-delete map
+     * takes, since it has to sit on the stream the root reads. The map keeps every row as one row
+     * under the same key, so the documents still land in the root's table, upserted by the root's
+     * key. Resolved by the alias alone, the root named the map step and no key at all: the target
+     * was created under the step's name and appended a document per change.
+     */
+    @Test
+    void aRootFedThroughAMapStillLandsInTheRootsTableByItsKey() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.name())
+                .as("the table assembled documents land in, which is the root table's, not the map step's")
+                .isEqualTo(PARENT_TABLE);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .as("the key an upsert matches a re-sent document on")
+                .containsExactly("id");
+        assertThat(assembled.fields())
+                .as("the marker the map writes on every document, declared like the columns it carries")
+                .filteredOn(field -> field.name().equals("is_deleted"))
+                .singleElement()
+                .satisfies(field -> {
+                    assertThat(field.inferredType()).isEqualTo(TapstateType.BOOLEAN);
+                    assertThat(field.primaryKey()).isFalse();
+                });
+    }
+
+    /**
+     * The target is created to the shape the map writes: a column the map drops is not declared, and a
+     * computed column is, with the type its expression gives and no part in the key.
+     */
+    @Test
+    void aRootFedThroughAMapIsDeclaredWithTheColumnsTheMapWrites() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            fields: { name: false, label: "='order'" }
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.fields().stream().map(TargetField::name))
+                .as("the key first, then the columns in the order the map writes them")
+                .containsExactly("id", "label", "is_deleted");
+        assertThat(assembled.fields())
+                .filteredOn(field -> field.name().equals("label"))
+                .singleElement()
+                .satisfies(field -> {
+                    assertThat(field.inferredType()).isEqualTo(TapstateType.STRING);
+                    assertThat(field.primaryKey()).isFalse();
+                });
+    }
+
+    /**
+     * A computed column that only moves another keeps that column's descriptors, as a rename does:
+     * without them a moved decimal reaches the target with no precision, scale or range to build its
+     * column from.
+     */
+    @Test
+    void aDecimalAMapMovesKeepsItsPrecisionAndScale() {
+        NumericType money = new NumericType(null, true, false, null,
+                new BigDecimal("-99999999.99"), new BigDecimal("99999999.99"), 10, 2);
+        DiscoveredSourceModel withAmount = new DiscoveredSourceModel(PARENT_SOURCE, "mysql", 1L,
+                new SourceModel(List.of(new SourceTable(PARENT_TABLE,
+                        List.of(new SourceField("id", "int"), new SourceField("name", "string"),
+                                new SourceField("amount", "decimal(10,2)", TapstateType.DECIMAL, null, money)),
+                        List.of("id"), List.of()))));
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            fields: { amount_copy: "=after.amount" }
+                            soft_delete: is_deleted
+                        """), List.of(), List.of(withAmount)), capturing(bound)).dagFor(PIPELINE);
+
+        assertThat(bound.get().get(STEP).fields())
+                .filteredOn(field -> field.name().equals("amount_copy"))
+                .singleElement()
+                .satisfies(field -> assertThat(field.numericType()).isEqualTo(money));
+    }
+
+    /**
+     * A map that writes a literal over the table's key column. Every row then carries the same value
+     * under the key's name, so that name no longer tells rows apart: inferring it as the root's key
+     * would upsert every document onto one. With no key declared, the nest is refused for having no
+     * root key instead of being keyed on the literal.
+     */
+    @Test
+    void aRootWhoseKeyAMapReplacesTakesNoKeyFromTheTable() {
+        StoreBackedDagSource dag = new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("      key: [ id ]\n", "")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            fields: { id: 0 }
+                            soft_delete: is_deleted
+                        """)), capturing(new AtomicReference<>()));
+
+        assertThatThrownBy(() -> dag.dagFor(PIPELINE))
+                .as("the root's key would otherwise be the column every row now holds 0 in")
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("TS0490006");
+    }
+
+    /**
+     * The same walk, where the map reads the source by its id. A source that selects one table is read
+     * by naming the source, and that name is not a table: the walk has to finish at the table the source
+     * selects, or the target is keyless again and named after the source.
+     */
+    @Test
+    void aRootFedThroughAMapThatNamesItsSourceStillLandsInTheRootsTableByItsKey() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders ]
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.name()).isEqualTo(PARENT_TABLE);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactly("id");
+    }
+
+    /**
+     * A map that renames the root's key column: the key is written in the name the map gave it, and
+     * the target is keyed on that name. Read off the raw source table instead, the key names a column
+     * the table does not have, nothing is marked primary, and every change is appended.
+     */
+    @Test
+    void aRootKeyedOnAColumnTheMapRenamedIsKeyedOnTheNewName() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("key: [ id ]", "key: [ order_key ]")
+                .replace("on: { order_id: id }", "on: { order_id: order_key }")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            fields: { order_key: $id }
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.name()).isEqualTo(PARENT_TABLE);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactly("order_key");
+    }
+
+    /**
+     * A root that leaves its key to discovery, fed through a map: the map writes the root table's rows,
+     * so that table's key identifies them, and the nest is not refused for having no key.
+     */
+    @Test
+    void aRootFedThroughAMapTakesItsTablesKeyWhenItDeclaresNone() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("      key: [ id ]\n", "")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.name()).isEqualTo(PARENT_TABLE);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactly("id");
+    }
+
+    /**
+     * A script between the table and the map ends the walk. What a script emits is not the table it
+     * reads, so the target stays where it was before the walk existed - under the alias's step - rather
+     * than moving to the script's name.
+     */
+    @Test
+    void aWalkThatMeetsAScriptLeavesTheTargetWhereItWas() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: cleanup
+                            type: js
+                            from: [ src_orders.orders ]
+                            script: |
+                              function process(record, ctx) { return record; }
+                          - id: live_orders
+                            type: map
+                            from: [ cleanup ]
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        assertThat(bound.get().get(STEP).name()).isEqualTo("live_orders");
+    }
+
+    /**
+     * Two sources read tables of one name, and the map reads the second by its source id. The walk has
+     * to end at that source's own stream: ending at the bare table name lets the first source's model
+     * answer, and the target then neither carries the second source's key nor matches its stream.
+     */
+    @Test
+    void aRootReadThroughASourceIdKeepsThatSourcesStreamWhenTableNamesRepeat() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("source: [ src_orders, src_items ]", "source: [ src_orders, src_items, src_archive ]")
+                // The other source's same-named table is read too, as a second embed, so both are streams.
+                .replace("from: { o: src_orders.orders, i: src_items.order_items }",
+                        "from: { o: live_orders, i: src_items.order_items, c: src_orders.orders }")
+                .replace("key: [ id ]", "key: [ archive_id ]")
+                .replace("- { from: i, on: { order_id: id }, as: array, path: items, arrayKey: [ id ] }",
+                        "- { from: i, on: { order_id: archive_id }, as: array, path: items, arrayKey: [ id ] }\n"
+                        + "        - { from: c, on: { id: archive_id }, as: object, path: current }")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_archive ]
+                            soft_delete: is_deleted
+                        """),
+                List.of("""
+                        version: tapstate/v1
+                        kind: source
+                        id: src_archive
+                        connector: mysql
+                        config: { host: h, port: 3306, database: d2, username: u, password: p }
+                        mode: cdc
+                        tables: [ orders ]
+                        """),
+                List.of(new DiscoveredSourceModel("src_archive", "mysql", 0L,
+                        new SourceModel(List.of(new SourceTable(PARENT_TABLE,
+                                List.of(new SourceField("archive_id", "int"), new SourceField("name", "string")),
+                                List.of("archive_id"), List.of())))))),
+                capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .as("the key of the source the map reads, not of the other source's same-named table")
+                .containsExactly("archive_id");
+    }
+
+    /**
      * The table half of the same claim, over a root that was never discovered. The columns are a
      * discovery's to supply and are absent here; which table the documents land in is the topology's, and
      * is known without one.
@@ -141,8 +418,38 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
         return new InMemoryStorePort(seedArtifacts());
     }
 
+    private static final String PARSED_PIPELINE = """
+                version: tapstate/v1
+                kind: pipeline
+                id: nested_orders
+                source: [ src_orders, src_items ]
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - id: order_doc
+                    type: nest
+                    from: { o: src_orders.orders, i: src_items.order_items }
+                    root:
+                      from: o
+                      key: [ id ]
+                      embed:
+                        - { from: i, on: { order_id: id }, as: array, path: items, arrayKey: [ id ] }
+                serve:
+                  from: order_doc
+                  sync:
+                    - source: tgt_mongo
+                """;
+
     /** The witness's own documents, parsed by the product's parser and stored as an apply would. */
     private static InMemoryStorePort parsedStore() {
+        return parsedStore(PARSED_PIPELINE);
+    }
+
+    private static InMemoryStorePort parsedStore(String pipeline) {
+        return parsedStore(pipeline, List.of(), List.of());
+    }
+
+    private static InMemoryStorePort parsedStore(String pipeline, List<String> moreSources,
+            List<DiscoveredSourceModel> moreModels) {
         DslParser parser = new DslParser();
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         for (String document : List.of(
@@ -171,28 +478,10 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
                 connector: mongodb
                 config: { uri: "mongodb://localhost:27017/t" }
                 """,
-                """
-                version: tapstate/v1
-                kind: pipeline
-                id: nested_orders
-                source: [ src_orders, src_items ]
-                settings: { read_mode: snapshot_and_cdc }
-                transforms:
-                  - id: order_doc
-                    type: nest
-                    from: { o: src_orders.orders, i: src_items.order_items }
-                    root:
-                      from: o
-                      key: [ id ]
-                      embed:
-                        - { from: i, on: { order_id: id }, as: array, path: items, arrayKey: [ id ] }
-                serve:
-                  from: order_doc
-                  sync:
-                    - source: tgt_mongo
-                """)) {
+                pipeline)) {
             artifacts.save(parser.parse(document));
         }
+        moreSources.forEach(document -> artifacts.save(parser.parse(document)));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         // The connector id has to be the one the parsed sources declare: a discovery belonging to another
@@ -207,6 +496,7 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
                         List.of(new SourceField("id", "int"), new SourceField("order_id", "int"),
                                 new SourceField("sku", "string")),
                         List.of("id"), List.of())))));
+        moreModels.forEach(store.schemas()::save);
         return store;
     }
 

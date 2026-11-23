@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>The envelope around it is composed, and has to be. Handing the rendered document straight back is
  * refused, by name: it also carries readings, when the point was recorded among them, and a write-back
- * that names one is answered {@code position.field-not-editable}. That is the right refusal -- setting a
+ * that names one is answered {@code TS0410003}. That is the right refusal -- setting a
  * derived field is meaningless -- so what a caller round-trips is the token, inside the smallest document
  * that names a point.
  *

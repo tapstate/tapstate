@@ -73,7 +73,7 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
-    void actuationBatchesOneTransactionSnapshotAndReloadsTheLatestIntent() {
+    void actuationUsesOneSnapshotCommandAndReloadsTheLatestIntent() {
         withConfiguration((domain, database, scope) -> {
             var node = new io.tapstate.spi.store.WorkloadClaimFence(
                     new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),
@@ -99,16 +99,16 @@ class MongoPipelineIntentStoreIT {
                 commands.clear();
                 assertThat(store.loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 1, desired));
                 System.out.println("ACTUATION_READ commands=" + commands.stream().map(command -> command.getFirstKey()).toList());
-                assertThat(commands).hasSize(3);
-                assertThat(commands.getFirst().getString("aggregate").getValue()).isEqualTo("cluster_identity");
+                assertThat(commands).hasSize(1);
+                assertThat(commands.getFirst().getString("aggregate").getValue()).isEqualTo("pipeline_intents");
                 assertThat(commands.getFirst().getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
-                assertThat(commands.getFirst().containsKey("txnNumber")).isTrue();
-                assertThat(commands.stream().map(command -> command.getFirstKey()).toList()).containsExactly("aggregate", "find", "commitTransaction");
+                assertThat(commands.getFirst().containsKey("txnNumber")).isFalse();
+                assertThat(commands.stream().map(command -> command.getFirstKey()).toList()).containsExactly("aggregate");
                 var stopped = intent(PipelineState.STOPPED, false, false, null);
                 assertThat(domain.intents().compareAndSet(scope, 1, stopped)).isTrue();
                 commands.clear();
                 assertThat(store.loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 2, stopped));
-                assertThat(commands).hasSize(3);
+                assertThat(commands).hasSize(1);
             }
         });
     }
@@ -124,7 +124,8 @@ class MongoPipelineIntentStoreIT {
                             .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
             var source = StorageBinding.defaultSourceId(StorageBinding.Mode.OP);
             SystemCollections.TRANSFORM_DEFINITIONS.on(database).insertOne(new Document("_id", source.toUpperCase(java.util.Locale.ROOT)));
-            assertThatThrownBy(() -> domain.intents().loadForActuation(scope.pipelineId()))
+            assertThat(domain.intents().loadForActuation(scope.pipelineId())).isPresent();
+            assertThatThrownBy(() -> domain.intents().load(scope.pipelineId()))
                     .isInstanceOfSatisfying(TapstateException.class, failure -> {
                         assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
                         assertThat(failure.args()).containsEntry("id", "storage-binding");
@@ -192,7 +193,7 @@ class MongoPipelineIntentStoreIT {
                 var listener = new CommandListener() {
                     @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
                     @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
-                        if (event.getCommandName().equals("aggregate") && armed.compareAndSet(false, true)) {
+                        if (event.getCommandName().equals("find") && armed.compareAndSet(false, true)) {
                             admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
                                     .append("mode", new Document("times", 1)).append("data", new Document("failCommands", List.of("find"))
                                             .append("errorCode", 112).append("errorLabels", List.of("TransientTransactionError"))));
@@ -208,12 +209,17 @@ class MongoPipelineIntentStoreIT {
                         .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
                     client.getDatabase("admin").runCommand(new Document("ping", 1));
                     var db = client.getDatabase(database.getName());
-                    var store = new MongoPipelineIntentStore(client, db, scope.clusterId(), new MongoStorageBindingStore(client, db, ciphers));
+                    // Exercise the transaction fallback with a real session and server failpoint.
+                    var fallback = org.mockito.Mockito.mock(com.mongodb.client.MongoClient.class, org.mockito.AdditionalAnswers.delegatesTo(client));
+                    org.mockito.Mockito.doReturn(org.mockito.Mockito.mock(com.mongodb.connection.ClusterDescription.class))
+                            .when(fallback).getClusterDescription();
+                    var store = new MongoPipelineIntentStore(fallback, db, scope.clusterId(), new MongoStorageBindingStore(fallback, db, ciphers));
                     commands.clear();
                     try {
                         assertThat(store.loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 2, stopped));
                         assertThat(changed).isTrue();
-                        assertThat(commands).containsExactly("aggregate", "find", "abortTransaction", "aggregate", "find", "commitTransaction");
+                        assertThat(commands).containsSubsequence("find", "abortTransaction", "find", "commitTransaction");
+                        assertThat(java.util.Collections.frequency(commands, "commitTransaction")).isOne();
                     } finally {
                         admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
                     }

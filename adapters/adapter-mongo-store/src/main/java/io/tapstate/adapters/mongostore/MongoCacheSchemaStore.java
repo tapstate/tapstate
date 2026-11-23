@@ -127,22 +127,11 @@ final class MongoCacheSchemaStore implements SchemaStore {
             }
             if (envelope == null || !envelope.containsKey(GENERATION)) return Optional.empty();
             String generation = envelope.getString(GENERATION);
-            var tables = new ArrayList<Document>();
-            var selected = captured == null ? rows.find(session, scoped(new Document("_id", ownedKeys(id)).append(GENERATION, generation)))
-                    .sort(new Document("order", 1)).into(new ArrayList<>()) : captured.getList("tables", Document.class);
-            for (Document row : selected) {
-                int order = tables.size();
-                if (!access.inScope(row, id) || !Integer.valueOf(order).equals(row.get("order"))
-                        || !tableKey(id, generation, order).equals(row.get("_id"))) throw unreadable(id);
-                Document payload = access.payload(row); payload.remove("_id"); payload.remove(GENERATION); payload.remove("order");
-                try {
-                    if (!payload.equals(MongoSchemaStore.tableDocument(MongoSchemaStore.toTable(payload, id)))) throw unreadable(id);
-                } catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
-                tables.add(row);
+            if (captured != null) return decodeDiscovered(id, envelope, captured.getList("tables", Document.class).iterator());
+            try (var cursor = rows.find(session, scoped(new Document("_id", ownedKeys(id)).append(GENERATION, generation)))
+                    .sort(new Document("order", 1)).iterator()) {
+                return decodeDiscovered(id, envelope, cursor);
             }
-            if (tables.size() != envelope.getInteger("tableCount")) throw unreadable(id);
-            try { return Optional.of(MongoSchemaStore.toDiscovered(envelope, tables)); }
-            catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
         });
     }
 
@@ -173,6 +162,29 @@ final class MongoCacheSchemaStore implements SchemaStore {
         return new Document("_id", 0).append("large", new Document("$gt", List.of(size, 64 * 1024)))
                 .append("value", new Document("$cond", java.util.Arrays.asList(
                         new Document("$lte", List.of(size, 64 * 1024)), "$$ROOT", null)));
+    }
+
+    Optional<DiscoveredSourceModel> decodeDiscovered(String id, Document envelope, java.util.Iterator<Document> rows) {
+        if (!access.inScope(envelope, id)) return Optional.empty();
+        validate(envelope, id);
+        if (!envelope.containsKey(GENERATION)) return Optional.empty();
+        String generation = envelope.getString(GENERATION);
+        var tables = new ArrayList<Document>();
+        while (rows.hasNext()) {
+            Document row = rows.next();
+            int order = tables.size();
+            if (!access.inScope(row, id) || !Integer.valueOf(order).equals(row.get("order"))
+                    || !tableKey(id, generation, order).equals(row.get("_id"))) throw unreadable(id);
+            Document payload = access.payload(row);
+            payload.remove("_id"); payload.remove(GENERATION); payload.remove("order");
+            try {
+                if (!payload.equals(MongoSchemaStore.tableDocument(MongoSchemaStore.toTable(payload, id)))) throw unreadable(id);
+            } catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
+            tables.add(row);
+        }
+        if (tables.size() != envelope.getInteger("tableCount")) throw unreadable(id);
+        try { return Optional.of(MongoSchemaStore.toDiscovered(envelope, tables)); }
+        catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(id); }
     }
 
     private void reclaim(String id) {
@@ -249,7 +261,7 @@ final class MongoCacheSchemaStore implements SchemaStore {
     }
     private static boolean canonicalUuid(String value) { try { return UUID.fromString(value).toString().equals(value); }
         catch (IllegalArgumentException invalid) { return false; } }
-    private static Document ownedKeys(String id) {
+    static Document ownedKeys(String id) {
         if (id.indexOf('.') >= 0) throw new IllegalArgumentException("connectionId must not contain '.'");
         return new Document("$gte", id + '.').append("$lt", id + '/');
     }

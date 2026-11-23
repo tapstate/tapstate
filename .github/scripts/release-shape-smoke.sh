@@ -195,6 +195,8 @@ has   "Cloud notification checkout selects only its helper" cloud-ghcr 'sparse-c
 has   "Cloud registration excludes older release lines" cloud-ghcr "if: needs.version.outputs.is_latest == 'true'"
 has   "Cloud registration sends the publisher's immutable image" cloud-ghcr 'CLOUD_IMAGE:.*steps[.]image[.]outputs[.]image'
 has   "Cloud registration sends the checked image digest" cloud-ghcr 'CLOUD_IMAGE_DIGEST:.*needs[.]release-images[.]outputs[.]cloud_digest'
+has   "Cloud determines Bedrock support from the checked Boot JAR" cloud-image 'BOOT-INF/classes/io/tapstate/app/ManagedAiConfiguration[.]class'
+has   "Cloud registration sends the checked runtime capability" cloud-ghcr 'CLOUD_MANAGED_BEDROCK:.*needs[.]release-images[.]outputs[.]cloud_managed_bedrock'
 has   "Cloud publication and registration serialize across versions" cloud-ghcr '^      group: tapstate-cloud-release-publication$'
 has   "queued Cloud publications do not replace one another" cloud-ghcr '^      queue: max$'
 cloud_publish_at="$(job cloud-ghcr | grep -n 'ghcr-publish[.]sh publish' | head -1 | cut -d: -f1)"
@@ -339,6 +341,8 @@ has "and a red smoke blocks the gate" gates 'needs:.*cli-native'
 
 # --- the gate is upstream of the draft -------------------------------------------------------------
 has "the draft waits on the gate"             draft  'needs:.*gates'
+has "the gate waits on the full reactor"       gates  'needs:.*reactor-regression'
+has "the reactor verifies the release commit" reactor-regression 'source-sha:.*needs[.]version[.]outputs[.]sha'
 has "the gate waits on the connector lane"    gates  'needs:.*connectors'
 has "the gate waits on the performance lane" gates  'needs:.*join-perf'
 # The slow lane starts alongside the build, not after it, which is the only reason its ~38 minutes
@@ -434,10 +438,10 @@ triggers() {
        inside && /^  [a-z_]+:/ { sub(/:.*/, ""); sub(/^  /, ""); print }' "$1" | sort
 }
 if [ "$(triggers "$nightly")" = $'schedule\nworkflow_dispatch' ] &&
-   grep -qF -- '- cron: "0 17 * * *"' "$nightly"; then
-  ok "Nightly runs only at 01:00 Shanghai time or when manually dispatched"
+   grep -qF -- '- cron: "0 10 * * *"' "$nightly"; then
+  ok "Nightly is scheduled for 18:00 Shanghai time or manually dispatched"
 else
-  bad "Nightly runs only at 01:00 Shanghai time or when manually dispatched" "unexpected Nightly triggers"
+  bad "Nightly is scheduled for 18:00 Shanghai time or manually dispatched" "unexpected Nightly triggers"
 fi
 for helper in release-images real-connectors; do
   if [ "$(triggers "$here/../workflows/$helper.yml")" = workflow_call ]; then
@@ -453,6 +457,10 @@ else
 fi
 release_workflow="$workflow"
 workflow="$nightly"
+has "Nightly verifies the run commit" reactor-regression 'source-sha:.*github[.]sha'
+hasnt "Nightly reactor execution is independent" reactor-regression '^    needs:'
+has "the failure alert observes reactor regression" notify-feishu 'needs:.*reactor-regression'
+has "the failure alert names reactor regression" notify-feishu 'failed[+]=[(]reactor-regression[)]'
 for j in real-connectors join-perf cli-native release-images; do
   has "Nightly calls the shared $j workflow" "$j" "uses: .*${j}[.]yml"
   has "Nightly pins $j to the event commit" "$j" 'source-sha:.*github[.]sha'

@@ -10,21 +10,25 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Bounded, queue-free execution with one complete convergence pass per Pipeline at a time. */
+/** Bounded convergence admission with one complete convergence pass per Pipeline at a time. */
 final class PipelinePassExecutor implements AutoCloseable {
     private final Set<String> active = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean stopped = new AtomicBoolean();
     private final ThreadPoolExecutor workers;
+    private final java.util.function.BiPredicate<String, Runnable> dispatcher;
     private final Semaphore startSlots;
     private final Semaphore periodicSlots;
 
-    PipelinePassExecutor(int parallelism) {
+    PipelinePassExecutor(int parallelism) { this(parallelism, null); }
+
+    PipelinePassExecutor(int parallelism, java.util.function.BiPredicate<String, Runnable> dispatcher) {
+        this.dispatcher = dispatcher;
         if (parallelism < 2) throw new IllegalArgumentException("at least two convergence workers are required");
         // Neither lane may use the last slot needed by the other.
         startSlots = new Semaphore(parallelism - 1);
         periodicSlots = new Semaphore(parallelism - 1);
         var sequence = new AtomicInteger();
-        workers = new ThreadPoolExecutor(parallelism, parallelism, 0, TimeUnit.MILLISECONDS,
+        workers = dispatcher != null ? null : new ThreadPoolExecutor(parallelism, parallelism, 0, TimeUnit.MILLISECONDS,
                 new SynchronousQueue<>(), task -> ShutdownAwait.daemon(task,
                         "pipeline-converge-" + sequence.incrementAndGet()), new ThreadPoolExecutor.AbortPolicy());
     }
@@ -51,11 +55,12 @@ final class PipelinePassExecutor implements AutoCloseable {
         }
         boolean accepted = false;
         try {
-            workers.execute(() -> {
+            Runnable admitted = () -> {
                 try { runReserved(pipeline, () -> timing.run(pass)); }
                 finally { if (lane != null) lane.release(); }
-            });
-            accepted = true;
+            };
+            if (dispatcher != null) accepted = dispatcher.test(pipeline, admitted);
+            else { workers.execute(admitted); accepted = true; }
         } catch (RejectedExecutionException rejected) {
             // Record the rejection after releasing its reservation below.
         } finally {
@@ -90,10 +95,10 @@ final class PipelinePassExecutor implements AutoCloseable {
 
     void stop() {
         stopped.set(true);
-        workers.shutdownNow();
+        if (workers != null) workers.shutdownNow();
     }
 
-    void awaitStopped(long deadline) { ShutdownAwait.executor(workers, deadline); }
+    void awaitStopped(long deadline) { if (workers != null) ShutdownAwait.executor(workers, deadline); }
 
     @Override public void close() { stop(); awaitStopped(ShutdownAwait.deadline()); }
 }

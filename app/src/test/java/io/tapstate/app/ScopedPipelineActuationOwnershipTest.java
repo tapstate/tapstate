@@ -195,6 +195,11 @@ class ScopedPipelineActuationOwnershipTest {
         nanos.addAndGet(TTL.toNanos());
         assertThatThrownBy(guard::run).isInstanceOf(TapstateException.class);assertThat(reads).hasValue(before);
     }
+    @Test void evaluationProofNeverOutlivesTenSecondsEvenWhenTheOriginalLeaseIsLonger(){
+        var owner=ownership();var permit=owner.permit(FIRST);var guard=owner.evaluationProof(FIRST,WorkloadClaimFence.from(permit.claim())).orElseThrow();
+        int before=reads.get();nanos.set(Duration.ofSeconds(10).toNanos()-1);guard.run();
+        nanos.incrementAndGet();assertThatThrownBy(guard::run).isInstanceOf(TapstateException.class);assertThat(reads).hasValue(before);
+    }
     @Test void anExecutionAdvanceInvalidatesTheCapturedPureEvaluationProof() {
         var owner=ownership();var permit=owner.permit(FIRST);var expected=WorkloadClaimFence.from(permit.claim());
         var guard=owner.evaluationProof(FIRST,expected).orElseThrow();

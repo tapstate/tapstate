@@ -37,6 +37,7 @@ import java.util.function.BiFunction;
 /** One fixed business scope; no claim transition uses another client or an unbound transaction. */
 final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.DeadlineWorkloadClaimStore {
     private static final System.Logger LOG = System.getLogger(MongoCacheWorkloadClaimStore.class.getName());
+    private static final String CLUSTER_ID = "clusterId";
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
@@ -207,17 +208,17 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireScope(original);
         var key = pipelineKey(original);
-        return transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl));
+        return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl)));
     }
 
     @Override public WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope original, WorkloadClaimFence node,
             long topologyRevision) {
         requireScope(original);
         if (topologyRevision != 1 || !node.owner().nodeId().equals(scope.clusterId())) throw claimFenced();
-        return transaction(true, original, (store, session) -> {
+        return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> {
             MongoCachePipelinePreparations.proveNode(session, database, scope, node);
             return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
-        });
+        }));
     }
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
         requireScope(original);
@@ -237,15 +238,16 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             requireActive.run();
             var selected = (budget == null ? database : budget.database(database))
                     .withReadPreference(ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
-            var facts = MongoPipelineProofFacts.readAuthority(selected, original, key);
+            var captured = MongoPipelineProofFacts.readPipelineAuthority(selected, original, key);
             requireActive.run();
             operations.check();
-            if (facts == null || MongoWorkloadClaimStore.nodeBacked(facts.claim())) return null;
+            if (captured == null) return null;
+            var facts = captured.facts();
             MongoCacheBusinessIdentity.requireObservedAdmission(facts.identity(), facts.schema(), scope);
             var access = new MongoCachePipelineAccess(client, database, original, null, requireActive);
             access.validateState(facts.checkpoint());
             access.requirePreparedClaim(facts.claim());
-            return MongoWorkloadClaimStore.observedReading(facts.claim());
+            return MongoWorkloadClaimStore.observedPipelineReading(facts.claim(), captured.node());
         }));
     }
 
@@ -352,13 +354,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public boolean release(WorkloadClaim expected) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, (store, session) -> {
+        java.util.function.Supplier<Boolean> change = () -> transaction(false, (store, session) -> {
             if (knownRetiredPipeline(session, expected.key())) return false;
             var retained = storedScope(session, expected.key());
             boolean released = store.release(expected);
             if (released && retained != null) fenceProgress(session, retained);
             return released;
         });
+        return expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                ? MongoCachePipelineStateStore.writeTransaction(client, expected.key().resourceId(), change) : change.get();
     }
     private boolean knownRetiredPipeline(ClientSession session, WorkloadClaimKey key) {
         if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION) return false;
@@ -379,7 +383,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision, Set<String> nodeIds) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
         if (expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION) {
-            return transaction(false, null, (store, session) -> {
+            return MongoCachePipelineStateStore.writeTransaction(client, expected.key().resourceId(), () -> transaction(false, null, (store, session) -> {
                 var first = store.advanceExecutionBeforeReads(expected, topologyRevision, nodeIds);
                 if (first.isEmpty()) {
                     // Preserve existing refusal diagnostics and the original node-backed lease path.
@@ -394,7 +398,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 validateState(session, retained);
                 fenceProgress(session, retained);
                 return Optional.of(advanced.claim());
-            }, true);
+            }, true));
         }
         return transaction(false, (store, session) -> {
             validateMutationScope(session, store, expected);
@@ -529,7 +533,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         try {
             if (!(row.get("pipelineScope") instanceof Document value) || !(value.get("bindingVersion") instanceof Long binding)
                     || !(value.get("stateGeneration") instanceof Long generation)) throw unreadableScope();
-            var decoded = new PipelineIntentScope(value.getString("clusterId"), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
+            var decoded = new PipelineIntentScope(value.getString(CLUSTER_ID), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
             if (!value.equals(scopeDocument(decoded)) || !key.resourceId().equals(decoded.pipelineId()) || !key.clusterId().equals(decoded.clusterId())
                     || !scope.equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadableScope();
             if (MongoCachePipelinePreparations.phase(row, decoded) != io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED) throw claimFenced();
@@ -538,7 +542,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
 
     private static Document scopeDocument(PipelineIntentScope value) {
-        return new Document("clusterId", value.clusterId()).append("bindingVersion", value.bindingVersion())
+        return new Document(CLUSTER_ID, value.clusterId()).append("bindingVersion", value.bindingVersion())
                 .append("cacheIncarnation", value.cacheIncarnation()).append("pipelineId", value.pipelineId()).append("stateGeneration", value.stateGeneration());
     }
     private static WorkloadClaimKey pipelineKey(PipelineIntentScope value) { return new WorkloadClaimKey(value.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, value.pipelineId()); }
@@ -593,6 +597,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     return committed;
                 }
             } catch (RuntimeException failed) {
+                operations.structures.clear();
                 // A known closed/revoked owner is diagnosed before a driver's closed-client failure.
                 requireActive.run();
                 throw failed;

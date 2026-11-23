@@ -16,7 +16,7 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
  * <p>Interpolation runs on the raw text, before anything is parsed. That is what fixes the location
  * of the whole mechanism: the loading side substitutes from its own environment and sends values, so
  * the variables read are the author's own. It is also why these codes are pre-semantic — there is no
- * field path yet, only a line and a column, the same shape {@code dsl.malformed-yaml} carries.
+ * field path yet, only a line and a column, the same shape {@code TS0010017} carries.
  *
  * <p>The refusals matter as much as the substitutions. A reference that cannot be resolved must fail
  * loudly: passing {@code ${MONGO_URI}} through as a literal string hands a connector a host that does
@@ -72,7 +72,7 @@ class InterpolatorTest {
                 () -> Interpolator.interpolate("uri: ${MONGO_URI}\n", NOTHING_SET), DslException.class);
 
         assertThat(ex).isNotNull();
-        assertThat(ex.code().code()).isEqualTo("dsl.undefined-variable");
+        assertThat(ex.code().code()).isEqualTo("TS0010018");
         assertThat(ex.args()).containsEntry("name", "MONGO_URI");
     }
 
@@ -115,7 +115,7 @@ class InterpolatorTest {
                 () -> Interpolator.interpolate("token: ${secret:TOKEN}\n", NOTHING_SET), DslException.class);
 
         assertThat(ex).isNotNull();
-        assertThat(ex.code().code()).isEqualTo("dsl.malformed-interpolation");
+        assertThat(ex.code().code()).isEqualTo("TS0010019");
         assertThat(ex.args().get("ref").toString()).contains("secret:TOKEN");
     }
 
@@ -126,7 +126,7 @@ class InterpolatorTest {
                 () -> Interpolator.interpolate("port: ${var:PORT}\n", env("PORT", "3306")), DslException.class);
 
         assertThat(ex).isNotNull();
-        assertThat(ex.code().code()).isEqualTo("dsl.malformed-interpolation");
+        assertThat(ex.code().code()).isEqualTo("TS0010019");
     }
 
     @Test
@@ -137,7 +137,7 @@ class InterpolatorTest {
                 DslException.class);
 
         assertThat(ex).isNotNull();
-        assertThat(ex.code().code()).isEqualTo("dsl.malformed-interpolation");
+        assertThat(ex.code().code()).isEqualTo("TS0010019");
         // the reference reported stops at the line's end — it does not swallow the rest of the document
         assertThat(ex.args().get("ref").toString()).doesNotContain("kind: source");
     }
@@ -149,7 +149,7 @@ class InterpolatorTest {
                 () -> Interpolator.interpolate("uri: ${not a name}\n", NOTHING_SET), DslException.class);
 
         assertThat(ex).isNotNull();
-        assertThat(ex.code().code()).isEqualTo("dsl.malformed-interpolation");
+        assertThat(ex.code().code()).isEqualTo("TS0010019");
     }
 
     @Test

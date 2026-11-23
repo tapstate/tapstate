@@ -80,6 +80,28 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
         return authority(captured);
     }
 
+    record PipelineAuthority(Authority facts, Document node) {}
+
+    /** A node-backed tenure and its original live node are sampled by the same server command. */
+    static PipelineAuthority readPipelineAuthority(MongoDatabase snapshot, PipelineIntentScope scope, WorkloadClaimKey key) {
+        var stages = authorityStages(scope, key);
+        var nodeId = new Document("clusterId", scope.clusterId())
+                .append("resourceType", io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION.name()).append("resourceId", "$$owner");
+        stages.add(new Document("$lookup", new Document("from", SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())
+                .append("let", new Document("owner", new Document("$arrayElemAt", List.of("$claim.row.ownerNodeId", 0))))
+                .append("pipeline", List.of(new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", nodeId)))),
+                        new Document("$limit", 1), MongoWorkloadClaimStore.leaseRemaining(true), inline()))
+                .append("as", "node")));
+        var captured = SystemCollections.CACHE_IDENTITY.on(snapshot).aggregate(stages).collation(SIMPLE).first();
+        var facts = authority(captured);
+        if (facts == null) return null;
+        var rows = captured.getList("node", Document.class);
+        var node = row(captured, "node");
+        // An actual missing node is a lease refusal; a bounded-out row keeps the original point-read path.
+        if (!rows.isEmpty() && node == null) return null;
+        return new PipelineAuthority(facts, node);
+    }
+
     static Authority readAuthority(ClientSession session, MongoDatabase database, PipelineIntentScope scope, WorkloadClaimKey key) {
         var stages = authorityStages(scope, key);
         return authority(SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, stages).collation(SIMPLE).first());

@@ -56,7 +56,7 @@ class BootstrapServiceTest {
                 () -> bootstrap.createFirstAdmin(CallerOrigin.REMOTE, "alice", "s3cret"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("control.bootstrap-forbidden");
+        assertThat(thrown.code().code()).isEqualTo("TS0210017");
         // The refusal must echo nothing back: a payload here could encode table state, which is exactly
         // what checking origin before emptiness exists to withhold from a remote caller.
         assertThat(thrown.args()).as("the remote refusal carries no state-revealing payload").isEmpty();
@@ -80,7 +80,7 @@ class BootstrapServiceTest {
         assertThat(thrown).isNotNull();
         assertThat(thrown.code().code())
                 .as("origin is rejected before the table is consulted, so no table state leaks")
-                .isEqualTo("control.bootstrap-forbidden");
+                .isEqualTo("TS0210017");
         assertThat(thrown.args())
                 .as("the refusal echoes nothing back, so it cannot carry table state either")
                 .isEmpty();
@@ -97,7 +97,7 @@ class BootstrapServiceTest {
                 () -> bootstrap.createFirstAdmin(CallerOrigin.LOOPBACK, "alice", "s3cret"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("control.bootstrap-closed");
+        assertThat(thrown.code().code()).isEqualTo("TS0210018");
         assertThat(thrown.args()).as("the closed-channel refusal carries no payload").isEmpty();
         assertThat(users.saved).as("the channel is closed; no second user is written").hasSize(1);
     }
@@ -158,7 +158,7 @@ class BootstrapServiceTest {
         TapstateException second = catchThrowableOfType(TapstateException.class,
                 () -> bootstrap.createFirstAdmin(CallerOrigin.LOOPBACK, "bob", "another"));
         assertThat(second).isNotNull();
-        assertThat(second.code().code()).isEqualTo("control.bootstrap-closed");
+        assertThat(second.code().code()).isEqualTo("TS0210018");
         assertThat(users.find("bob")).as("no second admin is created once the channel has closed").isEmpty();
     }
 
@@ -174,7 +174,7 @@ class BootstrapServiceTest {
         assertThat(thrown).isNotNull();
         assertThat(thrown.code().code())
                 .as("no audit, no execute: a failed audit write refuses the creation")
-                .isEqualTo("control.audit-blocked");
+                .isEqualTo("TS0210015");
         assertThat(users.saved).as("the admin is not created when its audit record could not be written").isEmpty();
     }
 
@@ -214,7 +214,7 @@ class BootstrapServiceTest {
 
         assertThat(users.saved.keySet()).as("only the first admin is created").containsExactly("alice");
         assertThat(secondOutcome.get()).as("the second caller finds the channel already closed").isNotNull();
-        assertThat(secondOutcome.get().code().code()).isEqualTo("control.bootstrap-closed");
+        assertThat(secondOutcome.get().code().code()).isEqualTo("TS0210018");
     }
 
     /** An in-memory user store keyed by username that also reports emptiness for the bootstrap guard. */

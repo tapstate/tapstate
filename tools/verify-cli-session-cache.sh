@@ -369,7 +369,7 @@ run_cli ls >"$out_dir/revoked.stdout" 2>"$out_dir/revoked.stderr"
 revoked_rc=$?
 set -e
 [[ "$revoked_rc" -ne 0 ]] || fail 'revoked session unexpectedly resumed'
-grep -q 'cli.auth-session-rejected' "$out_dir/revoked.stderr" || fail 'revoked resume did not return the stable rejection diagnostic'
+grep -q 'TS0330041' "$out_dir/revoked.stderr" || fail 'revoked resume did not return the stable rejection diagnostic'
 
 kill -TERM "$server_pid"
 wait "$server_pid" || true
@@ -416,8 +416,8 @@ set -e
   || fail 'non-TTY permission degradation unexpectedly succeeded'
 [[ ! -s "$out_dir/permission-degraded-non-tty.stdout" ]] \
   || fail 'non-TTY permission degradation polluted stdout'
-grep -q 'cli.auth-cache-permissions' "$out_dir/permission-degraded-non-tty.stderr" \
-  || fail 'non-TTY permission degradation did not return cli.auth-cache-permissions'
+grep -q 'TS0330040' "$out_dir/permission-degraded-non-tty.stderr" \
+  || fail 'non-TTY permission degradation did not return TS0330040'
 [[ -z "$(find "$auth_dir" -maxdepth 1 -type f -name '*.json' -print -quit)" ]] \
   || fail 'non-TTY permission degradation retained a cache record under broad permissions'
 
@@ -435,7 +435,7 @@ no_context_rc=$?
 set -e
 [[ "$no_context_rc" -ne 0 ]] || fail 'non-TTY online call without a context unexpectedly succeeded'
 [[ ! -s "$out_dir/no-context.stdout" ]] || fail 'non-TTY missing-context call polluted stdout'
-grep -q 'cli.context-required' "$out_dir/no-context.stderr" || fail 'non-TTY missing-context diagnostic was absent'
+grep -q 'TS0330054' "$out_dir/no-context.stderr" || fail 'non-TTY missing-context diagnostic was absent'
 ! grep -Eq 'Password:|Context action:|choice \[1-' "$out_dir/no-context.stderr" \
   || fail 'non-TTY missing-context call opened an interactive prompt'
 

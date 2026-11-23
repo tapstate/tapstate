@@ -75,7 +75,7 @@ class SupportedSubsetTest {
         String expression = shapeOf("SELECT o.o_id FROM orders o "
                 + "JOIN customers c ON o.o_cust_id = c.c_id + 1");
         String disjunction = shapeOf("SELECT o.o_id FROM orders o "
-                + "JOIN customers c ON o.o_cust_id = c.c_id OR o.o_id = c.c_id");
+                + "LEFT JOIN customers c ON o.o_cust_id = c.c_id OR o.o_id > c.c_id");
 
         assertThat(List.of(comparison, expression, disjunction))
                 .allMatch(shape -> shape.contains("equality"));

@@ -115,6 +115,61 @@ class FactsBecomeMetricDataTest {
     }
 
     @Test
+    void aRevokedPeriodicOfferCannotReplaceTheTerminalExport() {
+        producer.offer("a", PipelineState.STOPPED, AT, List.of());
+        var checks = new java.util.concurrent.atomic.AtomicInteger();
+        producer.offerIfCurrent("a", PipelineState.RUNNING, AT, List.of(Facts.records("a", 1, 1)),
+                () -> checks.getAndIncrement() == 0);
+
+        var state = only(producer.produce(Resource.empty()), FactsMetricProducer.STATE_METRIC)
+                .getLongGaugeData().getPoints();
+        assertThat(with(state, FactsMetricProducer.STATE_ATTRIBUTE, "stopped").getValue()).isEqualTo(1L);
+    }
+
+    @Test
+    void aRevokedFoldCannotSpendTheNextOffersNamedSeries() {
+        var checks = new java.util.concurrent.atomic.AtomicInteger();
+        var points = java.util.stream.IntStream.range(0, 1000).mapToObj(index ->
+                io.tapstate.core.lifecycle.MetricPoint.reading(java.util.Map.of(
+                        MetricAttributes.PIPELINE_ID, "a", MetricAttributes.TABLE_ID, "revoked-" + index), AT, 1)).toList();
+        var fact = new io.tapstate.core.lifecycle.MetricFact(LAG,
+                io.tapstate.core.lifecycle.MetricType.GAUGE, "ms", points);
+        producer.offerIfCurrent("a", PipelineState.RUNNING, AT, List.of(fact), () -> checks.getAndIncrement() == 0);
+        var accepted = new io.tapstate.core.lifecycle.MetricFact(LAG,
+                io.tapstate.core.lifecycle.MetricType.GAUGE, "ms", List.of(
+                        io.tapstate.core.lifecycle.MetricPoint.reading(java.util.Map.of(
+                                MetricAttributes.PIPELINE_ID, "a", MetricAttributes.TABLE_ID, "accepted"), AT, 2)));
+        producer.offer("a", PipelineState.RUNNING, AT, List.of(accepted));
+        assertThat(only(producer.produce(Resource.empty()), LAG).getLongGaugeData().getPoints())
+                .singleElement().satisfies(point -> assertThat(point.getAttributes()
+                        .get(AttributeKey.stringKey(MetricAttributes.TABLE_ID))).isEqualTo("accepted"));
+    }
+
+    @Test
+    void aHeldFoldDoesNotBlockAnotherPipelineOrRetention() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            try {
+                var held = executor.submit(() -> producer.offerIfCurrent("a", PipelineState.RUNNING, AT,
+                        List.of(Facts.records("a", 1, 1)), () -> {
+                            entered.countDown();
+                            try { assertThat(release.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+                            catch (InterruptedException stopped) { throw new AssertionError(stopped); }
+                            return true;
+                        }));
+                assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                executor.submit(() -> {
+                    producer.offer("b", PipelineState.RUNNING, AT, List.of(Facts.records("b", 2, 2)));
+                    producer.forgetPipelinesOutside(List.of("b"));
+                }).get(1, java.util.concurrent.TimeUnit.SECONDS);
+                release.countDown(); held.get(2, java.util.concurrent.TimeUnit.SECONDS);
+                assertThat(producer.pipelines()).containsExactly("b");
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test
     void aLaterOfferReplacesThePipelinesFactsAndAForgottenPipelinesSeriesStop() {
         producer.offer("a", PipelineState.RUNNING, AT, List.of(Facts.records("a", 1, 1)));
         producer.offer("b", PipelineState.RUNNING, AT, List.of(Facts.records("b", 2, 2)));

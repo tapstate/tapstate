@@ -28,7 +28,6 @@ final class NativeValidationReportHistory implements AutoCloseable {
     private final ScheduledFuture<?> polling;
     private volatile boolean closed;
     private long nextAttempt;
-    private ValidationTaskStore tasks;
     private Long emptyRevision;
     private String pipeline,afterPipeline,afterTask;
     NativeValidationReportHistory(MongoConfigurationDomain configuration,MongoCacheDomain cache,CacheBusinessScope scope,
@@ -53,7 +52,7 @@ final class NativeValidationReportHistory implements AutoCloseable {
                 revision = configuration.validationDiscoveryRevision();
                 if (revision.equals(emptyRevision)) return;
             }
-            if (tasks == null) tasks = configuration.validationTasks(this::requireActive);
+            var tasks = configuration.pollingValidationTasks(this::requireActive);
             if(pipeline==null){
                 var next=tasks.pipelines(afterPipeline,1);
                 if(next.isEmpty()){

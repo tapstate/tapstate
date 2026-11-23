@@ -45,12 +45,13 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
         var current = nativeStore == null ? null : nativeStore.planningScope(pipelineId);
         Map<String, SourceCaptureResolution> resolutions = new LinkedHashMap<>();
         Map<String, SourceResource> shared = new LinkedHashMap<>();
-        for (String sourceId : pipeline.get().sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+        for (String binding : pipeline.get().sourceBindings()) {
+            var ref = pipeline.get().sourceReference(binding);
+            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), ref.id());
             SourceCaptureResolution resolution;
             try {
                 resolution = SourceCaptureResolution.forPipeline(
-                        pipeline.get(), source, SourceDiscovery.model(storePort, source)).orElse(null);
+                        pipeline.get(), ref, source, SourceDiscovery.model(storePort, source)).orElse(null);
             } catch (TapstateException unresolved) {
                 if (unresolved.code() == ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED) {
                     // The read face treats a not-yet-resolvable selection as absent while discovery catches up.
@@ -59,14 +60,17 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                 throw unresolved;
             }
             if (resolution == null) continue;
-            resolutions.put(sourceId, resolution);
-            if (nativeStore != null && nativeStore.sharedStartSource(pipeline.get(), source)) shared.put(sourceId, source);
+            resolutions.put(binding, resolution);
+            boolean direct = ref instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs();
+            if (nativeStore != null && !direct && (pipeline.get().settings() == null
+                    || pipeline.get().settings().readMode() != io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY))
+                shared.put(binding, source);
         }
         Map<String, String> positions = new LinkedHashMap<>();
         resolutions.forEach((sourceId, resolution) -> {
             if (shared.containsKey(sourceId)) {
                 nativeStore.sharedSinkOffset(current, shared.get(sourceId), resolution)
-                        .ifPresent(offset -> addConfirmedPositions(positions, resolution.tables(), offset));
+                        .ifPresent(offset -> addLabeledPositions(positions, sourceId, resolution, resolutions.values(), offset));
                 return;
             }
             boolean singleNode = resolutions.values().stream()
@@ -76,11 +80,20 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                             .or(() -> singleNode ? meta.consumerOffset(pipelineId) : Optional.empty()))
                     .orElse(null);
             if (offset != null) {
-                addConfirmedPositions(positions, resolution.tables(), offset);
+                addLabeledPositions(positions, sourceId, resolution, resolutions.values(), offset);
             }
         });
         if (current != null) current.verify().run();
         return positions;
+    }
+
+    private static void addLabeledPositions(Map<String, String> positions, String binding,
+            SourceCaptureResolution resolution, java.util.Collection<SourceCaptureResolution> resolutions,
+            ConsumerOffset offset) {
+        var confirmed = new LinkedHashMap<String, String>();
+        addConfirmedPositions(confirmed, resolution.tables(), offset);
+        confirmed.forEach((table, position) -> positions.put(PipelineTableSelection.label(binding, table,
+                resolutions.stream().map(SourceCaptureResolution::tables)), position));
     }
 
     /** The same durable acknowledgement projection serves live samples and stored-position fallbacks. */

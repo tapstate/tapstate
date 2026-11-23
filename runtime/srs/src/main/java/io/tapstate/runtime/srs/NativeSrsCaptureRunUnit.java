@@ -5,11 +5,13 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.*;
 import io.tapstate.spi.store.*;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
 /** Native physical tails and private snapshot attachments have independent lifetimes and authority. */
@@ -25,6 +27,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private final CaptureObservation.Factory observations;
     private final Set<Tail> tails = ConcurrentHashMap.newKeySet();
     private final Set<CaptureRun> snapshots = ConcurrentHashMap.newKeySet();
+    private final Set<CaptureRun> closingSnapshots = ConcurrentHashMap.newKeySet();
+    private final Map<Runnable,CompletableFuture<Void>> closingOpenings = new ConcurrentHashMap<>();
     private final Map<Runnable,Runnable> pendingCloses = new ConcurrentHashMap<>();
     private final Map<CaptureRun,Runnable> runOwners = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -49,38 +53,60 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         checkpoints.setRemoveOnCancelPolicy(true);
     }
 
+    /** A caller can retain the original failed tail until it leaves its own admission lock. */
+    public interface RetainedTailOpening extends Runnable {
+        boolean retainFailedTail(Throwable failure);
+    }
+
     /** Only a physical CAPTURE owner opens this handle; no Pipeline consumer owns or closes it. */
-    public synchronized Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
+    public Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
             CaptureConfig config,CaptureStart start,Function<SrsCaptureWriter,CapturePort> ports,Runnable requireActive) {
         return startTail(scope, opened, originalCapture, config, start, ports, requireActive, false);
     }
-    public synchronized Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
+    public Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
             CaptureConfig config,CaptureStart start,Function<SrsCaptureWriter,CapturePort> ports,Runnable requireActive, boolean priorCacheHistory) {
         return startTail(scope, opened, originalCapture, config, start, ports, requireActive, priorCacheHistory, false);
     }
 
-    public synchronized Tail startTail(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
+    @SuppressWarnings("java:S2095") // The original owner keeps the registered tail through any pending close.
+    public Tail startTail(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
             CaptureConfig config, CaptureStart start, Function<SrsCaptureWriter, CapturePort> ports,
             Runnable requireActive, boolean priorCacheHistory, boolean skipEmptyStartupAck) {
-        Runnable fixed = guard(requireActive); fixed.run();
-        var stores = views.srs(scope,fixed);
-        var writer = new SrsCaptureWriter(scope,opened,originalCapture,stores,member,fixed,priorCacheHistory,true);
-        var health = new CaptureHealth(); var owned = new Tail(writer,null,health,requireActive); tails.add(owned);
+        Tail provisional = null;
         try {
-            var port = Objects.requireNonNull(ports.apply(writer),"prepared capture port");
-            if (port instanceof AutoCloseable opening) owned.opening = () -> closeOpening(opening, opened.captureId());
-            var source = observe(config, opened.captureId(), opened.miningChainId(), opened.epoch(), originalCapture,
-                    observation -> writer.start(port,config,start,health,observation));
-            owned.subscription = source; fixed.run();
-            owned.opening = null;
-            boolean awaitingCheckpoint = opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch();
-            owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed), opened.miningChainId(),
-                    opened.epoch(), source, health, fixed, skipEmptyStartupAck && awaitingCheckpoint);
-            fixed.run();
-            owned.checkpointTask = checkpoints.scheduleWithFixedDelay(owned::flushScheduled, 10, 10, TimeUnit.SECONDS);
-            return owned;
+            synchronized (this) {
+                Runnable fixed = guard(requireActive); fixed.run();
+                var stores = views.srs(scope, fixed);
+                var writer = new SrsCaptureWriter(scope, opened, originalCapture, stores, member, fixed, priorCacheHistory, true);
+                var health = new CaptureHealth();
+                var owned = new Tail(writer, null, health, requireActive);
+                provisional = owned;
+                // A stop can find the provisional tail before its source and task are installed.
+                owned.operations.lock();
+                try {
+                    tails.add(owned);
+                    var port = Objects.requireNonNull(ports.apply(writer), "prepared capture port");
+                    if (port instanceof AutoCloseable opening) owned.opening = () -> closeOpening(opening, opened.captureId());
+                    var source = observe(config, opened.captureId(), opened.miningChainId(), opened.epoch(), originalCapture,
+                            observation -> writer.start(port, config, start, health, observation));
+                    owned.subscription = source;
+                    fixed.run();
+                    owned.opening = null;
+                    boolean awaitingCheckpoint = opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch();
+                    owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed), opened.miningChainId(),
+                            opened.epoch(), source, health, fixed, skipEmptyStartupAck && awaitingCheckpoint);
+                    fixed.run();
+                    owned.checkpointTask = checkpoints.scheduleWithFixedDelay(owned::flushScheduled, 10, 10, TimeUnit.SECONDS);
+                    return owned;
+                } finally { owned.operations.unlock(); }
+            }
         } catch (RuntimeException | Error failure) {
-            writer.close(); closeAfter(failure,owned::close); throw failure;
+            if (provisional != null) {
+                provisional.writer.close();
+                if (!(requireActive instanceof RetainedTailOpening retained) || !retained.retainFailedTail(failure))
+                    closeAfter(failure, provisional::close);
+            }
+            throw failure;
         }
     }
 
@@ -102,16 +128,40 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
 
     /** A tail proposes only its subscribers' confirmed prefix; CACHE rechecks all references atomically. */
     public void retain(CacheBusinessScope scope,String chainId,WorkloadClaimFence originalCapture,Runnable requireActive) {
+        retain(scope, chainId, originalCapture, requireActive, null);
+    }
+
+    /** Uses a planning snapshot from the same maintenance pass. Trim still checks current progress. */
+    public void retain(CacheBusinessScope scope, String chainId, WorkloadClaimFence originalCapture, Runnable requireActive,
+            SrsConsumerStore.RetentionSnapshot planned) {
         Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);
-        var confirmed=stores.consumers().retentionFloors(chainId,stores.chains());
-        if(confirmed.isEmpty())return;
-        var floors=new TreeMap<>(confirmed.orElseThrow());
+        var floors = new TreeMap<String, Long>();
+        var snapshot = planned == null ? stores.consumers().retentionSnapshot(chainId) : Optional.of(planned);
+        if (snapshot.isPresent()) {
+            var retained = snapshot.orElseThrow();
+            for (var consumer : retained.consumers()) {
+                recordRetentionFloors(floors, retained.chain(), consumer.membership(), consumer.ringDoneThrough());
+            }
+        } else {
+            var confirmed = stores.consumers().retentionFloors(chainId, stores.chains());
+            if (confirmed.isEmpty()) return;
+            floors.putAll(confirmed.orElseThrow());
+        }
         for(var entry:floors.entrySet())if(entry.getValue()>=0) {
             fixed.run();String ring=SrsRingbuffer.ringName(chainId,entry.getKey());
             long trimmed=stores.log().bounds(ring).trimmedThrough();fixed.run();
             if(entry.getValue()>trimmed) {stores.log().trim(ring,entry.getValue(),originalCapture);fixed.run();}
         }
         stores.models().reclaim(chainId,originalCapture);fixed.run();
+    }
+
+    private static void recordRetentionFloors(Map<String, Long> floors, SrsChainState chain,
+            SrsConsumerMembership member, Map<String, Long> confirmed) {
+        for (String table : member.tables()) {
+            if (chain.servingTables().contains(table)) {
+                floors.merge(table, confirmed.getOrDefault(table, -1L), Math::min);
+            }
+        }
     }
 
     /** Resolves the existing durable read rule without publishing a cursor or treating read-ahead as confirmation. */
@@ -275,28 +325,36 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         private ScheduledFuture<?> checkpointTask;
         private final Runnable owner;
         private final AtomicBoolean ended = new AtomicBoolean();
+        private final ReentrantLock operations = new ReentrantLock();
         private Tail(SrsCaptureWriter writer,Subscription subscription,CaptureHealth health,Runnable owner) {
             this.writer = writer; this.subscription = subscription; this.health = health; this.owner = owner;
         }
         public CaptureHealth health() { return health; }
-        public synchronized void finishCheckpointing() {
-            if (!ended.get() && health.failure().isEmpty()) writer.finishCheckpointing();
-            if (checkpointTask != null) checkpointTask.cancel(false);
+        public void finishCheckpointing() {
+            operations.lock();
+            try {
+                if (!ended.get() && health.failure().isEmpty()) writer.finishCheckpointing();
+                if (checkpointTask != null) checkpointTask.cancel(false);
+            } finally { operations.unlock(); }
         }
-        private synchronized void flushScheduled() {
+        private void flushScheduled() {
+            operations.lock();
             try {
                 if (!ended.get() && health.failure().isEmpty()) writer.flushCheckpoint();
             } catch (RuntimeException | Error failure) {
                 writer.close();
                 health.fail(failure);
-            }
+            } finally { operations.unlock(); }
         }
-        @Override public synchronized void close() {
-            if (ended.get()) return;
-            if (checkpointTask != null) checkpointTask.cancel(false);
-            writer.close(); if(subscription!=null)subscription.close(); writer.stopSources();
-            if(opening!=null)opening.run();
-            ended.set(true); tails.remove(this);
+        @Override public void close() {
+            operations.lock();
+            try {
+                if (ended.get()) return;
+                if (checkpointTask != null) checkpointTask.cancel(false);
+                writer.close(); if(subscription!=null)subscription.close(); writer.stopSources();
+                if(opening!=null)opening.run();
+                ended.set(true); tails.remove(this);
+            } finally { operations.unlock(); }
         }
     }
     private static void closeOpening(AutoCloseable opening,String captureId) {
@@ -307,12 +365,20 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private static void closePortOpening(CapturePort port,String captureId) {
         if(port instanceof AutoCloseable opening)closeOpening(opening,captureId);
     }
-    public synchronized void stopSnapshot(CaptureRun original) {
-        if (snapshots.contains(Objects.requireNonNull(original,"original"))) { original.close(); snapshots.remove(original); runOwners.remove(original); }
+    public void stopSnapshot(CaptureRun original) {
+        if (!snapshots.contains(Objects.requireNonNull(original, "original"))) return;
+        if (!closingSnapshots.add(original)) throw stillEnding(original.chainId().map(MiningChainId::value).orElse("snapshot"));
+        try {
+            if (snapshots.contains(original)) {
+                original.close();
+                snapshots.remove(original);
+                runOwners.remove(original);
+            }
+        } finally { closingSnapshots.remove(original); }
     }
     private void register(CaptureRun original,Runnable owner) {runOwners.put(original,owner);snapshots.add(original);}
     /** Retries only this opening's retained handles, even when business authorization has ended. */
-    public synchronized void stopOpenings(Runnable originalOwner) {
+    public void stopOpenings(Runnable originalOwner) {
         Objects.requireNonNull(originalOwner);Throwable first=null;
         for(var run:List.copyOf(snapshots))if(runOwners.get(run)==originalOwner)first=closeAfter(first,() -> stopSnapshot(run));
         for(var tail:List.copyOf(tails))if(tail.owner==originalOwner)first=closeAfter(first,tail::close);
@@ -322,6 +388,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private SnapshotSession retainSession(SnapshotSession original,Runnable owner) {
         Runnable close=original::close;pendingCloses.put(close,owner);
         return new SnapshotSession() {
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure){return original.failureFact(failure);}
             @Override public CaptureBatch read(String table){return original.read(table);}
             @Override public void close(){closePending(close);}
         };
@@ -329,13 +396,41 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private CaptureBatch retainBatch(CaptureBatch original,Runnable owner) {
         Runnable close=original::close;pendingCloses.put(close,owner);
         return new CaptureBatch() {
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure){return original.failureFact(failure);}
             @Override public boolean hasNext(){return original.hasNext();}
             @Override public io.tapstate.core.event.Envelope next(){return original.next();}
             @Override public Optional<SourcePosition> seam(){return original.seam();}
             @Override public void close(){closePending(close);}
         };
     }
-    private void closePending(Runnable original){original.run();pendingCloses.remove(original);}
+    private void closePending(Runnable original) {
+        if (!pendingCloses.containsKey(original)) return;
+        var attempt = new CompletableFuture<Void>();
+        var inFlight = closingOpenings.putIfAbsent(original, attempt);
+        if (inFlight != null) throw new SnapshotSession.PendingClose(CaptureError.STILL_ENDING,
+                Map.of("captureId", "source opening"), null, inFlight);
+        try {
+            if (pendingCloses.containsKey(original)) {
+                original.run();
+                pendingCloses.remove(original);
+            }
+        } catch (SnapshotSession.PendingClose pending) {
+            pending.completion().whenComplete((ignored, failure) -> completeClose(original, attempt, failure));
+            throw pending;
+        } catch (RuntimeException | Error failure) {
+            completeClose(original, attempt, failure);
+            throw failure;
+        }
+        completeClose(original, attempt, null);
+    }
+    private void completeClose(Runnable original, CompletableFuture<Void> attempt, Throwable failure) {
+        closingOpenings.remove(original, attempt);
+        if (failure == null) attempt.complete(null);
+        else attempt.completeExceptionally(failure);
+    }
+    private static TapstateException stillEnding(String captureId) {
+        return new TapstateException(CaptureError.STILL_ENDING, Map.of("captureId", captureId), null);
+    }
     private Runnable guard(Runnable original) {
         Objects.requireNonNull(original,"requireActive");
         return () -> {

@@ -148,9 +148,9 @@ class PipelineStreamRoundTripTest {
         // caller end to end, not just that some intermediate layer encodes it correctly in isolation.
         FakeObservationStore observations = context.getBean(FakeObservationStore.class);
         observations.save(new Observation("pl1", PipelineState.FAILED,
-                Map.of("errors.engine.job-failed", 1L),
+                Map.of("errors.TS0440008", 1L),
                 Map.of(), Map.of(), new ObservationFailure(
-                        "engine.job-failed", Map.of("pipeline", "pl1", "cause", "sink refused the batch"))));
+                        "TS0440008", Map.of("pipeline", "pl1", "cause", "sink refused the batch"))));
 
         BlockingQueue<String[]> found = new LinkedBlockingQueue<>();
         AtomicBoolean stop = new AtomicBoolean(false);
@@ -163,7 +163,7 @@ class PipelineStreamRoundTripTest {
             String[] frame = found.poll(5, TimeUnit.SECONDS);
             assertThat(frame).isNotNull();
             assertThat(frame[0]).isEqualTo("FAILED");
-            assertThat(frame[1]).isEqualTo("engine.job-failed");
+            assertThat(frame[1]).isEqualTo("TS0440008");
             assertThat(frame[2]).contains("sink refused the batch");
         } finally {
             stop.set(true);
@@ -190,7 +190,7 @@ class PipelineStreamRoundTripTest {
         assertThat(watcher.isAlive())
                 .as("the watch must end on its own; a live thread here means it is reconnecting forever")
                 .isFalse();
-        assertThat(refusal.get()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(refusal.get()).isEqualTo("TS0280005");
     }
 
     @Test

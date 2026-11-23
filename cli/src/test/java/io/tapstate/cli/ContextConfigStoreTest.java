@@ -113,12 +113,12 @@ class ContextConfigStoreTest {
         Path config = root.resolve("config.yaml");
         ContextConfigStore store = ContextConfigStore.underHome(home);
 
-        assertRejectedAndUnchanged(store, config, "version: [not yaml\n", "cli.context-config-invalid");
-        assertRejectedAndUnchanged(store, config, "version: 1\ncontexts: {}\n", "cli.context-config-invalid");
+        assertRejectedAndUnchanged(store, config, "version: [not yaml\n", "TS0330035");
+        assertRejectedAndUnchanged(store, config, "version: 1\ncontexts: {}\n", "TS0330035");
         assertRejectedAndUnchanged(store, config, "version: 1\nversion: 1\ncontexts: {}\nworkspaceBindings: {}\n",
-                "cli.context-config-invalid");
+                "TS0330035");
         assertRejectedAndUnchanged(store, config, "version: 99\ncontexts: {}\nworkspaceBindings: {}\n",
-                "cli.context-config-version");
+                "TS0330036");
 
         Files.delete(config);
         Path target = home.resolve("outside.yaml");
@@ -126,10 +126,10 @@ class ContextConfigStoreTest {
         Files.createSymbolicLink(config, target);
         assertThatThrownBy(store::load)
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-config-invalid"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330035"));
         assertThatThrownBy(() -> store.save(ContextConfig.empty()))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-config-invalid"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330035"));
         assertThat(Files.readString(target)).isEqualTo("outside");
     }
 
@@ -160,7 +160,7 @@ class ContextConfigStoreTest {
         assertThat(ContextConfigStore.underHome(home, List.of(migration)).load()).isEqualTo(migrated);
         assertThatThrownBy(ContextConfigStore.underHome(home)::load)
                 .isInstanceOfSatisfying(TapstateException.class,
-                error -> assertThat(error.code().code()).isEqualTo("cli.context-config-version"));
+                error -> assertThat(error.code().code()).isEqualTo("TS0330036"));
     }
 
     @Test
@@ -184,7 +184,7 @@ class ContextConfigStoreTest {
         };
         assertThatThrownBy(() -> ContextConfigStore.underHome(home, List.of(wrongVersion)).load())
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-config-invalid"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330035"));
 
         ContextConfigStore store = ContextConfigStore.underHome(Files.createDirectory(home.resolve("updates")));
         assertThatThrownBy(() -> store.update(null)).isInstanceOf(IllegalArgumentException.class);
@@ -244,7 +244,7 @@ class ContextConfigStoreTest {
                     PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ));
             assertThatThrownBy(store::load)
                     .isInstanceOfSatisfying(TapstateException.class,
-                            error -> assertThat(error.code().code()).isEqualTo("cli.context-config-permissions"));
+                            error -> assertThat(error.code().code()).isEqualTo("TS0330037"));
             ownerOnlyFile(config);
         }
 
@@ -253,7 +253,7 @@ class ContextConfigStoreTest {
             Files.createLink(hardLink, config);
             assertThatThrownBy(store::load)
                     .isInstanceOfSatisfying(TapstateException.class,
-                            error -> assertThat(error.code().code()).isEqualTo("cli.context-config-invalid"));
+                            error -> assertThat(error.code().code()).isEqualTo("TS0330035"));
         } catch (UnsupportedOperationException unsupported) {
             // This filesystem cannot seed the hard-link case.
         }
@@ -282,7 +282,7 @@ class ContextConfigStoreTest {
 
         assertThatThrownBy(ContextConfigStore.underHome(home)::load)
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-config-invalid"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330035"));
         assertThat(Files.readString(config)).isEqualTo(yaml);
     }
 
@@ -297,18 +297,18 @@ class ContextConfigStoreTest {
                 version: "1"
                 contexts: {}
                 workspaceBindings: {}
-                """, "cli.context-config-invalid");
+                """, "TS0330035");
         assertRejectedAndUnchanged(store, config, """
                 version: 1
                 lastContext: true
                 contexts: {}
                 workspaceBindings: {}
-                """, "cli.context-config-invalid");
+                """, "TS0330035");
         assertRejectedAndUnchanged(store, config, """
                 version: 1
                 contexts: []
                 workspaceBindings: {}
-                """, "cli.context-config-invalid");
+                """, "TS0330035");
         assertRejectedAndUnchanged(store, config, """
                 version: 1
                 contexts:
@@ -319,7 +319,7 @@ class ContextConfigStoreTest {
                       verify: true
                     authRef: 5c199643-04da-4f72-9831-3a77e3590eed
                 workspaceBindings: {}
-                """, "cli.context-config-invalid");
+                """, "TS0330035");
         assertRejectedAndUnchanged(store, config, """
                 version: 1
                 contexts:
@@ -331,7 +331,7 @@ class ContextConfigStoreTest {
                       verify: "true"
                     authRef: 5c199643-04da-4f72-9831-3a77e3590eed
                 workspaceBindings: {}
-                """, "cli.context-config-invalid");
+                """, "TS0330035");
 
         Files.writeString(config, "version: 0\n", StandardCharsets.UTF_8);
         ownerOnlyFile(config);
@@ -348,7 +348,7 @@ class ContextConfigStoreTest {
         };
         assertThatThrownBy(() -> ContextConfigStore.underHome(home, List.of(broken)).load())
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.context-config-invalid"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330035"));
         assertThat(Files.readString(config)).isEqualTo("version: 0\n");
     }
 

@@ -22,7 +22,7 @@ final class ConfigurationVersion {
         return revision(versions.find(session, new Document("_id", ID)).first());
     }
 
-    private static long revision(Document current) {
+    static long revision(Document current) {
         if (current == null || !(current.get("revision") instanceof Long revision)
                 || revision < 0 || revision == Long.MAX_VALUE) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
