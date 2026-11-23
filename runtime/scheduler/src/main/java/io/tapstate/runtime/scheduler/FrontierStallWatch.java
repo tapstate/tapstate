@@ -3,8 +3,10 @@ package io.tapstate.runtime.scheduler;
 import io.tapstate.core.lifecycle.FrontierStall;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -37,8 +39,7 @@ import java.util.Set;
  * other's readings — and a joined name would answer that with a separator that has to be absent from every
  * pipeline id there will ever be.
  *
- * <p>Not thread-safe, and does not need to be: it is fed from the pass that publishes observations, which
- * is one caller at a time.
+ * <p>Protects the accumulated readings from concurrent publishers. Notifications run outside the lock.
  */
 public final class FrontierStallWatch {
 
@@ -64,34 +65,52 @@ public final class FrontierStallWatch {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(stalls, "stalls");
         Objects.requireNonNull(gaps, "gaps");
-        Map<String, Boolean> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
-        held.keySet().retainAll(stalls.keySet());
-        stalls.forEach((chain, pinnedMillis) -> {
-            Long gap = gaps.get(chain);
-            judge(pipelineId, held, new FrontierStall(chain, pinnedMillis,
-                    gap == null ? OptionalLong.empty() : OptionalLong.of(gap)));
-        });
-        if (held.isEmpty()) {
-            byPipeline.remove(pipelineId);
+        List<Runnable> notices = new ArrayList<>();
+        synchronized (byPipeline) {
+            Map<String, Boolean> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
+            held.keySet().retainAll(stalls.keySet());
+            stalls.forEach((chain, pinnedMillis) -> {
+                Long gap = gaps.get(chain);
+                judge(pipelineId, held, new FrontierStall(chain, pinnedMillis,
+                        gap == null ? OptionalLong.empty() : OptionalLong.of(gap)), notices);
+            });
+            if (held.isEmpty()) {
+                byPipeline.remove(pipelineId);
+            }
         }
+        Throwable failure = null;
+        for (var notice : notices) {
+            try { notice.run(); }
+            catch (RuntimeException | Error problem) {
+                if (failure == null) failure = problem;
+                else if (problem instanceof Error && !(failure instanceof Error)) {
+                    problem.addSuppressed(failure);
+                    failure = problem;
+                } else if (failure != problem) failure.addSuppressed(problem);
+            }
+        }
+        if (failure instanceof Error fatal) throw fatal;
+        if (failure instanceof RuntimeException refused) throw refused;
     }
 
     /** Which chains are currently held, as pipeline and chain together — what a caller asserts on. */
     Set<String> watching() {
         Set<String> held = new HashSet<>();
-        byPipeline.forEach((pipelineId, chains) ->
-                chains.keySet().forEach(chain -> held.add(pipelineId + "/" + chain)));
+        synchronized (byPipeline) {
+            byPipeline.forEach((pipelineId, chains) ->
+                    chains.keySet().forEach(chain -> held.add(pipelineId + "/" + chain)));
+        }
         return held;
     }
 
-    private void judge(String pipelineId, Map<String, Boolean> held, FrontierStall stall) {
+    private void judge(String pipelineId, Map<String, Boolean> held, FrontierStall stall, List<Runnable> notices) {
         boolean nowOver = pressure.isOver(stall);
         boolean wasOver = Boolean.TRUE.equals(held.get(stall.chain()));
         held.put(stall.chain(), nowOver);
         if (nowOver && !wasOver) {
-            alert.crossed(pipelineId, stall);
+            notices.add(() -> alert.crossed(pipelineId, stall));
         } else if (!nowOver && wasOver) {
-            alert.cleared(pipelineId, stall);
+            notices.add(() -> alert.cleared(pipelineId, stall));
         }
     }
 }

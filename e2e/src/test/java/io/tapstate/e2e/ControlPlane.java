@@ -289,6 +289,12 @@ final class ControlPlane {
      */
     List<Map<String, Object>> preview(
             String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts) {
+        return preview(pipelineId, outputId, rootLimit, sampleId, drafts, null);
+    }
+
+    List<Map<String, Object>> preview(
+            String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts,
+            String language) {
         List<Map<String, String>> encodedDrafts = drafts.stream()
                 .map(draft -> Map.of("source", draft.source(), "content", draft.content()))
                 .toList();
@@ -298,7 +304,7 @@ final class ControlPlane {
         request.put("rootLimit", rootLimit);
         request.put("sampleId", sampleId);
         request.put("drafts", encodedDrafts);
-        HttpResponse<String> response = send(authed("/api/artifacts:preview", JsonWriter.write(request)));
+        HttpResponse<String> response = sourceResponse("POST", "/api/artifacts:preview", request, null, language);
         expect(response, 200, "preview Pipeline " + pipelineId);
         String contentType = response.headers().firstValue("content-type").orElse("");
         if (!contentType.startsWith("application/x-ndjson")) {
@@ -970,6 +976,17 @@ final class ControlPlane {
     /** Removes the artifact {@code id}, offering {@code expectedContentHash} as the version the caller read. */
     void deleteArtifact(String id, String expectedContentHash) {
         expect(send(authedDelete(id, expectedContentHash)), 204, "delete " + id);
+    }
+
+    /** Returns false only when the current server refuses the deletion with its workload claim fence. */
+    boolean deleteArtifactWhenClaimAvailable(String id, String expectedContentHash) {
+        var response = send(authedDelete(id, expectedContentHash));
+        if (response.statusCode() == 500
+                && io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED.code().equals(codeOf(response.body()))) {
+            return false;
+        }
+        expect(response, 204, "delete " + id);
+        return true;
     }
 
     /**

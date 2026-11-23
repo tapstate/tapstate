@@ -48,7 +48,9 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -361,6 +363,26 @@ class ExecutionAuthorizationTest {
                 .isSameAs(failure);
         WorkloadClaim marked = claims.read(new WorkloadClaimKey(
                 "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
+        assertThat(marked.failureClaimGeneration()).isEqualTo(fence.claimGeneration());
+        assertThat(marked.failureAfterMemberLoss()).isFalse();
+    }
+
+    @Test
+    void aDeferredSnapshotPreparationFailureMarksItsCurrentRun() {
+        ExecutionFence fence = submittedRun();
+        var sink = mock(SinkWriter.class);
+        var failure = new TapstateException(ConnectorError.WRITE_FAILED,
+                Map.of("connector", "mongodb", "detail", "empty snapshot target preparation failed"), null);
+        doThrow(failure).when(sink).snapshotDelivered("orders");
+
+        try (var authorization = guard(claims)) {
+            var writer = FencedSinkWriterFactory.guarded(sink, fence, authorization);
+            assertThatThrownBy(() -> writer.snapshotDelivered("orders")).isSameAs(failure);
+        }
+
+        verify(sink).snapshotDelivered("orders");
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var marked = claims.read(key).orElseThrow().claim();
         assertThat(marked.failureClaimGeneration()).isEqualTo(fence.claimGeneration());
         assertThat(marked.failureAfterMemberLoss()).isFalse();
     }

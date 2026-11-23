@@ -65,7 +65,7 @@ class NativeAlertReadBudgetIT {
                 observer.getDatabase(storage.configurationDatabase()).getCollection("users").updateOne(new Document("_id","operator"),new Document("$set",new Document("role","read")));
                 var refused=post(http,root,"/api/alerts/configuration/list",token,Map.of("kind","RULE","limit",1),null);
                 assertThat(refused.statusCode()).as(refused.body()).isEqualTo(409);
-                assertThat(refused.body()).contains("alert.stale-action","actor-user-permission");
+                assertThat(refused.body()).contains("TS0340008","actor-user-permission");
             }
         }
     }

@@ -34,6 +34,9 @@ public interface SinkWriter extends AutoCloseable {
         return new io.tapstate.core.common.FailureFact(failure, diagnostic(failure));
     }
 
+    /** The runtime has delivered every snapshot row on this input, including an empty snapshot. */
+    default void snapshotDelivered(String stream) { }
+
     /** Closes the writer, releasing the target resource. Idempotent. */
     @Override
     void close();

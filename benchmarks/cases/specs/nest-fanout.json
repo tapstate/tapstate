@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "build-documents",
+      "operator": "nest"
+    }
+  ],
+  "inputs": {
+    "roots": {
+      "primary_key": "id",
+      "trial_rows": 2000,
+      "children_per_root": 4,
+      "incremental_initial_rows_trial_target": 75000,
+      "receives_changes": false
+    },
+    "children": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "foreign_key": "root_id",
+      "trial_rows": 8000
+    }
+  },
+  "parameters": {
+    "depth": 1,
+    "child_order": "ascending child key",
+    "paired_control": {
+      "baseline": {
+        "children_per_root": 4
+      },
+      "variant_trial": {
+        "children_per_root": 16
+      },
+      "changed_parameter": "children per root"
+    }
+  },
+  "expected": {
+    "readback": [
+      "Compare independently assembled complete child arrays for equal root counts across both arms.",
+      "Record output document bytes, peak memory and state size separately for each confirmed arm."
+    ]
+  },
+  "completion": {
+    "target_unit": "root document",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

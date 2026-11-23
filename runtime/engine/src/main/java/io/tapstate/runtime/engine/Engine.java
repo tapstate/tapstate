@@ -285,6 +285,20 @@ public final class Engine {
             }
         }
         public boolean awaitTerminal(Duration budget) { return !isLost() && awaitJob(job, budget); }
+
+        /** Waits for this exact job once cancellation has been submitted by the stop worker. */
+        public boolean awaitTerminal() {
+            if (isLost()) return false;
+            try {
+                job.getFuture().toCompletableFuture().get();
+                return true;
+            } catch (CancellationException | ExecutionException over) {
+                return true;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
         private JobFailureRegistry.Recorder failures() {
             // A processor may attach after this handle was obtained. This is a read of the original pair only.
             return JobFailureRegistry.of(member).existing(pipelineId, job.getId(), identity);
@@ -982,8 +996,7 @@ public final class Engine {
                         .merge(reading.kind(), measurement.value(), Math::max);
             }
         }
-        OperatorMapBindings bindings = member.getUserContext() == null ? null
-                : OperatorMapBindings.resolve(member, false);
+        OperatorMapBindings bindings = OperatorMapBindings.resolve(member, false);
         Map<String, NestStateReading> readings = new HashMap<>();
         var dataMembers = member.getCluster().getMembers().stream().filter(value -> !value.isLiteMember())
                 .map(value -> value.getUuid().toString()).collect(java.util.stream.Collectors.toSet());

@@ -34,15 +34,19 @@ import org.testcontainers.utility.DockerImageName;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -127,6 +131,58 @@ class MongoCachePipelineStoresIT {
             table.drop();
             assertThat(observations.updateExisting(later, 1)).isFalse();
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
+        });
+    }
+
+    @Test void aBulkObservationPreservesTheSuccessfulEntryAndReportsBothFailuresInOrder() {
+        withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE)
+                    .compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var accepted = observation(PipelineState.RUNNING);
+            var rejected = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null,
+                    AT.plusSeconds(1), List.of());
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            f.database().runCommand(new Document("collMod", collection.getNamespace().getCollectionName())
+                    .append("validator", new Document("observedAt", new Document("$ne", Date.from(rejected.observedAt())))));
+            var lostClaim = MongoCachePipelineAccess.fenced();
+
+            var failures = f.domain().writeObservations(List.of(
+                    new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), () -> { throw lostClaim; }, accepted, 1),
+                    new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), ACTIVE, accepted, 1),
+                    new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), ACTIVE, rejected, 1)));
+
+            assertThat(failures).hasSize(3);
+            assertThat(failures.get(0)).isSameAs(lostClaim);
+            assertThat(failures.get(1)).isNull();
+            assertThat(failures.get(2)).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(accepted);
+            assertThat(collection.countDocuments()).isOne();
+        });
+    }
+
+    @Test void bulkObservationRetainsTheStorageDiagnosticWhenStructureVerificationFails() {
+        withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE)
+                    .compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var sample = observation(PipelineState.RUNNING);
+            var entry = new MongoCacheDomain.ObservationWrite(SCOPE, f.fence(), ACTIVE, sample, 1);
+            var admin = f.admin().getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
+                    .append("data", new Document("failCommands", List.of("listCollections")).append("errorCode", 2)));
+            try {
+                assertThatThrownBy(() -> f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(sample, 1))
+                        .isInstanceOfSatisfying(TapstateException.class, failure ->
+                                assertThat(failure.code().code()).isEqualTo("TS0480001"));
+                assertThat(f.domain().writeObservations(List.of(entry)).getFirst())
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code().code()).isEqualTo("TS0480001");
+                            assertThat(failure.args()).containsExactly(Map.entry("detail", "MongoCommandException code=2"));
+                            assertThat(failure.getCause()).isNull();
+                        });
+            } finally {
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
         });
     }
 
@@ -308,6 +364,163 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void anUnrelatedPipelineCheckpointCommitsWhileAnotherPipelineWaitsOnTheSameClient() {
+        withFixture(f -> {
+            var healthyScope = new PipelineIntentScope(SCOPE.clusterId(), SCOPE.bindingVersion(),
+                    SCOPE.cacheIncarnation(), "shipments", SCOPE.stateGeneration());
+            var healthyKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION,
+                    healthyScope.pipelineId());
+            var healthyFence = new WorkloadClaimFence(healthyKey, f.fence().owner(), f.fence().claimGeneration(),
+                    f.fence().executionGeneration(), f.fence().topologyRevision());
+            var checkpoint = new Document(state(f.database()));
+            checkpoint.put("_id", healthyScope.pipelineId());
+            checkpoint.put("scope", header(healthyScope));
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).insertOne(checkpoint);
+            var healthyClaim = new Document(claim(f.database()));
+            healthyClaim.put("_id", MongoWorkloadClaimStore.id(healthyKey));
+            healthyClaim.put("resourceId", healthyScope.pipelineId());
+            healthyClaim.put("pipelineScope", header(healthyScope));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).insertOne(healthyClaim);
+
+            var held = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var stalled = new AtomicBoolean();
+            var healthyEntered = new CountDownLatch(1);
+            var healthyCompleted = new CountDownLatch(1);
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (isUpdate(event, "pipeline_state") && SCOPE.pipelineId().equals(event.getCommand()
+                            .getArray("updates").get(0).asDocument().getDocument("q").getString("_id").getValue())
+                            && stalled.compareAndSet(false, true)) {
+                        held.countDown();
+                        await(release);
+                    }
+                }
+            };
+            try (var observed = client(listener); var workers = Executors.newFixedThreadPool(2)) {
+                var database = observed.getDatabase(f.database().getName());
+                var slowStates = new MongoCachePipelineStateStore(
+                        new MongoCachePipelineAccess(observed, database, SCOPE, f.fence(), ACTIVE), new MongoStructureProof());
+                var healthyStates = new MongoCachePipelineStateStore(
+                        new MongoCachePipelineAccess(observed, database, healthyScope, healthyFence, ACTIVE), new MongoStructureProof());
+                var slow = workers.submit(() -> slowStates.compareAndSwap(SCOPE.pipelineId(), 0, "RUNNING", AT));
+                try {
+                    assertThat(held.await(10, TimeUnit.SECONDS)).isTrue();
+                    var healthy = workers.submit(() -> {
+                        healthyEntered.countDown();
+                        try { return healthyStates.compareAndSwap(healthyScope.pipelineId(), 0, "RUNNING", AT); }
+                        finally { healthyCompleted.countDown(); }
+                    });
+                    try {
+                        assertThat(healthyEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                        boolean completedBeforeRelease = healthyCompleted.await(2, TimeUnit.SECONDS);
+                        System.out.println("CHECKPOINT_PIPELINE_ISOLATION healthyCompletedBeforeRelease=" + completedBeforeRelease);
+                        assertThat(completedBeforeRelease)
+                                .as("an independent Pipeline checkpoint must commit while the other Pipeline remains stalled")
+                                .isTrue();
+                        assertThat(healthy.get(5, TimeUnit.SECONDS)).isInstanceOf(CasOutcome.Applied.class);
+                        assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database())
+                                .find(new Document("_id", healthyScope.pipelineId())).first()).containsEntry("stateJson", "RUNNING");
+                    } finally {
+                        release.countDown();
+                        assertThat(healthy.get(15, TimeUnit.SECONDS)).isInstanceOf(CasOutcome.Applied.class);
+                        System.out.println("CHECKPOINT_PIPELINE_ISOLATION healthyCommittedAfterRelease=true");
+                    }
+                } finally {
+                    release.countDown();
+                    assertThat(slow.get(15, TimeUnit.SECONDS)).isInstanceOf(CasOutcome.Applied.class);
+                }
+            }
+        });
+    }
+
+    @Test void aMultiPipelineWaitUsesStableOrderAndReleasesItsLanesWhenInterrupted() throws Exception {
+        var client = mock(MongoClient.class);
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var waitingThread = new AtomicReference<Thread>();
+        try (var workers = Executors.newFixedThreadPool(3)) {
+            var owner = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "orders", () -> {
+                held.countDown(); await(release); return true;
+            }));
+            Future<Boolean> waiting = null;
+            try {
+                assertThat(held.await(5, TimeUnit.SECONDS)).isTrue();
+                waiting = waitForBothCheckpointLanes(workers, client, waitingThread);
+                Thread waiter = awaitCheckpointLaneWait(waitingThread);
+                var independent = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "shipments", () -> true));
+                assertThat(independent.get(2, TimeUnit.SECONDS)).isTrue();
+                waiter.interrupt();
+                assertThat(waiting.get(5, TimeUnit.SECONDS)).isFalse();
+                var afterInterruption = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "shipments", () -> true));
+                assertThat(afterInterruption.get(2, TimeUnit.SECONDS)).isTrue();
+            } finally {
+                if (waiting != null) waiting.cancel(true);
+                release.countDown();
+                assertThat(owner.get(15, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    @Test void interruptingAMultiPipelineWaitReleasesItsAlreadyAcquiredLane() throws Exception {
+        var client = mock(MongoClient.class);
+        var held = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var waitingThread = new AtomicReference<Thread>();
+        var contenderThread = new AtomicReference<Thread>();
+        try (var workers = Executors.newFixedThreadPool(3)) {
+            var owner = workers.submit(() -> MongoCachePipelineStateStore.writeTransaction(client, "shipments", () -> {
+                held.countDown(); await(release); return true;
+            }));
+            Future<Boolean> waiting = null;
+            Future<Boolean> contender = null;
+            try {
+                assertThat(held.await(5, TimeUnit.SECONDS)).isTrue();
+                waiting = waitForBothCheckpointLanes(workers, client, waitingThread);
+                Thread waiter = awaitCheckpointLaneWait(waitingThread);
+                contender = workers.submit(() -> {
+                    contenderThread.set(Thread.currentThread());
+                    return MongoCachePipelineStateStore.writeTransaction(client, "orders", () -> true);
+                });
+                awaitCheckpointLaneWait(contenderThread);
+                assertThat(contender.isDone()).as("the multi-Pipeline caller already holds orders").isFalse();
+                waiter.interrupt();
+                assertThat(waiting.get(5, TimeUnit.SECONDS)).isFalse();
+                assertThat(contender.get(2, TimeUnit.SECONDS)).isTrue();
+            } finally {
+                if (waiting != null) waiting.cancel(true);
+                if (contender != null) contender.cancel(true);
+                release.countDown();
+                assertThat(owner.get(15, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    private static Future<Boolean> waitForBothCheckpointLanes(ExecutorService workers, MongoClient client,
+            AtomicReference<Thread> waitingThread) {
+        return workers.submit(() -> {
+            waitingThread.set(Thread.currentThread());
+            try {
+                return MongoCachePipelineStateStore.writeTransaction(client,
+                        List.of("shipments", "orders", "shipments"), () -> true);
+            } catch (TapstateException failure) {
+                assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                assertThat(Thread.currentThread().isInterrupted()).isTrue();
+                return false;
+            }
+        });
+    }
+
+    private static Thread awaitCheckpointLaneWait(AtomicReference<Thread> thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        Thread waiting;
+        while ((waiting = thread.get()) == null || waiting.getState() != Thread.State.WAITING) {
+            if (System.nanoTime() >= deadline) throw new AssertionError("caller did not wait for the held checkpoint lane");
+            Thread.sleep(1);
+        }
+        return waiting;
+    }
+
     @Test void delayedObservationCanWriteItsOwnRecordButCannotCrossAStopOrReplacement() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
@@ -344,6 +557,83 @@ class MongoCachePipelineStoresIT {
                 store.save(observation(PipelineState.RUNNING), 1);
                 assertThat(f.domain().pipelineObservations(scope(2)).read("orders")).isEmpty();
                 assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).countDocuments()).isEqualTo(2);
+            }
+        });
+    }
+
+    @Test void observationHousekeepingHasOneBoundedBatchAndCannotEraseARecreatedScope() {
+        withFixture(f -> {
+            var rows = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            for (long epoch = 1; epoch <= 64; epoch++) {
+                rows.insertOne(new Document("_id", new Document("scope", header(SCOPE)).append("epoch", epoch)));
+            }
+            replaceScope(f.database(), scope(2));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                    new Document("$set", new Document("pipelineScope", header(scope(2)))));
+            var paused = new CountDownLatch(1);
+            var proceed = new CountDownLatch(1);
+            var firstDelete = new AtomicBoolean(true);
+            var finds = new AtomicInteger();
+            var batches = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!event.getDatabaseName().equals(f.database().getName())
+                            || !Thread.currentThread().getName().equals("tapstate-observation-reap")) return;
+                    var command = event.getCommand();
+                    if (event.getCommandName().equals("find")) {
+                        assertThat(command.getNumber("limit").intValue()).isEqualTo(32);
+                        finds.incrementAndGet();
+                    } else if (event.getCommandName().equals("delete")) {
+                        batches.add(command.getArray("deletes").getFirst().asDocument().getDocument("q")
+                                .getDocument("_id").getArray("$in").size());
+                        if (firstDelete.compareAndSet(true, false)) { paused.countDown(); await(proceed); }
+                    }
+                }
+            };
+            try (var observed = client(listener)) {
+                var database = observed.getDatabase(f.database().getName());
+                var predecessor = new MongoCachePipelineObservationStore(new MongoCachePipelineAccess(observed,
+                        database, scope(2), f.fence(), ACTIVE));
+                try {
+                    // The cadence counter is process-wide. Each attempt advances a full 64-save interval.
+                    awaitCleanup(() -> {
+                        for (int i = 0; i < 64; i++) predecessor.save(observation(PipelineState.RUNNING), 1);
+                        return paused.getCount() == 0;
+                    });
+                    assertThat(finds).hasValue(1);
+                    var stale = new Document("_id.scope", header(SCOPE));
+                    for (int i = 0; i < 10; i++) MongoCachePipelineObservationStore.reap(database, stale);
+                    assertThat(finds).hasValue(1);
+                    var current = rows.find(new Document("_id.scope", header(scope(2)))).first();
+                    assertThat(current).isNotNull();
+                    var successor = Document.parse(current.toJson());
+                    successor.get("_id", Document.class).put("scope", header(scope(3)));
+                    var neighbor = Document.parse(current.toJson());
+                    neighbor.get("_id", Document.class).get("scope", Document.class).put("pipelineId", "neighbor");
+                    neighbor.put("pipelineId", "neighbor");
+                    rows.insertMany(List.of(successor, neighbor));
+                    replaceScope(f.database(), scope(3));
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                            new Document("$set", new Document("pipelineScope", header(scope(3)))));
+                    proceed.countDown();
+                    awaitCleanup(() ->
+                            rows.countDocuments(new Document("_id.scope", header(SCOPE))) == 32);
+                    assertThat(batches).containsExactly(32);
+                    assertThat(rows.find(new Document("_id", successor.get("_id"))).first()).isEqualTo(successor);
+                    assertThat(rows.find(new Document("_id", neighbor.get("_id"))).first()).isEqualTo(neighbor);
+                    var writer = new MongoCachePipelineObservationStore(new MongoCachePipelineAccess(observed,
+                            database, scope(3), f.fence(), ACTIVE));
+                    awaitCleanup(() -> {
+                        for (int i = 0; i < 64; i++) writer.save(observation(PipelineState.RUNNING), 1);
+                        return rows.countDocuments(new Document("_id.scope.pipelineId", "orders")
+                                .append("_id.scope.stateGeneration", new Document("$lt", 3))) == 0;
+                    });
+                    assertThat(batches).containsExactly(32, 32, 1);
+                    System.out.println("OBSERVATION_CLEANUP batches=" + batches + " successorKept=true neighborKept=true singleFlight=true");
+                    assertThat(rows.countDocuments()).isEqualTo(2);
+                    assertThat(rows.find(new Document("_id", successor.get("_id"))).first()).isEqualTo(successor);
+                    assertThat(rows.find(new Document("_id", neighbor.get("_id"))).first()).isEqualTo(neighbor);
+                } finally { proceed.countDown(); }
             }
         });
     }
@@ -654,6 +944,14 @@ class MongoCachePipelineStoresIT {
             assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
         });
+    }
+
+    private static void awaitCleanup(java.util.function.BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() >= deadline) throw new AssertionError("Observation cleanup did not finish within its test budget");
+            Thread.sleep(20);
+        }
     }
 
     private static String readerOutput(Process process) throws Exception {

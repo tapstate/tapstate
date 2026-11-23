@@ -140,6 +140,28 @@ class ScopedConvergenceTest {
         assertThat(actuator.calls()).containsExactly("stop:orders:purge");
     }
 
+    @Test void trackedPurgeWaitsForTheOriginalLiveJobDespiteAnAlreadyStoppedRecord() {
+        prepare(PipelineState.STOPPED);
+        var clearing = new PipelineIntentSnapshot(SCOPE, 3,
+                new DesiredState("orders", PipelineState.STOPPED, "original", true));
+        var running = new AtomicBoolean(true);
+        var stoppedBeforeClearing = new AtomicBoolean();
+        var enteredClear = new AtomicBoolean();
+        var runtime = new ForwardingActuator(actuator) {
+            @Override public void stop(String id, boolean purge) { running.set(false); }
+            @Override public void clearStopped(String id) {
+                enteredClear.set(true);
+                stoppedBeforeClearing.set(!running.get());
+            }
+            @Override public boolean isCarryingAJob(String id) { return running.get(); }
+        };
+
+        converger.convergeScoped(clearing, state, runtime, RebuildAdmission.never(), ignored -> {}, () -> true, true);
+
+        assertThat(enteredClear).isTrue();
+        assertThat(stoppedBeforeClearing).as("the original job exited before clearing retained state").isTrue();
+    }
+
     @ParameterizedTest
     @EnumSource(value = PipelineState.class, names = {"STOPPED", "RUNNING", "FAILED"})
     void aClearingStartCannotMistakeAnEarlierStopsStateCasForCompletedReplacement(PipelineState movedState) {

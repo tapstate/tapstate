@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "graph": [],
+  "inputs": {
+    "records": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers"
+    }
+  },
+  "parameters": {
+    "allow_manual_mix_override": true,
+    "preparation": "Preload a single deterministic source collection.",
+    "backlog_boundary_witness": "Use distinct resume positions for insert, update and delete sharing a timestamp, and exclude an earlier event from the same collection. Verify the sequence and readback independently."
+  },
+  "expected": {
+    "readback": [
+      "Compare every independently expected source key and value with the target.",
+      "Apply the source event sequence to the reference rows and check inserts, updated values, and absence after deletes.",
+      "For wide and large snapshots, record load, snapshot, drain and idle memory samples using each profile's own scale."
+    ]
+  },
+  "completion": {
+    "target_unit": "target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

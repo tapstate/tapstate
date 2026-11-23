@@ -191,6 +191,99 @@ class BoundedPipelinePreviewIT {
         }
     }
 
+    @Test
+    void reportsDroppedCompositeAssociationKeysThroughThePreviewApi(@TempDir Path directory) throws Exception {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectory(directory.resolve("source"));
+            Files.writeString(source.resolve("bmsql_oorder.csv"), """
+                    o_id,o_w_id,o_d_id,o_c_id
+                    order-1,w1,d2,c3
+                    """);
+            Files.writeString(source.resolve("bmsql_customer.csv"), """
+                    customer_id,c_w_id,c_d_id,c_id,c_name,c_credit
+                    row-1,w1,d2,c3,Matched,500
+                    row-2,w9,d2,c3,Other warehouse,20
+                    """);
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+
+            for (String field : List.of("c_w_id", "c_d_id", "c_id")) {
+                List<Map<String, Object>> rejected = previewCompositeAssociation(control, source,
+                        "c_credit: false, " + field + ": false", "en");
+                assertThat(rejected).extracting(event -> event.get("kind"))
+                        .as("invalid candidate events: %s", rejected)
+                        .containsExactly("run.accepted", "compile.completed", "run.failed");
+                assertThat(payload(rejected, "run.failed"))
+                        .containsEntry("code", "TS0360036")
+                        .containsEntry("params", Map.of("relation", "customer", "field", field,
+                                "transform", "customer__pre", "droppedField", field));
+            }
+
+            String dropped = "c_credit: false, c_d_id: false";
+            var simplified = payload(previewCompositeAssociation(control, source, dropped, "zh-CN"), "run.failed");
+            var traditional = payload(previewCompositeAssociation(control, source, dropped, "zh-TW"), "run.failed");
+            var expected = Map.of("relation", "customer", "field", "c_d_id",
+                    "transform", "customer__pre", "droppedField", "c_d_id");
+            assertThat(simplified).containsEntry("code", "TS0360036").containsEntry("params", expected);
+            assertThat(traditional).containsEntry("code", "TS0360036").containsEntry("params", expected);
+            assertThat((String) simplified.get("reason")).contains("\u5173\u8054\u952e", "c_d_id");
+            assertThat((String) traditional.get("reason")).contains("\u95dc\u806f\u9375", "c_d_id");
+
+            List<Map<String, Object>> restored = previewCompositeAssociation(control, source, "c_credit: false", null);
+            assertThat(restored).extracting(event -> event.get("kind"))
+                    .as("restored candidate events: %s", restored)
+                    .endsWith("result.completed", "run.completed");
+            Map<?, ?> order = documentBy(documents(payload(restored, "result.completed")), "o_id", "order-1");
+            assertThat(order.get("c_name")).isEqualTo("Matched");
+            assertThat(order.containsKey("c_credit")).isFalse();
+        }
+    }
+
+    private static List<Map<String, Object>> previewCompositeAssociation(
+            ControlPlane control, Path source, String fields, String language) {
+        String sourceDraft = """
+                version: tapstate/v1
+                kind: source
+                id: preview_source
+                connector: e2e_file
+                config: { uri: "%s" }
+                mode: cdc
+                tables: [ bmsql_oorder, bmsql_customer ]
+                """.formatted(source);
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: preview_pipeline
+                source: preview_source
+                transforms:
+                  - id: customer__pre
+                    from: [ bmsql_customer ]
+                    type: map
+                    fields: { %s }
+                  - id: order_tree
+                    type: nest
+                    from: { root: bmsql_oorder, customer: customer__pre }
+                    root:
+                      from: root
+                      key: [ o_id ]
+                      embed:
+                        - from: customer
+                          on: { c_w_id: o_w_id, c_d_id: o_d_id, c_id: o_c_id }
+                          key: [ c_w_id, c_d_id, c_id ]
+                          as: flat
+                view:
+                  id: preview_view
+                  from: order_tree
+                  primary_key: o_id
+                """.formatted(fields);
+        return control.preview(PIPELINE_ID, OUTPUT_ID, 1, SAMPLE_ID + "-composite",
+                List.of(new ControlPlane.PreviewDraft("source.tap.yml", sourceDraft),
+                        new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline)), language);
+    }
+
     private static void assertSampleAndCache(ControlPlane control, Path source) throws Exception {
         List<ControlPlane.PreviewDraft> drafts = List.of(
                 new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),

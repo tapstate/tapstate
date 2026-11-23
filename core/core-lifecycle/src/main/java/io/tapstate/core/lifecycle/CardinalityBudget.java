@@ -252,6 +252,17 @@ public enum CardinalityBudget {
         private Folder() {
         }
 
+        /** Copies bounded naming state so a consumer can commit it with an accepted observation. */
+        public Folder copy() {
+            var copy = new Folder();
+            named.forEach((instrument, pipelines) -> {
+                var copiedPipelines = new HashMap<String, Set<String>>();
+                pipelines.forEach((pipeline, values) -> copiedPipelines.put(pipeline, new HashSet<>(values)));
+                copy.named.put(instrument, copiedPipelines);
+            });
+            return copy;
+        }
+
         /**
          * Gives up what is remembered for every pipeline outside {@code pipelineIds}.
          *

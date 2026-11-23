@@ -1099,6 +1099,7 @@ class StoreBackedSinkAckFactoryTest {
         assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
                 .as("while serve.t still holds the table back from being recorded as loaded")
                 .isEmpty();
+        assertThat(factory.completedSnapshotInputs(member, java.util.Set.of("orders"))).isEmpty();
     }
 
     /** A load recorded as landed has landed, in a later run whose writers have said nothing yet. */
@@ -1114,6 +1115,7 @@ class StoreBackedSinkAckFactoryTest {
 
         assertThat(factory.loadLandings(member).stillLanding(
                 List.of(new AwaitedLoad("serve.s", "orders", List.of(WRITER))))).isEmpty();
+        assertThat(factory.completedSnapshotInputs(member, java.util.Set.of("orders"))).containsExactly("orders");
     }
 
     /** A table whose load the pipeline does not read at all has none in flight for a change to overtake. */

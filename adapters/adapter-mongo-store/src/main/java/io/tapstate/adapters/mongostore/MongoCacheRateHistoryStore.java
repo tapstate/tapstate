@@ -28,12 +28,22 @@ final class MongoCacheRateHistoryStore implements RateHistoryStore {
     }
 
     @Override public void append(RateSample sample) {
+        var captured = capture(sample);
+        transaction(true, session -> { rows.insertOne(session, new Document(captured)); return null; });
+    }
+
+    @Override public void appendWithin(RateSample sample, Duration timeout) {
+        var captured = capture(sample);
+        access.appendRateSample(timeout, session -> { rows.insertOne(session, new Document(captured)); return null; });
+    }
+
+    private Document capture(RateSample sample) {
         Objects.requireNonNull(sample, "sample"); access.requirePipeline(sample.pipelineId());
         // Identity and bytes belong to this invocation, including every transaction retry.
         Document captured = MongoRateHistoryStore.toDocument(sample).append("_id", new ObjectId())
                 .append("scope", MongoPipelinePreparationFacts.scope(access.scope));
         decode(captured);
-        transaction(true, session -> { rows.insertOne(session, new Document(captured)); return null; });
+        return captured;
     }
 
     @Override public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
@@ -91,6 +101,6 @@ final class MongoCacheRateHistoryStore implements RateHistoryStore {
     private static Document order(int direction) { return new Document("observedAt", direction).append("_id", direction); }
     private TapstateException unreadable() { return access.unreadable("rate-history"); }
     private <T> T transaction(boolean mutation, java.util.function.Function<ClientSession, T> action) {
-        return access.metadataTransaction(SystemCollections.CACHE_PIPELINE_RATE_HISTORY, mutation, action);
+        return access.rateHistoryTransaction(mutation, action);
     }
 }
