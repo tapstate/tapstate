@@ -448,11 +448,11 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
     }
 
     private <T> T transaction(PipelineIntentScope scope, boolean admission, Runnable originalActive, Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
+        java.util.function.Supplier<T> work = () -> StoreIo.call(() -> {
             try {
                 requireActive.run(); originalActive.run();
-                try (var session = client.startSession()) {
-                    T result = session.withTransaction(() -> {
+                var owner = admission ? MongoCacheAdmissionQueue.operations(client) : null;
+                T result = MongoCacheAdmissionQueue.driverTransaction(client, owner, TRANSACTION, session -> {
                         requireActive.run(); originalActive.run();
                         var identity = new MongoCacheBusinessIdentity(database, business);
                         if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
@@ -466,11 +466,13 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
                         T value = action.apply(session);
                         requireActive.run(); originalActive.run();
                         return value;
-                    }, TRANSACTION);
-                    requireActive.run(); originalActive.run();
-                    return result;
-                }
+
+                });
+                requireActive.run(); originalActive.run();
+                return result;
             } catch (RuntimeException failure) { requireActive.run(); originalActive.run(); throw failure; }
         });
+        return admission ? MongoCacheAdmissionQueue.first(client, database.getName(), business,
+                () -> { requireActive.run(); originalActive.run(); }, work) : work.get();
     }
 }

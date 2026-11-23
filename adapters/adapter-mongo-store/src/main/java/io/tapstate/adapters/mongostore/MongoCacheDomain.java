@@ -450,6 +450,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
         claimOperations.requireAdmission();
         loadBusinessScope(expected);
+        MongoCacheAdmissionQueue.bind(client, database.getName(), expected, claimOperations);
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive, null,
                 claimOperations, this::nodeSessionClient);
     }
@@ -592,12 +593,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     /** Controlled first preparation retains this exact cache domain and caller lifecycle. */
     public io.tapstate.spi.store.PipelineCachePreparations pipelinePreparations(CacheBusinessScope expected, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
+        MongoCacheAdmissionQueue.bind(client, database.getName(), expected, claimOperations);
         return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); });
     }
 
     /** The native member has already verified the business collections during storage admission. */
     public io.tapstate.spi.store.PipelineCachePreparations admittedPipelinePreparations(CacheBusinessScope expected, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
+        MongoCacheAdmissionQueue.bind(client, database.getName(), expected, claimOperations);
         return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); }, true);
     }
 
@@ -1010,6 +1013,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     @Override public synchronized void close() {
         if(connectionClosed)return;
         claimOperations.closeIfIdle();
+        MongoCacheAdmissionQueue.unbind(client);
         closed.set(true);
         if (nodeSessionClient != null) nodeSessionClient.close();
         connection.close();

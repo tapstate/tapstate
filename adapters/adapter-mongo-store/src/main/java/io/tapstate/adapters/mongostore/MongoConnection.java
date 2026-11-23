@@ -312,6 +312,7 @@ public final class MongoConnection implements AutoCloseable {
         this.database = opened.getDatabase(databaseName);
         for (var listener : clientSettings.getCommandListeners()) {
             if (listener instanceof MongoStructureFailureScope.CommandObserver observer) observer.bind(opened);
+            if (listener instanceof MongoCacheAdmissionQueue.Observer observer) observer.bind(opened);
         }
         this.client = opened;
         this.verifiedSettings = clientSettings;
@@ -434,6 +435,7 @@ public final class MongoConnection implements AutoCloseable {
         MongoClientSettings.Builder builder = MongoClientSettings.builder()
                 .addCommandListener(MongoCommandObservation.LISTENER)
                 .addCommandListener(new MongoStructureFailureScope.CommandObserver())
+                .addCommandListener(new MongoCacheAdmissionQueue.Observer())
                 .addCommandListener(MongoStructureFailureScope.listener(() -> client, () -> database,
                         explicitDatabase != null ? SystemCollections.Database.CACHE
                                 : strictStorage ? SystemCollections.Database.CONFIG : SystemCollections.Database.STORE))

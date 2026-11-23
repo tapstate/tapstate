@@ -239,7 +239,7 @@ final class MongoClaimOperations {
             throw new TapstateException(IoError.STORE_UNAVAILABLE,
                     java.util.Map.of("detail", "original consumer snapshot pin still in progress"), null);
         }
-        var call = new Call<>(deadline, guard, action, false, null, key);
+        var call = new Call<>(deadline, guard, action, false, null, key, null);
         calls.add(call);
         try {
             snapshotPins.execute(call);
@@ -297,7 +297,7 @@ final class MongoClaimOperations {
                     : activeRenewals.size() >= MAX_RENEWALS || !activeRenewals.add(key))) throw renewalBusy();
             if (key == null) unkeyedRenewal = true;
         }
-        var call = new Call<T>(deadline, guard, action, renewal, key, null);
+        var call = new Call<T>(deadline, guard, action, renewal, key, null, lane == workers ? MongoCacheAdmissionQueue.current(client) : null);
         calls.add(call);
         try { lane.execute(call); }
         catch (java.util.concurrent.RejectedExecutionException rejected) {
@@ -360,10 +360,14 @@ final class MongoClaimOperations {
         private final long callerThread = diagnosticId == 0 ? 0 : Thread.currentThread().threadId();
 
         private Call(long deadline, Runnable guard, Supplier<T> action, boolean renewal,
-                WorkloadClaimKey reservedKey, SrsConsumerKey pinKey) {
+                WorkloadClaimKey reservedKey, SrsConsumerKey pinKey, MongoCacheAdmissionQueue.Ticket admission) {
             this.deadline = deadline;this.guard=guard;this.action = action;this.renewal=renewal;this.reservedKey=reservedKey;
             this.pinKey = pinKey;
+            this.admission = admission;
+            if (admission != null) admission.retainCall();
         }
+
+        private final MongoCacheAdmissionQueue.Ticket admission;
 
         void cancelPending() {
             if (state.compareAndSet(0, 2)) {
@@ -384,10 +388,12 @@ final class MongoClaimOperations {
                 }
                 MongoClaimOperations.this.notifyAll();
             }
+            if (admission != null) admission.callFinished();
         }
 
         @Override public void run() {
             if (!state.compareAndSet(0, 1)) return;
+            var previousAdmission = MongoCacheAdmissionQueue.install(admission);
             long startedAt = diagnosticId == 0 ? 0 : System.nanoTime();
             MongoHttpDiagnosticsScope diagnostics = null;
             java.util.Map<String, Object> measured = null;
@@ -409,6 +415,7 @@ final class MongoClaimOperations {
             } catch (Throwable failed) { failure=failed; }
             finally {
                 current.remove();active.remove();
+                MongoCacheAdmissionQueue.restore(previousAdmission);
                 try { if (diagnostics != null) measured = diagnostics.snapshot(); }
                 finally {
                     try { if (diagnostics != null) diagnostics.close(); }
@@ -440,6 +447,7 @@ final class MongoClaimOperations {
     final class Transaction {
         private final ClientSession session;
         private final MongoClient originalClient;
+        private final MongoCacheAdmissionQueue.Ticket admission;
         private final WorkloadClaimKey renewalKey = MongoClaimOperations.this.renewalKey.get();
         private long number;
         private BsonDocument recoveryToken;
@@ -449,10 +457,16 @@ final class MongoClaimOperations {
         private boolean callbackReturned;
         private boolean released;
         private boolean closeAttempted;
+        private boolean commitAcknowledged;
+        private boolean legacyAdmission;
+        private boolean driverWireStarted;
+        private boolean driverEndObserved;
 
         private Transaction(ClientSession session, MongoClient originalClient) {
             this.session = session;
             this.originalClient = originalClient;
+            admission = MongoCacheAdmissionQueue.current(originalClient);
+            if (admission != null) admission.retainTransaction(this, deadline -> recoverAdmission(this, deadline));
         }
 
         void capture() {
@@ -461,6 +475,8 @@ final class MongoClaimOperations {
             if(!captured) {
                 number = session.getServerSession().getTransactionNumber();
                 captured=true;
+                if (legacyAdmission && admission != null)
+                    MongoCacheAdmissionQueue.observe(this, originalClient, session.getServerSession().getIdentifier(), number);
             }
             var token = session.getRecoveryToken();
             if (token != null) recoveryToken = token.clone();
@@ -468,6 +484,21 @@ final class MongoClaimOperations {
         boolean ended() { return ended; }
         boolean released() { return released; }
         boolean closeAttempted() { return closeAttempted; }
+        void observeDriverAttempt() {
+            captured = false; recoveryToken = null; driverWireStarted = false; driverEndObserved = false; commitAcknowledged = false;
+            capture();
+        }
+        void driverCommandStarted(long expected) { if (number == expected) driverWireStarted = true; }
+        void driverEnded(long expected, boolean committed, int code) {
+            if (number != expected || code == 251 && (recoveryToken == null || recoveryToken.isEmpty()) && (routed || !replicaSet)) return;
+            driverEndObserved = true;
+            if (committed) commitAcknowledged = true;
+        }
+        boolean driverProvedEnded() {
+            boolean proved = driverEndObserved || MongoCacheAdmissionQueue.observes(originalClient) && !driverWireStarted;
+            if (proved) ended = true;
+            return proved;
+        }
         void beginAttempt() {
             if(callbackReturned&&!ended)throw new RetryAfterCommit();
             captured=false;ended=false;callbackReturned=false;recoveryToken=null;
@@ -484,16 +515,43 @@ final class MongoClaimOperations {
         return transaction;
     }
 
+    synchronized Transaction ownAdmissionSession(ClientSession session, MongoClient originalClient) {
+        try { requireAdmission(); var owned = own(session, originalClient); owned.legacyAdmission = true; return owned; }
+        catch (RuntimeException | Error failure) {
+            try { session.close(); } catch (RuntimeException | Error close) { if (close != failure) failure.addSuppressed(close); }
+            throw failure;
+        }
+    }
+
+    void acknowledged(Transaction transaction) {
+        transaction.commitAcknowledged = true;
+        committed(transaction);
+    }
+
     void committed(Transaction transaction) {
         transaction.ended=true;
         if(current.get()!=null)current.get().remainingMillis();
         transaction.closeAttempted=true;
         transaction.session.close();
+        boolean previouslyReleased = transaction.released;
         transaction.released=true;
+        MongoCacheAdmissionQueue.forget(transaction);
         synchronized (this) {
             transactions.remove(transaction);
             notifyAll();
         }
+        if (!previouslyReleased && transaction.admission != null) transaction.admission.transactionFinished(transaction, transaction.commitAcknowledged);
+    }
+
+    private void recoverAdmission(Transaction transaction, long deadline) {
+        Call<Void> cleanup;
+        synchronized (transaction) {
+            if (!transactions.contains(transaction)) return;
+            if (transaction.cleanup == null || transaction.cleanup.result.isDone())
+                transaction.cleanup = submit(deadline, () -> {}, () -> { abort(transaction, budget()); return null; }, true, workers, null);
+            cleanup = transaction.cleanup;
+        }
+        result(cleanup, deadline);
     }
 
     /** A driver callback restart after commit first reconciles the previous exact transaction. */

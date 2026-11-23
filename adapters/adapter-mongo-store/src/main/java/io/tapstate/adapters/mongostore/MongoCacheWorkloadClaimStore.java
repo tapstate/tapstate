@@ -83,6 +83,19 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return StoreIo.call(() -> operations.call(deadline,active,operation));
     }
 
+    @Override public <T> T withClaimAcquisition(WorkloadClaimKey key, Runnable active, java.util.function.Supplier<T> operation) {
+        if (key.type() == WorkloadClaimType.NODE_SESSION || validation != null) { active.run(); return operation.get(); }
+        return MongoCacheAdmissionQueue.other(client, database.getName(), scope, Long.MAX_VALUE,
+                () -> { requireActive.run(); active.run(); }, operation);
+    }
+
+    @Override public <T> T withClaimAcquisitionDeadline(WorkloadClaimKey key, long deadline, Runnable active,
+            java.util.function.Supplier<T> operation) {
+        if (key.type() == WorkloadClaimType.NODE_SESSION || validation != null) return withDeadline(deadline, active, operation);
+        return MongoCacheAdmissionQueue.other(client, database.getName(), scope, deadline,
+                () -> { requireActive.run(); active.run(); }, () -> withDeadline(deadline, active, operation));
+    }
+
     @Override public <T> T withRenewalDeadline(long deadline,Runnable active,java.util.function.Supplier<T> operation) {
         return StoreIo.call(() -> operations.renew(deadline,active,operation));
     }
@@ -588,8 +601,9 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 }
                 for (int attempt = 0; ; attempt++) {
                     T committed;
-                    try (var session = client.startSession()) {
-                        committed = session.withTransaction(() -> checkedAttempt(session, null, callback), TRANSACTION);
+                    try {
+                        committed = MongoCacheAdmissionQueue.driverTransaction(client, operations, TRANSACTION,
+                                session -> checkedAttempt(session, null, callback));
                     } catch (MongoException conflict) {
                         // A duplicate-key error aborts its transaction; retry the original callback,
                         // never keep using that session or adopt another scope.
@@ -670,7 +684,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true))
                         .timeout(budget.remainingMillis(),java.util.concurrent.TimeUnit.MILLISECONDS).build());
                 committedAck=true;
-                operations.committed(owned);
+                operations.acknowledged(owned);
                 requireValidationAuthority();
                 budget.remainingMillis();
                 return result;
