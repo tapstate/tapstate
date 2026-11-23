@@ -19,6 +19,7 @@ class DefaultCopyPrimaryKeyUpdateIT {
     private static final String COMPOSITE = "mysql_ACC_COMPOSITE";
     private static final String OTHER = "mysql_ACC_OTHER";
     private static final Map<String, Object> ORIGINAL_KEY = Map.of("K1", 2, "K2", "k1");
+    private static final Map<String, Object> UPDATED_KEY = Map.of("K1", 2, "K2", "r1");
     private static final Map<String, Object> OTHER_KEY = Map.of("ID", 1);
 
     @Test
@@ -76,14 +77,20 @@ class DefaultCopyPrimaryKeyUpdateIT {
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
             assertThat(sql.executeUpdate("UPDATE ACC_OTHER SET STATUS='after' WHERE ID=1")).isEqualTo(1);
 
-            Await.until("the unrelated table's update to reach MongoDB after the primary-key change", () -> {
+            Await.until("the composite row to move to its new key and the unrelated update to reach MongoDB", () -> {
                 var status = control.pipelineStatus(PIPELINE);
                 var other = mongo.fetch(target, OTHER, OTHER_KEY);
                 assertThat(status.get("state"))
                         .as("pipeline status after the primary-key change %s, unrelated MongoDB row %s", status, other)
                         .isNotEqualTo(PipelineState.FAILED.name());
-                return other.filter(row -> "after".equals(row.get("STATUS"))).isPresent();
-            }, () -> control.pipelineStatus(PIPELINE) + " unrelated MongoDB row " + mongo.fetch(target, OTHER, OTHER_KEY));
+                return mongo.fetch(target, COMPOSITE, UPDATED_KEY)
+                        .filter(row -> "21".equals(String.valueOf(row.get("VAL")))).isPresent()
+                        && mongo.fetch(target, COMPOSITE, ORIGINAL_KEY).isEmpty()
+                        && other.filter(row -> "after".equals(row.get("STATUS"))).isPresent();
+            }, () -> control.pipelineStatus(PIPELINE)
+                    + " composite row at original key " + mongo.fetch(target, COMPOSITE, ORIGINAL_KEY)
+                    + " composite row at updated key " + mongo.fetch(target, COMPOSITE, UPDATED_KEY)
+                    + " unrelated MongoDB row " + mongo.fetch(target, OTHER, OTHER_KEY));
         }
     }
 }
