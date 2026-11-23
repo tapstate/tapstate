@@ -347,6 +347,8 @@ final class ValidationPipelineInitials implements SourceInitialLoadObserver, Aut
             actual.bounded(stream, through, fence);
             if (attempt != null && through.seq() == SourceOrder.SNAPSHOT_SEQ) service.enqueue(new Packet(original, attempt, "BOUND", stream, writer, null, through.epoch(), null, 0, null));
         }
+        @Override public void flush(boolean complete) { actual.flush(complete); }
+        @Override public void flushOnClose() { actual.flushOnClose(); }
     }
     private static final class Delivery implements Callable<Boolean>, Serializable, HazelcastInstanceAware {
         private static final long serialVersionUID = 1L; private final Packet packet; private transient HazelcastInstance member;

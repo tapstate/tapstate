@@ -27,6 +27,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
     private volatile long initialDeadline;
     private ExecutionAuthorization authorization;
     private OperatorMapBindings maps;
+    private final CheckpointProgressWrites progressWrites = new CheckpointProgressWrites();
 
     NativeMemberStorage(StorageRuntime.Bound bound, MongoConfigurationDomain configuration, ClusterProperties properties,
             WorkloadClaimStore claims, SrsStores sources) {
@@ -42,6 +43,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
                 properties.getWorkloadClaimRenewInterval(), System::nanoTime, this::nodeActive);
         config.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         config.getUserContext().put(SrsStoreViews.USER_CONTEXT_KEY, sourceViews());
+        config.getUserContext().put(CheckpointProgressWrites.USER_CONTEXT_KEY, progressWrites);
         maps = OperatorMapBindings.prepare(config, new ScopedOperatorStateProvider(bound.cache(), authorization));
         ScopedSinkStateProvider.bind(config, bound.cache(), configuration.requiredNotes());
         RequiredNestDeadLetter.bindTo(config, new ScopedRequiredDeadLetterProvider(configuration.requiredDeadLetters(), authorization));
@@ -90,9 +92,13 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
         };
     }
     @Override public synchronized void close() {
-        if (closed) return; closed = true;
+        if (closed) return;
+        closed = true;
         Throwable failure = null;
-        try { if (maps != null) maps.close(); } catch (RuntimeException | Error cleanup) { failure = cleanup; }
+        try { progressWrites.close(); } catch (RuntimeException | Error cleanup) { failure = cleanup; }
+        try { if (maps != null) maps.close(); } catch (RuntimeException | Error cleanup) {
+            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+        }
         try { if (authorization != null) authorization.close(); } catch (RuntimeException | Error cleanup) {
             if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
         }

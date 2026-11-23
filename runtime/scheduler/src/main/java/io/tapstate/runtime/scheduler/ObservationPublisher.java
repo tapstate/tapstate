@@ -990,8 +990,13 @@ public final class ObservationPublisher {
                 return Optional.empty();
             }
             if (measuredSuccessfully) {
-                coldLayer.saw(pipelineId, readings);
-                frontierStall.saw(pipelineId, pinned, gaps);
+                var committedReadings = readings;
+                var committedPinned = pinned;
+                var committedGaps = gaps;
+                observations.afterSave(() -> {
+                    coldLayer.saw(pipelineId, committedReadings);
+                    frontierStall.saw(pipelineId, committedPinned, committedGaps);
+                });
             }
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.

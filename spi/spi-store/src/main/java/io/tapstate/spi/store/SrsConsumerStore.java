@@ -106,6 +106,19 @@ public interface SrsConsumerStore {
     boolean advanceWriter(SrsConsumerContext context, long membershipRevision, String runId, String table, String writerId,
                           WriterProgress progress, WorkloadClaimFence originalPipelineFence);
 
+    /** Returns one ordered outcome per original report after its owning store has committed. */
+    default List<WriterProgressOutcome> advanceWriters(SrsConsumerContext context, long membershipRevision, String runId,
+            List<WriterProgressUpdate> reports, WorkloadClaimFence fence) {
+        var outcomes = new java.util.ArrayList<WriterProgressOutcome>(reports.size());
+        boolean stopped = false;
+        for (var report : reports) {
+            boolean committed = !stopped && advanceWriter(context, membershipRevision, runId, report.table(), report.writerId(), report.progress(), fence);
+            outcomes.add(new WriterProgressOutcome(committed, null));
+            if (!committed) stopped = true;
+        }
+        return List.copyOf(outcomes);
+    }
+
     /**
      * Saves the original first arrival and its initial read cursor together. A retained confirmed place is never raised by a later arrival.
      * A held place covering the requested floor succeeds without adopting a later progress revision; a new place uses only the original expected revision.

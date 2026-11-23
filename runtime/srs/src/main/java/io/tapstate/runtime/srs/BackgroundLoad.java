@@ -168,7 +168,7 @@ final class BackgroundLoad {
     }
 
     private void run() {
-        boolean normalCompletion = false;
+        boolean completed = false;
         try {
             readLoad();
             synchronized (this) {
@@ -188,7 +188,7 @@ final class BackgroundLoad {
             synchronized (this) {
                 keep = !cancelled;
                 opened = subscription.orElse(null);
-                normalCompletion = keep && !loadLetGo;
+                completed = keep;
             }
             if (!keep) {
                 // Abandoned while the tail was opening: nobody is left to close it but this thread.
@@ -202,25 +202,36 @@ final class BackgroundLoad {
                 health.fail(load.failureFact(failure));
             }
         } finally {
-            boolean deferred = false;
-            try { load.close(); }
-            catch (SnapshotSession.PendingClose pending) {
-                if (normalCompletion && !isCancelled() && pending.getSuppressed().length == 0)
-                    deferred = finishWhenClosed(pending);
-                else if (!isCancelled()) health.fail(pending);
-            }
-            catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
-            finally { if (!deferred) finished.countDown(); }
+            finishClose(completed);
         }
+    }
+
+    private void finishClose(boolean completed) {
+        boolean deferred = false;
+        try { load.close(); }
+        catch (SnapshotSession.PendingClose pending) {
+            if (completed && !isCancelled() && pending.getSuppressed().length == 0)
+                deferred = finishWhenClosed(pending);
+            else if (!isCancelled()) health.fail(pending);
+        }
+        catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
+        finally { if (!deferred) finished.countDown(); }
     }
 
     /** Observe the original cleanup attempt without another worker, read, tail or ownership transition. */
     private boolean finishWhenClosed(SnapshotSession.PendingClose pending) {
         try {
             pending.completion().whenComplete((ignored, outcome) -> {
-                try { load.close(); }
-                catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
-                finally { finished.countDown(); }
+                if (outcome == null) {
+                    finishClose(true);
+                } else {
+                    if (!isCancelled()) {
+                        Throwable original = outcome instanceof java.util.concurrent.CompletionException wrapped
+                                && wrapped.getCause() != null ? wrapped.getCause() : outcome;
+                        health.fail(original);
+                    }
+                    finished.countDown();
+                }
             });
             return true;
         } catch (RuntimeException | Error failure) {
