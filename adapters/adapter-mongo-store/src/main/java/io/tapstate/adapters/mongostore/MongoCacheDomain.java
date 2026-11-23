@@ -491,7 +491,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 new MongoSrsChainStore(client, database, expected, active, verifyStructure, lease), models,
                 new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease),
-                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(), runtime));
+                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(), runtime, claimOperations));
     }
 
     @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,

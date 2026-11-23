@@ -59,10 +59,9 @@ import java.util.function.Supplier;
 public final class MongoSrsConsumerStore implements SrsConsumerStore {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
-    private static final TransactionOptions PIN_TRANSACTION = TransactionOptions.builder()
-            .readConcern(TRANSACTION.getReadConcern()).writeConcern(TRANSACTION.getWriteConcern())
-            .timeout(15L, TimeUnit.SECONDS).build();
+    private static final long PIN_BUDGET = TimeUnit.SECONDS.toNanos(15);
     private final MongoClient client;
+    private final MongoClaimOperations pinOperations;
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
@@ -98,13 +97,20 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             Runnable requireStructure, MongoSrsLease readLease, boolean runtimeStructure) {
+        this(client, database, scope, requireActive, requireStructure, readLease, runtimeStructure, null);
+    }
+
+    MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
+            Runnable requireStructure, MongoSrsLease readLease, boolean runtimeStructure, MongoClaimOperations pinOperations) {
         this(client, database, scope, requireActive, requireStructure, readLease, runtimeStructure, new AtomicReference<>(),
-                readLease.enabled() ? MongoSrsLease.selected() : MongoSrsLease.perTransaction(), new AtomicReference<>());
+                readLease.enabled() ? MongoSrsLease.selected() : MongoSrsLease.perTransaction(), new AtomicReference<>(),
+                pinOperations);
     }
 
     private MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             Runnable requireStructure, MongoSrsLease readLease, boolean runtimeStructure, AtomicReference<ProvenReads> provenReads,
-            MongoSrsLease cursorLease, AtomicReference<ProvenCursor> provenCursor) {
+            MongoSrsLease cursorLease, AtomicReference<ProvenCursor> provenCursor, MongoClaimOperations pinOperations) {
+        this.pinOperations = pinOperations;
         this.readLease = readLease;
         this.provenReads = provenReads;
         this.cursorLease = cursorLease;
@@ -117,7 +123,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
     @Override public MongoSrsConsumerStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, readLease, runtimeStructure, provenReads, cursorLease, provenCursor);
+        return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, readLease, runtimeStructure, provenReads, cursorLease, provenCursor, pinOperations);
     }
 
     @Override public SharedSrsRecoverySnapshot inspectSharedRecovery(CapturePreparation previous) {
@@ -1285,7 +1291,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(snapshot, "snapshot");
         requireRevision(membershipRevision); requireRevision(expectedProgressRevision); String chain = context.key().miningChainId();
         var pipeline = pipelineAccess(context, fence);
-        return changingTheConsumer(() -> pinTransaction(session -> {
+        return changingTheConsumer(() -> pinTransaction(context.key(), session -> {
             // Reserve the chain before reading its model and cursor facts.
             var root = chains.reserveSnapshotPin(session, chain);
             new MongoCacheBusinessIdentity(database, scope).requireReady(session);
@@ -1322,11 +1328,19 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             return true;
         }));
     }
-    private boolean pinTransaction(Function<ClientSession, Boolean> action) {
-        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+    private boolean pinTransaction(SrsConsumerKey key, Function<ClientSession, Boolean> action) {
+        var budget = MongoReadBudget.until(System.nanoTime() + PIN_BUDGET);
+        if (pinOperations == null) return executePinTransaction(action, budget);
+        return pinOperations.snapshotPin(key, budget.deadlineNanos(), original -> executePinTransaction(action, original));
+    }
+
+    private boolean executePinTransaction(Function<ClientSession, Boolean> action, MongoReadBudget budget) {
+        return MongoStructureFailureScope.inspectOnFailure(client, budget, () -> StoreIo.call(() -> {
             requireActive.run();
             var attempts = new AtomicInteger();
             try (var session = client.startSession()) {
+                var options = TransactionOptions.builder().readConcern(TRANSACTION.getReadConcern())
+                        .writeConcern(TRANSACTION.getWriteConcern()).timeout(budget.remainingMillis(), TimeUnit.MILLISECONDS).build();
                 return session.withTransaction(() -> {
                     int attempt = attempts.getAndIncrement();
                     // Only a transient transaction reruns this callback. An ambiguous commit
@@ -1336,10 +1350,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     MongoStructureFailureScope.beginCallback();
                     if (!runtimeStructure) requireStructure.run();
                     requireActive.run();
+                    budget.remainingMillis();
                     boolean result = action.apply(session);
                     requireActive.run();
+                    budget.remainingMillis();
                     return result;
-                }, PIN_TRANSACTION);
+                }, options);
             } catch (UnchangedPin result) {
                 requireActive.run();
                 return result.accepted;

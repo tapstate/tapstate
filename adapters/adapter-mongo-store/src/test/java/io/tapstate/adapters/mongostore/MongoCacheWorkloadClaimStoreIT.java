@@ -829,6 +829,40 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
+    @Test void aTimedOutSnapshotPinRetainsItsConsumerOnlyUntilTheOriginalWorkerFinishes() {
+        withBusiness(f -> {
+            var operations = new MongoClaimOperations(f.admin());
+            var original = new io.tapstate.spi.store.SrsConsumerKey("source-chain", "orders", "source");
+            var other = new io.tapstate.spi.store.SrsConsumerKey("source-chain", "other", "source");
+            var opened = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            try (var caller = Executors.newSingleThreadExecutor()) {
+                var response = caller.submit(() -> operations.snapshotPin(original,
+                        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(400), budget -> {
+                            opened.countDown();
+                            await(release);
+                            return true;
+                        }));
+                try {
+                    assertThat(opened.await(1, TimeUnit.SECONDS)).isTrue();
+                    assertThatThrownBy(() -> response.get(2, TimeUnit.SECONDS))
+                            .hasCauseInstanceOf(TapstateException.class);
+                    assertThatThrownBy(() -> operations.snapshotPin(original, deadline(), budget -> true))
+                            .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                                assertThat(refused.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                                assertThat(refused.args()).containsEntry("detail", "original consumer snapshot pin still in progress");
+                            });
+                    assertThat(operations.<Boolean>snapshotPin(other, deadline(), budget -> true)).isTrue();
+                } finally {
+                    release.countDown();
+                }
+                operations.await(deadline());
+                assertThat(operations.<Boolean>snapshotPin(original, deadline(), budget -> true)).isTrue();
+                operations.closeIfIdle();
+            }
+        });
+    }
+
     @Test void unknownRenewalCommitRetriesTheSameCommitAndKeepsTheOriginalFence() {
         withBusiness(f -> {
             var commands = new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();

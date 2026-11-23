@@ -2,12 +2,16 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoCommandException;
 import com.mongodb.MongoException;
+import com.mongodb.MongoOperationTimeoutException;
 import com.mongodb.ReadPreference;
 import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.SrsConsumerKey;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -16,11 +20,13 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import org.bson.BsonDocument;
 import org.bson.Document;
@@ -55,6 +61,10 @@ final class MongoClaimOperations {
         worker.allowCoreThreadTimeOut(true);
         return worker;
     }
+
+    private final java.util.concurrent.ExecutorService snapshotPins =
+            Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("mongo-snapshot-pin-io-", 0).factory());
+    private final Set<SrsConsumerKey> activeSnapshotPins = new java.util.HashSet<>();
 
     private final Set<Call<?>> calls = ConcurrentHashMap.newKeySet();
     private final Set<Transaction> transactions = ConcurrentHashMap.newKeySet();
@@ -148,6 +158,42 @@ final class MongoClaimOperations {
         return call(deadline, guard, action, workers);
     }
 
+    /** The consumer keeps its original worker and session even when the caller spends its budget. */
+    <T> T snapshotPin(SrsConsumerKey key, long deadline, Function<MongoReadBudget, T> action) {
+        var inherited = current.get();
+        long selected = inherited == null || deadline - inherited.deadlineNanos() < 0
+                ? deadline : inherited.deadlineNanos();
+        var guard = active.get();
+        try {
+            return result(submitSnapshotPin(key, selected, guard == null ? () -> {} : guard,
+                    () -> action.apply(MongoReadBudget.until(selected))), selected);
+        } catch (TapstateException expired) {
+            if (expired.code() == IoError.WORKLOAD_CLAIM_FENCED && expired.getCause() instanceof TimeoutException) {
+                throw StoreIo.coded(new MongoOperationTimeoutException("snapshot pin deadline exceeded"));
+            }
+            throw expired;
+        }
+    }
+
+    private synchronized <T> Call<T> submitSnapshotPin(SrsConsumerKey key, long deadline, Runnable guard,
+            Supplier<T> action) {
+        requireAdmission();
+        remaining(deadline);
+        if (!activeSnapshotPins.add(key)) {
+            throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                    java.util.Map.of("detail", "original consumer snapshot pin still in progress"), null);
+        }
+        var call = new Call<>(deadline, guard, action, false, key);
+        calls.add(call);
+        try {
+            snapshotPins.execute(call);
+        } catch (java.util.concurrent.RejectedExecutionException refused) {
+            call.finished();
+            throw refused;
+        }
+        return call;
+    }
+
     <T> T renew(long deadline, Runnable guard, Supplier<T> action) {
         return call(deadline, guard, () -> {
             renewalLane.set(true);
@@ -178,7 +224,7 @@ final class MongoClaimOperations {
             throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.NOT_STARTED,
                     "the Pipeline renewal worker is still completing its original attempt");
         }
-        var call = new Call<T>(deadline,guard, action, renewal);
+        var call = new Call<T>(deadline,guard, action, renewal, null);
         if (renewal) renewalRunning = true;
         calls.add(call);
         try { lane.execute(call); }
@@ -227,14 +273,16 @@ final class MongoClaimOperations {
         private final Supplier<T> action;
         private final Runnable guard;
         private final boolean renewal;
+        private final SrsConsumerKey pinKey;
         private final AtomicInteger state = new AtomicInteger();
         private final CompletableFuture<T> result = new CompletableFuture<>();
         private final long diagnosticId = DIAGNOSTICS.isDebugEnabled() ? NEXT_DIAGNOSTIC.incrementAndGet() : 0;
         private final long submittedAt = diagnosticId == 0 ? 0 : System.nanoTime();
         private final long callerThread = diagnosticId == 0 ? 0 : Thread.currentThread().threadId();
 
-        private Call(long deadline,Runnable guard, Supplier<T> action, boolean renewal) {
+        private Call(long deadline, Runnable guard, Supplier<T> action, boolean renewal, SrsConsumerKey pinKey) {
             this.deadline = deadline;this.guard=guard;this.action = action;this.renewal=renewal;
+            this.pinKey = pinKey;
         }
 
         void cancelPending() {
@@ -249,6 +297,7 @@ final class MongoClaimOperations {
         private void finished() {
             synchronized (MongoClaimOperations.this) {
                 calls.remove(this);
+                if (pinKey != null) activeSnapshotPins.remove(pinKey);
                 if (renewal) renewalRunning = false;
                 MongoClaimOperations.this.notifyAll();
             }
@@ -262,9 +311,18 @@ final class MongoClaimOperations {
             T value=null;Throwable failure=null;
             try {
                 if (diagnosticId != 0) diagnostics = MongoHttpDiagnosticsScope.open();
-                current.set(MongoReadBudget.until(deadline));
-                active.set(guard);check();
-                value=action.get();check();
+                if (pinKey == null) {
+                    current.set(MongoReadBudget.until(deadline));
+                    active.set(guard);check();
+                    value=action.get();check();
+                } else {
+                    // A pin owns its explicit budget; it is not a nested Pipeline claim operation.
+                    remaining(deadline);
+                    guard.run();
+                    value=action.get();
+                    remaining(deadline);
+                    guard.run();
+                }
             } catch (Throwable failed) { failure=failed; }
             finally {
                 current.remove();active.remove();
@@ -281,6 +339,10 @@ final class MongoClaimOperations {
                 record.put("at", java.time.Instant.now().toString());
                 record.put("call_id", diagnosticId);
                 record.put("caller_thread_id", callerThread);
+                if (pinKey != null) {
+                    record.put("pipeline_id", pinKey.pipelineId());
+                    record.put("operation", "snapshot_pin");
+                }
                 record.put("thread_id", Thread.currentThread().threadId());
                 record.put("queue_ms", (startedAt - submittedAt) / 1_000_000.0);
                 record.put("execution_ms", (System.nanoTime() - startedAt) / 1_000_000.0);
@@ -427,5 +489,6 @@ final class MongoClaimOperations {
         renewals.shutdown();
         nodeSession.shutdown();
         nodeConfirmation.shutdown();
+        snapshotPins.shutdown();
     }
 }
