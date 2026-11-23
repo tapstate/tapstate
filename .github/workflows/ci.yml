@@ -1,9 +1,13 @@
 name: CI
-run-name: Pipeline Performance | T5 Copy endpoint latency qualification
+run-name: Pipeline Performance | Review verification | ${{ inputs.fail_java_setup && 'setup failure' || 'Copy latency' }}
 
 on:
   workflow_dispatch:
     inputs:
+      fail_java_setup:
+        description: Request an unavailable Java version in the measurement job
+        type: boolean
+        default: false
       mode:
         description: Selection mode for the branch or tag chosen in the dispatch form
         type: choice
@@ -60,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1d41a57e705d896a9e96bea8d2767b2ce8b2ab1c
+          ref: d8b59cef2625e42e2729d7334cbcb3cdb794a266
           persist-credentials: false
       - uses: actions/setup-java@v4
         with:
@@ -127,28 +131,31 @@ jobs:
         id: budget
         run: |
           now=$(date +%s)
+          mkdir -p "$RUNNER_TEMP/performance-batch"
+          printf 'Runner started at epoch %s. Round measurement cutoff %s.\n' "$now" "$STOP_AT" \
+            > "$RUNNER_TEMP/performance-batch/batch-start.txt"
           if (( STOP_AT <= now )); then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            mkdir -p "$RUNNER_TEMP/performance-batch"
             printf 'No time remained for this batch when the runner started.\n' > "$RUNNER_TEMP/performance-batch/expired.txt"
           else
             # Leave time to upload evidence before the job's 350 minute timeout.
             job_stop=$((now + 340 * 60))
             if (( job_stop < STOP_AT )); then
-              echo "STOP_AT=$job_stop" >> "$GITHUB_ENV"
+              STOP_AT="$job_stop"
             fi
+            echo "stop-at=$STOP_AT" >> "$GITHUB_OUTPUT"
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@v4
         if: steps.budget.outputs.run == 'true'
         with:
-          ref: 1d41a57e705d896a9e96bea8d2767b2ce8b2ab1c
+          ref: d8b59cef2625e42e2729d7334cbcb3cdb794a266
           persist-credentials: false
       - uses: actions/setup-java@v4
         if: steps.budget.outputs.run == 'true'
         with:
           distribution: temurin
-          java-version: '21.0.13+9.0.LTS'
+          java-version: ${{ inputs.fail_java_setup && '0.0.0' || '21.0.13+9.0.LTS' }}
           cache: maven
       - uses: actions/download-artifact@v4
         if: steps.budget.outputs.run == 'true'
@@ -157,12 +164,15 @@ jobs:
           path: ${{ runner.temp }}/performance-inputs
       - name: Set up Maven
         if: steps.budget.outputs.run == 'true'
+        env:
+          STOP_AT: ${{ steps.budget.outputs.stop-at }}
         run: |
-          mkdir -p "$RUNNER_TEMP/performance-batch"
           bash .github/scripts/performance-with-budget.sh "Maven setup" bash .github/scripts/setup-ci-maven.sh \
             > "$RUNNER_TEMP/performance-batch/maven-setup.log" 2>&1
       - name: Build and measure the fixed batch
         if: steps.budget.outputs.run == 'true'
+        env:
+          STOP_AT: ${{ steps.budget.outputs.stop-at }}
         shell: bash
         run: |
           set -euo pipefail
@@ -211,7 +221,7 @@ jobs:
           retention-days: 30
 
   report:
-    if: always() && github.run_attempt == '1' && needs.prepare.result != 'skipped'
+    if: always() && (github.run_attempt != '1' || needs.prepare.result != 'skipped')
     needs: [prepare, measure]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -219,31 +229,44 @@ jobs:
       contents: read
       actions: read
     steps:
+      - name: Direct the operator to a new run
+        if: github.run_attempt != '1'
+        run: |
+          message='Performance runs cannot be repeated with Re-run jobs. Use Run workflow to start a new run with the required inputs.'
+          printf '::error::%s\n' "$message"
+          printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - uses: actions/checkout@v4
+        if: github.run_attempt == '1'
         with:
-          ref: 1d41a57e705d896a9e96bea8d2767b2ce8b2ab1c
+          ref: d8b59cef2625e42e2729d7334cbcb3cdb794a266
           persist-credentials: false
       - uses: actions/download-artifact@v4
+        if: github.run_attempt == '1'
         continue-on-error: true
         with:
           name: performance-inputs-${{ github.run_attempt }}
           path: ${{ runner.temp }}/performance-inputs
       - uses: actions/download-artifact@v4
+        if: github.run_attempt == '1'
         continue-on-error: true
         with:
           pattern: performance-batch-${{ github.run_attempt }}-*
           path: ${{ runner.temp }}/performance-batches
       - name: Read job timing evidence
+        if: github.run_attempt == '1'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" > "$RUNNER_TEMP/performance-jobs.json"
       - name: Locate raw batch archives
+        if: github.run_attempt == '1'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/performance-artifacts.json"
       - name: Reconcile and publish
+        if: github.run_attempt == '1'
         env:
           PERFORMANCE_JOB_RESULTS: ${{ format('{{"prepare":"{0}","measure":"{1}"}}', needs.prepare.result, needs.measure.result) }}
         run: |
@@ -254,14 +277,14 @@ jobs:
       - name: Upload the report
         uses: actions/upload-artifact@v4
         id: report-artifact
-        if: always()
+        if: always() && github.run_attempt == '1'
         with:
           name: performance-report-${{ github.run_attempt }}
           path: ${{ runner.temp }}/performance-report
           if-no-files-found: error
           retention-days: 90
       - name: Link the published report
-        if: always() && steps.report-artifact.outcome == 'success'
+        if: always() && github.run_attempt == '1' && steps.report-artifact.outcome == 'success'
         env:
           REPORT_ARTIFACT_URL: ${{ steps.report-artifact.outputs.artifact-url }}
         run: printf '\n[Download report.json and report.md](%s)\n' "$REPORT_ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
