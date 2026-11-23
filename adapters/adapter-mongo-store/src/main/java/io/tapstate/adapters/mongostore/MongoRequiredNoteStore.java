@@ -258,7 +258,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     @Override
     public RequiredNoteScope open(RequiredNoteOwner owner) {
         Objects.requireNonNull(owner, "owner");
-        return StoreIo.call(() -> transaction(session -> open(session, owner)));
+        return StoreIo.call(() -> transaction(session -> open(session, owner), true));
     }
 
     @Override
@@ -1165,17 +1165,31 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     private <T> T transaction(Function<ClientSession, T> body) {
+        return transaction(body, false);
+    }
+
+    private <T> T transaction(Function<ClientSession, T> body, boolean recoverReadCheckout) {
+        var retryCheckout = new java.util.concurrent.atomic.AtomicBoolean(recoverReadCheckout);
         try (ClientSession session = client.startSession()) {
             return session.withTransaction(() -> {
-                MongoStructureFailureScope.beginCallback();
-                requireActive.run();
-                if (retirement != null) {
-                    checkRetiringOwner(session, retirement, false);
-                    checkRetirementToken(session, retirement);
+                try {
+                    MongoStructureFailureScope.beginCallback();
+                    requireActive.run();
+                    if (retirement != null) {
+                        checkRetiringOwner(session, retirement, false);
+                        checkRetirementToken(session, retirement);
+                    }
+                    T result = body.apply(session);
+                    requireActive.run();
+                    return result;
+                } catch (com.mongodb.MongoConnectionPoolClearedException checkout) {
+                    // Only this read-only callback may retry an unsent checkout under the
+                    // original transaction deadline. Commit uncertainty stays with the driver.
+                    if (!checkout.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)
+                            && retryCheckout.compareAndSet(true, false))
+                        checkout.addLabel(MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL);
+                    throw checkout;
                 }
-                T result = body.apply(session);
-                requireActive.run();
-                return result;
             }, TRANSACTION);
         }
     }

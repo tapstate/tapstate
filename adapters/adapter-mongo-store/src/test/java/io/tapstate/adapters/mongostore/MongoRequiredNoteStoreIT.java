@@ -40,6 +40,143 @@ class MongoRequiredNoteStoreIT {
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"first-checkout", "twice", "guard", "owner", "deadline", "ordinary-write"})
+    void aReadOnlyOpenRecoversOnlyOneCheckoutWithinItsOriginalAuthority(String stage) {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var scope = f.initialize(stage.equals("owner") ? pipeline("p1", 1) : chain("pool-recovery"));
+            var before = scopeMetadata(f, scope);
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var pause = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var failures = new AtomicInteger();
+            var active = new AtomicBoolean(true);
+            var delayed = new AtomicBoolean();
+            var secondClear = new AtomicBoolean();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            failures.incrementAndGet();resume.get().run();
+                            if (stage.equals("guard")) active.set(false);
+                            if (stage.equals("owner")) f.pipelineGeneration("p1", 2);
+                            if (stage.equals("deadline")) java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(600));
+                        }
+                    })).addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            commands.add(event.getCommandName());
+                        }
+                        @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                            if (!event.getCommandName().equals("find")) return;
+                            if (stage.equals("twice") && failures.get() == 1 && secondClear.compareAndSet(false, true)) pause.get().run();
+                            if (stage.equals("deadline") && delayed.compareAndSet(false, true))
+                                java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(500));
+                        }
+                    });
+            if (stage.equals("deadline")) settings.timeout(1000, TimeUnit.MILLISECONDS);
+            try (var client = MongoClients.create(settings.build())) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var pool = notePool(client);
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                pause.set(() -> poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null}));
+                var notes = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher())
+                        .guardedBy(() -> { if (!active.get()) throw scopeFailure(); });
+                commands.clear();pause.get().run();
+                var opened = new java.util.concurrent.atomic.AtomicReference<RequiredNoteScope>();
+                long began = System.nanoTime();
+                var failure = org.assertj.core.api.Assertions.catchThrowable(() -> {
+                    if (stage.equals("ordinary-write")) notes.compareAndSet(scope, "late", 0, bytes("refused"), false);
+                    else opened.set(notes.open(scope.owner()));
+                });
+                assertThat(failures).hasValue(stage.equals("twice") ? 2 : 1);
+                if (stage.equals("first-checkout")) {
+                    assertThat(failure).isNull();
+                    assertThat(opened.get()).isEqualTo(scope);
+                    assertThat(commands).containsExactly("find", "find", "commitTransaction");
+                } else if (stage.equals("guard") || stage.equals("owner")) {
+                    scopeUnavailable(failure);
+                    assertThat(opened.get()).isNull();
+                    if (stage.equals("guard")) assertThat(commands).isEmpty();
+                } else {
+                    assertThat(failure).isInstanceOfSatisfying(TapstateException.class, coded -> {
+                        assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        if (!stage.equals("deadline")) assertThat(coded.args()).containsEntry("detail", "MongoConnectionPoolClearedException");
+                        else assertThat(coded.args().get("detail").toString()).startsWith("MongoOperationTimeoutException");
+                    });
+                    assertThat(opened.get()).isNull();
+                    if (stage.equals("deadline")) assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - began)).isLessThan(1800);
+                }
+                assertThat(scopeMetadata(f, scope)).isEqualTo(before);
+                assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isZero();
+            }
+        });
+    }
+
+    @Test void anUnknownReadCommitDoesNotReplayTheRecoveredOpenCallback() {
+        withNotes(f -> {
+            var scope = f.initialize(chain("commit-recovery"));
+            var before = scopeMetadata(f, scope);
+            String app = "note-commit-" + UUID.randomUUID();
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var failures = new AtomicInteger();
+            var finds = new AtomicInteger();
+            var commits = new AtomicInteger();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applicationName(app).timeout(750, TimeUnit.MILLISECONDS)
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            failures.incrementAndGet();resume.get().run();
+                        }
+                    })).addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            if (event.getCommandName().equals("find")) finds.incrementAndGet();
+                            if (event.getCommandName().equals("commitTransaction")) commits.incrementAndGet();
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var pool = notePool(client);
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                var notes = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher());
+                var data = new Document("failCommands", List.of("commitTransaction")).append("appName", app)
+                        .append("writeConcernError", new Document("code", 64).append("errmsg", "test commit reply lost"))
+                        .append("blockConnection", true).append("blockTimeMS", 100);
+                f.admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", "alwaysOn").append("data", data));
+                try {
+                    poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null});
+                    assertThatThrownBy(() -> notes.open(scope.owner())).isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                } finally {
+                    f.admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+                assertThat(failures).hasValue(1);
+                assertThat(finds).hasValue(2);
+                assertThat(commits.get()).isGreaterThan(1);
+                assertThat(scopeMetadata(f, scope)).isEqualTo(before);
+            }
+        });
+    }
+
+    private static Object notePool(MongoClient client) {
+        try {
+            var delegate = driverField(client, "delegate");
+            var cluster = driverField(delegate, "cluster");
+            var server = ((java.util.concurrent.atomic.AtomicReference<?>) driverField(cluster, "server")).get();
+            return driverField(server, "connectionPool");
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+    }
+    private static Object driverField(Object owner, String field) throws ReflectiveOperationException {
+        var value = owner.getClass().getDeclaredField(field);value.setAccessible(true);return value.get(owner);
+    }
+    private static void poolMethod(Object pool, String method, Class<?>[] types, Object[] args) {
+        try {
+            var call = pool.getClass().getMethod(method, types);call.setAccessible(true);call.invoke(pool, args);
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+    }
+
     @Test void pipelineAndGlobalNoteScopesShareOneSnapshotWithoutWeakeningOwnerChecks() {
         withNotes(f -> {
             f.pipelineGeneration("p1", 1);
