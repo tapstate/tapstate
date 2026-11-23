@@ -136,23 +136,23 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     private Optional<PipelineIntentSnapshot> capturedActuation(ClientSession session, String pipelineId) {
         if (!MongoBindingReadFacts.supported(client)) return null;
         var stages = MongoStartConfigRead.root();
-        stages.add(new Document("$project", new Document("root", boundedValue())));
-        stages.add(actuationLookup(SystemCollections.STORAGE_BINDING, "binding", "cluster"));
-        stages.add(actuationLookup(SystemCollections.STORAGE_SETUP, "setup", "cluster"));
-        stages.add(actuationLookup(SystemCollections.STORAGE_RECOVERY, "recovery", "cluster"));
-        stages.add(actuationLookup(SystemCollections.PIPELINE_INTENTS, "intent", pipelineId));
-        stages.add(actuationLookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", pipelineId));
-        stages.add(actuationLookup(SystemCollections.PIPELINES, "pipeline", pipelineId));
+        stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_BINDING, "binding", "cluster"));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_SETUP, "setup", "cluster"));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_RECOVERY, "recovery", "cluster"));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.PIPELINE_INTENTS, "intent", pipelineId));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", pipelineId));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.PIPELINES, "pipeline", pipelineId));
         stages.add(new Document("$lookup", new Document("from", SystemCollections.SOURCES.collectionName())
                 .append("as", "source").append("let", new Document("id", new Document("$arrayElemAt", List.of("$binding.value.defaultSourceId", 0))))
                 .append("pipeline", List.of(new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", "$$id")))),
-                        new Document("$limit", 2), new Document("$project", new Document("value", boundedValue()))))));
+                        new Document("$limit", 2), new Document("$project", new Document("value", MongoStartConfigRead.boundedValue()))))));
         var globalId = new Document("bindingVersion", new Document("$arrayElemAt", List.of("$binding.value.bindingVersion", 0)))
                 .append("namespace", "pdk.global-state");
         stages.add(new Document("$lookup", new Document("from", SystemCollections.PDK_NOTE_SCOPES.collectionName())
                 .append("as", "global").append("let", new Document("id", globalId))
                 .append("pipeline", List.of(new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", "$$id")))),
-                        new Document("$limit", 2), new Document("$project", new Document("value", boundedValue()))))));
+                        new Document("$limit", 2), new Document("$project", new Document("value", MongoStartConfigRead.boundedValue()))))));
         var others = List.of(SystemCollections.PIPELINES, SystemCollections.TRANSFORM_DEFINITIONS,
                 SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS);
         for (int i = 0; i < others.size(); i++) {
@@ -162,18 +162,18 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         }
         var captured = identity.aggregate(session, stages).first();
         if (captured == null || !(captured.get("root") instanceof Document root)) return null;
-        var binding = actuationRow(captured, "binding", "cluster");
-        var setup = actuationRow(captured, "setup", "cluster");
-        var recovery = actuationRow(captured, "recovery", "cluster");
-        var intent = actuationRow(captured, "intent", pipelineId);
-        var mapping = actuationRow(captured, "mapping", pipelineId);
-        var pipeline = actuationRow(captured, "pipeline", pipelineId);
+        var binding = MongoStartConfigRead.boundedRow(captured, "binding", "cluster");
+        var setup = MongoStartConfigRead.boundedRow(captured, "setup", "cluster");
+        var recovery = MongoStartConfigRead.boundedRow(captured, "recovery", "cluster");
+        var intent = MongoStartConfigRead.boundedRow(captured, "intent", pipelineId);
+        var mapping = MongoStartConfigRead.boundedRow(captured, "mapping", pipelineId);
+        var pipeline = MongoStartConfigRead.boundedRow(captured, "pipeline", pipelineId);
         if (binding == null || setup == null || recovery == null || intent == null || mapping == null || pipeline == null
                 || !(binding.get("defaultSourceId") instanceof String sourceId)
                 || !(binding.get("bindingVersion") instanceof Long version)
                 || mapping.containsKey("cacheRecovery") || mapping.containsKey("sharedRecovery")) return null;
-        var source = actuationRow(captured, "source", sourceId);
-        var global = actuationRow(captured, "global", new Document("bindingVersion", version).append("namespace", "pdk.global-state"));
+        var source = MongoStartConfigRead.boundedRow(captured, "source", sourceId);
+        var global = MongoStartConfigRead.boundedRow(captured, "global", new Document("bindingVersion", version).append("namespace", "pdk.global-state"));
         if (source == null || global == null) return null;
         var snapshot = decode(intent);
         boolean conflict = false;
@@ -197,21 +197,6 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (prepared.phase() != io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE) return Optional.empty();
         if (!snapshot.scope().equals(prepared.scope())) throw fenced();
         return Optional.of(snapshot);
-    }
-
-    private static Document boundedValue() {
-        return new Document("$cond", List.of(new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), 64 * 1024)), "$$ROOT", false));
-    }
-
-    private static Document actuationLookup(SystemCollections collection, String field, Object id) {
-        return new Document("$lookup", new Document("from", collection.collectionName()).append("as", field)
-                .append("pipeline", List.of(new Document("$match", new Document("_id", id)), new Document("$limit", 2),
-                        new Document("$project", new Document("value", boundedValue())))));
-    }
-
-    private static Document actuationRow(Document captured, String field, Object id) {
-        var row = MongoStartConfigRead.row(captured, field, id);
-        return row.filter(value -> value.get("value") instanceof Document).map(value -> value.get("value", Document.class)).orElse(null);
     }
 
     @Override public List<String> pipelineIds() {

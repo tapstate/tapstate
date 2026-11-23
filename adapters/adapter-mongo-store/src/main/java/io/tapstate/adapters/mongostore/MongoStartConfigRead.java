@@ -65,6 +65,21 @@ final class MongoStartConfigRead {
         return Optional.of(List.copyOf(result));
     }
 
+    static Document boundedValue() {
+        return new Document("$cond", List.of(new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), MAX_INLINE_BYTES)), "$$ROOT", false));
+    }
+
+    static Document boundedLookup(SystemCollections collection, String field, Object id) {
+        return new Document("$lookup", new Document("from", collection.collectionName()).append("as", field)
+                .append("pipeline", List.of(new Document("$match", new Document("_id", id)), new Document("$limit", 2),
+                        new Document("$project", new Document("value", boundedValue())))));
+    }
+
+    static Document boundedRow(Document captured, String field, Object id) {
+        var row = MongoStartConfigRead.row(captured, field, id);
+        return row.filter(value -> value.get("value") instanceof Document).map(value -> value.get("value", Document.class)).orElse(null);
+    }
+
     static Document snapshot(MongoDatabase database, List<Document> stages) {
         return SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database.withReadPreference(ReadPreference.primary())
                 .withReadConcern(ReadConcern.SNAPSHOT)).aggregate(stages).first();

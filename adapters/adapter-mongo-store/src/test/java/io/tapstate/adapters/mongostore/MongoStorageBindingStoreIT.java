@@ -1024,6 +1024,41 @@ class MongoStorageBindingStoreIT {
     }
 
     @Test
+    void admittedPreparationReadsOnlyTheOriginalBindingSetupAndRecovery() {
+        withPrepared(f -> {
+            var initial = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var commands = new java.util.ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(f.settings.uri())).addCommandListener(listener).build());
+                 var session = observed.startSession()) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var selected = observed.getDatabase(f.database.getName());
+                var store = new MongoStorageBindingStore(observed, selected,
+                        SourceConfigCipherProvider.fixed(new SourceConfigCipher(new byte[32])));
+                commands.clear();
+                var held = session.withTransaction(() -> store.admittedCachePreparation(session));
+                assertThat(held).contains(initial.preparation());
+                System.out.println("ADMITTED_BINDING " + commands);
+                assertThat(commands).containsExactly("aggregate", "commitTransaction");
+                var setup = SystemCollections.STORAGE_SETUP.on(f.database);
+                setup.updateOne(new Document("_id", "cluster"), new Document("$set", new Document("padding", "x".repeat(80 * 1024))));
+                commands.clear();
+                assertThat(session.withTransaction(() -> store.admittedCachePreparation(session))).contains(initial.preparation());
+                assertThat(commands).contains("find", "commitTransaction");
+                setup.updateOne(new Document("_id", "cluster"), new Document("$unset", new Document("padding", "")));
+                SystemCollections.STORAGE_BINDING.on(f.database).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("candidateHash", "stale")));
+                assertThatThrownBy(() -> session.withTransaction(() -> store.admittedCachePreparation(session)))
+                        .isInstanceOfSatisfying(TapstateException.class, failure ->
+                                assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE));
+            }
+        });
+    }
+
+    @Test
     void onlyTheConfirmedFirstBindingWinnerReceivesAnInitialCacheInvocation() {
         withPrepared(f -> {
             var first = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));

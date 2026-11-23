@@ -402,15 +402,35 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     /** Rechecks the durable scope of a previously admitted runtime without reopening its connection. */
     Optional<CachePreparation> admittedCachePreparation(ClientSession session) {
         if (!MongoBindingReadFacts.supported(client)) return cachePreparationForTransaction(session);
-        var stored = bindings.find(session, new Document("_id", SINGLETON_ID))
-                .projection(new Document("cache", 0)).first();
+        var stages = MongoStartConfigRead.root();
+        stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
+        var bindingFields = new Document("clusterId", 1).append("layoutId", 1).append(BINDING_VERSION, 1)
+                .append("installationId", 1).append("operationId", 1).append("generation", 1)
+                .append("mode", 1).append("defaultSourceId", 1).append("candidateHash", 1);
+        stages.add(new Document("$lookup", new Document("from", SystemCollections.STORAGE_BINDING.collectionName())
+                .append("as", "binding").append("pipeline", List.of(new Document("$match", new Document("_id", SINGLETON_ID)),
+                        new Document("$limit", 2), new Document("$project", bindingFields),
+                        new Document("$project", new Document("value", MongoStartConfigRead.boundedValue()))))));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_SETUP, "setup", SINGLETON_ID));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_RECOVERY, "recovery", SINGLETON_ID));
+        var row = identity.aggregate(session, stages).first();
+        var bound = MongoStartConfigRead.boundedRow(row, "binding", SINGLETON_ID);
+        var stage = MongoStartConfigRead.boundedRow(row, "setup", SINGLETON_ID);
+        var recovery = MongoStartConfigRead.boundedRow(row, "recovery", SINGLETON_ID);
+        if (row != null && row.get("root") instanceof Document root && SINGLETON_ID.equals(root.get("_id"))
+                && bound != null && stage != null && recovery != null)
+            return admittedPreparation(session, bound, root, stage, recovery);
+        var stored = bindings.find(session, new Document("_id", SINGLETON_ID)).projection(new Document("cache", 0)).first();
         var facts = MongoBindingReadFacts.read(session, null, identity, setup, noteScopes, List.of());
-        var cluster = facts.identity();
+        return admittedPreparation(session, stored, facts.identity(), facts.setup(), null);
+    }
+
+    private Optional<CachePreparation> admittedPreparation(ClientSession session, Document stored, Document cluster,
+            Document state, Document recovery) {
         requireClusterIdentity(cluster);
         String clusterId = cluster.getString("clusterId");
         long version = cluster.getLong(BINDING_VERSION);
         if (version == 0) return Optional.empty();
-        var state = facts.setup();
         long generation = requireSetupIdentity(state, clusterId);
         try {
             if (stored == null || !clusterId.equals(stored.get("clusterId"))
@@ -424,7 +444,9 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
             if (!StorageBinding.defaultSourceId(mode).equals(defaultId)
                     || !(stored.get("candidateHash") instanceof String candidate)
                     || !candidate.equals(state.get("candidateHash"))) throw unreadable();
-            return Optional.of(MongoStorageRecoveryStore.read(session, database, owner, mode, version, state).preparation());
+            var current = recovery == null ? MongoStorageRecoveryStore.read(session, database, owner, mode, version, state)
+                    : MongoStorageRecoveryStore.read(recovery, owner, mode, version, () -> state);
+            return Optional.of(current.preparation());
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) {
             throw unreadable();
         }
