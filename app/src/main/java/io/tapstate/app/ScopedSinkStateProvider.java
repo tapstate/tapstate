@@ -29,6 +29,7 @@ final class ScopedSinkStateProvider {
     }
     static final class WriterStartup {
         private ConnectorRef artifact;
+        boolean independentArtifact() { return artifact != null && !artifact.shareSafe(); }
         private final PdkSinkPreparations.OpeningFacts ready = new PdkSinkPreparations.OpeningFacts();
     }
     PdkSinkPort open(HazelcastInstance member,ConfiguredSinkRun run,SinkConfig config,ConnectorProvisioner provisioner,

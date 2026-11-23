@@ -20,8 +20,8 @@ public final class PdkSinkPreparations {
     private final OnFullLoad policy;
     private final boolean fullLoad;
     public static final class OpeningFacts {
-        private final java.util.Set<SinkPreparationStore.Input> ready = new java.util.HashSet<>();
-        private SharedSinkConnectors.NoteIdentity notes;
+        private final java.util.Set<SinkPreparationStore.Input> ready = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        private volatile SharedSinkConnectors.NoteIdentity notes;
     }
     private final OpeningFacts opening;
     private final WorkloadClaimFence execution;

@@ -492,6 +492,38 @@ class ScopedTargetPreparationTest {
         assertThat(store.reads - before).isEqualTo(1);
     }
 
+    @Test void concurrentWarmOpeningRetainsFourIndependentPdkInstancesAndOneExactReadyRead(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
+        var calls = new ArrayList<String>(); var store = new Receipts(calls);
+        store.complete(store.begin(store.held.input()), new SinkPreparationStore.Result(true));
+        var opening = new PdkSinkPreparations.OpeningFacts();
+        var ref = new ConnectorRef(List.of(Synthetic.countingSink(directory)), "synthetic.CountingSink", "2.0.8", null);
+        var config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null, NODE, OnFullLoad.CLEAR, true);
+        var opened = new java.util.concurrent.CopyOnWriteArrayList<PdkSinkWriter>();
+        java.util.concurrent.Callable<PdkSinkWriter> create = () -> {
+            var receipts = new PdkSinkPreparations(store, SCOPE, NODE, PipelineNode.Purpose.SYNC, OnFullLoad.CLEAR, true, opening);
+            receipts.requireReady(List.of(TARGET));
+            var connector = PdkConnector.open("demo", ref, Map.of());
+            var writer = new PdkSinkWriter(connector, (context, rows, table, result) -> {}, config,
+                    Map.of("known", TARGET), null, true, null, PipelineNode.Purpose.SYNC, receipts);
+            try { writer.prepareTargets(); }
+            catch (Throwable failure) { writer.close(); throw new AssertionError(failure); }
+            opened.add(writer); return writer;
+        };
+        int before = store.reads;
+        try (var pool = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            create.call();
+            var pending = new ArrayList<java.util.concurrent.Future<PdkSinkWriter>>();
+            for (int i = 1; i < 4; i++) pending.add(pool.submit(create));
+            for (var future : pending) future.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(opened).hasSize(4);
+            var instances = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<PdkConnector, Boolean>());
+            opened.forEach(writer -> instances.add(writer.connector()));
+            assertThat(instances).hasSize(4);
+            assertThat(store.reads - before).isEqualTo(1);
+        } finally { opened.forEach(PdkSinkWriter::close); }
+    }
+
     @Test void sameNamedAliasWithAnotherModelCannotBypassThePreparedMemo()throws Throwable {
         var calls=new ArrayList<String>();var store=new Receipts(calls);var preparation=preparation("mysql",functions(calls),store,() -> {});
         preparation.prepare(TARGET,TargetTapTable.build(TARGET));calls.clear();

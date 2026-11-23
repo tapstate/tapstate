@@ -26,8 +26,10 @@ class ConfiguredSinkRunTest {
     private static final TargetTable TARGET=new TargetTable("target",List.of(new TargetField("id","int",true)));
     private static PdkSinkWriterFactory factory(){return new PdkSinkWriterFactory("demo",Map.of(),WriteMode.UPSERT,DdlPolicy.FAIL,Map.of("orders",TARGET),NODE,OnFullLoad.CLEAR,true);}
 
-    @Test void serializedFactoryUsesOnlyCapturedTokensExactArtifactAndIndependentCacheReceipts(@TempDir Path directory)throws Exception {
-        var trace=Files.createFile(directory.resolve("trace"));var ref=new ConnectorRef(List.of(SyntheticSinkJars.preparationSink(directory,trace,true)),"synthetic.PreparationSink","2.0.8",null,null,HASH,false);
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void serializedFactoryUsesOnlyCapturedTokensExactArtifactAndIndependentCacheReceipts(boolean certified, @TempDir Path directory)throws Exception {
+        var trace=Files.createFile(directory.resolve("trace"));var ref=new ConnectorRef(List.of(SyntheticSinkJars.preparationSink(directory,trace,true)),"synthetic.PreparationSink","2.0.8",null,null,HASH,certified);
         var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolve("demo")).thenReturn(ref);when(provisioner.resolve("demo",HASH)).thenReturn(ref);
         var notes=notes();var original=factory();var run=ConfiguredSinkRun.prepare(FENCE,original.config(),PipelineNode.Purpose.SYNC,notes,provisioner,() -> {});
         var receipts=new Receipts();receipts.prepareTargets(original.preparationInputs(SCOPE));var cache=mock(PipelineStoreViews.class);
@@ -38,7 +40,11 @@ class ConfiguredSinkRunTest {
         var member=Hazelcast.newHazelcastInstance(config);
         try {
             var copy=copy(original.forRun(run));copy.prepareTargets(member);
-            for(int i=0;i<3;i++)try(var ignored=copy.getEx()){}
+            var opening = copy.opening();
+            assertThat(opening.maximumConcurrentRemainingOpens()).isOne();
+            for(int i=0;i<3;i++)try(var ignored=opening.open(0,i)) {
+                assertThat(opening.maximumConcurrentRemainingOpens()).isEqualTo(certified ? 1 : 2);
+            }
             assertThat(Files.readAllLines(trace)).containsExactly("create:target","clear:target","stop","stop","stop","stop");
             verify(notes,never()).open(any());verify(notes,never()).initialize(any());verify(notes,never()).prepareOrigin(any(),any());
             verify(provisioner,never()).resolve("demo");verify(provisioner,atLeastOnce()).resolve("demo",HASH);
