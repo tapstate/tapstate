@@ -15,6 +15,7 @@ export async function notifyCloudRelease(env = process.env, fetchImpl = fetch) {
   const image = required(env, 'CLOUD_IMAGE');
   const imageTag = required(env, 'CLOUD_IMAGE_TAG');
   const imageDigest = required(env, 'CLOUD_IMAGE_DIGEST');
+  const managedBedrock = required(env, 'CLOUD_MANAGED_BEDROCK');
   const releaseCode = required(env, 'CLOUD_RELEASE_CODE');
   if (!/^\d+\.\d+\.\d+$/.test(version) || tag !== `v${version}`) {
     throw new Error('The release version and tag must identify the same numeric release');
@@ -22,6 +23,9 @@ export async function notifyCloudRelease(env = process.env, fetchImpl = fetch) {
   if (!/^[0-9a-f]{40}$/.test(commitId)) throw new Error('RELEASE_SHA must be a full commit SHA');
   if (!['ALPHA', 'BETA', 'RC', 'STABLE'].includes(releaseCode)) {
     throw new Error('CLOUD_RELEASE_CODE must be ALPHA, BETA, RC or STABLE');
+  }
+  if (!['true', 'false'].includes(managedBedrock)) {
+    throw new Error('CLOUD_MANAGED_BEDROCK must be true or false');
   }
   if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)
       || image !== `ghcr.io/tapstate/tapstate-cloud@${imageDigest}`
@@ -42,7 +46,7 @@ export async function notifyCloudRelease(env = process.env, fetchImpl = fetch) {
   const token = required(env, 'CLOUD_CLUSTER_VERSION_RELEASE_TOKEN');
   if (/[\r\n]/.test(token)) throw new Error('The Cloud release token must not contain line breaks');
   const extra = {
-    tag, image, imageTag, imageDigest,
+    tag, image, imageTag, imageDigest, managedBedrock,
     releaseUrl: `https://github.com/tapstate/tapstate/releases/tag/${tag}`,
     workflowUrl: required(env, 'RELEASE_RUN_URL'),
   };
