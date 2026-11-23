@@ -306,14 +306,20 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     private Optional<WorkloadClaim> renewClaim(WorkloadClaim expected, Duration ttl) {
         var firstMongoError = new java.util.concurrent.atomic.AtomicBoolean();
-        return transaction(false, null, (store, session) -> {
+        return transaction((session, budget) -> {
             try {
+                var store = raw.inStrictSession(session);
                 var renewed = store.renewBeforeReads(expected, ttl);
-                if (renewed.isPresent()) {
-                    var retained = expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
-                            ? decodeScope(renewed.orElseThrow().row(), expected.key()) : storedScope(session, expected.key());
-                    if (retained != null) validateState(session, retained);
-                } else validateMutationScope(session, store, expected);
+                if (renewed.isPresent() && expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION) {
+                    var row = renewed.orElseThrow().row();
+                    verifyPipelineRenewal(session, decodeScope(row, expected.key()), row);
+                } else {
+                    if (renewed.isPresent()) {
+                        var retained = storedScope(session, expected.key());
+                        if (retained != null) validateState(session, retained);
+                    } else validateMutationScope(session, store, expected);
+                    new MongoCacheBusinessIdentity(database, scope).requireAdmissionState(session);
+                }
                 return renewed.map(MongoWorkloadClaimStore.Renewal::claim);
             } catch (MongoException failure) {
                 if (expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
@@ -328,7 +334,21 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                         && !failure.hasErrorLabel("UnknownTransactionCommitResult")) throw new RenewalWriteConflict();
                 throw failure;
             }
-        }, true);
+        }, null);
+    }
+
+    private void verifyPipelineRenewal(ClientSession session, PipelineIntentScope retained, Document renewedRow) {
+        var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
+        var proof = MongoBindingReadFacts.supported(client) ? MongoPipelineProofFacts.readRenewal(session, database, retained) : null;
+        if (proof == null) {
+            access.stateRow(session);
+            access.requirePreparedClaim(renewedRow);
+            new MongoCacheBusinessIdentity(database, scope).requireAdmissionState(session);
+            return;
+        }
+        access.validateState(proof.checkpoint());
+        access.requirePreparedClaim(renewedRow);
+        MongoCacheBusinessIdentity.requireObservedAdmission(proof.identity(), proof.schema(), scope);
     }
     @Override public boolean release(WorkloadClaim expected) {
         requireKey(Objects.requireNonNull(expected, "expected").key());

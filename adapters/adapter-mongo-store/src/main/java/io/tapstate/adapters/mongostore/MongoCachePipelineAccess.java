@@ -502,6 +502,20 @@ final class MongoCachePipelineAccess {
         return state;
     }
 
+    Document stateForSnapshotPin(ClientSession session, boolean batchReads) {
+        var proof = batchReads && original != null ? MongoPipelineProofFacts.readPin(session, database, scope, original) : null;
+        var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+        if (proof == null) {
+            new MongoCacheBusinessIdentity(database, business).requireReady(session);
+            return stateForWriterProgress(session, true);
+        }
+        var state = proof.state();
+        MongoCacheBusinessIdentity.requireObservedReady(state.identity(), state.schema(), business);
+        validateState(state.checkpoint());
+        requirePreparedClaim(proof.claim());
+        return state.checkpoint();
+    }
+
     Document stateForWriterProgress(ClientSession session, boolean structureChecked) {
         Document state = SystemCollections.CACHE_PIPELINE_STATE.on(database)
                 .find(session, new Document("_id", scope.pipelineId())).first();

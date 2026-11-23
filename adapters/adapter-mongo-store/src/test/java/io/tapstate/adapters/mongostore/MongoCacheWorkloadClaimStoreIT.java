@@ -55,6 +55,35 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void aRenewalUsesOneJoinedProofAfterTheOriginalClaimWrite() {
+        withBusiness(f -> {
+            var original = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommand().containsKey("autocommit")) commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var operations = new MongoClaimOperations(observed);
+                try {
+                    var store = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()),
+                            SCOPE, ACTIVE, null, operations);
+                    var confirmed = store.withRenewalDeadline(deadline(), ACTIVE, () -> store.renew(original, TTL)).orElseThrow();
+                    assertThat(WorkloadClaimFence.from(confirmed)).isEqualTo(WorkloadClaimFence.from(original));
+                    assertThat(confirmed.leaseUntil()).isAfter(original.leaseUntil());
+                    assertThat(f.domain().workloadClaims(SCOPE).readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(confirmed);
+                    System.out.printf("PIPELINE_RENEWAL_COMMANDS count=%d commands=%s%n", commands.size(), commands);
+                    assertThat(commands).containsExactly("findAndModify", "aggregate", "commitTransaction");
+                } finally {
+                    operations.await(deadline());
+                    operations.closeIfIdle();
+                }
+            }
+        });
+    }
+
     @Test void onlyNodeRenewalAndConfirmationUseTheDedicatedClient() {
         withBusiness(f -> {
             var ordinary = new java.util.concurrent.CopyOnWriteArrayList<String>();

@@ -5,6 +5,7 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Collation;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -29,6 +30,45 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
         var claim = row(captured, "claim");
         return schema == null || checkpoint == null || claim == null ? null
                 : new MongoPipelineProofFacts(schema, checkpoint, claim);
+    }
+
+    record RenewalProof(Document identity, Document schema, Document checkpoint) {}
+
+    static RenewalProof readRenewal(ClientSession session, MongoDatabase database, PipelineIntentScope scope) {
+        return renewalProof(readPipelineAndBusiness(session, database, scope, List.of()), scope);
+    }
+
+    record PinProof(RenewalProof state, Document claim) {}
+
+    static PinProof readPin(ClientSession session, MongoDatabase database, PipelineIntentScope scope, WorkloadClaimFence original) {
+        var id = MongoWorkloadClaimStore.id(original.key());
+        var live = WorkloadClaimDocuments.live(original).append("pipelineScope", MongoPipelinePreparationFacts.scope(scope))
+                .append("pipelinePreparation.phase", "PREPARED");
+        var captured = readPipelineAndBusiness(session, database, scope, List.of(MongoCaptureStartupRows.lookup(
+                SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", id, List.of(new Document("$match", live)))));
+        var state = renewalProof(captured, scope);
+        if (state == null || MongoCaptureStartupRows.ambiguous(captured, "claim", id)) return null;
+        var claim = MongoCaptureStartupRows.get(captured, "claim");
+        return claim == null ? null : new PinProof(state, claim);
+    }
+
+    private static Document readPipelineAndBusiness(ClientSession session, MongoDatabase database, PipelineIntentScope scope,
+            List<Document> extra) {
+        var stages = new ArrayList<>(List.of(match("cluster"), inline(),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_PIPELINE_STATE, "checkpoint", scope.pipelineId())));
+        stages.addAll(extra);
+        return SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, stages).collation(SIMPLE).first();
+    }
+
+    private static RenewalProof renewalProof(Document captured, PipelineIntentScope scope) {
+        if (captured == null || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
+                || MongoCaptureStartupRows.ambiguous(captured, "checkpoint", scope.pipelineId())) return null;
+        var identity = captured.get(ROW, Document.class);
+        var schema = MongoCaptureStartupRows.get(captured, "schema");
+        var checkpoint = MongoCaptureStartupRows.get(captured, "checkpoint");
+        if (identity == null || !"cluster".equals(identity.get("_id")) || schema == null || checkpoint == null) return null;
+        return new RenewalProof(identity, schema, checkpoint);
     }
 
     record Authority(Document identity, Document schema, Document checkpoint, Document claim) {}

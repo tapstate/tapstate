@@ -284,6 +284,76 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void snapshotPinUsesAtMostNineReadsPerAttemptAndCommitsAfterALateConflict(boolean conflict) {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            var previous = publishSnapshotModels(f, tables).get("orders");
+            f.chains().requestTables(CHAIN, tables, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "retained"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(previous, -1)), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            f.chains().openEpoch(CHAIN, 1, f.captureFence()).orElseThrow();
+            var next = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 2, 0);
+            models(f).publishInitial(next, ring("orders"), new SourceTable("orders", List.of(new SourceField("id", "int")),
+                    List.of(), List.of()), f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 2, tables, f.captureFence())).isTrue();
+            var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(2, "new-snapshot", Map.of("orders", next));
+            var competingRenewal = new java.util.concurrent.atomic.AtomicBoolean(conflict);
+            var conflicts = new java.util.concurrent.atomic.AtomicInteger();
+            var commands = new java.util.LinkedHashMap<Long, List<String>>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    var body = event.getCommand();
+                    if (!body.containsKey("autocommit")) return;
+                    String command = event.getCommandName();
+                    var target = body.get(command);
+                    String collection = target != null && target.isString() ? target.asString().getValue() : "-";
+                    commands.computeIfAbsent(body.getNumber("txnNumber").longValue(), ignored -> new ArrayList<>())
+                            .add(command + ":" + collection);
+                    if ("update".equals(command) && "workload_claims".equals(collection)
+                            && competingRenewal.compareAndSet(true, false)) {
+                        var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+                        var renewed = claims.renew(f.pipelineA(), Duration.ofSeconds(30)).orElseThrow();
+                        assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(f.fenceA());
+                    }
+                    if (conflict) java.util.concurrent.locks.LockSupport.parkNanos(Duration.ofMillis(350).toNanos());
+                }
+                @Override public void commandFailed(com.mongodb.event.CommandFailedEvent event) {
+                    if (event.getThrowable() instanceof com.mongodb.MongoCommandException failure && failure.getCode() == 112)
+                        conflicts.incrementAndGet();
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                var store = runtimeConsumer(observed, observed.getDatabase(f.database().getName()));
+                var start = System.nanoTime();
+                assertThat(store.pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+                long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                var durable = f.consumers().progress(A).orElseThrow();
+                assertThat(durable.snapshot()).isEqualTo(pin);
+                assertThat(durable.revision()).isOne();
+                assertThat(conflicts).hasValue(conflict ? 1 : 0);
+                assertThat(commands).hasSize(conflict ? 2 : 1);
+                var successful = commands.lastEntry().getValue();
+                var writes = successful.stream().filter(c -> c.startsWith("update:") || c.startsWith("findAndModify:")).toList();
+                assertThat(writes).containsExactly("findAndModify:srs_chains", "update:pipeline_state",
+                        "update:srs_consumer_offsets", "update:workload_claims");
+                assertThat(successful).endsWith("commitTransaction:-");
+                var reads = commands.values().stream().map(rows -> rows.stream()
+                        .filter(c -> c.startsWith("find:") || c.startsWith("aggregate:") || c.startsWith("getMore:")).count()).toList();
+                System.out.printf("SNAPSHOT_PIN_READS late_conflict=%b reads=%s wall_ms=%d commands=%s%n",
+                        conflict, reads, millis, commands.values());
+                assertThat(reads).allSatisfy(readCount -> assertThat(readCount).isLessThanOrEqualTo(9));
+                assertThat(millis).isLessThan(15_000);
+            }
+        });
+    }
+
     @Test void startPredictionRefusesLostRootsAndCallerLossBeforeOwnPayloads() {
         withBusiness(f -> {
             f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
