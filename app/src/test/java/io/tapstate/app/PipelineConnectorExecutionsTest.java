@@ -126,6 +126,21 @@ class PipelineConnectorExecutionsTest {
     }
 
     @Test
+    void aStaleStopCannotAbortTheSubsequentExplicitStart() {
+        var f = new Fixture();
+        var retained = List.of(privateBinding(TARGET, OLD_HASH));
+        long laterStart = STOPPED.intentRevision() + 1;
+        var requested = new Handoff(laterStart, Phase.REQUESTED, List.of(), List.of());
+        when(f.bindings.load(SCOPE)).thenReturn(Optional.of(state(1, retained, requested)));
+
+        f.executions.stopped(STOPPED, CLAIM, ACTIVE);
+
+        verify(f.bindings, never()).abort(SCOPE, laterStart);
+        verify(f.bindings, never()).complete(SCOPE, laterStart);
+        verifyNoInteractions(f.consumers);
+    }
+
+    @Test
     void stoppingAfterPublicationFinishesTheOldHandoffUsingItsRevision() {
         var f = new Fixture();
         var old = List.of(shared(SOURCE, CHAIN, OLD_HASH));

@@ -15,9 +15,10 @@ import io.tapstate.spi.store.ConnectorArtifactMetadata.Origin;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.http.MediaType;
@@ -50,9 +51,10 @@ class NativeConnectorHandoffIT {
     @TempDir
     Path work;
 
-    @Test
+    @ParameterizedTest(name = "SRS enabled: {0}")
+    @ValueSource(booleans = {true, false})
     @Timeout(180)
-    void retainedRestartMovesOnlyTheStoppedReaderAndDeliversItsMissedChange() throws Exception {
+    void retainedRestartMovesOnlyTheStoppedReaderAndDeliversItsMissedChange(boolean shared) throws Exception {
         var storage = NativeAppStorage.createOnPremWithAdmin(MONGO, "handoff", "admin", "fixture-handoff-password");
         String fixture = System.getProperty("tapstate.pdk.it.mongodb-jar");
         Path original = fixture == null ? CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar")
@@ -81,7 +83,7 @@ class NativeConnectorHandoffIT {
             var cache = mongo.getDatabase(storage.cacheDatabase());
             var config = mongo.getDatabase(storage.configurationDatabase());
             source.insertOne(row(1, "snapshot"));
-            defineReaders(child.getBean(StorePort.class), sourceDb, secondTargetDb);
+            defineReaders(child.getBean(StorePort.class), sourceDb, secondTargetDb, shared);
 
             var token = child.getBean(TokenService.class).create(Scope.WRITE);
             var http = RestClient.builder().baseUrl("http://127.0.0.1:"
@@ -92,8 +94,8 @@ class NativeConnectorHandoffIT {
             assertDelivered(first, 1, "snapshot");
             command(http, "reader_b", "start", Map.of());
             assertDelivered(second, 1, "snapshot");
-            String oldChain = chain(cache, "reader_b");
-            assertThat(chain(cache, "reader_a")).isEqualTo(oldChain);
+            String oldChain = shared ? chain(cache, "reader_b") : null;
+            if (shared) assertThat(chain(cache, "reader_a")).isEqualTo(oldChain);
             long unchangedExecution = execution(cache, "reader_b");
 
             String newHash;
@@ -105,7 +107,7 @@ class NativeConnectorHandoffIT {
             source.insertOne(row(2, "both-original-readers"));
             assertDelivered(first, 2, "both-original-readers");
             assertDelivered(second, 2, "both-original-readers");
-            assertThat(chain(cache, "reader_a")).isEqualTo(oldChain);
+            if (shared) assertThat(chain(cache, "reader_a")).isEqualTo(oldChain);
 
             command(http, "reader_a", "stop", Map.of("purgeState", false));
             await().atMost(Duration.ofSeconds(45)).untilAsserted(() ->
@@ -120,16 +122,17 @@ class NativeConnectorHandoffIT {
             assertDelivered(first, 3, "while-a-stopped");
             assertThat(first.find(new Document("_id", 99L)).first()).containsEntry("payload", "existing-target-state");
             await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
-                assertThat(chain(cache, "reader_a")).isNotEqualTo(oldChain);
+                if (shared) assertThat(chain(cache, "reader_a")).isNotEqualTo(oldChain);
                 assertThat(effectiveHashes(config, "reader_a")).containsOnly(newHash);
             });
-            assertThat(chain(cache, "reader_b")).isEqualTo(oldChain);
+            if (shared) assertThat(chain(cache, "reader_b")).isEqualTo(oldChain);
+            else assertThat(cache.getCollection("srs_consumers").countDocuments()).isZero();
             assertThat(effectiveHashes(config, "reader_b")).containsOnly(oldHash);
             assertThat(execution(cache, "reader_b")).isEqualTo(unchangedExecution);
         }
     }
 
-    private static void defineReaders(StorePort store, String sourceDb, String targetDb) {
+    private static void defineReaders(StorePort store, String sourceDb, String targetDb, boolean shared) {
         var parser = new DslParser();
         store.artifacts().save(parser.parse("""
                 version: tapstate/v1
@@ -156,14 +159,14 @@ class NativeConnectorHandoffIT {
                     version: tapstate/v1
                     kind: pipeline
                     id: %s
-                    source: [ { id: input, srs: true } ]
+                    source: [ { id: input, srs: %s } ]
                     settings: { read_mode: snapshot_and_cdc }
                     serve:
                       from: orders
                       sync:
                         - source: %s
                           on_full_load: clear
-                    """.formatted(entry.getKey(), entry.getValue())));
+                    """.formatted(entry.getKey(), shared, entry.getValue())));
         }
     }
 

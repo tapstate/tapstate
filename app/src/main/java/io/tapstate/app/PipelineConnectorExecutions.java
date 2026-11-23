@@ -201,9 +201,12 @@ final class PipelineConnectorExecutions {
 
     void stopped(PipelineIntentSnapshot intent, WorkloadClaimFence claim, Runnable guard) {
         var state = store(guard).load(intent.scope()).orElse(null);
-        if (state != null && state.handoff() != null
-                && (state.handoff().intentRevision() != intent.intentRevision()
-                    || intent.desired().targetState() != io.tapstate.core.lifecycle.PipelineState.RUNNING)) {
+        if (state == null || state.handoff() == null) return;
+        long handoffRevision = state.handoff().intentRevision();
+        // A newer explicit start may commit while this stop is still finishing.
+        if (handoffRevision < intent.intentRevision()
+                || handoffRevision == intent.intentRevision()
+                    && intent.desired().targetState() != io.tapstate.core.lifecycle.PipelineState.RUNNING) {
             settle(intent.scope(), state, claim, guard);
         }
     }
