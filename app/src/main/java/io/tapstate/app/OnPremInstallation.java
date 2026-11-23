@@ -188,11 +188,13 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (stage.handoff().ordinal() < InstallationFiles.Handoff.CREATE_STARTED.ordinal()) return;
         var connection = connection(files);
         if (!configurationHash(connection).equals(stage.configurationHash())) throw StorageRuntime.unavailable();
-        if (root.runtime().configuration().isEmpty()) {
-            if (stage.handoff() != InstallationFiles.Handoff.CREATE_STARTED) throw StorageRuntime.unavailable();
+        if (stage.handoff() == InstallationFiles.Handoff.CREATE_STARTED) {
             var expected = stage.scope();
-            adopt(MongoConfigurationBootstrap.resume(settings(files, mongo), expected.clusterId(), expected.installationId(), expected.operationId(), expected.generation()), connection);
-        }
+            var prepared = MongoConfigurationBootstrap.resume(settings(files, mongo), expected.clusterId(),
+                    expected.installationId(), expected.operationId(), expected.generation());
+            if (root.runtime().configuration().isEmpty()) adopt(prepared, connection);
+            else prepared.close();
+        } else if (root.runtime().configuration().isEmpty()) throw StorageRuntime.unavailable();
         var status = states.load();
         if (status.phase() != StorageSetupStateStore.Phase.COMPLETE) {
             files.locked(() -> { files.saveStage(files.stage().withScope(status.scope()).withHandoff(InstallationFiles.Handoff.CONFIGURED, stage.configurationHash())); return null; });
