@@ -228,7 +228,8 @@ final class MongoAlertStateStore {
         if (changes.size() > 8) { throw new IllegalArgumentException("too many state transitions"); }
         Document head = MongoAlertStateEnvelope.head(candidate, revision + 1);
         Document episode = candidate.episode() == null ? null : MongoAlertStateEnvelope.episode(candidate.episode());
-        if (episode != null && (before == null || before.episode() == null || before.episode().value().number() != candidate.episode().value().number())
+        // An absent head was already proven to have no episode or transition in this snapshot.
+        if (episode != null && actual.isPresent() && (before == null || before.episode() == null || before.episode().value().number() != candidate.episode().value().number())
                 && episodes.find(session,new Document("_id",episode.get("_id"))).first() != null) { throw new IllegalArgumentException("original episode identity already exists"); }
         MongoAlertStateEnvelope.read(key, head, episode);
         java.time.Instant now = clock.instant();

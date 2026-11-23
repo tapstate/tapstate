@@ -553,6 +553,12 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     /** Decodes a full binding audit with facts already read in the original CONFIG snapshot. */
     CachePreparation auditedObservationBinding(Document cluster, Document stage, Document stored, Document recovery,
             Document source, Document global, boolean conflictingResource) {
+        return auditedObservationFacts(cluster,stage,stored,recovery,source,global,conflictingResource).preparation();
+    }
+
+    record AuditedBinding(StorageBinding binding,CachePreparation preparation) { }
+    AuditedBinding auditedObservationFacts(Document cluster,Document stage,Document stored,Document recovery,
+            Document source,Document global,boolean conflictingResource) {
         requireClusterIdentity(cluster);
         String clusterId = cluster.getString("clusterId");
         long version = cluster.getLong(BINDING_VERSION);
@@ -561,7 +567,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         requireDefaultSource(stored, source, conflictingResource);
         requireGlobalScope(global, clusterId);
         if (recovery == null) throw unreadable();
-        return MongoStorageRecoveryStore.read(recovery, binding.setup(), binding.mode(), version, () -> stage).preparation();
+        return new AuditedBinding(binding,MongoStorageRecoveryStore.read(recovery,binding.setup(),binding.mode(),version,()->stage).preparation());
     }
 
     private TransactionFacts readBound(ClientSession session, Document stored, MongoBindingReadFacts.Facts facts,

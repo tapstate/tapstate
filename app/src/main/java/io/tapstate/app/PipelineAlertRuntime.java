@@ -655,7 +655,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if(matching.size()>MAX_MATCHES)throw refused("matching-rule-budget");
             for(var rule:matching){
                 String domain=input instanceof AlertInput.Operational op?op.domainToken():null;
-                var binding=new AlertEvaluationHost.Binding(rule,resource,producer,sourceRevision,()->{active.run();localProof.run();},domain);
+                Runnable current=()->{active.run();localProof.run();};
+                java.util.function.Supplier<AlertStore.EvaluationProof> proof=domain==null?()->null:()->AlertStore.EvaluationProof.operation(current);
+                if(owner!=null&&domain!=null)proof=()->AlertStore.EvaluationProof.operation(
+                        (AlertStore.EvaluationProof.PipelineOperationGuard)()->{active.run();originalGuard.run();localProof.run();});
+                var binding=new AlertEvaluationHost.Binding(rule,resource,producer,sourceRevision,current,proof,domain);
                 var before=resolved.store().state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),active));
                 if(before.isEmpty() && input instanceof AlertInput.Operational op && op.domainToken()!=null && op.succeeded())continue;
                 if (before.isEmpty() && AlertEvaluationHost.structureInspection(typeId)

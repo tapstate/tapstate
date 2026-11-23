@@ -93,9 +93,9 @@ final class MongoAlertCoordinator implements AlertStore {
         return tx(access,write,authoring,null,action);
     }
     private <T>T tx(Access access,boolean write,boolean authoring,PlanVersion planned,Function<ClientSession,T> action) {
-        return txWithHost(access,write,authoring,planned,false,(session,hostReading)->action.apply(session));
+        return txWithHost(access,write,authoring,planned,false,null,(session,hostReading)->action.apply(session));
     }
-    private <T>T txWithHost(Access access,boolean write,boolean authoring,PlanVersion planned,boolean runtimeWrite,BiFunction<ClientSession,HostReading,T> action) {
+    private <T>T txWithHost(Access access,boolean write,boolean authoring,PlanVersion planned,boolean runtimeWrite,MongoAlertWriteFacts.Request request,BiFunction<ClientSession,HostReading,T> action) {
         if(access!=null){access.revalidate().run();access.locallyActive().run();}
         host.locallyActive().run(); var verifiedSchema=domain.currentAlertSchema();
         return StoreIo.call(()->domain.alertTransaction(new MongoReadBudget(Duration.ofSeconds(10)),session->{
@@ -105,7 +105,7 @@ final class MongoAlertCoordinator implements AlertStore {
                     session, SystemCollections.CONFIGURATION_VERSION.on(db));
             if (preimage != null && (!Long.valueOf(planned.configurationRevision()).equals(preimage.get("revision"))
                     || !Long.valueOf(planned.alertFence()).equals(preimage.get(ConfigurationVersion.ALERT_FENCE)))) throw new Conflict();
-            var hostReading=currentHost(session,write,false,preimage,runtimeWrite);
+            var hostReading=currentHost(session,write,false,preimage,runtimeWrite,request);
             domain.requireVerifiedAlertSchema(hostReading.marker());if(access!=null){currentActor(session,access.actor(),access);if(write&&access.actor()==null&&!Set.of("WRITE","ADMIN").contains(access.cloudGrantedScope()))throw stale("cloud-write-permission");}
             if(write){
                 keyFence(session,hostReading);
@@ -140,16 +140,16 @@ final class MongoAlertCoordinator implements AlertStore {
         return currentHost(session, write, includeDelivery, null);
     }
     private HostReading currentHost(ClientSession session, boolean write, boolean includeDelivery, Document preimage) {
-        return currentHost(session,write,includeDelivery,preimage,false);
+        return currentHost(session,write,includeDelivery,preimage,false,null);
     }
-    private HostReading currentHost(ClientSession session, boolean write, boolean includeDelivery, Document preimage,boolean runtimeWrite) {
+    private HostReading currentHost(ClientSession session, boolean write, boolean includeDelivery, Document preimage,boolean runtimeWrite,MongoAlertWriteFacts.Request request) {
         if(!write){
             host.locallyActive().run();var facts=bindings.admittedAlertHost(session, includeDelivery);
             if(facts!=null)return admittedHost(facts);
         }
         host.locallyActive().run();
         if(runtimeWrite&&write&&bindings.supportsAlertWriteFacts()) {
-            var captured=MongoAlertWriteFacts.read(db,session);
+            var captured=MongoAlertWriteFacts.read(db,session,request);
             if(captured!=null&&captured.singletonRecovery()) {
                 var stored=captured.row(SystemCollections.STORAGE_BINDING,"cluster");
                 if(stored!=null&&stored.get("defaultSourceId") instanceof String sourceId&&stored.get("bindingVersion") instanceof Long boundVersion&&boundVersion>0) {
@@ -157,9 +157,9 @@ final class MongoAlertCoordinator implements AlertStore {
 
                     boolean collision=false;
                     for(var table:MongoAlertWriteFacts.ARTIFACTS) if(table!=SystemCollections.SOURCES&&captured.row(table,sourceId)!=null){collision=true;break;}
-                    var cache=bindings.auditedObservationBinding(captured.identity(),setup,stored,captured.row(SystemCollections.STORAGE_RECOVERY,"cluster"),
+                    var audited=bindings.auditedObservationFacts(captured.identity(),setup,stored,captured.row(SystemCollections.STORAGE_RECOVERY,"cluster"),
                             captured.row(SystemCollections.SOURCES,sourceId),captured.row(SystemCollections.PDK_NOTE_SCOPES,new Document("bindingVersion",boundVersion).append("namespace","pdk.global-state")),collision);
-                    var binding=bindings.observationBinding(cache.businessScope(),stored,setup,captured.row(SystemCollections.STORAGE_RECOVERY,"cluster"));
+                    var cache=audited.preparation();var binding=audited.binding();
                     if(!MongoAlertHostIdentity.current(setup,host.setup(),binding))throw stale("host-installation");
                     if((binding.mode()==StorageBinding.Mode.OP)!=(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM))throw stale("deployment");
                     var version=preimage==null?captured.row(SystemCollections.CONFIGURATION_VERSION,ConfigurationVersion.ID):preimage;
@@ -368,7 +368,8 @@ final class MongoAlertCoordinator implements AlertStore {
     @Override public Outcome commit(Commit candidate){return commit(candidate,null);}
     @Override public Outcome commitAsCaller(Commit candidate,Access access){Objects.requireNonNull(access);return commit(candidate,access);}
     private Outcome commit(Commit c,Access access) {
-        try{return txWithHost(access,true,false,access==null?c.version():null,access==null&&c.state()!=null&&c.state().proof()!=null&&c.state().proof().pipeline()!=null,(s,checkedHost)->{
+        var request=c.state()==null?null:new MongoAlertWriteFacts.Request(c.state().after().snapshot().rule().key(),c.state().after().binding()==null?null:c.state().after().binding().ruleIdentity());
+        try{return txWithHost(access,true,false,access==null?c.version():null,access==null&&c.state()!=null&&c.state().proof()!=null&&(c.state().proof().pipeline()!=null||c.state().proof().requireCurrent() instanceof EvaluationProof.PipelineOperationGuard),request,(s,checkedHost)->{
             boolean changed=false;
             if(c.version()!=null&&access!=null){
                 var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(s,new Document("_id",ConfigurationVersion.ID)).first();
@@ -408,7 +409,7 @@ final class MongoAlertCoordinator implements AlertStore {
                 else {
                     if(v.after().binding()==null)throw stale("state-rule-binding");
                     var member=v.after().binding();
-                    var rule=definitions.load(s,Kind.RULE,member.ruleIdentity().id()).orElseThrow(()->stale("rule"));
+                    var rule=definitions.load(s,Kind.RULE,member.ruleIdentity().id(),checkedHost.facts()).orElseThrow(()->stale("rule"));
                     if(!(rule.definition() instanceof Rule currentRule) || ruleCapability(currentRule).isPresent())
                         throw unreadable("rule-capability");
                     long expected=v.expectedRuleRevision()==null?member.evaluation().revision():v.expectedRuleRevision();
@@ -670,11 +671,11 @@ final class MongoAlertCoordinator implements AlertStore {
     }
     private void resource(ClientSession s,AlarmKey.Resource r,long bindingRevision,boolean fence,MongoAlertWriteFacts facts) {
         if(r.kind().equals("source")){
-            Document row=SystemCollections.SOURCES.on(db).find(s,new Document("_id",r.id())).first();if(row==null)throw stale("source");
+            Document row=facts==null?SystemCollections.SOURCES.on(db).find(s,new Document("_id",r.id())).first():facts.row(SystemCollections.SOURCES,r.id());if(row==null)throw stale("source");
             var id=MongoSourceIdentity.read(row).binding();if(!id.incarnation().equals(r.incarnation())||bindingRevision>0&&id.bindingRevision()!=bindingRevision)throw stale("source-incarnation");
-            if(fence&&!artifacts.fenceSourceBinding(s,id))throw stale("source-binding");
+            if(fence&&!(facts==null?artifacts.fenceSourceBinding(s,id):artifacts.fenceSourceBinding(s,id,facts,row)))throw stale("source-binding");
         } else if(r.kind().equals("pipeline")){
-            var state=MongoPipelineStateMappings.decode(r.id(),SystemCollections.OPERATOR_GENERATIONS.on(db).find(s,new Document("_id",r.id())).first());
+            var state=MongoPipelineStateMappings.decode(r.id(),facts==null?SystemCollections.OPERATOR_GENERATIONS.on(db).find(s,new Document("_id",r.id())).first():facts.row(SystemCollections.OPERATOR_GENERATIONS,r.id()));
             if(state.phase()!=PipelineStateMapping.Phase.ACTIVE||!Long.toString(state.stateGeneration()).equals(r.incarnation()) )throw stale("pipeline-incarnation");
             if(facts==null) { if(artifacts.getInTransaction(s,r.id()).isEmpty())throw stale("pipeline-incarnation"); }
             else {

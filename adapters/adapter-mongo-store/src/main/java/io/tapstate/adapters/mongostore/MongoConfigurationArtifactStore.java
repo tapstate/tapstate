@@ -641,6 +641,11 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return MongoSourceIdentity.fence(session, database, expected, ciphers.current().activeKeyId());
     }
 
+    boolean fenceSourceBinding(ClientSession session,io.tapstate.spi.store.SourceBindingIdentity expected,MongoAlertWriteFacts facts,Document source) {
+        return MongoSourceIdentity.fence(session,database,expected,ciphers.current().activeKeyId(),facts.identity(),
+                facts.row(SystemCollections.SCHEMA_MIGRATIONS,"config"),source,facts.row(SystemCollections.CLUSTER_KEYS,"cluster"));
+    }
+
     @Override
     public List<Resource> list() {
         return readSnapshot(session -> documents(session).stream().map(this::decode).toList());

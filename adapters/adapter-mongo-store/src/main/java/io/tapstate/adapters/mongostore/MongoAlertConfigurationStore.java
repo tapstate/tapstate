@@ -89,8 +89,13 @@ final class MongoAlertConfigurationStore {
     }
 
     Optional<MongoAlertConfigurationCodec.Stored> load(ClientSession session, Kind kind, String id) {
+        return load(session,kind,id,null);
+    }
+
+    Optional<MongoAlertConfigurationCodec.Stored> load(ClientSession session,Kind kind,String id,MongoAlertWriteFacts facts) {
         MongoAlertStateStore.requireTransaction(session); requireActive.run();
-        Document row = collection(kind).find(session, new Document("_id", MongoAlertConfigurationCodec.key(scope, id))).first();
+        Document row = facts==null?collection(kind).find(session,new Document("_id",MongoAlertConfigurationCodec.key(scope,id))).first()
+                :facts.row(SystemCollections.ALERT_RULES,MongoAlertConfigurationCodec.key(scope,id));
         if (row == null) { requireActive.run(); return Optional.empty(); }
         var result = MongoAlertConfigurationCodec.read(kind, scope, id, row);
         requireActive.run(); return Optional.of(result);

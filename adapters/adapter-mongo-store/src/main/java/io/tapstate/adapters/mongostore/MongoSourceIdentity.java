@@ -81,10 +81,25 @@ final class MongoSourceIdentity {
         Document row = sources.find(session, new Document("_id", expected.sourceId()))
                 .projection(new Document("kind", 1).append(MongoSourceIdentitySchema.FIELD, 1)).first();
         if (row == null) { return false; }
+        return fence(session,database,expected,state,row,null,false);
+    }
+
+    static boolean fence(ClientSession session,MongoDatabase database,SourceBindingIdentity expected,String keyId,
+            Document identity,Document schema,Document source,Document key) {
+        MongoAlertStateStore.requireTransaction(session);
+        var state=MongoSourceIdentitySchema.read(identity,schema,keyId);
+        if(state==null||state.phase()!=MongoSourceIdentitySchema.Phase.READY)throw MongoSourceIdentitySchema.unavailable(expected.sourceId());
+        if(source==null)return false;
+        return fence(session,database,expected,state,source,key,true);
+    }
+
+    private static boolean fence(ClientSession session,MongoDatabase database,SourceBindingIdentity expected,
+            MongoSourceIdentitySchema.State state,Document row,Document key,boolean checkedKey) {
+        var sources=SystemCollections.SOURCES.on(database);
         Header actual = read(row);
         if (!actual.binding().equals(expected)) { return false; }
         if (actual.writeFence() == Long.MAX_VALUE) { throw exhausted(expected.sourceId()); }
-        fenceOriginalKey(session, database, state);
+        if(checkedKey)fenceOriginalKey(session,database,state,key);else fenceOriginalKey(session,database,state);
         return sources.updateOne(session, new Document("_id", expected.sourceId())
                         .append("sourceIdentity.incarnation", expected.incarnation())
                         .append("sourceIdentity.bindingRevision", expected.bindingRevision())
@@ -94,7 +109,11 @@ final class MongoSourceIdentity {
 
     private static void fenceOriginalKey(ClientSession session, MongoDatabase database, MongoSourceIdentitySchema.State state) {
         var keys = SystemCollections.CLUSTER_KEYS.on(database);
-        Document key = keys.find(session, new Document("_id", "cluster")).first();
+        fenceOriginalKey(session,database,state,keys.find(session,new Document("_id","cluster")).first());
+    }
+
+    private static void fenceOriginalKey(ClientSession session,MongoDatabase database,MongoSourceIdentitySchema.State state,Document key) {
+        var keys=SystemCollections.CLUSTER_KEYS.on(database);
         if (key == null || !state.clusterId().equals(key.get("clusterId")) || !Integer.valueOf(1).equals(key.get("formatVersion"))
                 || !state.keyId().equals(key.get("keyId")) || !(key.get("material") instanceof String material)) {
             throw MongoSourceIdentitySchema.unreadable("original-key");
