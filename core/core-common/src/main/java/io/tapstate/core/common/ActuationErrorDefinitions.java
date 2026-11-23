@@ -79,6 +79,9 @@ public final class ActuationErrorDefinitions {
     public static final ProductErrorDefinition SYNC_OUTPUT_IDENTITY_UNRESOLVED =
             DEFINITIONS.define(35, Severity.ERROR, Set.of("pipeline", "stream"));
 
+    public static final ProductErrorDefinition PREVIEW_ASSOCIATION_KEY_DROPPED =
+            DEFINITIONS.define(36, Severity.ERROR, Set.of("relation", "field", "transform", "droppedField"));
+
     private ActuationErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

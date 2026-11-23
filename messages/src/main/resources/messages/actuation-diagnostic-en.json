@@ -138,5 +138,9 @@
   "TS0360035": {
     "message": "Pipeline {pipeline} cannot start: stream {stream} publishes no key, and this sync matches writes on one.",
     "solution": "Publish every column of the source's key under any name - as the column itself, or as a pure read of it. A projection that drops or replaces any component leaves nothing for a later change to match, so the rows are written where nothing can find them again."
+  },
+  "TS0360036": {
+    "message": "The Map transform {transform} dropped {droppedField}, which relation {relation} needs for association key {field}.",
+    "solution": "Restore the dropped field in the Map transform and try the preview again."
   }
 }
