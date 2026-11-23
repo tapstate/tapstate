@@ -143,20 +143,35 @@ final class MongoCachePipelineAccess {
     }
 
     private <T> T transaction(TransactionOptions options, boolean checkAdmission, Function<ClientSession, T> action) {
+        return transaction(options, checkAdmission, action, false);
+    }
+
+    private <T> T transaction(TransactionOptions options, boolean checkAdmission, Function<ClientSession, T> action,
+            boolean recoverPublicationCheckout) {
         return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            var retryCheckout = new java.util.concurrent.atomic.AtomicBoolean(recoverPublicationCheckout);
             try {
                 requireActive.run();
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> {
-                        MongoStructureFailureScope.beginCallback();
-                        requireActive.run();
-                        if (checkAdmission) {
-                            new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
-                                    .requireAdmissionState(session);
+                        try {
+                            MongoStructureFailureScope.beginCallback();
+                            requireActive.run();
+                            if (checkAdmission) {
+                                new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
+                                        .requireAdmissionState(session);
+                            }
+                            T result = action.apply(session);
+                            requireActive.run();
+                            return result;
+                        } catch (com.mongodb.MongoConnectionPoolClearedException checkout) {
+                            // This checkout sent no command. Replay only this uncommitted publication callback.
+                            if (!checkout.hasErrorLabel(com.mongodb.MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)
+                                    && retryCheckout.compareAndSet(true, false)) {
+                                checkout.addLabel(com.mongodb.MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL);
+                            }
+                            throw checkout;
                         }
-                        T result = action.apply(session);
-                        requireActive.run();
-                        return result;
                     }, options);
                 }
             } catch (RuntimeException failure) { requireActive.run(); throw failure; }
@@ -269,7 +284,7 @@ final class MongoCachePipelineAccess {
     /** One bounded publication batch keeps the original proof at the transaction's write boundaries. */
     <T> T publicationModelsTransaction(Function<ClientSession, T> action) {
         if (!unpreparedModels || authoringModels == null)
-            return metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, true, action);
+            return metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, database, true, action, !unpreparedModels);
         return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try (var session = client.startSession()) {
                 T result = session.withTransaction(() -> {
@@ -310,8 +325,13 @@ final class MongoCachePipelineAccess {
     }
 
     <T> T metadataTransaction(SystemCollections table, MongoDatabase target, boolean mutation, Function<ClientSession, T> action) {
+        return metadataTransaction(table, target, mutation, action, false);
+    }
+
+    private <T> T metadataTransaction(SystemCollections table, MongoDatabase target, boolean mutation,
+            Function<ClientSession, T> action, boolean recoverPublicationCheckout) {
         if(authoringModels!=null)authoringModels.requireActive();
-        T result = transaction(session -> {
+        T result = transaction(TRANSACTION, true, session -> {
             if (unpreparedModels) {
                 if (table != SystemCollections.CACHE_DERIVED_SCHEMAS || !database.getName().equals(target.getName())) throw fenced();
                 requireUnpreparedModels(session);
@@ -334,7 +354,7 @@ final class MongoCachePipelineAccess {
             }
             if (mutation) { proveClaim(session, true); updateState(session, current, new Document(), false); }
             return action.apply(session);
-        });
+        }, recoverPublicationCheckout);
         if(authoringModels!=null)authoringModels.requireActive();
         requireActive.run(); return result;
     }
