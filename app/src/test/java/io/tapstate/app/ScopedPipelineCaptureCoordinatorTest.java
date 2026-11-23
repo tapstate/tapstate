@@ -21,6 +21,24 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ScopedPipelineCaptureCoordinatorTest {
+    @Test void aFirstSharedSnapshotUsesTheExactPostArrivalConsumerReceipt() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var old = f.streamingProgress.get();
+            var cursor = old.cursor();
+            var unpinned = new ConsumerOffset(cursor.pipelineId(), cursor.perTableSeq(), cursor.sinkAcked(),
+                    List.of(), null, 0, cursor.sinkAckedByTable(), cursor.progressKind());
+            f.streamingProgress.set(new SrsConsumerProgress(old.context(), old.membershipRevision(), old.revision(),
+                    unpinned, null, old.writerRun(), old.ringDoneThrough()));
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            var supplied = org.mockito.ArgumentCaptor.forClass(SrsConsumerProgress.class);
+            verify(f.runtime).resumeSnapshot(any(), any(), anyLong(), any(), any(), any(), supplied.capture());
+            assertThat(supplied.getValue()).isEqualTo(f.streamingProgress.get());
+            assertThat(supplied.getValue().snapshot()).isNull();
+            verify(f.runtime, never()).beginSnapshot(any(), any(), anyLong(), any(), any(), any());
+        }
+    }
+
     @Test void sharedTakeoverKeepsOneOpenerWhenAnotherPipelineAddsDemand() throws Exception {
         try (var f = new Fixture(ReadMode.CDC_ONLY)) {
             var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
@@ -1339,7 +1357,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(models.publishedForNewSnapshot(anyString(), anyMap())).thenReturn(Optional.of(Map.of("orders",
                     new SrsModel(key, SrsRingbuffer.ringName("mck-key", "orders"), new SourceTable("orders", List.of(), List.of(), List.of()), 0))));
             when(sources.srs(any(), any())).thenReturn(new SrsStores(chains, models, mock(SrsLogStore.class), consumers));
-            doAnswer(call -> {
+            org.mockito.stubbing.Answer<CaptureRun> snapshot = call -> {
                 var preparation = mock(SrsSnapshotPreparation.class);
                 this.preparation.set(preparation);
                 when(preparation.request()).thenReturn(new SnapshotPreparation(1, new SourcePosition("seam")));
@@ -1348,7 +1366,9 @@ class ScopedPipelineCaptureCoordinatorTest {
                 ports.apply(preparation);
                 CaptureHandoff output = call.getArgument(4); output.loaded("orders");
                 return mock(CaptureRun.class);
-            }).when(runtime).beginSnapshot(any(), any(), anyLong(), any(), any(), any());
+            };
+            doAnswer(snapshot).when(runtime).beginSnapshot(any(), any(), anyLong(), any(), any(), any());
+            doAnswer(snapshot).when(runtime).resumeSnapshot(any(), any(), anyLong(), any(), any(), any(), any());
         }
 
         ArtifactStore snapshot() { return ReadOnlyArtifactSnapshot.capture(memory.artifacts()); }

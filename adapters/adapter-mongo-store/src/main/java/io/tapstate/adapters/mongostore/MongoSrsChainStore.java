@@ -100,7 +100,10 @@ public final class MongoSrsChainStore implements SrsChainStore {
                 if (hasRetainedFacts(session, chain)) throw unproven(chain);
                 return Optional.empty();
             }
-            return Optional.of(state(session, row));
+            var facts = new MongoSrsReadFacts(session, database, scope, row, true);
+            var control = decode(row);
+            facts.prefetchStartupCheckpoint(row, control.checkpoint());
+            return Optional.of(state(session, row, true, facts));
         });
     }
     @Override public SrsChainState requestTables(String chain, Set<String> tables, WorkloadClaimFence fence) {

@@ -1715,6 +1715,26 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @Test void aFreshChainReadBatchesItsOwnRetainedCheckpointDependencies() {
+        withBusiness(f -> {
+            preparedTrimLog(f);
+            f.chains().requestTables(CHAIN, Set.of("orders"), f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.captureFence())).isTrue();
+            var key = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0);
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 4), "t4"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(key, 4)));
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            var commands = new ArrayList<String>();
+            io.tapstate.spi.store.SrsChainState loaded;
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try { loaded = f.chains().load(CHAIN).orElseThrow(); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(loaded.checkpoint()).isEqualTo(checkpoint);
+            System.out.println("FRESH_CHAIN_COMMANDS count=" + commands.size() + " commands=" + commands);
+            assertThat(commands).hasSizeLessThanOrEqualTo(9);
+        });
+    }
+
     @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"false,0", "false,100", "true,0", "true,100"})
     void oneTableArrivalCountsRemainBoundedWithOtherConsumers(boolean checkpointed, int siblings) {
         withBusiness(f -> {

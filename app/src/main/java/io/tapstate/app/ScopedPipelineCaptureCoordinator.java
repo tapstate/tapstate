@@ -750,6 +750,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             progress = prepareInitialArrivals(session, source, chain, start,
                     consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused), Optional.empty(), false);
         }
+        if (source.freshFull == null && session.snapshot
+                && !progress.cursor().snapshotCompletedTables().containsAll(source.selected.tables()))
+            source.retainedSnapshot = progress;
         waiting.remove(source.consumer.context().key());
         long originalEpoch =
                 progress.snapshot() != null
@@ -1075,7 +1078,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                             },
                             null);
                 };
-        if (source.freshFull == null)
+        var retained = source.retainedSnapshot;
+        source.retainedSnapshot = null;
+        if (retained != null)
+            source.run = runtime.resumeSnapshot(source.consumer, fixedConfig, firstEpoch, prepareSnapshot, output, guard, retained);
+        else if (source.freshFull == null)
             source.run =
                     runtime.beginSnapshot(
                             source.consumer,
@@ -1186,6 +1193,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         final Map<String,Long> estimates = new LinkedHashMap<>();
         Owner owner;CapturePreparation prepared;WorkloadClaimFence foreign;SrsStores srs;SrsConsumerRun consumer;SrsFreshFullPreparation freshFull; CaptureRun run; DirectChannelStore channels; DirectChannelProgress direct; CaptureStart start; long snapshotEpoch; Set<String> readTables=Set.of();
         ConfiguredCaptureRun tailOpening;
+        SrsConsumerProgress retainedSnapshot;
         Source(String id,SourceCaptureResolution selected,boolean shared,SourceModel frozen) {
             this.id=id;this.selected=selected;this.shared=shared;
             if(frozen==null)expectedModels=null;
