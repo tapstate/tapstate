@@ -42,7 +42,7 @@ final class ScopedSinkStateProvider {
         ConnectorProvisioner exact=id -> {
             active.run();
             if(!config.connectorId().equals(id))throw fenced();
-            if (startup.artifact == null) startup.artifact = provisioner.resolve(id,run.artifactHash());
+            if (startup.artifact == null) startup.artifact = provisioner.resolveStartup(id,run.artifactHash());
             active.run();
             return startup.artifact;
         };

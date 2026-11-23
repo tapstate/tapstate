@@ -30,7 +30,7 @@ class ConfiguredSinkRunTest {
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void serializedFactoryUsesOnlyCapturedTokensExactArtifactAndIndependentCacheReceipts(boolean certified, @TempDir Path directory)throws Exception {
         var trace=Files.createFile(directory.resolve("trace"));var ref=new ConnectorRef(List.of(SyntheticSinkJars.preparationSink(directory,trace,true)),"synthetic.PreparationSink","2.0.8",null,null,HASH,certified);
-        var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolve("demo")).thenReturn(ref);when(provisioner.resolve("demo",HASH)).thenReturn(ref);
+        var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolveStartup("demo")).thenReturn(ref);when(provisioner.resolveStartup("demo",HASH)).thenReturn(ref);
         var notes=notes();var original=factory();var run=ConfiguredSinkRun.prepare(FENCE,original.config(),PipelineNode.Purpose.SYNC,notes,provisioner,() -> {});
         var receipts=new Receipts();receipts.prepareTargets(original.preparationInputs(SCOPE));var cache=mock(PipelineStoreViews.class);
         when(cache.sinkPreparations(eq(SCOPE),eq(CLAIM),any())).thenAnswer(call -> {call.getArgument(2,Runnable.class).run();return receipts;});
@@ -47,7 +47,7 @@ class ConfiguredSinkRunTest {
             }
             assertThat(Files.readAllLines(trace)).containsExactly("create:target","clear:target","stop","stop","stop","stop");
             verify(notes,never()).open(any());verify(notes,never()).initialize(any());verify(notes,never()).prepareOrigin(any(),any());
-            verify(provisioner,never()).resolve("demo");verify(provisioner,atLeastOnce()).resolve("demo",HASH);
+            verify(provisioner,never()).resolveStartup("demo");verify(provisioner,atLeastOnce()).resolveStartup("demo",HASH);
             assertThat(receipts.rows.values()).allSatisfy(row -> assertThat(row.phase()).isEqualTo(SinkPreparationStore.Phase.READY));
         }finally{member.shutdown();}
     }
@@ -71,7 +71,7 @@ class ConfiguredSinkRunTest {
         var physical=new TargetTable("orders",List.of(new TargetField("_unwind_source_id","string",true),new TargetField("position","long",true)),
                 List.of(new TargetIndex(List.of("_unwind_source_id","position"),true)));
         var original=new PdkSinkWriterFactory("mongodb",settings,WriteMode.UPSERT,DdlPolicy.FAIL,Map.of("input",logical),NODE,OnFullLoad.APPEND,false);
-        var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolve("mongodb")).thenReturn(ref);when(provisioner.resolve("mongodb",HASH)).thenReturn(ref);
+        var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolveStartup("mongodb")).thenReturn(ref);when(provisioner.resolveStartup("mongodb",HASH)).thenReturn(ref);
         var notes=notes();when(notes.origin(any())).thenReturn(ConnectorNoteOrigin.capture("mongodb",HASH,settings));
         var roster=new ArrayList<SinkPreparationStore.Input>();
         var bound=(PdkSinkWriterFactory)new StoreBackedDagSource.PdkSinkWriterBinder(notes,provisioner)

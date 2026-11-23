@@ -33,6 +33,11 @@ public interface ConnectorProvisioner {
         return retainedHash == null ? resolve(connectorId) : resolve(connectorId, retainedHash);
     }
 
+    /** Resolves one startup artifact while retaining ordinary selection and exact-hash rules. */
+    default ConnectorRef resolveStartup(String connectorId) { return resolve(connectorId); }
+
+    default ConnectorRef resolveStartup(String connectorId, String contentHash) { return resolve(connectorId, contentHash); }
+
     /** Resolves only the connector needed by the current Capture startup. */
     default ConnectorRef resolveCaptureStartup(String connectorId) { return resolve(connectorId); }
 

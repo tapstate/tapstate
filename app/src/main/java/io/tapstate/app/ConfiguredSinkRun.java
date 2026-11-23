@@ -53,7 +53,7 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         var primary = opened.primary();
         var global = opened.global();
         var pinned=recoveryPinned?fixed.origin(primary):null;
-        var ref=pinned==null?provisioner.resolve(config.connectorId()):provisioner.resolve(config.connectorId(),pinned.artifactHash());requireActive.run();
+        var ref=pinned==null?provisioner.resolveStartup(config.connectorId()):provisioner.resolveStartup(config.connectorId(),pinned.artifactHash());requireActive.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),ref.contentHash(),config.settings());
         if(pinned!=null && !pinned.equals(expected))throw unavailable();
         if(!expected.equals(fixed.prepareOrigin(primary,expected)))throw unavailable();
@@ -73,7 +73,7 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         },active);
         ConnectorProvisioner exact=id -> {
             active.run();if(!config.connectorId().equals(id))throw unavailable();
-            var ref=provisioner.resolve(id,artifactHash);active.run();return ref;
+            var ref=provisioner.resolveStartup(id,artifactHash);active.run();return ref;
         };
         var claim=new WorkloadClaimFence(new WorkloadClaimKey(original.scope().clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,original.pipelineId()),
                 new WorkloadOwner(original.ownerNodeId(),original.ownerBootId()),original.claimGeneration(),original.executionGeneration(),original.topologyRevision());

@@ -114,15 +114,27 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
         }
     }
 
-    @Override public ConnectorRef resolveCaptureStartup(String connectorId) {
+    @Override public ConnectorRef resolveCaptureStartup(String connectorId) { return resolveStartup(connectorId); }
+
+    @Override public ConnectorRef resolveStartup(String connectorId) { return startup(connectorId, null); }
+
+    @Override public ConnectorRef resolveStartup(String connectorId, String retainedHash) {
+        if (retainedHash == null || !retainedHash.matches("[a-f0-9]{64}"))
+            return ConnectorProvisioner.super.resolveStartup(connectorId, retainedHash);
+        return startup(connectorId, retainedHash);
+    }
+
+    private ConnectorRef startup(String connectorId, String retainedHash) {
         String hint;
-        synchronized (stagedHints) { hint = stagedHints.get(connectorId); }
+        synchronized (stagedHints) { hint = retainedHash == null ? stagedHints.get(connectorId) : retainedHash; }
         var verified = hint == null ? null : verifiedStagedPath(connectorId, hint);
-        var registration = selectRegistration(connectorId, registry.findAllForCaptureStartup(connectorId));
+        var registrations = registry.findAllForCaptureStartup(connectorId);
+        var registration = retainedHash == null ? selectRegistration(connectorId, registrations)
+                : selectExact(connectorId, retainedHash, registrations);
         var result = verified != null && hint.equals(registration.contentHash())
                 ? loaded(connectorId, registration, verified, false)
-                : materialize(connectorId, registration, false, false, true);
-        rememberStaged(connectorId, result.contentHash());
+                : materialize(connectorId, registration, retainedHash != null, false, true);
+        if (retainedHash == null) rememberStaged(connectorId, result.contentHash());
         return result;
     }
 
