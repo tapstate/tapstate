@@ -17,8 +17,11 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
 import io.tapstate.testsupport.RequiresDocker;
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -385,11 +388,12 @@ class ThreeLayerRestartContinuationIT {
                     originalConfiguration = installationFacts(configuration);
                     assertThat(chains.countDocuments()).isOne(); originalChain = chains.find().first();
                     assertThat(originalChain.get("checkpoint", Document.class)).isNotEmpty();
+                    long outageLogOffset = Files.size(first.output());
                     CACHE.getDockerClient().pauseContainerCmd(CACHE.getContainerId()).exec(); paused = true;
                     mongo.update(source, TABLE, Map.of("id", 2L), Map.of("seq", 222L));
                     mongo.delete(source, TABLE, Map.of("id", 3L));
                     Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
-                            () -> recordedNodeSessionLoss(first.output()), first::tail);
+                            () -> recordedNodeSessionLoss(first.output(), outageLogOffset), first::tail);
                     assertThat(first.isAlive()).isTrue();
                     if (!together) {
                         assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
@@ -531,9 +535,11 @@ class ThreeLayerRestartContinuationIT {
                 "--SDK_STATUS_SENDER_ENABLED=false", "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds")));
     }
 
-    private static boolean recordedNodeSessionLoss(Path output) {
-        try (var lines = Files.lines(output)) {
-            return lines.anyMatch(line -> line.contains("Node session lost:"));
+    private static boolean recordedNodeSessionLoss(Path output, long outageLogOffset) {
+        try (var input = Files.newInputStream(output);
+             var reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            input.skipNBytes(outageLogOffset);
+            return reader.lines().anyMatch(line -> line.contains("Node session lost:"));
         } catch (IOException e) {
             throw new UncheckedIOException("could not read server output at " + output, e);
         }
