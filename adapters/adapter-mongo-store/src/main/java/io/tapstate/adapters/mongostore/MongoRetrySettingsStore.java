@@ -19,9 +19,18 @@ import org.bson.Document;
 
 final class MongoRetrySettingsStore implements RetrySettingsStore {
     private static final String ID = "cluster";
+    private static final String ID_FIELD = "_id";
+    private static final String CLUSTER_ID = "clusterId";
+    private static final String FORMAT_VERSION = "formatVersion";
+    private static final String REVISION = "revision";
+    private static final String DEFAULTS = "defaults";
+    private static final String OPERATIONS = "operations";
+    private static final String ENABLED = "enabled";
+    private static final String INTERVAL = "intervalMillis";
+    private static final String MAX_DURATION = "maxDurationMillis";
     private static final int FORMAT = 1;
-    private static final Set<String> FIELDS = Set.of("_id", "clusterId", "formatVersion", "revision", "defaults", "operations");
-    private static final Set<String> POLICY_FIELDS = Set.of("enabled", "intervalMillis", "maxDurationMillis");
+    private static final Set<String> FIELDS = Set.of(ID_FIELD, CLUSTER_ID, FORMAT_VERSION, REVISION, DEFAULTS, OPERATIONS);
+    private static final Set<String> POLICY_FIELDS = Set.of(ENABLED, INTERVAL, MAX_DURATION);
 
     private final MongoCollection<Document> rows;
     private final String clusterId;
@@ -36,7 +45,7 @@ final class MongoRetrySettingsStore implements RetrySettingsStore {
     @Override
     public Settings read() {
         requireOpen.run();
-        var result = StoreIo.call(() -> rows.find(new Document("_id", ID)).first());
+        var result = StoreIo.call(() -> rows.find(new Document(ID_FIELD, ID)).first());
         requireOpen.run();
         return result == null ? Settings.unconfigured() : decode(result);
     }
@@ -46,8 +55,8 @@ final class MongoRetrySettingsStore implements RetrySettingsStore {
         var replacement = new Settings(Math.addExact(expectedRevision, 1), defaults, operations);
         var current = read();
         if (current.revision() != expectedRevision) return Optional.empty();
-        var expect = new Document("_id", ID).append("clusterId", clusterId)
-                .append("formatVersion", FORMAT).append("revision", expectedRevision);
+        var expect = new Document(ID_FIELD, ID).append(CLUSTER_ID, clusterId)
+                .append(FORMAT_VERSION, FORMAT).append(REVISION, expectedRevision);
         var next = encode(replacement);
         boolean replaced = StoreIo.call(() -> {
             requireOpen.run();
@@ -68,28 +77,28 @@ final class MongoRetrySettingsStore implements RetrySettingsStore {
         var overrides = new Document();
         settings.operations().forEach((operation, value) -> overrides.append(operation, policy(
                 value.enabled(), value.interval(), value.maxDuration())));
-        return new Document("_id", ID).append("clusterId", clusterId).append("formatVersion", FORMAT)
-                .append("revision", settings.revision())
-                .append("defaults", policy(defaults.enabled(), defaults.interval(), defaults.maxDuration()))
-                .append("operations", overrides);
+        return new Document(ID_FIELD, ID).append(CLUSTER_ID, clusterId).append(FORMAT_VERSION, FORMAT)
+                .append(REVISION, settings.revision())
+                .append(DEFAULTS, policy(defaults.enabled(), defaults.interval(), defaults.maxDuration()))
+                .append(OPERATIONS, overrides);
     }
 
     private Settings decode(Document row) {
         try {
-            if (!row.keySet().equals(FIELDS) || !ID.equals(row.getString("_id")) || !clusterId.equals(row.getString("clusterId"))
-                    || !Integer.valueOf(FORMAT).equals(row.get("formatVersion")) || row.getLong("revision") <= 0) throw unreadable();
-            var defaults = row.get("defaults", Document.class);
+            if (!row.keySet().equals(FIELDS) || !ID.equals(row.getString(ID_FIELD)) || !clusterId.equals(row.getString(CLUSTER_ID))
+                    || !Integer.valueOf(FORMAT).equals(row.get(FORMAT_VERSION)) || row.getLong(REVISION) <= 0) throw unreadable();
+            var defaults = row.get(DEFAULTS, Document.class);
             if (!defaults.keySet().equals(POLICY_FIELDS)) throw unreadable();
-            var policy = new RetryPolicy(defaults.getBoolean("enabled"), duration(defaults, "intervalMillis"),
-                    duration(defaults, "maxDurationMillis"));
+            var policy = new RetryPolicy(defaults.getBoolean(ENABLED), duration(defaults, INTERVAL),
+                    duration(defaults, MAX_DURATION));
             var overrides = new LinkedHashMap<String, OperationOverride>();
-            row.get("operations", Document.class).forEach((operation, raw) -> {
+            row.get(OPERATIONS, Document.class).forEach((operation, raw) -> {
                 var fields = (Document) raw;
                 if (!POLICY_FIELDS.containsAll(fields.keySet())) throw unreadable();
-                overrides.put(operation, new OperationOverride(fields.getBoolean("enabled"),
-                        duration(fields, "intervalMillis"), duration(fields, "maxDurationMillis")));
+                overrides.put(operation, new OperationOverride(fields.getBoolean(ENABLED),
+                        duration(fields, INTERVAL), duration(fields, MAX_DURATION)));
             });
-            return new Settings(row.getLong("revision"), policy, overrides);
+            return new Settings(row.getLong(REVISION), policy, overrides);
         } catch (ClassCastException | NullPointerException | IllegalArgumentException | ArithmeticException invalid) {
             throw unreadable();
         }
@@ -97,9 +106,9 @@ final class MongoRetrySettingsStore implements RetrySettingsStore {
 
     private static Document policy(Boolean enabled, Duration interval, Duration maxDuration) {
         var fields = new Document();
-        if (enabled != null) fields.append("enabled", enabled);
-        if (interval != null) fields.append("intervalMillis", interval.toMillis());
-        if (maxDuration != null) fields.append("maxDurationMillis", maxDuration.toMillis());
+        if (enabled != null) fields.append(ENABLED, enabled);
+        if (interval != null) fields.append(INTERVAL, interval.toMillis());
+        if (maxDuration != null) fields.append(MAX_DURATION, maxDuration.toMillis());
         return fields;
     }
 

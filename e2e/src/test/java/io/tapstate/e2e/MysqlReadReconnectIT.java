@@ -5,14 +5,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
+import io.tapstate.testsupport.TcpResetProxy;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -37,7 +36,8 @@ class MysqlReadReconnectIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
         try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
-             ServerHandle server = Tiers.IN_PROCESS.launch(storage); ResetProxy proxy = new ResetProxy(mysql)) {
+             ServerHandle server = Tiers.IN_PROCESS.launch(storage); TcpResetProxy proxy = new TcpResetProxy(
+                     mysql.get("host").toString(), Integer.parseInt(mysql.get("port").toString()))) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
             var defaults = control.retrySettings();
@@ -47,7 +47,10 @@ class MysqlReadReconnectIT {
             assertThat(control.replaceRetrySettings(0, policy).statusCode()).isEqualTo(409);
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-            apply(control, proxy.settings(mysql), targetUri, pipeline, "retry_source", table, shared);
+            var proxied = new LinkedHashMap<>(mysql);
+            proxied.put("host", "127.0.0.1");
+            proxied.put("port", proxy.port());
+            apply(control, proxied, targetUri, pipeline, "retry_source", table, shared);
             awaitIds(control, pipeline, mongo, target, table, List.of(1L));
             sql(mysql, "INSERT INTO " + table + " VALUES (2, 'before-fault')",
                     "INSERT INTO " + table + " VALUES (4, 'before-fault-control')");
@@ -68,86 +71,6 @@ class MysqlReadReconnectIT {
                         return original.get("chainId").equals(current.get("chainId"))
                                 && current.get("token") != null && !original.get("token").equals(current.get("token"));
                     }, () -> control.positionReading(pipeline));
-        }
-    }
-
-    private static final class ResetProxy implements AutoCloseable {
-        private final java.net.ServerSocket listener;
-        private final String host;
-        private final int port;
-        private final java.util.Set<Hop> hops = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        private volatile boolean available = true;
-
-        ResetProxy(Map<String, Object> settings) throws java.io.IOException {
-            host = settings.get("host").toString();
-            port = Integer.parseInt(settings.get("port").toString());
-            listener = new java.net.ServerSocket(0, 16, java.net.InetAddress.getByName("127.0.0.1"));
-            Thread.ofVirtual().start(this::accept);
-        }
-
-        Map<String, Object> settings(Map<String, Object> original) {
-            var wrapped = new LinkedHashMap<>(original);
-            wrapped.put("host", "127.0.0.1");
-            wrapped.put("port", listener.getLocalPort());
-            return wrapped;
-        }
-
-        void resetFor(Duration duration) throws Exception {
-            available = false;
-            assertThat(hops.size()).isGreaterThan(0);
-            for (Hop hop : hops) hop.reset();
-            // Restoration is a fixture event that ends the configured network outage.
-            var restoration = CompletableFuture.runAsync(() -> available = true,
-                    CompletableFuture.delayedExecutor(duration.toMillis(), TimeUnit.MILLISECONDS));
-            restoration.get(duration.plusSeconds(10).toMillis(), TimeUnit.MILLISECONDS);
-        }
-
-        private void accept() {
-            while (!listener.isClosed()) {
-                try {
-                    var front = listener.accept();
-                    if (!available) {
-                        front.setSoLinger(true, 0);
-                        front.close();
-                        continue;
-                    }
-                    var back = new java.net.Socket(host, port);
-                    var hop = new Hop(front, back);
-                    hops.add(hop);
-                    Thread.ofVirtual().start(() -> pump(hop, front, back));
-                    Thread.ofVirtual().start(() -> pump(hop, back, front));
-                } catch (java.io.IOException closedOrUnavailable) {
-                    if (!listener.isClosed()) System.out.println("TCP_PROXY_ERROR " + closedOrUnavailable);
-                }
-            }
-        }
-
-        private void pump(Hop hop, java.net.Socket input, java.net.Socket output) {
-            try {
-                input.getInputStream().transferTo(output.getOutputStream());
-            } catch (java.io.IOException closed) {
-                // Reset and fixture teardown both close active connections.
-            } finally {
-                hops.remove(hop);
-                hop.close();
-            }
-        }
-
-        public void close() throws java.io.IOException {
-            listener.close();
-            for (Hop hop : hops) hop.close();
-        }
-
-        private record Hop(java.net.Socket front, java.net.Socket back) {
-            void reset() {
-                try { front.setSoLinger(true, 0); } catch (java.io.IOException alreadyClosed) {}
-                close();
-            }
-
-            void close() {
-                try { front.close(); } catch (java.io.IOException alreadyClosed) {}
-                try { back.close(); } catch (java.io.IOException alreadyClosed) {}
-            }
         }
     }
 

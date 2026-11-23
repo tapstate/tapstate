@@ -138,6 +138,7 @@ class ScopedEngineLifecycleActuatorTest {
         var root = mock(ScopedPipelineCaptureCoordinator.class);
         when(root.forRun(any(), any(), any())).thenReturn(fixedCapture);
         when(root.directRetry(new ExecutionFence(SCOPE, claim(1)))).thenReturn(Optional.of(retry));
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(2)))).thenReturn(Optional.of(retry));
         when(root.streamRetryPolicy()).thenReturn(policy);
         doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("shared-capture")))
                 .when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
@@ -153,6 +154,8 @@ class ScopedEngineLifecycleActuatorTest {
 
         time.set(Duration.ofSeconds(8).toNanos());
         assertThat(retry.decision(policy)).isEqualTo(new CaptureReadRetry.Pending(fact, null));
+        assertThat(actor.recoverSource("p", () -> true)).contains(new LifecycleActuator.SourceRecovery(fact));
+        verify(root).clearDirectRetries(SCOPE);
     }
 
     @Test void failedSubmissionKeepsItsDiagnosticReadableAfterInvalidatingActuation() {

@@ -62,7 +62,21 @@ class MongoConfigurationArtifactStoreIT {
             var disabled = store.replace(1, defaults.disabled(), Map.of("stream-read",
                     new io.tapstate.spi.store.RetrySettingsStore.OperationOverride(true, null, null))).orElseThrow();
             assertThat(disabled.policy("stream-read").enabled()).isFalse();
-            assertThat(SystemCollections.CONFIG_RETRY_SETTINGS.on(database).countDocuments()).isEqualTo(1);
+            var documents = SystemCollections.CONFIG_RETRY_SETTINGS.on(database);
+            assertThat(documents.countDocuments()).isEqualTo(1);
+            var saved = documents.find().first();
+            assertThat(saved).isNotNull();
+            for (var malformed : List.of(new Document(saved).append("clusterId", "different-cluster"),
+                    new Document(saved).append("formatVersion", 2),
+                    new Document(saved).append("revision", 0L),
+                    new Document(saved).append("defaults", new Document("intervalMillis", 10L)),
+                    new Document(saved).append("operations", new Document("snapshot-read", new Document("enabled", "no"))),
+                    new Document(saved).append("operations", new Document("unknown", new Document("enabled", false))),
+                    new Document(saved).append("operations", new Document("snapshot-read", new Document("typo", false))))) {
+                documents.replaceOne(new Document("_id", "cluster"), malformed);
+                assertThatThrownBy(store::read).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            }
         });
     }
 

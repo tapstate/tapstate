@@ -54,4 +54,26 @@ class RetryWindowTest {
                 cause -> { throw new AssertionError("retry classifier invoked"); }, () -> {}, () -> { throw failure; }))
                 .isSameAs(failure);
     }
+
+    @Test
+    void aDeclinedFailureAndACancelledAttemptKeepTheirOriginalOutcomes() {
+        var failure = new IOException("source failed");
+        var policy = new RetryPolicy(true, Duration.ofMillis(1), Duration.ofSeconds(3));
+        assertThatThrownBy(() -> RetryWindow.execute(() -> policy, cause -> Optional.empty(), () -> {},
+                () -> { throw failure; })).isSameAs(failure);
+
+        var checks = new AtomicInteger();
+        var cancelled = new java.util.concurrent.CancellationException("owner left");
+        assertThatThrownBy(() -> RetryWindow.execute(() -> policy, cause -> Optional.of(() -> {}),
+                () -> { if (checks.incrementAndGet() > 1) throw cancelled; },
+                () -> { throw failure; })).isSameAs(cancelled);
+    }
+
+    @Test
+    void retryDurationsMustFitTheMonotonicClock() {
+        assertThatThrownBy(() -> new RetryPolicy(true, Duration.ZERO, Duration.ofDays(1)))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new RetryPolicy(true, Duration.ofSeconds(1), Duration.ofSeconds(Long.MAX_VALUE)))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }

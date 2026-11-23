@@ -12,6 +12,8 @@ import java.util.function.Supplier;
 public final class RetryWindow {
     @FunctionalInterface
     public interface Operation<T> {
+        // The caller and classifier must receive the original checked failure from the wrapped API.
+        @SuppressWarnings("java:S112")
         T attempt() throws Throwable;
     }
 
@@ -69,15 +71,19 @@ public final class RetryWindow {
                 if (!policies.get().enabled()) throw failure;
                 var prepare = prepareRetry.apply(failure);
                 if (prepare.isEmpty()) throw failure;
-                while (true) {
-                    guard.run();
-                    var delay = window.delay(policies.get()).orElseThrow(() -> failure);
-                    if (delay.isZero()) break;
-                    TimeUnit.NANOSECONDS.sleep(Math.min(delay.toNanos(), TimeUnit.SECONDS.toNanos(1)));
-                }
-                guard.run();
+                awaitAttempt(window, policies, guard, failure);
                 prepare.orElseThrow().run();
             }
+        }
+    }
+
+    private static void awaitAttempt(RetryWindow window, Supplier<RetryPolicy> policies, Runnable guard,
+            Exception failure) throws Exception {
+        while (true) {
+            guard.run();
+            var delay = window.delay(policies.get()).orElseThrow(() -> failure);
+            if (delay.isZero()) return;
+            TimeUnit.NANOSECONDS.sleep(Math.min(delay.toNanos(), TimeUnit.SECONDS.toNanos(1)));
         }
     }
 }
