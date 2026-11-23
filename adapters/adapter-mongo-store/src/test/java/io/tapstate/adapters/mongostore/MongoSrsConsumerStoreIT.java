@@ -4076,4 +4076,107 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @org.junit.jupiter.api.RepeatedTest(2)
+    void aFirstPinWithEnoughLeaseSlackMustNotBeInvalidatedByItsOwnLateRenewal() {
+        firstPinWindow(false);
+    }
+
+    @Test void aFirstPinWithoutTheFullRenewalMarginStillAllowsItsOwnRenewal() {
+        firstPinWindow(true);
+    }
+
+    private static void firstPinWindow(boolean shortLease) {
+        withBusiness(f -> {
+            enablePipelineClaimAdmission(f);
+            var pin = new SrsSnapshotPin(1, "first-attempt", publishSnapshotModels(f, Set.of("orders")));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var claimTable = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+            claimTable.updateOne(new Document("_id", MongoWorkloadClaimStore.id(f.pipelineA().key())),
+                    new Document("$set", new Document("leaseUntil", new java.util.Date(System.currentTimeMillis() + (shortLease ? 18000 : 24000)))));
+            var operations = new MongoClaimOperations(f.client());
+            var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {}, null, operations);
+            var paused = new CountDownLatch(1); var resume = new CountDownLatch(1);
+            var hold = new java.util.concurrent.atomic.AtomicBoolean(true);
+            var commands = new java.util.concurrent.ConcurrentHashMap<Integer, String>();
+            var conflicts = new java.util.concurrent.atomic.AtomicInteger(); var wires = new java.util.concurrent.atomic.AtomicInteger();
+            var commits = new java.util.concurrent.atomic.AtomicInteger();
+            var admin = f.client().getDatabase("admin");
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    wires.incrementAndGet();
+                    var value = event.getCommand().get(event.getCommandName());
+                    if (value != null && value.isString()) commands.put(event.getRequestId(), value.asString().getValue());
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if ("commitTransaction".equals(event.getCommandName())) commits.incrementAndGet();
+                    if ("update".equals(event.getCommandName()) && "pipeline_state".equals(commands.remove(event.getRequestId()))
+                            && hold.compareAndSet(true, false)) {
+                        paused.countDown();
+                        try { assertThat(resume.await(12, TimeUnit.SECONDS)).isTrue(); }
+                        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                    }
+                }
+                @Override public void commandFailed(com.mongodb.event.CommandFailedEvent event) {
+                    if (event.getThrowable() instanceof com.mongodb.MongoException failure && failure.getCode() == 112
+                            && conflicts.incrementAndGet() == 1 && !shortLease) {
+                        admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                                .append("data", new Document("appName", "tapstate-pin-coordination").append("failCommands", List.of("aggregate"))
+                                        .append("blockConnection", true).append("blockTimeMS", 6000)));
+                    }
+                }
+            };
+            try (var observed = pinClient(listener); var executor = Executors.newSingleThreadExecutor()) {
+                long start = System.nanoTime();
+                var task = executor.submit(() -> coordinatedPinStore(f, observed, operations).pinSnapshot(A, member.revision(), 0, pin, f.fenceA()));
+                assertThat(paused.await(4, TimeUnit.SECONDS)).isTrue();
+                long renewalAt = start + TimeUnit.SECONDS.toNanos(6);
+                TimeUnit.NANOSECONDS.sleep(Math.max(0, renewalAt - System.nanoTime()));
+                assertThat(renewPinTestLease(authority, f.pipelineB(), 30)).isPresent();
+                boolean deferred = false;
+                try { assertThat(renewPinTestLease(authority, f.pipelineA(), 30)).isPresent(); }
+                catch (io.tapstate.spi.store.WorkloadClaimRenewalException unavailable) {
+                    assertThat(unavailable.reason()).isEqualTo(io.tapstate.spi.store.WorkloadClaimRenewalException.Reason.NOT_STARTED);
+                    deferred = true;
+                }
+                TimeUnit.NANOSECONDS.sleep(Math.max(0, start + TimeUnit.MILLISECONDS.toNanos(10100) - System.nanoTime()));
+                resume.countDown();
+                Boolean accepted = null; Throwable failed = null;
+                try { accepted = task.get(8, TimeUnit.SECONDS); }
+                catch (java.util.concurrent.ExecutionException failure) { failed = failure.getCause(); }
+                long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                boolean stillLive = authority.read(f.pipelineA().key()).orElseThrow().leased();
+                System.out.printf("PIN_FIRST_WINDOW short_lease=%s elapsed_ms=%d wire=%d code112=%d same_key_deferred=%s other_key_renewed=true claim_still_live=%s pin_commits=%d accepted=%s failure=%s%n",
+                        shortLease, elapsed, wires.get(), conflicts.get(), deferred, stillLive, commits.get(), accepted,
+                        failed == null ? "none" : failed.getClass().getSimpleName());
+                assertThat(failed).isNull(); assertThat(accepted).isTrue();
+                assertThat(conflicts).hasValue(shortLease ? 1 : 0); assertThat(commits).hasValue(1); assertThat(deferred).isEqualTo(!shortLease);
+                assertThat(f.consumers().progress(A)).hasValueSatisfying(value -> assertThat(value.snapshot()).isEqualTo(pin));
+                assertThat(renewPinTestLease(authority, f.pipelineA(), 30)).isPresent();
+            } finally {
+                resume.countDown();
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                operations.await(System.nanoTime() + TimeUnit.SECONDS.toNanos(2)); operations.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void pinSchedulingSampleUsesStatementServerTimeWithoutTreatingItsSnapshotAsAuthority() {
+        withBusiness(f -> {
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+            var claims = new MongoWorkloadClaimStore(table);
+            try (var session = f.client().startSession()) {
+                session.startTransaction(com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT).build());
+                SystemCollections.SRS_CHAINS.on(f.database()).find(session, new Document("_id", CHAIN)).first();
+                TimeUnit.MILLISECONDS.sleep(1200);
+                long before = claims.read(f.pipelineA().key()).orElseThrow().leaseRemaining().toMillis();
+                var proof = MongoPipelineProofFacts.readPin(session, f.database(), positionScope(A), f.fenceA());
+                assertThat(proof).isNotNull();
+                long observed = MongoWorkloadClaimStore.observedReading(proof.claim()).leaseRemaining().toMillis();
+                long after = claims.read(f.pipelineA().key()).orElseThrow().leaseRemaining().toMillis();
+                assertThat(observed).isBetween(after - 100, before + 100);
+                session.abortTransaction();
+            }
+        });
+    }
+
 }

@@ -1685,11 +1685,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         requireRevision(membershipRevision); requireRevision(expectedProgressRevision); String chain = context.key().miningChainId();
         var pipeline = pipelineAccess(context, fence);
         var claimConflict = new AtomicBoolean();
-        return changingTheConsumer(() -> pinTransaction(context.key(), fence, claimConflict, session -> {
+        return changingTheConsumer(() -> pinTransaction(context.key(), fence, claimConflict, (session, schedulingProof) -> {
             // Reserve the chain before reading its model and cursor facts.
             var root = chains.reserveSnapshotPin(session, chain);
             boolean batchReads = root != null && MongoBindingReadFacts.supported(client);
-            var state = pipeline.stateForSnapshotPin(session, batchReads);
+            var state = pipeline.stateForSnapshotPin(session, batchReads, schedulingProof);
             pipeline.updateState(session, state, new Document(), false);
             var facts = root == null ? new MongoSrsReadFacts(session, database, scope, true)
                     : new MongoSrsReadFacts(session, database, scope, root, true);
@@ -1755,7 +1755,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private boolean pinTransaction(SrsConsumerKey key, WorkloadClaimFence fence, AtomicBoolean claimConflict,
-            Function<ClientSession, Boolean> action) {
+            java.util.function.BiFunction<ClientSession, java.util.function.Consumer<MongoPipelineProofFacts.PinProof>, Boolean> action) {
         var budget = MongoReadBudget.until(System.nanoTime() + PIN_BUDGET);
         if (pinOperations == null) return executePinTransaction(fence, claimConflict, action, budget);
         return pinOperations.snapshotPin(key, budget.deadlineNanos(),
@@ -1763,13 +1763,14 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private boolean executePinTransaction(WorkloadClaimFence fence, AtomicBoolean claimConflict,
-            Function<ClientSession, Boolean> action, MongoReadBudget budget) {
+            java.util.function.BiFunction<ClientSession, java.util.function.Consumer<MongoPipelineProofFacts.PinProof>, Boolean> action, MongoReadBudget budget) {
         return MongoStructureFailureScope.inspectOnFailure(client, budget, () -> StoreIo.call(() ->
                 MongoCachePipelineStateStore.writeTransaction(client, fence.key().resourceId(), budget, () -> {
             requireActive.run();
             var attempts = new AtomicInteger();
             var retry = new AtomicReference<MongoClaimOperations.PinRetry>();
             var checkedRetry = new AtomicBoolean();
+            var checkedInitial = new AtomicBoolean();
             try (var session = client.startSession()) {
                 if (pinOperations != null) pinOperations.awaitPipelineRenewal(fence.key(), budget);
                 for (int connectionAttempt = 0; ; connectionAttempt++) {
@@ -1793,7 +1794,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                             if (!runtimeStructure) requireStructure.run();
                             requireActive.run();
                             budget.remainingMillis();
-                            boolean result = action.apply(session);
+                            boolean result = action.apply(session, proof -> {
+                                if (pinOperations != null && !checkedRetry.get() && checkedInitial.compareAndSet(false, true))
+                                    retry.set(protectInitialPin(fence, budget, proof));
+                            });
                             requireActive.run();
                             budget.remainingMillis();
                             return result;
@@ -1818,6 +1822,21 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 if (pinOperations != null) pinOperations.releasePinRetry(retry.get());
             }
         })));
+    }
+
+    private MongoClaimOperations.PinRetry protectInitialPin(WorkloadClaimFence fence, MongoReadBudget budget,
+            MongoPipelineProofFacts.PinProof proof) {
+        try {
+            if (MongoWorkloadClaimStore.nodeBacked(proof.claim())) return null;
+            var observed = MongoWorkloadClaimStore.observedReading(proof.claim());
+            if (!observed.leased() || !fence.equals(WorkloadClaimFence.from(observed.claim()))) return null;
+            // This old snapshot only bounds local scheduling; the final durable claim CAS remains mandatory.
+            long leaseDeadline = proof.sampledAtNanos() + observed.leaseRemaining().toNanos();
+            return pinOperations.protectPinRetry(fence, budget.deadlineNanos(), leaseDeadline);
+        } catch (TapstateException | ArithmeticException unavailable) {
+            budget.remainingMillis();
+            return null;
+        }
     }
 
     private MongoClaimOperations.PinRetry protectPinRetry(WorkloadClaimFence fence, MongoReadBudget budget) {

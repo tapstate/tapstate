@@ -588,7 +588,8 @@ final class MongoCachePipelineAccess {
         return state;
     }
 
-    Document stateForSnapshotPin(ClientSession session, boolean batchReads) {
+    Document stateForSnapshotPin(ClientSession session, boolean batchReads,
+            java.util.function.Consumer<MongoPipelineProofFacts.PinProof> schedulingProof) {
         var proof = batchReads && original != null ? MongoPipelineProofFacts.readPin(session, database, scope, original) : null;
         var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
         if (proof == null) {
@@ -599,6 +600,7 @@ final class MongoCachePipelineAccess {
         MongoCacheBusinessIdentity.requireObservedReady(state.identity(), state.schema(), business);
         validateState(state.checkpoint());
         requirePreparedClaim(proof.claim());
+        schedulingProof.accept(proof);
         return state.checkpoint();
     }
 

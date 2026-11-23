@@ -38,18 +38,19 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
         return renewalProof(readPipelineAndBusiness(session, database, scope, List.of()), scope);
     }
 
-    record PinProof(RenewalProof state, Document claim) {}
+    record PinProof(RenewalProof state, Document claim, long sampledAtNanos) {}
 
     static PinProof readPin(ClientSession session, MongoDatabase database, PipelineIntentScope scope, WorkloadClaimFence original) {
+        long sampledAt = System.nanoTime();
         var id = MongoWorkloadClaimStore.id(original.key());
         var live = WorkloadClaimDocuments.live(original).append("pipelineScope", MongoPipelinePreparationFacts.scope(scope))
                 .append("pipelinePreparation.phase", "PREPARED");
         var captured = readPipelineAndBusiness(session, database, scope, List.of(MongoCaptureStartupRows.lookup(
-                SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", id, List.of(new Document("$match", live)))));
+                SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", id, List.of(new Document("$match", live), MongoWorkloadClaimStore.leaseRemaining(true)))));
         var state = renewalProof(captured, scope);
         if (state == null || MongoCaptureStartupRows.ambiguous(captured, "claim", id)) return null;
         var claim = MongoCaptureStartupRows.get(captured, "claim");
-        return claim == null ? null : new PinProof(state, claim);
+        return claim == null ? null : new PinProof(state, claim, sampledAt);
     }
 
     private static Document readPipelineAndBusiness(ClientSession session, MongoDatabase database, PipelineIntentScope scope,
