@@ -82,6 +82,22 @@ final class MongoCacheMetadataStructure {
         requireActive.run();
     }
 
+    boolean hasAggregateState() {
+        return !collections(Set.of(SystemCollections.CACHE_AGGREGATE_STATE.collectionName())).isEmpty();
+    }
+
+    void prepareRetainedAggregateStateInTransaction(ClientSession session,
+            io.tapstate.spi.store.CacheBusinessScope scope, Runnable requireActive) {
+        if (hasAggregateState()) return;
+        verify(BUSINESS_TABLES.stream().filter(table -> table != SystemCollections.CACHE_AGGREGATE_STATE).toList());
+        var referenced = new Document("_id.clusterId", scope.clusterId()).append("_id.bindingVersion", scope.bindingVersion())
+                .append("_id.cacheIncarnation", scope.cacheIncarnation())
+                .append("placements.resource", io.tapstate.spi.store.OperatorPlacement.Resource.AGGREGATE_STATE.name());
+        if (SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, referenced)
+                .projection(new Document("_id", 1)).first() != null) throw unreadable("collections");
+        prepareInTransaction(session, requireActive, List.of(SystemCollections.CACHE_AGGREGATE_STATE));
+    }
+
     void prepareLegacyConnectorArtifactsInTransaction(ClientSession session, Runnable requireActive) {
         prepareInTransaction(session, requireActive, List.of(SystemCollections.CACHE_CONNECTOR_ARTIFACTS));
     }

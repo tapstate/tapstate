@@ -261,6 +261,27 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         });
     }
 
+    /** Prepares the newly introduced aggregate structure before admitting a retained business scope. */
+    public void prepareRetainedAggregateState(CacheBusinessScope expected, Runnable requireActive) {
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        var structure = new MongoCacheMetadataStructure(database, rateRetention);
+        StoreIo.run(() -> {
+            active.run();
+            if (structure.hasAggregateState()) return;
+            try (var session = client.startSession()) {
+                session.withTransaction(() -> {
+                    active.run();
+                    new MongoCacheBusinessIdentity(database, expected).admitMetadataWrite(session);
+                    structure.prepareRetainedAggregateStateInTransaction(session, expected, active);
+                    active.run();
+                    return null;
+                }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.LOCAL)
+                        .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
+            }
+            active.run();
+        });
+    }
+
     /** Admission validates retained business structures and configured indexes without repairing them. */
     public void verifyBusinessReady(CacheBusinessScope expected) {
         loadBusinessScope(expected);

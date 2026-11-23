@@ -1,6 +1,15 @@
 {
   "schemaVersion": 1,
   "recoveryProfiles": {
+    "aggregate-state-startup-upgrade": {
+      "goal": "Continue from the complete original aggregate state. Prepare the empty aggregate structure when upgrading a pre-aggregate CACHE that has no recorded aggregate placements.",
+      "entry": "Original runtime restart. Before retained business readiness, the startup upgrade may prepare only the missing aggregate_state collection and its existing operator_placement index.",
+      "prerequisites": [
+        "Require the original ready CACHE scope and verify the other business collections and their indexes.",
+        "The current CACHE scope has no recorded AGGREGATE_STATE placement. A recorded placement with a missing collection requires the existing scoped recovery.",
+        "The upgrade preserves original definitions, state, connector bindings, and CDC positions. It writes no aggregate rows and adds no document fields."
+      ]
+    },
     "configuration-backup": {
       "goal": "Restore original authoritative facts without inventing identity or history.",
       "entry": "Restore matching Configuration and keyring through database/deployment backup tools.",
@@ -1384,6 +1393,10 @@
     }
   },
   "consistencyProfiles": {
+    "aggregate-state-startup-upgrade": {
+      "atomicDomain": "CACHE",
+      "fencing": "Ordinary leased operator reads and writes retain their full existing fences. The startup upgrade uses the original CACHE metadata admission fence and verifies absence of current aggregate placements in the same CACHE client/session transaction as collection and index creation."
+    },
     "config": {
       "atomicDomain": "CONFIG",
       "fencing": "Same CONFIG client/session with resource revision/CAS, original scope and configuration_version where applicable; never a runtime lease mirror."
@@ -3825,7 +3838,7 @@
     {
       "id": "mongo.cache.aggregate_state",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -3834,15 +3847,17 @@
       ],
       "responsibility": "State of aggregate steps. Membership rows: one per input row, holding the group the row is in and the order of the last event applied, or that the row is gone. Group rows: one per input row in its group, holding what the row gives each field and its order; one totals row per group; one ordered entry per input row for each min, max, first or last field; one count per distinct value for each count_distinct field. Keys are text that sorts by content, and customer values appear inside them.",
       "writers": [
-        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore",
+        "io.tapstate.adapters.mongostore.MongoCacheMetadataStructure"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
       ],
-      "recovery": "runtime-state",
-      "consistency": "cache",
+      "recovery": "aggregate-state-startup-upgrade",
+      "consistency": "aggregate-state-startup-upgrade",
       "growth": "About two rows per live input row plus one per input row for each field that keeps its inputs, plus one totals row per group. Rows of deleted input rows are kept until the source position that removed them is settled. No row grows with the size of a group.",
       "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheBusinessPreparationIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAggregateStateStoreIT.java",
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/aggregate/GroupStage.java",
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/aggregate/MembershipStage.java",
