@@ -7,6 +7,7 @@ from io import BytesIO
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from urllib.error import HTTPError
@@ -158,6 +159,10 @@ class ActionsRunTest(unittest.TestCase):
                     {"name": "Build and measure the fixed batch", "conclusion": "success"},
                     {"name": "Upload batch evidence", "conclusion": "failure"},
                 ]},
+                {"name": "measure (3)", "conclusion": "failure", "steps": [
+                    {"name": "Run actions/setup-java@v4", "conclusion": "failure"},
+                    {"name": "Upload batch evidence", "conclusion": "failure"},
+                ]},
             ]})
             attempt = {"run_id": 111, "attempt": 1}
             runner.write_json(root / "run.json", {"github_attempt": attempt})
@@ -181,7 +186,7 @@ class ActionsRunTest(unittest.TestCase):
                 {"batch": 0, "reason": "batch failed before writing a summary"},
                 {"batch": 1, "reason": "batch evidence upload failed"},
                 {"batch": 2, "reason": "batch expired before measurement"},
-                {"batch": 3, "reason": "batch summary missing or unreadable"},
+                {"batch": 3, "reason": "batch setup failed (Run actions/setup-java@v4)"},
             ], result["errors"])
             self.assertEqual({"missing": 4}, result["repeat_counts"])
 
@@ -393,7 +398,7 @@ class ActionsRunTest(unittest.TestCase):
                 if expected_calls:
                     execute.assert_called_once_with(
                         ["gh", "api", "--method", "POST", "repos/example/repo/actions/runs/21/cancel"],
-                        check=True, timeout=30)
+                        check=True, stderr=subprocess.PIPE, timeout=30)
 
     def test_failed_allocation_accounts_for_every_selected_case_as_not_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -457,18 +462,40 @@ class ActionsRunTest(unittest.TestCase):
         delivery_intent = {"workflow_run": {"id": 10}, "id": 11, "created_at": now.isoformat()}
         draft_state = {"updated_at": now.isoformat(), "active": {"workflow": {"reason": "missing-handoff"}}}
         source = {"id": 10}
-        for status, digest, expected in (("accepted", catalog.digest(draft_state), draft_state),
-                                         ("rejected", catalog.digest(draft_state), {"active": {}}),
-                                         ("unknown", catalog.digest(draft_state), None),
-                                         ("accepted", "wrong", None)):
+        for status, digest, pending in (
+            ("accepted", catalog.digest(draft_state), {}),
+            ("rejected", catalog.digest(draft_state), {}),
+            ("unknown", catalog.digest(draft_state), {"workflow": "alert"}),
+            ("accepted", "wrong", {"workflow": "alert"}),
+        ):
             with self.subTest(status=status, digest=digest), \
                     patch.object(actions_watch, "latest_artifact", side_effect=[None, (delivery_intent, source)]), \
                     patch.object(actions_watch, "artifact", side_effect=[
                         draft_state, {"status": status, "intent_sha256": digest},
                     ]):
-                if expected is None:
-                    with self.assertRaisesRegex(ValueError, "run 10 is uncertain"):
-                        actions_watch.latest_state("example/repo", "main", now)
-                else:
-                    actual = actions_watch.latest_state("example/repo", "main", now)
-                    self.assertEqual(expected["active"], actual["active"])
+                actual = actions_watch.latest_state("example/repo", "main", now)
+                self.assertEqual(pending, actual.get("pending", {}))
+                accepted = status == "accepted" and digest == catalog.digest(draft_state)
+                self.assertEqual(draft_state["active"] if accepted else {}, actual["active"])
+
+    def test_conflicting_cancellation_does_not_prevent_a_health_card(self):
+        now = datetime.fromisoformat("2026-11-23T15:00:00+00:00")
+        run = {"id": 21, "run_attempt": 1, "status": "in_progress", "event": "workflow_run",
+               "created_at": "2026-11-22T11:00:01Z", "run_started_at": "2026-11-22T11:00:02Z",
+               "display_title": "Pipeline Performance | Nightly 20/1"}
+        nightly = {"id": 20, "event": "schedule", "run_attempt": 1, "status": "completed",
+                   "created_at": "2026-11-22T10:00:00Z", "updated_at": "2026-11-22T11:00:00Z"}
+        error = subprocess.CalledProcessError(1, "gh", stderr=b"gh: conflict (HTTP 409)\n")
+        for status in ("in_progress", "completed"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as d:
+                output = Path(d) / "health"
+                with patch.object(actions_watch, "api", side_effect=[
+                    {"workflow_runs": [nightly]}, {"workflow_runs": [run]}, run, dict(run, status=status),
+                ]) as api, patch.object(actions_watch.subprocess, "run", side_effect=error), \
+                        patch.object(actions_watch, "latest_state",
+                                     return_value={"active": {}, "updated_at": now.isoformat()}):
+                    actions_watch.prepare(output, "example/repo", "main", now=now)
+                self.assertEqual(4, api.call_count)
+                health = catalog.read_json(output / "health.json")
+                self.assertEqual(bool(health["cancellation_errors"]), status == "in_progress")
+                self.assertTrue((output / "card.json").is_file())

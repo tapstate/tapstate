@@ -20,7 +20,10 @@ import verdict
 def missing_batch_reason(folder, job):
     if (folder / "expired.txt").is_file():
         return "batch expired before measurement"
-    if "Upload batch evidence" in job.get("failed_steps", []):
+    failed_steps = job.get("failed_steps", [])
+    if failed_steps and failed_steps[0] not in {"Build and measure the fixed batch", "Upload batch evidence"}:
+        return f"batch setup failed ({failed_steps[0]})"
+    if "Upload batch evidence" in failed_steps:
         return "batch evidence upload failed"
     if job.get("conclusion") == "failure":
         return "batch failed before writing a summary"

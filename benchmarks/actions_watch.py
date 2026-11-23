@@ -45,6 +45,10 @@ def attempt_artifact(item, source):
             <= actions_health.timestamp(source["updated_at"]))
 
 
+def has_http_status(error, status):
+    return (error.stderr or b"").rstrip().endswith(f"(HTTP {status})".encode())
+
+
 def artifact(repository, source, name, filename):
     available = api(repository, f"runs/{source['id']}/artifacts?name={name}&per_page=20")["artifacts"]
     candidates = [item for item in available if item["name"] == name and attempt_artifact(item, source)]
@@ -52,7 +56,12 @@ def artifact(repository, source, name, filename):
         return {}
     item = candidates[0]
     path = f"repos/{repository}/actions/artifacts/{item['id']}/zip"
-    archive = subprocess.check_output(["gh", "api", path], timeout=60)
+    try:
+        archive = subprocess.check_output(["gh", "api", path], stderr=subprocess.PIPE, timeout=60)
+    except subprocess.CalledProcessError as error:
+        if has_http_status(error, 410):
+            return {}
+        raise
     if len(archive) > ARTIFACT_LIMIT or item.get("digest") != f"sha256:{sha256(archive).hexdigest()}":
         return {}
     try:
@@ -106,12 +115,18 @@ def latest_state(repository, branch, now):
     _, source = intent
     proposed = artifact(repository, source, "performance-notification-intent", "next-state.json")
     receipt = artifact(repository, source, "performance-notification-receipt", "delivery.json")
-    if proposed and receipt.get("intent_sha256") == catalog.digest(proposed):
-        if receipt["status"] == "rejected":
-            return state
-        if receipt["status"] == "accepted":
-            return proposed
-    raise ValueError(f"Delivery from health run {source['id']} is uncertain")
+    if not proposed or not isinstance(proposed.get("active"), dict):
+        raise ValueError(f"Notification intent from run {source['id']} could not be read")
+    status = receipt.get("status") if receipt.get("intent_sha256") == catalog.digest(proposed) else None
+    if status == "accepted":
+        return proposed
+    pending = dict(proposed.get("pending", state.get("pending", {})))
+    if status != "rejected":
+        before, after = state["active"], proposed["active"]
+        for key in before.keys() | after.keys():
+            if before.get(key) != after.get(key):
+                pending[key] = "alert" if key in after else "recovery"
+    return {**state, "pending": pending}
 
 
 def stop_expiring_run(repository, performance, now):
@@ -129,8 +144,15 @@ def stop_expiring_run(repository, performance, now):
     live = api(repository, f"runs/{run_id}")
     if live["run_attempt"] != 1 or live["status"] == "completed":
         return
-    subprocess.run(["gh", "api", "--method", "POST", f"repos/{repository}/actions/runs/{run_id}/cancel"],
-                   check=True, timeout=30)
+    try:
+        subprocess.run(["gh", "api", "--method", "POST", f"repos/{repository}/actions/runs/{run_id}/cancel"],
+                       check=True, stderr=subprocess.PIPE, timeout=30)
+    except subprocess.CalledProcessError as error:
+        if not has_http_status(error, 409):
+            raise
+        latest = api(repository, f"runs/{run_id}")
+        if latest["run_attempt"] == 1 and latest["status"] != "completed":
+            raise ValueError("GitHub returned HTTP 409 and the first attempt is still active") from None
 
 
 def prepare(output, repository, branch, *, now=None):
@@ -157,33 +179,44 @@ def prepare(output, repository, branch, *, now=None):
             if run_id in rerun_ids and not reports[run_id] and report_removed_after_rerun(repository, run_id):
                 observation["status"] = "report-removed-after-rerun"
     output.mkdir(parents=True)
-    runner.write_json(output / "health.json", {"observations": [observe_run(item, now) for item in observed]})
+    check = {"observations": [observe_run(item, now) for item in observed], "cancellation_errors": []}
     for observation in observed:
         run = observation["performance"]
         if observation["status"] in {"performance-running", "performance-expired"} and run["status"] != "completed":
-            stop_expiring_run(repository, run, now)
+            try:
+                stop_expiring_run(repository, run, now)
+            except (OSError, subprocess.SubprocessError, ValueError) as error:
+                reason = str(error)
+                check["cancellation_errors"].append({"run_id": run["id"], "reason": reason})
+                print(f"::warning::Cancellation for performance run {run['id']}: {reason}", file=sys.stderr)
+    runner.write_json(output / "health.json", check)
 
     previous = latest_state(repository, branch, now)
     previous_marker = previous.get("observation", {})
     health = actions_health.select_observation(observed, previous_marker)
     performance = health["performance"]
     health["observed_at"] = now.isoformat()
-    runner.write_json(output / "health.json", {
-        **observe_run(health, now), "observations": [observe_run(item, now) for item in observed],
-    })
     active, healthy = notifications.signals(health)
-    notices, next_state = notifications.changes(previous["active"], active, healthy)
+    previous_pending = previous.get("pending", {})
+    # A newly observed opposite condition ends this ambiguous delivery transition.
+    pending = {key: direction for key, direction in previous_pending.items()
+               if key not in (healthy if direction == "alert" else active)}
+    notices, next_state = notifications.changes(
+        previous["active"], {key: signal for key, signal in active.items() if key not in pending}, healthy - pending.keys(),
+    )
+    runner.write_json(output / "health.json", {**check, **observe_run(health, now), "pending_delivery": pending})
     settled = (health["status"] in {"reported", "report-removed-after-rerun"}
                or health["status"] in notifications.WORKFLOW_ANOMALIES)
     marker = actions_health.observation_marker(health) if settled else previous_marker
-    state = {"updated_at": now.isoformat(), "active": next_state, "observation": marker}
+    state = {"updated_at": now.isoformat(), "active": next_state, "observation": marker, "pending": pending}
     if notices:
         target = performance or health["nightly"]
         details = (f"https://github.com/{repository}/actions/runs/{target['id']}/attempts/1" if target
                    else f"https://github.com/{repository}/actions/workflows/pipeline-performance.yml")
         runner.write_json(output / "card.json", notifications.card(health, notices, details))
         runner.write_json(output / "next-state.json", state)
-    elif marker != previous_marker or now - actions_health.timestamp(previous["updated_at"]) >= timedelta(days=1):
+    elif (marker != previous_marker or pending != previous_pending
+          or now - actions_health.timestamp(previous["updated_at"]) >= timedelta(days=1)):
         runner.write_json(output / "state.json", state)
 
 

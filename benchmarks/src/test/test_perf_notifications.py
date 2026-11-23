@@ -5,6 +5,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -441,6 +442,70 @@ class NotificationTest(unittest.TestCase):
                         card = catalog.read_json(output / "card.json")
                         self.assertIn("Report for this attempt missing", card["card"]["elements"][0]["content"])
 
+    def test_archive_disappearance_rechecks_inventory_and_first_upload(self):
+        nightly, original, now = scheduled(21)
+        later = {**original, "run_attempt": 2}
+        archive = {"id": 10, "name": "performance-report-1", "expired": False, "size_in_bytes": 10,
+                   "workflow_run": {"id": original["id"], "head_sha": original["head_sha"]},
+                   "created_at": original["run_started_at"]}
+        first_jobs = [{"name": "report", "steps": [{"name": "Upload the report", "conclusion": "success"}]}]
+        for status in (410, 403):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "health"
+                responses = [{"workflow_runs": [nightly]}, {"workflow_runs": [later]}, original,
+                             {"artifacts": [archive]}, {"artifacts": []}, {"jobs": first_jobs}]
+                failure = subprocess.CalledProcessError(1, "gh", stderr=f"gh: failed (HTTP {status})\n".encode())
+                with patch.object(actions_watch, "api", side_effect=responses) as query, \
+                        patch.object(actions_watch.subprocess, "check_output", side_effect=failure), \
+                        patch.object(actions_watch, "latest_state",
+                                     return_value={"active": {}, "updated_at": now.isoformat()}):
+                    if status == 410:
+                        actions_watch.prepare(output, REPOSITORY, "main", now=now)
+                        self.assertEqual(6, query.call_count)
+                        health = catalog.read_json(output / "health.json")
+                        self.assertEqual("report-removed-after-rerun", health["status"])
+                        self.assertFalse((output / "card.json").exists())
+                    else:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            actions_watch.prepare(output, REPOSITORY, "main", now=now)
+                        self.assertEqual(4, query.call_count)
+
+    def test_uncertain_alert_allows_an_independent_alert_and_clears_on_healthy_evidence(self):
+        nightly, run, now = scheduled(21)
+        initial = {"active": {}, "updated_at": now.isoformat()}
+        attempted = {"active": {"workflow": {"kind": "workflow", "reason": "missing-handoff"}},
+                     "updated_at": now.isoformat()}
+        unknown = {"status": "unknown", "intent_sha256": catalog.digest(attempted)}
+        with patch.object(actions_watch, "latest_artifact", side_effect=[None, ({"id": 8}, {"id": 7})]), \
+                patch.object(actions_watch, "artifact", side_effect=[attempted, unknown]):
+            pending = actions_watch.latest_state(REPOSITORY, "main", now)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, missing in enumerate((True, False)):
+                result = raw_results(root / f"report-{index}", nightly, run,
+                                     {CASE_IDS[4]: (130, 132)}, self.cases, missing=missing)
+                output = root / f"health-{index}"
+                with patch.object(actions_watch, "api", side_effect=[
+                    {"workflow_runs": [nightly]}, {"workflow_runs": [run]},
+                ]), patch.object(actions_watch, "artifact", return_value=result), \
+                        patch.object(actions_watch, "latest_state", return_value=pending):
+                    actions_watch.prepare(output, REPOSITORY, "main", now=now)
+                proposed = catalog.read_json(output / "next-state.json")
+                keys = proposed["active"]
+                self.assertEqual(1, len(keys))
+                self.assertTrue(next(iter(keys)).startswith("comparison:"))
+                self.assertEqual({"workflow": "alert"} if missing else {}, proposed["pending"])
+
+                if missing:
+                    receipt = {"status": "rejected", "intent_sha256": catalog.digest(proposed)}
+                    with patch.object(actions_watch, "latest_artifact", side_effect=[
+                        ({"id": 5, "created_at": "2026-11-21T11:00:00Z"}, {"id": 4}),
+                        ({"id": 10, "created_at": "2026-11-21T12:00:00Z"}, {"id": 9}),
+                    ]), patch.object(actions_watch, "artifact", side_effect=[initial, proposed, receipt]):
+                        pending = actions_watch.latest_state(REPOSITORY, "main", now)
+                    self.assertEqual({"workflow": "alert"}, pending["pending"])
+                    self.assertEqual({}, pending["active"])
+
     def test_artifact_bytes_are_bound_to_original_attempt_and_verified_digest(self):
         _, run, _ = scheduled(21)
         buffer = BytesIO()
@@ -456,7 +521,8 @@ class NotificationTest(unittest.TestCase):
         with patch.object(actions_watch, "api", return_value={"artifacts": [item, later]}), \
                 patch.object(actions_watch.subprocess, "check_output", return_value=body) as download:
             self.assertEqual({"fixture": True}, actions_watch.artifact(REPOSITORY, run, name, "report.json"))
-            download.assert_called_once_with(["gh", "api", "repos/example/repo/actions/artifacts/10/zip"], timeout=60)
+            download.assert_called_once_with(["gh", "api", "repos/example/repo/actions/artifacts/10/zip"],
+                                             stderr=subprocess.PIPE, timeout=60)
         with patch.object(actions_watch, "api", return_value={"artifacts": [item]}), \
                 patch.object(actions_watch.subprocess, "check_output", return_value=body + b"changed"):
             self.assertEqual({}, actions_watch.artifact(REPOSITORY, run, name, "report.json"))

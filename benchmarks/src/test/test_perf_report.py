@@ -232,14 +232,15 @@ class PerfReportTest(unittest.TestCase):
         case_id = self.row["case_id"]
         identity = {"id": "accepted", "version": "v1", "code_sha": "a" * 40, "environment": "fixture-env"}
         document = {**self.baseline, **identity, "kind": "accepted"}
+        published_row = dict(self.row, code_sha=identity["code_sha"])
         variations = {
             "wrong-profile": {"environment_profile": "different"},
             "wrong-case": {"case_id": "different"},
             "wrong-code": {"code_sha": "b" * 40},
             "wrong-arm-run": {"paired_arms": {"control": dict(self.row, code_sha="a" * 40),
                                               "variant": dict(self.row, code_sha="a" * 40, run_id="different")}},
-            "wrong-arm-profile": {"paired_arms": {"ordinary": self.row,
-                                                   "other": dict(self.row, environment_profile="different")}},
+            "wrong-arm-profile": {"paired_arms": {"ordinary": published_row,
+                                                   "other": dict(published_row, environment_profile="different")}},
             "bad-window": {"resources": {"status": "observed", "windows": {
                 "snapshot": {"source": "procfs", "covered": True, "rss_peak_kib": "bad"}}}},
             "bad-percentile": {"live_latency": {"status": "eligible", "source": "events", "p95Nanos": None}},
@@ -249,7 +250,7 @@ class PerfReportTest(unittest.TestCase):
             path = Path(directory) / "baseline.json"
             for name, override in variations.items():
                 with self.subTest(name=name):
-                    document["cases"][case_id] = {**self.row, "code_sha": identity["code_sha"], **override}
+                    document["cases"][case_id] = {**published_row, **override}
                     path.write_text(json.dumps(document))
                     reference, status = baseline.load(path, identity=identity)
                     self.assertIsNone(reference)

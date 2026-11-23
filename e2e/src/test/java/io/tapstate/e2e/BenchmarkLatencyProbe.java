@@ -53,7 +53,7 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
     }
 
     // The unchanged MongoDB connector stamps the event's cluster-time second. Leave an
-    // idle gap between warm-up and scoring so that this second never spans both cohorts.
+    // short gap to reduce ambiguous repetitions of the same operation and key.
     void awaitScoringBoundary() {
         long wait = 1000 - System.currentTimeMillis() % 1000;
         long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(wait);
@@ -74,8 +74,11 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
                 return insufficient(expected, minimumP95, coverage, "MongoDB and fixture clocks did not agree");
             }
             var warmup = live.warmup().streams().get(stream);
-            long start = Math.floorDiv(live.measured().startedAt().toEpochMilli(), 1000) * 1000;
-            long finish = Math.floorDiv(live.measured().writesFinishedAt().toEpochMilli(), 1000) * 1000 + 1000;
+            if (measured.first() == null || measured.last() == null) {
+                return insufficient(expected, minimumP95, coverage, "The measured source history has no event timestamps");
+            }
+            long start = measured.first().clusterTime().getTime() * 1000L;
+            long finish = (measured.last().clusterTime().getTime() + 1L) * 1000;
             long end = live.measured().writesFinishedAt().plus(drain).toEpochMilli();
             List<Confirmation> observed = read(source, false);
             List<Confirmation> confirmed = read(path(".ack"), true);
@@ -133,8 +136,11 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
         var distinct = new HashSet<Event>();
         for (int index = 0; index < source.size(); index++) {
             Event event = source.get(index).event();
-            boolean inWindow = event.epochMillis() >= scoringStart && event.epochMillis() < scoringEnd;
-            if (inWindow != (index >= warmEvents)) {
+            // Independent sequence digests disambiguate cohorts sharing the boundary second.
+            boolean invalidTime = index < warmEvents
+                    ? event.epochMillis() > scoringStart
+                    : event.epochMillis() < scoringStart || event.epochMillis() >= scoringEnd;
+            if (invalidTime) {
                 throw new IllegalArgumentException("The independent source cohort did not match the connector's time window");
             }
             if (!distinct.add(event)) {
