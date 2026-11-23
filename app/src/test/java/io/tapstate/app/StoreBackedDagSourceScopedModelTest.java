@@ -425,6 +425,7 @@ class StoreBackedDagSourceScopedModelTest {
         var notes=org.mockito.Mockito.mock(RequiredNoteStore.class);
         org.mockito.Mockito.when(notes.guardedBy(org.mockito.ArgumentMatchers.any())).thenReturn(notes);
         org.mockito.Mockito.when(notes.open(org.mockito.ArgumentMatchers.any())).thenAnswer(call -> new RequiredNoteScope(call.getArgument(0),5));
+        org.mockito.Mockito.when(notes.openPipelineScopes(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenCallRealMethod();
         org.mockito.Mockito.when(notes.prepareOrigin(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any())).thenAnswer(call -> call.getArgument(1));
         var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"synthetic.NotLoaded","2.0.8",null,null,"a".repeat(64),false);
         var source=new StoreBackedDagSource(f.store,new StoreBackedDagSource.PdkSinkWriterBinder(notes,id -> ref));

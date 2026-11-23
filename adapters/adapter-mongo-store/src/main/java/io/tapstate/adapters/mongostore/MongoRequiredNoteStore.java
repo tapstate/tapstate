@@ -262,6 +262,48 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     @Override
+    public PipelineScopes openPipelineScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {
+        if (retirement != null || primary.kind() != RequiredNoteOwner.Kind.PIPELINE
+                || global.kind() != RequiredNoteOwner.Kind.GLOBAL
+                || MongoValidationClaimObservation.lacksSnapshotRead(client))
+            return RequiredNoteStore.super.openPipelineScopes(primary, global);
+        return StoreIo.call(() -> {
+            requireActive.run();
+            var stages = MongoStartConfigRead.root();
+            stages.add(new Document("$match", new Document("layoutId", MongoConfigurationDomain.LAYOUT)
+                    .append("bindingVersion", primary.bindingVersion())));
+            stages.add(noteScopeLookup(SystemCollections.OPERATOR_GENERATIONS, "operator", primary.ownerId()));
+            stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_SCOPES, "primary", scopeId(primary)));
+            stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_SCOPES, "global", scopeId(global)));
+            var snapshot = MongoStartConfigRead.snapshot(database, stages);
+            var operator = noteScopeRow(snapshot, "operator", primary.ownerId());
+            var first = noteScopeRow(snapshot, "primary", scopeId(primary));
+            var second = noteScopeRow(snapshot, "global", scopeId(global));
+            if (operator == null || first == null || second == null)
+                return RequiredNoteStore.super.openPipelineScopes(primary, global);
+            checkBinding(snapshot, primary);
+            checkPipelineOwner(operator, primary, false);
+            var primaryScope = scopeOf(primary, first);
+            checkBinding(snapshot, global);
+            var globalScope = scopeOf(global, second);
+            requireActive.run();
+            return new PipelineScopes(primaryScope, globalScope);
+        });
+    }
+
+    private static Document noteScopeLookup(SystemCollections table, String slot, Object key) {
+        var bytes = new Document("$bsonSize", "$$ROOT");
+        return MongoValidationClaimObservation.lookup(table, slot, key,
+                new Document("_id", 1).append("boundedRow", new Document("$cond",
+                        List.of(new Document("$lte", List.of(bytes, 64 * 1024)), "$$ROOT", false))));
+    }
+
+    private static Document noteScopeRow(Document snapshot, String slot, Object key) {
+        return MongoStartConfigRead.row(snapshot, slot, key)
+                .map(row -> row.get("boundedRow")).filter(Document.class::isInstance).map(Document.class::cast).orElse(null);
+    }
+
+    @Override
     public CaptureScopes openCaptureScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {
         if (retirement != null || primary.kind() != RequiredNoteOwner.Kind.CHAIN || global.kind() != RequiredNoteOwner.Kind.GLOBAL)
             return RequiredNoteStore.super.openCaptureScopes(primary, global);
@@ -1025,19 +1067,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         }
         if (owner.kind() == RequiredNoteOwner.Kind.PIPELINE) {
             Document operator = operators.find(session, new Document("_id", owner.ownerId())).first();
-            PipelineStateMapping mapping;
-            try {
-                mapping = MongoPipelineStateMappings.decode(owner.ownerId(), operator);
-            } catch (TapstateException invalidMapping) {
-                throw unavailable();
-            }
-            if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE || mapping.stateGeneration() != owner.stateGeneration()) {
-                throw unavailable();
-            }
-            var recovery=MongoCacheRecoveryFacts.read(operator);
-            if (!authoringOnly && recovery.isPresent() && MongoPipelinePreparationFacts.decode(owner.ownerId(),operator,
-                    recovery.orElseThrow().targetScope().clusterId()).phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE)
-                throw unavailable();
+            checkPipelineOwner(operator, owner, authoringOnly);
             if (write) {
                 Document filter = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
                         .append("phase", "ACTIVE").append("noteWriteFence", operator.getLong("noteWriteFence"));
@@ -1045,6 +1075,22 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                         new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw unavailable();
             }
         }
+    }
+
+    private static void checkPipelineOwner(Document operator, RequiredNoteOwner owner, boolean authoringOnly) {
+        PipelineStateMapping mapping;
+        try {
+            mapping = MongoPipelineStateMappings.decode(owner.ownerId(), operator);
+        } catch (TapstateException invalidMapping) {
+            throw unavailable();
+        }
+        if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE || mapping.stateGeneration() != owner.stateGeneration()) {
+            throw unavailable();
+        }
+        var recovery=MongoCacheRecoveryFacts.read(operator);
+        if (!authoringOnly && recovery.isPresent() && MongoPipelinePreparationFacts.decode(owner.ownerId(),operator,
+                recovery.orElseThrow().targetScope().clusterId()).phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE)
+            throw unavailable();
     }
 
     private SourceConfigCipher cipherForWrite(ClientSession session) {

@@ -47,8 +47,11 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         Objects.requireNonNull(requireActive,"requireActive");requireActive.run();
         if(original.scope()==null || config.node()==null || !config.node().pipelineId().equals(original.pipelineId()))throw unavailable();
         var fixed=notes.guardedBy(requireActive);var scope=original.scope();
-        var primary=fixed.open(RequiredNoteOwner.forNode(scope.bindingVersion(),config.node(),purpose,scope.stateGeneration()));
-        var global=fixed.open(new RequiredNoteOwner(scope.bindingVersion(),"pdk.global-state",RequiredNoteOwner.Kind.GLOBAL,scope.clusterId(),0));
+        var opened = fixed.openPipelineScopes(
+                RequiredNoteOwner.forNode(scope.bindingVersion(), config.node(), purpose, scope.stateGeneration()),
+                new RequiredNoteOwner(scope.bindingVersion(), "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, scope.clusterId(), 0));
+        var primary = opened.primary();
+        var global = opened.global();
         var pinned=recoveryPinned?fixed.origin(primary):null;
         var ref=pinned==null?provisioner.resolve(config.connectorId()):provisioner.resolve(config.connectorId(),pinned.artifactHash());requireActive.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),ref.contentHash(),config.settings());

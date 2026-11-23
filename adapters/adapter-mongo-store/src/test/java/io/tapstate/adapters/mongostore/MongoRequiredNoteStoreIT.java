@@ -40,6 +40,39 @@ class MongoRequiredNoteStoreIT {
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
+    @Test void pipelineAndGlobalNoteScopesShareOneSnapshotWithoutWeakeningOwnerChecks() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var primary = f.initialize(pipeline("p1", 1));
+            var shared = f.initialize(global());
+            var commands = new ArrayList<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var store = new MongoRequiredNoteStore(observed, observed.getDatabase(f.database.getName()), f.cipher());
+                commands.clear();
+                assertThat(store.open(primary.owner())).isEqualTo(primary);
+                assertThat(store.open(shared.owner())).isEqualTo(shared);
+                assertThat(commands).containsExactly("find", "find", "find", "commitTransaction",
+                        "find", "find", "commitTransaction");
+                commands.clear();
+                assertThat(store.openPipelineScopes(primary.owner(), shared.owner()))
+                        .isEqualTo(new RequiredNoteStore.PipelineScopes(primary, shared));
+                assertThat(commands).containsExactly("aggregate");
+                f.pipelineGeneration("p1", 2);
+                assertThatThrownBy(() -> store.openPipelineScopes(primary.owner(),shared.owner()))
+                        .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                System.out.println("PIPELINE_NOTE_SCOPES original_commands=7 combined_commands=1 old_generation_rejected=true");
+            }
+        });
+    }
+
     @Test
     void repeatedClearsRetainTheOriginalConnectionBeyondTheBoxedLongCache() {
         withNotes(f -> {

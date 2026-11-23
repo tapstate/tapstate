@@ -104,6 +104,7 @@ class ConfiguredSinkRunTest {
     }
     private static RequiredNoteStore notes() {
         var notes=mock(RequiredNoteStore.class);when(notes.guardedBy(any())).thenReturn(notes);when(notes.open(any())).thenAnswer(call -> new RequiredNoteScope(call.getArgument(0),5));
+        when(notes.openPipelineScopes(any(), any())).thenCallRealMethod();
         when(notes.prepareOrigin(any(),any())).thenAnswer(call -> call.getArgument(1));
         when(notes.origin(any())).thenReturn(ConnectorNoteOrigin.capture("demo",HASH,Map.of()));when(notes.read(any(),anyString())).thenReturn(new RequiredNoteValue(0,null));return notes;
     }
