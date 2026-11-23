@@ -12,7 +12,7 @@ class ConnectorDiagnosticContractTest {
     @Test void remainingDefinitionsKeepParametersSeverityAndHistoricalRecovery() {
         var codes = new ArrayList<TapstateErrorCode>();
         codes.addAll(List.of(ConnectorError.values()));
-        assertThat(codes).hasSize(42);
+        assertThat(codes).hasSize(43);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String legacy = "connector." + ((Enum<?>) code).name().toLowerCase(Locale.ROOT).replace('_', '-');

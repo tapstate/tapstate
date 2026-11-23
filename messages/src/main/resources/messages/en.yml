@@ -721,6 +721,12 @@ connector.load-failed:
 connector.class-not-found:
   message: "Connector '{connector}' entry class '{class}' was not found or is not a connector."
   solution: "Check the connector id resolves to a connector jar that declares this entry class."
+connector.local-artifact-unavailable:
+  message: "Connector '{connector}' requires local artifact {hash}, which is missing or unreadable."
+  solution: "Restore the original connector JAR under that hash, then retry from the retained position."
+connector.download-target-changed:
+  message: "The download target for connector '{connector}' has changed."
+  solution: "Review the current version and confirm the new target."
 connector.artifact-unreadable:
   message: "Connector artifact '{artifact}' could not be read."
   solution: "Check the artifact is a complete, readable connector jar (ZIP archive); download it again if it is truncated or corrupt."
