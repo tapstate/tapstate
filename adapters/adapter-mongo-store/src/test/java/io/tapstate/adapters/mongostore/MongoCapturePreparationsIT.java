@@ -165,6 +165,59 @@ class MongoCapturePreparationsIT {
     }
 
     @Test
+    void aVersionedCaptureGrantRequiresTheExactPreparedRevisionAndRetainsItsArtifact() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var original = f.issue(f.request).preparation();
+            var scope = f.request.pipeline();
+            var store = f.configuration.intents();
+            var start = store.load(scope.pipelineId()).orElseThrow();
+            assertThat(store.compareAndSetExplicitStart(scope, start.intentRevision(), start.desired())).isTrue();
+            var restart = store.load(scope.pipelineId()).orElseThrow();
+            String hash = "b".repeat(64);
+            String chain = io.tapstate.core.model.canonical.SourceCaptureIdentity.versionedSharedChain(
+                    original.canonicalChainId(), hash,
+                    scope.pipelineId() + ":" + scope.stateGeneration() + ":" + restart.intentRevision());
+            String captureId = io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain);
+            var owner = new RequiredNoteOwner(scope.bindingVersion(), "pdk.chain." + chain,
+                    RequiredNoteOwner.Kind.CHAIN, chain, 0);
+            var candidate = new ConnectorRunBindings.Binding("input", PipelineNode.Purpose.CAPTURE, "mysql", "2.0",
+                    hash, new RequiredNoteScope(owner, 1), captureId, chain);
+
+            var request = new CapturePreparationRequest(scope, f.request.originalPipeline(), f.request.originalNode(),
+                    f.request.sourceId(), f.request.inputs(),
+                    new CapturePreparationRequest.SharedArtifact(hash, restart.intentRevision()));
+            var captures = f.configuration.capturePreparations();
+            assertCode(() -> captures.issueFirstCreate(request), IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.controls().countDocuments()).isEqualTo(1);
+            assertThat(captures.read(f.scope, captureId)).isEmpty();
+
+            var bindings = store.connectorBindings();
+            bindings.prepare(restart, List.of(candidate));
+            var versioned = f.issue(request).preparation();
+            assertThat(versioned.canonicalChainId()).isEqualTo(chain);
+            assertThat(versioned.captureId()).isEqualTo(captureId);
+            assertThat(f.controls().find(new Document("artifactHash", hash)).first()).isNotNull();
+            assertThat(captures.read(f.scope, original.captureId())).contains(original);
+            assertThat(f.issue(request).preparation()).isEqualTo(versioned);
+            assertThat(f.controls().countDocuments()).isEqualTo(2);
+
+            assertCode(() -> bindings.publish(restart), IoError.NOTE_SCOPE_UNAVAILABLE);
+            var notes = f.configuration.requiredNotes();
+            var required = new RequiredNoteOrigin("mysql", hash, new byte[]{3});
+            assertThat(notes.prepareOrigin(candidate.notes(), required)).isEqualTo(required);
+            notes.markLocalArtifactReady(candidate.notes(), required);
+            bindings.publish(restart);
+            bindings.complete(scope, restart.intentRevision());
+            assertThat(captures.issueFirstCreate(request)).isEqualTo(new CaptureCreationResult.AlreadyIssued(versioned));
+            try (var reopened = MongoConfigurationDomain.open(f.settings, scope.clusterId())) {
+                assertThat(reopened.capturePreparations().read(f.scope, captureId)).contains(versioned);
+                assertThat(reopened.intents().connectorBindings().load(scope).orElseThrow().effective())
+                        .containsExactly(candidate);
+            }
+        });
+    }
+
+    @Test
     void sharedNoteLookupsRespectPipelineNodeSettingsAndTheCurrentArtifactHash() {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var inherited = f.issue(f.request).preparation();

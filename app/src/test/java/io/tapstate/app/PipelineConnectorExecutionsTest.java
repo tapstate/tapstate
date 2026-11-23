@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.canonical.SourceCaptureIdentity;
+import io.tapstate.spi.store.CapturePreparation;
 import io.tapstate.spi.store.CaptureStatePreparations;
 import io.tapstate.spi.store.ConnectorBindingStore;
 import io.tapstate.spi.store.ConnectorRunBindings;
@@ -37,11 +38,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -167,9 +170,75 @@ class PipelineConnectorExecutionsTest {
         verify(f.connectors, never()).resolve(CONNECTOR);
     }
 
+    @Test
+    void recoveryUsesASeparateChainForTheRetainedPrivateHash() {
+        var f = new Fixture();
+        var scope = PipelineConnectorExecutions.business(SCOPE);
+        var privateNotes = new RequiredNoteScope(SOURCE.privateOwner(SCOPE), 1);
+        var retained = origin(SOURCE, OLD_HASH);
+        when(f.notes.origin(privateNotes)).thenReturn(retained);
+        when(f.capture.inspectSharedOrigin(scope, SOURCE.id(), "source-hash", SCOPE.pipelineId(), "pipeline-hash"))
+                .thenReturn(Optional.of(retained));
+        assertThat(f.executions.recoveryBinding(SCOPE, SOURCE, "source-hash", "pipeline-hash", ACTIVE)).isNull();
+        verify(f.connectors, never()).resolveRetained(any(), any(), any());
+
+        when(f.capture.inspectSharedOrigin(scope, SOURCE.id(), "source-hash", SCOPE.pipelineId(), "pipeline-hash"))
+                .thenReturn(Optional.of(origin(SOURCE, NEW_HASH)));
+        when(f.connectors.resolveRetained(f.notes, privateNotes, retained)).thenReturn(ref(OLD_HASH));
+        String retainedChain = SourceCaptureIdentity.versionedSharedChain(CHAIN, OLD_HASH, null);
+        var expected = shared(SOURCE, retainedChain, OLD_HASH);
+        assertThat(f.executions.recoveryBinding(SCOPE, SOURCE, "source-hash", "pipeline-hash", ACTIVE))
+                .isEqualTo(expected);
+        verify(f.connectors, never()).resolve(CONNECTOR);
+    }
+
+    @Test
+    void firstSharedStartJoinsOnlyAChainBoundToItsSelectedArtifact() {
+        var f = new Fixture();
+        var scope = PipelineConnectorExecutions.business(SCOPE);
+        var olderChain = shared(SOURCE, CHAIN, OLD_HASH);
+        var prep = new CapturePreparation(scope, CapturePreparation.Mode.SHARED_SRS,
+                CHAIN, olderChain.captureId(), "mc-" + OLD_HASH, UUID.randomUUID().toString());
+        when(f.capture.read(scope, olderChain.captureId())).thenReturn(Optional.of(prep));
+        var first = intent(SCOPE, 1, PipelineState.RUNNING);
+        var requested = state(0, List.of(), new Handoff(1, Phase.REQUESTED, List.of(), List.of()));
+        when(f.bindings.load(SCOPE)).thenReturn(Optional.of(requested));
+        when(f.bindings.prepare(eq(first), any())).thenAnswer(call -> state(0, List.of(),
+                new Handoff(1, Phase.PREPARED, call.getArgument(1), List.of())));
+
+        when(f.notes.originIfPresent(olderChain.notes())).thenReturn(Optional.of(origin(SOURCE, OLD_HASH)));
+        f.executions.prepare(first, List.of(SOURCE), CLAIM, ACTIVE);
+        var independent = shared(SOURCE, SourceCaptureIdentity.versionedSharedChain(CHAIN, NEW_HASH, null), NEW_HASH);
+        verify(f.bindings).prepare(first, List.of(independent));
+
+        when(f.notes.originIfPresent(olderChain.notes())).thenReturn(Optional.of(origin(SOURCE, NEW_HASH)));
+        f.executions.prepare(first, List.of(SOURCE), CLAIM, ACTIVE);
+        verify(f.bindings).prepare(first, List.of(shared(SOURCE, CHAIN, NEW_HASH)));
+    }
+
+    @Test
+    void restartingWithTheSameHashKeepsItsExistingPrivateNoteOwner() {
+        var f = new Fixture();
+        var oldBinding = privateBinding(TARGET, NEW_HASH);
+        var current = List.of(oldBinding);
+        var origin = origin(TARGET, NEW_HASH);
+        when(f.bindings.load(SCOPE)).thenReturn(Optional.of(state(1, current,
+                new Handoff(2, Phase.REQUESTED, List.of(), List.of()))));
+        when(f.bindings.prepare(START, current)).thenReturn(state(1, current,
+                new Handoff(2, Phase.PREPARED, current, List.of())));
+        when(f.notes.prepareOrigin(oldBinding.notes(), origin)).thenReturn(origin);
+
+        f.executions.prepare(START, List.of(TARGET), CLAIM, ACTIVE);
+
+        verify(f.bindings).prepare(START, current);
+        verify(f.connectors).markBound(f.notes, oldBinding.notes(), origin);
+        verify(f.notes, never()).prepareArtifactBinding(any(), any(), any());
+    }
+
     private static final class Fixture {
         final PipelineIntentStore intents = mock(PipelineIntentStore.class);
         final ConnectorBindingStore bindings = mock(ConnectorBindingStore.class);
+        final CaptureStatePreparations capture = mock(CaptureStatePreparations.class);
         final RequiredNoteStore notes = mock(RequiredNoteStore.class);
         final LocalConnectorArtifacts connectors = mock(LocalConnectorArtifacts.class);
         final SrsConsumerStore consumers = mock(SrsConsumerStore.class);
@@ -184,7 +253,6 @@ class PipelineConnectorExecutionsTest {
             when(connectors.resolve(CONNECTOR)).thenReturn(ref(NEW_HASH));
             when(connectors.artifactVersion(CONNECTOR, NEW_HASH)).thenReturn(Optional.of("2.0"));
             when(connectors.artifactVersion(CONNECTOR, OLD_HASH)).thenReturn(Optional.of("1.0"));
-            var capture = mock(CaptureStatePreparations.class);
             when(capture.guardedBy(ACTIVE)).thenReturn(capture);
             var srs = mock(SrsStoreViews.class);
             var stores = mock(SrsStores.class);
@@ -213,7 +281,7 @@ class PipelineConnectorExecutionsTest {
     }
 
     private static Binding privateBinding(PipelineConnectorExecutions.Node node, String hash) {
-        return new Binding(node.id(), node.purpose(), CONNECTOR, "1.0", hash,
+        return new Binding(node.id(), node.purpose(), CONNECTOR, OLD_HASH.equals(hash) ? "1.0" : "2.0", hash,
                 new RequiredNoteScope(node.privateOwner(SCOPE), 1), null, null);
     }
 

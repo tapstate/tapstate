@@ -56,8 +56,17 @@ class MongoSrsConsumerStoreIT {
     private static final String CHAIN = "chain-a";
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
     private static final SrsConsumerContext B = context("pipeline-b", "source-b", 1);
-    @ParameterizedTest @ValueSource(booleans = {false, true})
-    void aConnectorHandoffSeedsOnlyItsOwnCandidateFromTheOriginalGlobalAck(boolean initialLoad) {
+    @Test
+    void handoffSeedsOnlyTheCandidateFromTheOriginalGlobalAck() {
+        aConnectorHandoffSeedsOnlyItsOwnCandidateFromTheOriginalGlobalAck(false);
+    }
+
+    @Test
+    void handoffDuringInitialLoadSeedsOnlyTheCandidateFromTheOriginalSnapshotPin() {
+        aConnectorHandoffSeedsOnlyItsOwnCandidateFromTheOriginalGlobalAck(true);
+    }
+
+    private void aConnectorHandoffSeedsOnlyItsOwnCandidateFromTheOriginalGlobalAck(boolean initialLoad) {
         withBusiness(f -> {
             var tables = initialLoad ? Set.of("orders", "items") : Set.of("orders");
             var references = publishSnapshotModels(f, tables);
@@ -116,8 +125,17 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
-    @ParameterizedTest @ValueSource(booleans = {false, true})
-    void aPreparedConnectorHandoffReattachesAfterThePipelineBootChanges(boolean modelsPrepared) {
+    @Test
+    void preparedHandoffReattachesAfterThePipelineBootChanges() {
+        aPreparedConnectorHandoffReattachesAfterThePipelineBootChanges(false);
+    }
+
+    @Test
+    void handoffWithPublishedModelsReattachesAfterThePipelineBootChanges() {
+        aPreparedConnectorHandoffReattachesAfterThePipelineBootChanges(true);
+    }
+
+    private void aPreparedConnectorHandoffReattachesAfterThePipelineBootChanges(boolean modelsPrepared) {
         withBusiness(f -> {
             publishSnapshotModels(f, Set.of("orders"));
             f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();

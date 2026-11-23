@@ -183,6 +183,75 @@ class LocalConnectorArtifactsTest {
     }
 
     @Test
+    void anOldBundledArtifactKeepsItsImageCopyAfterItsRetainedLocalCopyIsReclaimed() throws IOException {
+        var cache = new Cache();
+        var runtime = installer(cache, (hash, output) -> { throw new AssertionError("Unexpected GridFS"); });
+        Path bundled = artifact("2.9.3");
+        String bundledHash = ContentHash.of(Files.readAllBytes(bundled));
+        long size = Files.size(bundled);
+        assertThatThrownBy(() -> runtime.registerBundle(bundled, "orders", bundledHash, size + 1L))
+                .isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> runtime.registerBundle(bundled, "orders", "b".repeat(64), size))
+                .isInstanceOf(TapstateException.class);
+        assertThat(runtime.registerBundle(bundled, "orders", bundledHash, size).newlyRegistered()).isTrue();
+        assertThat(runtime.registerBundle(bundled, "orders", bundledHash, size).newlyRegistered()).isFalse();
+        assertThat(cache.byHash.get(bundledHash).origin()).isEqualTo(Origin.BUNDLE);
+        assertThat(runtime.resolve("orders", bundledHash).classpath()).containsExactly(bundled);
+
+        String latest = install(runtime, artifact("2.9.12"));
+        runtime.retain(runtime.resolve("orders", bundledHash));
+        Path retained = work.resolve("plugins").resolve(bundledHash + ".jar");
+        assertThat(Files.readAllBytes(retained)).isEqualTo(Files.readAllBytes(bundled));
+        assertThat(runtime.cacheIdentity("orders")).isEqualTo(latest);
+        runtime.reclaim(Set.of("orders"), () -> Set.of(bundledHash));
+        assertThat(retained).exists();
+
+        runtime.reclaim(Set.of("orders"), Set::of);
+        assertThat(retained).doesNotExist();
+        assertThat(bundled).exists();
+        assertThat(runtime.resolve("orders", bundledHash).classpath()).containsExactly(bundled);
+        assertThat(runtime.resolve("orders").contentHash()).isEqualTo(latest);
+        assertThat(cache.forNode("node")).extracting(ConnectorArtifactHoldings.Held::sha256)
+                .containsExactlyInAnyOrder(bundledHash, latest);
+    }
+
+    @Test
+    void stagingFailuresLeaveNoPublishedArtifactAndCanRetryTheSameDownload() throws IOException {
+        var cache = new Cache();
+        var installer = installer(cache, (hash, output) -> { throw new AssertionError("Unexpected GridFS"); });
+        byte[] original = Files.readAllBytes(artifact("2.9.3"));
+        var broken = new java.io.InputStream() {
+            private boolean firstRead = true;
+
+            @Override
+            public int read() throws IOException {
+                if (!firstRead) throw new IOException("fixture transfer stopped");
+                firstRead = false;
+                return original[0] & 0xff;
+            }
+        };
+        String hash = ContentHash.of(original);
+
+        assertThatThrownBy(() -> installer.install(broken, Origin.DOWNLOAD, "orders", hash))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED));
+        assertThatThrownBy(() -> installer.install(new java.io.ByteArrayInputStream(original), Origin.DOWNLOAD,
+                "orders", "b".repeat(64))).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> installer.install(new java.io.ByteArrayInputStream(original), Origin.DOWNLOAD,
+                "other", hash)).isInstanceOf(TapstateException.class);
+        assertThat(cache.byHash).isEmpty();
+        assertThat(cache.forNode("node")).isEmpty();
+        try (var files = Files.list(work.resolve("plugins"))) {
+            assertThat(files.toList()).isEmpty();
+        }
+
+        var retried = installer.install(new java.io.ByteArrayInputStream(original), Origin.DOWNLOAD, "orders", hash);
+        assertThat(retried.newlyRegistered()).isTrue();
+        assertThat(retried.registration().contentHash()).isEqualTo(hash);
+        assertThat(Files.readAllBytes(work.resolve("plugins").resolve(hash + ".jar"))).isEqualTo(original);
+    }
+
+    @Test
     void startupCompletesInterruptedInstallsAndLeavesCompletedRecordsAlone() throws IOException {
         var cache = new Cache();
         LocalConnectorArtifacts.LegacyArtifact legacy = (hash, output) -> {

@@ -64,6 +64,8 @@ class MongoPipelineIntentStoreIT {
             bindings.seed(original, List.of(old));
             assertThat(bindings.prepare(original, List.of(candidate)).handoff().phase()).isEqualTo(ConnectorRunBindings.Phase.PREPARED);
             assertThat(bindings.prepare(original, List.of(candidate)).effective()).containsExactly(old);
+            assertThat(bindings.loadAll()).containsOnlyKeys("flow").containsEntry("flow", bindings.load(scope).orElseThrow());
+            assertThat(domain.retainedConnectorArtifacts()).containsExactlyInAnyOrder(old.sha256(), candidate.sha256());
             assertThatThrownBy(() -> bindings.prepare(original, List.of(old))).satisfies(MongoPipelineIntentStoreIT::fenced);
             assertThat(store.compareAndSet(scope, 2, intent(PipelineState.PAUSED, false, false, null))).isTrue();
             assertThatThrownBy(() -> bindings.publish(original)).satisfies(MongoPipelineIntentStoreIT::fenced);
@@ -73,6 +75,7 @@ class MongoPipelineIntentStoreIT {
             bindings.abort(scope, 2);
             assertThat(bindings.load(scope).orElseThrow().effective()).containsExactly(old);
             assertThat(bindings.load(scope).orElseThrow().handoff()).isNull();
+            assertThat(domain.retainedConnectorArtifacts()).containsExactly(old.sha256());
             try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
                 assertThat(reopened.intents().connectorBindings().load(scope)).isEqualTo(bindings.load(scope));
             }

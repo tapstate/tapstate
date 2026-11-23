@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.jar.JarOutputStream;
@@ -124,6 +125,80 @@ class ConnectorCatalogRefreshTest {
     }
 
     @Test
+    void anIncompatibleCurrentBomUsesThePinnedCompatibleHistory() throws Exception {
+        var remote = new RepositoryFixture();
+        URI repository = URI.create("https://repository.test/releases/");
+        remote.repoint(repository);
+        remote.publish(repository, "mysql", DIGEST);
+        remote.files.put(SUPPORT, ConnectorSupportSnapshotTest.manifest(10, "mysql"));
+
+        var bom = new MavenConnectorCatalog.Coordinate("io.tapdata", "connectors-bom", BOM_VERSION);
+        URI activeBom = bom.file(repository, "pom");
+        String historicalVersion = "2.0.9.20261023.1";
+        var historicalBom = new MavenConnectorCatalog.Coordinate(bom.groupId(), bom.artifactId(), historicalVersion);
+        remote.files.put(historicalBom.file(repository, "pom"), remote.files.get(activeBom)
+                .replace(BOM_VERSION, historicalVersion)
+                .replace(">2.0.11<", ">2.0.9<").replace(">2.11.0<", ">2.9.12<"));
+        remote.files.put(activeBom, remote.files.get(activeBom).replace(">2.0.11<", ">2.0.12<"));
+        remote.files.put(bom.metadata(repository), """
+                <metadata><groupId>io.tapdata</groupId><artifactId>connectors-bom</artifactId>
+                  <versioning><versions><version>%s</version></versions></versioning>
+                </metadata>
+                """.formatted(historicalVersion));
+
+        var refresh = catalog(remote, ConnectorSupportSnapshotTest.manifest(10, "mysql"));
+        URI compatibleJar = repository.resolve(PREFIX + "mysql-connector/2.9.12/mysql-connector-2.9.12.jar");
+        URI checksum = URI.create(compatibleJar + ".sha256");
+        assertThat(refresh.refresh().downloads()).isEmpty();
+        remote.files.put(checksum, DIGEST);
+        var available = refresh.refresh();
+        assertThat(available.downloads().get("mysql").jar()).isEqualTo(compatibleJar);
+        assertThat(available.downloads().get("mysql").sha256()).isEqualTo(DIGEST);
+
+        remote.files.put(checksum, "invalid checksum");
+        assertThatThrownBy(refresh::refresh).isInstanceOf(IOException.class).hasMessageContaining("Invalid SHA-256");
+        assertThat(refresh.current()).isSameAs(available);
+    }
+
+    @Test
+    void eachBundleRequiresTheExactPublishedConnectorSet() throws Exception {
+        var remote = new RepositoryFixture();
+        URI repository = URI.create("https://repository.test/");
+        var cloud = List.of("mongodb", "mysql", "postgres", "mongodb-atlas");
+        var onPrem = List.of("mongodb", "mysql", "postgres", "mongodb-atlas", "oracle", "sqlserver",
+                "aws-rds-mysql", "dummy");
+        remote.repoint(repository);
+        var rows = new HashMap<String, ConnectorSupportManifest.Entry>();
+        for (String id : onPrem) {
+            remote.publish(repository, id, DIGEST);
+            rows.put(id, new ConnectorSupportManifest.Entry(id, id, List.of("source"), "0.8.0", "oss",
+                    id + "-connector", false));
+        }
+        var manifest = new ConnectorSupportManifest(10, rows);
+        var repositories = ConnectorReleaseCatalog.repositories(new String(remote.read(REPOSITORIES), StandardCharsets.UTF_8));
+        for (var profile : Map.of("cloud", cloud, "onprem", onPrem).entrySet()) {
+            var downloads = ConnectorBundleSelection.select(profile.getKey(), manifest, repositories,
+                    "0.8.0", "2.0.11-SNAPSHOT", remote);
+            assertThat(downloads).extracting(ConnectorReleaseCatalog.Download::connectorId)
+                    .containsExactlyElementsOf(profile.getValue());
+            assertThat(downloads).allSatisfy(download -> {
+                assertThat(download.jar()).isEqualTo(repository.resolve(jarPath(download.connectorId())));
+                assertThat(download.sha256()).isEqualTo(DIGEST);
+            });
+        }
+
+        remote.missing = Set.of(repository.resolve(jarPath("oracle")));
+        assertThatThrownBy(() -> ConnectorBundleSelection.select("onprem", manifest, repositories,
+                "0.8.0", "2.0.11-SNAPSHOT", remote))
+                .isInstanceOf(IOException.class).hasMessage("No compatible published JAR is available for oracle");
+
+        rows.remove("mongodb");
+        assertThatThrownBy(() -> ConnectorBundleSelection.select("cloud",
+                new ConnectorSupportManifest(11, rows), repositories, "0.8.0", "2.0.11-SNAPSHOT", remote))
+                .isInstanceOf(IOException.class).hasMessage("Required connector is outside the official support manifest: mongodb");
+    }
+
+    @Test
     void readsAndNormalizesTheAuthenticationManifestAttribute() throws Exception {
         var manifest = new Manifest();
         manifest.getMainAttributes().putValue("Manifest-Version", "1.0");
@@ -179,21 +254,24 @@ class ConnectorCatalogRefreshTest {
         }
 
         private void publish(URI repository, String id, String digest) {
+            var props = new StringBuilder();
+            var managed = new StringBuilder();
+            for (String name : List.of("mysql", "postgres", "unlisted", "mongodb", "mongodb-atlas",
+                    "oracle", "sqlserver", "aws-rds-mysql", "dummy")) {
+                String tag = "tapdata.connector." + name + "-connector.pdk.api.version";
+                props.append("<").append(tag).append(">2.0.11</").append(tag).append(">");
+                managed.append("""
+                        <dependency><groupId>io.tapdata</groupId><artifactId>%s-connector</artifactId>
+                        <version>2.11.0</version></dependency>
+                        """.formatted(name));
+            }
             files.put(repository.resolve(PREFIX + "connectors-bom/" + BOM_VERSION + "/connectors-bom-" + BOM_VERSION + ".pom"), """
                     <project xmlns="http://maven.apache.org/POM/4.0.0">
                       <groupId>io.tapdata</groupId><artifactId>connectors-bom</artifactId><version>%s</version>
-                      <properties>
-                        <tapdata.connector.mysql-connector.pdk.api.version>2.0.11</tapdata.connector.mysql-connector.pdk.api.version>
-                        <tapdata.connector.postgres-connector.pdk.api.version>2.0.11</tapdata.connector.postgres-connector.pdk.api.version>
-                        <tapdata.connector.unlisted-connector.pdk.api.version>2.0.11</tapdata.connector.unlisted-connector.pdk.api.version>
-                      </properties>
-                      <dependencyManagement><dependencies>
-                        <dependency><groupId>io.tapdata</groupId><artifactId>mysql-connector</artifactId><version>2.11.0</version></dependency>
-                        <dependency><groupId>io.tapdata</groupId><artifactId>postgres-connector</artifactId><version>2.11.0</version></dependency>
-                        <dependency><groupId>io.tapdata</groupId><artifactId>unlisted-connector</artifactId><version>2.11.0</version></dependency>
-                      </dependencies></dependencyManagement>
+                      <properties>%s</properties>
+                      <dependencyManagement><dependencies>%s</dependencies></dependencyManagement>
                     </project>
-                    """.formatted(BOM_VERSION));
+                    """.formatted(BOM_VERSION, props, managed));
             files.put(repository.resolve(jarPath(id) + ".sha256"), digest);
         }
     }
