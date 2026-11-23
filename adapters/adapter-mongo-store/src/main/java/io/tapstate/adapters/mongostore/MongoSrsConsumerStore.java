@@ -958,6 +958,22 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         chains.replace(session, root, replacement);
         return new RetainedModels(replacement, held.state(), Set.copyOf(result));
     }
+    private void prefetchPinnedReferences(View held, MongoSrsReadFacts facts) {
+        var references = new java.util.LinkedHashSet<SrsModelKey>();
+        for (var cursor : held.cursors().values()) {
+            var pin = cursor.snapshot();
+            if (pin == null) continue;
+            if (pin.models().size() > 64) return;
+            references.addAll(pin.models().values());
+            if (references.size() > 64) return;
+        }
+        if (references.size() < 2) return;
+        facts.prefetchExactIds(SystemCollections.SRS_MODEL_CONTEXTS,
+                references.stream().map(MongoSrsModelContexts::contextId).toList(), requireActive);
+        facts.prefetchExactIds(SystemCollections.SRS_MODELS,
+                references.stream().map(MongoSrsModelStore::key).toList(), requireActive);
+    }
+
     /** Serializes model reclamation with attach, detach and exact snapshot-pin publication. */
     Set<io.tapstate.spi.store.SrsModelKey> retainedModels(ClientSession session,String chain, MongoSrsReadFacts facts) {
         Document root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
@@ -965,6 +981,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         facts.seed(SystemCollections.SRS_CHAINS, root);
         var state = chains.state(session, root, false, facts);
         var held = relations(session, chain, root, state);
+        prefetchPinnedReferences(held, facts);
         var result = new java.util.HashSet<io.tapstate.spi.store.SrsModelKey>();
         for(var member:held.members().values()) {
             if(member.detached())continue;

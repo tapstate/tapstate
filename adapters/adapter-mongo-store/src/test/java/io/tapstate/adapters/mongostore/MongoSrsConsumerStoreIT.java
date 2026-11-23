@@ -3881,6 +3881,47 @@ class MongoSrsConsumerStoreIT {
             }
         });
     }
+    @Test void reclaimBatchesHistoricalPinsAndDeletesOnlyTheUnprotectedBodies() {
+        withBusiness(f -> {
+            var models = models(f);
+            var keys = new ArrayList<SrsModelKey>();
+            keys.add(publishSnapshotModels(f, Set.of("orders")).get("orders"));
+            for (int epoch = 2; epoch <= 5; epoch++) {
+                assertThat(f.chains().openEpoch(CHAIN, epoch - 1, f.captureFence())).hasValue((long) epoch);
+                var key = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), epoch, 0);
+                keys.add(key);
+                models.publishInitial(key, ring("orders"),
+                        new SourceTable("orders", List.of(new SourceField("id", "int")), List.of(), List.of()), f.captureFence());
+                if (epoch == 2 || epoch == 4) {
+                    var consumer = epoch == 2 ? A : B;
+                    var fence = epoch == 2 ? f.fenceA() : f.fenceB();
+                    var member = f.consumers().attach(consumer, 0, Set.of("orders"), fence).orElseThrow();
+                    assertThat(f.consumers().pinSnapshot(consumer, member.revision(), 0,
+                            new SrsSnapshotPin(epoch, "offset-" + epoch, Map.of("orders", key)), fence)).isTrue();
+                }
+            }
+            var batched = new java.util.HashSet<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    var command = event.getCommand();
+                    if (!"find".equals(event.getCommandName())) return;
+                    var predicate = command.getDocument("filter").get("_id");
+                    if (predicate instanceof org.bson.BsonDocument id && id.get("$in") instanceof org.bson.BsonArray ids
+                            && ids.size() == 2) batched.add(command.getString("find").getValue());
+                }
+            };
+            try (var client = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                var original = new MongoSrsModelStore(client, client.getDatabase(f.database().getName()), SCOPE);
+                assertThat(original.reclaim(CHAIN, f.captureFence())).isEqualTo(2);
+            }
+            assertThat(batched).contains("srs_models", "srs_model_contexts");
+            assertThat(keys.stream().filter(key -> reclaimStored(f, key)).toList())
+                    .containsExactly(keys.get(1), keys.get(3), keys.get(4));
+        });
+    }
+
     @Test void reclaimStillValidatesPinnedModelsOutsideTheCheckpoint() {
         withBusiness(f -> {
             pinCurrentCheckpointModels(f, Set.of("orders", "items", "quiet"));
@@ -4274,6 +4315,8 @@ class MongoSrsConsumerStoreIT {
             var start = new CountDownLatch(1); var release = new CountDownLatch(1);
             var accepted = new java.util.concurrent.atomic.AtomicInteger(); var refused = new java.util.concurrent.atomic.AtomicInteger();
             var active = new java.util.concurrent.atomic.AtomicInteger(); var maximum = new java.util.concurrent.atomic.AtomicInteger();
+            var ordinaryDecisions = new CountDownLatch(6);
+            var allFourActive = new CountDownLatch(4);
             try (var caller = Executors.newFixedThreadPool(6)) {
                 var futures = new java.util.ArrayList<java.util.concurrent.Future<?>>();
                 for (int i = 0; i < 6; i++) {
@@ -4288,6 +4331,7 @@ class MongoSrsConsumerStoreIT {
                                             session.startTransaction();
                                             SystemCollections.CACHE_IDENTITY.on(f.database()).find(session, new Document("_id", "cluster")).first();
                                             maximum.accumulateAndGet(active.incrementAndGet(), Math::max); accepted.incrementAndGet();
+                                            ordinaryDecisions.countDown(); allFourActive.countDown();
                                             awaitPinTestBarrier(release);
                                             active.decrementAndGet();
                                             return true;
@@ -4295,15 +4339,14 @@ class MongoSrsConsumerStoreIT {
                                     }));
                         } catch (io.tapstate.spi.store.WorkloadClaimRenewalException failure) {
                             assertThat(failure.reason()).isEqualTo(io.tapstate.spi.store.WorkloadClaimRenewalException.Reason.NOT_STARTED);
-                            refused.incrementAndGet();
+                            refused.incrementAndGet(); ordinaryDecisions.countDown();
                         }
                     }));
                 }
                 start.countDown();
-                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(3)).untilAsserted(() -> {
-                    assertThat(accepted).hasValue(4 - reservedCount);
-                    assertThat(refused).hasValue(2 + reservedCount);
-                });
+                assertThat(ordinaryDecisions.await(3, TimeUnit.SECONDS)).isTrue();
+                assertThat(accepted).hasValue(4 - reservedCount);
+                assertThat(refused).hasValue(2 + reservedCount);
                 var recoveryFutures = new java.util.ArrayList<java.util.concurrent.Future<?>>();
                 try (var recoveryCallers = Executors.newFixedThreadPool(reservedCount)) {
                     for (var key : reserved) recoveryFutures.add(recoveryCallers.submit(() -> operations.renew(key,
@@ -4313,10 +4356,12 @@ class MongoSrsConsumerStoreIT {
                                     session.startTransaction();
                                     SystemCollections.CACHE_IDENTITY.on(f.database()).find(session, new Document("_id", "cluster")).first();
                                     maximum.accumulateAndGet(active.incrementAndGet(), Math::max);
+                                    allFourActive.countDown();
                                     awaitPinTestBarrier(release); active.decrementAndGet(); return true;
                                 } finally { operations.abort(owned, operations.budget()); }
                             }))));
-                    org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).untilAsserted(() -> assertThat(active).hasValue(4));
+                    assertThat(allFourActive.await(2, TimeUnit.SECONDS)).isTrue();
+                    assertThat(active).hasValue(4);
                     assertThat(maximum).hasValue(4);
                     assertThat(operations.nodeSession(System.nanoTime() + TimeUnit.SECONDS.toNanos(2), () -> {},
                             () -> f.database().runCommand(new Document("ping", 1)).getDouble("ok"))).isEqualTo(1d);
