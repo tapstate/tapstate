@@ -386,6 +386,19 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return load(session).map(Loaded::cachePreparation);
     }
 
+    Optional<CachePreparation> capturedCachePreparation(ClientSession session, Document stored,
+            MongoBindingReadFacts.Facts facts, Document source, Document recovery) {
+        var cluster = facts.identity();
+        requireClusterIdentity(cluster);
+        String clusterId = cluster.getString("clusterId");
+        long version = cluster.getLong(BINDING_VERSION);
+        var state = facts.setup();
+        long generation = requireSetupIdentity(state, clusterId);
+        if (version == 0) return cachePreparationForTransaction(session);
+        return readBound(session, stored, facts, clusterId, version, state, generation, source, recovery)
+                .loaded().map(Loaded::cachePreparation);
+    }
+
     /** Rechecks the durable scope of a previously admitted runtime without reopening its connection. */
     Optional<CachePreparation> admittedCachePreparation(ClientSession session) {
         if (!MongoBindingReadFacts.supported(client)) return cachePreparationForTransaction(session);
@@ -480,6 +493,11 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
 
     private TransactionFacts readBound(ClientSession session, Document stored, MongoBindingReadFacts.Facts facts,
             String clusterId, Long version, Document state, long currentGeneration) {
+        return readBound(session, stored, facts, clusterId, version, state, currentGeneration, null, null);
+    }
+
+    private TransactionFacts readBound(ClientSession session, Document stored, MongoBindingReadFacts.Facts facts,
+            String clusterId, Long version, Document state, long currentGeneration, Document capturedSource, Document capturedRecovery) {
         try {
             if (stored == null || !clusterId.equals(stored.get("clusterId"))
                     || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))
@@ -489,7 +507,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
             StorageBinding.Mode mode = StorageBinding.Mode.valueOf(stored.getString("mode"));
             String defaultId = stored.getString("defaultSourceId");
             requireBoundSetup(state, scope, version, defaultId, currentGeneration);
-            Document source = sources.find(session, new Document("_id", defaultId)).first();
+            Document source = capturedSource == null ? sources.find(session, new Document("_id", defaultId)).first() : capturedSource;
             if (source == null || !DEFAULT_ROLE.equals(source.get("systemRole"))
                     || (facts != null ? facts.conflictingResource() : hasOtherResource(session, defaultId))
                     || !stored.get("sourceHash").equals(CanonicalHash.of(codec.decode(source)))) throw unreadable();
@@ -501,8 +519,9 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     .append("namespace", "pdk.global-state"))).first();
             requireGlobalScope(global, clusterId);
             StorageBinding binding = new StorageBinding(scope, mode, version, defaultId, cache);
-            return new TransactionFacts(Optional.of(new Loaded(binding, candidateHash,
-                    MongoStorageRecoveryStore.read(session, database, binding, state))), state);
+            var recovery = capturedRecovery == null ? MongoStorageRecoveryStore.read(session, database, binding, state)
+                    : MongoStorageRecoveryStore.read(capturedRecovery, scope, mode, version, () -> state);
+            return new TransactionFacts(Optional.of(new Loaded(binding, candidateHash, recovery)), state);
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
             // Stored or decrypted values may contain credentials. Never attach parser input or causes.
             throw unreadable();

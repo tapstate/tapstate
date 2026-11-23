@@ -73,6 +73,156 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void actuationBatchesOneTransactionSnapshotAndReloadsTheLatestIntent() {
+        withConfiguration((domain, database, scope) -> {
+            var node = new io.tapstate.spi.store.WorkloadClaimFence(
+                    new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),
+                            io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION, "node-a"),
+                    new io.tapstate.spi.store.WorkloadOwner("node-a", "boot-a"), 1, 0, 1);
+            var preparation = new io.tapstate.spi.store.PipelinePreparation(scope.pipelineId(), scope.stateGeneration(),
+                    io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE, scope, UUID.randomUUID().toString(), node);
+            SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(new Document("_id", scope.pipelineId()),
+                    new Document("$set", new Document("cachePreparation", MongoPipelinePreparationFacts.encode(preparation))));
+            var desired = intent(PipelineState.RUNNING, false, false, null);
+            assertThat(domain.intents().compareAndSet(scope, 0, desired)).isTrue();
+            var commands = new ArrayList<org.bson.BsonDocument>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommand().clone()); }
+            };
+            var material = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+            try (var client = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var db = client.getDatabase(database.getName());
+                var store = new MongoPipelineIntentStore(client, db, scope.clusterId(), new MongoStorageBindingStore(client, db, ciphers));
+                commands.clear();
+                assertThat(store.loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 1, desired));
+                System.out.println("ACTUATION_READ commands=" + commands.stream().map(command -> command.getFirstKey()).toList());
+                assertThat(commands).hasSize(3);
+                assertThat(commands.getFirst().getString("aggregate").getValue()).isEqualTo("cluster_identity");
+                assertThat(commands.getFirst().getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
+                assertThat(commands.getFirst().containsKey("txnNumber")).isTrue();
+                assertThat(commands.stream().map(command -> command.getFirstKey()).toList()).containsExactly("aggregate", "find", "commitTransaction");
+                var stopped = intent(PipelineState.STOPPED, false, false, null);
+                assertThat(domain.intents().compareAndSet(scope, 1, stopped)).isTrue();
+                commands.clear();
+                assertThat(store.loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 2, stopped));
+                assertThat(commands).hasSize(3);
+            }
+        });
+    }
+
+    @Test
+    void actuationRetainsForeignCollectionCollationAndErrorPriority() {
+        withConfiguration((domain, database, scope) -> {
+            readyForActuation(domain, database, scope);
+            var name = SystemCollections.TRANSFORM_DEFINITIONS.collectionName();
+            SystemCollections.TRANSFORM_DEFINITIONS.on(database).drop();
+            database.createCollection(name, new com.mongodb.client.model.CreateCollectionOptions().collation(
+                    com.mongodb.client.model.Collation.builder().locale("en")
+                            .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            var source = StorageBinding.defaultSourceId(StorageBinding.Mode.OP);
+            SystemCollections.TRANSFORM_DEFINITIONS.on(database).insertOne(new Document("_id", source.toUpperCase(java.util.Locale.ROOT)));
+            assertThatThrownBy(() -> domain.intents().loadForActuation(scope.pipelineId()))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                        assertThat(failure.args()).containsEntry("id", "storage-binding");
+                    });
+            SystemCollections.PIPELINE_INTENTS.on(database).updateOne(new Document("_id", scope.pipelineId()),
+                    new Document("$set", new Document("intentRevision", 1)));
+            assertThatThrownBy(() -> domain.intents().loadForActuation(scope.pipelineId()))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                        assertThat(failure.args()).containsEntry("id", "pipeline-intent");
+                    });
+        });
+    }
+
+    @Test
+    void actuationRetainsSourceCollationWhenTheSnapshotRootIsCaseInsensitive() {
+        withConfiguration((domain, database, scope) -> {
+            var desired = readyForActuation(domain, database, scope);
+            var root = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database);
+            var identity = root.find().first();
+            root.drop();
+            database.createCollection(SystemCollections.CONFIG_CLUSTER_IDENTITY.collectionName(),
+                    new com.mongodb.client.model.CreateCollectionOptions().collation(
+                            com.mongodb.client.model.Collation.builder().locale("en")
+                                    .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            root.insertOne(identity);
+            SystemCollections.SOURCES.on(database).insertOne(new Document("_id",
+                    StorageBinding.defaultSourceId(StorageBinding.Mode.OP).toUpperCase(java.util.Locale.ROOT)));
+            assertThat(domain.intents().loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 1, desired));
+        });
+    }
+
+    @Test
+    void actuationFallsBackForLargeRowsAndRefusesForeignCacheAndMappingScopes() {
+        withConfiguration((domain, database, scope) -> {
+            readyForActuation(domain, database, scope);
+            var intents = SystemCollections.PIPELINE_INTENTS.on(database);
+            var filter = new Document("_id", scope.pipelineId());
+            var original = intents.find(filter).first();
+            String revision = "a".repeat(70 * 1024);
+            intents.updateOne(filter, new Document("$set", new Document("revision", revision)));
+            assertThat(domain.intents().loadForActuation(scope.pipelineId())).get()
+                    .satisfies(snapshot -> assertThat(snapshot.desired().revision()).isEqualTo(revision));
+            intents.replaceOne(filter, original);
+            intents.updateOne(filter, new Document("$set", new Document("cacheIncarnation", UUID.randomUUID().toString())));
+            assertThatThrownBy(() -> domain.intents().loadForActuation(scope.pipelineId())).satisfies(MongoPipelineIntentStoreIT::unreadable);
+            intents.replaceOne(filter, original);
+            SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(filter,
+                    new Document("$set", new Document("stateGeneration", 2L)));
+            assertThatThrownBy(() -> domain.intents().loadForActuation(scope.pipelineId())).satisfies(MongoPipelineIntentStoreIT::fenced);
+        });
+    }
+
+    @Test
+    void actuationRebuildsAllCapturedFactsAfterATransientTransactionFailure() {
+        withConfiguration((domain, database, scope) -> {
+            readyForActuation(domain, database, scope);
+            var stopped = intent(PipelineState.STOPPED, false, false, null);
+            var commands = new ArrayList<String>();
+            var changed = new java.util.concurrent.atomic.AtomicBoolean();
+            var armed = new java.util.concurrent.atomic.AtomicBoolean();
+            var material = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+            try (var admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var listener = new CommandListener() {
+                    @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+                    @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                        if (event.getCommandName().equals("aggregate") && armed.compareAndSet(false, true)) {
+                            admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                                    .append("mode", new Document("times", 1)).append("data", new Document("failCommands", List.of("find"))
+                                            .append("errorCode", 112).append("errorLabels", List.of("TransientTransactionError"))));
+                        }
+                    }
+                    @Override public void commandFailed(CommandFailedEvent event) {
+                        if (event.getCommandName().equals("find") && changed.compareAndSet(false, true)) {
+                            assertThat(domain.intents().compareAndSet(scope, 1, stopped)).isTrue();
+                        }
+                    }
+                };
+                try (var client = MongoClients.create(MongoClientSettings.builder()
+                        .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                    client.getDatabase("admin").runCommand(new Document("ping", 1));
+                    var db = client.getDatabase(database.getName());
+                    var store = new MongoPipelineIntentStore(client, db, scope.clusterId(), new MongoStorageBindingStore(client, db, ciphers));
+                    commands.clear();
+                    try {
+                        assertThat(store.loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 2, stopped));
+                        assertThat(changed).isTrue();
+                        assertThat(commands).containsExactly("aggregate", "find", "abortTransaction", "aggregate", "find", "commitTransaction");
+                    } finally {
+                        admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     void latestIntentAndCoordinatesSurviveReopenWithoutAnyCacheResource() {
         withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
@@ -422,6 +572,19 @@ class MongoPipelineIntentStoreIT {
         return new DesiredState("flow", target, HASH, purge, "assembly-a", reassemble, epoch);
     }
     private static io.tapstate.core.model.Resource pipeline() { return new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: []\n"); }
+    private static DesiredState readyForActuation(MongoConfigurationDomain domain, MongoDatabase database, PipelineIntentScope scope) {
+        var node = new io.tapstate.spi.store.WorkloadClaimFence(
+                new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION, "node-a"),
+                new io.tapstate.spi.store.WorkloadOwner("node-a", "boot-a"), 1, 0, 1);
+        var preparation = new io.tapstate.spi.store.PipelinePreparation(scope.pipelineId(), scope.stateGeneration(),
+                io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE, scope, UUID.randomUUID().toString(), node);
+        SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(new Document("_id", scope.pipelineId()),
+                new Document("$set", new Document("cachePreparation", MongoPipelinePreparationFacts.encode(preparation))));
+        var desired = intent(PipelineState.RUNNING, false, false, null);
+        assertThat(domain.intents().compareAndSet(scope, 0, desired)).isTrue();
+        return desired;
+    }
+
     private static long revision(MongoDatabase database) { return SystemCollections.CONFIGURATION_VERSION.on(database).find().first().getLong("revision"); }
     private static Document mapping(MongoDatabase database) { return SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "flow")).first(); }
     private static void fenced(Throwable failure) { assertThat(failure).isInstanceOfSatisfying(TapstateException.class,
