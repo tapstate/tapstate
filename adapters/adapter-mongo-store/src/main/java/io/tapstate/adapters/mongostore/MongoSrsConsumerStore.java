@@ -1544,9 +1544,14 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 || entry.getValue() == null || entry.getValue() < -1 || entry.getValue() == Long.MAX_VALUE))
             throw new IllegalArgumentException("invalid original consumer arrivals");
         var captured = Map.copyOf(sequences);
-        return checkpointTransaction(context.key().pipelineId(), admitted, session -> {
+        return checkpointInTransaction(context.key().pipelineId(), session -> {
+            boolean combine = admitted && prepareBeforeWrite && namesPipeline(context, fence)
+                    && MongoBindingReadFacts.supported(client);
+            if (!combine) validateStore(session, admitted);
             var pipeline = pipelineAccess(context, fence);
-            var state = prepareBeforeWrite ? pipeline.stateForWriterProgress(session, true) : pipeline.state(session, true);
+            Document state;
+            if (combine) state = pipeline.stateForStartupWrite(session, true, ignored -> {});
+            else state = prepareBeforeWrite ? pipeline.stateForWriterProgress(session, true) : pipeline.state(session, true);
             if (!prepareBeforeWrite) proveConsumerWrite(session, pipeline, state);
             var own = prepareBeforeWrite ? requireStartupOwn(session, context, admitted)
                     : requireOwn(session, context, admitted);
@@ -1689,7 +1694,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             // Reserve the chain before reading its model and cursor facts.
             var root = chains.reserveSnapshotPin(session, chain);
             boolean batchReads = root != null && MongoBindingReadFacts.supported(client);
-            var state = pipeline.stateForSnapshotPin(session, batchReads, schedulingProof);
+            var state = pipeline.stateForStartupWrite(session, batchReads, schedulingProof);
             pipeline.updateState(session, state, new Document(), false);
             var facts = root == null ? new MongoSrsReadFacts(session, database, scope, true)
                     : new MongoSrsReadFacts(session, database, scope, root, true);
@@ -2340,13 +2345,16 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     private MongoCachePipelineAccess pipelineAccess(SrsConsumerContext context, WorkloadClaimFence fence) {
         Objects.requireNonNull(fence, "originalPipelineFence");
-        if (fence.executionGeneration() < 1 || fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
-                || !scope.clusterId().equals(fence.key().clusterId())
-                || !context.key().pipelineId().equals(fence.key().resourceId())) throw fenced();
+        if (!namesPipeline(context, fence)) throw fenced();
         var physical = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(),
                 context.key().pipelineId(), context.stateGeneration());
         return new MongoCachePipelineAccess(client, database, physical, fence, requireActive);
     }
+    private boolean namesPipeline(SrsConsumerContext context, WorkloadClaimFence fence) {
+        return fence != null && fence.executionGeneration() > 0 && fence.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                && scope.clusterId().equals(fence.key().clusterId()) && context.key().pipelineId().equals(fence.key().resourceId());
+    }
+
     private <T> T changingTheConsumer(Supplier<T> change) {
         readLease.drop();
         cursorLease.drop();
