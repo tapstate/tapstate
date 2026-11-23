@@ -104,8 +104,8 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             Path staged = Files.createTempFile(directory, ".connector-", ".jar");
             boolean complete = false;
             try {
-                try (var file = FileChannel.open(staged, StandardOpenOption.WRITE)) {
-                    var output = Channels.newOutputStream(file);
+                try (var file = FileChannel.open(staged, StandardOpenOption.WRITE);
+                        var output = Channels.newOutputStream(file)) {
                     byte[] buffer = new byte[128 * 1024];
                     long total = 0;
                     for (int read; (read = input.read(buffer)) >= 0;) {

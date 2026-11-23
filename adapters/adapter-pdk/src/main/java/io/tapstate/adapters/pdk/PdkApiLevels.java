@@ -67,8 +67,8 @@ public final class PdkApiLevels {
     public static int compareArtifactVersions(String left, String right) {
         String[] a = baseVersion(left).split("\\.");
         String[] b = baseVersion(right).split("\\.");
-        boolean numericLeft = baseVersion(left).matches("[0-9]+(\\.[0-9]+)*");
-        boolean numericRight = baseVersion(right).matches("[0-9]+(\\.[0-9]+)*");
+        boolean numericLeft = baseVersion(left).matches("[0-9]+(?:\\.[0-9]+)*+");
+        boolean numericRight = baseVersion(right).matches("[0-9]+(?:\\.[0-9]+)*+");
         if (numericLeft != numericRight) return Boolean.compare(numericLeft, numericRight);
         if (!numericLeft) return left.compareTo(right);
         for (int i = 0; i < Math.max(a.length, b.length); i++) {

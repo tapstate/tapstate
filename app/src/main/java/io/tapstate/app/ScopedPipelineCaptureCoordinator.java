@@ -482,6 +482,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     session.inputs.sourceHashes().get(reference.binding()), session.inputs.pipelineHash(), () -> requireSession(session));
         }
         var previous = session.selection.previous(reference.binding(), PipelineNode.Purpose.CAPTURE);
+        if (shared && previous != null && binding == null) throw refused();
         var opportunity = binding == null || binding.captureId() == null ? null
                 : stores.configuration().read(stores.scope(), binding.captureId()).orElse(null);
         boolean switching = previous != null && shared && !binding.chainId().equals(previous.chainId());

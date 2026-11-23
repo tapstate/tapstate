@@ -21,9 +21,9 @@ import org.xml.sax.SAXException;
 
 /** Reads connector releases from Maven BOMs and orders compatible candidates for a host. */
 final class MavenConnectorCatalog {
-    private static final Pattern GROUP = Pattern.compile("[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*");
+    private static final Pattern GROUP = Pattern.compile("[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*+");
     private static final Pattern ARTIFACT = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_.-]*");
-    private static final Pattern RELEASE = Pattern.compile("[0-9]+(\\.[0-9]+)*");
+    private static final Pattern RELEASE = Pattern.compile("[0-9]+(?:\\.[0-9]+)*+");
     private static final Pattern API = Pattern.compile("2\\.(?:0\\.)?([0-9]+)(?:-SNAPSHOT|-[0-9]{8}\\.[0-9]{6}-[0-9]+)?");
 
     private MavenConnectorCatalog() {

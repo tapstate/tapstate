@@ -71,6 +71,34 @@ class MongoRequiredNoteStoreIT {
     }
 
     @Test
+    void artifactBindingCopiesOriginalNotesWithoutMutatingTheirOwner() {
+        withNotes(f -> {
+            var previous = f.initialize(chain("old-artifact"));
+            var candidateOwner = chain("next-artifact");
+            f.notes.initialize(candidateOwner);
+            var original = f.notes.origin(previous);
+            var replacement = new RequiredNoteOrigin(original.connectorId(), "b".repeat(64), original.settings());
+            assertThat(f.notes.compareAndSet(previous, "position", 0, bytes("from-source"), false)).isTrue();
+            assertThat(f.notes.compareAndSet(previous, "removed", 0, bytes("deleted"), false)).isTrue();
+            assertThat(f.notes.compareAndSet(previous, "removed", 1, null, true)).isTrue();
+
+            var candidate = f.notes.prepareArtifactBinding(candidateOwner, replacement, previous);
+            assertThat(f.notes.prepareArtifactBinding(candidateOwner, replacement, previous)).isEqualTo(candidate);
+            assertThat(f.notes.origin(candidate)).isEqualTo(replacement);
+            assertThat(f.notes.localArtifactReady(candidate, replacement)).isTrue();
+            assertThat(f.notes.read(candidate, "position").bytes()).containsExactly(bytes("from-source"));
+            assertThat(f.notes.read(candidate, "removed").present()).isFalse();
+            assertThat(f.notes.read(candidate, "removed").revision()).isEqualTo(1);
+            assertThat(f.notes.read(previous, "removed").revision()).isEqualTo(2);
+            assertThat(f.notes.origin(previous)).isEqualTo(original);
+            assertThatThrownBy(() -> f.notes.prepareArtifactBinding(candidateOwner, original, previous))
+                    .satisfies(MongoRequiredNoteStoreIT::originMismatch);
+            assertThatThrownBy(() -> f.notes.prepareArtifactBinding(previous.owner(), replacement, previous))
+                    .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+        });
+    }
+
+    @Test
     void keyDeletionRetainsTheRevisionAndNoOldPayloadOrEventArchive() {
         withNotes(f -> {
             RequiredNoteScope scope = f.initialize(global());

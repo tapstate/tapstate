@@ -51,13 +51,13 @@ public final class ConnectorClassLoader implements AutoCloseable {
     private static final Map<ArtifactKey, ConnectorClassLoader> SHARED = new HashMap<>();
 
     private final URLClassLoader loader;
-    private final boolean shared;
+    private final boolean sharedLoader;
     private int users;
     private boolean pinned;
 
-    private ConnectorClassLoader(URLClassLoader loader, boolean shared) {
+    private ConnectorClassLoader(URLClassLoader loader, boolean sharedLoader) {
         this.loader = loader;
-        this.shared = shared;
+        this.sharedLoader = sharedLoader;
     }
 
     /** Opens an isolated loader over {@code classpath} (the connector jar plus any bundled deps). */
@@ -158,7 +158,7 @@ public final class ConnectorClassLoader implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!shared) closeLoader();
+        if (!sharedLoader) closeLoader();
     }
 
     private void closeLoader() {

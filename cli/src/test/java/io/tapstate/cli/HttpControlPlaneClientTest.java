@@ -72,24 +72,67 @@ class HttpControlPlaneClientTest {
         } finally { server.stop(0); }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    @Timeout(10)
+    void readsTheFinalResultOfAnAcceptedConnectorDownload(boolean installed) throws Exception {
+        String hash = "a".repeat(64);
+        String operation = "242a7615-7ee0-46a7-84ce-d2cda0a4f17d";
+        String finalBody = installed ? """
+                {"state":"INSTALLED","connectorId":"mysql","sha256":"%s","pdkApiVersion":"2.0.11",
+                 "newlyRegistered":true}
+                """.formatted(hash) : """
+                {"state":"FAILED","errorCode":"TS0380002"}
+                """;
+        var polls = new AtomicInteger();
+        var methods = new java.util.concurrent.ConcurrentLinkedQueue<String>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/api/connector-center/mysql:download", exchange -> {
+            methods.add(exchange.getRequestMethod());
+            respond(exchange, 202, "{\"operationId\":\"" + operation + "\"}");
+        });
+        server.createContext("/api/connector-center/operations/" + operation, exchange -> {
+            methods.add(exchange.getRequestMethod());
+            respond(exchange, 200, polls.incrementAndGet() == 1 ? "{\"state\":\"PENDING\"}" : finalBody);
+        });
+        server.start();
+        try {
+            var result = new HttpControlPlaneClient().downloadConnector(baseOf(server), "token", "mysql");
+            if (installed) {
+                assertThat(result).contains(new ConnectorRegisterOutcome.Registered(
+                        new RegisteredConnector("mysql", hash, "2.0.11", true)));
+            } else {
+                assertThat(result).containsInstanceOf(ConnectorRegisterOutcome.Rejected.class);
+                assertThat(((ConnectorRegisterOutcome.Rejected) result.orElseThrow()).code()).isEqualTo("TS0380002");
+            }
+            assertThat(methods).containsExactly("POST", "GET", "GET");
+        } finally {
+            server.stop(0);
+        }
+    }
+
     private static HttpServer serverReplying(int status, String body) throws Exception {
         return serverReplying("/healthz", status, body);
     }
 
     private static HttpServer serverReplying(String path, int status, String body) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        server.createContext(path, exchange -> {
-            byte[] bytes = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
+        server.createContext(path, exchange -> respond(exchange, status, body));
+        server.start();
+        return server;
+    }
+
+    private static void respond(com.sun.net.httpserver.HttpExchange exchange, int status, String body)
+            throws java.io.IOException {
+        byte[] bytes = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
+        try (exchange) {
             exchange.sendResponseHeaders(status, bytes.length == 0 ? -1 : bytes.length);
             if (bytes.length > 0) {
                 try (OutputStream os = exchange.getResponseBody()) {
                     os.write(bytes);
                 }
             }
-            exchange.close();
-        });
-        server.start();
-        return server;
+        }
     }
 
     private static URI baseOf(HttpServer server) {

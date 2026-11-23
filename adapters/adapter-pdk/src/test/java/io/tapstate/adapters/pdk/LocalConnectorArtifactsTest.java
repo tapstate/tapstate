@@ -182,6 +182,51 @@ class LocalConnectorArtifactsTest {
         assertThat(runtime.resolve("orders", old).contentHash()).isEqualTo(old);
     }
 
+    @Test
+    void startupCompletesInterruptedInstallsAndLeavesCompletedRecordsAlone() throws IOException {
+        var cache = new Cache();
+        LocalConnectorArtifacts.LegacyArtifact legacy = (hash, output) -> {
+            throw new AssertionError("Unexpected GridFS");
+        };
+        Path source = artifact("2.9.3");
+        String hash = ContentHash.of(Files.readAllBytes(source));
+        Path plugins = Files.createDirectories(work.resolve("plugins"));
+        var records = new ConnectorInstallRecords(plugins);
+        var pending = new ConnectorInstallRecords.Installation("orders", "2.9.3", Origin.UPLOAD,
+                Files.size(source), ConnectorInstallRecords.State.PENDING);
+
+        records.save(hash, pending);
+        var incomplete = installer(cache, legacy);
+        incomplete.restore();
+        assertThat(incomplete.versions()).isEmpty();
+        assertThat(cache.byHash).isEmpty();
+
+        Files.copy(source, plugins.resolve(hash + ".jar"));
+        var moved = installer(cache, legacy);
+        moved.restore();
+        assertThat(moved.versions()).extracting(ConnectorArtifactMetadata::sha256).containsExactly(hash);
+        assertThat(cache.forNode("node")).extracting(ConnectorArtifactHoldings.Held::sha256).containsExactly(hash);
+        assertThat(records.read(hash)).contains(pending.complete());
+        var originalRegistration = cache.byHash.get(hash);
+
+        records.save(hash, pending);
+        installer(cache, legacy).restore();
+        assertThat(records.read(hash)).contains(pending.complete());
+        assertThat(cache.byHash.get(hash)).isSameAs(originalRegistration);
+
+        Path record = plugins.resolve(hash + ".json");
+        Files.setLastModifiedTime(record, java.nio.file.attribute.FileTime.fromMillis(1000));
+        var completedAt = Files.getLastModifiedTime(record);
+        installer(cache, legacy).restore();
+        assertThat(Files.getLastModifiedTime(record)).isEqualTo(completedAt);
+        assertThat(cache.byHash.get(hash)).isSameAs(originalRegistration);
+
+        Files.writeString(record, "interrupted");
+        installer(cache, legacy).restore();
+        assertThat(records.read(hash)).contains(new ConnectorInstallRecords.Installation(
+                "orders", "2.9.3", Origin.DROP_DIRECTORY, Files.size(source), ConnectorInstallRecords.State.COMPLETE));
+    }
+
     private LocalConnectorArtifacts installer(Cache cache, LocalConnectorArtifacts.LegacyArtifact legacy) {
         return new LocalConnectorArtifacts(work.resolve("plugins"), new ConnectorIntrospector(), cache,
                 cache.specs, cache, "node", legacy, () -> List.of("orders"), "2.0.11-SNAPSHOT");
