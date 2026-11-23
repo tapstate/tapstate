@@ -105,14 +105,28 @@ class CaptureAuthorizationSnapshotIT {
 
     @Test void actualExpiryAndReplacementOwnerRemainRefused() throws Exception {
         try (var f = new Fixture()) {
-            var original = f.acquire(Duration.ofMillis(200));
+            var original = f.acquire(Duration.ofSeconds(1));
             var fence = WorkloadClaimFence.from(original);
-            Thread.sleep(300);
-            assertThat(f.claims.read(f.key)).hasValueSatisfying(reading -> assertThat(reading.leased()).isFalse());
-            try (var authorization = ExecutionAuthorization.scoped(f.scope, f.proofClaims, Duration.ofSeconds(10), System::nanoTime, () -> true)) {
+            var captured = f.proofClaims.read(f.key).orElseThrow();
+            assertThat(captured.leased()).isTrue();
+            var delayed = org.mockito.Mockito.mock(WorkloadClaimStore.class);
+            var first = new java.util.concurrent.atomic.AtomicBoolean(true);
+            org.mockito.Mockito.when(delayed.read(f.key)).thenAnswer(call -> {
+                if (first.compareAndSet(true, false)) {
+                    Thread.sleep(captured.leaseRemaining().toMillis() + 200);
+                    return Optional.of(captured);
+                }
+                return f.proofClaims.read(f.key);
+            });
+            try (var authorization = ExecutionAuthorization.scoped(f.scope, delayed, Duration.ofSeconds(10), System::nanoTime, () -> true)) {
                 assertThatThrownBy(() -> authorization.requireCapture(f.scope, fence)).isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
             }
+            org.mockito.Mockito.verify(delayed, org.mockito.Mockito.atLeast(2)).read(f.key);
+            assertThat(f.claims.read(f.key)).hasValueSatisfying(reading -> {
+                assertThat(reading.leased()).isFalse();
+                assertThat(reading.claim().leaseUntil()).isEqualTo(original.leaseUntil());
+            });
             var replacement = f.claims.acquire(f.key, new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).claim();
             assertThat(WorkloadClaimFence.from(replacement)).isNotEqualTo(fence);
             try (var authorization = ExecutionAuthorization.scoped(f.scope, f.proofClaims, Duration.ofSeconds(10), System::nanoTime, () -> true)) {

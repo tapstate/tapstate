@@ -301,13 +301,21 @@ class ScopedExecutionAuthorizationTest {
     @Test void aReplyAfterTheOriginalLeaseBoundDoesNotAuthorize() {
         WorkloadClaim run = raw.advanceExecution(raw.acquire(KEY, OWNER, 7, Duration.ofMillis(100)).claim(),
                 7, Set.of("node-a")).orElseThrow();
+        var attempts = new AtomicInteger();
         try (var guard = guard()) {
             when(store.readPipeline(FIRST)).thenAnswer(call -> {
-                WorkloadClaimReading captured = raw.read(KEY).orElseThrow();
+                var captured = raw.read(KEY);
+                attempts.incrementAndGet();
+                raw.elapse(Duration.ofMillis(200));
                 nanos.addAndGet(Duration.ofMillis(200).toNanos());
-                return java.util.Optional.of(captured);
+                return captured;
             });
             assertThat(guard.authorized(new ExecutionFence(FIRST, WorkloadClaimFence.from(run)))).isFalse();
+            assertThat(attempts).hasValue(2);
+            assertThat(raw.read(KEY)).hasValueSatisfying(current -> {
+                assertThat(current.leased()).isFalse();
+                assertThat(current.claim().leaseUntil()).isEqualTo(run.leaseUntil());
+            });
         }
     }
 
