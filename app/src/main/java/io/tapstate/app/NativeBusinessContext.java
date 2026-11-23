@@ -347,6 +347,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 }
             });
         }
+        @Bean io.tapstate.control.core.RetrySettingsService retrySettingsService(RetrySettingsStore store, AuditGate audit) {
+            return new io.tapstate.control.core.RetrySettingsService(store, audit);
+        }
+
         @Bean SrsStores nativeSrsStores(NativeBusinessContext owner) {
             return owner.original.cache().runtimeSrs(owner.original.preparation().businessScope(), owner.original::requireBusiness);
         }

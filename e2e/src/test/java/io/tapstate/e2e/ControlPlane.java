@@ -2458,8 +2458,13 @@ final class ControlPlane {
     }
 
     HttpResponse<String> replaceRetrySettings(long revision, Map<String, Object> defaults) {
+        return replaceRetrySettings(revision, defaults, Map.of());
+    }
+
+    HttpResponse<String> replaceRetrySettings(long revision, Map<String, Object> defaults,
+            Map<String, Map<String, Object>> operations) {
         return send(authedPut("/api/retry-settings", JsonWriter.write(
-                Map.of("revision", revision, "defaults", defaults, "operations", Map.of()))));
+                Map.of("revision", revision, "defaults", defaults, "operations", operations))));
     }
 
     private HttpRequest authedPut(String path, String body) {
