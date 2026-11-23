@@ -128,7 +128,7 @@ final class MongoClaimOperations {
         }
     }
 
-    record PinRetry(WorkloadClaimFence fence, long pinDeadline, long leaseDeadline) {}
+    record PinRetry(WorkloadClaimFence fence, long protectedUntil, long leaseDeadline) {}
 
     synchronized void awaitPipelineRenewal(WorkloadClaimKey key, MongoReadBudget pinBudget) {
         while (activeRenewals.contains(key) || ownsRenewalTransaction(key)) {
@@ -141,6 +141,12 @@ final class MongoClaimOperations {
             }
         }
         requireAdmission();
+    }
+
+    synchronized PinRetry protectInitialPin(WorkloadClaimFence fence, long pinDeadline, long leaseDeadline) {
+        long protectedUntil = Math.min(pinDeadline,
+                leaseDeadline - PIN_RENEWAL_BUDGET - RENEWAL_DISPATCH_MARGIN - 1);
+        return protectPinRetry(fence, protectedUntil, leaseDeadline);
     }
 
     synchronized PinRetry protectPinRetry(WorkloadClaimFence fence, long pinDeadline, long leaseDeadline) {
@@ -166,9 +172,9 @@ final class MongoClaimOperations {
         if (renewalLane.get() == null) return;
         var pin = pinRetries.get(fence.key());
         long now = System.nanoTime();
-        if (pin == null || !pin.fence().equals(fence) || pin.pinDeadline() - now <= 0) return;
+        if (pin == null || !pin.fence().equals(fence) || pin.protectedUntil() - now <= 0) return;
         long renewalBudget = Math.max(PIN_RENEWAL_BUDGET, budget().deadlineNanos() - now);
-        if (pin.leaseDeadline() - pin.pinDeadline() > renewalBudget + RENEWAL_DISPATCH_MARGIN) throw renewalBusy();
+        if (pin.leaseDeadline() - pin.protectedUntil() > renewalBudget + RENEWAL_DISPATCH_MARGIN) throw renewalBusy();
     }
 
     boolean pipelineRenewal() {

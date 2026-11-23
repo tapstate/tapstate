@@ -1837,7 +1837,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (!observed.leased() || !fence.equals(WorkloadClaimFence.from(observed.claim()))) return null;
             // This old snapshot only bounds local scheduling; the final durable claim CAS remains mandatory.
             long leaseDeadline = proof.sampledAtNanos() + observed.leaseRemaining().toNanos();
-            return pinOperations.protectPinRetry(fence, budget.deadlineNanos(), leaseDeadline);
+            return pinOperations.protectInitialPin(fence, budget.deadlineNanos(), leaseDeadline);
         } catch (TapstateException | ArithmeticException unavailable) {
             budget.remainingMillis();
             return null;
