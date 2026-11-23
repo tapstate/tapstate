@@ -142,9 +142,8 @@ The report artifact `performance-report-<attempt>` includes `report.json` and
 a result with its case version, tested SHA, workload, and environment profile.
 The scheduled health workflow runs from the default branch. It sends through
 the `PERFORMANCE_FEISHU_WEBHOOK` repository Actions secret for the synchronization
-performance bot. Set the repository Actions variable `PERFORMANCE_FEISHU_MENTION_ID` to the recipient's Feishu member ID
-or an Open ID valid for the bot and group. The notification shows the run-wide
-coverage and links to the same Actions attempt for the full evidence.
+performance bot. The group notification shows run-wide coverage and links to
+the same Actions attempt for the full evidence.
 
 Delivery state advances after the webhook confirms acceptance. A definite
 rejection leaves the previous state available for the next scheduled check.

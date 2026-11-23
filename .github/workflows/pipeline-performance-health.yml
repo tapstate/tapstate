@@ -29,7 +29,6 @@ jobs:
       - name: Check the scheduled Nightly, handoff, and report
         env:
           GH_TOKEN: ${{ github.token }}
-          PERFORMANCE_FEISHU_MENTION_ID: ${{ vars.PERFORMANCE_FEISHU_MENTION_ID }}
         run: python3 -B benchmarks/actions_watch.py prepare "$RUNNER_TEMP/performance-health"
       - uses: actions/upload-artifact@v4
         with:

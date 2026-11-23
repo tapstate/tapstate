@@ -7,7 +7,6 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 from urllib.request import Request, urlopen
@@ -123,7 +122,7 @@ def stop_expiring_run(repository, performance, now):
                    check=True, timeout=30)
 
 
-def prepare(output, repository, branch, mention_id, *, now=None):
+def prepare(output, repository, branch, *, now=None):
     now = now or datetime.now(timezone.utc)
     recent = (now - timedelta(days=2)).date().isoformat()
     nightlies = api(repository, f"workflows/nightly-test.yml/runs?branch={branch}&event=schedule"
@@ -164,13 +163,10 @@ def prepare(output, repository, branch, mention_id, *, now=None):
     marker = actions_health.observation_marker(health) if settled else previous_marker
     state = {"updated_at": now.isoformat(), "active": next_state, "observation": marker}
     if notices:
-        if (any(not notice.get("recovered") for notice in notices)
-                and (not re.fullmatch(r"[A-Za-z0-9_-]+", mention_id) or mention_id.lower() == "all")):
-            raise ValueError("Configure the verified Feishu recipient ID for performance alerts")
         target = performance or health["nightly"]
         details = (f"https://github.com/{repository}/actions/runs/{target['id']}/attempts/1" if target
                    else f"https://github.com/{repository}/actions/workflows/pipeline-performance.yml")
-        runner.write_json(output / "card.json", notifications.card(health, notices, mention_id, details))
+        runner.write_json(output / "card.json", notifications.card(health, notices, details))
         runner.write_json(output / "next-state.json", state)
     elif marker != previous_marker or now - actions_health.timestamp(previous["updated_at"]) >= timedelta(days=1):
         runner.write_json(output / "state.json", state)
@@ -230,8 +226,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "prepare":
-            prepare(args.output, os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF_NAME"],
-                    os.environ.get("PERFORMANCE_FEISHU_MENTION_ID", ""))
+            prepare(args.output, os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF_NAME"])
         else:
             send(args.output, os.environ.get("PERFORMANCE_FEISHU_WEBHOOK", ""))
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:

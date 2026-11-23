@@ -130,7 +130,7 @@ def elapsed_label(health):
     return f"Elapsed {hours}h {minutes:02d}m" if hours else f"Elapsed {minutes}m"
 
 
-def card(health, updates, mention_id, details_url):
+def card(health, updates, details_url):
     report = health.get("report") or {}
     timing = report.get("workflow", {}).get("timing", {})
     business_source = (health.get("nightly") or {}).get("created_at", health["due_at"])
@@ -139,8 +139,6 @@ def card(health, updates, mention_id, details_url):
     comparison_counts = report.get("comparison_counts", {})
     coverage = report.get("comparison_coverage", {})
     lines = [f"**{date} (UTC+8)** | Scheduled synchronization suite | {elapsed_label(health)}"]
-    if any(not update.get("recovered") for update in updates):
-        lines[0] += f" | <at id={mention_id}></at>"
     if report:
         outcomes = [f"Planned {len(report['selected_ids'])}", f"Completed {case_counts.get('completed', 0)}",
                     f"Failed {case_counts.get('failed', 0)}"]

@@ -145,7 +145,7 @@ class NotificationTest(unittest.TestCase):
         with patch.object(actions_watch, "api", side_effect=query), \
                 patch.object(actions_watch, "artifact", return_value=report) as fetch, \
                 patch.object(actions_watch, "latest_state", return_value=previous):
-            actions_watch.prepare(folder, REPOSITORY, "main", "ou_fixture", now=now)
+            actions_watch.prepare(folder, REPOSITORY, "main", now=now)
         fetch.assert_called_once_with(REPOSITORY, performance, "performance-report-1", "report.json")
 
     def test_mixed_report_and_card_reconcile_to_the_same_attempt(self):
@@ -161,6 +161,7 @@ class NotificationTest(unittest.TestCase):
             self.prepare(output, catalog.read_json(artifact), nightly, performance, now,
                          {"active": {}, "updated_at": now.isoformat()})
             body = catalog.read_json(output / "card.json")
+            self.assertEqual(notifications.CARD_LABEL, body["card"]["header"]["title"]["content"])
             markdown, action = body["card"]["elements"]
             text = markdown["content"]
             summary = actions_report.summary(report, REPOSITORY)
@@ -168,7 +169,7 @@ class NotificationTest(unittest.TestCase):
             self.assertEqual({"suspected-regression": 4, "normal": 1, "observe": 1, "unavailable": 6},
                              report["comparison_counts"])
             self.assertEqual({"comparable": 6, "incomparable": 1, "unavailable": 5}, report["comparison_coverage"])
-            for expected in ("2026-11-22 (UTC+8)", "Elapsed 42m", "<at id=ou_fixture></at>",
+            for expected in ("2026-11-22 (UTC+8)", "Elapsed 42m",
                              "Planned 12 | Completed 7 | Failed 4 | Not run 1",
                              "Comparable 6 | Suspected regressions 4 | Incomparable 1 | Unavailable 5",
                              "batch summary missing or unreadable", f"{CASE_IDS[0]}@1 (basic)",
@@ -224,9 +225,7 @@ class NotificationTest(unittest.TestCase):
                     content = catalog.read_json(output / "card.json")["card"]["elements"][0]["content"]
                     if label == "recovered":
                         self.assertIn("**Recovered** performance cases 1", content)
-                        self.assertNotIn("<at", content)
-                    else:
-                        self.assertIn("<at id=ou_fixture></at>", content)
+                    self.assertNotIn("<at", content)
                     with patch.object(actions_watch, "urlopen", return_value=BytesIO(json.dumps({"code": code}).encode())):
                         if code == 1:
                             with self.assertRaisesRegex(ValueError, "did not accept"):
@@ -357,7 +356,7 @@ class NotificationTest(unittest.TestCase):
                     {"workflow_runs": [new_nightly, old_nightly]}, {"workflow_runs": [new_run, old_run]},
                 ]), patch.object(actions_watch, "artifact", side_effect=lambda _, run, *args: reports[run["id"]]), \
                         patch.object(actions_watch, "latest_state", return_value=state):
-                    actions_watch.prepare(output, REPOSITORY, "main", "ou_fixture", now=now)
+                    actions_watch.prepare(output, REPOSITORY, "main", now=now)
                 outcome = catalog.read_json(output / "health.json")
                 self.assertEqual(expected_run["id"], outcome["performance_run_id"])
                 self.assertEqual(["reported", "performance-expired"],
