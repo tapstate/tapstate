@@ -280,6 +280,7 @@ final class ConvergenceDriver implements AutoCloseable {
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
         PipelineConvergencePass pass = null;
         PipelineActuationOwnership.Pass localPass = null;
+        boolean initialStartAwaitingProof = false;
         try {
             PipelineActuationOwnership.Permit permit;
             if (scoped == null) {
@@ -316,8 +317,10 @@ final class ConvergenceDriver implements AutoCloseable {
                         // Only an accepted actuation attempt consumes priority. Deferred
                         // preparation and a denied permit must still be able to use the slot.
                         if (candidate.startRevision() != 0 && snapshot.get().intentRevision() == candidate.startRevision()
-                                && snapshot.get().desired().targetState() == PipelineState.RUNNING)
+                                && snapshot.get().desired().targetState() == PipelineState.RUNNING) {
+                            initialStartAwaitingProof = isNewStart(candidate);
                             attemptedStarts.merge(pipelineId, candidate.startRevision(), Math::max);
+                        }
                         localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
                         pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
                                 scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
@@ -338,6 +341,7 @@ final class ConvergenceDriver implements AutoCloseable {
             if (scoped != null) alert(() -> scoped.alerts().expecting(originalPass));
             LifecycleActuator actuator = scoped == null ? null : scoped.actuators().apply(pass);
             RebuildAdmission rebuilds = scoped == null ? null : scoped.rebuilds().apply(pass);
+            initialStartAwaitingProof = false;
             ConvergeResult result;
             try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CONVERGE)) {
                 result = scoped == null ? converger.converge(pipelineId)
@@ -384,6 +388,9 @@ final class ConvergenceDriver implements AutoCloseable {
             PipelineDiagnostics.failed(e);
             PipelineConvergencePass failedPass = pass;
             if (scoped != null) alert(() -> scoped.alerts().unavailable(failedPass));
+            // A transient proof lookup did not start the job. Its pending intent still needs the start slot.
+            if (initialStartAwaitingProof && e instanceof TapstateException failure && failure.code() == IoError.STORE_UNAVAILABLE)
+                attemptedStarts.remove(pipelineId, candidate.startRevision());
             // A pass that keeps throwing never reaches publish(), so the read face would stay empty and a
             // permanently broken pipeline would look identical to a slow one. Count the consecutive
             // failures and publish them as an error observation so the failure is observable, not just

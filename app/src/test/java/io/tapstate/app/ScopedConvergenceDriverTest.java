@@ -449,7 +449,18 @@ class ScopedConvergenceDriverTest {
         }
     }
 
+    @Test void aFailedPreActuationProofKeepsTheOriginalStartPriority() throws Exception {
+        assertStartAdmitted(StartProbe.FAILED_PROOF);
+    }
+
+    private enum StartProbe { LOAD, DENIED_PERMIT, FAILED_PROOF }
+
     private void assertStartAdmitted(boolean retryPermit) throws Exception {
+        assertStartAdmitted(retryPermit ? StartProbe.DENIED_PERMIT : StartProbe.LOAD);
+    }
+
+    private void assertStartAdmitted(StartProbe probe) throws Exception {
+        boolean retryPermit = probe != StartProbe.LOAD;
         var old = List.of("old-a", "old-b", "old-c", "old-d");
         var current = new java.util.concurrent.atomic.AtomicReference<>(old);
         var periodic = new java.util.concurrent.CountDownLatch(3);
@@ -460,8 +471,13 @@ class ScopedConvergenceDriverTest {
         var fresh = new PipelineIntentScope("cluster", 1, "cache", "fresh", 1);
         var tries = new java.util.concurrent.atomic.AtomicInteger();
         when(ownership.permit(fresh)).thenAnswer(call -> {
-            if (tries.incrementAndGet() == 1) denied.countDown();
-            else started.countDown();
+            if (tries.incrementAndGet() == 1) {
+                if (probe == StartProbe.FAILED_PROOF) {
+                    var key = new WorkloadClaimKey(fresh.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, fresh.pipelineId());
+                    return new PipelineActuationOwnership.Permit(true, claims.acquire(key, OWNER, 1, Duration.ofSeconds(30)).claim());
+                }
+                denied.countDown();
+            } else started.countDown();
             return PipelineActuationOwnership.Permit.denied();
         });
         var store = mock(PipelineIntentStore.class);
@@ -485,8 +501,16 @@ class ScopedConvergenceDriverTest {
             }
             return Optional.empty();
         });
+        when(ownership.enterPass(fresh)).thenReturn(mock(PipelineActuationOwnership.Pass.class));
         var port = new ConvergenceDriver.ScopedPorts(store, views, () -> {},
-                pass -> { throw new AssertionError("empty intent cannot actuate"); },
+                pass -> {
+                    if (probe == StartProbe.FAILED_PROOF) {
+                        denied.countDown();
+                        throw new io.tapstate.core.common.TapstateException(IoError.STORE_UNAVAILABLE,
+                                Map.of("detail", "initial claim proof unavailable"), null);
+                    }
+                    throw new AssertionError("empty intent cannot actuate");
+                },
                 pass -> RebuildAdmission.never(), ids -> {});
         try (var driver = ConvergenceDriver.scoped(null, mock(ObservationPublisher.class), null,
                 MetricsExport.none(), () -> true, ownership, port)) {
