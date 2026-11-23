@@ -349,7 +349,8 @@ class IndependentCdcRecoveryIT {
             assertThat(priority(fixture.rootTarget(), ROOT, "1"))
                     .as("the full load's newer row survives CDC replay even while Low remains retained")
                     .isEqualTo("High");
-            assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+            assertThat(Await.answered("the reloaded execution's first observation", TIMEOUT,
+                    () -> control.errorCount(ROOT_PIPELINE))).isZero();
         }
     }
 
