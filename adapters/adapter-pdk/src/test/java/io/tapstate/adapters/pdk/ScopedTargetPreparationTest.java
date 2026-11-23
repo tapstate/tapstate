@@ -84,6 +84,74 @@ class ScopedTargetPreparationTest {
                 .prepare(TARGET,TargetTapTable.build(TARGET))).isInstanceOf(TapstateException.class);
         assertThat(calls).isEmpty();assertThat(store.held.revision()).isZero();
     }
+    @Test void openingReceiptMemoRejectsChangedModelsAndRunsTheActiveGuard() throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls);
+        store.complete(store.begin(store.held.input()), new SinkPreparationStore.Result(true));
+        var receipts = binding(store);
+        receipts.requireReady(List.of(TARGET));
+        var active = new AtomicBoolean(true);
+        var preparation = new PdkTargetPreparation("demo", null, functions(calls), OnFullLoad.CLEAR, true,
+                NODE, null, true, PipelineNode.Purpose.SYNC, () -> { if (!active.get()) throw refused(); }, receipts);
+        int before = store.reads;
+        preparation.prepareAtOpen(TARGET, TargetTapTable.build(TARGET));
+        assertThat(store.reads).isEqualTo(before);
+        var changed = new TargetTable(TARGET.name(), List.of(new TargetField("changed", "int", true)));
+        assertThatThrownBy(() -> preparation.prepareAtOpen(changed, TargetTapTable.build(changed)))
+                .isInstanceOf(TapstateException.class);
+        assertThat(store.reads).isEqualTo(before + 1);
+        active.set(false);
+        assertThatThrownBy(() -> preparation.prepareAtOpen(TARGET, TargetTapTable.build(TARGET)))
+                .isInstanceOf(TapstateException.class);
+        assertThat(store.reads).isEqualTo(before + 1);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void aNewOpeningRejectsUnavailableReceiptsAndRuntimePreparationStillReads(boolean missing) throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls);
+        store.complete(store.begin(store.held.input()), new SinkPreparationStore.Result(true));
+        var first = binding(store);
+        first.requireReady(List.of(TARGET));
+        var row = store.held;
+        store.held = new SinkPreparationStore.Snapshot(row.input(), row.operationId(), 1,
+                SinkPreparationStore.Phase.PREPARING, row.originalClaim(), null);
+        SinkPreparationStore unavailable = missing ? org.mockito.Mockito.mock(SinkPreparationStore.class) : store;
+        if (missing) org.mockito.Mockito.when(unavailable.load(org.mockito.ArgumentMatchers.any())).thenThrow(refused());
+        var fresh = new PdkSinkPreparations(unavailable, SCOPE, NODE, PipelineNode.Purpose.SYNC, OnFullLoad.CLEAR, true);
+        var freshPreparation = new PdkTargetPreparation("demo", null, functions(calls), OnFullLoad.CLEAR, true,
+                NODE, null, true, PipelineNode.Purpose.SYNC, () -> {}, fresh);
+        assertThatThrownBy(() -> freshPreparation.prepareAtOpen(TARGET, TargetTapTable.build(TARGET)))
+                .isInstanceOf(TapstateException.class);
+        var runtimePreparation = new PdkTargetPreparation("demo", null, functions(calls), OnFullLoad.CLEAR, true,
+                NODE, null, true, PipelineNode.Purpose.SYNC, () -> {}, first);
+        int before = store.reads;
+        assertThatThrownBy(() -> runtimePreparation.prepareForWrite(TARGET, TargetTapTable.build(TARGET)))
+                .isInstanceOf(TapstateException.class);
+        assertThat(store.reads).isEqualTo(before + 1);
+    }
+
+    @Test void independentWritersReuseOnlyTheirExactOpeningReceipt(@org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls);
+        store.complete(store.begin(store.held.input()), new SinkPreparationStore.Result(true));
+        var opening = new PdkSinkPreparations.OpeningFacts();
+        var ref = new ConnectorRef(List.of(Synthetic.countingSink(directory)), "synthetic.CountingSink", "2.0.8", null);
+        var config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null, NODE, OnFullLoad.CLEAR, true);
+        int before = store.reads;
+        for (int i = 0; i < 4; i++) {
+            var receipts = new PdkSinkPreparations(store, SCOPE, NODE, PipelineNode.Purpose.SYNC, OnFullLoad.CLEAR, true, opening);
+            receipts.requireReady(List.of(TARGET));
+            var connector = PdkConnector.open("demo", ref, Map.of());
+            try (var writer = new PdkSinkWriter(connector, (context, rows, table, result) -> {}, config,
+                    Map.of("known", TARGET), null, true, null, PipelineNode.Purpose.SYNC, receipts)) {
+                writer.prepareTargets();
+            }
+        }
+        assertThat(store.reads - before).isEqualTo(1);
+    }
+
     @Test void sameNamedAliasWithAnotherModelCannotBypassThePreparedMemo()throws Throwable {
         var calls=new ArrayList<String>();var store=new Receipts(calls);var preparation=preparation("mysql",functions(calls),store,() -> {});
         preparation.prepare(TARGET,TargetTapTable.build(TARGET));calls.clear();

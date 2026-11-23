@@ -170,10 +170,16 @@ final class PdkSinkWriter implements SinkWriter {
 
     /** Prepare selected tables even when their source snapshot contains no rows. */
     void prepareTargets() throws Throwable {
+        prepareTargets(true);
+    }
+
+    private void prepareTargets(boolean opening) throws Throwable {
         connector.underLoader(() -> {
             for (Map.Entry<String, TargetTable> entry : targets.entrySet()) {
                 TargetTable target = projectedTarget(entry.getKey(), entry.getValue());
-                preparation.prepare(target, tableModel(entry.getKey(), target));
+                TapTable table = tableModel(entry.getKey(), target);
+                if (opening) preparation.prepareAtOpen(target, table);
+                else preparation.prepare(target, table);
             }
             if (identityConfig != null) {
                 PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities,operationObserver);
@@ -242,7 +248,7 @@ final class PdkSinkWriter implements SinkWriter {
                             "append mode rejects a multi-table batch before any connector write"));
                 }
                 if (!batch.keys().isEmpty()) {
-                    if (!identityPrepared) prepareTargets();
+                    if (!identityPrepared) prepareTargets(false);
                     batch.keys().forEach((stream, keys) -> PdkMongoIdentityGuard.verify(connector, identities.get(stream), keys));
                 }
                 return writeRows(rowsByTable);
