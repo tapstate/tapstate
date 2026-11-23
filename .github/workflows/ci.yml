@@ -1,5 +1,5 @@
 name: CI
-run-name: Pipeline Performance | T5 Copy endpoint latency qualification
+run-name: Pipeline Performance | T5 candidate verification
 
 on:
   workflow_dispatch:
@@ -26,9 +26,109 @@ permissions:
   contents: read
 
 jobs:
+  workflow-fixtures:
+    if: inputs.mode == 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 1c566d5cbe18e90c5fd8aceb875193514e6d95b3
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+      - name: Run performance workflow and comparison fixtures
+        run: python3 -B -m unittest discover -v -s benchmarks/src/test
+
+      - name: Publish mixed report and notification fixture
+        run: |
+          mkdir -p "$RUNNER_TEMP/performance-fixture"
+          PYTHONPATH=benchmarks:benchmarks/src/test python3 -B - <<'PY'
+          import os
+          from pathlib import Path
+          from test_perf_notifications import CASE_IDS, NotificationTest, raw_results, scheduled
+          import actions_health, actions_report, notifications, runner
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          output = Path(os.environ["RUNNER_TEMP"]) / "performance-fixture"
+          nightly, performance, now = scheduled(21)
+          performance["id"] = int(os.environ["GITHUB_RUN_ID"])
+          assert os.environ["GITHUB_RUN_ATTEMPT"] == "1"
+          NotificationTest.setUpClass()
+          samples = dict(zip(CASE_IDS, [(100, 100)] * 4 + [(130, 130)] * 4
+                             + [(99, 100), (115, 118), "incompatible"]))
+          result = raw_results(output / "raw-fixture", nightly, performance, samples,
+                               NotificationTest.cases, failures=True, missing=True)
+          health = actions_health.assess(now, [nightly], [performance], {performance["id"]: result})
+          assert health["status"] == "reported"
+          notices, _ = notifications.changes({}, *notifications.signals(health))
+          url = f"https://github.com/{repo}/actions/runs/{performance['id']}/attempts/1"
+          runner.write_json(output / "report.json", result)
+          runner.write_json(output / "card.json", notifications.card(health, notices, url))
+          (output / "tested-revision.txt").write_text(os.environ["CANDIDATE"] + "\n")
+          summary = actions_report.summary(result, repo)
+          (output / "summary.md").write_text(summary)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as target:
+              target.write("Synthetic mixed-result fixture.\n\n" + summary)
+          PY
+        env:
+          CANDIDATE: 1c566d5cbe18e90c5fd8aceb875193514e6d95b3
+      - uses: actions/upload-artifact@v4
+        id: mixed-report
+        with:
+          name: performance-report-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/performance-fixture
+          if-no-files-found: error
+          retention-days: 90
+      - name: Link the mixed fixture report
+        env:
+          REPORT_URL: ${{ steps.mixed-report.outputs.artifact-url }}
+        run: printf '\n[Download mixed report.json and evidence](%s)\n' "$REPORT_URL" >> "$GITHUB_STEP_SUMMARY"
+
+  prepare-all:
+    if: github.run_attempt == '1' && inputs.mode == 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      batches: ${{ steps.prepare.outputs.batches }}
+      measurement_stop: ${{ steps.prepare.outputs.measurement_stop }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 1c566d5cbe18e90c5fd8aceb875193514e6d95b3
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+      - name: Read the start time for this attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/performance-run.json"
+      - name: Select and allocate formal cases
+        id: prepare
+        run: |
+          python3 -B benchmarks/actions_run.py \
+            --workloads benchmarks/cases/formal-workloads.json \
+            --estimates benchmarks/cases/hosted-runner-estimates.json \
+            --run "$RUNNER_TEMP/performance-run.json" \
+            --output "$RUNNER_TEMP/performance-inputs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-inputs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/performance-inputs
+          if-no-files-found: error
+          retention-days: 90
+
   prepare:
     if: >-
-      github.run_attempt == '1' &&
+      github.run_attempt == '1' && inputs.mode != 'all' &&
       (github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'workflow_run' &&
          github.event.workflow_run.event == 'schedule' &&
@@ -56,37 +156,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/performance-run.json"
-      - name: Allocate a bounded Copy latency qualification case
+      - name: Select and allocate formal cases
         id: prepare
         run: |
-          set -euo pipefail
-          export PERF_INPUT_DIR="$RUNNER_TEMP/performance-inputs"
-          mkdir -p "$PERF_INPUT_DIR"
-          python3 -B - <<'PYTHON'
-          import os
-          from pathlib import Path
-          import sys
-          sys.path.insert(0, 'benchmarks')
-          import actions_run, baseline, catalog, runner
-          output = Path(os.environ['PERF_INPUT_DIR'])
-          attempt = runner.github_attempt()
-          run = catalog.read_json(output.parent / 'performance-run.json')
-          receipt = baseline.pin(output, actions_run.RUNNER_PROFILE)
-          runner.write_json(output / 'baseline-receipt.json', receipt)
-          runner.write_json(output / 'run.json', {'github_attempt': attempt, 'scope': 'qualification',
-                            'baseline_receipt_sha256': catalog.digest(receipt),
-                            'timing': actions_run.run_timing(run, None)})
-          runner.write_json(output.parent / 'qualification-estimates.json', {
-              'environment': actions_run.RUNNER_PROFILE,
-              'durations_seconds': {'copy.live.basic.standard': 480},
-          })
-          PYTHON
-          python3 -B benchmarks/runner.py allocate --id 'copy.live.basic.standard@1' \
-            --rows 1000 --rate 5 --warmup-seconds 10 --measurement-seconds 120 --timeout-seconds 120 \
-            --repeats 1 --environment ubuntu-24.04-x64-op --slots 1 --batch-seconds 1200 \
-            --deadline-seconds 1800 --reserve-seconds 600 --bind-github-attempt \
-            --estimates "$RUNNER_TEMP/qualification-estimates.json" --output "$PERF_INPUT_DIR/manifest.json"
-          printf 'batches=[0]\nmeasurement_stop=%s\n' "$(($(date +%s) + 1800))" >> "$GITHUB_OUTPUT"
+          python3 -B benchmarks/actions_run.py \
+            --workloads benchmarks/cases/formal-workloads.json \
+            --estimates benchmarks/cases/hosted-runner-estimates.json \
+            --run "$RUNNER_TEMP/performance-run.json" \
+            --output "$RUNNER_TEMP/performance-inputs"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
