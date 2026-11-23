@@ -672,18 +672,26 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock,
                 NodeSessionLease node,CloudRuntimeSettings cloud){
             ScopedSinkStateProvider.of(member).observeOperations((run,config,slot,guard,local)->{
-                String sourceId = owner.original.binding().defaultSourceId();
-                var source = owner.configuration.sourceBindingForSinkStartup(sourceId);
-                org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).debug("Target monitoring identity [source={},captured={},connector={},settings={},binding={}]",source.isPresent(),run.source()!=null,
-                        source.map(value->value.source().connector().equals(config.connectorId())).orElse(false),
-                        source.map(value->value.source().config().equals(config.settings())).orElse(false),
-                        source.map(value->run.source()!=null && run.source().matches(value)).orElse(false));
-                return source.filter(s->s.source().connector().equals(config.connectorId())&&s.source().config().equals(config.settings()))
-                        .filter(s->run.source()!=null && run.source().matches(s))
-                        .map(s->signals.source(s,"target:"+run.original().pipelineId()+":"+run.original().scope().stateGeneration()+":"+run.node().nodeId()+":"+run.purpose()+":"+run.original().topologyRevision()+":"+slot,
-                                guard,slot.equals("assessment")?()->{
-                                    owner.memberStorage.requireNode();owner.context.getBean(ExecutionAuthorization.class).requireLocal(run.original());
-                                }:local)).orElse(io.tapstate.spi.capture.SourceOperationObserver.NONE);
+                var dependency = runtime.pipelineGuard(run.original(), guard);
+                boolean transferred = false;
+                try {
+                    String sourceId = owner.original.binding().defaultSourceId();
+                    var source = owner.configuration.sourceBindingForSinkStartup(sourceId);
+                    org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).debug("Target monitoring identity [source={},captured={},connector={},settings={},binding={}]",source.isPresent(),run.source()!=null,
+                            source.map(value->value.source().connector().equals(config.connectorId())).orElse(false),
+                            source.map(value->value.source().config().equals(config.settings())).orElse(false),
+                            source.map(value->run.source()!=null && run.source().matches(value)).orElse(false));
+                    var observer = source.filter(s->s.source().connector().equals(config.connectorId())&&s.source().config().equals(config.settings()))
+                            .filter(s->run.source()!=null && run.source().matches(s))
+                            .map(s->signals.source(s,"target:"+run.original().pipelineId()+":"+run.original().scope().stateGeneration()+":"+run.node().nodeId()+":"+run.purpose()+":"+run.original().topologyRevision()+":"+slot,
+                                    dependency,slot.equals("assessment")?()->{
+                                        owner.memberStorage.requireNode();owner.context.getBean(ExecutionAuthorization.class).requireLocal(run.original());
+                                    }:local)).orElse(io.tapstate.spi.capture.SourceOperationObserver.NONE);
+                    transferred = observer != io.tapstate.spi.capture.SourceOperationObserver.NONE;
+                    return observer;
+                } finally {
+                    if (!transferred) dependency.close();
+                }
             });
             java.util.function.Supplier<AlertNodeLifecycleStore.Registration> registration=()->{
                 owner.memberStorage.requireNode();var committed=membership.committed();
@@ -782,11 +790,21 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean(destroyMethod = "close") ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
-                HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
+                HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster, HazelcastProperties hz,
                 ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,
                 ClusterNodeAlertSource resourceAlerts, ProcessObservationWriter observationWrites, PeriodicObservations periodicObservations,
                 PipelineConvergences pipelineConvergences) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
+            HazelcastOperatorReadiness.bindTerminalRead(member,
+                    original -> !actuator.hasPendingSubmission(original.pipelineId()), owner.memberStorage::requireNode);
+            var nativeRecheck = new NativeStoppedTerminalRecheck(owner.configuration, owner.original.cache(), engine,
+                    plans, operators, owner.memberStorage::requireNode);
+            // Completion receipts belong to this process. A peer may still own asynchronous reporting.
+            StoppedTerminalRecheck stopped = cluster.getProfile() != ClusterProperties.Profile.SINGLE
+                    || hz.getDiscovery().getMode() != HazelcastProperties.DiscoveryMode.NONE ? null :
+                    (intent, checkpoint, original, tenure) -> NativeStoppedTerminalRecheck.localEvidence(member, membership, original)
+                            && nativeRecheck.unchanged(intent, checkpoint, original, tenure)
+                            && NativeStoppedTerminalRecheck.localEvidence(member, membership, original);
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
             if (!(captures instanceof ScopedPipelineCaptureCoordinator scopedCaptures)) throw ThreeLayerStorePort.refused();
@@ -832,7 +850,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                         try (var ignored = ownership.enterPass(intent.scope())) {
                                             rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
                                         }
-                                    }), observationSampling, observationWrites), periodicObservations, pipelineConvergences);
+                                    }), observationSampling, observationWrites, stopped), periodicObservations, pipelineConvergences);
         }
         @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {

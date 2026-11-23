@@ -93,11 +93,20 @@ final class PipelineActuationOwnership {
     private final Map<String, Control> controls = new HashMap<>();
     private final Map<String, ScopedAcquisition> acquisitions = new HashMap<>();
     private final Map<String, PendingRelease> pendingReleases = new HashMap<>();
+    enum StopReleaseStatus { PENDING, CONFIRMED, UNPROVEN }
+    static final class StopRelease {
+        private volatile StopReleaseStatus status = StopReleaseStatus.PENDING;
+        StopReleaseStatus status() { return status; }
+    }
     private static final class PendingRelease {
         private final PipelineIntentScope scope;
         private final WorkloadClaim claim;
+        private final StopRelease terminal;
+        private java.time.Instant deadlineBeforeRelease;
         private boolean inFlight;
-        private PendingRelease(PipelineIntentScope scope, WorkloadClaim claim) { this.scope = scope; this.claim = claim; }
+        private PendingRelease(PipelineIntentScope scope, WorkloadClaim claim, boolean stopped) {
+            this.scope = scope; this.claim = claim; this.terminal = stopped ? new StopRelease() : null;
+        }
     }
     private record ScopedAcquisition(Held previous, Held candidate, WorkloadClaim original) {}
     /** Local scheduling order only; neither a lease deadline nor an authority token. */
@@ -162,6 +171,32 @@ final class PipelineActuationOwnership {
         private final String pipeline;
         private final Thread thread = Thread.currentThread();
         private Pass(String pipeline) { this.pipeline = pipeline; }
+
+        /** Ends only the settled original tenure. Ambiguous release stays registered for readback. */
+        StopRelease relinquishStopped(PipelineIntentScope scope, WorkloadClaimFence expected) {
+            if (Thread.currentThread() != thread || !pipeline.equals(scope.pipelineId()) || !admission.enter()) return null;
+            try {
+                PendingRelease release;
+                synchronized (PipelineActuationOwnership.this) {
+                    var state = held.get(pipeline);
+                    if (closing || !fenced || !accepts(scope) || !membership.businessEligible()
+                            || passes.get(pipeline) != this || controls.containsKey(pipeline) || waitingControls.contains(pipeline)
+                            || acquisitions.containsKey(pipeline) || pendingReleases.containsKey(pipeline) || state == null
+                            || state.executionAdvancing || !scope.equals(state.scope) || state.claim == null
+                            || state.runMembers != null && !state.runMembers.equals(Set.of(owner.nodeId()))
+                            || !owner.equals(expected.owner()) || !expected.equals(WorkloadClaimFence.from(state.claim))) return null;
+                    // A dispatched worker takes this lease by CAS. Never race an in-flight renewal.
+                    var lease = state.scopedLease.get();
+                    if (lease != null && (lease.inFlight() || lease.lost() || !state.scopedLease.compareAndSet(lease, null))) return null;
+                    release = new PendingRelease(scope, state.claim, true);
+                    pendingReleases.put(pipeline, release);
+                    held.remove(pipeline, state);
+                }
+                releasePending(release);
+                return release.terminal;
+            } finally { admission.leave(); }
+        }
+
         @Override public void close() {
             synchronized (PipelineActuationOwnership.this) {
                 passes.remove(pipeline, this);
@@ -514,9 +549,21 @@ final class PipelineActuationOwnership {
         var local = held.get(scope.pipelineId());
         if (local != null && scope.equals(local.scope) && local.claim != null
                 && WorkloadClaimFence.from(local.claim).equals(WorkloadClaimFence.from(claim))) return null;
-        var pending = new PendingRelease(scope, claim);
+        var pending = new PendingRelease(scope, claim, false);
         pendingReleases.put(scope.pipelineId(), pending);
         return pending;
+    }
+
+    /** Retries an ambiguous release on this pipeline's worker, never on a peer's startup path. */
+    boolean finishStoppedRelease(String pipeline) {
+        PendingRelease pending;
+        synchronized (this) { pending = pendingReleases.get(pipeline); }
+        if (pending == null || pending.terminal == null) return true;
+        if (!admission.enter()) return false;
+        try {
+            releasePending(pending);
+            synchronized (this) { return !pendingReleases.containsKey(pipeline); }
+        } finally { admission.leave(); }
     }
 
     private void releasePending(PendingRelease pending) {
@@ -526,13 +573,29 @@ final class PipelineActuationOwnership {
             pending.inFlight = true;
         }
         boolean released = false;
+        boolean confirmedStop = false;
         try {
             var expected = WorkloadClaimFence.from(pending.claim);
             var stored = claims.readPipelineForRelease(pending.scope);
             if (closing || !admission.current() || !membership.businessEligible()) return;
-            released = stored.isEmpty() || !stored.orElseThrow().leased()
-                    || !expected.equals(WorkloadClaimFence.from(stored.orElseThrow().claim()));
-            if (!released) released = claims.release(pending.claim);
+            boolean same = stored.isPresent() && expected.equals(WorkloadClaimFence.from(stored.orElseThrow().claim()));
+            released = !same || !stored.orElseThrow().leased();
+            if (released && same && pending.terminal != null && pending.deadlineBeforeRelease != null) {
+                // A naturally expired lease keeps its original server deadline.
+                confirmedStop = stored.orElseThrow().claim().leaseUntil().isBefore(pending.deadlineBeforeRelease);
+            }
+            if (!released) {
+                if (pending.terminal != null) pending.deadlineBeforeRelease = stored.orElseThrow().claim().leaseUntil();
+                if (claims.release(pending.claim)) {
+                    if (pending.terminal == null) released = true;
+                    else {
+                        var after = claims.readPipelineForRelease(pending.scope);
+                        boolean original = after.isPresent() && expected.equals(WorkloadClaimFence.from(after.orElseThrow().claim()));
+                        released = !original || !after.orElseThrow().leased();
+                        confirmedStop = original && released;
+                    }
+                }
+            }
             if (closing || !admission.current() || !membership.businessEligible()) released = false;
         } catch (TapstateException refused) {
             // A definitive refusal of this physical scope cannot authorize a write to its successor.
@@ -543,7 +606,15 @@ final class PipelineActuationOwnership {
         } finally {
             synchronized (this) {
                 pending.inFlight = false;
-                if (released) pendingReleases.remove(pending.scope.pipelineId(), pending);
+                if (released) {
+                    if (pending.terminal != null) {
+                        pending.terminal.status = confirmedStop ? StopReleaseStatus.CONFIRMED : StopReleaseStatus.UNPROVEN;
+                        if (confirmedStop) LOG.log(System.Logger.Level.DEBUG,
+                                "Confirmed stopped Pipeline lease release {0}, claim={1}, execution={2}",
+                                pending.scope.pipelineId(), pending.claim.claimGeneration(), pending.claim.executionGeneration());
+                    }
+                    pendingReleases.remove(pending.scope.pipelineId(), pending);
+                }
             }
         }
     }
@@ -1664,7 +1735,10 @@ final class PipelineActuationOwnership {
             try {
                 if (admission.current()) {
                     List<PendingRelease> pending;
-                    synchronized (this) { pending = List.copyOf(pendingReleases.values()); }
+                    synchronized (this) {
+                        pending = pendingReleases.values().stream()
+                                .filter(item -> item.terminal == null || !pipelineIds.contains(item.scope.pipelineId())).toList();
+                    }
                     pending.forEach(this::releasePending);
                     retainOwned(pipelineIds);
                 }

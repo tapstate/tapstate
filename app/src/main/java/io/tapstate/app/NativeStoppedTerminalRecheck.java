@@ -25,6 +25,16 @@ final class NativeStoppedTerminalRecheck implements StoppedTerminalRecheck {
         this.operators = Objects.requireNonNull(operators); this.active = Objects.requireNonNull(active);
     }
 
+    static boolean localEvidence(com.hazelcast.core.HazelcastInstance member, ClusterMembershipGate membership,
+            io.tapstate.spi.store.WorkloadClaimFence original) {
+        var committed = membership.committed();
+        if (committed == null || !committed.clusterId().equals(original.key().clusterId()) || committed.revision() != original.topologyRevision()
+                || !committed.activeNodeIds().equals(java.util.Set.of(original.owner().nodeId()))) return false;
+        var data = member.getCluster().getMembers().stream().filter(candidate -> !candidate.isLiteMember()).toList();
+        return data.size() == 1 && data.getFirst().localMember()
+                && original.owner().nodeId().equals(ClusterMembershipGate.stableIdOf(data.getFirst()));
+    }
+
     @Override public boolean unchanged(PipelineIntentSnapshot processed, CheckpointDoc checkpoint,
             WorkloadClaimFence original, Tenure tenure) {
         Objects.requireNonNull(processed); Objects.requireNonNull(checkpoint); Objects.requireNonNull(original); Objects.requireNonNull(tenure);

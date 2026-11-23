@@ -121,6 +121,9 @@ class PipelineStopConvergenceTest {
                 driver.reconcile();
                 return stopped(scopedState, ids) && (blockedAt != Hold.PURGE_CLOSE || cleared.size() == 100);
             });
+            // A durable STOPPED state can precede the tail of its worker. Let all submitted
+            // operations return before the fixture closes the executor.
+            await().atMost(Duration.ofSeconds(7)).until(() -> ids.stream().noneMatch(work::stopping));
             assertThat(calls).hasSize(100).allSatisfy((id, count) -> assertThat(count).hasValue(1));
             verify(actuator, times(blockedAt == Hold.PURGE_CLOSE ? 100 : 0)).clearStopped(anyString());
         }

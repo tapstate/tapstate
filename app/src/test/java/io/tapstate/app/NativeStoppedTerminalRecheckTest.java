@@ -61,6 +61,25 @@ class NativeStoppedTerminalRecheckTest {
         verifyNoMoreInteractions(f.cache, f.intents, f.operators);
     }
 
+    @Test void localCompletionReceiptsCannotAuthorizeRemoteTenuresOrAChangedTopology() {
+        var member = mock(com.hazelcast.core.HazelcastInstance.class, org.mockito.Mockito.RETURNS_DEEP_STUBS);
+        var local = mock(com.hazelcast.cluster.Member.class);
+        var remote = mock(com.hazelcast.cluster.Member.class);
+        var membership = mock(ClusterMembershipGate.class);
+        var claim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "p"),
+                new WorkloadOwner("node", "boot"), 1, 1, 1);
+        when(local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE)).thenReturn("node");
+        when(local.localMember()).thenReturn(true);
+        when(member.getCluster().getMembers()).thenReturn(java.util.Set.of(local));
+        when(membership.committed()).thenReturn(new io.tapstate.spi.store.ClusterMembership("cluster", 1, java.util.Set.of("node")));
+        assertThat(NativeStoppedTerminalRecheck.localEvidence(member, membership, claim)).isTrue();
+        when(member.getCluster().getMembers()).thenReturn(java.util.Set.of(local, remote));
+        assertThat(NativeStoppedTerminalRecheck.localEvidence(member, membership, claim)).isFalse();
+        when(member.getCluster().getMembers()).thenReturn(java.util.Set.of(local));
+        when(membership.committed()).thenReturn(new io.tapstate.spi.store.ClusterMembership("cluster", 2, java.util.Set.of("node")));
+        assertThat(NativeStoppedTerminalRecheck.localEvidence(member, membership, claim)).isFalse();
+    }
+
     @Test void aNewRunOrSameTargetNewStopRevisionCannotReuseTheProcessedStop() {
         for (var state : List.of(PipelineState.RUNNING, PipelineState.STOPPED)) {
             var f = new Fixture();

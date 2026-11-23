@@ -84,6 +84,8 @@ class ClaimExpiryIsNeverDecidedByANodeClockTest {
         var auditedReads = Map.of(
                 ownership + ".permit(java.lang.String, " + ownership + "$Held, boolean)", 3L,
                 ownership + ".renewScoped(" + ownership + "$Held, long)", 4L,
+                // A lost Stop release reply is resolved by a shortened server deadline on the same fence.
+                ownership + ".releasePending(" + ownership + "$PendingRelease)", 2L,
                 // Confirmation compares two server deadlines for an extension of the same node lease.
                 "io.tapstate.app.NodeSessionLease.confirm(io.tapstate.app.NodeSessionLease$Proof, long, long)", 2L,
                 ownership + ".advanceScopedProof(" + ownership + "$Held, " + claim + ")", 2L,

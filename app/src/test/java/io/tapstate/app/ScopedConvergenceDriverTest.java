@@ -83,6 +83,7 @@ class ScopedConvergenceDriverTest {
     private PeriodicObservations periodicObservations;
     private NativeObservationSampling nativeSampling;
     private ProcessObservationWriter observationWrites;
+    private StoppedTerminalRecheck stoppedRecheck;
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -113,7 +114,7 @@ class ScopedConvergenceDriverTest {
                     pendingCleanup=false; carrying.set(false);
                 }
             };
-        }, pass -> rebuildPolicy, ids -> retained.add(List.copyOf(ids)), alertFeed, deferredStart, null, nativeSampling, observationWrites);
+        }, pass -> rebuildPolicy, ids -> retained.add(List.copyOf(ids)), alertFeed, deferredStart, null, nativeSampling, observationWrites, stoppedRecheck);
         StateStore poisonState = mock(StateStore.class, call -> { throw new AssertionError("unscoped state accessed"); });
         ObservationStore poisonObservations = mock(ObservationStore.class, call -> { throw new AssertionError("unscoped observation accessed"); });
         var poisonDesired = mock(io.tapstate.spi.store.DesiredStore.class,
@@ -185,6 +186,72 @@ class ScopedConvergenceDriverTest {
             assertThat(carrying).isTrue();
             assertThat(views.observations(FIRST).read("orders")).get()
                     .extracting(Observation::state).isEqualTo(PipelineState.RUNNING);
+        }
+    }
+
+    private static TerminalPublication.Receipt receipt(java.util.concurrent.atomic.AtomicReference<TerminalPublication.Status> state) {
+        return new TerminalPublication.Receipt() {
+            public TerminalPublication.Status status() { return state.get(); }
+            public boolean seal() { return state.get() == TerminalPublication.Status.COMPLETE; }
+        };
+    }
+
+    @Test void stoppedTenureWaitsForHistoryAndAlertsAndDoesNotReacquireForAnUnchangedIntent() throws Exception {
+        var history = new java.util.concurrent.atomic.AtomicReference<>(TerminalPublication.Status.PENDING);
+        var alerts = new java.util.concurrent.atomic.AtomicReference<>(TerminalPublication.Status.PENDING);
+        var rechecks = new java.util.concurrent.CopyOnWriteArrayList<StoppedTerminalRecheck.Tenure>();
+        stoppedRecheck = (processed, checkpoint, original, tenure) -> {
+            assertThat(processed).isEqualTo(intents.snapshot);
+            assertThat(checkpoint.pipelineId()).isEqualTo(FIRST.pipelineId());
+            rechecks.add(tenure);
+            return true;
+        };
+        observationWrites = mock(ProcessObservationWriter.class);
+        org.mockito.Mockito.doAnswer(call -> { call.<Runnable>getArgument(1).run(); return null; })
+                .when(observationWrites).now(any(), any());
+        when(observationWrites.terminalHistory(any(), org.mockito.ArgumentMatchers.nullable(ProcessObservationWriter.History.class)))
+                .thenReturn(receipt(history));
+        alertFeed = mock(PipelineAlertFeed.class);
+        when(alertFeed.terminalPublished(any(), any(), any(), org.mockito.ArgumentMatchers.isNull(), org.mockito.ArgumentMatchers.anyBoolean()))
+                .thenReturn(receipt(alerts));
+        nativeSampling = mock(NativeObservationSampling.class);
+        when(ownership.finishStoppedRelease("orders")).thenReturn(true);
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4, new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var workers = new PipelineConvergences(1, 2)) {
+            pipelineConvergences = workers;
+            try (var driver = driver()) {
+                var local = mock(PipelineActuationOwnership.Pass.class);
+                when(ownership.enterPass(FIRST)).thenReturn(local);
+                var release = mock(PipelineActuationOwnership.StopRelease.class);
+                when(release.status()).thenReturn(PipelineActuationOwnership.StopReleaseStatus.CONFIRMED);
+                when(local.relinquishStopped(eq(FIRST), any())).thenReturn(release);
+                driver.reconcile();
+                org.awaitility.Awaitility.await().untilAsserted(() -> verify(observationWrites).terminalHistory(
+                        any(), org.mockito.ArgumentMatchers.nullable(ProcessObservationWriter.History.class)));
+                org.awaitility.Awaitility.await().until(() -> !workers.stopping("orders"));
+                int fullReads = intents.loads;
+                history.set(TerminalPublication.Status.COMPLETE);
+                nanoTime.set(Duration.ofSeconds(31).toNanos());
+                driver.schedule();
+                org.awaitility.Awaitility.await().until(() -> !rechecks.isEmpty() && !workers.stopping("orders"));
+                verify(local, never()).relinquishStopped(any(), any());
+                alerts.set(TerminalPublication.Status.COMPLETE);
+                driver.schedule();
+                org.awaitility.Awaitility.await().untilAsserted(() -> verify(local).relinquishStopped(eq(FIRST), any()));
+                org.awaitility.Awaitility.await().until(() -> !workers.stopping("orders"));
+                nanoTime.addAndGet(Duration.ofSeconds(31).toNanos());
+                driver.schedule();
+                org.awaitility.Awaitility.await().until(() -> rechecks.contains(StoppedTerminalRecheck.Tenure.ENDED) && !workers.stopping("orders"));
+                assertThat(intents.loads).isEqualTo(fullReads);
+                verify(observationWrites, times(1)).terminalHistory(any(), org.mockito.ArgumentMatchers.nullable(ProcessObservationWriter.History.class));
+                // A new explicit Stop is a new intent even when its desired state stays STOPPED.
+                intents.snapshot = new PipelineIntentSnapshot(FIRST, 5, new DesiredState("orders", PipelineState.STOPPED, "original"));
+                driver.schedule();
+                org.awaitility.Awaitility.await().until(() -> intents.loads > fullReads && !workers.stopping("orders"));
+                intents.snapshot = new PipelineIntentSnapshot(FIRST, 6, new DesiredState("orders", PipelineState.RUNNING, "original"));
+                scheduledPass(driver);
+                assertThat(carrying).isTrue();
+            }
         }
     }
 
