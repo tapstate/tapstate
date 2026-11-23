@@ -338,14 +338,7 @@ final class ConvergenceDriver {
             PipelineConvergencePass originalPass = pass;
             if (scoped != null) alert(() -> scoped.alerts().expecting(originalPass));
             ConvergeResult result = scoped == null ? converger.converge(pipelineId)
-                    : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
-                            scoped.rebuilds().apply(pass), ignored -> {
-                                discardPeriodic(pipelineId);
-                                writeObservationNow(pipelineId, () -> publisher.publishScoped(originalPass.scope(),
-                                        originalPass.state(), originalPass.observationSample(), null));
-                            },
-                            () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent(),
-                            stopOperation);
+                    : convergeScoped(originalPass, stopOperation);
             if (result.status() == ConvergeStatus.RECOVERING) return;
             if (periodicObservations != null && result.status() == ConvergeStatus.CONVERGED
                     && result.checkpoint().filter(checkpoint ->
@@ -406,6 +399,23 @@ final class ConvergenceDriver {
             MDC.remove(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY);
             MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
         }
+    }
+
+    private ConvergeResult convergeScoped(PipelineConvergencePass pass, boolean stopOperation) {
+        String pipelineId = pass.scope().pipelineId();
+        var state = pass.state();
+        var actuator = scoped.actuators().apply(pass);
+        var rebuilds = scoped.rebuilds().apply(pass);
+        Consumer<String> beforeCompletion = ignored -> {
+            discardPeriodic(pipelineId);
+            writeObservationNow(pipelineId, () -> publisher.publishScoped(pass.scope(),
+                    pass.state(), pass.observationSample(), null));
+        };
+        BooleanSupplier currentIntent = () -> scoped.intents().loadForActuation(pipelineId)
+                .filter(pass.intent()::equals).isPresent();
+        if (stopOperation) return converger.convergeScoped(pass.intent(), state, actuator, rebuilds,
+                beforeCompletion, currentIntent, true);
+        return converger.convergeScoped(pass.intent(), state, actuator, rebuilds, beforeCompletion, currentIntent);
     }
 
     private void writeObservationNow(String pipelineId, Runnable publication) {

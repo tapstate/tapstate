@@ -255,43 +255,42 @@ class PipelineDirectPreparationIT {
                 assertThat(stores.chains().load(chain).orElseThrow().checkpoint()).isNotNull();
                 var prepared=f.configuration.capturePreparations().read(f.business(),io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain)).orElseThrow();
                 var captureKey=new WorkloadClaimKey(f.business().clusterId(),WorkloadClaimType.CAPTURE,prepared.captureId());
-                synchronized(coordinator) {
-                    // Remove only these model bodies; all original control and private history remains authoritative.
-                    var bodies=f.cacheDatabase.getCollection("srs_models").find(new Document("_id.chain",chain)).into(new ArrayList<>());
-                    assertThat(bodies).hasSize(2);
-                    for(var body:bodies)assertThat(f.cacheDatabase.getCollection("srs_models").deleteOne(new Document("_id",body.get("_id"))).getDeletedCount()).isOne();
-                    assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
-                    var observed=stores.consumers().inspectSharedRecovery(prepared);assertThat(observed.pipelines().keySet()).containsExactly("flow");
-                    var capture=claims.read(captureKey).orElseThrow();assertThat(capture.leased()).isTrue();
-                    if(missingControls) {
-                        var offsets=f.cacheDatabase.getCollection("srs_consumer_offsets");
-                        var offset=offsets.find(new Document("_id.chain",chain)).first();assertThat(offset).isNotNull();
-                        assertThat(offsets.deleteOne(new Document("_id",offset.get("_id"))).getDeletedCount()).isOne();
-                        assertThatThrownBy(() -> stores.consumers().inspectSharedRecovery(prepared)).isInstanceOf(TapstateException.class);
-                        var damaged=sharedCleanupControls(f);
-                        assertThatThrownBy(() -> first.stopCapture("flow",false)).isInstanceOf(TapstateException.class);
-                        assertThat(physical.closed).hasValue(0);assertThat(coordinator.hasScope(f.scope)).isTrue();
-                        var retainedClaim=claims.read(captureKey).orElseThrow();
-                        assertThat(retainedClaim.claim()).isEqualTo(capture.claim());assertThat(retainedClaim.leased()).isTrue();
-                        assertThat(sharedCleanupControls(f)).isEqualTo(damaged);
-                        return;
-                    }
-                    var before=sharedCleanupControls(f);
-                    assertThatThrownBy(() -> coordinator.retireShared(prepared,observed.captureFence())).isInstanceOf(TapstateException.class);
-                    assertThatThrownBy(() -> coordinator.requireSharedRetired(prepared,observed.captureFence())).isInstanceOf(TapstateException.class);
-                    first.stopCapture("flow",false);
-                    assertThat(physical.closed).hasValue(1);assertThat(first.isCapturing("flow")).isFalse();assertThat(coordinator.hasScope(f.scope)).isFalse();
-                    var ended=claims.read(captureKey).orElseThrow();assertThat(ended.leased()).isFalse();
-                    assertThat(WorkloadClaimFence.from(ended.claim())).isEqualTo(WorkloadClaimFence.from(capture.claim()));
-                    assertThat(ended.claim().executionNodeIds()).isEqualTo(capture.claim().executionNodeIds());
-                    assertThat(sharedCleanupControls(f)).isEqualTo(before);
-                    assertThat(f.cacheDatabase.getCollection("srs_models").countDocuments(new Document("_id.chain",chain))).isZero();
-                    assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
-                    var retained=stores.consumers().inspectSharedRecovery(prepared);
-                    assertThat(retained.consumers()).isEqualTo(observed.consumers());assertThat(retained.captureFence()).isEqualTo(observed.captureFence());
-                    coordinator.retireShared(prepared,retained.captureFence());coordinator.requireSharedRetired(prepared,observed.captureFence());
-                    assertThat(physical.closed).hasValue(1);
+                stopFixtureMaintenance(coordinator);
+                // Remove only these model bodies; all original control and private history remains authoritative.
+                var bodies=f.cacheDatabase.getCollection("srs_models").find(new Document("_id.chain",chain)).into(new ArrayList<>());
+                assertThat(bodies).hasSize(2);
+                for(var body:bodies)assertThat(f.cacheDatabase.getCollection("srs_models").deleteOne(new Document("_id",body.get("_id"))).getDeletedCount()).isOne();
+                assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
+                var observed=stores.consumers().inspectSharedRecovery(prepared);assertThat(observed.pipelines().keySet()).containsExactly("flow");
+                var capture=claims.read(captureKey).orElseThrow();assertThat(capture.leased()).isTrue();
+                if(missingControls) {
+                    var offsets=f.cacheDatabase.getCollection("srs_consumer_offsets");
+                    var offset=offsets.find(new Document("_id.chain",chain)).first();assertThat(offset).isNotNull();
+                    assertThat(offsets.deleteOne(new Document("_id",offset.get("_id"))).getDeletedCount()).isOne();
+                    assertThatThrownBy(() -> stores.consumers().inspectSharedRecovery(prepared)).isInstanceOf(TapstateException.class);
+                    var damaged=sharedCleanupControls(f);
+                    assertThatThrownBy(() -> first.stopCapture("flow",false)).isInstanceOf(TapstateException.class);
+                    assertThat(physical.closed).hasValue(0);assertThat(coordinator.hasScope(f.scope)).isTrue();
+                    var retainedClaim=claims.read(captureKey).orElseThrow();
+                    assertThat(retainedClaim.claim()).isEqualTo(capture.claim());assertThat(retainedClaim.leased()).isTrue();
+                    assertThat(sharedCleanupControls(f)).isEqualTo(damaged);
+                    return;
                 }
+                var before=sharedCleanupControls(f);
+                assertThatThrownBy(() -> coordinator.retireShared(prepared,observed.captureFence())).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> coordinator.requireSharedRetired(prepared,observed.captureFence())).isInstanceOf(TapstateException.class);
+                first.stopCapture("flow",false);
+                assertThat(physical.closed).hasValue(1);assertThat(first.isCapturing("flow")).isFalse();assertThat(coordinator.hasScope(f.scope)).isFalse();
+                var ended=claims.read(captureKey).orElseThrow();assertThat(ended.leased()).isFalse();
+                assertThat(WorkloadClaimFence.from(ended.claim())).isEqualTo(WorkloadClaimFence.from(capture.claim()));
+                assertThat(ended.claim().executionNodeIds()).isEqualTo(capture.claim().executionNodeIds());
+                assertThat(sharedCleanupControls(f)).isEqualTo(before);
+                assertThat(f.cacheDatabase.getCollection("srs_models").countDocuments(new Document("_id.chain",chain))).isZero();
+                assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
+                var retained=stores.consumers().inspectSharedRecovery(prepared);
+                assertThat(retained.consumers()).isEqualTo(observed.consumers());assertThat(retained.captureFence()).isEqualTo(observed.captureFence());
+                coordinator.retireShared(prepared,retained.captureFence());coordinator.requireSharedRetired(prepared,observed.captureFence());
+                assertThat(physical.closed).hasValue(1);
             } finally {member.shutdown();}
         });
     }
@@ -461,52 +460,52 @@ class PipelineDirectPreparationIT {
                 assertCode(() -> firstPhysical.listener.get().onBatch(List.of(Envelope.insert(2,"orders",Map.of("id",99),null)),Optional.of(new SourcePosition("late-closed-tail"))),IoError.CACHE_BUSINESS_FENCED);
                 assertThat(f.cacheDatabase.getCollection("srs_events").countDocuments()).isEqualTo(events);
                 if(!retainedStatus.equals("healthy")) {
-                    synchronized(firstRoot) { synchronized(otherRoot) {
-                        status(f,otherScope,otherFence,retainedStatus.equals("PAUSED")?"PAUSED":"RUNNING");
-                        assertThat(f.cacheDatabase.getCollection("srs_models").deleteMany(new Document("_id.chain",chain)).getDeletedCount()).isPositive();
-                        assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
-                        status(f,f.scope,firstFence,"STOPPED");
-                        // The remote consumer still needs this original physical owner even when model bodies are lost.
-                        var stopped=sharedCleanupControls(f);
-                        first.stopCapture("flow",false);
-                        assertThat(widened.closed).hasValue(0);assertThat(firstRoot.hasScope(f.scope)).isFalse();
-                        assertThat(sharedCleanupControls(f)).isEqualTo(stopped);
-                        var key=new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,
-                                io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain));
-                        assertThat(claims.read(key).orElseThrow().leased()).isTrue();
-                        var prepared=f.configuration.capturePreparations().read(f.business(),key.resourceId()).orElseThrow();
-                        var retained=stores.consumers().inspectSharedRecovery(prepared);
-                        assertThat(retained.pipelines()).containsKeys("flow","other");
-                        assertThatThrownBy(() -> firstRoot.retireShared(prepared,retained.captureFence())).isInstanceOf(TapstateException.class);
+                    stopFixtureMaintenance(firstRoot);
+                    stopFixtureMaintenance(otherRoot);
+                    status(f,otherScope,otherFence,retainedStatus.equals("PAUSED")?"PAUSED":"RUNNING");
+                    assertThat(f.cacheDatabase.getCollection("srs_models").deleteMany(new Document("_id.chain",chain)).getDeletedCount()).isPositive();
+                    assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
+                    status(f,f.scope,firstFence,"STOPPED");
+                    // The remote consumer still needs this original physical owner even when model bodies are lost.
+                    var stopped=sharedCleanupControls(f);
+                    first.stopCapture("flow",false);
+                    assertThat(widened.closed).hasValue(0);assertThat(firstRoot.hasScope(f.scope)).isFalse();
+                    assertThat(sharedCleanupControls(f)).isEqualTo(stopped);
+                    var key=new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,
+                            io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain));
+                    assertThat(claims.read(key).orElseThrow().leased()).isTrue();
+                    var prepared=f.configuration.capturePreparations().read(f.business(),key.resourceId()).orElseThrow();
+                    var retained=stores.consumers().inspectSharedRecovery(prepared);
+                    assertThat(retained.pipelines()).containsKeys("flow","other");
+                    assertThatThrownBy(() -> firstRoot.retireShared(prepared,retained.captureFence())).isInstanceOf(TapstateException.class);
+                    assertThatThrownBy(() -> firstRoot.requireSharedRetired(prepared,retained.captureFence())).isInstanceOf(TapstateException.class);
+                    assertThat(widened.closed).hasValue(0);assertThat(sharedCleanupControls(f)).isEqualTo(stopped);
+                    status(f,otherScope,otherFence,"STOPPED");other.stopCapture("other",false);
+                    var beforeRetirement=sharedCleanupControls(f);
+                    var wrong=new WorkloadClaimFence(key,retained.captureFence().owner(),retained.captureFence().claimGeneration()+1,
+                            retained.captureFence().executionGeneration(),retained.captureFence().topologyRevision());
+                    assertThatThrownBy(() -> firstRoot.retireShared(prepared,wrong)).isInstanceOf(TapstateException.class);
+                    assertThat(widened.closed).hasValue(0);
+                    if(retainedStatus.startsWith("release-")) {
+                        var attempts=new java.util.concurrent.atomic.AtomicInteger();
+                        var unavailable=new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","release response unavailable"),null);
+                        doAnswer(call -> {
+                            if(attempts.incrementAndGet()==1) {
+                                if(retainedStatus.equals("release-after"))call.callRealMethod();
+                                throw unavailable;
+                            }
+                            return call.callRealMethod();
+                        }).when(firstOwnership).release(any());
+                        assertThatThrownBy(() -> firstRoot.retireShared(prepared,retained.captureFence())).isSameAs(unavailable);
                         assertThatThrownBy(() -> firstRoot.requireSharedRetired(prepared,retained.captureFence())).isInstanceOf(TapstateException.class);
-                        assertThat(widened.closed).hasValue(0);assertThat(sharedCleanupControls(f)).isEqualTo(stopped);
-                        status(f,otherScope,otherFence,"STOPPED");other.stopCapture("other",false);
-                        var beforeRetirement=sharedCleanupControls(f);
-                        var wrong=new WorkloadClaimFence(key,retained.captureFence().owner(),retained.captureFence().claimGeneration()+1,
-                                retained.captureFence().executionGeneration(),retained.captureFence().topologyRevision());
-                        assertThatThrownBy(() -> firstRoot.retireShared(prepared,wrong)).isInstanceOf(TapstateException.class);
-                        assertThat(widened.closed).hasValue(0);
-                        if(retainedStatus.startsWith("release-")) {
-                            var attempts=new java.util.concurrent.atomic.AtomicInteger();
-                            var unavailable=new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","release response unavailable"),null);
-                            doAnswer(call -> {
-                                if(attempts.incrementAndGet()==1) {
-                                    if(retainedStatus.equals("release-after"))call.callRealMethod();
-                                    throw unavailable;
-                                }
-                                return call.callRealMethod();
-                            }).when(firstOwnership).release(any());
-                            assertThatThrownBy(() -> firstRoot.retireShared(prepared,retained.captureFence())).isSameAs(unavailable);
-                            assertThatThrownBy(() -> firstRoot.requireSharedRetired(prepared,retained.captureFence())).isInstanceOf(TapstateException.class);
-                            assertThat(widened.closed).hasValue(1);
-                            assertThat(claims.read(key).orElseThrow().leased()).isEqualTo(retainedStatus.equals("release-before"));
-                            assertThat(sharedCleanupControls(f)).isEqualTo(beforeRetirement);
-                        }
-                        firstRoot.retireShared(prepared,retained.captureFence());firstRoot.requireSharedRetired(prepared,retained.captureFence());
-                        assertThat(widened.closed).hasValue(1);var ended=claims.read(key).orElseThrow();assertThat(ended.leased()).isFalse();
-                        assertThat(WorkloadClaimFence.from(ended.claim())).isEqualTo(retained.captureFence());
+                        assertThat(widened.closed).hasValue(1);
+                        assertThat(claims.read(key).orElseThrow().leased()).isEqualTo(retainedStatus.equals("release-before"));
                         assertThat(sharedCleanupControls(f)).isEqualTo(beforeRetirement);
-                    } }
+                    }
+                    firstRoot.retireShared(prepared,retained.captureFence());firstRoot.requireSharedRetired(prepared,retained.captureFence());
+                    assertThat(widened.closed).hasValue(1);var ended=claims.read(key).orElseThrow();assertThat(ended.leased()).isFalse();
+                    assertThat(WorkloadClaimFence.from(ended.claim())).isEqualTo(retained.captureFence());
+                    assertThat(sharedCleanupControls(f)).isEqualTo(beforeRetirement);
                     return;
                 }
                 status(f,f.scope,firstFence,"STOPPED");first.stopCapture("flow",false);assertThat(widened.closed).hasValue(0);
@@ -526,6 +525,16 @@ class PipelineDirectPreparationIT {
             assertThat(f.configDatabase.getCollection("capture_preparations").countDocuments()).isOne();
         });
     }
+    private static void stopFixtureMaintenance(ScopedPipelineCaptureCoordinator coordinator) throws Exception {
+        for (String fieldName : List.of("maintenance", "ownerOperations")) {
+            var field = ScopedPipelineCaptureCoordinator.class.getDeclaredField(fieldName);
+            field.setAccessible(true);
+            var worker = (java.util.concurrent.ExecutorService) field.get(coordinator);
+            worker.shutdown();
+            assertThat(worker.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
     private static void status(Fixture f,PipelineIntentScope scope,WorkloadClaimFence original,String status) {
         var states=f.cache.pipelineStates(scope,original,ACTIVE);var prior=states.read(scope.pipelineId()).orElseThrow();
         assertThat(states.compareAndSwap(scope.pipelineId(),prior.epoch(),status,CLOCK.instant())).isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
