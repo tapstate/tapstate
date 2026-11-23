@@ -411,7 +411,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                         new Document("$limit", 2), new Document("$project", bindingFields),
                         new Document("$project", new Document("value", MongoStartConfigRead.boundedValue()))))));
         stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_SETUP, "setup", SINGLETON_ID));
-        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_RECOVERY, "recovery", SINGLETON_ID));
+        stages.add(MongoStartConfigRead.boundedSingleton(SystemCollections.STORAGE_RECOVERY, "recovery"));
     }
 
     record AdmittedFacts(Optional<CachePreparation> preparation, Document version) {}

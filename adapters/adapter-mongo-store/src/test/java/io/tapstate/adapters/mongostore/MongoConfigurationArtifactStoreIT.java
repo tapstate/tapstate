@@ -129,6 +129,33 @@ class MongoConfigurationArtifactStoreIT {
         });
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"admitted", "captured-start"})
+    void positiveConfigurationHelpersRejectAnExtraRecoveryRecord(String entry) {
+        withBound((domain, database) -> {
+            var input=source("src","input");
+            var flow=(io.tapstate.core.model.PipelineResource)PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: src\n");
+            domain.artifacts().saveAll(List.of(input,flow));
+            var original=SystemCollections.STORAGE_RECOVERY.on(database).find().first();
+            SystemCollections.STORAGE_RECOVERY.on(database).insertOne(new Document("_id","unexpected"));
+            String material=SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var ciphers=SourceConfigCipherProvider.fixed(new SourceConfigCipher(Base64.getUrlDecoder().decode(material)));
+            try(var client=MongoClients.create(MONGO.getReplicaSetUrl());var session=client.startSession()) {
+                var selected=client.getDatabase(database.getName());var bindings=new MongoStorageBindingStore(client,selected,ciphers);
+                assertThatThrownBy(()->session.withTransaction(()->bindings.cachePreparationForTransaction(session)))
+                        .isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                var captured=new MongoConfigurationArtifactStore(client,selected,ciphers);
+                if(entry.equals("admitted")) assertThatThrownBy(()->session.withTransaction(()->bindings.admittedCachePreparation(session)))
+                        .isInstanceOfSatisfying(TapstateException.class,error->{
+                            assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                            assertThat(error.args()).containsEntry("id","storage-recovery").containsEntry("field","cache-identity");
+                        });
+                else assertThat(captured.capturedStartInventory(flow,new io.tapstate.spi.store.CacheBusinessScope(
+                        "cluster-a",1,original.getString("cacheIncarnation")))).isEmpty();
+            }
+        });
+    }
+
     @Test
     void staleDefinitionDependenciesRejectTheWholeMixedConfigurationBatch() {
         withStore((store, database) -> {

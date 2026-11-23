@@ -26,7 +26,7 @@ final class MongoStartConfigRead {
     static void addBinding(List<Document> stages) {
         stages.add(MongoValidationClaimObservation.lookup(SystemCollections.STORAGE_BINDING, "binding", "cluster", null));
         stages.add(MongoValidationClaimObservation.lookup(SystemCollections.STORAGE_SETUP, "setup", "cluster", null));
-        stages.add(MongoValidationClaimObservation.lookup(SystemCollections.STORAGE_RECOVERY, "recovery", "cluster", null));
+        stages.add(boundedSingleton(SystemCollections.STORAGE_RECOVERY, "recovery"));
     }
 
     static void addArtifacts(List<Document> stages, List<String> ids) {
@@ -67,6 +67,14 @@ final class MongoStartConfigRead {
 
     static Document boundedValue() {
         return new Document("$cond", List.of(new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), MAX_INLINE_BYTES)), "$$ROOT", false));
+    }
+
+    /** A singleton proof observes the whole collection, including a second noncanonical row. */
+    static Document boundedSingleton(SystemCollections collection, String field) {
+        return new Document("$lookup", new Document("from", collection.collectionName()).append("as", field)
+                .append("pipeline", List.of(new Document("$limit", 2),
+                        new Document("$project", new Document("_id", 0).append("value", boundedValue())),
+                        new Document("$project", new Document("_id", "$value._id").append("value", 1)))));
     }
 
     static Document boundedLookup(SystemCollections collection, String field, Object id) {

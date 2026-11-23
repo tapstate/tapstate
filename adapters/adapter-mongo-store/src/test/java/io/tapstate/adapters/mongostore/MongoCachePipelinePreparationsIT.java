@@ -194,6 +194,32 @@ class MongoCachePipelinePreparationsIT {
     }
 
     @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"issue", "check", "complete"})
+    void deferredPreparationRejectsAnExtraRecoveryRecord(String phase) {
+        withFixture(f->{
+            var pending=deferredStart(f);var configuration=f.configuration.preparations();
+            FirstPipelineCreation grant=phase.equals("issue")?null:((FirstPipelineCreationResult.Issued)configuration.issueDeferred(pending,f.node)).creation();
+            var reserved=grant==null?null:f.preparations().reserveFirst(grant,TTL);
+            var receipt=phase.equals("complete")?f.preparations().seedDeferred(reserved,configuration,pending,AT):null;
+            SystemCollections.STORAGE_RECOVERY.on(f.configDatabase).insertOne(new Document("_id","unexpected"));
+            var beforeMapping=SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find().into(new ArrayList<>());
+            var beforeCache=f.snapshot();
+            Runnable check=switch(phase){
+                case "issue"->()->configuration.issueDeferred(pending,f.node);
+                case "check"->()->configuration.requireIssuedDeferred(pending,grant.preparation().preparationId());
+                case "complete"->()->configuration.completeDeferred(pending,receipt);
+                default->throw new AssertionError(phase);
+            };
+            assertThatThrownBy(check::run).isInstanceOfSatisfying(TapstateException.class,error->{
+                assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                assertThat(error.args()).containsEntry("id","storage-recovery").containsEntry("field","cache-identity");
+            });
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).find().into(new ArrayList<>())).isEqualTo(beforeMapping);
+            assertThat(f.snapshot()).isEqualTo(beforeCache);
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"issue,revision", "check,revision", "complete,revision",
             "issue,failure", "check,failure", "complete,failure", "issue,replacement", "check,replacement", "complete,replacement",
             "issue,mapping", "check,mapping", "complete,mapping", "issue,reset", "check,reset", "complete,reset"})
