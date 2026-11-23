@@ -29,6 +29,20 @@ permissions:
   contents: read
 
 jobs:
+  reject-rerun:
+    name: Reject performance reruns
+    if: github.run_attempt != '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Direct the operator to a new run
+        run: |
+          message='Performance runs cannot be repeated with Re-run jobs. Use Run workflow to start a new run with the required inputs.'
+          printf '::error::%s\n' "$message"
+          printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
   prepare:
     if: >-
       github.run_attempt == '1' &&
@@ -217,7 +231,8 @@ jobs:
             --inputs "$RUNNER_TEMP/performance-inputs" --artifacts "$RUNNER_TEMP/performance-batches" \
             --output "$RUNNER_TEMP/performance-report" --jobs "$RUNNER_TEMP/performance-jobs.json" \
             --artifact-index "$RUNNER_TEMP/performance-artifacts.json"
-      - uses: actions/upload-artifact@v4
+      - name: Upload the report
+        uses: actions/upload-artifact@v4
         id: report-artifact
         if: always()
         with:

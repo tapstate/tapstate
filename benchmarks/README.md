@@ -140,6 +140,12 @@ retain three cycles with shorter scoring windows and matching idle observations.
 The report artifact `performance-report-<attempt>` includes `report.json` and
 `report.md`. The input and batch artifact names also carry the attempt. Reproduce
 a result with its case version, tested SHA, workload, and environment profile.
+Use **Run workflow** to start a new run for a repeat measurement. **Re-run all
+jobs** can remove the first run's artifacts before the workflow rejects the new
+attempt. If the first report upload succeeded and the report is gone after a
+rerun, the health check records its removal and leaves notification state
+unchanged.
+
 The scheduled health workflow runs from the default branch. It sends through
 the `PERFORMANCE_FEISHU_WEBHOOK` repository Actions secret for the synchronization
 performance bot. The group notification shows run-wide coverage and links to

@@ -27,6 +27,7 @@ def api(repository, path):
 
 HEALTH_PATH = ".github/workflows/pipeline-performance-health.yml"
 ARTIFACT_LIMIT = 16 * 1024 * 1024
+REPORT_NAME = "performance-report-1"
 
 
 def first_attempt(repository, run):
@@ -63,6 +64,15 @@ def artifact(repository, source, name, filename):
             return value if isinstance(value, dict) else {}
     except (BadZipFile, ValueError, UnicodeError):
         return {}
+
+
+def report_removed_after_rerun(repository, run_id):
+    artifacts = api(repository, f"runs/{run_id}/artifacts?name={REPORT_NAME}&per_page=20")["artifacts"]
+    if any(item["name"] == REPORT_NAME for item in artifacts):
+        return False
+    jobs = api(repository, f"runs/{run_id}/attempts/1/jobs?per_page=100")["jobs"]
+    return any(step["name"] == "Upload the report" and step["conclusion"] == "success"
+               for job in jobs if job["name"] == "report" for step in job["steps"])
 
 
 def latest_artifact(repository, branch, name):
@@ -132,14 +142,20 @@ def prepare(output, repository, branch, *, now=None):
                             f"&created=%3E%3D{recent}&per_page=100")["workflow_runs"]
     nightlies = [first_attempt(repository, run) for run in nightlies]
     # The attempt's original status and timestamps survive later reruns of the workflow.
+    rerun_ids = {run["id"] for run in runs if run["run_attempt"] > 1}
     candidates = [first_attempt(repository, run) for run in runs]
     reports = {}
     observed = actions_health.observations(now, nightlies, candidates, reports)
     for observation in observed:
         performance = observation["performance"]
         if observation["status"] == "report-missing":
-            reports[performance["id"]] = artifact(repository, performance, "performance-report-1", "report.json")
+            reports[performance["id"]] = artifact(repository, performance, REPORT_NAME, "report.json")
     observed = actions_health.observations(now, nightlies, candidates, reports)
+    for observation in observed:
+        if observation["status"] == "report-missing":
+            run_id = observation["performance"]["id"]
+            if run_id in rerun_ids and not reports[run_id] and report_removed_after_rerun(repository, run_id):
+                observation["status"] = "report-removed-after-rerun"
     output.mkdir(parents=True)
     runner.write_json(output / "health.json", {"observations": [observe_run(item, now) for item in observed]})
     for observation in observed:
@@ -157,7 +173,8 @@ def prepare(output, repository, branch, *, now=None):
     })
     active, healthy = notifications.signals(health)
     notices, next_state = notifications.changes(previous["active"], active, healthy)
-    settled = health["status"] == "reported" or health["status"] in notifications.WORKFLOW_ANOMALIES
+    settled = (health["status"] in {"reported", "report-removed-after-rerun"}
+               or health["status"] in notifications.WORKFLOW_ANOMALIES)
     marker = actions_health.observation_marker(health) if settled else previous_marker
     state = {"updated_at": now.isoformat(), "active": next_state, "observation": marker}
     if notices:

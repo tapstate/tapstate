@@ -396,6 +396,51 @@ class NotificationTest(unittest.TestCase):
                          actions_health.assess(now - timedelta(minutes=10), [nightly], [], {})["status"])
         self.assertEqual("missing-handoff", actions_health.assess(now, [nightly], [], {})["status"])
 
+    def test_later_attempt_with_removed_report_requires_evidence_of_first_upload(self):
+        nightly, original, now = scheduled(21)
+        later = {**original, "run_attempt": 3}
+        upload = {"name": "Upload the report", "conclusion": "success"}
+        jobs = [{"name": "report", "conclusion": "failure", "steps": [upload]}]
+        active = {"workflow": {"kind": "workflow", "reason": "missing-handoff"}}
+        report_endpoint = f"runs/{original['id']}/artifacts?name=performance-report-1&per_page=20"
+        cases = [
+            ([], jobs, "report-removed-after-rerun"),
+            ([], [{**jobs[0], "steps": [{**upload, "conclusion": "failure"}]}], "report-missing"),
+            ([{"name": "performance-report-1", "expired": True}], jobs, "report-missing"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (artifacts, first_jobs, status) in enumerate(cases):
+                with self.subTest(status=status, inventory=artifacts):
+                    responses = {
+                        f"runs/{original['id']}/attempts/1": original,
+                        report_endpoint: {"artifacts": artifacts},
+                        f"runs/{original['id']}/attempts/1/jobs?per_page=100": {"jobs": first_jobs},
+                    }
+
+                    def query(_, path):
+                        if path.startswith("workflows/nightly"):
+                            return {"workflow_runs": [nightly]}
+                        if path.startswith("workflows/pipeline-performance"):
+                            return {"workflow_runs": [later]}
+                        return responses[path]
+
+                    output = Path(directory) / str(index)
+                    with patch.object(actions_watch, "api", side_effect=query), \
+                            patch.object(actions_watch, "latest_state",
+                                         return_value={"active": active, "updated_at": now.isoformat()}):
+                        actions_watch.prepare(output, REPOSITORY, "main", now=now)
+                    health = catalog.read_json(output / "health.json")
+                    self.assertEqual(status, health["status"])
+                    self.assertEqual(original["id"], health["performance_run_id"])
+                    if status == "report-removed-after-rerun":
+                        self.assertFalse((output / "card.json").exists())
+                        state = catalog.read_json(output / "state.json")
+                        self.assertEqual(active, state["active"])
+                        self.assertEqual(status, state["observation"]["status"])
+                    else:
+                        card = catalog.read_json(output / "card.json")
+                        self.assertIn("Report for this attempt missing", card["card"]["elements"][0]["content"])
+
     def test_artifact_bytes_are_bound_to_original_attempt_and_verified_digest(self):
         _, run, _ = scheduled(21)
         buffer = BytesIO()
