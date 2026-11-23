@@ -593,7 +593,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** Snapshot pins need exact structural bodies and bounds, without adopting newer models or event ranges. */
     void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys) {
-        requireSnapshotReferences(session, keys, (MongoSrsReadFacts) null);
+        requireSnapshotReferences(session, keys, new MongoSrsReadFacts(session, database, scope, false));
     }
 
     void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys, Document verifiedChain) {
