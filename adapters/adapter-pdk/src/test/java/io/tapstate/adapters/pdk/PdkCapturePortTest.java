@@ -959,6 +959,41 @@ class PdkCapturePortTest {
         }
     }
 
+    @Test void aHostDeferredPreflightRetainsItsExactConnectorUntilTheHostClosesIt(@TempDir Path dir) throws Exception {
+        String channel = "preflight-deferred-" + java.util.UUID.randomUUID();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var ended = new CountDownLatch(1);
+        System.getProperties().put(channel + ".entered", entered);
+        System.getProperties().put(channel + ".release", release);
+        System.getProperties().put(channel + ".ended", ended);
+        var provisions = new java.util.concurrent.atomic.AtomicInteger();
+        var ref = new ConnectorRef(List.of(Synthetic.gatedStopSource(dir, channel)), "synthetic.GatedStopSource", "2.0.8", null);
+        var original = new TapstateException(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE,
+                Map.of("chain", "original", "table", "t1", "version", "0"), null);
+        var port = new PdkCapturePort(id -> { provisions.incrementAndGet(); return ref; })
+                .withDeferredPreflightClose(failure -> failure == original)
+                .withStreamPreparation(actual -> { throw original; });
+        try (var callers = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            try {
+                assertThatThrownBy(() -> port.cdc(config("t1"), CaptureStart.present(), (events, position) -> {})).isSameAs(original);
+                assertThat(original.getSuppressed()).isEmpty();
+                assertThat(entered.getCount()).isOne();
+                var closing = callers.submit(port::close);
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(closing).isNotDone();
+                release.countDown();
+                closing.get(5, TimeUnit.SECONDS);
+                assertThat(ended.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(provisions).hasValue(1);
+            } finally {
+                release.countDown();
+                port.close();
+                for (String key : List.of(".entered", ".release", ".ended")) System.getProperties().remove(channel + key);
+            }
+        }
+    }
+
     @Test void aPendingPreflightAlsoFencesSnapshotOpeningsThroughAPreparedClone(@TempDir Path dir) throws Exception {
         String channel="preflight-snapshot-"+java.util.UUID.randomUUID();
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var ended=new CountDownLatch(1);

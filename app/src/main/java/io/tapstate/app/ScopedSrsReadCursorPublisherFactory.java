@@ -23,7 +23,8 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
         var bound = ScopedSrsConsumerAccess.bind(member,run);
         return sequence -> {
             bound.requireClaim(null);
-            if (!bound.store().advanceReadSequence(run.context(),run.membershipRevision(),table,sequence,run.originalClaim())) throw ScopedSrsConsumerAccess.refused(run);
+            boolean committed = bound.store().advanceReadSequence(run.context(),run.membershipRevision(),table,sequence,run.originalClaim());
+            if (!committed) throw ScopedSrsConsumerAccess.refused(run);
         };
     }
     @Override public io.tapstate.runtime.srs.SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {

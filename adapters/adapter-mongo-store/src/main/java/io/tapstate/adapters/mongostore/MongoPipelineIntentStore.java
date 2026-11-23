@@ -219,6 +219,20 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         });
     }
 
+    @Override public Optional<DispatchSnapshot> dispatchSnapshot() {
+        return Optional.of(transaction(session -> {
+            var ids = new ArrayList<String>();
+            var stopping = new java.util.HashSet<String>();
+            for (var row : intents.find(session, new Document("deleted", new Document("$ne", true)))
+                    .projection(new Document("_id", 1).append("targetState", 1))) {
+                if (!(row.get("_id") instanceof String id) || id.isBlank()) throw unreadable();
+                ids.add(id);
+                if (PipelineState.STOPPED.name().equals(row.get("targetState"))) stopping.add(id);
+            }
+            return new DispatchSnapshot(ids, stopping);
+        }));
+    }
+
     @Override public List<String> pipelineIds() {
         return transaction(session -> intents.find(session, new Document("deleted", new Document("$ne", true)))
                 .projection(new Document("_id", 1)).map(row -> {

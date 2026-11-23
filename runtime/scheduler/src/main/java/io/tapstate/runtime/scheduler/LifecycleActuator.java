@@ -38,6 +38,9 @@ public interface LifecycleActuator {
      */
     void stop(String pipelineId, boolean purgeState);
 
+    /** Clears an original execution whose physical stop has already been confirmed. */
+    default void clearStopped(String pipelineId) { stop(pipelineId, true); }
+
     /**
      * The failure of the pipeline's job if it died on its own, or empty while it runs, has no job, or
      * was ended by a stop. This is how the converge loop observes a job that failed after it started:

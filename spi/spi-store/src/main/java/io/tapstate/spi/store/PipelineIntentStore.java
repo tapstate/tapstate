@@ -3,6 +3,7 @@ package io.tapstate.spi.store;
 import io.tapstate.core.lifecycle.DesiredState;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /** Configuration-owned latest intents; cache epochs are meaningful only within the captured scope. */
 public interface PipelineIntentStore {
@@ -52,6 +53,16 @@ public interface PipelineIntentStore {
 
     /** Retains only the next revision and coordinates, and removes the id from the reconcile set. */
     boolean remove(PipelineIntentScope scope, long expectedIntentRevision);
+
+    /** Scheduling hints only; the admitted pass still reads its original intent and proves ownership. */
+    record DispatchSnapshot(List<String> pipelineIds, Set<String> stopping) {
+        public DispatchSnapshot {
+            pipelineIds = List.copyOf(pipelineIds);
+            stopping = Set.copyOf(stopping);
+        }
+    }
+
+    default Optional<DispatchSnapshot> dispatchSnapshot() { return Optional.empty(); }
 
     /** Projects live ids only, without decoding intent bodies. */
     List<String> pipelineIds();
