@@ -21,6 +21,7 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.concurrent.ExecutorService;
@@ -237,7 +238,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
         private volatile long total;
         private volatile String connector;
         private volatile String hash;
-        private volatile InstallationFailure error;
+        private final AtomicReference<InstallationFailure> error = new AtomicReference<>();
         private volatile String pdkApiVersion;
         private volatile boolean newlyRegistered;
 
@@ -271,7 +272,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
         }
 
         private void fail(InstallationFailure failure) {
-            error = failure;
+            error.set(failure);
             phase = "FAILED";
         }
 
@@ -283,7 +284,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
             if (total >= 0) status.put("totalBytes", total);
             if (connector != null) status.put("connectorId", connector);
             if (hash != null) status.put("sha256", hash);
-            var failure = error;
+            var failure = error.get();
             if (failure != null) {
                 status.put("errorCode", failure.code());
                 status.put("failure", failure);
