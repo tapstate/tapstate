@@ -1399,7 +1399,12 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         // Opening publishes this reference once; the tail owns its mutable lifecycle.
         @SuppressWarnings("java:S3077")
         volatile NativeSrsCaptureRunUnit.Tail tail;
-        final Runnable guard=this::require;
+        final Runnable guard = new NativeSrsCaptureRunUnit.RetainedTailOpening() {
+            @Override public void run() { require(); }
+            @Override public boolean retainFailedTail(Throwable failure) {
+                return Thread.holdsLock(ScopedPipelineCaptureCoordinator.this) && !(failure instanceof SrsBaselineModelMismatch);
+            }
+        };
         SourceOperationObserver reports=SourceOperationObserver.NONE;
         volatile boolean ioExitConfirmed;
         Physical(Owner owner){this.owner=owner;}

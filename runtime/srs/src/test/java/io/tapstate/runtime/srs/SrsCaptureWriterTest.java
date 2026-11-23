@@ -338,6 +338,53 @@ class SrsCaptureWriterTest {
         }
     }
 
+    @Test void aFailedTailCloseLeavesAnIndependentNativeOpeningFree() throws Exception {
+        var f = new Fixture();
+        var closeEntered = new java.util.concurrent.CountDownLatch(1);
+        var allowClose = new java.util.concurrent.CountDownLatch(1);
+        var firstFailure = new IllegalStateException("original startup refused");
+        var secondFailure = new IllegalStateException("independent startup reached its own source");
+        class Opening implements CapturePort, AutoCloseable {
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                throw firstFailure;
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) { throw secondFailure; }
+            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new AssertionError(); }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new AssertionError(); }
+            @Override public void close() {
+                closeEntered.countDown();
+                try { assertThat(allowClose.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+            }
+        }
+        try (var unit = new NativeSrsCaptureRunUnit(SCOPE, new SrsStores(f.chains, f.models, SHARED_LOG, unusedConsumers), member);
+                var callers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var blocked = callers.submit(() -> unit.startTail(SCOPE, f.opened, FENCE, f.config(),
+                    CaptureStart.present(), writer -> new Opening(), () -> {}));
+            try {
+                assertThat(closeEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var independent = callers.submit(() -> unit.beginSnapshotOnly(
+                        f.config().at(new io.tapstate.core.model.PipelineNode("independent", "input")), 1,
+                        new CapturePort() {
+                            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) { throw new AssertionError(); }
+                            @Override public CaptureBatch snapshot(CaptureConfig config) { throw secondFailure; }
+                            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new AssertionError(); }
+                            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new AssertionError(); }
+                        }, new CaptureHandoff() {
+                            @Override public void accept(Envelope row) { }
+                            @Override public void loaded(String table) { }
+                        }, () -> {}));
+                assertThatThrownBy(() -> independent.get(1, java.util.concurrent.TimeUnit.SECONDS))
+                        .isInstanceOf(java.util.concurrent.ExecutionException.class).hasCause(secondFailure);
+                assertThat(blocked).isNotDone();
+            } finally { allowClose.countDown(); }
+            assertThatThrownBy(() -> blocked.get(5, java.util.concurrent.TimeUnit.SECONDS)).hasCause(firstFailure);
+        }
+    }
+
     @Test void sampledRecoveryKeepsOriginalBodiesAndPublishesActualNewEpochObservations() {
         var f = new Fixture(); var refs = new TreeMap<String, SrsTableCheckpoint>();
         for (String name : f.actual.keySet()) {

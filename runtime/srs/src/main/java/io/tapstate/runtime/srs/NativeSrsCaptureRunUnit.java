@@ -52,38 +52,55 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         checkpoints.setRemoveOnCancelPolicy(true);
     }
 
+    /** A caller can retain the original failed tail until it leaves its own admission lock. */
+    public interface RetainedTailOpening extends Runnable {
+        boolean retainFailedTail(Throwable failure);
+    }
+
     /** Only a physical CAPTURE owner opens this handle; no Pipeline consumer owns or closes it. */
-    public synchronized Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
+    public Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
             CaptureConfig config,CaptureStart start,Function<SrsCaptureWriter,CapturePort> ports,Runnable requireActive) {
         return startTail(scope, opened, originalCapture, config, start, ports, requireActive, false);
     }
-    public synchronized Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
+    public Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
             CaptureConfig config,CaptureStart start,Function<SrsCaptureWriter,CapturePort> ports,Runnable requireActive, boolean priorCacheHistory) {
         return startTail(scope, opened, originalCapture, config, start, ports, requireActive, priorCacheHistory, false);
     }
 
-    public synchronized Tail startTail(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
+    public Tail startTail(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
             CaptureConfig config, CaptureStart start, Function<SrsCaptureWriter, CapturePort> ports,
             Runnable requireActive, boolean priorCacheHistory, boolean skipEmptyStartupAck) {
-        Runnable fixed = guard(requireActive); fixed.run();
-        var stores = views.srs(scope,fixed);
-        var writer = new SrsCaptureWriter(scope,opened,originalCapture,stores,member,fixed,priorCacheHistory,true);
-        var health = new CaptureHealth(); var owned = new Tail(writer,null,health,requireActive); tails.add(owned);
+        Tail provisional = null;
         try {
-            var port = Objects.requireNonNull(ports.apply(writer),"prepared capture port");
-            if (port instanceof AutoCloseable opening) owned.opening = () -> closeOpening(opening, opened.captureId());
-            var source = observe(config, opened.captureId(), opened.miningChainId(), opened.epoch(), originalCapture,
-                    observation -> writer.start(port,config,start,health,observation));
-            owned.subscription = source; fixed.run();
-            owned.opening = null;
-            boolean awaitingCheckpoint = opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch();
-            owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed), opened.miningChainId(),
-                    opened.epoch(), source, health, fixed, skipEmptyStartupAck && awaitingCheckpoint);
-            fixed.run();
-            owned.checkpointTask = checkpoints.scheduleWithFixedDelay(owned::flushScheduled, 10, 10, TimeUnit.SECONDS);
-            return owned;
+            synchronized (this) {
+                Runnable fixed = guard(requireActive); fixed.run();
+                var stores = views.srs(scope, fixed);
+                var writer = new SrsCaptureWriter(scope, opened, originalCapture, stores, member, fixed, priorCacheHistory, true);
+                var health = new CaptureHealth();
+                var owned = new Tail(writer, null, health, requireActive);
+                provisional = owned;
+                tails.add(owned);
+                var port = Objects.requireNonNull(ports.apply(writer), "prepared capture port");
+                if (port instanceof AutoCloseable opening) owned.opening = () -> closeOpening(opening, opened.captureId());
+                var source = observe(config, opened.captureId(), opened.miningChainId(), opened.epoch(), originalCapture,
+                        observation -> writer.start(port, config, start, health, observation));
+                owned.subscription = source;
+                fixed.run();
+                owned.opening = null;
+                boolean awaitingCheckpoint = opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch();
+                owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed), opened.miningChainId(),
+                        opened.epoch(), source, health, fixed, skipEmptyStartupAck && awaitingCheckpoint);
+                fixed.run();
+                owned.checkpointTask = checkpoints.scheduleWithFixedDelay(owned::flushScheduled, 10, 10, TimeUnit.SECONDS);
+                return owned;
+            }
         } catch (RuntimeException | Error failure) {
-            writer.close(); closeAfter(failure,owned::close); throw failure;
+            if (provisional != null) {
+                provisional.writer.close();
+                if (!(requireActive instanceof RetainedTailOpening retained) || !retained.retainFailedTail(failure))
+                    closeAfter(failure, provisional::close);
+            }
+            throw failure;
         }
     }
 

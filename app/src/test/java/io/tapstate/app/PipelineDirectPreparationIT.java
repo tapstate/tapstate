@@ -513,7 +513,8 @@ class PipelineDirectPreparationIT {
                 widened.listener.get().onBatch(List.of(Envelope.insert(3,"quiet",Map.of("id",3),null)),Optional.of(new SourcePosition("quiet-two")));
                 assertThat(stores.consumers().progress(binding.run().context()).orElseThrow()).isEqualTo(progress);
                 firstRoot.close();assertThat(widened.closed).hasValue(1);
-                awaitNative(() -> !otherPorts.isEmpty());var successor=otherPorts.getFirst();
+                awaitNative(() -> !otherPorts.isEmpty() && otherPorts.getFirst().start.get() != null);
+                var successor = otherPorts.getFirst();
                 assertThat(other.captureFailure("other")).isEmpty();assertThat(successor.start.get()).isEqualTo(CaptureStart.resume(new SourcePosition("quiet-two")));
                 assertThat(stores.chains().load(chain).orElseThrow().epoch()).isEqualTo(3);
                 assertThat(other.captureBindings().logged().get(otherSource.id())).isEqualTo(binding);
