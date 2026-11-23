@@ -89,7 +89,7 @@ final class DeferredSinkAck implements SinkAck {
     }
 
     @Override public void flushOnClose() {
-        if (!failed && authorized.getAsBoolean()) flush(true);
+        if (!failed && authorized.getAsBoolean()) CheckpointWriteAcks.close(() -> flush(true));
     }
 
     private static final class Progress {

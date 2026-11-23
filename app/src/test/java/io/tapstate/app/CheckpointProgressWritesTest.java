@@ -336,6 +336,23 @@ class CheckpointProgressWritesTest {
         }
     }
 
+    @Test void anOutstandingSnapshotBoundaryAlsoHonorsTheCloseDeadline() {
+        var store = successfulStore();
+        try (var writes = manualWrites(1, 8192)) {
+            var bound = bound(store, () -> {});
+            var snapshot = new WriterProgress(SourceOrder.snapshotRow(1), null);
+            var shutdown = new ShutdownAwait();
+            assertThatThrownBy(() -> shutdown.complete(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(250),
+                    () -> CheckpointWriteAcks.close(() -> writes.writer(bound, null, "run", "orders", "writer", snapshot))))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isSameAs(StorageRuntime.unavailable().code()));
+            assertThat(writes.retainedRequests()).isOne();
+            writes.flush();
+            verify(store).advanceWriter(RUN.context(), 4, "run", "orders", "writer", snapshot, FENCE);
+            assertThat(writes.retainedRequests()).isZero();
+        }
+    }
+
     @Test void cancellingAnOfferedReceiptDoesNotDiscardItsAlreadyAdmittedProgress() {
         var store = successfulStore();
         try (var writes = manualWrites(1, 8192)) {

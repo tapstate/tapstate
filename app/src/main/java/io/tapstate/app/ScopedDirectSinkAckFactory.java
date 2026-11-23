@@ -129,6 +129,6 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
             if (complete) receipts.await();
             else receipts.check();
         }
-        @Override public void flushOnClose() { flush(true); }
+        @Override public void flushOnClose() { CheckpointWriteAcks.close(() -> flush(true)); }
     }
 }

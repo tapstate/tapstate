@@ -1,10 +1,14 @@
 package io.tapstate.app;
 
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /** Tracks accepted checkpoint writes for one original sink writer. */
 final class CheckpointWriteAcks {
+    private static final Duration CLOSE_ALLOWANCE = Duration.ofSeconds(20);
+
     private int inFlight;
     private Throwable failure;
 
@@ -29,12 +33,18 @@ final class CheckpointWriteAcks {
     }
 
     synchronized void await() {
+        Long closing = ShutdownAwait.currentDeadline();
         try {
-            while (inFlight != 0 && failure == null) wait();
+            while (inFlight != 0 && failure == null) {
+                if (closing == null) wait();
+                else TimeUnit.NANOSECONDS.timedWait(this, ShutdownAwait.remaining(closing));
+            }
             check();
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw StorageRuntime.unavailable();
         }
     }
+
+    static void close(Runnable flush) { ShutdownAwait.within(CLOSE_ALLOWANCE, flush); }
 }

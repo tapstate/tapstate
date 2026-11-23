@@ -84,6 +84,8 @@ final class CheckpointProgressWrites implements AutoCloseable {
         synchronized (this) {
             if (writers.contains(Thread.currentThread())) throw new IllegalStateException("a progress write cannot wait on its own worker");
         }
+        Long closing = ShutdownAwait.currentDeadline();
+        if (closing != null) return ShutdownAwait.future(completion, closing);
         try { return completion.get(); }
         catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();

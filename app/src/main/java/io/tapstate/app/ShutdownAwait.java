@@ -19,6 +19,25 @@ final class ShutdownAwait {
         return inherited == null ? System.nanoTime() + Duration.ofSeconds(10).toNanos() : inherited;
     }
 
+    static Long currentDeadline() { return DEADLINE.get(); }
+
+    static void within(Duration allowance, Runnable action) {
+        long limit = System.nanoTime() + allowance.toNanos();
+        Long inherited = DEADLINE.get();
+        if (inherited == null || inherited - limit > 0) runWithDeadline(limit, action);
+        else action.run();
+    }
+
+    private static void runWithDeadline(long deadline, Runnable action) {
+        Long previous = DEADLINE.get();
+        DEADLINE.set(deadline);
+        try { action.run(); }
+        finally {
+            if (previous == null) DEADLINE.remove();
+            else DEADLINE.set(previous);
+        }
+    }
+
     static Thread daemon(Runnable task, String name) {
         var thread = new Thread(workerTask(task), name);
         thread.setDaemon(true);
@@ -52,8 +71,8 @@ final class ShutdownAwait {
         }
     }
 
-    static void future(CompletableFuture<?> future, long deadline) {
-        try { future.get(future.isDone()?0:remaining(deadline), TimeUnit.NANOSECONDS); }
+    static <T> T future(CompletableFuture<T> future, long deadline) {
+        try { return future.get(future.isDone()?0:remaining(deadline), TimeUnit.NANOSECONDS); }
         catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();throw StorageRuntime.unavailable();
         } catch (ExecutionException failure) {
@@ -80,19 +99,15 @@ final class ShutdownAwait {
         var proposed = new CompletableFuture<Void>();
         var current = attempt.compareAndExchange(null, proposed);
         if (current == null) {
-            Long previous = DEADLINE.get();
             try {
                 remaining(deadline);
-                DEADLINE.set(deadline);
-                action.run();
+                runWithDeadline(deadline, action);
                 proposed.complete(null);
             } catch (RuntimeException | Error failure) {
                 proposed.completeExceptionally(failure);
                 // A later explicit cleanup attempt keeps the same owners, with a fresh allowance.
                 attempt.compareAndSet(proposed, null);
                 throw failure;
-            } finally {
-                if (previous == null) DEADLINE.remove(); else DEADLINE.set(previous);
             }
         } else {
             try { current.get(current.isDone()?0:remaining(deadline), TimeUnit.NANOSECONDS); }

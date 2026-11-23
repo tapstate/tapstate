@@ -162,6 +162,19 @@ class SinkProcessorTest {
     }
 
     @Test
+    void closes_the_target_when_the_checkpoint_close_wait_fails() throws Exception {
+        var failure = new IllegalStateException("checkpoint close wait expired");
+        var ack = new SinkAck() {
+            @Override public void advance(String chain, ChainPosition position) { }
+            @Override public void flushOnClose() { throw failure; }
+        };
+        var writer = new RecordingWriter();
+        var processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(), 1, 1));
+        assertThatThrownBy(processor::close).isSameAs(failure);
+        assertThat(writer.closes.get()).isEqualTo(1);
+    }
+
+    @Test
     void a_failed_write_propagates_the_cause_not_the_completion_wrapper() throws Exception {
         SinkFailure boom = new SinkFailure("target refused the batch");
         SinkProcessor processor = init(new SinkProcessor(new FailingWriter(boom), 4, 1024));
