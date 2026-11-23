@@ -29,10 +29,17 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     record Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
             BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
-            BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans) {
+            BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans,
+            java.util.function.Predicate<ExecutionFence> capturePreparationLease) {
+        Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
+                BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
+                BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans) {
+            this(operators, releaseHot, rebuild, plans, ignored -> false);
+        }
         Ports {
             Objects.requireNonNull(operators,"operators"); Objects.requireNonNull(releaseHot,"releaseHot");
             Objects.requireNonNull(rebuild,"rebuild"); Objects.requireNonNull(plans,"plans");
+            Objects.requireNonNull(capturePreparationLease,"capturePreparationLease");
         }
     }
     /** At most one unresolved submission per Pipeline in this assembly; no absence is inferred from a timeout. */
@@ -102,6 +109,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                 : ownership.proveClaim(pass.scope(), command);
         if (!proved) throw fenced();
         requireLocal();
+    }
+    /** Preparation may use this process's confirmed lease; later reads and durable writes retain their fences. */
+    private void requireCapturePreparation() {
+        requireLocal();
+        if (original != null && isCurrentRun() && ports.capturePreparationLease().test(original)) {
+            requireLocal();
+            return;
+        }
+        require();
     }
     private void requireEarlier(ExecutionFence fixed) {
         var scope = fixed.scope(); var current = pass.scope();
@@ -198,7 +214,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                         PipelineDiagnostics.measure(id(), Phase.PIPELINE_CAPTURE_INPUTS, prepareCapture));
             }
             try {
-                require();
+                requireCapturePreparation();
                 PipelineDiagnostics.measure(id(), Phase.PIPELINE_CAPTURE_START, () -> {
                     openCapture.run();
                     return null;

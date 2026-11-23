@@ -203,6 +203,19 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         return runtime instanceof PipelineAlertRuntime alerts?Optional.of(alerts.health()):Optional.empty();
     }
 
+    /** A local preparation hint never grants storage or Jet submission authority. */
+    static boolean localCapturePreparationLease(boolean cloud, ClusterProperties.Profile profile,
+            HazelcastProperties.DiscoveryMode discovery, StorageBinding.Mode mode, HazelcastInstance member,
+            ClusterMembershipGate membership, PipelineActuationOwnership ownership, ExecutionFence original) {
+        if (cloud || profile != ClusterProperties.Profile.SINGLE || discovery != HazelcastProperties.DiscoveryMode.NONE
+                || mode != StorageBinding.Mode.OP || original == null || original.scope() == null || original.executionGeneration() < 1) return false;
+        var expected = new WorkloadClaimFence(new WorkloadClaimKey(original.scope().clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, original.pipelineId()),
+                new WorkloadOwner(original.ownerNodeId(), original.ownerBootId()), original.claimGeneration(), original.executionGeneration(), original.topologyRevision());
+        return NativeStoppedTerminalRecheck.localEvidence(member, membership, expected)
+                && original.ownerBootId().equals(member.getCluster().getLocalMember().getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE))
+                && ownership.hasLocalWriterLease(original);
+    }
+
     private void preparePipeline(PipelineIntentScope scope) {
         original.requireBusiness();
         var snapshot = ReadOnlyArtifactSnapshot.capture(context.getBean(ArtifactStore.class));
@@ -793,7 +806,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster, HazelcastProperties hz,
                 ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,
                 ClusterNodeAlertSource resourceAlerts, ProcessObservationWriter observationWrites, PeriodicObservations periodicObservations,
-                PipelineConvergences pipelineConvergences) {
+                PipelineConvergences pipelineConvergences, CloudRuntimeSettings cloud) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             HazelcastOperatorReadiness.bindTerminalRead(member,
                     original -> !actuator.hasPendingSubmission(original.pipelineId()), owner.memberStorage::requireNode);
@@ -824,7 +837,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var ports = new ScopedEngineLifecycleActuator.Ports(operators::prepare, operators::releaseHot,
                     rebuilds::rebuild, (original, command) -> plans.forRun(original, () -> {
                         owner.memberStorage.requireNode(); if (!ownership.proveClaim(original.scope(), command)) throw ThreeLayerStorePort.refused();
-                    }));
+                    }), original -> localCapturePreparationLease(cloud.cloud(), cluster.getProfile(), hz.getDiscovery().getMode(), owner.original.binding().mode(),
+                            member, membership, ownership, original));
             var observationSampling = new NativeObservationSampling(owner.configuration, owner.original.cache(), scopedCaptures,
                     pipeline -> engine.captureRun(pipeline).map(run -> {
                         if (!(run.operatorManifest().executionIdentity() instanceof ExecutionFence original)) throw ThreeLayerStorePort.refused();
