@@ -48,20 +48,24 @@ class BenchmarkLatencyProbeTest {
         var scored = window(observed(UPDATE, DELETE, INSERT));
         var warmup = window(observed(WARMUP));
         var duplicate = new Confirmation(UPDATE, 2_100);
-        var wrongEvent = new Confirmation(new Event(1, 6, 2_000), 2_100);
-        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, List.of(duplicate, duplicate), warmup, scored, 2_000, 3_000, 2_600));
-        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, List.of(wrongEvent), warmup, scored, 2_000, 3_000, 2_600));
-        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, List.of(), warmup,
-                window(observed(DELETE, UPDATE, INSERT)), 2_000, 3_000, 2_600));
-        assertThrows(IllegalArgumentException.class, () -> correlate(observed(WARMUP, UPDATE, UPDATE), List.of(),
-                warmup, window(observed(UPDATE, UPDATE)), 2_000, 3_000, 2_600));
+        var duplicateAcks = List.of(duplicate, duplicate);
+        var unmatchedAck = List.of(new Confirmation(new Event(1, 6, 2_000), 2_100));
+        var earlyAck = List.of(new Confirmation(UPDATE, 1_999));
+        List<Confirmation> noAcks = List.of();
+        var reordered = window(observed(DELETE, UPDATE, INSERT));
+        var duplicateSources = observed(WARMUP, UPDATE, UPDATE);
+        var duplicateScored = window(observed(UPDATE, UPDATE));
         var misorderedWarmup = new Event(1, 5, 3_000);
-        assertThrows(IllegalArgumentException.class, () -> correlate(observed(misorderedWarmup, UPDATE, DELETE, INSERT),
-                List.of(), window(observed(misorderedWarmup)), scored, 2_000, 3_000, 2_600));
-        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, List.of(), warmup, scored,
-                1_500, 2_000, 2_600));
-        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, List.of(new Confirmation(UPDATE, 1_999)),
-                warmup, scored, 2_000, 3_000, 2_600));
+        var misorderedSources = observed(misorderedWarmup, UPDATE, DELETE, INSERT);
+        var misorderedWindow = window(observed(misorderedWarmup));
+
+        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, duplicateAcks, warmup, scored, 2_000, 3_000, 2_600));
+        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, unmatchedAck, warmup, scored, 2_000, 3_000, 2_600));
+        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, noAcks, warmup, reordered, 2_000, 3_000, 2_600));
+        assertThrows(IllegalArgumentException.class, () -> correlate(duplicateSources, noAcks, warmup, duplicateScored, 2_000, 3_000, 2_600));
+        assertThrows(IllegalArgumentException.class, () -> correlate(misorderedSources, noAcks, misorderedWindow, scored, 2_000, 3_000, 2_600));
+        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, noAcks, warmup, scored, 1_500, 2_000, 2_600));
+        assertThrows(IllegalArgumentException.class, () -> correlate(SOURCES, earlyAck, warmup, scored, 2_000, 3_000, 2_600));
     }
 
     @Test

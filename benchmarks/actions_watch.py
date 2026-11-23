@@ -28,6 +28,7 @@ def api(repository, path):
 HEALTH_PATH = ".github/workflows/pipeline-performance-health.yml"
 ARTIFACT_LIMIT = 16 * 1024 * 1024
 REPORT_NAME = "performance-report-1"
+OBSERVATION_ARTIFACT = "performance-health-observation"
 
 
 def first_attempt(repository, run):
@@ -98,7 +99,7 @@ def read_scheduled_report(repository, source, rerun):
     return report, removed
 
 
-def latest_artifact(repository, branch, name):
+def trusted_artifacts(repository, branch, name):
     artifacts = api(repository, f"artifacts?name={name}&per_page=50")["artifacts"]
     candidates = sorted(artifacts, key=artifact_order, reverse=True)
     for candidate in candidates:
@@ -107,8 +108,11 @@ def latest_artifact(repository, branch, name):
             continue
         source = first_attempt(repository, api(repository, f"runs/{reference['id']}"))
         if source["event"] == "schedule" and source["path"] == HEALTH_PATH and attempt_artifact(candidate, source):
-            return candidate, source
-    return None
+            yield candidate, source
+
+
+def latest_artifact(repository, branch, name):
+    return next(trusted_artifacts(repository, branch, name), None)
 
 
 def artifact_order(item):
@@ -136,17 +140,57 @@ def latest_state(repository, branch, now):
         return state_from_intent(proposed)
     # The previous accepted receipt may have survived without its state artifact.
     state = proposed.get("previous", state)
-    pending = dict(proposed.get("pending", state.get("pending", {})))
+    pending = dict(state.get("pending", proposed.get("pending", {})))
     if status != "rejected":
         before, after = state["active"], proposed["active"]
         for key in before.keys() | after.keys():
             if before.get(key) != after.get(key):
-                pending[key] = "alert" if key in after else "recovery"
+                pending[key] = after.get(key)
     return {**state, "pending": pending}
 
 
 def state_from_intent(proposed):
     return {key: value for key, value in proposed.items() if key != "previous"}
+
+
+def previous_budget_cancellations(repository, branch, observations, now):
+    tracked = set()
+    for observation in observations:
+        run = observation["performance"]
+        if not run or not run.get("run_started_at"):
+            continue
+        deadline = actions_health.workflow_deadline(run)
+        if run.get("conclusion") == "cancelled" or (
+                run["status"] != "completed" and now >= deadline - timedelta(seconds=CONTROL_RESERVE_SECONDS)):
+            tracked.add(str(run["id"]))
+    if not tracked:
+        return {}
+    receipts = {}
+    for _, source in trusted_artifacts(repository, branch, OBSERVATION_ARTIFACT):
+        saved = artifact(repository, source, OBSERVATION_ARTIFACT, "health.json")
+        if not saved:
+            raise ValueError(f"Health observation from run {source['id']} could not be read")
+        for run_id, receipt in saved.get("budget_cancellations", {}).items():
+            if run_id in tracked and receipt.get("run_attempt") == 1:
+                receipts.setdefault(run_id, receipt)
+        if not saved.get("cancellation_history_error") or tracked <= receipts.keys():
+            break
+    return receipts
+
+
+def reconcile_pending(previous, active, healthy):
+    confirmed = dict(previous["active"])
+    pending = {}
+    for key, attempted in previous.get("pending", {}).items():
+        if attempted is None or attempted == "recovery":
+            if key in healthy or key in active:
+                # The previous proposal observed recovery. End that incident without resending its card.
+                confirmed.pop(key, None)
+            else:
+                pending[key] = attempted
+        elif key not in healthy or key in active:
+            pending[key] = attempted
+    return confirmed, pending
 
 
 def stop_expiring_run(repository, performance, now):
@@ -173,6 +217,8 @@ def stop_expiring_run(repository, performance, now):
         latest = api(repository, f"runs/{run_id}")
         if latest["run_attempt"] == 1 and latest["status"] != "completed":
             raise ValueError("GitHub returned HTTP 409 and the first attempt is still active") from None
+        return None
+    return {"run_attempt": 1, "requested_at": now.isoformat(), "deadline_at": deadline.isoformat()}
 
 
 def prepare(output, repository, branch, *, now=None):
@@ -187,29 +233,52 @@ def prepare(output, repository, branch, *, now=None):
     rerun_ids = {run["id"] for run in runs if run["run_attempt"] > 1}
     candidates = [first_attempt(repository, run) for run in runs]
     reports, removed_reports = {}, set()
+    report_errors = []
     observed = actions_health.observations(now, nightlies, candidates, reports)
     for observation in observed:
-        if observation["status"] == "report-missing":
-            performance = observation["performance"]
-            run_id = performance["id"]
+        performance = observation["performance"]
+        if observation["status"] not in {"report-missing", "performance-expired"} or performance["status"] != "completed":
+            continue
+        run_id = performance["id"]
+        try:
             reports[run_id], removed = read_scheduled_report(repository, performance, run_id in rerun_ids)
-            if removed:
-                removed_reports.add(run_id)
+        except (OSError, subprocess.SubprocessError) as error:
+            if observation["status"] != "performance-expired":
+                raise
+            report_errors.append({"run_id": run_id, "reason": str(error)})
+            continue
+        if removed:
+            removed_reports.add(run_id)
+
     observed = actions_health.observations(now, nightlies, candidates, reports)
-    for observation in observed:
-        if observation["status"] == "report-missing" and observation["performance"]["id"] in removed_reports:
-            observation["status"] = "report-removed-after-rerun"
+    cancellations = {}
     output.mkdir(parents=True)
-    check = {"observations": [observe_run(item, now) for item in observed], "cancellation_errors": []}
+    check = {"budget_cancellations": cancellations, "cancellation_errors": [], "report_errors": report_errors}
     for observation in observed:
         run = observation["performance"]
         if observation["status"] in {"performance-running", "performance-expired"} and run["status"] != "completed":
             try:
-                stop_expiring_run(repository, run, now)
+                receipt = stop_expiring_run(repository, run, now)
+                if receipt:
+                    cancellations.setdefault(str(run["id"]), receipt)
             except (OSError, subprocess.SubprocessError, ValueError) as error:
                 reason = str(error)
                 check["cancellation_errors"].append({"run_id": run["id"], "reason": reason})
                 print(f"::warning::Cancellation for performance run {run['id']}: {reason}", file=sys.stderr)
+    try:
+        # History supplements current evidence and never precedes deadline enforcement.
+        cancellations.update(previous_budget_cancellations(repository, branch, observed, now))
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        check["cancellation_history_error"] = str(error)
+    for observation in observed:
+        if observation["status"] != "report-missing":
+            continue
+        run = observation["performance"]
+        if run["id"] in removed_reports:
+            observation["status"] = "report-removed-after-rerun"
+        elif run.get("conclusion") == "cancelled" and str(run["id"]) in cancellations:
+            observation["status"] = "performance-budget-cancelled"
+    check["observations"] = [observe_run(item, now) for item in observed]
     runner.write_json(output / "health.json", check)
 
     previous = latest_state(repository, branch, now)
@@ -218,13 +287,11 @@ def prepare(output, repository, branch, *, now=None):
     performance = health["performance"]
     health["observed_at"] = now.isoformat()
     active, healthy = notifications.signals(health)
-    previous_pending = previous.get("pending", {})
-    # A newly observed opposite condition ends this ambiguous delivery transition.
-    pending = {key: direction for key, direction in previous_pending.items()
-               if key not in (healthy if direction == "alert" else active)}
-    notices, next_state = notifications.changes(
-        previous["active"], {key: signal for key, signal in active.items() if key not in pending}, healthy - pending.keys(),
-    )
+    confirmed, pending = reconcile_pending(previous, active, healthy)
+    # An ambiguous card suppresses repeat delivery of its signal, but a material escalation can proceed.
+    eligible = {key: signal for key, signal in active.items()
+                if key not in pending or (isinstance(pending[key], dict) and notifications.escalated(pending[key], signal))}
+    notices, next_state = notifications.changes(confirmed, eligible, healthy - pending.keys())
     runner.write_json(output / "health.json", {**check, **observe_run(health, now), "pending_delivery": pending})
     settled = (health["status"] in {"reported", "report-removed-after-rerun"}
                or health["status"] in notifications.WORKFLOW_ANOMALIES)
@@ -235,8 +302,11 @@ def prepare(output, repository, branch, *, now=None):
         details = (f"https://github.com/{repository}/actions/runs/{target['id']}/attempts/1" if target
                    else f"https://github.com/{repository}/actions/workflows/pipeline-performance.yml")
         runner.write_json(output / "card.json", notifications.card(health, notices, details))
-        runner.write_json(output / "next-state.json", {**state, "previous": previous})
-    elif (marker != previous_marker or pending != previous_pending
+        base = {**previous, "active": confirmed, "pending": pending}
+        accepted_pending = {key: attempted for key, attempted in pending.items()
+                            if next_state.get(key) == confirmed.get(key)}
+        runner.write_json(output / "next-state.json", {**state, "pending": accepted_pending, "previous": base})
+    elif (marker != previous_marker or pending != previous.get("pending", {})
           or now - actions_health.timestamp(previous["updated_at"]) >= timedelta(days=1)):
         runner.write_json(output / "state.json", state)
 

@@ -368,7 +368,8 @@ class ActionsRunTest(unittest.TestCase):
             ([nightly], [], "missing-handoff"),
             ([nightly], [dict(queued, run_attempt=2)], "missing-handoff"),
             ([nightly], [queued], "performance-queued"),
-            ([nightly], [dict(queued, status="completed", run_started_at="2026-11-21T14:00:01Z")], "report-missing"),
+            ([nightly], [dict(queued, status="completed", run_started_at="2026-11-21T14:00:01Z",
+                              updated_at="2026-11-21T14:44:00Z")], "report-missing"),
         ]
         for nightlies, jobs, status in cases:
             with self.subTest(status=status):
@@ -465,8 +466,8 @@ class ActionsRunTest(unittest.TestCase):
         for status, digest, pending in (
             ("accepted", catalog.digest(draft_state), {}),
             ("rejected", catalog.digest(draft_state), {}),
-            ("unknown", catalog.digest(draft_state), {"workflow": "alert"}),
-            ("accepted", "wrong", {"workflow": "alert"}),
+            ("unknown", catalog.digest(draft_state), {"workflow": draft_state["active"]["workflow"]}),
+            ("accepted", "wrong", {"workflow": draft_state["active"]["workflow"]}),
         ):
             with self.subTest(status=status, digest=digest), \
                     patch.object(actions_watch, "latest_artifact", side_effect=[None, (delivery_intent, source)]), \
@@ -492,6 +493,7 @@ class ActionsRunTest(unittest.TestCase):
                 with patch.object(actions_watch, "api", side_effect=[
                     {"workflow_runs": [nightly]}, {"workflow_runs": [run]}, run, dict(run, status=status),
                 ]) as api, patch.object(actions_watch.subprocess, "run", side_effect=error), \
+                        patch.object(actions_watch, "trusted_artifacts", return_value=[]), \
                         patch.object(actions_watch, "latest_state",
                                      return_value={"active": {}, "updated_at": now.isoformat()}):
                     actions_watch.prepare(output, "example/repo", "main", now=now)
@@ -499,6 +501,48 @@ class ActionsRunTest(unittest.TestCase):
                 health = catalog.read_json(output / "health.json")
                 self.assertEqual(bool(health["cancellation_errors"]), status == "in_progress")
                 self.assertTrue((output / "card.json").is_file())
+
+    def test_successful_budget_cancel_survives_the_next_health_poll(self):
+        now = datetime.fromisoformat("2026-11-23T17:40:00+00:00")
+        nightly = {"id": 20, "event": "schedule", "run_attempt": 1, "status": "completed",
+                   "created_at": "2026-11-23T10:00:00Z", "updated_at": "2026-11-23T11:00:00Z"}
+        original = {"id": 21, "run_attempt": 1, "status": "in_progress", "event": "workflow_run",
+                    "created_at": "2026-11-23T11:00:01Z", "run_started_at": "2026-11-23T11:00:02Z",
+                    "display_title": "Pipeline Performance | Nightly 20/1"}
+        state = {"active": {}, "updated_at": now.isoformat()}
+        source = {"id": 45}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(actions_watch, "latest_state", return_value=state):
+            root = Path(directory)
+            unavailable = subprocess.CalledProcessError(1, "gh", stderr=b"gh: missing (HTTP 404)\n")
+            with patch.object(actions_watch, "trusted_artifacts", side_effect=unavailable), \
+                    patch.object(actions_watch, "api", side_effect=[
+                        {"workflow_runs": [nightly]}, {"workflow_runs": [original]},
+                        {"jobs": [{"name": "measure (0)", "status": "queued"}]}, original,
+                    ]), patch.object(actions_watch.subprocess, "run") as cancel:
+                actions_watch.prepare(root / "cancel", "example/repo", "main", now=now)
+                cancel.assert_called_once()
+            saved = catalog.read_json(root / "cancel/health.json")
+            self.assertEqual([], saved["cancellation_errors"])
+            self.assertIn("cancellation_history_error", saved)
+            self.assertEqual(1, saved["budget_cancellations"]["21"]["run_attempt"])
+            self.assertEqual(now.isoformat(), saved["budget_cancellations"]["21"]["requested_at"])
+
+            completed = dict(original, status="completed", conclusion="cancelled",
+                             updated_at=(now + timedelta(seconds=3)).isoformat())
+            for index, prior in enumerate((saved, {"observations": []})):
+                output = root / f"poll-{index}"
+                with patch.object(actions_watch, "trusted_artifacts", return_value=[({}, source)]), \
+                        patch.object(actions_watch, "api", side_effect=[
+                            {"workflow_runs": [nightly]}, {"workflow_runs": [completed]},
+                        ]), patch.object(actions_watch, "artifact", side_effect=lambda _, __, name, ___:
+                                         prior if name == "performance-health-observation" else {}):
+                    actions_watch.prepare(output, "example/repo", "main", now=now + timedelta(minutes=10))
+                observed = catalog.read_json(output / "health.json")
+                accepted = "budget_cancellations" in prior
+                self.assertEqual("performance-budget-cancelled" if accepted else "report-missing", observed["status"])
+                card = catalog.read_json(output / "card.json")["card"]["elements"][0]["content"]
+                self.assertIn("cancelled at its budget boundary" if accepted else "Report for this attempt missing", card)
 
     def test_lost_committed_upload_cannot_undo_an_accepted_alert(self):
         now = datetime.fromisoformat("2026-11-23T15:00:00+00:00")
@@ -509,7 +553,7 @@ class ActionsRunTest(unittest.TestCase):
                     "active": {**confirmed["active"], "case": {"kind": "execution", "reason": "read back failed"}}}
         for status, pending, active in (
             ("rejected", {}, confirmed["active"]),
-            ("unknown", {"case": "alert"}, confirmed["active"]),
+            ("unknown", {"case": proposal["active"]["case"]}, confirmed["active"]),
             ("accepted", {}, proposal["active"]),
         ):
             with self.subTest(status=status), patch.object(actions_watch, "latest_artifact", side_effect=[

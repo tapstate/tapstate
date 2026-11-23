@@ -228,7 +228,7 @@ class NotificationTest(unittest.TestCase):
                         self.assertIn("**Recovered** performance cases 1", content)
                     self.assertNotIn("<at", content)
                     proposed = catalog.read_json(output / "next-state.json")
-                    self.assertEqual(state, proposed["previous"])
+                    self.assertEqual({"pending": {}, **state}, proposed["previous"])
                     with patch.object(actions_watch, "urlopen", return_value=BytesIO(json.dumps({"code": code}).encode())):
                         if code == 1:
                             with self.assertRaisesRegex(ValueError, "did not accept"):
@@ -329,7 +329,8 @@ class NotificationTest(unittest.TestCase):
             self.assertEqual(run["id"], outcome["performance"]["id"])
         late.update(status="completed", updated_at=now.isoformat())
         outcome = actions_health.assess(now, [nightly, next_nightly], [late], {})
-        self.assertEqual("report-missing", outcome["status"])
+        self.assertEqual("performance-expired", outcome["status"])
+        self.assertEqual("performance-expired", notifications.signals(outcome)[0]["workflow"]["reason"])
         with tempfile.TemporaryDirectory() as directory:
             report = raw_results(Path(directory), nightly, late, {CASE_IDS[0]: (100, 100)}, self.cases)
         outcome = actions_health.assess(now, [nightly, next_nightly], [late], {late["id"]: report})
@@ -487,7 +488,7 @@ class NotificationTest(unittest.TestCase):
     def test_uncertain_alert_allows_an_independent_alert_and_clears_on_healthy_evidence(self):
         nightly, run, now = scheduled(21)
         initial = {"active": {}, "updated_at": now.isoformat()}
-        attempted = {"active": {"workflow": {"kind": "workflow", "reason": "missing-handoff"}},
+        attempted = {"active": {"workflow": {"kind": "workflow", "reason": "batch summary missing or unreadable"}},
                      "updated_at": now.isoformat()}
         unknown = {"status": "unknown", "intent_sha256": catalog.digest(attempted)}
         with patch.object(actions_watch, "latest_artifact", side_effect=[None, ({"id": 8}, {"id": 7})]), \
@@ -508,7 +509,7 @@ class NotificationTest(unittest.TestCase):
                 keys = proposed["active"]
                 self.assertEqual(1, len(keys))
                 self.assertTrue(next(iter(keys)).startswith("comparison:"))
-                self.assertEqual({"workflow": "alert"} if missing else {}, proposed["pending"])
+                self.assertEqual(attempted["active"] if missing else {}, proposed["pending"])
 
                 if missing:
                     receipt = {"status": "rejected", "intent_sha256": catalog.digest(proposed)}
@@ -517,8 +518,57 @@ class NotificationTest(unittest.TestCase):
                         ({"id": 10, "created_at": "2026-11-21T12:00:00Z"}, {"id": 9}),
                     ]), patch.object(actions_watch, "artifact", side_effect=[initial, proposed, receipt]):
                         pending = actions_watch.latest_state(REPOSITORY, "main", now)
-                    self.assertEqual({"workflow": "alert"}, pending["pending"])
+                    self.assertEqual(attempted["active"], pending["pending"])
                     self.assertEqual({}, pending["active"])
+
+    def test_uncertain_recovery_ends_the_episode_and_same_reason_can_recur(self):
+        nightly, run, now = scheduled(21)
+        signal = {"kind": "workflow", "reason": "report-missing"}
+        prior = {"active": {"workflow": signal}, "updated_at": now.isoformat()}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = raw_results(root / "valid", nightly, run, {CASE_IDS[0]: (100, 100)}, self.cases)
+            self.prepare(root / "recovery", report, nightly, run, now, prior)
+            recovery = catalog.read_json(root / "recovery/next-state.json")
+            self.assertNotIn("workflow", recovery["active"])
+            unknown = {"status": "unknown", "intent_sha256": catalog.digest(recovery)}
+            with patch.object(actions_watch, "latest_artifact", side_effect=[None, ({"id": 8}, {"id": 7})]), \
+                    patch.object(actions_watch, "artifact", side_effect=[recovery, unknown]):
+                pending = actions_watch.latest_state(REPOSITORY, "main", now)
+            self.prepare(root / "healthy", report, nightly, run, now, pending)
+            self.assertFalse((root / "healthy/card.json").exists())
+            cleared = catalog.read_json(root / "healthy/state.json")
+            self.assertEqual({}, cleared["active"])
+            next_nightly, next_run, next_now = scheduled(22)
+            self.prepare(root / "recurrence", {}, next_nightly, next_run, next_now, cleared)
+            next_intent = catalog.read_json(root / "recurrence/next-state.json")
+            self.assertEqual(signal, next_intent["active"]["workflow"])
+
+    def test_uncertain_escalation_only_suppresses_the_signal_already_attempted(self):
+        nightly, run, now = scheduled(21)
+        prior = {"active": {"workflow": {"kind": "workflow", "reason": "missing-handoff"}},
+                 "updated_at": now.isoformat()}
+        attempted = {"active": {"workflow": {"kind": "workflow", "reason": "report-missing"}},
+                     "previous": prior, "updated_at": now.isoformat()}
+        unknown = {"status": "unknown", "intent_sha256": catalog.digest(attempted)}
+        with patch.object(actions_watch, "latest_artifact", side_effect=[None, ({"id": 8}, {"id": 7})]), \
+                patch.object(actions_watch, "artifact", side_effect=[attempted, unknown]):
+            pending = actions_watch.latest_state(REPOSITORY, "main", now)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.prepare(root / "same", {}, nightly, run, now, pending)
+            self.assertFalse((root / "same/card.json").exists())
+            expired = {**run, "updated_at": (actions_health.workflow_deadline(run) + timedelta(minutes=5)).isoformat()}
+            self.prepare(root / "worse", {}, nightly, expired, now + timedelta(hours=7), pending)
+            proposed = catalog.read_json(root / "worse/next-state.json")
+            self.assertEqual("performance-expired", proposed["active"]["workflow"]["reason"])
+
+            rejected = {"status": "rejected", "intent_sha256": catalog.digest(proposed)}
+            with patch.object(actions_watch, "latest_artifact", side_effect=[None, ({"id": 10}, {"id": 9})]), \
+                    patch.object(actions_watch, "artifact", side_effect=[proposed, rejected]):
+                after_rejection = actions_watch.latest_state(REPOSITORY, "main", now)
+            self.prepare(root / "same-after-rejection", {}, nightly, run, now, after_rejection)
+            self.assertFalse((root / "same-after-rejection/card.json").exists())
 
     def test_artifact_bytes_are_bound_to_original_attempt_and_verified_digest(self):
         _, run, _ = scheduled(21)

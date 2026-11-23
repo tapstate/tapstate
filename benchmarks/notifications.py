@@ -13,6 +13,7 @@ WORKFLOW_ANOMALIES = {
     "missing-nightly": "Scheduled Nightly missing",
     "missing-handoff": "Performance handoff missing",
     "performance-expired": "Performance run exceeded its deadline",
+    "performance-budget-cancelled": "Performance run cancelled at its budget boundary",
     "performance-start-unavailable": "Performance start time missing",
     "report-missing": "Report for this attempt missing",
 }

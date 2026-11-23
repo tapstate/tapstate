@@ -86,9 +86,10 @@ def assess_slot(now, due, nightly_attempts, performance_runs, reports):
         return outcome(due, "performance-running" if now < deadline else "performance-expired", **identity)
     report = reports.get(performance["id"])
     if not matching_report(report, performance, nightly):
-        return outcome(due, "report-missing", **identity)
-    completed = timestamp(performance["updated_at"])
-    status = "performance-expired" if completed > deadline else "reported"
+        report = None
+    if timestamp(performance["updated_at"]) > deadline:
+        return outcome(due, "performance-expired", report=report, **identity)
+    status = "reported" if report is not None else "report-missing"
     return outcome(due, status, report=report, **identity)
 
 
