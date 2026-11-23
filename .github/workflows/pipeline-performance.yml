@@ -216,9 +216,15 @@ jobs:
             --output "$RUNNER_TEMP/performance-report" --jobs "$RUNNER_TEMP/performance-jobs.json" \
             --artifact-index "$RUNNER_TEMP/performance-artifacts.json"
       - uses: actions/upload-artifact@v4
+        id: report-artifact
         if: always()
         with:
           name: performance-report-${{ github.run_attempt }}
           path: ${{ runner.temp }}/performance-report
           if-no-files-found: error
           retention-days: 90
+      - name: Link the published report
+        if: always() && steps.report-artifact.outcome == 'success'
+        env:
+          REPORT_ARTIFACT_URL: ${{ steps.report-artifact.outputs.artifact-url }}
+        run: printf '\n[Download report.json and report.md](%s)\n' "$REPORT_ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"

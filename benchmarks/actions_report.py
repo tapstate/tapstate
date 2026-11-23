@@ -316,6 +316,12 @@ def evidence_location(result, row, repository, run_id):
     return artifact_link(artifact, repository, run_id)
 
 
+def failure_summary(reason):
+    lines = str(reason).strip().splitlines()
+    first = lines[0] if lines else "unavailable"
+    return first[:240] + "..." if len(first) > 240 else first
+
+
 def execution_failures(result, repository, run_id):
     lines = ["", "## Case execution failures", ""]
     groups = {}
@@ -326,7 +332,7 @@ def execution_failures(result, repository, run_id):
                     if arm["status"] in verdict.FAILED_STATUSES | {"timed-out"}]
         for name, arm in failures or [("repeat", row)]:
             groups.setdefault((arm.get("last_stage") or "unavailable",
-                               arm.get("reason") or arm["status"]), []).append((row, name, arm["status"]))
+                               failure_summary(arm.get("reason") or arm["status"])), []).append((row, name, arm["status"]))
     for (stage, reason), observations in sorted(groups.items()):
         count = len({row["case_id"] for row, _, _ in observations})
         lines.extend(["", f"<details><summary>{cell(stage)} · {cell(reason)} — {count} cases</summary>", "",
@@ -349,7 +355,7 @@ def other_execution_outcomes(result, repository, run_id):
              "|---|---:|---|---|---|---|"]
     for row in rows:
         lines.append(table(case_label(result["case_context"][row["case_id"]]), row["repeat"], row["status"],
-                           row.get("last_stage"), row.get("reason"), evidence_location(result, row, repository, run_id)))
+                           row.get("last_stage"), failure_summary(row.get("reason") or "unavailable"), evidence_location(result, row, repository, run_id)))
     lines.extend(["", "</details>"])
     return lines
 

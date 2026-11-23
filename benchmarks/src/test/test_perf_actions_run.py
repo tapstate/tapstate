@@ -198,7 +198,8 @@ class ActionsRunTest(unittest.TestCase):
                     "resources": {"status": "observed", "scope": "OP process", "op_heap_limit_mib": 256,
                                   "windows": {"snapshot": {"covered": True, "source": "procfs", "rss_peak_kib": 126}}},
                 })
-        rows[2].update(status="failed", last_stage="readback", reason="different target keys")
+        readback_failure = "different target keys\nExpected " + "x" * 4000
+        rows[2].update(status="failed", last_stage="readback", reason=readback_failure)
         for field in ("source_data", "effective_input_rows", "confirmed_output_units", "target_readback_rows", "resources"):
             rows[3].pop(field)
         rows[3].update(status="failed", last_stage="prepare", reason="fixture failed early")
@@ -279,7 +280,9 @@ class ActionsRunTest(unittest.TestCase):
                 self.assertEqual(attempt, data["github_attempt"])
                 self.assertEqual({"completed": 2, "failed": 1}, data["case_counts"])
                 self.assertEqual({"failed": 2, "completed": 4}, data["repeat_counts"])
-                self.assertEqual("different target keys", data["results"][2]["reason"])
+                self.assertEqual(readback_failure, data["results"][2]["reason"])
+                self.assertIn("different target keys", markdown)
+                self.assertNotIn("x" * 300, markdown)
                 self.assertIn(f"{bad}@1", markdown)
                 self.assertIn("| single | right | 20 | 19 | 7 |", markdown)
                 self.assertIn("| single | 38 | 39 |", markdown)
