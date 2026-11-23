@@ -269,11 +269,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             return RequiredNoteStore.super.openPipelineScopes(primary, global);
         return StoreIo.call(() -> {
             requireActive.run();
-            var stages = MongoStartConfigRead.root();
-            stages.add(new Document("$match", new Document("layoutId", MongoConfigurationDomain.LAYOUT)
-                    .append("bindingVersion", primary.bindingVersion())));
-            stages.add(noteScopeLookup(SystemCollections.OPERATOR_GENERATIONS, "operator", primary.ownerId()));
-            stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_SCOPES, "primary", scopeId(primary)));
+            var stages = pipelineNoteStages(primary);
             stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_SCOPES, "global", scopeId(global)));
             var snapshot = MongoStartConfigRead.snapshot(database, stages);
             var operator = noteScopeRow(snapshot, "operator", primary.ownerId());
@@ -289,6 +285,15 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             requireActive.run();
             return new PipelineScopes(primaryScope, globalScope);
         });
+    }
+
+    private static List<Document> pipelineNoteStages(RequiredNoteOwner owner) {
+        var stages = MongoStartConfigRead.root();
+        stages.add(new Document("$match", new Document("layoutId", MongoConfigurationDomain.LAYOUT)
+                .append("bindingVersion", owner.bindingVersion())));
+        stages.add(noteScopeLookup(SystemCollections.OPERATOR_GENERATIONS, "operator", owner.ownerId()));
+        stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_SCOPES, "primary", scopeId(owner)));
+        return stages;
     }
 
     private static Document noteScopeLookup(SystemCollections table, String slot, Object key) {
@@ -381,6 +386,28 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     @Override
     public RequiredNoteOrigin origin(RequiredNoteScope scope) {
         requireOriginScope(scope);
+        var owner = scope.owner();
+        if (retirement == null && owner.kind() == RequiredNoteOwner.Kind.PIPELINE
+                && !MongoValidationClaimObservation.lacksSnapshotRead(client)) {
+            var captured = MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+                requireActive.run();
+                var stages = pipelineNoteStages(owner);
+                stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_ORIGINS, "origin", scopeId(owner)));
+                var snapshot = MongoStartConfigRead.snapshot(database, stages);
+                var operator = noteScopeRow(snapshot, "operator", owner.ownerId());
+                var metadata = noteScopeRow(snapshot, "primary", scopeId(owner));
+                var stored = noteScopeRow(snapshot, "origin", scopeId(owner));
+                if (operator == null || metadata == null || stored == null) return null;
+                checkBinding(snapshot, owner);
+                checkPipelineOwner(operator, owner, false);
+                if (!scopeOf(owner, metadata).equals(scope)) throw unavailable();
+                var value = retainedOrigin(scope, metadata, stored);
+                if (value == null) throw unavailable();
+                requireActive.run();
+                return value;
+            }));
+            if (captured != null) return captured;
+        }
         return transactionWithInspection(session -> {
             RequiredNoteOrigin retained = retainedOrigin(session, scope, verifyScope(session, scope, false));
             if (retained == null) throw unavailable();
@@ -948,7 +975,10 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     private RequiredNoteOrigin retainedOrigin(ClientSession session, RequiredNoteScope scope, Document metadata) {
         scopeOf(scope.owner(), metadata);
-        Document stored = origins.find(session, byScope(scope.owner())).first();
+        return retainedOrigin(scope, metadata, origins.find(session, byScope(scope.owner())).first());
+    }
+
+    private RequiredNoteOrigin retainedOrigin(RequiredNoteScope scope, Document metadata, Document stored) {
         if (Long.valueOf(0).equals(metadata.get("originGeneration"))) {
             if (stored != null) throw unreadable("origin");
             return null;

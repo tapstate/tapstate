@@ -46,6 +46,37 @@ class MongoSinkPreparationStoreIT {
     private static final Instant AT = Instant.parse("2026-10-19T03:00:00Z");
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a","boot-a");
 
+    @Test void aSingleReadyReceiptAndItsAuthorityUseOneSnapshotCommand() {
+        withFixture(f -> {
+            var input = f.input("orders");
+            var control = f.store();
+            control.prepareTargets(List.of(input));
+            var ready = control.complete(control.begin(input), new SinkPreparationStore.Result(true));
+            var commands = new ArrayList<org.bson.BsonDocument>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            commands.add(event.getCommand().clone());
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping",1));
+                var access = new MongoCachePipelineAccess(client,client.getDatabase(f.cache.getName()),f.scope,f.fence,ACTIVE);
+                var store = new MongoSinkPreparationStore(access);
+                commands.clear();
+                assertThat(store.load(input)).isEqualTo(ready);
+                assertThat(store.loadMany(List.of(input))).containsExactly(ready);
+                assertThat(commands).hasSize(2).allSatisfy(command -> {
+                    assertThat(command.getString("aggregate").getValue()).isEqualTo("cache_identity");
+                    assertThat(command.getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
+                    assertThat(command.containsKey("txnNumber")).isFalse();
+                });
+                System.out.println("SINK_RECEIPT single=1 single_target_roster=1");
+            }
+        });
+    }
+
     @Test void readyRetainsTheKnownCreateResultAcrossExecutionAndIndependentClientRestart() {
         withFixture(f -> {
             var input=f.input("orders");var store=f.store();store.prepareTargets(List.of(input));

@@ -35,16 +35,37 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
 
     /** The four original authority facts, from a single server snapshot. */
     static Authority readAuthority(MongoDatabase snapshot, PipelineIntentScope scope, WorkloadClaimKey key) {
+        var stages = authorityStages(scope, key);
+        var captured = SystemCollections.CACHE_IDENTITY.on(snapshot).aggregate(stages).collation(SIMPLE).first();
+        return authority(captured);
+    }
+
+    record SinkReceipt(Authority authority, Document row) {}
+
+    static SinkReceipt readSinkReceipt(MongoDatabase snapshot, PipelineIntentScope scope, WorkloadClaimKey key,
+            Document receiptId) {
+        var stages = authorityStages(scope, key);
+        stages.add(lookup(SystemCollections.CACHE_SINK_PREPARATIONS, "receipt", receiptId, false));
+        var captured = SystemCollections.CACHE_IDENTITY.on(snapshot).aggregate(stages).collation(SIMPLE).first();
+        var facts = authority(captured);
+        if (facts == null) return null;
+        var receipt = row(captured, "receipt");
+        return receipt == null ? null : new SinkReceipt(facts, receipt);
+    }
+
+    private static List<Document> authorityStages(PipelineIntentScope scope, WorkloadClaimKey key) {
         var identityFilter = new Document("_id", "cluster").append("clusterId", scope.clusterId())
                 .append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation())
                 .append("layoutId", MongoConfigurationDomain.LAYOUT).append("businessPhase", MongoCacheIdentity.READY)
                 .append("$expr", new Document("$eq", List.of(new Document("$type", "$bindingVersion"), "long")));
-        var captured = SystemCollections.CACHE_IDENTITY.on(snapshot).aggregate(List.of(
+        return new ArrayList<>(List.of(
                 new Document("$match", identityFilter), inline(),
                 lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business", false),
                 lookup(SystemCollections.CACHE_PIPELINE_STATE, "checkpoint", scope.pipelineId(), false),
-                lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", MongoWorkloadClaimStore.id(key), true)))
-                .collation(SIMPLE).first();
+                lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", MongoWorkloadClaimStore.id(key), true)));
+    }
+
+    private static Authority authority(Document captured) {
         if (captured == null) return null;
         var identity = captured.get(ROW, Document.class);
         var schema = row(captured, "schema");

@@ -65,7 +65,11 @@ class MongoRequiredNoteStoreIT {
                 assertThat(store.openPipelineScopes(primary.owner(), shared.owner()))
                         .isEqualTo(new RequiredNoteStore.PipelineScopes(primary, shared));
                 assertThat(commands).containsExactly("aggregate");
+                commands.clear();
+                assertThat(store.origin(primary)).isEqualTo(origin("same-connection"));
+                assertThat(commands).containsExactly("aggregate");
                 f.pipelineGeneration("p1", 2);
+                assertThatThrownBy(() -> store.origin(primary)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
                 assertThatThrownBy(() -> store.openPipelineScopes(primary.owner(),shared.owner()))
                         .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
                 System.out.println("PIPELINE_NOTE_SCOPES original_commands=7 combined_commands=1 old_generation_rejected=true");

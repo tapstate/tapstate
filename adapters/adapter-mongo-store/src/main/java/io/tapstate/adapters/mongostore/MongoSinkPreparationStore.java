@@ -462,6 +462,8 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
     @Override
     public Snapshot load(Input original) {
         requireScope(original);
+        var snapshot = snapshotReceipt(original);
+        if (snapshot != null) return snapshot;
         return access.metadataTransaction(
                 SystemCollections.CACHE_SINK_PREPARATIONS,
                 false,
@@ -473,6 +475,10 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
         var inputs = List.copyOf(originals);
         inputs.forEach(this::requireScope);
         if (inputs.isEmpty()) return List.of();
+        if (inputs.size() == 1) {
+            var snapshot = snapshotReceipt(inputs.getFirst());
+            if (snapshot != null) return List.of(snapshot);
+        }
         return access.metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, false, session -> {
             var control = marker(claim(session));
             if (!(control.get(TARGETS) instanceof List<?> targets)) throw rebuild(access.scope);
@@ -563,15 +569,31 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
         if (table.replaceOne(session, raw, replacement).getMatchedCount() != 1) throw fenced();
     }
 
-    private Snapshot require(ClientSession session, Input expected) {
-        var control = marker(claim(session));
+    private Snapshot snapshotReceipt(Input expected) {
+        var receipt = access.sinkReceipt(id(expected.key()));
+        if (receipt == null) return null;
+        var control = marker(requireClaimScope(receipt.authority().claim()));
+        requireManifestInput(expected, control);
+        return readReceipt(expected, control, receipt.row());
+    }
+
+    private void requireManifestInput(Input expected, Document control) {
         if (!(control.get(TARGETS) instanceof List<?> targets)
                 || !targets.contains(input(expected))) throw rebuild(access.scope);
+    }
+
+    private Snapshot require(ClientSession session, Input expected) {
+        var control = marker(claim(session));
+        requireManifestInput(expected, control);
         var raw =
                 SystemCollections.CACHE_SINK_PREPARATIONS
                         .on(access.database)
                         .find(session, new Document("_id", id(expected.key())))
                         .first();
+        return readReceipt(expected, control, raw);
+    }
+
+    private Snapshot readReceipt(Input expected, Document control, Document raw) {
         Snapshot held = decode(raw);
         if (!held.input().equals(expected)
                 || !held.operationId().equals(control.getString(PREPARATION_ID)))

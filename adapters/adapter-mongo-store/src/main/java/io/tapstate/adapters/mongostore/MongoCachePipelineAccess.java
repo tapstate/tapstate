@@ -84,6 +84,25 @@ final class MongoCachePipelineAccess {
 
     <T> T transaction(Function<ClientSession, T> action) { return transaction(TRANSACTION, action); }
 
+    MongoPipelineProofFacts.SinkReceipt sinkReceipt(Document receiptId) {
+        if (original == null || unpreparedModels || authoringModels != null || !MongoBindingReadFacts.supported(client)
+                || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            requireActive.run();
+            var snapshot = database.withReadPreference(com.mongodb.ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
+            var receipt = MongoPipelineProofFacts.readSinkReceipt(snapshot, scope, original.key(), receiptId);
+            requireActive.run();
+            if (receipt != null) {
+                var facts = receipt.authority();
+                var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+                MongoCacheBusinessIdentity.requireObservedAdmission(facts.identity(), facts.schema(), business);
+                validateState(facts.checkpoint());
+                requirePreparedClaim(facts.claim());
+            }
+            return receipt;
+        }));
+    }
+
     <T> T stateTransaction(boolean mutation, Function<ClientSession, T> action) {
         return transaction(session -> {
             var current = state(session, true);
