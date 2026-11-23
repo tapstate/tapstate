@@ -100,13 +100,16 @@ class ScopedPipelineCaptureCoordinatorTest {
             var local = new WorkloadClaim(f.capture.key(), OWNER, 2, 0, 1, Instant.now().plusSeconds(60));
             var prepared = ((CaptureCreationResult.AlreadyIssued) f.configuration.issueFirstCreate(null)).preparation();
             when(f.cache.load(prepared)).thenAnswer(call -> new CaptureCacheState(prepared, WorkloadClaimFence.from(local), Optional.of(chain.get())));
+            org.mockito.Mockito.doAnswer(call -> f.ownership.acquire(call.getArgument(0))).when(f.ownership).acquireInitial(any());
             when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true, local));
             doAnswer(call -> {
                 var expected = call.getArgument(1, WorkloadClaimFence.class);
                 if (expected.owner().nodeId().equals("remote")) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
                 return expected;
             }).when(f.authorization).requireCapture(any(), any());
+            org.mockito.Mockito.clearInvocations(f.ownership);
             org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            verify(f.ownership,never()).acquireInitial(any());verify(f.ownership,atLeastOnce()).acquire(any());
             assertThat(flow.captureFailure("flow")).as("the first takeover opens its original tail").isEmpty();
             assertThat(other.captureFailure("peer")).as("the follower keeps the same capture").isEmpty();
             awaitOwnerOperations(f);
@@ -487,7 +490,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             String ring=SrsRingbuffer.ringName("mck-key","orders");
             assertThat(f.buffer.drain(bindings.bufferKey("left"),ring)).singleElement().satisfies(row -> assertThat(row.after()).containsEntry("source","left"));
             assertThat(f.buffer.drain(bindings.bufferKey("right"),ring)).singleElement().satisfies(row -> assertThat(row.after()).containsEntry("source","right"));
-            verify(f.ownership).acquire(any()); assertThat(f.opened).hasValue(2);
+            verify(f.ownership).acquireInitial(any());verify(f.ownership).acquire(any()); assertThat(f.opened).hasValue(2);
             run.stopCapture("flow",false); verify(f.ownership).release(f.capture); assertThat(f.closedPorts).hasValue(2);
         }
     }
@@ -1389,6 +1392,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
         when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
         when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(chain.get())));
+        org.mockito.Mockito.doAnswer(call -> f.ownership.acquire(call.getArgument(0))).when(f.ownership).acquireInitial(any());
         when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
         when(consumers.find(context.key())).thenReturn(Optional.of(membership));
         when(consumers.progress(context)).thenAnswer(ignored -> Optional.of(progress.get()));
@@ -1453,6 +1457,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
             when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
             when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(chain.get())));
+            org.mockito.Mockito.doAnswer(call -> f.ownership.acquire(call.getArgument(0))).when(f.ownership).acquireInitial(any());
             when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
             when(consumers.find(context.key())).thenReturn(Optional.of(membership));
             when(consumers.progress(context)).thenAnswer(ignored -> Optional.of(progress.get()));
@@ -1508,6 +1513,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
             when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString(),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
             when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(originalChain)));
+            org.mockito.Mockito.doAnswer(call -> f.ownership.acquire(call.getArgument(0))).when(f.ownership).acquireInitial(any());
             when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
             when(consumers.find(context.key())).thenReturn(Optional.of(membership));
             when(consumers.progress(context)).thenReturn(Optional.of(retained));
@@ -1729,6 +1735,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(authorization.require(any())).thenReturn(PIPELINE);
             when(authorization.authorized(ORIGINAL)).thenReturn(true);
             when(authorization.requireCapture(any(),any())).thenAnswer(call -> call.getArgument(1));
+            org.mockito.Mockito.doAnswer(call -> ownership.acquire(call.getArgument(0))).when(ownership).acquireInitial(any());
             when(ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
             when(ownership.renew(any())).thenAnswer(call -> Optional.of(call.getArgument(0)));
             when(ownership.ttl()).thenReturn(Duration.ofSeconds(60));
@@ -1775,6 +1782,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
 
         private void streaming() {
+            org.mockito.Mockito.doAnswer(call -> ownership.acquire(call.getArgument(0))).when(ownership).acquireInitial(any());
             when(ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(false, capture));
             when(snapshots.count(anyString(), anyString(), anyLong())).thenReturn(OptionalLong.of(0));
             var consumers = consumerStore();
