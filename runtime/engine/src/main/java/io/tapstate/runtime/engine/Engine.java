@@ -996,8 +996,7 @@ public final class Engine {
                         .merge(reading.kind(), measurement.value(), Math::max);
             }
         }
-        OperatorMapBindings bindings = member.getUserContext() == null ? null
-                : OperatorMapBindings.resolve(member, false);
+        OperatorMapBindings bindings = OperatorMapBindings.resolve(member, false);
         Map<String, NestStateReading> readings = new HashMap<>();
         var dataMembers = member.getCluster().getMembers().stream().filter(value -> !value.isLiteMember())
                 .map(value -> value.getUuid().toString()).collect(java.util.stream.Collectors.toSet());
