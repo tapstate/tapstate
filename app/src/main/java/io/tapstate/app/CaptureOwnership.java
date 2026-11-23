@@ -64,7 +64,9 @@ final class CaptureOwnership {
         this.fenced = true;
     }
 
-    Permit acquire(CaptureId captureId) {
+    Permit acquire(CaptureId captureId) { return acquire(captureId,false); }
+    Permit acquireInitial(CaptureId captureId) { return acquire(captureId,true); }
+    private Permit acquire(CaptureId captureId,boolean initial) {
         Objects.requireNonNull(captureId, "captureId");
         if (!fenced) {
             return Permit.unfenced();
@@ -75,7 +77,7 @@ final class CaptureOwnership {
         }
         WorkloadClaimKey key =
                 new WorkloadClaimKey(clusterId, WorkloadClaimType.CAPTURE, captureId.value());
-        return claims.acquire(key, owner, current.revision(), ttl)
+        return (initial?claims.acquireInitialCapture(key,owner,current.revision(),ttl):claims.acquire(key, owner, current.revision(), ttl))
                 .filter(attempt -> attempt.acquired() && attempt.claim().owner().equals(owner))
                 .map(attempt -> new Permit(true, attempt.claim()))
                 .orElseGet(Permit::denied);

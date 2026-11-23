@@ -35,6 +35,14 @@ public interface DeadlineWorkloadClaimStore extends WorkloadClaimStore {
         return withClaimAcquisitionDeadline(key, deadlineNanos, requireActive, operation);
     }
 
+    default <T> T withInitialCaptureAcquisition(WorkloadClaimKey key,Runnable requireActive,Supplier<T> operation) {
+        return withClaimAcquisition(key,requireActive,operation);
+    }
+
+    default <T> T withInitialCaptureAcquisition(WorkloadClaimKey key,long deadlineNanos,Runnable requireActive,Supplier<T> operation) {
+        return withClaimAcquisitionDeadline(key,deadlineNanos,requireActive,operation);
+    }
+
     /** Scoped Pipeline renewal can use a separate execution lane. */
     default <T> T withRenewalDeadline(long deadlineNanos, Runnable requireActive, Supplier<T> operation) {
         return withDeadline(deadlineNanos, requireActive, operation);

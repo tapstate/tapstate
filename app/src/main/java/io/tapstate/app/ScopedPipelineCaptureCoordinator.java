@@ -596,7 +596,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         source.identity = identities.apply(definition.id())
                 .filter(identity -> identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
         source.prepared = prepared.preparation();
-        source.owner = owner(session, source, prepared);
+        source.owner = owner(session, source, prepared,true);
         if (shared) attachSharedSource(session, source, issued instanceof CaptureCreationResult.Issued first
                 && first.creation().newSharedHistory(), retained);
     }
@@ -1219,7 +1219,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                             });
     }
 
-    private Owner owner(Session session,Source source,CaptureCacheState prepared) {
+    private Owner owner(Session session,Source source,CaptureCacheState prepared) { return owner(session,source,prepared,false); }
+    private Owner owner(Session session,Source source,CaptureCacheState prepared,boolean initial) {
         var id=prepared.preparation().captureId(); var existing=owners.get(id);
         if(existing!=null) {
             if (existing.stopping || existing.drainingReports()) throw new RingNotOpenYet(new CaptureId(id));
@@ -1232,7 +1233,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             })) throw refused();
             return existing;
         }
-        var permit=execution.ownership().acquire(new CaptureId(id));
+        var permit=initial?execution.ownership().acquireInitial(new CaptureId(id)):execution.ownership().acquire(new CaptureId(id));
         if(!permit.acquired()) {
             if(!source.shared)throw new RingNotOpenYet(new CaptureId(id));
             source.foreign=stores.preparations().load(prepared.preparation()).claim();return null;

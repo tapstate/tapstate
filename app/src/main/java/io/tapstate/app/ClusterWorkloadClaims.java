@@ -66,6 +66,9 @@ final class ClusterWorkloadClaims {
             if (kind == Operation.RENEWAL && !recoveries.isEmpty())
                 return ((io.tapstate.spi.store.DeadlineWorkloadClaimStore) store).withRenewalDeadline(
                         key, recoveries, System.nanoTime() + budgetNanos, () -> {}, action);
+            if(kind==Operation.INITIAL_ACQUISITION&&key.type()==WorkloadClaimType.CAPTURE
+                    &&store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)
+                return bounded.withInitialCaptureAcquisition(key,()->{},action);
             if ((kind == Operation.ACQUISITION || kind == Operation.INITIAL_ACQUISITION) && store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)
                 return bounded.withClaimAcquisition(key, () -> {}, action);
             return action.get();
@@ -80,7 +83,9 @@ final class ClusterWorkloadClaims {
                 result = switch (kind) {
                     case ORDINARY -> bounded.withDeadline(deadline, active, action);
                     case ACQUISITION -> bounded.withClaimAcquisitionDeadline(key, deadline, active, action);
-                    case INITIAL_ACQUISITION -> bounded.withInitialPipelineAcquisition(key, deadline, active, action);
+                    case INITIAL_ACQUISITION -> key.type()==WorkloadClaimType.CAPTURE
+                            ? bounded.withInitialCaptureAcquisition(key,deadline,active,action)
+                            : bounded.withInitialPipelineAcquisition(key, deadline, active, action);
                     case RENEWAL -> recoveries.isEmpty() ? bounded.withRenewalDeadline(key, deadline, active, action)
                             : bounded.withRenewalDeadline(key, recoveries, deadline, active, action);
                 };
@@ -102,6 +107,12 @@ final class ClusterWorkloadClaims {
         }
         if (key.type() == WorkloadClaimType.NODE_SESSION) return call(() -> Optional.of(store.acquire(key, owner, topologyRevision, ttl)));
         return acquire(key, true, () -> Optional.of(store.acquire(key, owner, topologyRevision, ttl)));
+    }
+
+    Optional<WorkloadClaimAttempt> acquireInitialCapture(WorkloadClaimKey key,WorkloadOwner owner,long topologyRevision,Duration ttl) {
+        if(key.type()!=WorkloadClaimType.CAPTURE)throw new IllegalArgumentException("initial Capture acquisition requires a Capture key");
+        if(!membership.businessEligible())return Optional.empty();
+        return acquire(key,true,()->Optional.of(store.acquire(key,owner,topologyRevision,ttl)),true);
     }
 
     Optional<WorkloadClaim> acquireValidationExecution(
