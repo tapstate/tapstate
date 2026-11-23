@@ -547,4 +547,36 @@ class ScopedEngineLifecycleActuatorTest {
         };
         assertThatThrownBy(() -> legacy.forRun(SCOPE,claim(1),new ExecutionFence(SCOPE,claim(1)))).isInstanceOf(TapstateException.class);
     }
+    private ScopedEngineLifecycleActuator actuatorWithLocalCaptureLease() {
+        var original = ports();
+        var local = new ScopedEngineLifecycleActuator.Ports(original.operators(), original.releaseHot(), original.rebuild(),
+                original.plans(), ignored -> true);
+        return new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache", ConnectorReadiness.NONE,
+                Clock.systemUTC(), local, submissions);
+    }
+
+    @Test void localCapturePreparationLeaseCannotReplaceTheLaterJetSubmissionProof() {
+        var checkedAfterCapture = new AtomicBoolean();
+        when(ownership.proveStartClaim(eq(SCOPE), any())).thenAnswer(call -> {
+            if (events.contains("capture")) checkedAfterCapture.set(true);
+            return active.get() && held.get().equals(call.getArgument(1));
+        });
+        when(ownership.proveClaim(eq(SCOPE), any())).thenAnswer(call ->
+                !events.contains("record") && active.get() && held.get().equals(call.getArgument(1)));
+        assertThatThrownBy(() -> actuatorWithLocalCaptureLease().start("p")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(events).contains("capture", "build", "record");
+        assertThat(checkedAfterCapture).isTrue();
+        verify(engine, never()).submitRun(anyString(), any(DAG.class), anyMap(), any(NestSettings.class), any(OperatorRunManifest.class));
+    }
+
+    @Test void localCapturePreparationLeaseCannotReplaceTheCaptureBindingProof() {
+        when(ownership.proveStartClaim(eq(SCOPE), any())).thenAnswer(call ->
+                !events.contains("capture") && active.get() && held.get().equals(call.getArgument(1)));
+        assertThatThrownBy(() -> actuatorWithLocalCaptureLease().start("p")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(events).contains("capture").doesNotContain("build", "record", "submit");
+        verify(engine, never()).submitRun(anyString(), any(DAG.class), anyMap(), any(NestSettings.class), any(OperatorRunManifest.class));
+    }
+
 }
