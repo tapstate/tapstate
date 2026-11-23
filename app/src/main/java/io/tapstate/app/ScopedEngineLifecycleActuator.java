@@ -329,6 +329,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         recoveringSource = true;
         try {
             start(pipeline);
+            // A shared source can defer submission before the replacement Direct reader is created.
+            if (run == null) retry.interrupted(pending.failure());
             return Optional.of(new SourceRecovery(null));
         } catch (TapstateException failure) {
             if (invalidated) throw failure;

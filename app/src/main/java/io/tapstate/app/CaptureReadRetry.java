@@ -8,9 +8,17 @@ import java.time.Duration;
 final class CaptureReadRetry {
     record Pending(FailureFact failure, Duration delay) {}
 
-    private final RetryWindow window = new RetryWindow();
+    private final RetryWindow window;
     private FailureFact retained;
     private boolean pending;
+
+    CaptureReadRetry() {
+        this(new RetryWindow());
+    }
+
+    CaptureReadRetry(RetryWindow window) {
+        this.window = window;
+    }
 
     synchronized void interrupted(FailureFact failure) {
         window.failed();
