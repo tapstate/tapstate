@@ -4129,6 +4129,7 @@ class MongoSrsConsumerStoreIT {
                 long start = System.nanoTime();
                 var task = executor.submit(() -> coordinatedPinStore(f, observed, operations).pinSnapshot(A, member.revision(), 0, pin, f.fenceA()));
                 assertThat(paused.await(4, TimeUnit.SECONDS)).isTrue();
+                assertThat(renewPinTestLease(authority, f.pipelineB(), 30)).isPresent();
                 long renewalAt = start + TimeUnit.SECONDS.toNanos(6);
                 TimeUnit.NANOSECONDS.sleep(Math.max(0, renewalAt - System.nanoTime()));
                 assertThat(renewPinTestLease(authority, f.pipelineB(), 30)).isPresent();
@@ -4139,13 +4140,15 @@ class MongoSrsConsumerStoreIT {
                     deferred = true;
                 }
                 TimeUnit.NANOSECONDS.sleep(Math.max(0, start + TimeUnit.MILLISECONDS.toNanos(10100) - System.nanoTime()));
+                assertThat(renewPinTestLease(authority, f.pipelineB(), 30)).isPresent();
                 resume.countDown();
                 Boolean accepted = null; Throwable failed = null;
                 try { accepted = task.get(8, TimeUnit.SECONDS); }
                 catch (java.util.concurrent.ExecutionException failure) { failed = failure.getCause(); }
                 long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                assertThat(renewPinTestLease(authority, f.pipelineB(), 30)).isPresent();
                 boolean stillLive = authority.read(f.pipelineA().key()).orElseThrow().leased();
-                System.out.printf("PIN_FIRST_WINDOW short_lease=%s elapsed_ms=%d wire=%d code112=%d same_key_deferred=%s other_key_renewed=true claim_still_live=%s pin_commits=%d accepted=%s failure=%s%n",
+                System.out.printf("PIN_FIRST_WINDOW short_lease=%s elapsed_ms=%d wire=%d code112=%d same_key_deferred=%s other_key_renewals=4 claim_still_live=%s pin_commits=%d accepted=%s failure=%s%n",
                         shortLease, elapsed, wires.get(), conflicts.get(), deferred, stillLive, commits.get(), accepted,
                         failed == null ? "none" : failed.getClass().getSimpleName());
                 assertThat(failed).isNull(); assertThat(accepted).isTrue();
