@@ -1260,7 +1260,8 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         // Freeze caller-owned collections before a transaction callback can be retried.
         var requested = new SrsConsumerWriterRun(membershipRevision,fence,runId,expected,Map.of());
         return transaction(session -> {
-            proveProgress(session, context, fence); var own = requireOwn(session,context);
+            proveProgress(session, context, fence);
+            var own = runtimeStructure ? requireStartupOwn(session, context, true) : requireOwn(session, context);
             if (!bound(own.member(),membershipRevision,fence)) return false;
             if (!own.member().tables().equals(requested.expected().keySet())) throw unavailable(context.key().miningChainId());
             var held = own.cursor(); var before = held.writerRun();
@@ -1323,7 +1324,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             var pipeline = pipelineAccess(context, fence);
             var state = prepareBeforeWrite ? pipeline.stateForWriterProgress(session, true) : pipeline.state(session, true);
             if (!prepareBeforeWrite) proveConsumerWrite(session, pipeline, state);
-            var own = prepareBeforeWrite ? requireArrivalOwn(session, context, admitted)
+            var own = prepareBeforeWrite ? requireStartupOwn(session, context, admitted)
                     : requireOwn(session, context, admitted);
             var initialized = prepareArrival(own, membershipRevision, expectedProgressRevision, captured, fence);
             // Keep the exact claim write and the original claim, state, and cursor write order.
@@ -1887,7 +1888,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return own;
     }
 
-    private Own requireArrivalOwn(ClientSession session, SrsConsumerContext context, boolean businessChecked) {
+    private Own requireStartupOwn(ClientSession session, SrsConsumerContext context, boolean businessChecked) {
         var facts = new MongoSrsReadFacts(session, database, scope, businessChecked);
         if (businessChecked) {
             String chain = context.key().miningChainId();

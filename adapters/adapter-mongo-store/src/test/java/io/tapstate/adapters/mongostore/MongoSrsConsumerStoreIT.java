@@ -1949,6 +1949,40 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @Test void writerRegistrationReusesTheCurrentConsumerAndItsPinnedModelProof() {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            var refs = publishSnapshotModels(f, tables);
+            f.chains().requestTables(CHAIN, tables, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(
+                    new ChainPosition(SourceOrder.snapshotRow(1), "source"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"), -1)), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "source", refs);
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+            var commands = new java.util.ArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            commands.add(event.getCommandName());
+                        }
+                    }).build();
+            try (var observed = MongoClients.create(settings)) {
+                var store = runtimeConsumer(observed, observed.getDatabase(f.database().getName()));
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                commands.clear();
+                var roster = Map.of("orders", List.of("w0", "w1", "w2", "w3"));
+                assertThat(store.beginWriterRun(A, member.revision(), "jet-one", roster, f.fenceA())).isTrue();
+                System.out.println("WRITER_REGISTRATION " + commands);
+                assertThat(commands.size()).isLessThanOrEqualTo(13);
+                assertThat(f.consumers().progress(A).orElseThrow().writerRun().expected()).isEqualTo(roster);
+            }
+        });
+    }
+
     @Test
     void nodeBackedWriterUsesTheNodeLeaseAndRejectsBothOldExecutionsAndOldBoots() {
         withBusiness(f -> {
