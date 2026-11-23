@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f9524fad46e00318ebc8ab798ccd4186f316cab3
+          ref: 8031b2b71d124b8077675e0631f63a46c9f33b33
           persist-credentials: false
       - name: Verify pinned baseline, comparison and report fixtures
         run: |
@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f9524fad46e00318ebc8ab798ccd4186f316cab3
+          ref: 8031b2b71d124b8077675e0631f63a46c9f33b33
           persist-credentials: false
       - uses: actions/setup-java@v4
         with:
@@ -118,7 +118,7 @@ jobs:
       - uses: actions/checkout@v4
         if: steps.budget.outputs.run == 'true'
         with:
-          ref: f9524fad46e00318ebc8ab798ccd4186f316cab3
+          ref: 8031b2b71d124b8077675e0631f63a46c9f33b33
           persist-credentials: false
       - uses: actions/setup-java@v4
         if: steps.budget.outputs.run == 'true'
@@ -195,7 +195,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f9524fad46e00318ebc8ab798ccd4186f316cab3
+          ref: 8031b2b71d124b8077675e0631f63a46c9f33b33
           persist-credentials: false
       - uses: actions/download-artifact@v4
         continue-on-error: true
@@ -226,9 +226,15 @@ jobs:
             --output "$RUNNER_TEMP/performance-report" --jobs "$RUNNER_TEMP/performance-jobs.json" \
             --artifact-index "$RUNNER_TEMP/performance-artifacts.json"
       - uses: actions/upload-artifact@v4
+        id: report-artifact
         if: always()
         with:
           name: performance-report-${{ github.run_attempt }}
           path: ${{ runner.temp }}/performance-report
           if-no-files-found: error
           retention-days: 90
+      - name: Link the published report
+        if: always() && steps.report-artifact.outcome == 'success'
+        env:
+          REPORT_ARTIFACT_URL: ${{ steps.report-artifact.outputs.artifact-url }}
+        run: printf '\n[Download report.json and report.md](%s)\n' "$REPORT_ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
