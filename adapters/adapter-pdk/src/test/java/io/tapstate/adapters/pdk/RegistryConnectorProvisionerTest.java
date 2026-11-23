@@ -84,6 +84,37 @@ class RegistryConnectorProvisionerTest {
     }
 
     @Test
+    void stagingACaptureArtifactRechecksTheSelectedRegistrationWithAnotherStartupRead(@TempDir Path dir) throws IOException {
+        byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
+        var registry = org.mockito.Mockito.spy(new InMemoryConnectorRegistry());
+        var registration = registry.register("orders", "1.3.5", RegistrationSource.SEED, bytes).registration();
+        Path seeds = Files.createDirectories(dir.resolve("seeds"));
+        Files.write(seeds.resolve("orders-connector.jar"), bytes);
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"), seeds);
+        org.mockito.Mockito.doReturn(List.of(registration), List.of()).when(registry).findAllForCaptureStartup("orders");
+        assertSafeLoadFailure(() -> provisioner.resolveCaptureStartup("orders"));
+        org.mockito.Mockito.verify(registry, org.mockito.Mockito.times(2)).findAllForCaptureStartup("orders");
+    }
+
+    @Test
+    void warmCaptureStartupAdmitsVerifiedSeedWithOneFreshRegistrationRead(@TempDir Path dir) throws IOException {
+        byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
+        var registry = org.mockito.Mockito.spy(new InMemoryConnectorRegistry());
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, bytes);
+        Path seeds = Files.createDirectories(dir.resolve("seeds"));
+        Files.write(seeds.resolve("orders-connector.jar"), bytes);
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"), seeds);
+        var first = provisioner.resolveCaptureStartup("orders");
+        org.mockito.Mockito.clearInvocations(registry);
+        assertThat(provisioner.resolveCaptureStartup("orders")).isEqualTo(first);
+        org.mockito.Mockito.verify(registry).findAllForCaptureStartup("orders");
+        org.mockito.Mockito.doReturn(List.of()).when(registry).findAllForCaptureStartup("orders");
+        assertThatThrownBy(() -> provisioner.resolveCaptureStartup("orders"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_REGISTERED));
+    }
+
+    @Test
     void captureStartupReusesInspectionOnlyForARegisteredAndVerifiedArtifact(@TempDir Path dir) throws IOException {
         byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
         var registry = new InMemoryConnectorRegistry();

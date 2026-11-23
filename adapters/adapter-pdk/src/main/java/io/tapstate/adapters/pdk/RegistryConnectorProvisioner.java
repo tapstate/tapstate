@@ -115,18 +115,26 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     }
 
     @Override public ConnectorRef resolveCaptureStartup(String connectorId) {
-        return materialize(connectorId, selectRegistration(connectorId, registry.findAll(connectorId)), false);
+        String hint;
+        synchronized (stagedHints) { hint = stagedHints.get(connectorId); }
+        var verified = hint == null ? null : verifiedStagedPath(connectorId, hint);
+        var registration = selectRegistration(connectorId, registry.findAllForCaptureStartup(connectorId));
+        var result = verified != null && hint.equals(registration.contentHash())
+                ? loaded(connectorId, registration, verified, false)
+                : materialize(connectorId, registration, false, false, true);
+        rememberStaged(connectorId, result.contentHash());
+        return result;
     }
 
     @Override public ConnectorRef revalidateCaptureStartup(String connectorId, ConnectorRef captured) {
         var hash = captured.contentHash();
         if (hash == null || !hash.matches("[a-f0-9]{64}")) return ConnectorProvisioner.super.revalidateCaptureStartup(connectorId, captured);
-        var matches = registry.findAll(connectorId).stream()
+        var matches = registry.findAllForCaptureStartup(connectorId).stream()
                 .filter(row -> connectorId.equals(row.connectorId()) && hash.equals(row.contentHash())).toList();
         if (matches.size() != 1) throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
         var target = cacheDir.resolve(hash + ".jar");
         if (!captured.classpath().equals(List.of(target)) || !Files.exists(target))
-            return materialize(connectorId, matches.getFirst(), true);
+            return materialize(connectorId, matches.getFirst(), true, false, true);
         validatedCache(connectorId, hash, target);
         return captured;
     }
@@ -157,11 +165,17 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
         return materialize(connectorId, registration, retainedHash, false);
     }
     private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash, boolean defaultTest) {
+        return materialize(connectorId, registration, retainedHash, defaultTest, false);
+    }
+
+    private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash,
+            boolean defaultTest, boolean startup) {
         Path staged = stage(connectorId, registration.contentHash());
         if (seedDir != null) {
             // Local bytes grant no authority: recheck the original selector after staging.
             // A retained hash can coexist with other versions; ID-only resolution cannot.
-            List<ConnectorRegistration> current = registry.findAll(connectorId).stream()
+            var registrations = startup ? registry.findAllForCaptureStartup(connectorId) : registry.findAll(connectorId);
+            List<ConnectorRegistration> current = registrations.stream()
                     .filter(candidate -> !retainedHash || candidate.contentHash().equals(registration.contentHash())).toList();
             if (current.size() != 1 || !current.getFirst().equals(registration))
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);

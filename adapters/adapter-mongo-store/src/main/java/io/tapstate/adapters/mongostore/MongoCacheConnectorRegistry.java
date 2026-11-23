@@ -53,6 +53,7 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
+    private final MongoDatabase database;
     private final CacheBusinessScope scope;
     private final Runnable ownerOpen;
     private final Runnable requireActive;
@@ -61,6 +62,7 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
     private final MongoCollection<Document> chunks;
 
     MongoCacheConnectorRegistry(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable ownerOpen, Runnable requireActive) {
+        this.database = Objects.requireNonNull(database, "database");
         this.client = Objects.requireNonNull(client, "client"); this.scope = Objects.requireNonNull(scope, "scope");
         this.ownerOpen = Objects.requireNonNull(ownerOpen, "ownerOpen"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.access = new MongoCacheMetadataAccess(client, database, scope, SystemCollections.CACHE_CONNECTOR_ARTIFACTS, this::active);
@@ -152,6 +154,40 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
 
     @Override public List<ConnectorRegistration> list() { return registrations(null); }
     @Override public List<ConnectorRegistration> findAll(String connectorId) { return registrations(Objects.requireNonNull(connectorId, "connectorId")); }
+    @Override public List<ConnectorRegistration> findAllForCaptureStartup(String connectorId) {
+        Objects.requireNonNull(connectorId, "connectorId");
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return findAll(connectorId);
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            active();
+            var filter = publishedFilter().append("metadata.connectorId", connectorId);
+            var files = access.collection.withReadConcern(ReadConcern.SNAPSHOT).withReadPreference(ReadPreference.primary());
+            // The registration's filter and filename order use the original files collection's collation.
+            var captured = files.aggregate(List.of(new Document("$match", filter),
+                    new Document("$sort", new Document("filename", 1)), new Document("$limit", 65),
+                    new Document("$project", new Document("_id", 0).append("value", MongoStartConfigRead.boundedValue())),
+                    new Document("$facet", new Document("registrations", List.of(new Document("$match", new Document())))),
+                    MongoStartConfigRead.boundedLookup(SystemCollections.CACHE_IDENTITY, "identity", "cluster"),
+                    MongoStartConfigRead.boundedLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"))).first();
+            var identity = MongoStartConfigRead.boundedRow(captured, "identity", "cluster");
+            var schema = MongoStartConfigRead.boundedRow(captured, "schema", "business");
+            if (identity == null || schema == null) return findAll(connectorId);
+            MongoCacheBusinessIdentity.requireObservedAdmission(identity, schema, scope);
+            var rows = captured.getList("registrations", Document.class);
+            if (rows.size() > 64 || rows.stream().anyMatch(value -> !(value.get("value") instanceof Document)))
+                return findAll(connectorId);
+            var registrations = new ArrayList<ConnectorRegistration>();
+            var hashes = new HashSet<String>();
+            for (var value : rows) {
+                var stored = decode(value.get("value", Document.class));
+                if (!connectorId.equals(stored.registration().connectorId())) return findAll(connectorId);
+                if (!hashes.add(stored.registration().contentHash())) throw unreadable(stored.registration().contentHash());
+                registrations.add(stored.registration());
+            }
+            active();
+            return List.copyOf(registrations);
+        }));
+    }
+
     private List<ConnectorRegistration> registrations(String connectorId) {
         return access.read(session -> {
             Document filter = publishedFilter();
