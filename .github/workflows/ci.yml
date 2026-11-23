@@ -1,13 +1,9 @@
 name: CI
-run-name: Pipeline Performance | Review verification | ${{ inputs.fail_java_setup && 'setup failure' || 'Copy latency' }}
+run-name: Pipeline Performance | Review verification | Formal batches
 
 on:
   workflow_dispatch:
     inputs:
-      fail_java_setup:
-        description: Request an unavailable Java version in the measurement job
-        type: boolean
-        default: false
       mode:
         description: Selection mode for the branch or tag chosen in the dispatch form
         type: choice
@@ -74,37 +70,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/performance-run.json"
-      - name: Allocate a bounded Copy latency qualification case
+      - name: Select and allocate formal cases
         id: prepare
         run: |
-          set -euo pipefail
-          export PERF_INPUT_DIR="$RUNNER_TEMP/performance-inputs"
-          mkdir -p "$PERF_INPUT_DIR"
-          python3 -B - <<'PYTHON'
-          import os
-          from pathlib import Path
-          import sys
-          sys.path.insert(0, 'benchmarks')
-          import actions_run, baseline, catalog, runner
-          output = Path(os.environ['PERF_INPUT_DIR'])
-          attempt = runner.github_attempt()
-          run = catalog.read_json(output.parent / 'performance-run.json')
-          receipt = baseline.pin(output, actions_run.RUNNER_PROFILE)
-          runner.write_json(output / 'baseline-receipt.json', receipt)
-          runner.write_json(output / 'run.json', {'github_attempt': attempt, 'scope': 'qualification',
-                            'baseline_receipt_sha256': catalog.digest(receipt),
-                            'timing': actions_run.run_timing(run, None)})
-          runner.write_json(output.parent / 'qualification-estimates.json', {
-              'environment': actions_run.RUNNER_PROFILE,
-              'durations_seconds': {'copy.live.basic.standard': 480},
-          })
-          PYTHON
-          python3 -B benchmarks/runner.py allocate --id 'copy.live.basic.standard@1' \
-            --rows 1000 --rate 5 --warmup-seconds 10 --measurement-seconds 120 --timeout-seconds 120 \
-            --repeats 1 --environment ubuntu-24.04-x64-op --slots 1 --batch-seconds 1200 \
-            --deadline-seconds 1800 --reserve-seconds 600 --bind-github-attempt \
-            --estimates "$RUNNER_TEMP/qualification-estimates.json" --output "$PERF_INPUT_DIR/manifest.json"
-          printf 'batches=[0]\nmeasurement_stop=%s\n' "$(($(date +%s) + 1800))" >> "$GITHUB_OUTPUT"
+          python3 -B benchmarks/actions_run.py \
+            --workloads benchmarks/cases/formal-workloads.json \
+            --estimates benchmarks/cases/hosted-runner-estimates.json \
+            --run "$RUNNER_TEMP/performance-run.json" \
+            --output "$RUNNER_TEMP/performance-inputs"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -155,7 +128,7 @@ jobs:
         if: steps.budget.outputs.run == 'true'
         with:
           distribution: temurin
-          java-version: ${{ inputs.fail_java_setup && '0.0.0' || '21.0.13+9.0.LTS' }}
+          java-version: '21.0.13+9.0.LTS'
           cache: maven
       - uses: actions/download-artifact@v4
         if: steps.budget.outputs.run == 'true'
