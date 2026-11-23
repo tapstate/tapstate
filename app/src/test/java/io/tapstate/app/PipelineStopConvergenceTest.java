@@ -49,6 +49,7 @@ class PipelineStopConvergenceTest {
         var listed = new AtomicReference<>(held);
         var entered = new CountDownLatch(4);
         var release = new CountDownLatch(1);
+        var ioMonitors = new ConcurrentHashMap<String, Object>();
         var actual = new InMemoryStateStore();
         var calls = new ConcurrentHashMap<String, AtomicInteger>();
         Set<String> cleared = ConcurrentHashMap.newKeySet();
@@ -64,7 +65,7 @@ class PipelineStopConvergenceTest {
         });
         when(intents.loadForActuation(anyString())).thenAnswer(call -> {
             String id = call.getArgument(0);
-            if (blockedAt == Hold.INTENT_READ && held.contains(id)) hold(entered, release);
+            if (blockedAt == Hold.INTENT_READ && held.contains(id)) hold(ioMonitors, id, entered, release);
             var scope = new PipelineIntentScope("cluster", 1, "cache", id, 1);
             return Optional.of(new PipelineIntentSnapshot(scope, 1,
                     new DesiredState(id, PipelineState.STOPPED, "definition", blockedAt == Hold.PURGE_CLOSE && !cleared.contains(id))));
@@ -77,7 +78,8 @@ class PipelineStopConvergenceTest {
         when(ownership.enterPass(any())).thenReturn(mock(PipelineActuationOwnership.Pass.class));
         StateStore scopedState = spy(actual);
         doAnswer(call -> {
-            if (blockedAt == Hold.STATE_WRITE && held.contains(call.getArgument(0))) hold(entered, release);
+            String id = call.getArgument(0);
+            if (blockedAt == Hold.STATE_WRITE && held.contains(id)) hold(ioMonitors, id, entered, release);
             return call.callRealMethod();
         }).when(scopedState).compareAndSwap(anyString(), anyLong(), anyString(), any());
         when(states.pipelineStates(any())).thenReturn(scopedState);
@@ -86,7 +88,8 @@ class PipelineStopConvergenceTest {
         doAnswer(call -> {
             String id = call.getArgument(0);
             calls.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
-            if ((blockedAt == Hold.TARGET_CLOSE || blockedAt == Hold.PURGE_CLOSE) && held.contains(id)) hold(entered, release);
+            if ((blockedAt == Hold.TARGET_CLOSE || blockedAt == Hold.PURGE_CLOSE) && held.contains(id))
+                hold(ioMonitors, id, entered, release);
             return null;
         }).when(actuator).stop(anyString(), eq(false));
         doAnswer(call -> { cleared.add(call.getArgument(0)); return null; }).when(actuator).clearStopped(anyString());
@@ -128,8 +131,11 @@ class PipelineStopConvergenceTest {
         return ids.stream().allMatch(id -> state.read(id).orElseThrow().stateJson().equals(StateJson.of(PipelineState.STOPPED)));
     }
 
-    private static void hold(CountDownLatch entered, CountDownLatch release) throws InterruptedException {
-        entered.countDown();
-        assertThat(release.await(25, TimeUnit.SECONDS)).isTrue();
+    private static void hold(ConcurrentHashMap<String, Object> monitors, String id,
+            CountDownLatch entered, CountDownLatch release) throws InterruptedException {
+        synchronized (monitors.computeIfAbsent(id, ignored -> new Object())) {
+            entered.countDown();
+            assertThat(release.await(25, TimeUnit.SECONDS)).isTrue();
+        }
     }
 }

@@ -767,6 +767,44 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void aMaintenanceCloseDoesNotBlockAccessToAnIndependentPipeline() throws Exception {
+        var allowClose = new CountDownLatch(1);
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100));
+                var calls = Executors.newSingleThreadExecutor()) {
+            try {
+                pendingTailFailure(f, allowClose);
+                var other = new PipelineIntentScope("cluster", BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "independent", 1);
+                var checked = calls.submit(() -> f.coordinator.hasScope(other));
+                assertThat(checked.get(1, TimeUnit.SECONDS)).isFalse();
+            } finally { allowClose.countDown(); }
+        }
+    }
+
+    @Test void failedStartCleanupLeavesTheSharedCaptureRegistryAvailable() throws Exception {
+        var closeEntered = new CountDownLatch(1);
+        var allowClose = new CountDownLatch(1);
+        var refused = new IllegalStateException("original second source refused its opening");
+        var captured = healthyCaptureRun();
+        try (var f = new Fixture(List.of("left", "right"), 2); var calls = Executors.newFixedThreadPool(2)) {
+            doReturn(captured).doThrow(refused).when(f.runtime).beginSnapshotOnly(any(), anyLong(), any(), any(), any());
+            doAnswer(call -> {
+                closeEntered.countDown();
+                assertThat(allowClose.await(5, TimeUnit.SECONDS)).isTrue();
+                return null;
+            }).when(f.runtime).stopSnapshot(same(captured));
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            var original = calls.submit(() -> run.startCapture("flow", f.snapshot(), f.models()));
+            try {
+                assertThat(closeEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                var other = new PipelineIntentScope("cluster", BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "independent", 1);
+                assertThat(calls.submit(() -> f.coordinator.hasScope(other)).get(1, TimeUnit.SECONDS)).isFalse();
+                assertThat(original).isNotDone();
+            } finally { allowClose.countDown(); }
+            assertThatThrownBy(() -> original.get(5, TimeUnit.SECONDS)).hasCause(refused);
+            assertThat(run.isCapturing("flow")).isFalse();
+        }
+    }
+
     @Test void anExpiredLocalProofFallsBackWhileFullAuthorityStillStands() {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);

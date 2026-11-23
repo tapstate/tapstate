@@ -12,8 +12,10 @@ final class PipelineConvergences implements AutoCloseable {
 
     private final PeriodicObservations work;
     private final Set<String> activeStops = new HashSet<>();
+    // A connector may hold a JVM monitor while blocked in I/O. Keep it off both the four
+    // convergence slots and the virtual-thread carriers used by other runtime work.
     private final java.util.concurrent.ExecutorService stopOperations = Executors.newThreadPerTaskExecutor(
-            Thread.ofVirtual().name("tapstate-pipeline-stop-", 1).factory());
+            Thread.ofPlatform().daemon(true).name("tapstate-pipeline-stop-", 1).factory());
     private boolean closing;
 
     PipelineConvergences() {
