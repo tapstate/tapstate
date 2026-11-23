@@ -266,6 +266,20 @@ public final class MongoSrsChainStore implements SrsChainStore {
         return state(session, row, businessChecked, new MongoSrsReadFacts(session, database, scope, row, businessChecked));
     }
 
+    SrsChainState startupState(ClientSession session, Document row, boolean businessChecked) {
+        return startupState(session, row, new MongoSrsReadFacts(session, database, scope, row, businessChecked), businessChecked);
+    }
+
+    SrsChainState startupState(ClientSession session, Document row, MongoSrsReadFacts facts) {
+        return startupState(session, row, facts, true);
+    }
+
+    private SrsChainState startupState(ClientSession session, Document row, MongoSrsReadFacts facts, boolean businessChecked) {
+        var control = decode(row);
+        facts.prefetchStartupCheckpoint(row, control.checkpoint());
+        return state(session, row, businessChecked, facts);
+    }
+
     SrsChainState state(ClientSession session, Document row, boolean businessChecked, MongoSrsReadFacts facts) {
         SrsChainState state = decode(row);
         if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked, facts);

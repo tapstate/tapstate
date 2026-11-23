@@ -581,6 +581,128 @@ class MongoCapturePreparationsIT {
         });
     }
 
+    @Test void preparedCaptureAdmissionUsesFourCommandsAndKeepsOwnershipAndHistoryFences() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var first = f.preparations().createFirst(f.issue(f.request));
+            var key = first.claim().key();
+            var claims = f.claims();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                assertThat(claims.acquire(key, OWNER, 1, TTL).acquired()).isTrue();
+            } finally { MongoCommandObservation.CURRENT.remove(); }
+            assertThat(commands).containsExactly("aggregate", "update", "findAndModify", "commitTransaction");
+            assertThat(claims.acquire(key, new WorkloadOwner("node-b", "boot-b"), 1, TTL).acquired()).isFalse();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache).updateOne(new Document("_id", MongoWorkloadClaimStore.id(key)),
+                    new Document("$unset", new Document("capturePreparation", "")));
+            var root = SystemCollections.CACHE_IDENTITY.on(f.cache).find(new Document("_id", "cluster")).first();
+            assertThatThrownBy(() -> claims.acquire(key, OWNER, 1, TTL)).isInstanceOf(TapstateException.class);
+            assertThat(SystemCollections.CACHE_IDENTITY.on(f.cache).find(new Document("_id", "cluster")).first()).isEqualTo(root);
+            System.out.println("CAPTURE_ADMISSION commands=" + commands);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(longs = {-1, 0})
+    void retainedSharedCaptureLoadBatchesOriginalCheckpointProof(long sequence) {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var first = f.preparations().createFirst(f.issue(f.request));
+            var owned = f.claims().acquire(first.claim().key(), OWNER, 1, TTL).claim();
+            var fence = WorkloadClaimFence.from(owned);
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var chain = first.preparation().chainId();
+            stores.chains().requestTables(chain, Set.of("orders"), fence);
+            stores.chains().openEpoch(chain, 0, fence).orElseThrow();
+            var key = new SrsModelKey(chain, "orders", f.scope.cacheIncarnation(), 1, 0);
+            String ring = "srs." + chain + ".orders";
+            stores.models().publish(new SrsModel(key, ring, new SourceTable("orders",
+                    List.of(new SourceField("id", "integer")), List.of("id"), List.of()), 0), fence);
+            assertThat(stores.chains().publishServingTables(chain, 1, Set.of("orders"), fence)).isTrue();
+            stores.log().store(ring, 0, new SrsLogRecord("position-0", io.tapstate.core.event.Op.INSERT, 1,
+                    null, Map.of("id", 1), 0, fence, 1));
+            var checkpoint = new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(
+                    new io.tapstate.core.event.SourceOrder(1, 0), "position-0"), Map.of("orders", new SrsTableCheckpoint(key, sequence)));
+            stores.chains().checkpoint(chain, 0, checkpoint, fence).orElseThrow();
+            var expected = f.preparations().load(first.preparation());
+            var commands = new ArrayList<String>();
+            var targets = new ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                    var target = event.getCommand().get(event.getCommandName());
+                    targets.add(event.getCommandName() + " " + (target != null && target.isString() ? target.asString().getValue() : "-"));
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(CACHE.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                commands.clear(); targets.clear();
+                var store = new MongoCaptureCachePreparations(observed, observed.getDatabase(f.cache.getName()),
+                        f.scope, MongoStorageBindingStore.targetFingerprint(f.connection), ACTIVE, f.domain.rateRetention());
+                assertThat(store.load(first.preparation())).isEqualTo(expected);
+                int optimizedCount = commands.size();
+                System.out.println("CAPTURE_RETAINED_LOAD sequence=" + sequence + " commands=" + optimizedCount + " targets=" + targets);
+                commands.clear(); targets.clear();
+                try (var session = observed.startSession()) {
+                    session.withTransaction(() -> {
+                        var database = observed.getDatabase(f.cache.getName());
+                        new MongoCacheBusinessIdentity(database, f.scope).requireAdmissionState(session);
+                        var rawClaim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                                new Document("_id", MongoWorkloadClaimStore.id(first.claim().key()))).first();
+                        assertThat(MongoCaptureCachePreparations.requirePreparation(rawClaim, first.claim().key(), f.scope))
+                                .isEqualTo(first.preparation());
+                        var retainedFence = WorkloadClaimFence.from(new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database))
+                                .inStrictSession(session).decodeStored(rawClaim));
+                        var root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
+                        var retainedChain = new MongoSrsChainStore(observed, database, f.scope).state(session, root);
+                        assertThat(new CaptureCacheState(first.preparation(), retainedFence, Optional.of(retainedChain))).isEqualTo(expected);
+                        return null;
+                    }, TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
+                            .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build());
+                }
+                System.out.println("CAPTURE_RETAINED_LOAD sequence=" + sequence + " baseline=" + commands.size() + " targets=" + targets);
+                assertThat(optimizedCount).isEqualTo(sequence == -1 ? 2 : 7);
+                assertThat(commands).hasSize(sequence == -1 ? 10 : 15);
+                for (var dependency : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_LOG_BOUNDS)) {
+                    var record = dependency.on(f.cache).findOneAndDelete(new Document());
+                    try {
+                        assertThatThrownBy(() -> store.load(first.preparation())).isInstanceOf(TapstateException.class);
+                    } finally {
+                        dependency.on(f.cache).insertOne(record);
+                    }
+                    assertThat(store.load(first.preparation())).isEqualTo(expected);
+                }
+                SystemCollections.SRS_EVENTS.on(f.cache).deleteMany(new Document());
+                if (sequence == 0) assertThatThrownBy(() -> store.load(first.preparation())).isInstanceOf(TapstateException.class);
+                else assertThat(store.load(first.preparation())).isEqualTo(expected);
+            }
+        });
+    }
+
+    @Test void retainedSharedCaptureLoadReadsAdmissionClaimAndRootTogether() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var first = f.preparations().createFirst(f.issue(f.request));
+            var commands = new ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(CACHE.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                commands.clear();
+                var store = new MongoCaptureCachePreparations(observed, observed.getDatabase(f.cache.getName()),
+                        f.scope, MongoStorageBindingStore.targetFingerprint(f.connection), ACTIVE, f.domain.rateRetention());
+                assertThat(store.load(first.preparation())).isEqualTo(first);
+                assertThat(commands).containsExactly("aggregate");
+                var root = SystemCollections.SRS_CHAINS.on(f.cache);
+                root.updateOne(new Document("_id", first.preparation().chainId()),
+                        new Document("$set", new Document("checkpoint", new Document("invalid", true))));
+                assertThatThrownBy(() -> store.load(first.preparation())).isInstanceOf(TapstateException.class);
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache).deleteOne(new Document("_id", MongoWorkloadClaimStore.id(first.claim().key())));
+                assertCode(() -> store.load(first.preparation()), IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            }
+        });
+    }
+
     @Test void retainedCaptureConfigUsesOneSnapshotPerReadWithFreshSourceValidation() {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var retained = f.issue(f.request).preparation();

@@ -117,6 +117,19 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         if (existing.leased() && key.type() == WorkloadClaimType.PIPELINE_ACTUATION
                 && key.clusterId().equals(existing.claim().owner().nodeId()) && nodeBacked(stored(key)))
             return WorkloadClaimAttempt.refused(existing.claim());
+        return acquireExisting(key, owner, topologyRevision, ttl, existing);
+    }
+
+    WorkloadClaimAttempt acquireRetainedCapture(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision,
+            Duration ttl, Document observed) {
+        validate(key, owner, topologyRevision, ttl);
+        if (session == null || !strict || key.type() != WorkloadClaimType.CAPTURE)
+            throw new IllegalStateException("retained capture admission requires its original transaction");
+        return acquireExisting(key, owner, topologyRevision, ttl, reading(observed));
+    }
+
+    private WorkloadClaimAttempt acquireExisting(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision,
+            Duration ttl, WorkloadClaimReading existing) {
         Document eligible = new Document("_id", id(key)).append("$or", List.of(ownerFilter(owner),
                 new Document("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")))));
         Document updated = findOneAndUpdate(eligible, acquirePipeline(key, owner, topologyRevision, ttl), false);

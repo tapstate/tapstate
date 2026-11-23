@@ -215,7 +215,7 @@ final class MongoSrsReadFacts {
     }
 
     private void requireSession(ClientSession original, MongoDatabase selected) {
-        if (session != original || database != selected || !session.hasActiveTransaction())
-            throw new IllegalStateException("checkpoint facts require their original active transaction callback");
+        if (session != original || database != selected || !session.hasActiveTransaction() && !session.getOptions().isSnapshot())
+            throw new IllegalStateException("checkpoint facts require their original snapshot session");
     }
 }

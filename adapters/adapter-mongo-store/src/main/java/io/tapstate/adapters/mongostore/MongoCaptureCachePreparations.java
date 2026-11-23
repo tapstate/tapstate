@@ -273,7 +273,39 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             return new Control(original,claim,epoch,serves);
         });
     }
-    @Override public CaptureCacheState load(CapturePreparation original){Objects.requireNonNull(original,"original");requireScope(original);return transaction(() -> {},session -> loadInSession(session,original));}
+    @Override public CaptureCacheState load(CapturePreparation original) {
+        Objects.requireNonNull(original, "original"); requireScope(original);
+        if (original.mode() != CapturePreparation.Mode.SHARED_SRS || original.replacement())
+            return transaction(() -> {}, session -> loadInSession(session, original));
+        if (MongoCaptureStartupRows.supportsReadSnapshot(client, database))
+            return MongoCaptureStartupRows.readSnapshot(client, active, session -> loadStartup(session, original));
+        return transaction(() -> {}, false, session -> loadStartup(session, original));
+    }
+
+    private CaptureCacheState loadStartup(ClientSession session, CapturePreparation original) {
+        var key = new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.CAPTURE, original.captureId());
+        var id = MongoWorkloadClaimStore.id(key);
+        var joined = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                new Document("$match", new Document("_id", "cluster")),
+                new Document("$project", new Document("identity", "$$ROOT")),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", id),
+                MongoCaptureStartupRows.lookup(SystemCollections.SRS_CHAINS, "chain", original.chainId()))).first();
+        if (joined != null && (!"cluster".equals(joined.get("identity", Document.class).get("_id"))
+                || MongoCaptureStartupRows.ambiguous(joined, "schema", "business")
+                || MongoCaptureStartupRows.ambiguous(joined, "claim", id)
+                || MongoCaptureStartupRows.ambiguous(joined, "chain", original.chainId()))) {
+            new MongoCacheBusinessIdentity(database, scope).requireAdmissionState(session);
+            return loadInSession(session, original);
+        }
+        MongoCacheBusinessIdentity.requireObservedAdmission(joined == null ? null : joined.get("identity", Document.class),
+                MongoCaptureStartupRows.get(joined, "schema"), scope);
+        var claim = captureFence(session, original, MongoCaptureStartupRows.get(joined, "claim"));
+        var root = MongoCaptureStartupRows.get(joined, "chain");
+        if (root == null || !original.captureId().equals(root.get("captureId"))) throw history(original);
+        var chain = new MongoSrsChainStore(client, database, scope).startupState(session, root, true);
+        return new CaptureCacheState(original, claim, Optional.of(chain));
+    }
     private CaptureCacheState loadInSession(ClientSession session,CapturePreparation original) {
         var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,original.captureId());
         var row=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
@@ -326,11 +358,14 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         });
     }
     private <T>T transaction(Runnable originalActive,Function<ClientSession,T> body) {
+        return transaction(originalActive, true, body);
+    }
+    private <T>T transaction(Runnable originalActive, boolean checkAdmission, Function<ClientSession,T> body) {
         return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
                 active.run();originalActive.run();
                 try(var session=client.startSession()) {
-                    var result=session.withTransaction(() -> {MongoStructureFailureScope.beginCallback();active.run();originalActive.run();new MongoCacheBusinessIdentity(database,scope).requireAdmissionState(session);var value=body.apply(session);active.run();originalActive.run();return value;},TRANSACTION);
+                    var result=session.withTransaction(() -> {MongoStructureFailureScope.beginCallback();active.run();originalActive.run();if(checkAdmission)new MongoCacheBusinessIdentity(database,scope).requireAdmissionState(session);var value=body.apply(session);active.run();originalActive.run();return value;},TRANSACTION);
                     active.run();originalActive.run();return result;
                 }
             }catch(RuntimeException failure){active.run();originalActive.run();throw failure;}

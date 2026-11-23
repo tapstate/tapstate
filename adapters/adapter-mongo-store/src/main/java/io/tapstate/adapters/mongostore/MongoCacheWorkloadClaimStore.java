@@ -161,16 +161,19 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireKey(key);
         if (key.type() == WorkloadClaimType.PIPELINE_ACTUATION) throw MongoCacheBusinessIdentity.businessFenced();
+        if (key.type() == WorkloadClaimType.CAPTURE) {
+            return transaction((session, budget) -> {
+                var row = new MongoCacheBusinessIdentity(database, scope).admitRetainedCapture(session, key);
+                if (row == null) throw MongoCapturePreparationFacts.history(key.resourceId());
+                MongoCaptureCachePreparations.requirePreparation(row, key, scope);
+                return raw.inStrictSession(session).acquireRetainedCapture(key, owner, topologyRevision, ttl, row);
+            }, null);
+        }
         return transaction(true, (store, session) -> {
             if (key.type() == WorkloadClaimType.VALIDATION) {
                 var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
                 requireValidationClaim(session, row, key);
                 return store.acquireExisting(key, owner, topologyRevision, ttl);
-            }
-            if(key.type()==WorkloadClaimType.CAPTURE) {
-                var row=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
-                if(row==null)throw MongoCapturePreparationFacts.history(key.resourceId());
-                MongoCaptureCachePreparations.requirePreparation(row,key,scope);return store.acquireExisting(key,owner,topologyRevision,ttl);
             }
             return store.acquire(key,owner,topologyRevision,ttl);
         });
