@@ -68,7 +68,7 @@ class MongoPipelineIntentStoreIT {
             var store = domain.intents();
             var desired = intent(PipelineState.RUNNING, false, false, null);
             var inputs = new io.tapstate.spi.store.PipelinePreparationInputs(HASH, Map.of(), Map.of(), List.of());
-            var valid = Map.<String, Object>of("id", "doc-42", "field", "revision");
+            var valid = Map.<String, Object>of("id", "orders v2/archive:2026", "field", "source[0].tables[1].name");
             assertThat(store.compareAndSetStart(scope, 0, desired, inputs)).isTrue();
             store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE, valid);
             assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailureParams())

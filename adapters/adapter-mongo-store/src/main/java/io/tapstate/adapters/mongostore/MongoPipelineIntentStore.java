@@ -27,6 +27,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 
 /** Latest configuration intent, state mapping contention and authoring version share one transaction. */
 final class MongoPipelineIntentStore implements PipelineIntentStore {
@@ -38,6 +39,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     private static final String PREPARATION = "startPreparation";
     private static final String FAILURE = "startFailure";
     private static final String FAILURE_PARAMS = "startFailureParams";
+    private static final Pattern DOCUMENT_FIELD = Pattern.compile("[\\p{L}\\p{Nd}._-]+(?:\\[[0-9]+\\][\\p{L}\\p{Nd}._-]*)*");
     private final MongoClient client;
     private final MongoDatabase database;
     private final MongoCollection<Document> intents;
@@ -313,13 +315,16 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
 
     private static boolean validDocumentParams(Map<String, Object> params) {
         return params.keySet().equals(IoError.DOCUMENT_UNREADABLE.placeholders())
-                && params.values().stream().allMatch(MongoPipelineIntentStore::boundedIdentifier);
+                && params.get("id") instanceof String id && boundedText(id) && !id.contains("://")
+                && params.get("field") instanceof String field && boundedText(field) && DOCUMENT_FIELD.matcher(field).matches();
     }
 
-    private static boolean boundedIdentifier(Object value) {
-        return value instanceof String text && !text.isEmpty() && text.length() <= 256
+    private static boolean boundedText(String text) {
+        return !text.isBlank() && text.length() <= 256
                 && text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 256
-                && text.codePoints().allMatch(c -> Character.isLetterOrDigit(c) || c == '.' || c == '_' || c == '-');
+                && text.codePoints().noneMatch(cp -> Character.isISOControl(cp)
+                        || Character.getType(cp) == Character.LINE_SEPARATOR
+                        || Character.getType(cp) == Character.PARAGRAPH_SEPARATOR);
     }
 
     @Override public boolean remove(PipelineIntentScope scope, long expected) { return change(scope, expected, null); }
