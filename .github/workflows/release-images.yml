@@ -12,6 +12,9 @@ on:
       release-version:
         required: true
         type: string
+      onprem-only:
+        type: boolean
+        default: false
     secrets:
       RELEASE_SATELLITE_TOKEN:
         required: true
@@ -209,6 +212,7 @@ jobs:
           if-no-files-found: error
 
   cloud-server-jar:
+    if: ${{ !inputs.onprem-only }}
     # Cloud and on-prem share the same server revision but not the same Web bundle. The Cloud Web
     # profile consumes the Cluster cookie session and compiles its Console return URL into static
     # assets, so reusing the ordinary Boot JAR would silently ship on-prem login behavior.

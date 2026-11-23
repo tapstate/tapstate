@@ -10,6 +10,10 @@ on:
         description: Run only the full reactor regression for the selected branch
         type: boolean
         default: false
+      candidate-op-web-sha:
+        description: Build the on-prem release artifacts only, using this exact Web commit
+        type: string
+        default: ''
       connector-inputs:
         description: Connector input policy
         type: choice
@@ -21,19 +25,20 @@ permissions:
 
 jobs:
   reactor-regression:
+    if: ${{ !inputs.candidate-op-web-sha }}
     uses: ./.github/workflows/reactor-regression.yml
     with:
       source-sha: ${{ github.sha }}
 
   prepare:
-    if: ${{ !inputs.reactor-only }}
+    if: ${{ inputs.candidate-op-web-sha || !inputs.reactor-only }}
     runs-on: ubuntu-latest
     outputs:
       web-sha: ${{ steps.inputs.outputs.web-sha }}
       version: ${{ steps.inputs.outputs.version }}
     steps:
       - name: Require the default branch for the Cloud build environment
-        if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+        if: ${{ !inputs.candidate-op-web-sha && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
         run: |
           echo "::error::Run Nightly Test from the default branch to access the protected Cloud build inputs."
           exit 1
@@ -44,10 +49,14 @@ jobs:
         id: inputs
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          CANDIDATE_OP_WEB_SHA: ${{ inputs.candidate-op-web-sha }}
         run: |
           set -euo pipefail
-          web_branch="$(gh api repos/tapstate/tapstate-web --jq .default_branch)"
-          web_sha="$(gh api "repos/tapstate/tapstate-web/git/ref/heads/$web_branch" --jq .object.sha)"
+          web_sha="$CANDIDATE_OP_WEB_SHA"
+          if [[ -z "$web_sha" ]]; then
+            web_branch="$(gh api repos/tapstate/tapstate-web --jq .default_branch)"
+            web_sha="$(gh api "repos/tapstate/tapstate-web/git/ref/heads/$web_branch" --jq .object.sha)"
+          fi
           [[ "$web_sha" =~ ^[0-9a-f]{40}$ ]]
           version="$(python3 -c 'import xml.etree.ElementTree as e; print(e.parse("pom.xml").findtext("./{*}properties/{*}revision"))')"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -57,6 +66,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   real-connectors:
+    if: ${{ !inputs.candidate-op-web-sha }}
     needs: prepare
     uses: ./.github/workflows/real-connectors.yml
     with:
@@ -68,6 +78,7 @@ jobs:
       TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}
 
   join-perf:
+    if: ${{ !inputs.candidate-op-web-sha }}
     needs: prepare
     permissions:
       contents: read
@@ -78,6 +89,7 @@ jobs:
       trend-workflow: nightly-test.yml
 
   cli-native:
+    if: ${{ !inputs.candidate-op-web-sha }}
     needs: prepare
     uses: ./.github/workflows/cli-native.yml
     with:
@@ -90,12 +102,14 @@ jobs:
     with:
       source-sha: ${{ github.sha }}
       web-sha: ${{ needs.prepare.outputs.web-sha }}
+      onprem-only: ${{ inputs.candidate-op-web-sha != '' }}
       release-version: ${{ needs.prepare.outputs.version }}
     secrets:
       RELEASE_SATELLITE_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
       CLOUD_ARTIFACT_KEY: ${{ secrets.CLOUD_ARTIFACT_KEY }}
 
   gate-selftests:
+    if: ${{ !inputs.candidate-op-web-sha }}
     needs: prepare
     runs-on: ubuntu-latest
     steps:
@@ -105,6 +119,7 @@ jobs:
       - run: bash .github/scripts/release-gate-selftests.sh
 
   distribution:
+    if: ${{ !inputs.candidate-op-web-sha }}
     needs: [prepare, cli-native, release-images]
     runs-on: ubuntu-latest
     steps:

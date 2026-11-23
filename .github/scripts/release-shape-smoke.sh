@@ -381,6 +381,7 @@ for j in release-images connectors join-perf; do
   hasnt "$j cannot ignore a failed run" "$j" '^    (if:|continue-on-error:)'
 done
 has "release calls the shared image workflow" release-images 'uses: .*release-images[.]yml'
+hasnt "production release cannot run in OP candidate mode" release-images 'onprem-only:'
 has "the shared image workflow receives the frozen Web commit" release-images 'web-sha:.*needs[.]version[.]outputs[.]web_sha'
 has "the shared image workflow receives the release version" release-images 'release-version:.*needs[.]version[.]outputs[.]version'
 has "release calls the shared connector workflow" connectors 'uses: .*real-connectors[.]yml'
@@ -388,8 +389,16 @@ has "release calls the full join performance workflow" join-perf 'uses: .*join-p
 hasnt "the release gate cannot ignore failed prerequisites" gates '^    (if:|continue-on-error:)'
 for j in server-image cloud-server-jar cloud-image; do
   has "$j checks out the caller's immutable source" "$j" 'ref:.*inputs[.]source-sha'
-  hasnt "$j cannot ignore a failed build or smoke" "$j" '^    (if:|continue-on-error:)'
+  hasnt "$j cannot ignore a failed build or smoke" "$j" '^    continue-on-error:'
 done
+for j in server-image cloud-image; do
+  hasnt "$j retains its default success guard" "$j" '^    if:'
+done
+if [[ "$(job cloud-server-jar | grep '^    if:')" == '    if: ${{ !inputs.onprem-only }}' ]]; then
+  ok "the Cloud build only skips in explicit OP candidate mode"
+else
+  bad "the Cloud build only skips in explicit OP candidate mode" "unexpected Cloud job guard"
+fi
 
 # --- everything is built from the commit the version job resolved -------------------------------
 # The `commit` input is what makes a release from an older line possible at all, and it defaults to
@@ -456,6 +465,11 @@ fi
 release_workflow="$workflow"
 workflow="$nightly"
 has "Nightly verifies the run commit" reactor-regression 'source-sha:.*github[.]sha'
+has "Nightly selects the OP mode from an explicit Web commit" release-images 'onprem-only:.*inputs[.]candidate-op-web-sha'
+has "the candidate Web commit must be a full SHA" prepare 'web_sha.*\[0-9a-f\].*40'
+for job_id in reactor-regression real-connectors join-perf cli-native gate-selftests distribution; do
+  has "$job_id is omitted from the OP candidate run" "$job_id" '^    if:.*!inputs[.]candidate-op-web-sha'
+done
 hasnt "Nightly reactor execution is independent" reactor-regression '^    needs:'
 has "the failure alert observes reactor regression" notify-feishu 'needs:.*reactor-regression'
 has "the failure alert names reactor regression" notify-feishu 'failed[+]=[(]reactor-regression[)]'
