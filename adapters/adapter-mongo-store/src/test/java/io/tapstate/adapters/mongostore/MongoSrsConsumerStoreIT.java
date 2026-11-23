@@ -379,6 +379,15 @@ class MongoSrsConsumerStoreIT {
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void snapshotPinUsesAtMostNineReadsPerAttemptAndCommitsAfterALateConflict(boolean conflict) {
+        checkSnapshotPinReadBudget(conflict, false);
+    }
+
+    @Test
+    void snapshotPinReusesCheckpointFactsWithinOriginalBudgetAfterALateConflict() {
+        checkSnapshotPinReadBudget(true, true);
+    }
+
+    private void checkSnapshotPinReadBudget(boolean conflict, boolean delayed) {
         withBusiness(f -> {
             var tables = Set.of("orders");
             var previous = publishSnapshotModels(f, tables).get("orders");
@@ -412,7 +421,14 @@ class MongoSrsConsumerStoreIT {
                         var renewed = claims.renew(f.pipelineA(), Duration.ofSeconds(30)).orElseThrow();
                         assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(f.fenceA());
                     }
-                    if (conflict) java.util.concurrent.locks.LockSupport.parkNanos(Duration.ofMillis(350).toNanos());
+                    long delay = conflict ? 350 : 0;
+                    if (delayed && "aggregate".equals(command) && "srs_chains".equals(collection) && body.containsKey("pipeline")) {
+                        boolean proofs = body.getArray("pipeline").stream().anyMatch(stage -> stage.isDocument()
+                                && stage.asDocument().containsKey("$lookup")
+                                && "proof0".equals(stage.asDocument().getDocument("$lookup").getString("as").getValue()));
+                        delay = proofs ? 2130 : 2290;
+                    }
+                    java.util.concurrent.locks.LockSupport.parkNanos(Duration.ofMillis(delay).toNanos());
                 }
                 @Override public void commandFailed(com.mongodb.event.CommandFailedEvent event) {
                     if (event.getThrowable() instanceof com.mongodb.MongoCommandException failure && failure.getCode() == 112)
@@ -424,7 +440,12 @@ class MongoSrsConsumerStoreIT {
                     .addCommandListener(listener).build())) {
                 var store = runtimeConsumer(observed, observed.getDatabase(f.database().getName()));
                 var start = System.nanoTime();
-                assertThat(store.pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+                try {
+                    assertThat(store.pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+                } finally {
+                    System.out.printf("PIN_DELAYED_ATTEMPTS elapsed_ms=%d commands=%s%n",
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), commands.values());
+                }
                 long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
                 var durable = f.consumers().progress(A).orElseThrow();
                 assertThat(durable.snapshot()).isEqualTo(pin);
@@ -440,7 +461,7 @@ class MongoSrsConsumerStoreIT {
                         .filter(c -> c.startsWith("find:") || c.startsWith("aggregate:") || c.startsWith("getMore:")).count()).toList();
                 System.out.printf("SNAPSHOT_PIN_READS late_conflict=%b reads=%s wall_ms=%d commands=%s%n",
                         conflict, reads, millis, commands.values());
-                assertThat(reads).allSatisfy(readCount -> assertThat(readCount).isLessThanOrEqualTo(9));
+                assertThat(reads).allSatisfy(readCount -> assertThat(readCount).isLessThanOrEqualTo(delayed ? 4 : 9));
                 assertThat(millis).isLessThan(15_000);
             }
         });

@@ -1457,7 +1457,9 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             boolean batchReads = root != null && MongoBindingReadFacts.supported(client);
             var state = pipeline.stateForSnapshotPin(session, batchReads);
             pipeline.updateState(session, state, new Document(), false);
-            var view = root == null ? view(session, chain) : pinRelations(session, chain, root, batchReads);
+            var facts = root == null ? new MongoSrsReadFacts(session, database, scope, true)
+                    : new MongoSrsReadFacts(session, database, scope, root, true);
+            var view = root == null ? view(session, chain) : pinRelations(session, chain, root, batchReads, facts, snapshot);
             var member = view.members().get(context.key().consumerId());
             if (member == null || member.detached() || !member.context().equals(context)) throw unavailable(chain);
             if (member.revision() != membershipRevision) throw new UnchangedPin(false);
@@ -1468,7 +1470,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (!snapshot.models().keySet().equals(required)) throw unavailable(chain);
             if (before != null && (before.snapshotEpoch() != snapshot.snapshotEpoch() || !before.sourcePosition().equals(snapshot.sourcePosition())
                     || before.models().entrySet().stream().anyMatch(entry -> !entry.getValue().equals(snapshot.models().get(entry.getKey()))))) throw unavailable(chain);
-            validateSnapshot(session, context, snapshot, new MongoSrsReadFacts(session, database, scope, true));
+            validateSnapshot(session, context, snapshot, facts);
             if (snapshot.equals(before)) {
                 provePinClaim(pipeline, session, claimConflict);
                 throw new UnchangedPin(true);
@@ -1488,8 +1490,13 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             return true;
         }));
     }
-    private View pinRelations(ClientSession session, String chain, Document root, boolean batchReads) {
-        var state = batchReads ? chains.startupState(session, root, true) : chains.state(session, root, true);
+    private View pinRelations(ClientSession session, String chain, Document root, boolean batchReads,
+            MongoSrsReadFacts facts, SrsSnapshotPin snapshot) {
+        if (batchReads) {
+            var control = MongoSrsChainStore.decode(root, scope, new MongoSrsModelContexts(database, scope));
+            facts.prefetchStartupCheckpoint(root, control.checkpoint(), snapshot);
+        }
+        var state = chains.state(session, root, true, facts);
         if (batchReads) {
             var captured = startProgressRows(session, chain, records.chain(chain));
             if (captured != null && chain.equals(captured.get("root", Document.class).get("_id"))) {

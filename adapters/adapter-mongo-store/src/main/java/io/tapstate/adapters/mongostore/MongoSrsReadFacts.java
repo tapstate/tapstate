@@ -87,8 +87,15 @@ final class MongoSrsReadFacts {
 
     /** Prefetches the bounded predicates of one retained checkpoint without weakening their decoders. */
     void prefetchStartupCheckpoint(Document root, io.tapstate.spi.store.SrsCaptureCheckpoint checkpoint) {
+        prefetchStartupCheckpoint(root, checkpoint, null);
+    }
+
+    void prefetchStartupCheckpoint(Document root, io.tapstate.spi.store.SrsCaptureCheckpoint checkpoint, SrsSnapshotPin pin) {
         requireSession(session, database);
-        if (checkpoint == null || checkpoint.tables().isEmpty() || checkpoint.tables().size() > 8) return;
+        if (checkpoint == null || checkpoint.tables().isEmpty() || checkpoint.tables().size() > 8) {
+            prefetchSnapshotReferences(root, pin);
+            return;
+        }
         var requested = new java.util.LinkedHashMap<Lookup, Query>();
         var contexts = new MongoSrsModelContexts(database, scope);
         for (var at : checkpoint.tables().values()) {
@@ -108,21 +115,26 @@ final class MongoSrsReadFacts {
             addQuery(requested, SystemCollections.SRS_LOG_BOUNDS,
                     new Document("_id", MongoSrsLogStore.boundsId(ring)), false);
         }
+        addSnapshotReferences(root, pin, requested);
         prefetchStartupProofs(root, requested);
     }
 
     void prefetchSnapshotReferences(Document root, SrsSnapshotPin pin) {
         requireSession(session, database);
-        if (pin == null || pin.models().size() > 8) return;
         var requested = new java.util.LinkedHashMap<Lookup, Query>();
+        addSnapshotReferences(root, pin, requested);
+        if (requested.size() > 1) prefetchStartupProofs(root, requested);
+    }
+
+    private void addSnapshotReferences(Document root, SrsSnapshotPin pin, Map<Lookup, Query> requested) {
+        if (pin == null || pin.models().size() > 8 || pin.models().values().stream().anyMatch(key ->
+                !key.miningChainId().equals(root.get("_id")) || !key.cacheIncarnation().equals(scope.cacheIncarnation()))) return;
         for (var key : pin.models().values()) {
-            if (!key.miningChainId().equals(root.get("_id")) || !key.cacheIncarnation().equals(scope.cacheIncarnation())) return;
             addQuery(requested, SystemCollections.SRS_MODEL_CONTEXTS,
                     new Document("_id", MongoSrsModelContexts.contextId(key)), false);
             addQuery(requested, SystemCollections.SRS_MODELS,
                     new Document("_id", MongoSrsModelStore.key(key)), false);
         }
-        if (requested.size() > 1) prefetchStartupProofs(root, requested);
     }
 
     private void prefetchStartupProofs(Document root, Map<Lookup, Query> requested) {
