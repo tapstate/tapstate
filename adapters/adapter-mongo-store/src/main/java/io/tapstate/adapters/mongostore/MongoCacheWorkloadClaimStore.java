@@ -379,11 +379,51 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
         requireKey(key);
+        if (key.type() == WorkloadClaimType.CAPTURE) {
+            var observed = readCaptureAuthority(key);
+            if (observed != null) return Optional.of(observed);
+        }
         return transaction(false, (store, session) -> {
             storedScope(session, key);
             return store.read(key);
         });
     }
+    private WorkloadClaimReading readCaptureAuthority(WorkloadClaimKey key) {
+        if (!MongoBindingReadFacts.supported(client) || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
+        var budget = operations.budget();
+        return MongoStructureFailureScope.inspectOnFailure(client, budget, () -> StoreIo.call(() -> {
+            if (budget == null) operations.requireAdmission();
+            operations.check();
+            requireActive.run();
+            var selected = (budget == null ? database : budget.database(database))
+                    .withReadPreference(ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
+            var id = MongoWorkloadClaimStore.id(key);
+            var bounded = new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), 64 * 1024));
+            var value = new Document("value", new Document("$cond", List.of(bounded, "$$ROOT", false)));
+            var captured = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(selected).aggregate(List.of(
+                    new Document("$match", new Document("_id", id)),
+                    new Document("$limit", 1),
+                    MongoWorkloadClaimStore.leaseRemaining(true),
+                    new Document("$project", new Document("claim", new Document("$cond", List.of(bounded, List.of("$$ROOT"), List.of())))),
+                    MongoValidationClaimObservation.lookup(SystemCollections.CACHE_IDENTITY, "identity", "cluster", value),
+                    MongoValidationClaimObservation.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business", value))).first();
+            var claim = MongoStartConfigRead.row(captured, "claim", id);
+            var identity = capturedCaptureRow(captured, "identity", "cluster");
+            var schema = capturedCaptureRow(captured, "schema", "business");
+            requireActive.run();
+            operations.check();
+            if (claim.isEmpty() || identity == null || schema == null || MongoWorkloadClaimStore.nodeBacked(claim.orElseThrow())) return null;
+            MongoCacheBusinessIdentity.requireObservedAdmission(identity, schema, scope);
+            MongoCaptureCachePreparations.requirePreparation(claim.orElseThrow(), key, scope);
+            return MongoWorkloadClaimStore.observedReading(claim.orElseThrow());
+        }));
+    }
+
+    private static Document capturedCaptureRow(Document captured, String name, Object id) {
+        return MongoStartConfigRead.row(captured, name, id).filter(row -> row.get("value") instanceof Document)
+                .map(row -> row.get("value", Document.class)).orElse(null);
+    }
+
     @Override public Map<WorkloadClaimKey, WorkloadClaimReading> readAll(Collection<WorkloadClaimKey> keys) {
         Objects.requireNonNull(keys, "keys");
         var captured = List.copyOf(keys);
