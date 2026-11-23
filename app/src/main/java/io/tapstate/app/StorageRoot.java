@@ -280,7 +280,7 @@ final class StorageRoot implements AutoCloseable {
         if (!configuration.bindings().load().filter(binding::equals).isPresent()
                 || !configuration.bindings().cachePreparation().filter(preparation::equals).isPresent())
             throw StorageRuntime.unavailable();
-        original.verifyAuthentication(); original.verifyBusiness();
+        original.verifyAuthentication(); original.verifyRetainedBusiness();
         if (cloud.cloud()) authentication.managed(); else authentication.local();
         if (runtime != selected || selected.boundForObservation().orElseThrow(StorageRuntime::unavailable) != original)
             throw StorageRuntime.unavailable();
