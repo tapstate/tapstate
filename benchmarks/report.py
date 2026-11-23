@@ -1,14 +1,14 @@
 """Reconcile batch results and compare compatible benchmark observations."""
 
-import math
 from statistics import median
 
+import baseline as baseline_schema
 import catalog
 import verdict
 
-CASE_CONDITIONS = ("case_version", "definition_sha256", "mode", "scale", "effective_load",
-                   "connector_sha256", "environment")
+CASE_CONDITIONS = baseline_schema.CASE_CONDITIONS
 ARM_CONDITIONS = ("effective_input_rows", "mongo_topology", "target_delay_millis", "database_conditions")
+OOM_ATTRIBUTIONS = {"observed-java-out-of-memory", "observed-op-oom-kill"}
 
 
 def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
@@ -55,7 +55,7 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
                      (row.get("definition_sha256") != case["definition_sha256"] or
                       row.get("effective_load") != effective or
                       row.get("code_sha") != manifest["identity"]["code_sha"] or
-                      not matches_environment(row, manifest["environment"])))):
+                      not matches_execution(row, manifest["environment"], case)))):
                 rows[key] = {"case_id": key[0], "repeat": key[1], "status": "invalid",
                              "reason": "repeat binding mismatch"}
             else:
@@ -68,7 +68,9 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
         failures = memory_failures(row, baseline, manifest["environment"])
         if failures:
             row["memory_failures"] = failures
-            if row["status"] == "completed":
+            if row["status"] not in verdict.FAILED_STATUSES:
+                if row.get("reason"):
+                    row["reason_before_memory_failure"] = row["reason"]
                 row.update(status="failed", last_stage="memory", reason=failures[0]["reason"])
         comparison = compare(row if key in rows else None, baseline, manifest["environment"])
         if comparison["status"] == "baseline-not-supplied" and baseline_status:
@@ -87,22 +89,32 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
     return result
 
 
-def matches_environment(row, profile):
-    return (row.get("environment_profile") == profile
-            and all(arm.get("environment_profile") == profile for arm in row.get("paired_arms", {}).values()))
+def matches_execution(row, profile, case):
+    if row.get("environment_profile") != profile:
+        return False
+    arms = row.get("paired_arms")
+    if arms is None:
+        return "paired-control" not in case.get("tags", [])
+    if not isinstance(arms, dict) or not arms:
+        return False
+    if "paired-control" in case.get("tags", []) and len(arms) != 2:
+        return False
+    arm_fields = ("case_id", "environment_profile", "code_sha", "run_id", "repeat", *CASE_CONDITIONS)
+    return all(isinstance(arm, dict) and arm.get("status") == "completed"
+               and all(arm.get(field) == row.get(field) for field in arm_fields) for arm in arms.values())
 
 
 def memory_failures(row, baseline, environment):
     failures = []
-    limits = {}
-    if baseline and baseline["environment"] == environment and row["status"] == "completed":
-        reference = baseline["cases"].get(row["case_id"], {})
-        if reference and all(key in reference and reference[key] == row.get(key) for key in CASE_CONDITIONS):
-            limits = baseline.get("memory_limits", {}).get(row["case_id"], {})
-    for name, arm in row.get("paired_arms", {"single": row}).items():
-        if arm.get("exit_attribution") == "observed-java-out-of-memory":
-            failures.append({"arm": name, "scope": "OP process", "reason": "observed-java-out-of-memory"})
-        if limits:
+    reference = compatible_case(row, baseline, environment)
+    limits = baseline.get("memory_limits", {}).get(row["case_id"], {}) if reference else {}
+    reference_arms = arms_for(reference) if reference else {}
+    for name, arm in arms_for(row).items():
+        attribution = arm.get("exit_attribution")
+        if attribution in OOM_ATTRIBUTIONS:
+            failures.append({"arm": name, "scope": "OP process", "reason": attribution})
+        ref = reference_arms.get(name)
+        if limits and ref and matching_arm(arm, ref) and resource_conditions(arm) == resource_conditions(ref):
             for metric, observed, source in eligible_metrics(arm):
                 limit = limits.get(metric)
                 if limit and source == limit["source"] and valid(observed) and observed > limit["limit_kib"]:
@@ -116,15 +128,15 @@ def summarize_repeats(results):
     for row in results:
         if row["status"] != "completed" or any(key not in row for key in CASE_CONDITIONS):
             continue
-        for name, arm in row.get("paired_arms", {"single": row}).items():
+        for name, arm in arms_for(row).items():
             if arm.get("status") != "completed" or arm.get("mongo_topology") and not arm.get("database_conditions"):
                 continue
             conditions = {key: row[key] for key in (*CASE_CONDITIONS, "run_id")}
             conditions["op_boot_sha256"] = arm.get("op_boot_sha256")
             conditions.update({key: arm.get(key) for key in ARM_CONDITIONS})
             for metric, value, source in eligible_metrics(arm):
-                if valid(value):
-                    binding = {**conditions, "metric_source": source}
+                if valid_metric_value(metric, value):
+                    binding = {**conditions, **metric_conditions(arm, metric), "metric_source": source}
                     key = row["case_id"], name, metric, catalog.digest(binding)
                     cohort = observed.setdefault(key, (binding, []))
                     cohort[1].append(value)
@@ -147,16 +159,21 @@ def eligible_metrics(arm):
     if resources.get("status") == "observed":
         windows = resources["windows"]
         for phase, usage in windows.items():
-            if usage.get("covered") and identified_source(usage.get("source")):
+            if usage.get("covered") is True and identified_source(usage.get("source")):
                 yield f"{phase}.rss_peak_kib", usage.get("rss_peak_kib"), usage["source"]
         steady = [windows.get(f"steady-{index}", {}) for index in (1, 2, 3)]
         steady_source = covered_rss_source(steady)
-        if steady_source and nondecreasing_rss(steady):
-            yield "steady.rss_growth_kib_per_second", resources.get("steady_rss_growth_kib_per_second"), steady_source
+        steady_starts = [window.get("started_epoch_ms") for window in steady]
+        if (steady_source and nondecreasing_rss(steady) and strictly_ordered_integers(steady_starts)):
+            seconds = (steady_starts[-1] - steady_starts[0]) / 1000
+            yield "steady.rss_growth_kib_per_second", (
+                steady[-1]["rss_median_kib"] - steady[0]["rss_median_kib"]
+            ) / seconds, steady_source
         cycles = arm.get("lifecycle_cycles", [])
         idle = [windows.get(f"lifecycle-cycle-{cycle['cycle']}/idle", {}) for cycle in cycles]
         idle_source = covered_rss_source(idle)
-        if (len(cycles) >= 3 and idle_source and len({cycle["idle_seconds"] for cycle in cycles}) == 1
+        if (len(cycles) >= 3 and idle_source and strictly_ordered_integers([cycle["cycle"] for cycle in cycles])
+                and len({cycle["idle_seconds"] for cycle in cycles}) == 1
                 and all(cycle.get("state") == "STOPPED" and cycle.get("target_readback") == "verified"
                         for cycle in cycles)
                 and nondecreasing_rss(idle)):
@@ -164,7 +181,7 @@ def eligible_metrics(arm):
 
 
 def covered_rss_source(windows):
-    if not windows or not all(window.get("covered") and valid(window.get("rss_median_kib"))
+    if not windows or not all(window.get("covered") is True and valid(window.get("rss_median_kib"))
                               for window in windows):
         return None
     source = windows[0].get("source")
@@ -173,6 +190,46 @@ def covered_rss_source(windows):
 
 def nondecreasing_rss(windows):
     return all(first["rss_median_kib"] <= second["rss_median_kib"] for first, second in zip(windows, windows[1:]))
+
+
+def arms_for(row):
+    return row.get("paired_arms", {"single": row})
+
+
+def compatible_case(row, baseline, environment):
+    if not row or row["status"] != "completed" or not baseline or baseline["environment"] != environment:
+        return None
+    ref = baseline["cases"].get(row["case_id"])
+    if (not ref or ref.get("status") != "completed" or arms_for(row).keys() != arms_for(ref).keys()
+            or any(key not in row or key not in ref or row[key] != ref[key] for key in CASE_CONDITIONS)
+            or row.get("environment_profile") != ref.get("environment_profile")):
+        return None
+    return ref
+
+
+def matching_arm(arm, ref):
+    return (arm.get("status") == ref.get("status") == "completed"
+            and (not arm.get("mongo_topology") or bool(arm.get("database_conditions")))
+            and all(arm.get(key) == ref.get(key) for key in (*ARM_CONDITIONS, "environment", "environment_profile")))
+
+
+def resource_conditions(arm):
+    resources = arm.get("resources", {})
+    return {key: resources.get(key) for key in ("scope", "op_heap_limit_mib", "sampling_interval_ms")}
+
+
+def metric_conditions(arm, metric):
+    if ".rss_" not in metric:
+        return {}
+    conditions = resource_conditions(arm)
+    if metric == "lifecycle.idle_rss_retained_kib":
+        conditions["idle_seconds"] = [cycle["idle_seconds"] for cycle in arm["lifecycle_cycles"]]
+    return conditions
+
+
+def strictly_ordered_integers(values):
+    return all(type(value) is int and value >= 0 for value in values) and all(
+        first < second for first, second in zip(values, values[1:]))
 
 
 def compare(row, baseline, environment):
@@ -185,45 +242,52 @@ def compare(row, baseline, environment):
     if baseline["environment"] != environment:
         return {"status": "environment-mismatch"}
     reference = baseline["cases"].get(row["case_id"])
-    if reference is not None and reference.get("status") != "completed":
+    if reference is None or reference.get("status") != "completed":
         return {"status": "baseline-result-unavailable"}
-    if not reference or any(key not in row or key not in reference or row[key] != reference[key]
-                            for key in CASE_CONDITIONS):
+    if not compatible_case(row, baseline, environment):
         return {"status": "incompatible"}
-    arms = row.get("paired_arms", {"single": row})
-    reference_arms = reference.get("paired_arms", {"single": reference})
-    if arms.keys() != reference_arms.keys():
+    arms = arms_for(row)
+    refs = arms_for(reference)
+    if any(not matching_arm(arm, refs[name]) for name, arm in arms.items()):
         return {"status": "incompatible"}
     comparisons = {}
     for name, arm in arms.items():
-        ref = reference_arms[name]
-        arm_result = {}
-        if arm.get("status") != "completed" or ref.get("status") != "completed":
-            continue
-        if arm.get("mongo_topology") and not arm.get("database_conditions"):
-            continue
-        if any(arm.get(key) != ref.get(key) for key in ARM_CONDITIONS):
-            continue
+        ref = refs[name]
         reference_metrics = {(metric, source): value for metric, value, source in eligible_metrics(ref)}
+        arm_result = {}
         for metric, observed, source in eligible_metrics(arm):
-            ratio(arm_result, metric, observed, reference_metrics.get((metric, source)))
+            conditions = metric_conditions(arm, metric)
+            if conditions == metric_conditions(ref, metric):
+                ratio(arm_result, metric, observed, reference_metrics.get((metric, source)), source, conditions)
         if arm_result:
             comparisons[name] = arm_result
-    status = "fixture-comparison" if baseline["kind"] == "fixture" else "compared"
-    return {"status": status if comparisons else "no-eligible-observation", "arms": comparisons}
+    if not comparisons:
+        status = "no-eligible-observation"
+    else:
+        status = "fixture-comparison" if baseline["kind"] == "fixture" else "compared"
+    return {"status": status, "arms": comparisons}
 
 
-def ratio(output, metric, observed, reference):
-    if valid(observed) and valid(reference):
-        output[metric] = {"observed": observed, "baseline": reference, "change_ratio": observed / reference - 1}
+def ratio(output, metric, observed, reference, source, conditions):
+    if valid_metric_value(metric, observed) and valid_metric_value(metric, reference):
+        change = observed / reference - 1 if reference else None
+        if change is None or baseline_schema.finite_number(change):
+            output[metric] = {"observed": observed, "baseline": reference, "change_ratio": change,
+                              "source": source, "conditions": conditions}
+
+
+def valid_metric_value(metric, value):
+    if metric in {"steady.rss_growth_kib_per_second", "lifecycle.idle_rss_retained_kib", "endpoint_p95_nanos"}:
+        return baseline_schema.finite_number(value) and value >= 0
+    return valid(value)
 
 
 def valid(value):
-    return type(value) in (float, int) and math.isfinite(value) and value > 0
+    return baseline_schema.finite_number(value) and value > 0
 
 
 def identified_source(value):
-    return isinstance(value, str) and bool(value.strip())
+    return baseline_schema.nonblank(value)
 
 
 def markdown(report):

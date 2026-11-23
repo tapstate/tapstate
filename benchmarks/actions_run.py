@@ -123,10 +123,12 @@ def prepare(args, event_name, event, attempt, run):
     output.mkdir(parents=True)
     inputs = (event.get("inputs") or {}) if upstream is None else {}
     scope = inputs.get("mode", "all")
-    runner.write_json(output / "run.json", {"github_attempt": attempt, "scope": scope, "timing": timing})
+    run_record = {"github_attempt": attempt, "scope": scope, "timing": timing}
+    runner.write_json(output / "run.json", run_record)
     flags = selection(scope, inputs.get("group", ""), inputs.get("filters", ""), inputs.get("case_ids", ""))
     receipt = baseline.pin(output, RUNNER_PROFILE, inputs.get("baseline_version"))
     runner.write_json(output / "baseline-receipt.json", receipt)
+    runner.write_json(output / "run.json", {**run_record, "baseline_receipt_sha256": catalog.digest(receipt)})
     budget = remaining_seconds(timing, reserve=MEASUREMENT_RESERVE_SECONDS)
     if budget <= BUILD_RESERVE_SECONDS:
         raise ValueError("Insufficient workflow time remains to prepare a measurement batch")

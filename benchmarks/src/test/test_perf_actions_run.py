@@ -1,4 +1,7 @@
 from argparse import Namespace
+import copy
+import hashlib
+import json
 from datetime import datetime, timedelta
 from io import BytesIO
 import os
@@ -6,6 +9,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -13,6 +17,7 @@ import actions_run
 import actions_report
 import actions_health
 import actions_watch
+import baseline
 import catalog
 import notifications
 import runner
@@ -170,6 +175,169 @@ class ActionsRunTest(unittest.TestCase):
                 {"batch": 3, "reason": "batch summary missing or unreadable"},
             ], result["errors"])
             self.assertEqual({"missing": 4}, result["repeat_counts"])
+
+    def test_report_cli_uses_only_the_selected_published_baseline(self):
+        environment = "runner"
+        good, bad, mismatched = "copy.snapshot.basic.standard", "union.snapshot.basic.standard", "copy.snapshot.wide"
+        cases = []
+        rows = []
+        for case_id in (good, bad, mismatched):
+            case = {"id": case_id, "case_version": 1, "group": "copy" if case_id != bad else "union",
+                    "mode": "snapshot", "tags": [], "definition_sha256": case_id, "spec": "specs/copy-basic.json",
+                    "profile": "standard", "description": f"Scenario {case_id}", "workload_spec": {"profile": {"fields": 5}}}
+            cases.append({"case": case, "repeats": 2, "rows": 40})
+            for number in (1, 2):
+                rows.append({
+                    "case_id": case_id, "case_version": 1, "repeat": number, "status": "completed",
+                    "run_id": "fixture", "code_sha": "candidate", "definition_sha256": case_id,
+                    "mode": "snapshot", "scale": "formal", "connector_sha256": "connector",
+                    "effective_load": {"rows": 40}, "environment": {"cpu_count": 4}, "environment_profile": environment,
+                    "effective_input_rows": {"left": 20, "right": 20},
+                    "source_data": {"tables": {"left": {"rows": 20, "fields": 5}, "right": {"rows": 19, "fields": 7}}},
+                    "confirmed_output_units": 38, "target_readback_rows": 39, "mongo_shared_instance_resident_mib": 512,
+                    "resources": {"status": "observed", "scope": "OP process", "op_heap_limit_mib": 256,
+                                  "windows": {"snapshot": {"covered": True, "source": "procfs", "rss_peak_kib": 126}}},
+                })
+        rows[2].update(status="failed", last_stage="readback", reason="different target keys")
+        for field in ("source_data", "effective_input_rows", "confirmed_output_units", "target_readback_rows", "resources"):
+            rows[3].pop(field)
+        rows[3].update(status="failed", last_stage="prepare", reason="fixture failed early")
+        reference = {row["case_id"]: copy.deepcopy(row) for row in (rows[0], rows[4])}
+        reference[good]["resources"]["windows"]["snapshot"]["rss_peak_kib"] = 100
+        reference[mismatched]["effective_load"]["rows"] = 80
+        for row in reference.values():
+            row["code_sha"] = "d" * 40
+        metric = "snapshot.rss_peak_kib"
+        policy = {"version": 1, "cases": {good: {
+            metric: {"worse": "higher", "observe_ratio": 0.1, "suspect_ratio": 0.2,
+                     "minimum_absolute": 2, "baseline_noise": 5, "minimum_repeats": 2}
+        }}}
+        content = {"kind": "accepted", "environment": environment, "cases": reference,
+                   "code_sha": "d" * 40, "comparison_rules": policy}
+        versions = {}
+        bodies = {}
+        for version, revision in (("v1", "b" * 40), ("v2", "c" * 40)):
+            body = json.dumps(dict(content, id=f"baseline-{version}", version=version)).encode()
+            bodies[revision] = body
+            versions[version] = {"id": f"baseline-{version}", "commit": revision, "code_sha": content["code_sha"],
+                                 "sha256": hashlib.sha256(body).hexdigest(), "environment": environment,
+                                 "path": "baselines/case-results.json"}
+
+        release_sha = "a" * 40
+        record = None
+        requested = []
+
+        def fetch(url):
+            parts = url.split("/")
+            requested.append(url)
+            if url.endswith("/commits/main"):
+                return json.dumps({"sha": release_sha}).encode()
+            if url.endswith("/releases.json"):
+                if record is None:
+                    raise HTTPError(url, 404, "not published", None, None)
+                self.assertEqual(release_sha, parts[-3])
+                return json.dumps(record).encode()
+            return bodies[parts[-3]]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "performance-batch-1-0"
+            (folder / "run").mkdir(parents=True)
+            (folder / "environment.txt").write_text("Image ubuntu24 version-1\nModel name: Fixture CPU\n")
+            index = root / "artifacts.json"
+            runner.write_json(index, {"artifacts": [
+                {"workflow_run": {"id": 111}, "name": folder.name, "id": 222, "digest": "sha256:abc", "expired": False},
+                {"workflow_run": {"id": 112}, "name": folder.name, "id": 333, "expired": False},
+            ]})
+            attempt = {"run_id": 111, "attempt": 1}
+            run_record = {"github_attempt": attempt, "scope": "ids"}
+            assembly = {"identity": {"code_sha": "candidate"}, "environment": environment, "github_attempt": attempt,
+                        "selected_ids": [good, bad, mismatched], "unallocated": [],
+                        "batches": [{"index": 0, "entries": cases}]}
+            assembly["manifest_sha256"] = catalog.digest(assembly)
+            runner.write_json(root / "manifest.json", assembly)
+            runner.write_json(folder / "run" / "summary.json", {
+                "batch": 0, "run_id": "fixture", "process_exit": 1, "github_attempt": attempt,
+                "manifest_sha256": assembly["manifest_sha256"], "identity": assembly["identity"], "results": rows,
+            })
+
+            def publish_report(label, receipt):
+                runner.write_json(root / "baseline-receipt.json", receipt)
+                runner.write_json(root / "run.json", dict(run_record, baseline_receipt_sha256=catalog.digest(receipt)))
+                output = root / label
+                step = output / "step-summary.md"
+                arguments = ["actions_report.py", "--inputs", str(root), "--artifacts", str(root),
+                             "--output", str(output), "--artifact-index", str(index)]
+                with patch.object(sys, "argv", arguments), patch.dict(os.environ, {
+                    "GITHUB_RUN_ID": "111", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_REPOSITORY": "example/repo",
+                    "GITHUB_STEP_SUMMARY": str(step), "PERFORMANCE_JOB_RESULTS": '{"measure":"failure"}',
+                }):
+                    self.assertEqual(1, actions_report.main())
+                data = json.loads((output / "report.json").read_text())
+                markdown = step.read_text()
+                self.assertEqual(markdown, (output / "report.md").read_text())
+                self.assertEqual(attempt, data["github_attempt"])
+                self.assertEqual({"completed": 2, "failed": 1}, data["case_counts"])
+                self.assertEqual({"failed": 2, "completed": 4}, data["repeat_counts"])
+                self.assertEqual("different target keys", data["results"][2]["reason"])
+                self.assertIn(f"{bad}@1", markdown)
+                self.assertIn("| single | right | 20 | 19 | 7 |", markdown)
+                self.assertIn("| single | 38 | 39 |", markdown)
+                self.assertIn("| single | unavailable | unavailable | unavailable | unavailable |", markdown)
+                self.assertIn("Fixture CPU", markdown)
+                self.assertIn("/runs/111/artifacts/222", markdown)
+                self.assertEqual("sha256:abc", data["batch_evidence"]["0"]["digest"])
+                return data, markdown
+
+            receipt = baseline.pin(root, environment, fetch=fetch)
+            unavailable, markdown = publish_report("none", receipt)
+            self.assertEqual("baseline-not-published", unavailable["baseline"]["reason"])
+            self.assertIn("Comparison unavailable (baseline-not-published)", markdown)
+
+            record = {"schema_version": 1, "active": {environment: "v1"}, "versions": {"v1": versions["v1"]}}
+            # The v2 bytes already exist, but the publication record still points to the verified v1.
+            pinned = baseline.pin(root, environment, fetch=fetch)
+            self.assertEqual("v1", pinned["version"])
+            self.assertFalse(any("/" + "c" * 40 + "/" in url for url in requested))
+            release_sha = "e" * 40
+            record = {"schema_version": 1, "active": {environment: "v2"}, "versions": versions}
+            other_dir = root / "next-inputs"
+            other_dir.mkdir()
+            next_receipt = baseline.pin(other_dir, environment, fetch=fetch)
+            self.assertEqual("v2", next_receipt["version"])
+            self.assertEqual(release_sha, next_receipt["release_record_commit"])
+            self.assertEqual("v1", baseline.pin(other_dir, environment, "v1", fetch=fetch)["version"])
+            data, markdown = publish_report("v1", pinned)
+            self.assertEqual("a" * 40, data["baseline"]["release_record_commit"])
+            self.assertEqual(pinned["sha256"], data["baseline"]["sha256"])
+            self.assertIn(pinned["sha256"], markdown)
+            self.assertIn("Baseline version v1", markdown)
+            self.assertEqual({"comparable": 1, "incomparable": 1, "unavailable": 1}, data["comparison_coverage"])
+            self.assertEqual("suspected-regression", data["case_verdicts"][good]["comparison"])
+            self.assertEqual("incompatible", data["results"][4]["comparisons"]["status"])
+            self.assertIn(f"| {good}@1 | single | 100 | 126.0 | +26.0%", markdown)
+            self.assertEqual("performance-report-1", data["report_artifact_name"])
+
+            baseline_file = root / "baseline.json"
+            invalid_documents = {
+                "baseline-unreadable": None, "baseline-invalid-json": b"{", "invalid-baseline-schema": b"{}",
+                "baseline-identity-mismatch": bodies["c" * 40], "baseline-digest-mismatch": bodies["c" * 40],
+            }
+            for expected, body in invalid_documents.items():
+                with self.subTest(expected=expected):
+                    receipt = dict(pinned)
+                    if body is None:
+                        baseline_file.unlink()
+                    else:
+                        baseline_file.write_bytes(body)
+                        if expected != "baseline-digest-mismatch":
+                            receipt["sha256"] = hashlib.sha256(body).hexdigest()
+                    data, markdown = publish_report(expected, receipt)
+                    self.assertEqual(expected, data["baseline"]["reason"])
+                    self.assertIn(f"Comparison unavailable ({expected})", markdown)
+                    self.assertEqual({"unavailable": 3}, data["comparison_counts"])
+                    self.assertFalse(any(case["metrics"] for case in data["case_verdicts"].values()))
+                    self.assertNotIn("+26.0%", markdown)
 
     def test_independent_health_distinguishes_a_queued_handoff_from_a_missing_run(self):
         now = datetime.fromisoformat("2026-11-21T15:00:00+00:00")

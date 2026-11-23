@@ -4,6 +4,7 @@ from datetime import datetime
 from html import escape
 
 import catalog
+import verdict
 
 
 WORKFLOW_ANOMALIES = {"missing-nightly", "missing-handoff", "performance-expired", "report-missing"}
@@ -73,7 +74,7 @@ def escalated(previous, current):
     change = (after["observed_median"] - before["observed_median"]) * direction
     return (before["baseline"] == after["baseline"] and before["thresholds"] == rule
             and change > max(rule["minimum_absolute"], rule["baseline_noise"])
-            and change / before["observed_median"] >= rule["suspect_ratio"])
+            and (not before["observed_median"] or change / before["observed_median"] >= rule["suspect_ratio"]))
 
 
 def card(health, updates, mention_id, details_url):
@@ -113,7 +114,7 @@ def card(health, updates, mention_id, details_url):
         else:
             metric = item["metric"]
             lines.append(f"**Suspected regression** {name} | {metric['metric']}: "
-                         f"{metric['baseline']:g} → {metric['observed_median']:g} ({metric['change_ratio']:+.1%})")
+                         f"{metric['baseline']:g} → {metric['observed_median']:g} ({verdict.format_change(metric)})")
     recovered = sum(bool(item.get("recovered")) for item in updates)
     if recovered:
         lines.append(f"**Recovered** {recovered}")
