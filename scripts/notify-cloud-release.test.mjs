@@ -9,6 +9,7 @@ const config = {
   RELEASE_VERSION: '0.7.0', RELEASE_TAG: 'v0.7.0', RELEASE_SHA: 'b'.repeat(40), RELEASE_BRANCH: 'main',
   CLOUD_IMAGE: `ghcr.io/tapstate/tapstate-cloud@${digest}`,
   CLOUD_IMAGE_TAG: 'ghcr.io/tapstate/tapstate-cloud:0.7.0', CLOUD_IMAGE_DIGEST: digest,
+  CLOUD_MANAGED_BEDROCK: 'true',
   CLOUD_RELEASE_API_URL: 'https://cloud.example.test/v1/api/cluster-versions',
   CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: 'test-release-secret', CLOUD_RELEASE_CODE: 'BETA',
   RELEASE_RUN_URL: 'https://github.com/tapstate/tapstate/actions/runs/123',
@@ -82,9 +83,23 @@ test('registers the published source and immutable image through the existing AP
   assert.equal(body.git.extra.image, config.CLOUD_IMAGE);
   assert.equal(body.git.extra.imageTag, config.CLOUD_IMAGE_TAG);
   assert.equal(body.git.extra.imageDigest, digest);
+  assert.equal(body.git.extra.managedBedrock, 'true');
   assert.equal(body.git.extra.tag, 'v0.7.0');
   assert.equal(body.git.extra.workflowUrl, config.RELEASE_RUN_URL);
   assert.equal(body.releaseNotes, body.git.extra.releaseUrl);
+});
+
+test('registers a historical Cloud build without managed Bedrock', async () => {
+  const remote = transport();
+  await notifyCloudRelease({ ...config, CLOUD_MANAGED_BEDROCK: 'false' }, remote.fetchImpl);
+  assert.equal(JSON.parse(remote.calls[1].options.body).git.extra.managedBedrock, 'false');
+});
+
+test('rejects an invalid capability result before contacting the catalog', async () => {
+  const remote = transport();
+  await assert.rejects(notifyCloudRelease({ ...config, CLOUD_MANAGED_BEDROCK: 'yes' }, remote.fetchImpl),
+    /CLOUD_MANAGED_BEDROCK must be true or false/);
+  assert.equal(remote.calls.length, 0);
 });
 
 test('a release already overtaken at notification time is skipped', async () => {

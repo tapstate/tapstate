@@ -121,7 +121,9 @@ the repository's Actions secrets before using that notification:
 
 The request carries the version and source revision; `git.extra` records the
 image tag, immutable image reference, digest, release URL, and workflow URL.
-Cloud provisioning continues to select the image by its version tag. Publication
+It also records whether the checked Cloud Boot JAR contains the managed
+Bedrock runtime configuration. The Cloud control plane can use this record
+to pin managed Bedrock launches to the approved image digest. Publication
 and registration share a cross-version concurrency queue so a delayed older
 insert cannot overtake the newer version's registration. Older
 release lines and releases already overtaken when the notification checks
