@@ -66,7 +66,7 @@ class ANestAcceptsPositionsSettledByAFilterTest {
         assertThat(topology.vertices()).hasSize(2);
 
         int routed = 0;
-        int isolated = 0;
+        Map<String, Integer> isolatedOutputs = new LinkedHashMap<>();
         Integer settlementPartition = null;
         for (Map.Entry<String, Vertex> filter : filters.entrySet()) {
             Envelope kept = Envelope.insert(1L, filter.getKey(), row("customer_id", 1, "profile_ref", 1,
@@ -78,11 +78,9 @@ class ANestAcceptsPositionsSettledByAFilterTest {
             List<Edge> routes = new ArrayList<>();
             for (Edge first : dag.getOutboundEdges(filter.getValue().getName())) {
                 if (first.getRoutingPolicy() == Edge.RoutingPolicy.ISOLATED) {
-                    assertThat(filter.getKey()).isEqualTo("customer");
                     List<Edge> afterOwners = dag.getOutboundEdges(first.getDestName());
-                    assertThat(afterOwners).hasSize(2);
+                    assertThat(isolatedOutputs.put(filter.getKey(), afterOwners.size())).isNull();
                     routes.addAll(afterOwners);
-                    isolated++;
                 } else {
                     routes.add(first);
                 }
@@ -101,7 +99,7 @@ class ANestAcceptsPositionsSettledByAFilterTest {
                 routed++;
             }
         }
-        assertThat(isolated).isOne();
+        assertThat(isolatedOutputs).containsExactlyInAnyOrderEntriesOf(Map.of("customer", 2, "profile", 1));
         assertThat(routed).isEqualTo(9);
     }
 
