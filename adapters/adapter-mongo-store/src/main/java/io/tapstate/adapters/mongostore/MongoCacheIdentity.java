@@ -72,6 +72,7 @@ final class MongoCacheIdentity {
 
     private void requireStoppedClaims(ClientSession session, io.tapstate.spi.store.CacheBusinessScope business) {
         var unsafe = new Document("_id.clusterId", business.clusterId()).append("$or", java.util.List.of(
+                new Document("leaseUntil", java.util.Date.from(io.tapstate.spi.store.ProcessNodeSession.PROCESS_OWNED)),
                 new Document("leaseUntil", new Document("$not", new Document("$type", "date"))),
                 new Document("$expr", new Document("$gt", java.util.List.of("$leaseUntil", "$$NOW")))));
         if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, unsafe)

@@ -1646,6 +1646,35 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
+    @Test void processRestartUsesANewGenerationAndAnOrphanCannotAuthorizeOldWrites() {
+        withBusiness(f -> {
+            var store = f.domain().workloadClaims(SCOPE);
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, SCOPE.clusterId());
+            var first = store.acquireProcessNode(key, new WorkloadOwner(key.resourceId(), "first-boot"), TTL).claim();
+            var old = WorkloadClaimFence.from(first);
+            io.tapstate.spi.store.ProcessNodeSession.open(first, TTL);
+            try {
+                assertThat(store.read(key).orElseThrow().leased()).isTrue();
+                var pipeline = store.acquireNodeBackedPipeline(PIPELINE, old, 1).claim();
+                assertThat(store.readPipeline(PIPELINE).orElseThrow().leased()).isTrue();
+                assertThat(store.acquireProcessNode(key, first.owner(), TTL).acquired()).isFalse();
+                // A crash loses only process memory; the original Mongo documents stay in place.
+                io.tapstate.spi.store.ProcessNodeSession.close(first);
+                assertThat(store.readPipeline(PIPELINE).orElseThrow().leased()).isFalse();
+                var next = store.acquireProcessNode(key, new WorkloadOwner(key.resourceId(), "second-boot"), TTL).claim();
+                assertThat(next.claimGeneration()).isGreaterThan(first.claimGeneration());
+                io.tapstate.spi.store.ProcessNodeSession.open(next, TTL);
+                try {
+                    assertThat(store.release(first)).isFalse();
+                    assertThatThrownBy(() -> store.acquireNodeBackedPipeline(PIPELINE, old, 1)).isInstanceOf(TapstateException.class);
+                    var replacement = store.acquireNodeBackedPipeline(PIPELINE, WorkloadClaimFence.from(next), 1).claim();
+                    assertThat(replacement.claimGeneration()).isGreaterThan(pipeline.claimGeneration());
+                    assertThat(store.advanceExecution(pipeline, 1, Set.of(first.owner().nodeId()))).isEmpty();
+                } finally { io.tapstate.spi.store.ProcessNodeSession.close(next); }
+            } finally { io.tapstate.spi.store.ProcessNodeSession.close(first); }
+        });
+    }
+
     @Test void anOversizedClaimSnapshotStillRequiresTheOriginalLiveNodeLease() {
         withBusiness(f -> {
             var claims = f.domain().workloadClaims(SCOPE);

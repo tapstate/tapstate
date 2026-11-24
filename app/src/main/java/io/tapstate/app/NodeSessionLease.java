@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.spi.store.ProcessNodeSession;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
 import io.tapstate.spi.store.IoError;
@@ -87,6 +88,13 @@ final class NodeSessionLease implements AutoCloseable {
         this.ttl = Objects.requireNonNull(ttl, "ttl");
         this.lost = Objects.requireNonNull(lost, "lost");
         this.intervalNanos = renewInterval.toNanos();
+        if (ProcessNodeSession.isProcessIdentity(initial)) {
+            ProcessNodeSession.open(initial, ttl);
+            LOG.info("Single-node OP owns the Node Session in this process [node={}, generation={}].",
+                    initial.key().resourceId(), initial.claimGeneration());
+            this.renewer = null;
+            return;
+        }
         // Two threads: a renewal the store never answers holds one of them, and the lapse still has to be
         // noticed on the other.
         this.renewer = Executors.newScheduledThreadPool(2, runnable -> {
@@ -253,7 +261,7 @@ final class NodeSessionLease implements AutoCloseable {
         for (;;) {
             Proof proof = current.get();
             if (proof == null) return null;
-            if (nanoTime.getAsLong() - proof.until() < 0) {
+            if (renewer == null || nanoTime.getAsLong() - proof.until() < 0) {
                 if (current.get() == proof) return proof;
                 continue;
             }
@@ -298,11 +306,12 @@ final class NodeSessionLease implements AutoCloseable {
     /** Fence locally before stopping, and never put coordination I/O ahead of the member stop. */
     void stopAndClose(Runnable stop) {
         Proof ending = current.getAndSet(null);
+        if (ending != null && renewer == null) ProcessNodeSession.close(ending.claim());
         try {
             stop.run();
         } finally {
             if (ending != null) {
-                renewer.shutdownNow();
+                if (renewer != null) renewer.shutdownNow();
                 release(ending.claim());
             }
         }
@@ -312,6 +321,11 @@ final class NodeSessionLease implements AutoCloseable {
     void closeAfterMemberStops() {
         Proof ending = current.getAndSet(null);
         if (ending == null) return;
+        if (renewer == null) {
+            ProcessNodeSession.close(ending.claim());
+            Thread.ofPlatform().daemon(true).name("tapstate-node-release").start(() -> release(ending.claim()));
+            return;
+        }
         renewer.execute(() -> {
             try {
                 release(ending.claim());
@@ -326,7 +340,7 @@ final class NodeSessionLease implements AutoCloseable {
         try {
             store.release(ending);
         } catch (RuntimeException unavailable) {
-            LOG.warn("Could not release the node session during shutdown; it will expire by lease.", unavailable);
+            LOG.warn("Could not record the node session release during shutdown.", unavailable);
         }
     }
 }

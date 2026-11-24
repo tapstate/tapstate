@@ -10,6 +10,7 @@ import com.mongodb.client.ClientSession;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.ProcessNodeSession;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -107,6 +108,21 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         WorkloadClaim current = read(key).map(WorkloadClaimReading::claim).orElseThrow(
                 () -> new IllegalStateException("contended workload claim vanished: " + key));
         return WorkloadClaimAttempt.refused(current);
+    }
+
+    @Override public WorkloadClaimAttempt acquireProcessNode(WorkloadClaimKey key, WorkloadOwner owner, Duration proofWindow) {
+        if (!strict || session == null || key.type() != WorkloadClaimType.NODE_SESSION)
+            throw MongoCacheWorkloadClaimStore.claimFenced();
+        var old = read(key);
+        if (old.isPresent() && old.get().leased()) return WorkloadClaimAttempt.refused(old.get().claim());
+        var granted = acquire(key, owner, 0, proofWindow);
+        if (!granted.acquired()) return granted;
+        // Both operations share the original transaction; only the boot identity is committed.
+        var update = new Document("$set", new Document("leaseUntil", Date.from(ProcessNodeSession.PROCESS_OWNED)));
+        var row = collection.findOneAndUpdate(session, expected(granted.claim()), update,
+                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+        if (row == null) throw MongoCacheWorkloadClaimStore.claimFenced();
+        return WorkloadClaimAttempt.acquired(decodeStrict(row));
     }
 
     /** Existing-only continuation for a retained preparation; this method has no absent-key branch. */
@@ -481,8 +497,9 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
             var prepared = MongoCapturePreparationFacts.annex(marker);
             if (!fence.key().resourceId().equals(prepared.captureId()) || !fence.key().clusterId().equals(prepared.scope().clusterId()))
                 throw MongoCacheWorkloadClaimStore.claimFenced();
-            filter.append("capturePreparation", marker)
-                    .append("$expr", new Document("$gt", List.of(Date.from(parent.orElseThrow().claim().leaseUntil()), "$$NOW")));
+            filter.append("capturePreparation", marker);
+            if (!ProcessNodeSession.isProcessIdentity(parent.orElseThrow().claim()))
+                filter.append("$expr", new Document("$gt", List.of(Date.from(parent.orElseThrow().claim().leaseUntil()), "$$NOW")));
         }
         return Optional.of(filter);
     }
@@ -506,8 +523,10 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private static WorkloadClaim withLease(WorkloadClaim claim, WorkloadClaimReading node) {
+        var until = ProcessNodeSession.isProcessIdentity(node.claim())
+                ? java.time.Instant.now().plus(node.leaseRemaining()) : node.claim().leaseUntil();
         return new WorkloadClaim(claim.key(), claim.owner(), claim.claimGeneration(), claim.executionGeneration(),
-                claim.topologyRevision(), node.claim().leaseUntil(), claim.contextExecutionGeneration(),
+                claim.topologyRevision(), until, claim.contextExecutionGeneration(),
                 claim.executionClaimGeneration(), claim.executionNodeIds(), claim.failureClaimGeneration(), claim.failureAfterMemberLoss());
     }
 
@@ -591,7 +610,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
 
     static WorkloadClaimReading observedReading(Document document) {
         if (!(document.get(LEASE_REMAINING) instanceof Long)) throw unreadableClaim();
-        return new WorkloadClaimReading(decodeStrict(document), Duration.ofMillis(number(document, LEASE_REMAINING)));
+        return timedOrProcessReading(decodeStrict(document), number(document, LEASE_REMAINING));
     }
 
     static WorkloadClaimReading observedPipelineReading(Document document,Document observedNode) {
@@ -616,15 +635,20 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
             return nodeLease(document).map(node -> new WorkloadClaimReading(withLease(claim, node), node.leaseRemaining()))
                     .orElseGet(() -> new WorkloadClaimReading(claim, Duration.ZERO));
         }
-        return new WorkloadClaimReading(
-                read(document), Duration.ofMillis(number(document, LEASE_REMAINING)));
+        return timedOrProcessReading(read(document), number(document, LEASE_REMAINING));
+    }
+
+    private static WorkloadClaimReading timedOrProcessReading(WorkloadClaim claim, long remainingMillis) {
+        if (ProcessNodeSession.isProcessIdentity(claim))
+            return new WorkloadClaimReading(claim, ProcessNodeSession.proofWindow(claim));
+        return new WorkloadClaimReading(claim, Duration.ofMillis(remainingMillis));
     }
 
     static WorkloadClaimReading nodeSessionReading(Document document) {
         var claim = decodeStrict(document);
         if (claim.key().type() != WorkloadClaimType.NODE_SESSION || nodeBacked(document)
                 || !(document.get(LEASE_REMAINING) instanceof Long remaining)) throw unreadableClaim();
-        return new WorkloadClaimReading(claim, Duration.ofMillis(remaining));
+        return timedOrProcessReading(claim, remaining);
     }
 
     private static long number(Document document, String field) {

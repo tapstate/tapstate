@@ -37,6 +37,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
         this.sources = Objects.requireNonNull(sources);
         this.leases = Objects.requireNonNull(leases);
     }
+    @Override public boolean processOwnsNode() { return leases == ClusterProperties.WorkloadLeases.NODE_BACKED; }
     @Override public synchronized void prepare(Config config, WorkloadClaim originalNode, long askedAt) {
         bound.requireBusiness();
         if (closed || authorization != null || originalNode == null) throw ThreeLayerStorePort.refused();

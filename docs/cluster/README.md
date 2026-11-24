@@ -9,14 +9,16 @@ target: https://tapstate.dev/docs/guides/cluster
 Cluster mode is opt-in. An installation that does not set a discovery mode remains a single member,
 binds the member protocol to `127.0.0.1`, and cannot discover another Tapstate process.
 
-Single-node OP with discovery disabled defaults to `tapstate.cluster.workload-leases-enabled=false`.
-Pipeline and Capture keep their own claim generations and follow the member's timed Node Session.
-NEST reuses its placement validation for the current execution. State writes check the original
-claim and inventory in the transaction.
+Single-node OP (`tapstate.cluster.profile=single`, the default) requires exclusive use of its storage.
+The process owns its Node Session in memory. Pipeline and Capture follow that session without
+periodic Mongo renewals. Mongo records the boot and execution generations at acquisition so
+a previous execution cannot write after a restart. Pipeline intents, checkpoints, SRS offsets
+and NEST state remain durable. NEST reuses its placement proof for the current execution.
 
-To enable independent Pipeline and Capture renewals and timed NEST validation, add
-`--tapstate.cluster.workload-leases-enabled=true` to the OP startup command and restart OP.
-Cloud and multi-member deployments always use independent workload leases.
+Multi-member profiles and Cloud use Mongo leases. The earlier draft setting
+`tapstate.cluster.workload-leases-enabled` has no effect. A single member checks the Hazelcast
+membership at startup and listens for subsequent joins. On seeing a peer, the OP process reports
+the cluster name and member addresses, stops serving work and exits with a nonzero status.
 
 Every cluster member needs:
 

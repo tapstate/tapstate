@@ -61,6 +61,9 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
     private void report(boolean write,Throwable failure){try{observer.accept(write,failure);}catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Storage operation collection is degraded");}}
     public WorkloadClaimAttempt acquire(WorkloadClaimKey key,WorkloadOwner owner,long revision,Duration ttl){return call(true,()->delegate.acquire(key,owner,revision,ttl));}
     public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope scope,WorkloadOwner owner,long revision,Duration ttl){return call(true,()->delegate.acquirePipeline(scope,owner,revision,ttl));}
+    @Override public WorkloadClaimAttempt acquireProcessNode(WorkloadClaimKey key, WorkloadOwner owner, Duration proofWindow) {
+        return call(true, () -> delegate.acquireProcessNode(key, owner, proofWindow));
+    }
     @Override public WorkloadClaimAttempt acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long revision) {
         return call(true, () -> delegate.acquireNodeBackedCapture(key, node, revision));
     }

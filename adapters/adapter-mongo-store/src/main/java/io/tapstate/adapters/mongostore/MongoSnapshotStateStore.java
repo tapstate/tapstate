@@ -55,7 +55,8 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
             var decodedNode = MongoWorkloadClaimStore.decodeStrict(node);
             if (!(claim.get(MongoWorkloadClaimStore.NODE_LEASE_GENERATION) instanceof Long generation)
                     || generation < 1 || !nodeKey.equals(decodedNode.key()) || !original.owner().equals(decodedNode.owner())
-                    || generation != decodedNode.claimGeneration() || !decodedNode.leaseUntil().isAfter(now)) throw fenced();
+                    || generation != decodedNode.claimGeneration() || !(decodedNode.leaseUntil().isAfter(now) || ProcessNodeSession.isProcessIdentity(decodedNode)
+                    && ProcessNodeSession.owns(WorkloadClaimFence.from(decodedNode)))) throw fenced();
         } else if (!decoded.leaseUntil().isAfter(now)) throw fenced();
         return validatedOrder(MongoCaptureStartupRows.get(captured, "order"), access.scope).getLong("order");
     }

@@ -421,9 +421,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             });
         }
         @Bean ClusterProperties.WorkloadLeases workloadLeases(NativeBusinessContext owner, ClusterProperties cluster,
-                CloudRuntimeSettings cloud, HazelcastProperties hazelcast) {
-            return cluster.workloadLeases(cloud.cloud(), owner.original.binding().mode() == StorageBinding.Mode.OP,
-                    hazelcast.getDiscovery().getMode());
+                CloudRuntimeSettings cloud) {
+            return cluster.workloadLeases(cloud.cloud(), owner.original.binding().mode() == StorageBinding.Mode.OP);
         }
         @Bean MemberStorage memberStorage(NativeBusinessContext owner, ClusterProperties cluster, WorkloadClaimStore claims,
                 SrsStores sources, ClusterProperties.WorkloadLeases leases) {

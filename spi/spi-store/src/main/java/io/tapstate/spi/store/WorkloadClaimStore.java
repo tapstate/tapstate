@@ -26,6 +26,11 @@ public interface WorkloadClaimStore {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
     }
 
+    /** Records a new boot generation for an exclusively owned local OP installation. */
+    default WorkloadClaimAttempt acquireProcessNode(WorkloadClaimKey key, WorkloadOwner owner, Duration proofWindow) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
     /** Admits a prepared Capture under the exact single-member Node Session. */
     default WorkloadClaimAttempt acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long topologyRevision) {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);

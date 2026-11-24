@@ -17,7 +17,6 @@ class ClusterProperties {
     private String id;
     private String nodeId;
     private Profile profile = Profile.SINGLE;
-    private Boolean workloadLeasesEnabled;
     private int bootstrapMinMembers = 3;
     private Duration nodeSessionTtl = Duration.ofSeconds(30);
     private Duration nodeSessionRenewInterval = Duration.ofSeconds(10);
@@ -50,17 +49,10 @@ class ClusterProperties {
         this.profile = profile;
     }
 
-    public Boolean getWorkloadLeasesEnabled() { return workloadLeasesEnabled; }
-
-    public void setWorkloadLeasesEnabled(Boolean enabled) { workloadLeasesEnabled = enabled; }
-
     enum WorkloadLeases { INDEPENDENT, NODE_BACKED }
 
-    WorkloadLeases workloadLeases(boolean cloud, boolean op, HazelcastProperties.DiscoveryMode discovery) {
-        boolean singleOp = !cloud && op && profile == Profile.SINGLE && discovery == HazelcastProperties.DiscoveryMode.NONE;
-        if (!singleOp && Boolean.FALSE.equals(workloadLeasesEnabled))
-            throw new IllegalArgumentException("tapstate.cluster.workload-leases-enabled=false requires single-node OP with discovery NONE");
-        return singleOp && !Boolean.TRUE.equals(workloadLeasesEnabled) ? WorkloadLeases.NODE_BACKED : WorkloadLeases.INDEPENDENT;
+    WorkloadLeases workloadLeases(boolean cloud, boolean op) {
+        return !cloud && op && profile == Profile.SINGLE ? WorkloadLeases.NODE_BACKED : WorkloadLeases.INDEPENDENT;
     }
 
     int getBootstrapMinMembers() {

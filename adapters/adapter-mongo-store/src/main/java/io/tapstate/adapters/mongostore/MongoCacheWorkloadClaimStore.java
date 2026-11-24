@@ -261,6 +261,13 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl)));
     }
 
+    @Override public WorkloadClaimAttempt acquireProcessNode(WorkloadClaimKey key, WorkloadOwner owner, Duration proofWindow) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.NODE_SESSION || !scope.clusterId().equals(key.resourceId())
+                || !key.resourceId().equals(owner.nodeId())) throw claimFenced();
+        return transaction(true, (store, session) -> store.acquireProcessNode(key, owner, proofWindow));
+    }
+
     @Override public WorkloadClaimAttempt acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long revision) {
         requireKey(key);
         if (key.type() != WorkloadClaimType.CAPTURE || revision != 1 || !scope.clusterId().equals(node.owner().nodeId()))
