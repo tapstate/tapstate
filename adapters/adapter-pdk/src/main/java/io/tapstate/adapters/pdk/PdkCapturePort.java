@@ -1510,7 +1510,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             long remaining = cutoff - System.nanoTime();
             if (remaining > 0) {
                 try { TimeUnit.NANOSECONDS.sleep(remaining); }
-                catch (InterruptedException cancelled) { return; }
+                catch (InterruptedException cancelled) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
             synchronized (this) {
                 confirm();
