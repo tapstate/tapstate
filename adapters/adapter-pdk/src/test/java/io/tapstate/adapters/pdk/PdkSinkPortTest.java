@@ -294,6 +294,20 @@ class PdkSinkPortTest {
     }
 
     @Test
+    void aRejectedRowPreventsTheBatchFromAcknowledgingItsSourcePosition(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.partiallyRejectedSink(dir);
+        var port = new PdkSinkPort(provisioner(jar, "synthetic.PartiallyRejected"));
+        try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.IGNORE))) {
+            assertThatThrownBy(() -> await(writer, List.of(insert(1), insert(2))))
+                    .isInstanceOf(ExecutionException.class)
+                    .cause().isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(ConnectorError.WRITE_FAILED);
+                        assertThat(failure).hasRootCauseMessage("target rejected the row");
+                    });
+        }
+    }
+
+    @Test
     void writeAccumulatesCountsAcrossMultipleConnectorFlushes(@TempDir Path dir) throws Exception {
         // A connector may report a batch in several flushes, one consumer callback each; the writer must
         // sum the accepted counts, not report only the last flush's.

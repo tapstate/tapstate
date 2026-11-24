@@ -360,7 +360,7 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {
-        long[] accepted = {0};
+        var outcome = new BatchOutcome();
         for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
             List<TapRecordEvent> rows = entry.getValue();
             TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
@@ -377,12 +377,16 @@ final class PdkSinkWriter implements SinkWriter {
             // The frozen PDK API stores alternatives by the current thread name.
             writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
-            try {write.writeRecord(connector.context(), rows, table,
-                    result -> accepted[0] += accepted(result));}
-            catch(Throwable failure){operation(table.getId(),failure);throw failure;}
+            try {
+                write.writeRecord(connector.context(), rows, table, outcome::accept);
+                if (outcome.failure != null) throw outcome.failure;
+            } catch (Throwable failure) {
+                operation(table.getId(), failure);
+                throw failure;
+            }
             operation(table.getId(),null);
         }
-        return new WriteResult(accepted[0]);
+        return new WriteResult(outcome.accepted);
     }
 
     private TargetTable projectedTarget(String stream, TargetTable original) {
@@ -390,8 +394,18 @@ final class PdkSinkWriter implements SinkWriter {
         return plan == null ? original : plan.target();
     }
 
-    private static long accepted(WriteListResult<TapRecordEvent> result) {
-        return result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+    private static final class BatchOutcome {
+        private long accepted;
+        private Throwable failure;
+
+        void accept(WriteListResult<TapRecordEvent> result) {
+            var errors = result.getErrorMap();
+            if (failure == null && errors != null && !errors.isEmpty()) {
+                failure = errors.values().iterator().next();
+                if (failure == null) failure = new IllegalStateException("Connector rejected a row without a cause");
+            }
+            accepted += result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+        }
     }
 
     private TapRecordEvent encode(Envelope env) {
