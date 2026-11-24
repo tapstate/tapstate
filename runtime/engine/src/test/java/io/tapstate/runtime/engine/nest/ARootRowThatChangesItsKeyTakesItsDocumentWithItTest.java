@@ -6,6 +6,7 @@ import static io.tapstate.runtime.engine.nest.NestTreeFixtures.embed;
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.nest;
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.tables;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
@@ -263,6 +264,76 @@ class ARootRowThatChangesItsKeyTakesItsDocumentWithItTest {
                         && "C1".equals(keyOf(event)));
     }
 
+    @Test
+    void aReplayedDepartureCannotTakeTheSubtreeOfTheRootThatReusedTheKey() throws Exception {
+        AssemblerProcessor leaving = assembler();
+        AssemblerProcessor arriving = assembler();
+        customer(leaving, "C1");
+        policy(leaving, "P1", "C1");
+        renamed(leaving, arriving, "C1", "C2");
+        assertThat(policiesOf("C2")).extracting(row -> row.get("policy_no")).containsExactly("PN-P1");
+
+        feed(leaving, OWN_ROWS, Envelope.insert(10, "customer",
+                row("customer_id", "C1", "name", "replacement"), null).withOrder(at(10)));
+        feed(leaving, POLICIES, Envelope.insert(11, "policy",
+                row("policy_id", "P2", "customer_id", "C1", "policy_no", "PN-P2"), null).withOrder(at(11)));
+        assertThat(policiesOf("C1")).extracting(row -> row.get("policy_no")).containsExactly("PN-P2");
+
+        AssemblerProcessor reopened = assembler();
+        Envelope moved = customerRenamed(9, "C1", "C2");
+        List<Object> replay = feed(reopened, DEPARTURES, moved);
+        List<Object> arrival = feed(reopened, OWN_ROWS, moved, moved);
+
+        assertAll(
+                () -> assertThat(arrival).as("the collected document is available immediately on replay")
+                        .anyMatch(item -> item instanceof Envelope event && "C2".equals(keyOf(event))
+                                && event.positions().equals(moved.positions())),
+
+                () -> assertThat(policiesOf("C1")).extracting(row -> row.get("policy_no"))
+                        .as("the old departure cannot detach children from the replacement root")
+                        .containsExactly("PN-P2"),
+                () -> assertThat(policiesOf("C2")).extracting(row -> row.get("policy_no")).containsExactly("PN-P1"),
+                () -> assertThat(replay).noneMatch(item -> item instanceof Envelope event
+                        && event.op() == Op.DELETE && "C1".equals(keyOf(event))),
+                () -> assertThat(stores.forParking(TOPOLOGY.assembler()).count())
+                        .as("the old departure has no tree left to park")
+                        .isZero());
+    }
+
+    @Test
+    void anArrivalReplayedBeforeTheDepartureStillWaitsForItsTree() throws Exception {
+        var leaving = assembler();
+        customer(leaving, "C1");
+        policy(leaving, "P1", "C1");
+        var moved = customerRenamed(9, "C1", "C2");
+        assertThat(feed(assembler(), OWN_ROWS, moved)).isEmpty();
+
+        var reopened = assembler();
+        assertThat(feed(reopened, OWN_ROWS, moved)).isEmpty();
+        feed(leaving, DEPARTURES, moved);
+        reopened.tryProcess();
+        assertThat(policiesOf("C2")).extracting(row -> row.get("policy_no")).containsExactly("PN-P1");
+    }
+
+    @Test
+    void repeatingTheDepartureLeavesLaterChildrenAtTheVacantKey() throws Exception {
+        var leaving = assembler();
+        customer(leaving, "C1");
+        policy(leaving, "P1", "C1");
+        renamed(leaving, assembler(), "C1", "C2");
+
+        feed(leaving, POLICIES, Envelope.insert(10, "policy",
+                row("policy_id", "P2", "customer_id", "C1", "policy_no", "PN-P2"), null).withOrder(at(10)));
+        var reopened = assembler();
+        feed(reopened, DEPARTURES, customerRenamed(9, "C1", "C2"));
+        feed(reopened, OWN_ROWS, Envelope.insert(11, "customer",
+                row("customer_id", "C1", "name", "replacement"), null).withOrder(at(11)));
+
+        assertThat(policiesOf("C1")).extracting(row -> row.get("policy_no")).containsExactly("PN-P2");
+        assertThat(policiesOf("C2")).extracting(row -> row.get("policy_no")).containsExactly("PN-P1");
+        assertThat(stores.forParking(TOPOLOGY.assembler()).count()).isZero();
+    }
+
     /** Drives both halves of one rename, departure first, and answers with everything that went downstream. */
     private List<Object> renamed(AssemblerProcessor losing, AssemblerProcessor gaining, String was, String is)
             throws Exception {
@@ -280,9 +351,8 @@ class ARootRowThatChangesItsKeyTakesItsDocumentWithItTest {
         return processor;
     }
 
-    private List<Object> feed(AssemblerProcessor processor, int ordinal, Envelope event) {
-        TestInbox inbox = new TestInbox();
-        inbox.queue().add(event);
+    private List<Object> feed(AssemblerProcessor processor, int ordinal, Envelope... events) {
+        TestInbox inbox = new TestInbox(List.of(events));
         processor.process(ordinal, inbox);
         List<Object> emitted = new ArrayList<>();
         out.drainQueueAndReset(0, emitted, false);

@@ -153,6 +153,28 @@ public final class RootAssembly implements Serializable {
      */
     private final List<NestElement> heldElements = new ArrayList<>();
 
+    /** Whether a later root input has already reused or removed this key. */
+    boolean rootHasPassed(SourceOrder order) {
+        return rootOrder != null && rootOrder.compareTo(order) > 0;
+    }
+
+    boolean rootDeletedAt(SourceOrder order) {
+        return !rootPresent && order.equals(rootOrder);
+    }
+
+    /**
+     * An accepted root clears its reference snapshot. Sending that root records the snapshot, even
+     * when it names no referenced objects. Queuing a replay must preserve this evidence across drains.
+     */
+    boolean rootSentAt(SourceOrder order) {
+        return rootPresent && order.equals(rootOrder) && missingObjectReferences != null;
+    }
+
+    /** The existing state may have been sent before a restart lost the target acknowledgement. */
+    void coverRootReplay(Map<String, ChainPosition> positions) {
+        fromRoot.add(positions);
+    }
+
     /** Whether the root row is currently in the document — false before it arrives and after it is deleted. */
     public boolean rootPresent() {
         return rootPresent;

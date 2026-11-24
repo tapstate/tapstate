@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.function.FunctionEx;
+import com.hazelcast.jet.datamodel.Tuple2;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Processor;
@@ -101,7 +102,17 @@ public final class NestDag {
                     frontier == null ? null : frontier.axes(), chains)));
             built.put(spec.pathId(), vertex);
             for (NestInbound edge : spec.inbound()) {
-                connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width, spec.mapName());
+                if (spec.isAssembler() && edge.pathId().isEmpty() && edge.tracksKeyChanges()) {
+                    if (!edge.carriesDepartures()) {
+                        NestInbound departure = spec.inbound().stream()
+                                .filter(other -> other.pathId().isEmpty() && other.carriesDepartures())
+                                .findFirst().orElseThrow();
+                        connectRoot(dag, vertex, edge, departure, upstream, nextOutbound, frontier, width,
+                                spec.mapName());
+                    }
+                } else {
+                    connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width, spec.mapName());
+                }
             }
             if (!spec.isAssembler() && binding.stores().hasReleaseRecovery()) {
                 String name = spec.name() + ":recovery";
@@ -251,6 +262,31 @@ public final class NestDag {
         }
         carried.put(spec.pathId(), List.copyOf(reaching));
         return byOrdinal;
+    }
+
+    private static void connectRoot(DAG dag, Vertex destination, NestInbound rows, NestInbound departures,
+            Function<String, List<Vertex>> upstream, ToIntFunction<Vertex> nextOutbound,
+            NestFrontier frontier, NodeWidth width, String namespace) {
+        List<Vertex> sources = upstream.apply(rows.alias());
+        if (sources == null || sources.isEmpty()) {
+            throw new IllegalStateException("nest alias '" + rows.alias() + "' resolved to no vertex");
+        }
+        Vertex source = sources.size() == 1 ? sources.get(0)
+                : merged(dag, destination, rows, sources, nextOutbound, frontier);
+        Vertex owners = dag.newVertex(destination.getName() + ":root-owners",
+                ProcessorMetaSupplier.of(source.getMetaSupplier().preferredLocalParallelism(),
+                        () -> new NestRootInputs(rows, namespace)))
+                .localParallelism(source.getLocalParallelism());
+        dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(owners).isolated());
+        FunctionEx<Object, Object> key = item -> {
+            if (item instanceof SettledPositions) return SETTLED_POSITIONS_LANE;
+            if (item instanceof Tuple2<?, ?> departure) return departure.f0();
+            return NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), rows.keyFields(), namespace);
+        };
+        dag.edge(width.into(Edge.from(owners, 0).to(destination, rows.ordinal()), destination.getName(), key));
+        // Retain the logical control input and its frontier coverage. Data uses only output zero.
+        dag.edge(width.into(Edge.from(owners, 1).to(destination, departures.ordinal()),
+                destination.getName(), (Object item) -> SETTLED_POSITIONS_LANE));
     }
 
     private static void connect(DAG dag, Vertex destination, NestInbound edge, Map<List<String>, Vertex> built,
