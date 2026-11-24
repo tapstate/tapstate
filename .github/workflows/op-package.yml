@@ -1,4 +1,8 @@
 name: Build OP archive
+run-name: >-
+  OP archive · ${{ inputs.source_ref || github.ref_name }} ·
+  ${{ inputs.platform == 'linux-amd64' && 'Linux x86-64' || inputs.platform == 'darwin-arm64' && 'macOS Apple Silicon' || 'Linux + macOS' }} ·
+  @${{ github.actor }}
 
 on:
   workflow_dispatch:
