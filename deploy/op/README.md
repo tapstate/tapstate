@@ -1,9 +1,9 @@
 # Tapstate OP server archive
 
 Use a 64-bit Java 21 installation and an existing MongoDB with access to the databases you plan to
-use for Tapstate. The package contains the Tapstate server and its MongoDB connector. It also
-contains a controller for each supported platform, Linux x86-64 and macOS on Apple silicon.
-A manually packaged archive contains the controller for the platform selected when it was built.
+use for Tapstate. The package contains the Tapstate server, MongoDB and MongoDB Atlas connectors. It also
+contains the controllers selected in the packaging workflow. Choose both Linux x86-64 and
+macOS on Apple silicon, or build a single-platform archive.
 
 1. Download the archive and its independent SHA-256 file. Verify the checksum before extracting.
    On Linux run `sha256sum -c tapstate-op-<version>.tar.gz.sha256`. On macOS use
@@ -43,11 +43,23 @@ directory. The server and seed set are selected by the new package manifest. If 
 interrupted, extract the complete archive again. Existing installations and Pipeline recovery state
 come from the retained data directory and MongoDB.
 
-## Package additional connectors
+## Build an OP archive
 
-In GitHub Actions, run **Repackage a published OP release** with a published release tag,
-one platform and an optional comma-separated list of connector IDs. Download the archive
-and its SHA-256 from that run's Artifacts and follow the installation instructions above.
+In GitHub Actions, open **Build OP archive** and select **Run workflow**. Enter the Tapstate
+branch or tag in `source_ref` or leave it blank to use the workflow's selected ref. Use
+`refs/heads/` or `refs/tags/` to disambiguate a branch and tag with the same name. The
+selected Tapstate source needs to contain the OP packaging code. Set `web_ref` to the matching
+Tapstate Web ref when building a change that also needs a specific Web revision.
+
+Choose the platform and a connector selection. **All** includes every connector listed in the
+workflow. **GA**, **Beta**, and **Alpha** match the release stage declared in the selected JAR.
+**Custom** uses the checked connectors. Every archive includes MongoDB and MongoDB Atlas.
+Bundled JARs must be published and compatible with the selected Tapstate source.
+
+Download the archive and its SHA-256 from the run's **Artifacts**. A branch such as
+`ws/example` produces `tapstate-op-ws-example.tar.gz`. A version tag such as `v0.8.0`
+produces `tapstate-op-0.8.0.tar.gz`. Other tags use the tag name. The run summary shows
+the source commits and the IDs, versions, and paths of connector JARs verified in the archive.
 
 Use the separate [Quickstart](https://github.com/tapstate/tapstate/blob/main/docs/quickstart-online.md)
 to run the demo stack.

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -46,6 +47,24 @@ class PublishedConnectorsTest(unittest.TestCase):
         self.assertEqual({entry["id"] for entry in entries}, set(PUBLISHED.STAGE.CLOUD_IDS))
         self.assertTrue(all(entry["groupId"] == "io.tapdata" and entry["version"] == "2.5.0" for entry in entries))
 
+    def test_download_uses_the_shared_512_mb_jar_limit(self):
+        with patch.object(PUBLISHED.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as curl:
+            PUBLISHED.download("https://maven.example.test/db2-connector.jar", Path("db2-connector.jar"))
+        command = curl.call_args.args[0]
+        self.assertEqual(command[command.index("--max-filesize") + 1], "512000000")
+
+    def test_op_keeps_its_licenses_when_the_selection_matches_cloud(self):
+        selected = [entry for entry in self.selection if entry["id"] in PUBLISHED.STAGE.CLOUD_IDS]
+        with patch.object(PUBLISHED, "download", side_effect=self.download):
+            included = PUBLISHED.stage(Path("fixture-boot.jar"), "op", self.fixture.staged,
+                                       selection=selected, extra=("mongodb-atlas", "mysql", "postgres"))
+        self.assertEqual(set(included), set(PUBLISHED.STAGE.CLOUD_IDS))
+        lock = self.fixture.staged / "release/connectors.lock.json"
+        _, licenses = PUBLISHED.STAGE.read_lock(lock, included, profile="op")
+        self.assertEqual({entry["name"] for entry in licenses}, set(PUBLISHED.STAGE.REQUIRED_LICENSE_FILES))
+        with self.assertRaisesRegex(PUBLISHED.STAGE.StageError, "companion license"):
+            PUBLISHED.STAGE.read_lock(lock, profile="cloud")
+
     def test_onprem_includes_dummy_and_companion_terms_and_excludes_db2(self):
         with patch.object(PUBLISHED, "download", side_effect=self.download):
             PUBLISHED.stage(Path("fixture-boot.jar"), "onprem", self.fixture.staged, selection=self.selection)
@@ -55,6 +74,25 @@ class PublishedConnectorsTest(unittest.TestCase):
         self.assertIn("dummy", {entry["id"] for entry in entries})
         self.assertNotIn("db2", {entry["id"] for entry in entries})
         self.assertEqual({entry["name"] for entry in licenses}, set(PUBLISHED.STAGE.REQUIRED_LICENSE_FILES))
+
+    def test_op_stage_filters_read_jar_labels_and_keep_mongo_and_atlas(self):
+        labels = {"mongodb": "GA", "mongodb-atlas": "GA", "mysql": " Ga ",
+                  "postgres": "Beta", "oracle": None}
+        for connector_id, label in labels.items():
+            self.fixture.make_jar(connector_id, authentication=label)
+        digests = {entry["id"]: entry["sha256"] for entry in self.fixture.entries}
+        selected = [dict(entry, sha256=digests[entry["id"]])
+                    for entry in self.selection if entry["id"] in labels]
+        core = {"mongodb", "mongodb-atlas"}
+        for stage, expected in ((None, set(labels)), ("ga", core | {"mysql"}),
+                                ("beta", core | {"postgres"}), ("alpha", core | {"oracle"})):
+            with self.subTest(stage=stage), patch.object(PUBLISHED, "download", side_effect=self.download):
+                staged = self.fixture.root / f"op-{stage}"
+                included = PUBLISHED.stage(Path("fixture-boot.jar"), "op", staged, selection=selected,
+                                           extra=("mongodb-atlas", "mysql", "postgres", "oracle"), release_stage=stage)
+                self.assertEqual(set(included), expected)
+                self.assertEqual({path.name for path in (staged / "connectors").iterdir()},
+                                 {f"{connector_id}-connector.jar" for connector_id in expected})
 
     def test_mismatched_digest_never_publishes_a_stage(self):
         selected = [entry for entry in self.selection if entry["id"] in PUBLISHED.STAGE.CLOUD_IDS]

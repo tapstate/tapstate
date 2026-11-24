@@ -132,7 +132,7 @@ jobs:
         run: .github/scripts/set-version.sh "$VERSION"
       - uses: actions/download-artifact@v4
         with:
-          pattern: tapstate-*.tar.gz
+          pattern: tapstate-${{ needs.prepare.outputs.version }}-*.tar.gz
           path: staging
           merge-multiple: true
       - uses: actions/download-artifact@v4

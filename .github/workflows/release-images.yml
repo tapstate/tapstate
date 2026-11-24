@@ -127,28 +127,6 @@ jobs:
           name: server-boot-jar
           path: app/target/app-*-boot.jar
           if-no-files-found: error
-      - uses: actions/setup-go@v5
-        if: hashFiles('deploy/op/controller/go.mod') != ''
-        with:
-          go-version-file: deploy/op/controller/go.mod
-          cache: false
-      - name: assemble the OP archive from the same server build
-        if: hashFiles('deploy/op/package.py') != ''
-        env:
-          VERSION: ${{ inputs.release-version }}
-          BOOT_SHA: ${{ steps.web-provenance.outputs.boot-jar-sha256 }}
-        run: |
-          bash deploy/op/build-controllers.sh "$RUNNER_TEMP/op-controllers"
-          python3 deploy/op/package.py official \
-            --version "$VERSION" --assembly "app/target/app-$VERSION-dist.tar.gz" \
-            --controllers "$RUNNER_TEMP/op-controllers" --boot-sha256 "$BOOT_SHA" \
-            --output "$RUNNER_TEMP/op/tapstate-op-$VERSION.tar.gz"
-      - uses: actions/upload-artifact@v4
-        if: hashFiles('deploy/op/package.py') != ''
-        with:
-          name: tapstate-op-${{ inputs.release-version }}.tar.gz
-          path: ${{ runner.temp }}/op/
-          if-no-files-found: error
       # Older release sources retain their own image format.
       - name: stage the exact on-prem connector and license bytes
         if: hashFiles('deploy/docker/connectors.lock.json') != ''

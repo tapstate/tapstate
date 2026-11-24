@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run in the selected product checkout after downloading the CLI and OP image artifacts.
+# Run in the selected product checkout after downloading the CLI and server image artifacts.
 set -euo pipefail
 
 version="$1"
@@ -28,5 +28,4 @@ python3 .github/scripts/web-provenance.py create \
 python3 .github/scripts/web-provenance.py verify \
   --oci-layout image/layout --provenance "$provenance" --web-profile onprem \
   --boot-jar-sha256 "$boot_sha256"
-export OP_BOOT_SHA256="$boot_sha256"
 .github/scripts/release-manifest.sh "$version" staging image/layout

@@ -28,6 +28,7 @@ ONPREM_IDS = (
     "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2"
 )
 REQUIRED_LICENSE_FILES = ("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt")
+MAX_JAR_BYTES = 512_000_000
 CLOUD_IDS = ("mongodb", "mysql", "postgres", "mongodb-atlas")
 PUBLISHED_ONPREM_IDS = ("mongodb", "mysql", "postgres", "mongodb-atlas", "oracle", "sqlserver", "aws-rds-mysql", "dummy")
 COORDINATE_KEYS = {"groupId", "artifactId", "version"}
@@ -62,7 +63,7 @@ def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS, *,
         raise StageError("connector lock must have schemaVersion, connectors, and licenseFiles")
     if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] not in (2, 3):
         raise StageError("connector lock schemaVersion must be 2 or 3")
-    if profile is not None:
+    if profile in ("cloud", "onprem"):
         if lock["schemaVersion"] == 3:
             required_ids = PUBLISHED_ONPREM_IDS if profile == "onprem" else CLOUD_IDS
         else:
@@ -78,9 +79,7 @@ def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS, *,
         connector_id = entry["id"]
         if not isinstance(connector_id, str) or connector_id not in required_ids:
             raise StageError(f"unexpected connector id: {connector_id!r}")
-        # The Db2 artifact includes its native runtime; other connector budgets remain unchanged.
-        maximum = 256 * 1024 * 1024 if connector_id == "db2" else 128_000_000
-        if type(entry["bytes"]) is not int or not 1_000_000 <= entry["bytes"] <= maximum:
+        if type(entry["bytes"]) is not int or not 1_000_000 <= entry["bytes"] <= MAX_JAR_BYTES:
             raise StageError(f"{connector_id}: invalid shaded JAR length")
         if not isinstance(entry["sha256"], str) or not SHA256.fullmatch(entry["sha256"]):
             raise StageError(f"{connector_id}: invalid SHA-256")
@@ -100,7 +99,8 @@ def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS, *,
     if sorted(ids) != sorted(required_ids):
         raise StageError("connector lock has a duplicate or missing id")
     license_files = lock["licenseFiles"]
-    expected_licenses = () if lock["schemaVersion"] == 3 and set(required_ids) == set(CLOUD_IDS) else REQUIRED_LICENSE_FILES
+    cloud_profile = profile == "cloud" or (profile is None and set(required_ids) == set(CLOUD_IDS))
+    expected_licenses = () if lock["schemaVersion"] == 3 and cloud_profile else REQUIRED_LICENSE_FILES
     if not isinstance(license_files, list) or len(license_files) != len(expected_licenses):
         raise StageError("connector lock has missing or unexpected companion license files")
     names = []
@@ -175,8 +175,11 @@ def verify_jar(path: Path, entry: dict[str, Any]) -> None:
             spec = json.loads(jar.read(entry["specPath"]).decode("utf-8"))
     except (OSError, zipfile.BadZipFile, UnicodeError, json.JSONDecodeError) as exc:
         raise StageError(f"{connector_id}: JAR manifest or spec is unreadable") from exc
-    # The published SQL Server JAR is built from the upstream mssql module, while its PDK id is sqlserver.
-    implementation_title = "mssql-connector" if connector_id == "sqlserver" else f"{connector_id}-connector"
+    # Versioned locks record the Maven module name independently of the connector's PDK ID.
+    if "artifactId" in entry:
+        implementation_title = entry["artifactId"]
+    else:
+        implementation_title = "mssql-connector" if connector_id == "sqlserver" else f"{connector_id}-connector"
     expected_headers = {
         "Implementation-Title": implementation_title,
         "Git-Commit-Id": entry["upstreamRevision"],

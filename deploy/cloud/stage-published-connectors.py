@@ -18,6 +18,7 @@ assert SPEC is not None and SPEC.loader is not None
 STAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(STAGE)
 ROOT = Path(__file__).resolve().parents[2]
+OP_DEFAULT_CONNECTORS = ("mongodb", "mongodb-atlas")
 
 
 def select(boot_jar: Path, profile: str, java: str, extra: tuple[str, ...] = ()) -> list[dict]:
@@ -43,13 +44,13 @@ def download(url: str, destination: Path) -> None:
         raise STAGE.StageError("connector selection contains an invalid download URL")
     process = subprocess.run([
         "curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--proto-redir", "=https",
-        "--max-time", "120", "--max-filesize", "128000000", "--output", str(destination), url,
+        "--max-time", "120", "--max-filesize", str(STAGE.MAX_JAR_BYTES), "--output", str(destination), url,
     ], capture_output=True, timeout=125, check=False)
     if process.returncode != 0:
         raise STAGE.StageError(f"{destination.name}: Maven artifact download failed (curl exit={process.returncode})")
 
 
-def inspect(path: Path, selected: dict) -> dict:
+def inspect(path: Path, selected: dict) -> tuple[dict, str]:
     digest, size = STAGE.sha256_and_size(path)
     if digest != selected["sha256"]:
         raise STAGE.StageError(f"{selected['id']}: JAR SHA-256 differs from the selected release")
@@ -69,13 +70,16 @@ def inspect(path: Path, selected: dict) -> dict:
             raise STAGE.StageError(f"{selected['id']}: expected exactly one matching connector spec")
     if headers.get("Implementation-Version") != selected["version"]:
         raise STAGE.StageError(f"{selected['id']}: JAR version differs from the selected Maven release")
+    authentication = headers.get("Authentication", "").strip().lower()
+    release_stage = authentication if authentication in {"ga", "beta"} else "alpha"
     return {"id": selected["id"], "bytes": size, "sha256": digest,
             "upstreamRevision": headers.get("Git-Commit-Id"), "pdkApiVersion": selected["pdkApiVersion"],
-            "specPath": paths[0], **{key: selected[key] for key in STAGE.COORDINATE_KEYS}}
+            "specPath": paths[0], **{key: selected[key] for key in STAGE.COORDINATE_KEYS}}, release_stage
 
 
 def stage(boot_jar: Path, profile: str, output: Path, java: str = "java", *,
-          selection: list[dict] | None = None, extra: tuple[str, ...] = ()) -> None:
+          selection: list[dict] | None = None, extra: tuple[str, ...] = (),
+          release_stage: str | None = None) -> tuple[str, ...]:
     if output.exists() or output.is_symlink():
         raise STAGE.StageError("stage directory already exists; refusing to overwrite it")
     if profile == "op":
@@ -91,7 +95,12 @@ def stage(boot_jar: Path, profile: str, output: Path, java: str = "java", *,
         for entry in selected:
             path = jars / f"{entry['id']}-connector.jar"
             download(entry["url"], path)
-            entries.append(inspect(path, entry))
+            locked, stage_label = inspect(path, entry)
+            if release_stage is None or entry["id"] in OP_DEFAULT_CONNECTORS or stage_label == release_stage:
+                entries.append(locked)
+            else:
+                path.unlink()
+        included = tuple(entry["id"] for entry in entries)
         licenses = []
         if profile != "cloud":
             for name in STAGE.REQUIRED_LICENSE_FILES:
@@ -101,7 +110,8 @@ def stage(boot_jar: Path, profile: str, output: Path, java: str = "java", *,
                 licenses.append({"name": name, "bytes": size, "sha256": digest})
         lock = jars / "connectors.lock.json"
         lock.write_text(json.dumps({"schemaVersion": 3, "connectors": entries, "licenseFiles": licenses}, indent=2) + "\n")
-        STAGE.stage(lock, jars, output, required)
+        STAGE.stage(lock, jars, output, included, profile=profile)
+        return included
 
 
 def main() -> int:

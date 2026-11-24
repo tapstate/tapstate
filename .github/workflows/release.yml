@@ -394,12 +394,10 @@ jobs:
       # asks has to be the tree this release was built from.
       - name: write the release version into every file that pins one
         run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
-      # Take only the CLI and OP archive assets. An unfiltered download pulls in whatever else the other jobs upload,
-      # so this job's success came to depend on artifacts it never uses, and one that failed to download
-      # sank the whole release step.
+      # Select only the CLI archives for this release version.
       - uses: actions/download-artifact@v4
         with:
-          pattern: tapstate-*.tar.gz
+          pattern: tapstate-${{ needs.version.outputs.version }}-*.tar.gz
           path: staging
           merge-multiple: true
       - uses: actions/download-artifact@v4
@@ -483,8 +481,8 @@ jobs:
           # writes a "## What's Changed" of its own.
           generate_release_notes: true
           files: |
-            staging/tapstate-*.tar.gz
-            staging/tapstate-*.tar.gz.sha256
+            staging/tapstate-${{ needs.version.outputs.version }}-*.tar.gz
+            staging/tapstate-${{ needs.version.outputs.version }}-*.tar.gz.sha256
             staging/checksums.txt
             staging/platform-minimums.txt
             staging/tapstate-${{ needs.version.outputs.version }}-provenance.json

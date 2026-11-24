@@ -55,7 +55,7 @@ def checked_file(package, entry):
     return path
 
 
-def verified(root, version, expected_platforms, expected_boot=None):
+def verified(root, version, expected_platforms, expected_boot=None, expected_connectors=None):
     manifest = read_json(root / "op-manifest.json")
     if manifest["schemaVersion"] != 1 or manifest["version"] != version:
         raise ValueError("OP manifest schema or release version does not match")
@@ -64,7 +64,7 @@ def verified(root, version, expected_platforms, expected_boot=None):
         raise ValueError("unexpected server JAR location")
     checked_file(root, server)
     if expected_boot and server["sha256"] != expected_boot:
-        raise ValueError("OP server JAR differs from the release image")
+        raise ValueError("OP server JAR differs from the expected build")
     controllers = manifest["controllers"]
     if set(controllers) != set(expected_platforms):
         raise ValueError("unexpected platform set in OP manifest")
@@ -97,8 +97,8 @@ def verified(root, version, expected_platforms, expected_boot=None):
     files = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
     if not expected <= files or any(not name.startswith("conf/") for name in files - expected):
         raise ValueError("OP archive contains missing or unexpected files")
-    if len(expected_platforms) == len(PLATFORMS) and ids != ["mongodb"]:
-        raise ValueError("official OP archive must contain exactly the MongoDB connector")
+    if expected_connectors is not None and set(ids) != set(expected_connectors):
+        raise ValueError("bundled connectors do not match the requested selection")
     return manifest
 
 
@@ -110,7 +110,7 @@ def release_checksum(archive, checksum):
     return fields[0]
 
 
-def write_package(root, version, platforms, bundle, output, source=None):
+def write_package(root, version, platforms, bundle, output, connectors, source=None):
     for directory in ("connectors", "release"):
         shutil.copytree(bundle / directory, root / directory)
     lock = root / "release/connectors.lock.json"
@@ -126,7 +126,7 @@ def write_package(root, version, platforms, bundle, output, source=None):
     if source:
         manifest["sourceArchiveSha256"] = source
     (root / "op-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    verified(root, version, platforms)
+    verified(root, version, platforms, expected_connectors=connectors)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
         staged = Path(temporary) / output.name
@@ -138,13 +138,22 @@ def write_package(root, version, platforms, bundle, output, source=None):
         checksum.replace(output.with_name(output.name + ".sha256"))
 
 
+def optional_connectors(selection):
+    ids = dict.fromkeys(re.split(r"[,\s]+", selection.strip())) if selection.strip() else {}
+    if any(not CONNECTOR_ID.fullmatch(value) for value in ids):
+        raise ValueError("invalid connector ID in the OP selection")
+    return tuple(value for value in ids if value != "mongodb")
+
+
 def official(args, work):
+    platforms = (args.platform,) if args.platform else PLATFORMS
+    extra = tuple(dict.fromkeys(("mongodb-atlas", *optional_connectors(args.connectors))))
     release = extract(args.assembly, work, f"tapstate-server-{args.version}")
     root = release.rename(work / ROOT)
     boot = root / f"lib/app-{args.version}-boot.jar"
     if args.boot_sha256 and sha(boot) != args.boot_sha256:
-        raise ValueError("server Assembly JAR differs from the release image")
-    for platform in PLATFORMS:
+        raise ValueError("server Assembly JAR differs from the expected build")
+    for platform in platforms:
         target = root / "bin" / platform / "tapstate-ctl"
         target.parent.mkdir()
         shutil.copyfile(args.controllers / platform / "tapstate-ctl", target)
@@ -153,18 +162,15 @@ def official(args, work):
         source = HERE / name if name == "README.md" else HERE.parents[1] / name
         shutil.copyfile(source, root / name)
     bundle = work / "bundle"
-    PUBLISHED.stage(boot, "op", bundle, args.java)
-    write_package(root, args.version, PLATFORMS, bundle, args.output)
+    included = PUBLISHED.stage(boot, "op", bundle, args.java, extra=extra, release_stage=args.release_stage)
+    write_package(root, args.version, platforms, bundle, args.output, included)
 
 
 def manual(args, work):
     source_digest = release_checksum(args.archive, args.checksum)
     root = extract(args.archive, work, ROOT)
-    manifest = verified(root, args.version, PLATFORMS)
-    extra = tuple(dict.fromkeys(re.split(r"[,\s]+", args.connectors.strip()))) if args.connectors.strip() else ()
-    if any(not CONNECTOR_ID.fullmatch(value) for value in extra):
-        raise ValueError("invalid connector ID in the manual selection")
-    extra = tuple(value for value in extra if value != "mongodb")
+    manifest = verified(root, args.version, PLATFORMS, expected_connectors=("mongodb",))
+    extra = optional_connectors(args.connectors)
     bundle = work / "bundle"
     PUBLISHED.stage(root / manifest["server"]["path"], "op", bundle, args.java, extra=extra)
     for platform in PLATFORMS:
@@ -172,7 +178,7 @@ def manual(args, work):
             shutil.rmtree(root / "bin" / platform)
     for directory in ("connectors", "release"):
         shutil.rmtree(root / directory)
-    write_package(root, args.version, (args.platform,), bundle, args.output, source_digest)
+    write_package(root, args.version, (args.platform,), bundle, args.output, ("mongodb", *extra), source_digest)
 
 
 def main():
@@ -189,12 +195,15 @@ def main():
             command.add_argument("--checksum", type=Path, required=True)
         if action in ("official", "verify"):
             command.add_argument("--boot-sha256")
-        if action == "manual":
-            command.add_argument("--platform", choices=PLATFORMS, required=True)
+        command.add_argument("--platform", choices=PLATFORMS, required=action == "manual")
+        if action in ("official", "manual"):
             command.add_argument("--connectors", default="")
         if action == "official":
             command.add_argument("--assembly", type=Path, required=True)
             command.add_argument("--controllers", type=Path, required=True)
+            command.add_argument("--release-stage", choices=("ga", "beta", "alpha"))
+        if action == "verify":
+            command.add_argument("--list-connectors", action="store_true")
     args = parser.parse_args()
     try:
         if not VERSION.fullmatch(args.version):
@@ -203,7 +212,13 @@ def main():
             work = Path(temporary)
             if args.action == "verify":
                 release_checksum(args.archive, args.checksum)
-                verified(extract(args.archive, work, ROOT), args.version, PLATFORMS, args.boot_sha256)
+                platforms = (args.platform,) if args.platform else PLATFORMS
+                manifest = verified(extract(args.archive, work, ROOT), args.version, platforms, args.boot_sha256)
+                if args.list_connectors:
+                    for entry in manifest["connectors"]:
+                        connector_id = entry["id"]
+                        jar = f"{ROOT}/connectors/{connector_id}-connector.jar"
+                        print(f"{connector_id}\t{entry['version']}\t{jar}")
             elif args.action == "official":
                 official(args, work)
             else:
