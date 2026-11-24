@@ -25,6 +25,11 @@ final class NestRootInputs extends AbstractProcessor implements Staged {
     }
 
     @Override
+    public boolean isCooperative() {
+        return true;
+    }
+
+    @Override
     public Stage stage() {
         return Stage.NEST;
     }
