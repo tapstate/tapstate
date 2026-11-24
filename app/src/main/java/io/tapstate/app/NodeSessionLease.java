@@ -47,7 +47,7 @@ final class NodeSessionLease implements AutoCloseable {
 
     /** When the lease the last accepted renewal bought runs out, on the monotonic clock. */
     private volatile long provenUntil;
-    private volatile Runnable stopMember = () -> { };
+    private final AtomicReference<Runnable> stopMember = new AtomicReference<>(() -> { });
 
     private NodeSessionLease() {
         this.nanoTime = System::nanoTime;
@@ -216,12 +216,12 @@ final class NodeSessionLease implements AutoCloseable {
     }
 
     void stopMemberOnClose(Runnable stop) {
-        stopMember = Objects.requireNonNull(stop);
+        stopMember.set(Objects.requireNonNull(stop));
     }
 
     @Override
     public void close() {
-        stopAndClose(stopMember);
+        stopAndClose(stopMember.get());
     }
 
     /** Fence locally before stopping, and never put coordination I/O ahead of the member stop. */

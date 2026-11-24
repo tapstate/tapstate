@@ -292,27 +292,40 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     }
     private void closeOwned(long deadline) {
         active.set(false); handlers = List.of();
-        // Spring removes its singletons on close. A retry must still check the actual workers.
         boolean retrying = shutdownOwners != null;
-        if (!retrying && context != null) {
-            var beans = context.getBeanFactory();
-            shutdownOwners = new ShutdownOwners(
-                    (PipelineActuationOwnership) beans.getSingleton("pipelineActuationOwnership"),
-                    (PeriodicObservations) beans.getSingleton("periodicObservations"),
-                    (PipelineConvergences) beans.getSingleton("pipelineConvergences"),
-                    (ProcessObservationWriter) beans.getSingleton("processObservationWriter"),
-                    (HazelcastInstance) beans.getSingleton("hazelcastMember"),
-                    (NodeSessionLease) beans.getSingleton("nodeSessionLease"));
-        }
         var owners = shutdownOwners;
-        var pipelines = owners == null ? null : owners.pipelines();
-        var periodic = owners == null ? null : owners.periodic();
-        var convergence = owners == null ? null : owners.convergence();
-        var observationWrites = owners == null ? null : owners.observationWrites();
-        var member = owners == null ? null : owners.member();
+        if (owners == null) {
+            owners = ShutdownOwners.capture(context);
+            // Spring removes its singletons on close. Retain them until cleanup has succeeded.
+            if (context != null) shutdownOwners = owners;
+        }
+
+        try {
+            drainWorkers(owners, deadline);
+        } catch (RuntimeException failure) {
+            // Keep worker resources open for retry, but stop the old member and end its session.
+            var member = owners.member();
+            if (member != null) {
+                try {
+                    stopMember(member, owners.lease());
+                } catch (RuntimeException cleanup) {
+                    if (cleanup != failure) failure.addSuppressed(cleanup);
+                }
+            }
+            throw failure;
+        }
+
+        closeWorkerResources(owners.member(), retrying);
+        shutdownOwners = null;
+    }
+
+    private void drainWorkers(ShutdownOwners owners, long deadline) {
+        var pipelines = owners.pipelines();
+        var periodic = owners.periodic();
+        var convergence = owners.convergence();
+        var observationWrites = owners.observationWrites();
         var alerts = alertRuntime.get();
         var initial = initialTestCaller.get();
-
         var drain = new ArrayList<Runnable>();
         if (pipelines != null) drain.add(pipelines::stopForShutdown);
         if (convergence != null) drain.add(convergence::close);
@@ -326,37 +339,46 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         if (periodic != null) drain.add(() -> periodic.awaitStopped(deadline));
         if (observationWrites != null) drain.add(observationWrites::close);
         if (initial != null) drain.add(initial::interrupt);
-        try {
-            ShutdownAwait.all(drain);
-        } catch (RuntimeException | Error failure) {
-            // Keep worker resources open for retry, but stop the old member and end its session.
-            if (member != null) ShutdownAwait.all(List.of(
-                    () -> { throw failure; },
-                    () -> stopMember(member, owners.lease())));
-            throw failure;
-        }
+        ShutdownAwait.all(drain);
+    }
 
+    private void closeWorkerResources(HazelcastInstance member, boolean retrying) {
         var cleanup = new ArrayList<Runnable>();
         if (payloadCleanup != null) cleanup.add(() -> { payloadCleanup.close(); payloadCleanup = null; });
         if (memberStorage != null) cleanup.add(memberStorage::close);
         if (context != null) cleanup.add(context::close);
         if (member != null) cleanup.add(() -> {
-            if (retrying && member.getLifecycleService().isRunning()) member.shutdown();
-            if (member.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
+            if (retrying) stopMember(member, null);
+            else requireStopped(member);
         });
         ShutdownAwait.all(cleanup);
-        shutdownOwners = null;
     }
 
     private static void stopMember(HazelcastInstance member, NodeSessionLease lease) {
         if (lease != null) lease.close();
         if (member.getLifecycleService().isRunning()) member.shutdown();
+        requireStopped(member);
+    }
+
+    private static void requireStopped(HazelcastInstance member) {
         if (member.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
     }
 
     private record ShutdownOwners(PipelineActuationOwnership pipelines, PeriodicObservations periodic,
             PipelineConvergences convergence, ProcessObservationWriter observationWrites, HazelcastInstance member,
-            NodeSessionLease lease) {}
+            NodeSessionLease lease) {
+        static ShutdownOwners capture(GenericApplicationContext context) {
+            if (context == null) return new ShutdownOwners(null, null, null, null, null, null);
+            var beans = context.getBeanFactory();
+            return new ShutdownOwners(
+                    (PipelineActuationOwnership) beans.getSingleton("pipelineActuationOwnership"),
+                    (PeriodicObservations) beans.getSingleton("periodicObservations"),
+                    (PipelineConvergences) beans.getSingleton("pipelineConvergences"),
+                    (ProcessObservationWriter) beans.getSingleton("processObservationWriter"),
+                    (HazelcastInstance) beans.getSingleton("hazelcastMember"),
+                    (NodeSessionLease) beans.getSingleton("nodeSessionLease"));
+        }
+    }
 
     static final class ChildOnly implements Condition {
         @Override public boolean matches(ConditionContext context, org.springframework.core.type.AnnotatedTypeMetadata metadata) {
