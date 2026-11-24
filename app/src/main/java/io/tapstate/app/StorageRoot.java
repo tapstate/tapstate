@@ -555,7 +555,9 @@ final class StorageRoot implements AutoCloseable {
             original = runtime.current(); phase = Phase.AUTH_READY;
             wakeRecovery();
             if (runtime.requireConfiguration().setupStates().load().phase() == StorageSetupStateStore.Phase.COMPLETE) {
-                startInitialBusiness(original.orElseThrow(), assembly);
+                var retained = original.orElseThrow();
+                retained.cache().prepareRetainedAggregateState(retained.preparation().businessScope(), retained::requireActive);
+                startInitialBusiness(retained, assembly);
                 wakeRecovery();
             }
         } catch (TapstateException unavailable) {

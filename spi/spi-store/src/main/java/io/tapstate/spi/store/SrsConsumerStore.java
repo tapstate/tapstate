@@ -64,6 +64,27 @@ public interface SrsConsumerStore {
     Optional<ConsumerOffset> cursor(SrsConsumerContext context);
     Optional<SrsConsumerProgress> progress(SrsConsumerContext context);
 
+    /** Stages one unused physical chain from an exact earlier consumer ACK under the replacement execution. */
+    default Optional<SrsConsumerMembership> prepareConnectorHandoff(SrsConsumerProgress original,
+            SrsConsumerContext candidate, WorkloadClaimFence candidateCapture, WorkloadClaimFence currentPipeline,
+            java.time.Instant preparedAt) {
+        throw new UnsupportedOperationException("connector handoff is not supported");
+    }
+
+    /** Reopens a seeded candidate before its first source checkpoint, retaining its original consumer proof. */
+    default Optional<SrsChainState> reopenConnectorHandoffEpoch(SrsConsumerProgress original,
+            SrsConsumerContext candidate, WorkloadClaimFence currentPipeline, WorkloadClaimFence candidateCapture,
+            long expectedEpoch, Set<String> tables) {
+        throw new UnsupportedOperationException("connector handoff epoch recovery is not supported");
+    }
+
+    /** Pins the candidate models and retained load completion before any candidate Pipeline writer runs. */
+    default boolean completeConnectorHandoff(SrsConsumerProgress original, SrsConsumerContext candidate,
+            long membershipRevision, long expectedProgressRevision, SrsSnapshotPin models,
+            WorkloadClaimFence currentPipeline) {
+        throw new UnsupportedOperationException("connector handoff is not supported");
+    }
+
     /** An implementation may validate one event's original consumer and model in one guarded read. */
     default boolean supportsReadEventVerification() { return false; }
 
@@ -105,6 +126,19 @@ public interface SrsConsumerStore {
     /** Monotonically folds one original writer's report and its confirmed cursor in the same cache transaction. */
     boolean advanceWriter(SrsConsumerContext context, long membershipRevision, String runId, String table, String writerId,
                           WriterProgress progress, WorkloadClaimFence originalPipelineFence);
+
+    /** Returns one ordered outcome per original report after its owning store has committed. */
+    default List<WriterProgressOutcome> advanceWriters(SrsConsumerContext context, long membershipRevision, String runId,
+            List<WriterProgressUpdate> reports, WorkloadClaimFence fence) {
+        var outcomes = new java.util.ArrayList<WriterProgressOutcome>(reports.size());
+        boolean stopped = false;
+        for (var report : reports) {
+            boolean committed = !stopped && advanceWriter(context, membershipRevision, runId, report.table(), report.writerId(), report.progress(), fence);
+            outcomes.add(new WriterProgressOutcome(committed, null));
+            if (!committed) stopped = true;
+        }
+        return List.copyOf(outcomes);
+    }
 
     /**
      * Saves the original first arrival and its initial read cursor together. A retained confirmed place is never raised by a later arrival.

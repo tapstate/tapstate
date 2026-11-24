@@ -61,6 +61,12 @@ required status checks include Sonar. Nightly only stores
 Actions artifacts. GitHub Release, GHCR pushes and Cloud registration belong
 to the separate release workflow.
 
+For a pre-merge OP candidate, select the Runtime work branch and pass the
+matching full Web commit SHA as `candidate-op-web-sha`. Nightly runs the same
+on-prem image and native archive build used for release. Download the archive
+and checksum from the run's Actions artifacts. The candidate runs only the
+on-prem build and its packaging checks.
+
 Configure the repository Actions secret `NIGHTLY_FEISHU_WEBHOOK` with the
 target Feishu group's bot URL. Scheduled failures send one message with the
 failed jobs and the Actions run link. Manual runs and scheduled successes
@@ -121,7 +127,9 @@ the repository's Actions secrets before using that notification:
 
 The request carries the version and source revision; `git.extra` records the
 image tag, immutable image reference, digest, release URL, and workflow URL.
-Cloud provisioning continues to select the image by its version tag. Publication
+It also records whether the checked Cloud Boot JAR contains the managed
+Bedrock runtime configuration. The Cloud control plane can use this record
+to pin managed Bedrock launches to the approved image digest. Publication
 and registration share a cross-version concurrency queue so a delayed older
 insert cannot overtake the newer version's registration. Older
 release lines and releases already overtaken when the notification checks

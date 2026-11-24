@@ -1,7 +1,9 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.Operation;
 import io.tapstate.control.core.OperationRegistry;
+import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TapstatePrincipal;
 import io.tapstate.control.restapi.OperationRequestMappingHandlerMapping.OptionsHandler;
 import jakarta.servlet.http.HttpServletRequest;
@@ -33,7 +35,9 @@ import java.util.function.Supplier;
  */
 final class OperationAuthorizationManager implements AuthorizationManager<RequestAuthorizationContext> {
 
-    static final String OPERATION_ATTRIBUTE = OperationAuthorizationManager.class.getName() + ".operation";
+    static final String REQUIREMENT_ATTRIBUTE = OperationAuthorizationManager.class.getName() + ".requirement";
+
+    record Requirement(String operationId, Scope scope) { }
 
     private final ObjectProvider<HandlerMappingIntrospector> handlers;
     private final OperationRegistry registry;
@@ -58,8 +62,7 @@ final class OperationAuthorizationManager implements AuthorizationManager<Reques
                     .distinct().sorted(Comparator.comparing(Operation::id)).toList();
             Authentication current = authentication.get();
             for (Operation operation : operations) {
-                if (!permits(current, operation)) {
-                    request.setAttribute(OPERATION_ATTRIBUTE, operation);
+                if (!permits(current, operation, request)) {
                     return new AuthorizationDecision(false);
                 }
             }
@@ -67,17 +70,20 @@ final class OperationAuthorizationManager implements AuthorizationManager<Reques
             return new AuthorizationDecision(true);
         }
         Operation operation = operationFor(handler);
-        request.setAttribute(OPERATION_ATTRIBUTE, operation);
-        boolean granted = permits(authentication.get(), operation);
+        boolean granted = permits(authentication.get(), operation, request);
         if (granted) {
             OperationRequestMappingHandlerMapping.recordOptionsLookup(request, handler);
         }
         return new AuthorizationDecision(granted);
     }
 
-    private static boolean permits(Authentication current, Operation operation) {
-        return current != null && current.isAuthenticated() && current.getPrincipal() instanceof TapstatePrincipal principal
-                && principal.permits(operation.scope());
+    private static boolean permits(Authentication current, Operation operation, HttpServletRequest request) {
+        TapstatePrincipal principal = current != null && current.isAuthenticated()
+                && current.getPrincipal() instanceof TapstatePrincipal authenticated ? authenticated : null;
+        Scope required = principal == null ? operation.scope()
+                : ControlOperations.requiredScope(operation, principal.credentialType());
+        request.setAttribute(REQUIREMENT_ATTRIBUTE, new Requirement(operation.id(), required));
+        return principal != null && principal.permits(required);
     }
 
     private Operation operationFor(HandlerMethod handler) {

@@ -289,6 +289,12 @@ final class ControlPlane {
      */
     List<Map<String, Object>> preview(
             String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts) {
+        return preview(pipelineId, outputId, rootLimit, sampleId, drafts, null);
+    }
+
+    List<Map<String, Object>> preview(
+            String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts,
+            String language) {
         List<Map<String, String>> encodedDrafts = drafts.stream()
                 .map(draft -> Map.of("source", draft.source(), "content", draft.content()))
                 .toList();
@@ -298,7 +304,7 @@ final class ControlPlane {
         request.put("rootLimit", rootLimit);
         request.put("sampleId", sampleId);
         request.put("drafts", encodedDrafts);
-        HttpResponse<String> response = send(authed("/api/artifacts:preview", JsonWriter.write(request)));
+        HttpResponse<String> response = sourceResponse("POST", "/api/artifacts:preview", request, null, language);
         expect(response, 200, "preview Pipeline " + pipelineId);
         String contentType = response.headers().firstValue("content-type").orElse("");
         if (!contentType.startsWith("application/x-ndjson")) {
@@ -2445,6 +2451,22 @@ final class ControlPlane {
     }
 
     /** The same request as a replacement rather than a submission, for the one face that takes a PUT. */
+    HttpResponse<String> retrySettings() {
+        var response = send(authedGet("/api/retry-settings"));
+        expect(response, 200, "read the cluster retry settings");
+        return response;
+    }
+
+    HttpResponse<String> replaceRetrySettings(long revision, Map<String, Object> defaults) {
+        return replaceRetrySettings(revision, defaults, Map.of());
+    }
+
+    HttpResponse<String> replaceRetrySettings(long revision, Map<String, Object> defaults,
+            Map<String, Map<String, Object>> operations) {
+        return send(authedPut("/api/retry-settings", JsonWriter.write(
+                Map.of("revision", revision, "defaults", defaults, "operations", operations))));
+    }
+
     private HttpRequest authedPut(String path, String body) {
         return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(TIMEOUT)

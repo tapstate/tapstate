@@ -96,6 +96,21 @@ class ThreeLayerObservationTest {
         verifyNoInteractions(f.cache);
     }
 
+    @Test void aRecordedStartFailureProjectsTheStoredDocumentAndField() {
+        var f = new Fixture();
+        var pending = new PipelinePreparation("pipeline", 1, PipelinePreparation.Phase.UNASSIGNED, null, null, null);
+        var params = Map.of("id", "doc-42", "field", "revision");
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), pending,
+                Optional.empty(), Optional.empty(), false, Optional.of(IoError.DOCUMENT_UNREADABLE), 1, params);
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeaders(ids, true)).thenReturn(Map.of("pipeline", header));
+
+        var failure = f.port.pipelineCatalogStates(ids).get("pipeline").observation().orElseThrow().failure();
+        assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+        assertThat(failure.params()).isEqualTo(params);
+        verifyNoInteractions(f.cache);
+    }
+
     @Test void aBatchCannotPublishAnObservationAfterItsConfigurationFenceChanges() {
         var f = new Fixture();
         var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(),

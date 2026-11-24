@@ -160,6 +160,7 @@ final class E2eConnectorJar {
         Manifest manifest = new Manifest();
         Attributes attributes = manifest.getMainAttributes();
         attributes.put(Attributes.Name.MANIFEST_VERSION, "1.0");
+        attributes.put(Attributes.Name.IMPLEMENTATION_VERSION, "1.0");
         attributes.put(new Attributes.Name("PDK-API-Version"), pdkApiVersion);
         return manifest;
     }

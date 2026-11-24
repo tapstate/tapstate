@@ -95,30 +95,11 @@
          the assembly root carries it on the host classpath at runtime scope, so a real connector's base
          class can bootstrap the runtime through the host loader (see the pdk-runner managed entry below).
 
-         Tracks the 2.0.11 shared API/entity baseline as a snapshot. There is deliberately NO byte-level pin: an
-         upstream snapshot cannot be reproducibly pinned from the POM. The nexus retains only the most
-         recent snapshot builds, so naming an older timestamped build fails once it is purged; the base
-         -SNAPSHOT always resolves whatever build the nexus currently serves. That drift is accepted —
-         compatibility is judged by version/level, not by byte content, and a same-version rebuild is
-         treated as contract-equivalent; a byte-level content / drift gate is a later hardening step.
-         These artifacts are published only to the tapdata nexus (a public, anonymously readable
-         snapshot repository declared in the root POM), not to Maven Central. This property is also the
-         home of the version -> API-level mapping the compatibility check reads (the level table lands
-         with the resolver). The contract (tapdata-api) and its error-code libraries carry a different
-         base version, so both are set. -->
-    <pdk-api.version>2.0.11-SNAPSHOT</pdk-api.version>
-    <!-- The entity companion supplies the floating-point types used by current connectors. -->
-    <pdk-entity.version>2.0.11-SNAPSHOT</pdk-entity.version>
-    <pdk-errorcode.version>2.11-SNAPSHOT</pdk-errorcode.version>
-    <!-- The PDK runtime (pdk-runner): a connector base class bootstraps TapRuntime through the host
-         loader at construction, so the assembly root carries this on its runtime classpath. A separate
-         line from the API contract above (the runner tracks the 2.x line, the contract the 2.0.x line). -->
-    <pdk-runner.version>2.11-SNAPSHOT</pdk-runner.version>
-    <!-- The PDK's shared utility library (tapdata-common): connectors declare it `provided` and expect
-         the host to have it, so a host that does not is one where those connectors link at load and
-         fail part-way through a read. Same 2.x line as the runner, and it has to be one line: both sit
-         under io.tapdata, which the connector loader delegates to the host wholesale. -->
-    <pdk-common.version>2.11-SNAPSHOT</pdk-common.version>
+         Upgrade the host set together here using exact published Maven versions. The entity and API
+         can have different build numbers even when published by the same upstream build. -->
+    <pdk-api.version>2.0.11-20261116.020136-7</pdk-api.version>
+    <pdk-entity.version>2.0.11-20261116.020136-8</pdk-entity.version>
+    <pdk-runtime.version>2.11-20261116.020136-7</pdk-runtime.version>
     <!-- Testcontainers: brings up a throwaway Mongo replica-set in tests so the storage CAS
          contract is witnessed against a real Mongo, not only the pure in-memory contract. Test scope
          only, in adapter-mongo-store. -->
@@ -379,22 +360,27 @@
       <dependency>
         <groupId>io.tapdata</groupId>
         <artifactId>error-code-scanner</artifactId>
-        <version>${pdk-errorcode.version}</version>
+        <version>${pdk-runtime.version}</version>
       </dependency>
       <dependency>
         <groupId>io.tapdata</groupId>
         <artifactId>error-code-core</artifactId>
-        <version>${pdk-errorcode.version}</version>
+        <version>${pdk-runtime.version}</version>
       </dependency>
       <dependency>
         <groupId>io.tapdata</groupId>
         <artifactId>tapdata-pdk-runner</artifactId>
-        <version>${pdk-runner.version}</version>
+        <version>${pdk-runtime.version}</version>
       </dependency>
       <dependency>
         <groupId>io.tapdata</groupId>
         <artifactId>tapdata-common</artifactId>
-        <version>${pdk-common.version}</version>
+        <version>${pdk-runtime.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.tapdata</groupId>
+        <artifactId>pdk-error-code</artifactId>
+        <version>${pdk-runtime.version}</version>
       </dependency>
       <!-- Testcontainers module set (aligns testcontainers-core + mongodb + junit-jupiter). Its own
            third-party transitives (jackson / slf4j / commons-compress) still resolve against the

@@ -42,10 +42,10 @@ class OnPremManagementChannelTest {
             try (var http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build()) {
                 var entry = http.send(HttpRequest.newBuilder(URI.create(publicUrl + "/auth/storage-entry")).GET().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(entry.statusCode()).isEqualTo(200);
-                assertThat((Map<?,?>)JsonReader.parse(entry.body())).isEqualTo(Map.of("mode", "OP", "entry", "SETUP_REQUIRED", "management", false));
+                assertThat((Map<?,?>)JsonReader.parse(entry.body())).isEqualTo(Map.of("mode", "OP", "entry", "SETUP_REQUIRED", "management", false, "businessReady", false));
                 var managedEntry = http.send(HttpRequest.newBuilder(URI.create(management + "/auth/storage-entry")).GET().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(managedEntry.statusCode()).isEqualTo(200);
-                assertThat((Map<?,?>)JsonReader.parse(managedEntry.body())).isEqualTo(Map.of("mode", "OP", "entry", "SETUP_REQUIRED", "management", true));
+                assertThat((Map<?,?>)JsonReader.parse(managedEntry.body())).isEqualTo(Map.of("mode", "OP", "entry", "SETUP_REQUIRED", "management", true, "businessReady", false));
                 var page = http.send(HttpRequest.newBuilder(URI.create(management + "/installation")).header("Accept", "text/html").GET().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(page.statusCode()).withFailMessage(page.body()).isEqualTo(200);
                 assertThat(page.body()).contains("id=\"root\"").doesNotContain(issued.token());

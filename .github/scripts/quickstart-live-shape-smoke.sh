@@ -108,10 +108,10 @@ cli_step="$(step "The CLI the quickstart installed is the release's own")"
 has "the installed CLI is held to the image tag this leg started" "$cli_step" \
   'PREPARED##\*:'
 
-# --- the connector jars --------------------------------------------------------------------------
-jars_step="$(step 'The connector jars the quickstart fetched are readable jars')"
-has "the fetched jars are opened, not just weighed" "$jars_step" 'zipfile'
-has "and their entries are read back" "$jars_step" 'testzip'
+# --- the connector inputs ------------------------------------------------------------------------
+jars_step="$(step "Verify the demo's connector inputs")"
+has "the candidate checks image JAR hashes" "$jars_step" 'sha256sum -c'
+has "the legacy published lane opens its downloaded JARs" "$jars_step" 'testzip'
 
 # --- where the upgrade starts --------------------------------------------------------------------
 resolve_step="$(step 'Resolve the two releases this leg moves between')"

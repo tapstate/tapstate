@@ -1,6 +1,9 @@
 package io.tapstate.adapters.mongostore;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -258,6 +261,27 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                     return expected;
                 }, businessTransaction());
             } catch (RuntimeException failure) { businessActive(); throw failure; }
+        });
+    }
+
+    /** Prepares the newly introduced aggregate structure before admitting a retained business scope. */
+    public void prepareRetainedAggregateState(CacheBusinessScope expected, Runnable requireActive) {
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        var structure = new MongoCacheMetadataStructure(database, rateRetention);
+        StoreIo.run(() -> {
+            active.run();
+            if (structure.hasAggregateState()) return;
+            try (var session = client.startSession()) {
+                session.withTransaction(() -> {
+                    active.run();
+                    new MongoCacheBusinessIdentity(database, expected).admitMetadataWrite(session);
+                    structure.prepareRetainedAggregateStateInTransaction(session, expected, active);
+                    active.run();
+                    return null;
+                }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.LOCAL)
+                        .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
+            }
+            active.run();
         });
     }
 
@@ -520,12 +544,44 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     public io.tapstate.spi.store.ConnectorRegistry connectors(CacheBusinessScope expected, Runnable requireActive) {
+        var bucket = SystemCollections.CACHE_CONNECTOR_ARTIFACTS;
+        var structure = new MongoCacheMetadataStructure(database, rateRetention);
+        if (MongoCollectionMetadata.matching(database, java.util.Set.copyOf(bucket.physicalNames()), false).isEmpty()) {
+            StoreIo.run(() -> {
+                Runnable active = () -> { businessActive(); requireActive.run(); };
+                active.run();
+                try (var session = client.startSession()) {
+                    session.withTransaction(() -> {
+                        active.run();
+                        new MongoCacheBusinessIdentity(database, expected).admitMetadataWrite(session);
+                        structure.prepareLegacyConnectorArtifactsInTransaction(session, active);
+                        return null;
+                    }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.LOCAL)
+                            .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
+                }
+            });
+        }
         var registry = new MongoCacheConnectorRegistry(client, database, expected, this::businessActive, requireActive);
         registry.verify(); return registry;
     }
 
+    public boolean copyLegacyConnectorArtifact(CacheBusinessScope scope, Runnable requireActive,
+                                               String hash, java.io.OutputStream output) throws java.io.IOException {
+        requireActive.run();
+        var bucket = SystemCollections.CACHE_CONNECTOR_ARTIFACTS;
+        var structures = MongoCollectionMetadata.matching(database, java.util.Set.copyOf(bucket.physicalNames()), false);
+        if (structures.isEmpty()) return false;
+        return new MongoCacheConnectorRegistry(client, database, scope, this::businessActive, requireActive)
+                .copyArtifactTo(hash, output);
+    }
+
     public io.tapstate.spi.store.ConnectorCatalogStore connectorCatalog(CacheBusinessScope expected, Runnable requireActive) {
         return new MongoCacheConnectorCatalogStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTOR_CATALOG, requireActive));
+    }
+    public io.tapstate.spi.store.ConnectorArtifactHoldings connectorArtifactHoldings(CacheBusinessScope expected, Runnable requireActive) {
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        MongoCacheConnectorArtifactHoldings.prepare(client, database, expected, active);
+        return new MongoCacheConnectorArtifactHoldings(metadataAccess(expected, SystemCollections.CACHE_CONNECTOR_ARTIFACT_HOLDINGS, requireActive));
     }
     public io.tapstate.spi.store.ConnectorSpecStore connectorSpecs(CacheBusinessScope expected, Runnable requireActive) {
         return new MongoCacheConnectorSpecStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTOR_SPECS, requireActive));
@@ -824,6 +880,17 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 return java.util.Optional.empty();
             throw failure;
         }
+    }
+
+    public record ObservationWrite(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active,
+            Observation observation, long checkpointEpoch) {}
+
+    /** Writes independent latest observations and returns each original entry's failure, or null on success. */
+    public List<RuntimeException> writeObservations(List<ObservationWrite> batch) {
+        return MongoCachePipelineObservationStore.writeBatch(batch.stream().map(write ->
+                new MongoCachePipelineObservationStore.BatchWrite(
+                        new MongoCachePipelineObservationStore(pipelineAccess(write.scope(), write.original(), write.active())),
+                        write.observation(), write.checkpointEpoch())).toList());
     }
 
     /** Missing projections are unknown; they do not permit creation of a missing checkpoint. */

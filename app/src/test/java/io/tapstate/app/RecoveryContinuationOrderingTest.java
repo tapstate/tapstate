@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.control.core.*;
@@ -32,6 +33,7 @@ class RecoveryContinuationOrderingTest {
         var originalBinding = new StorageBinding(setup.load().scope(), StorageBinding.Mode.OP, 1, "views",
                 new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, "mongodb://fixture/cache", "cache", null));
         when(bound.binding()).thenReturn(originalBinding);
+        when(bound.cache()).thenReturn(mock(MongoCacheDomain.class));
         when(business.applicationDataVerification()).thenReturn(new DefaultSourceVerification.Verification(
                 DefaultSourceVerification.Status.UNKNOWN, null, null));
         var current=new AtomicReference<StorageRuntime.Business>();

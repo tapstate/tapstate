@@ -14,6 +14,10 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ConnectorRunBindings;
+import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.RequiredNoteScope;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.StorageBinding;
@@ -46,6 +50,62 @@ class MongoPipelineIntentStoreIT {
     private static final String HASH = CanonicalHash.of(pipeline());
 
     @Test
+    void aPreparedArtifactHandoffPreservesTheOriginalBindingWhenItsStartIsSuperseded() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.STOPPED, false, false, null))).isTrue();
+            assertThat(store.compareAndSetExplicitStart(scope, 1, intent(PipelineState.RUNNING, false, true, 0L))).isTrue();
+            var original = store.load("flow").orElseThrow();
+            var bindings = store.connectorBindings();
+            var oldNote = new RequiredNoteScope(RequiredNoteOwner.forNode(scope.bindingVersion(),
+                    new PipelineNode("flow", "target"), PipelineNode.Purpose.SYNC, scope.stateGeneration()), 1);
+            var old = new ConnectorRunBindings.Binding("target", PipelineNode.Purpose.SYNC, "mongodb", "1.0", "a".repeat(64), oldNote, null, null);
+            var candidate = new ConnectorRunBindings.Binding("target", PipelineNode.Purpose.SYNC, "mongodb", "2.0", "b".repeat(64), oldNote, null, null);
+            bindings.seed(original, List.of(old));
+            assertThat(bindings.prepare(original, List.of(candidate)).handoff().phase()).isEqualTo(ConnectorRunBindings.Phase.PREPARED);
+            assertThat(bindings.prepare(original, List.of(candidate)).effective()).containsExactly(old);
+            assertThat(bindings.loadAll()).containsOnlyKeys("flow").containsEntry("flow", bindings.load(scope).orElseThrow());
+            assertThat(domain.retainedConnectorArtifacts()).containsExactlyInAnyOrder(old.sha256(), candidate.sha256());
+            assertThatThrownBy(() -> bindings.prepare(original, List.of(old))).satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThat(store.compareAndSet(scope, 2, intent(PipelineState.PAUSED, false, false, null))).isTrue();
+            assertThatThrownBy(() -> bindings.publish(original)).satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThat(bindings.load(scope).orElseThrow().effective()).containsExactly(old);
+            assertThatThrownBy(() -> store.compareAndSetExplicitStart(scope, 3, intent(PipelineState.RUNNING, false, false, null)))
+                    .satisfies(MongoPipelineIntentStoreIT::fenced);
+            bindings.abort(scope, 2);
+            assertThat(bindings.load(scope).orElseThrow().effective()).containsExactly(old);
+            assertThat(bindings.load(scope).orElseThrow().handoff()).isNull();
+            assertThat(domain.retainedConnectorArtifacts()).containsExactly(old.sha256());
+            try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
+                assertThat(reopened.intents().connectorBindings().load(scope)).isEqualTo(bindings.load(scope));
+            }
+        });
+    }
+
+    @Test
+    void publishedBindingCleanupRetainsItsOriginalRevisionAcrossLaterIntents() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            var bindings = store.connectorBindings();
+            assertThat(store.compareAndSetExplicitStart(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+            var original = store.load("flow").orElseThrow();
+            bindings.prepare(original, List.of());
+            var published = bindings.publish(original);
+            assertThat(published.effectiveIntentRevision()).isEqualTo(1);
+            assertThat(published.handoff().phase()).isEqualTo(ConnectorRunBindings.Phase.PUBLISHED);
+            assertThatThrownBy(() -> store.compareAndSetExplicitStart(scope, 1,
+                    intent(PipelineState.RUNNING, false, false, null))).satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThat(store.compareAndSet(scope, 1, intent(PipelineState.PAUSED, false, false, null))).isTrue();
+            assertThatThrownBy(() -> bindings.abort(scope, 1)).satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThatThrownBy(() -> bindings.complete(scope, 2)).satisfies(MongoPipelineIntentStoreIT::fenced);
+            bindings.complete(scope, 1);
+            bindings.complete(scope, 1);
+            assertThat(bindings.load(scope).orElseThrow().handoff()).isNull();
+            assertThat(bindings.load(scope).orElseThrow().effectiveIntentRevision()).isEqualTo(1);
+        });
+    }
+
+    @Test
     void latestIntentAndCoordinatesSurviveReopenWithoutAnyCacheResource() {
         withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
@@ -59,6 +119,78 @@ class MongoPipelineIntentStoreIT {
             }
             assertThat(database.listCollectionNames().into(new ArrayList<>()))
                     .contains("pipeline_intents").doesNotContain("pipeline_desired", "pipeline_state", "cache_identity", "workload_claims", "srs_meta");
+        });
+    }
+
+    @Test
+    void deferredRejectionsExposeOnlyCompleteBoundedDocumentIdentifiers() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            var desired = intent(PipelineState.RUNNING, false, false, null);
+            var inputs = new io.tapstate.spi.store.PipelinePreparationInputs(HASH, Map.of(), Map.of(), List.of());
+            var valid = Map.<String, Object>of("id", "orders v2/archive:2026", "field", "source[0].tables[1].name");
+            assertThat(store.compareAndSetStart(scope, 0, desired, inputs)).isTrue();
+            store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE, valid);
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailureParams())
+                    .isEqualTo(valid);
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), false).get("flow").startFailure()).isEmpty();
+            assertThat(domain.pipelineDisplayHeaders(List.of(), true)).isEmpty();
+
+            var rows = SystemCollections.PIPELINE_INTENTS.on(database);
+            var filter = new Document("_id", "flow");
+            var original = rows.find(filter).first();
+            rows.updateOne(filter, new Document("$set", new Document("startFailureParams", new Document("id", "incomplete"))));
+            assertThatThrownBy(() -> store.load("flow")).satisfies(MongoPipelineIntentStoreIT::unreadable);
+            var malformed = domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+            assertThat(malformed.startFailure()).isEmpty();
+            assertThat(malformed.intentFailure()).hasValueSatisfying(MongoPipelineIntentStoreIT::unreadable);
+            rows.replaceOne(filter, original);
+
+            var mappings = SystemCollections.OPERATOR_GENERATIONS.on(database);
+            var currentMapping = mappings.find(filter).first();
+            mappings.updateOne(filter, new Document("$set", new Document("stateGeneration", 2L))
+                    .append("$unset", new Document("connectorBindings", "")));
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailure()).isEmpty();
+            mappings.replaceOne(filter, currentMapping);
+
+            assertThat(store.compareAndSetStart(scope, 1, desired, inputs)).isTrue();
+            store.failStart(store.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", "mongodb://credential.invalid/private", "field", "revision"));
+            var rejection = domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+            assertThat(rejection.startFailure()).contains(IoError.DOCUMENT_UNREADABLE);
+            assertThat(rejection.startFailureParams()).isEmpty();
+            assertThat(SystemCollections.PIPELINE_INTENTS.on(database).find().first())
+                    .doesNotContainKey("startFailureParams");
+        });
+    }
+
+    @Test
+    void rejectedDiagnosticValuesKeepTheGenericFailure() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            var desired = intent(PipelineState.RUNNING, false, false, null);
+            var inputs = new io.tapstate.spi.store.PipelinePreparationInputs(HASH, Map.of(), Map.of(), List.of());
+            long revision = 0;
+            for (var params : List.<Map<String, Object>>of(
+                    Map.of("id", " ", "field", "revision"),
+                    Map.of("id", "a".repeat(257), "field", "revision"),
+                    Map.of("id", "\u00e9".repeat(129), "field", "revision"),
+                    Map.of("id", "bad\nline", "field", "revision"),
+                    Map.of("id", "bad\u2028line", "field", "revision"),
+                    Map.of("id", "bad\u2029line", "field", "revision"),
+                    Map.of("id", "document", "field", "body:raw=value"),
+                    Map.of("id", "document", "field", 1))) {
+                assertThat(store.compareAndSetStart(scope, revision++, desired, inputs)).isTrue();
+                var pending = store.pendingStart("flow").orElseThrow();
+                assertThatThrownBy(() -> store.compareAndSetStart(scope, pending.intent().intentRevision(), desired, inputs))
+                        .satisfies(MongoPipelineIntentStoreIT::fenced);
+                store.failStart(pending, IoError.DOCUMENT_UNREADABLE, params);
+                var rejection = domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+                assertThat(rejection.startFailure()).contains(IoError.DOCUMENT_UNREADABLE);
+                assertThat(rejection.startFailureParams()).isEmpty();
+            }
+            assertThat(store.remove(scope, revision)).isTrue();
+            assertThat(domain.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailure()).isEmpty();
         });
     }
 

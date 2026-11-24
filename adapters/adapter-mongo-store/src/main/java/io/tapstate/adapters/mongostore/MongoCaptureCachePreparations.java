@@ -229,7 +229,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         var original=MongoCaptureStatePreparations.consumeFirst(invocation,targetFingerprint);
         var preparation=original.preparation();var request=original.request();String ringRetention=original.retention();requireScope(preparation);
         if(preparation.replacement())throw history(preparation);
-        return transaction(original::requireActive,session -> {
+        return checkpointTransaction(request.pipeline(), original::requireActive,session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);
             if(preparation.mode()==CapturePreparation.Mode.SHARED_SRS)structure.verifySrs();
             if(preparation.mode()==CapturePreparation.Mode.DIRECT)structure.verifyDirect();
@@ -240,7 +240,12 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             var identity=new MongoCacheBusinessIdentity(database,scope);identity.admitClaim(session);
             Date now=MongoCachePipelinePreparations.proveNode(session,database,scope,request.originalNode());
             var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,preparation.captureId());
-            if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first()!=null)throw history(preparation);
+            if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first()!=null) {
+                var artifact = request.sharedArtifact();
+                if (artifact != null && artifact.handoffIntentRevision() != null)
+                    return loadInSession(session, preparation);
+                throw history(preparation);
+            }
             requireNoPriorFacts(session,preparation);
             var initial=new WorkloadClaimFence(key,request.originalNode().owner(),1,0,request.originalNode().topologyRevision());
             var row=new Document("_id",MongoWorkloadClaimStore.id(key)).append("clusterId",key.clusterId()).append("resourceType",key.type().name()).append("resourceId",key.resourceId())
@@ -309,6 +314,9 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         }
     }
     private void requireScope(CapturePreparation original){if(!scope.equals(original.scope()))throw MongoCapturePreparationFacts.fenced();}
+    private <T> T checkpointTransaction(io.tapstate.spi.store.PipelineIntentScope pipeline, Runnable originalActive, Function<ClientSession, T> body) {
+        return MongoCachePipelineStateStore.writeTransaction(client, pipeline.pipelineId(), () -> transaction(originalActive, body));
+    }
     private <T>T transaction(Runnable originalActive,Function<ClientSession,T> body) {
         return StoreIo.call(() -> {
             try {

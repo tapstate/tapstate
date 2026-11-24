@@ -297,7 +297,7 @@ export COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
 ```
 
 Everything below runs from here — this is where the compose file lives, so
-`docker compose …` finds it, and the jars and workspace you create sit alongside it.
+`docker compose …` finds it, and the demo workspace sits alongside it.
 
 `docker-compose.yml` on its own names the published server image and never builds,
 because that is the file a user downloads into an empty directory where there is no
@@ -326,7 +326,10 @@ it again.
 > **Preview.** With the development override in play, the server image is built
 > locally on first run from a repackaged jar, so build that jar once:
 > ```sh
-> ( cd ../.. && mvn -pl app -am -DskipTests package )    # -> app/target/app-<version>-boot.jar
+> ( cd ../.. && mvn -pl app -am -DskipTests package )
+> python3 ../cloud/stage-published-connectors.py --boot-jar ../../app/target/app-*-boot.jar \
+>   --profile onprem --stage-dir "$PWD/.onprem-seeds"
+> export TAPSTATE_ONPREM_CONNECTORS_CONTEXT="$PWD/.onprem-seeds"
 > ```
 > Drop the override once the image is published and this becomes a plain pull.
 
@@ -408,41 +411,14 @@ independent of Spring. Do not expose `cli/target/tapstate` directly when MCP is
 needed: a global symlink must point at the bundle's `bin/tapstate`, or the launcher
 cannot find the sidecar.
 
-## 4. Get the connector jars
+## 4. Check the connectors in the image
 
-This walkthrough needs a MySQL, a PostgreSQL and a MongoDB connector. Prebuilt jars are
-published as release assets — download them next to the compose file:
+The matching OP image includes MongoDB, MySQL, and PostgreSQL. MongoDB is available
+during storage initialization. After signing in, run `connectors` in the CLI and
+check that all three are registered before applying the demo sources.
 
-```sh
-base=https://github.com/tapstate/tapstate/releases/download/connectors-preview
-curl -fL -O "$base/mysql-connector.jar"
-curl -fL -O "$base/postgres-connector.jar"
-curl -fL -O "$base/mongodb-connector.jar"
-```
-
-These three jars are published so this walkthrough runs without building the connector
-repositories first. The download list is the demo's selection; the full accepted set and
-certification directions are described in [Connector support boundary](#connector-support-boundary).
-The jars are shaded and carry their own drivers on an isolated loader;
-`mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
-FOSS Exception (see [`NOTICE`](../NOTICE)).
-
-The same release carries Oracle, SQL Server, Db2, Db2 for i, MongoDB Atlas, and the unverified AWS RDS MySQL preview
-for explicit registration. From an authenticated CLI session, give `register` the published
-connector id instead of a local path:
-
-```console
-tapstate(admin@127.0.0.1:8080)> register oracle
-tapstate(admin@127.0.0.1:8080)> register sqlserver
-tapstate(admin@127.0.0.1:8080)> register mongodb-atlas
-tapstate(admin@127.0.0.1:8080)> register aws-rds-mysql
-tapstate(admin@127.0.0.1:8080)> register db2
-tapstate(admin@127.0.0.1:8080)> register db2i
-```
-
-The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to
-the connected server. Set `TAPSTATE_CONNECTORS_URL` to an HTTPS mirror when GitHub Releases
-is not reachable.
+For additional connectors, use the server's Connector Center to install an
+available version. On OP you can also upload a supported local JAR.
 
 ## 5. Author the resources
 
@@ -595,9 +571,6 @@ bound local to /.../work
 tapstate(offline:work)> auth login admin
 Password:                       # the admin password from step 2 (not echoed)
 signed in as admin (read, write, admin)
-tapstate(admin@127.0.0.1:8080)> register ../mysql-connector.jar
-tapstate(admin@127.0.0.1:8080)> register ../postgres-connector.jar
-tapstate(admin@127.0.0.1:8080)> register ../mongodb-connector.jar
 tapstate(admin@127.0.0.1:8080)> apply source/orders_db.tap.yml
 tapstate(admin@127.0.0.1:8080)> apply source/fulfillment_db.tap.yml
 tapstate(admin@127.0.0.1:8080)> discover-schema orders_db
@@ -647,7 +620,7 @@ while a machine token is selected.
 
 - **`register`** uploads a connector jar to the server (content-addressed and
   idempotent; re-registering the same jar is a no-op). An exact published connector id,
-  such as `oracle` or `sqlserver`, is downloaded from `connectors-preview` first. Local
+  such as `oracle` or `sqlserver`, uses the runtime's Maven download center. Local
   paths resolve against the workspace root — `work/` here — which is why the jars beside
   it are reached as `../mysql-connector.jar`. An absolute path works too, as does naming
   a directory: `register ..` uploads every `*.jar` under it as one batch. An existing
@@ -676,13 +649,10 @@ the same workflow. The sidecar is a foreground stdio process. It does not contai
 model, start a Tapstate Server, or access the state store directly; every tool call
 uses the Server's authenticated HTTP control API.
 
-Register connector jars and create a revocable machine token from an authenticated
+Create a revocable machine token from an authenticated
 CLI session first:
 
 ```console
-tapstate(admin@127.0.0.1:8080)> register ../mysql-connector.jar
-tapstate(admin@127.0.0.1:8080)> register ../postgres-connector.jar
-tapstate(admin@127.0.0.1:8080)> register ../mongodb-connector.jar
 tapstate(admin@127.0.0.1:8080)> token create --scope write
 created <token-id> WRITE
 token <one-time-token>
@@ -811,8 +781,11 @@ pagination, REST and MCP forms, and the difference between an empty retained win
 - **The position it reports is `targetAckedPosition`: how far the target has confirmed writes.**
   When a connector supplies a Java-serialized token, `metrics` summarizes how many tables have
   an acknowledged position and how many distinct positions they share; it cannot infer a source
-  coordinate or lag from those opaque bytes. The REST metrics response retains the raw token for
-  machine use. This is not how far the source could be read to or how far the pipeline has processed.
+  coordinate or lag from those opaque bytes. The REST metrics response returns an
+  `opaque-v1:<sha256>` fingerprint for equality comparisons. The updated CLI shows a short
+  fingerprint with either server version. An older CLI may print the full fingerprint verbatim.
+  To read or write a resume point, use `/api/pipelines/{id}/position`.
+  This is not how far the source could be read to or how far the pipeline has processed.
   Those two are printed by name as `not collected`, because a position that is simply missing reads
   the same as one this product has no concept of — and only one of those is an answer. A target that
   has stopped accepting writes freezes this position while the other two would still be moving, so
@@ -948,7 +921,7 @@ docker compose down -v     # stops every service and drops the named volumes
 
 `down -v` discards the store, so a re-run re-registers the connectors from scratch.
 The pulled/built images remain — remove them with `docker image rm <image>` if you
-want the machine back exactly as it was. The jars and `work/` you created
+want the machine back exactly as it was. The generated `work/` directory
 here are just files; delete them as usual.
 
 ## Upgrading to a newer release

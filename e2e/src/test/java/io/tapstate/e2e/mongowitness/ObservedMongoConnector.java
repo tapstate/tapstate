@@ -40,13 +40,14 @@ public final class ObservedMongoConnector implements TapConnector {
     @Override
     public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
         delegate.registerCapabilities(functions, codecs);
-        Path witness;
-        try (InputStream in = getClass().getClassLoader().getResourceAsStream("mongo-write-witness-path.txt")) {
-            if (in == null) throw new AssertionError("missing write witness path");
-            witness = Path.of(new String(in.readAllBytes(), StandardCharsets.UTF_8));
-        } catch (java.io.IOException failure) {
-            throw new AssertionError("cannot read write witness path", failure);
+        Path latency = witnessPath("mongo-latency-witness-path.txt");
+        if (latency != null) {
+            functions.supportWriteRecord(LatencyWitness.target(latency, functions.getWriteRecordFunction()));
+            functions.supportStreamRead(LatencyWitness.source(latency, functions.getStreamReadFunction()));
+            return;
         }
+        Path witness = witnessPath("mongo-write-witness-path.txt");
+        if (witness == null) throw new AssertionError("missing write witness path");
         var original = functions.getWriteRecordFunction();
         if (original == null) throw new AssertionError("real Mongo connector registered no writer");
         functions.supportWriteRecord(WriteTableWitness.record(witness, original));
@@ -64,6 +65,14 @@ public final class ObservedMongoConnector implements TapConnector {
                     appendTailObservation(tail, "END");
                 }
             });
+        }
+    }
+
+    private Path witnessPath(String resource) {
+        try (InputStream in = getClass().getClassLoader().getResourceAsStream(resource)) {
+            return in == null ? null : Path.of(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+        } catch (IOException failure) {
+            throw new AssertionError("cannot read witness path", failure);
         }
     }
 

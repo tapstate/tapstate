@@ -16,6 +16,13 @@ import io.tapstate.spi.store.WorkloadClaimFence;
  * is the only verb that can also be asked to throw away what the pipeline has.
  */
 public interface LifecycleActuator {
+    record SourceRecovery(io.tapstate.core.common.FailureFact failure) {}
+
+    /** Handles a recoverable source exit while the original running intent remains current. */
+    default Optional<SourceRecovery> recoverSource(String pipeline, java.util.function.BooleanSupplier currentIntent) {
+        return Optional.empty();
+    }
+
 
     /** Begins a fresh run of the pipeline: submits its topology as the pipeline's one job. */
     void start(String pipelineId);
@@ -37,6 +44,9 @@ public interface LifecycleActuator {
      * on a pipeline whose owner asked for it to be left alone.
      */
     void stop(String pipelineId, boolean purgeState);
+
+    /** Clears an original execution whose physical stop has already been confirmed. */
+    default void clearStopped(String pipelineId) { stop(pipelineId, true); }
 
     /**
      * The failure of the pipeline's job if it died on its own, or empty while it runs, has no job, or

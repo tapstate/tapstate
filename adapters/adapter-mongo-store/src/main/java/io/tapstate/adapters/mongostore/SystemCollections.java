@@ -243,6 +243,8 @@ public enum SystemCollections {
     CACHE_SOURCE_SCHEMAS("source_schemas", Database.CACHE, MongoCacheSchemaStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_CATALOG("connector_catalog", Database.CACHE, MongoCacheConnectorCatalogStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_SPECS("connector_specs", Database.CACHE, MongoCacheConnectorSpecStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_ARTIFACT_HOLDINGS("connector_artifact_holdings", Database.CACHE,
+            MongoCacheConnectorArtifactHoldings.class, Strategy.OWNED_ELSEWHERE, 0),
     CACHE_CONNECTION_TEST_RESULTS("connection_test_results", Database.CACHE, MongoCacheConnectionTestResultStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_ARTIFACTS("connector_artifacts", Database.CACHE, MongoCacheConnectorRegistry.class, Strategy.IMMUTABLE, 1, Kind.GRIDFS_BUCKET,
             new IndexSpec(List.of("metadata.connectorId"), false)),
@@ -307,7 +309,8 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
     ALERT_NODE_LIFECYCLES("alert_node_lifecycles", Database.CONFIG, MongoAlertNodeLifecycleStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("authorityId","clusterId","phase","nodeId","bootId"), false, "alert_query_node_lifecycle")),
-    CONFIG_AI_PROVIDER_SETTINGS("ai_provider_settings", Database.CONFIG, MongoConfigurationAiProviderSettingsStore.class, Strategy.MIGRATED, 2);
+    CONFIG_AI_PROVIDER_SETTINGS("ai_provider_settings", Database.CONFIG, MongoConfigurationAiProviderSettingsStore.class, Strategy.MIGRATED, 2),
+    CONFIG_RETRY_SETTINGS("retry_settings", Database.CONFIG, MongoRetrySettingsStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

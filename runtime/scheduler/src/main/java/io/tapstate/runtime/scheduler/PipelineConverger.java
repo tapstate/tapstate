@@ -43,6 +43,7 @@ public final class PipelineConverger {
     private final boolean requirePreparedState;
     private final Consumer<String> beforeCompletion;
     private final BooleanSupplier stillOriginalIntent;
+    private final boolean trackedStop;
 
     /** A converge loop that never rebuilds a failed run, which is every run on a single node. */
     public PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock) {
@@ -59,12 +60,13 @@ public final class PipelineConverger {
     public PipelineConverger(
             DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
             RebuildAdmission rebuilds, Consumer<String> beforeCompletion) {
-        this(desired, state, actuator, clock, rebuilds, false, beforeCompletion, () -> false);
+        this(desired, state, actuator, clock, rebuilds, false, beforeCompletion, () -> false, false);
     }
 
     private PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
             RebuildAdmission rebuilds, boolean requirePreparedState, Consumer<String> beforeCompletion,
-            BooleanSupplier stillOriginalIntent) {
+            BooleanSupplier stillOriginalIntent, boolean trackedStop) {
+        this.trackedStop = trackedStop;
         this.requirePreparedState = requirePreparedState;
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
@@ -100,8 +102,15 @@ public final class PipelineConverger {
     public ConvergeResult convergeScoped(PipelineIntentSnapshot intent, StateStore scopedState,
             LifecycleActuator scopedActuator, RebuildAdmission scopedRebuilds, Consumer<String> finalObservation,
             BooleanSupplier currentIntent) {
+        return convergeScoped(intent, scopedState, scopedActuator, scopedRebuilds, finalObservation, currentIntent, false);
+    }
+
+    public ConvergeResult convergeScoped(PipelineIntentSnapshot intent, StateStore scopedState,
+            LifecycleActuator scopedActuator, RebuildAdmission scopedRebuilds, Consumer<String> finalObservation,
+            BooleanSupplier currentIntent, boolean trackedStop) {
         Objects.requireNonNull(intent, "intent");
-        return new PipelineConverger(desired, scopedState, scopedActuator, clock, scopedRebuilds, true, finalObservation, currentIntent)
+        return new PipelineConverger(desired, scopedState, scopedActuator, clock, scopedRebuilds, true, finalObservation,
+                currentIntent, trackedStop)
                 .converge(intent.scope().pipelineId(), Optional.ofNullable(intent.desired()), intent.intentRevision());
     }
 
@@ -203,6 +212,13 @@ public final class PipelineConverger {
             return driven.checkpoint()
                     .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
                     .orElse(driven);
+        }
+        var sourceRecovery = actuator.recoverSource(pipelineId, stillOriginalIntent);
+        if (sourceRecovery.isPresent()) {
+            var failed = sourceRecovery.orElseThrow().failure();
+            if (failed == null) return ConvergeResult.recovering(current);
+            ConvergeResult driven = driveTo(pipelineId, PipelineState.FAILED, false, current, false);
+            return driven.checkpoint().map(checkpoint -> ConvergeResult.failed(checkpoint, failed)).orElse(driven);
         }
         Optional<LifecycleActuator.Completion> completion = actuator.completion(pipelineId);
         if (completion.isPresent()) {
@@ -339,17 +355,29 @@ public final class PipelineConverger {
         if (current.stateJson().equals(targetJson) && !evenIfAlreadyThere) {
             return ConvergeResult.converged(current);
         }
+        boolean stopBeforePublication = trackedStop && target == PipelineState.STOPPED;
+        if (stopBeforePublication && (evenIfAlreadyThere || !current.stateJson().equals(targetJson))) {
+            if (!stillOriginalIntent.getAsBoolean()) return ConvergeResult.superseded();
+            try {
+                actuator.stop(pipelineId, false);
+            } catch (TapstateException refused) {
+                return failedWith(pipelineId, refused);
+            }
+            if (!stillOriginalIntent.getAsBoolean()) return ConvergeResult.superseded();
+        }
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             PipelineState from = StateJson.parse(current.stateJson());
             CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
             if (outcome instanceof CasOutcome.Applied applied) {
+                if (stopBeforePublication && !purgeState) return ConvergeResult.converged(applied.next());
                 if (target == PipelineState.FAILED) {
                     rebuilds.recordFailure(pipelineId);
                 }
                 // Record first, then actuate: the store is the source of truth and Jet is subordinate, so the
                 // fenced write lands the intent durably before the job side is driven to match it.
                 try {
-                    actuate(pipelineId, from, target, purgeState, rebuild);
+                    if (stopBeforePublication) actuator.clearStopped(pipelineId);
+                    else actuate(pipelineId, from, target, purgeState, rebuild);
                 } catch (TapstateException refused) {
                     if(target==PipelineState.COMPLETED)return ConvergeResult.failed(applied.next(),refused);
                     // The job side refused with a diagnosis. Record it the way a job that died is recorded,

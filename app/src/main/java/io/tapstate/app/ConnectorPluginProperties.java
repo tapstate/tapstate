@@ -21,6 +21,11 @@ public class ConnectorPluginProperties {
 
     /** The seed directory swept at startup: every {@code *.jar} in it is registered if absent. */
     private Path seedDir = Path.of("connectors");
+    private Path dropDir = Path.of("connectors");
+
+    public Path getDropDir() { return dropDir; }
+
+    public void setDropDir(Path dropDir) { this.dropDir = dropDir; }
 
     /**
      * Further connector ids the runtime register path accepts, beyond the ones this release officially

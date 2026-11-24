@@ -26,6 +26,9 @@ public interface ObservationStore {
     /** Publishes a sample measured against the given checkpoint, without adopting a newer epoch. */
     default void save(Observation observation, long checkpointEpoch) { save(observation); }
 
+    /** Runs side effects after the save that precedes them has committed. */
+    default void afterSave(Runnable committed) { committed.run(); }
+
     /** Final data measured immediately before the bounded execution completed. */
     default Optional<Observation> beforeCompletion(String pipelineId, long checkpointEpoch) {
         return read(pipelineId);
