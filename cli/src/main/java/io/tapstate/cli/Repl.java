@@ -8,6 +8,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.lifecycle.LegacyPositionEncoding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.schema.SchemaNavigator;
@@ -3942,22 +3943,16 @@ final class Repl {
         };
     }
 
-    private static boolean isSerializedJavaPosition(String position) {
-        // AC ED 00 05 is the Java serialization header (rO0AB in base64). The CLI has no connector
-        // class or safe source-coordinate decoder for these opaque tokens.
-        return position != null && position.startsWith("rO0AB");
-    }
-
     private static String metricsPositionFingerprint(String position) {
         if (position.matches("opaque-v1:[0-9a-f]{64}")) {
             return position.substring("opaque-v1:".length());
         }
         // Older servers sent the serialized token itself. Keep the same displayed fingerprint.
-        return isSerializedJavaPosition(position) ? CanonicalHash.ofText(position) : null;
+        return LegacyPositionEncoding.hasJavaStreamHeader(position) ? CanonicalHash.ofText(position) : null;
     }
 
     private static String positionForText(String position) {
-        return isSerializedJavaPosition(position) ? OPAQUE_POSITION : position;
+        return LegacyPositionEncoding.hasJavaStreamHeader(position) ? OPAQUE_POSITION : position;
     }
 
     private int historyOnline(String id, List<String> options) {

@@ -6014,7 +6014,7 @@ class ReplTest {
                 + "AApzb3J0U3RyaW5ndAASTGphdmEvbGFuZy9TdHJpbmc7TAAMc291cmNlT2Zmc2V0cQB+AAJ4cHBwcA==";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
-                Map.of("orders", serializedPosition, "accounts", serializedPosition),
+                Map.of("orders", serializedPosition, "accounts", serializedPosition, "archive", "rO0ABA=="),
                 List.of("sourceHeadPosition"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -6022,7 +6022,8 @@ class ReplTest {
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected");
+        assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected",
+                "targetAckedPosition.archive  rO0ABA==");
         assertThat(out).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
                 .containsPattern("targetAckedPosition.accounts  opaque position fingerprint [0-9a-f]{16}");
         assertThat(out).as("text metrics must not expose an opaque serialized connector object")

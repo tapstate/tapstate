@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineMetrics;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.LegacyPositionEncoding;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -89,18 +90,9 @@ public record PipelineMetricsResponse(String pipelineId, Map<String, Long> metri
 
     private static Map<String, String> wirePositions(Map<String, String> acknowledgedPositions) {
         Map<String, String> positions = new TreeMap<>(acknowledgedPositions);
-        positions.replaceAll((table, position) -> hasSerializedStreamHeader(position)
+        positions.replaceAll((table, position) -> LegacyPositionEncoding.hasJavaStreamHeader(position)
                 ? "opaque-v1:" + CanonicalHash.ofText(position) : position);
         return positions;
-    }
-
-    private static boolean hasSerializedStreamHeader(String position) {
-        // The base64 prefix for AC ED 00 05. Four lower bits in the sixth digit belong to the next byte.
-        if (position.length() < 8 || !position.startsWith("rO0AB")) {
-            return false;
-        }
-        char sixthDigit = position.charAt(5);
-        return (sixthDigit >= 'Q' && sixthDigit <= 'Z') || (sixthDigit >= 'a' && sixthDigit <= 'f');
     }
 
     private static Fact fact(MetricFact fact) {
