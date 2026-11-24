@@ -28,6 +28,7 @@ import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -41,9 +42,9 @@ import org.junit.jupiter.api.Test;
  * where the nest's documents land: in the root's table, matched on the root's key, and routed among a sink's
  * writers by that table and key.
  *
- * <p>The sink is told about the nest's own stream, as for any nest, and no row arriving from this one is on it.
- * Told nothing more, its writers fall back to a bare table name carrying no key, and a sink running several
- * writers - the default - has no target to route the rows by and fails the run on the first of them.
+ * <p>The sink must resolve the model by the original stream ID on each forwarded row. Otherwise,
+ * the writers fall back to a bare table name carrying no key, and a sink running several writers
+ * has no target to route the rows by.
  *
  * <p>The root's key here is not the table's primary key, so a sink that took the table's own model for these rows
  * - matching re-sent rows on a key the nest did not declare - is told apart from one that lands them as the nest's
@@ -102,6 +103,30 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
         assertThat(planned.shape().sinkTargetsOf(SINK)).containsEntry(TABLE, new SinkTarget(TABLE, List.of("id")));
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void preparesOneTargetForTheDirectAndProjectedNestRoutes(boolean rename) {
+        Map<String, FieldRule> rules = rename ? Map.of("display_name", FieldRule.rename("name"))
+                : Map.of("name", FieldRule.drop());
+        Step project = Step.inline("project", FromClause.list(FromRef.literal(STEP)),
+                new TransformBody.MapProjection(rules), null);
+        InMemoryStorePort store = seedStore(List.of(rootOnly(STEP, "id"), project),
+                FromClause.list(FromRef.literal(TABLE), FromRef.literal("project")));
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        DagSource.PlannedDag planned = new StoreBackedDagSource(store, capturing(bound)).plannedDagFor(PIPELINE, null);
+
+        var factory = new PdkSinkWriterFactory("fake", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL,
+                bound.get(), new PipelineNode(PIPELINE, "sync_1"));
+        assertThat(factory.preparationInputs(new PipelineIntentScope("cluster", 1L, "cache", PIPELINE, 1L)))
+                .as("the physical target roster for both routes").hasSize(1);
+        assertThat(bound.get()).containsOnlyKeys(TABLE);
+        List<String> fields = rename ? List.of("id", "cust_no", "name", "display_name")
+                : List.of("id", "cust_no", "name");
+        assertThat(bound.get().get(TABLE).fields()).extracting(TargetField::name).containsExactlyElementsOf(fields);
+        assertThat(planned.shape().sinkTargetsOf(SINK))
+                .containsOnly(Map.entry(TABLE, new SinkTarget(TABLE, List.of("id"))));
+    }
+
     @Test
     void aProjectionAfterNestPreservesTheDeclaredCompositeKeyOrder() {
         List<String> key = List.of("id", "cust_no");
@@ -113,7 +138,8 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
 
         DagSource.PlannedDag planned = new StoreBackedDagSource(store, capturing(bound)).plannedDagFor(PIPELINE, null);
 
-        assertThat(bound.get().get(STEP).fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+        assertThat(bound.get()).containsOnlyKeys(TABLE);
+        assertThat(bound.get().get(TABLE).fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
                 .containsExactlyElementsOf(key);
         assertThat(planned.shape().sinkTargetsOf(SINK)).containsEntry(TABLE, new SinkTarget(TABLE, key));
     }

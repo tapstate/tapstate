@@ -3171,13 +3171,12 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * The streams a sink's rows arrive on: {@code streams}, and for each nest among them that assembles nothing, the
-     * streams its rows are actually on - each landing in that nest's target in {@code targets}.
+     * The streams a sink's rows arrive on. An embed-free nest forwards its root streams, so its
+     * projected target contributes to those streams' models.
      *
      * <p>A sink names one target per stream. So a stream that reaches it both as such a nest's documents and another
-     * way - as itself, or as another such nest's documents - lands one way only, and only where the two land it in
-     * the same table on the same key; otherwise the rows of one way would be routed and matched on a key they were
-     * not given, and the start is refused here, before anything opens.
+     * way can share a target model where the routes land in the same table on the same key.
+     * A different table or key is refused before anything opens.
      */
     private static Set<String> landing(String pipelineId, Set<String> streams, Map<String, TargetTable> targets,
             Map<String, Set<String>> passedOn) {
@@ -3200,6 +3199,7 @@ final class StoreBackedDagSource implements DagSource {
                     pending.addAll(passedOn.get(arriving));
                     continue;
                 }
+                landing.remove(stream);
                 String other = streams.contains(arriving) ? arriving : landedBy.get(arriving);
                 if (other == null) {
                     landing.add(arriving);
@@ -3218,6 +3218,8 @@ final class StoreBackedDagSource implements DagSource {
                                     "other",
                                     other),
                             null);
+                } else {
+                    targets.put(arriving, mergeLandingTargets(targets.get(arriving), target));
                 }
             }
         }
@@ -3228,6 +3230,29 @@ final class StoreBackedDagSource implements DagSource {
     private static boolean landsAlike(TargetTable one, TargetTable other) {
         return one != null && other != null && one.name().equals(other.name())
                 && keyColumnsOf(one).equals(keyColumnsOf(other));
+    }
+
+    private static TargetTable mergeLandingTargets(TargetTable first, TargetTable second) {
+        if (first.equals(second)) return first;
+        Map<String, TargetField> fields = new LinkedHashMap<>();
+        first.fields().forEach(field -> fields.put(field.name(), field));
+        second.fields().forEach(field -> fields.merge(field.name(), field,
+                StoreBackedDagSource::mergeLandingField));
+        Set<TargetIndex> indexes = new LinkedHashSet<>(first.indexes());
+        indexes.addAll(second.indexes());
+        // A unique index must be valid on every route that writes to the table.
+        indexes.removeIf(index -> index.unique()
+                && (!first.indexes().contains(index) || !second.indexes().contains(index)));
+        return TargetModelResolver.keyedOn(new TargetTable(first.name(), List.copyOf(fields.values()),
+                List.copyOf(indexes), first.unwindIdentity()), keyColumnsOf(first));
+    }
+
+    private static TargetField mergeLandingField(TargetField first, TargetField second) {
+        return new TargetField(first.name(), Objects.equals(first.type(), second.type()) ? first.type() : null,
+                first.primaryKey(),
+                first.inferredType() == second.inferredType() ? first.inferredType() : TapstateType.UNKNOWN,
+                Objects.equals(first.numericType(), second.numericType()) ? first.numericType() : null,
+                Objects.equals(first.stringType(), second.stringType()) ? first.stringType() : null);
     }
 
     /** The stream ids a terminal sink can receive: source tables, or a nest step's assembled stream id. */
