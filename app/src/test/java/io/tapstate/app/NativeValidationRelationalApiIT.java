@@ -145,6 +145,23 @@ class NativeValidationRelationalApiIT {
                             "task", "balance", "taskGeneration", task.get("taskGeneration"), "revision", task.get("revision"),
                             "sequence", "1", "command", UUID.randomUUID().toString()));
                     assertThat(report).containsEntry("result", "COMPLETE_WITH_OBSERVATIONS").containsEntry("rootCount", "1");
+                    var reference = (Map<?, ?>) report.get("reference");
+                    String rootsPath = taskPath + "/reports/" + reference.get("run") + "/roots";
+                    String query = "?generation=" + reference.get("generation") + "&sequence=" + reference.get("sequence");
+                    var roots = get(http, read, rootsPath + query);
+                    assertThat((List<Map>) roots.get("items")).singleElement().satisfies(root -> {
+                        var detail = get(http, read, rootsPath + "/" + root.get("id") + query);
+                        var observation = (Map<?, ?>) detail.get("observation");
+                        assertThat((List<Map>) reportField(observation, "samples").get("value")).anySatisfy(sample -> {
+                            var finding = reportField(sample, "finding");
+                            assertThat(reportField(finding, "kind").get("value")).isEqualTo("TARGET_VALUE");
+                            var path = reportField(reportField(finding, "location"), "fieldPath");
+                            assertThat((List<Map>) path.get("value")).extracting(part -> part.get("value"))
+                                    .containsExactly("c_balance");
+                            assertBalanceSample(reportField(sample, "source"), new BigDecimal("-10.00"));
+                            assertBalanceSample(reportField(sample, "target"), new BigDecimal("-11.00"));
+                        });
+                    });
                 } finally {
                     for (String database : List.of(storage.configurationDatabase(), storage.cacheDatabase(), storage.masterDatabase())) {
                         raw.getDatabase(database).drop();
@@ -152,6 +169,25 @@ class NativeValidationRelationalApiIT {
                 }
             }
         }
+    }
+
+    private static Map<?, ?> reportField(Map<?, ?> object, String name) {
+        var fields = (List<Map<?, ?>>) object.get("value");
+        return fields.stream().filter(field -> name.equals(field.get("name")))
+                .map(field -> (Map<?, ?>) field.get("value"))
+                .findFirst().orElseThrow(() -> new AssertionError("Missing report field " + name));
+    }
+
+    private static void assertBalanceSample(Map<?, ?> side, BigDecimal expected) {
+        var row = reportField(side, "row");
+        var entries = (List<Map<?, ?>>) reportField(row, "entries").get("value");
+        assertThat(entries).anySatisfy(entry -> {
+            assertThat(reportField(entry, "name").get("value")).isEqualTo("c_balance");
+            var balance = reportField(reportField(entry, "value"), "value");
+            assertThat(reportField(balance, "kind").get("value")).isEqualTo("DECIMAL");
+            assertThat(reportField(balance, "scale").get("value")).isEqualTo(Integer.toString(expected.scale()));
+            assertThat(reportField(balance, "unscaled").get("value")).isEqualTo(expected.unscaledValue().toString());
+        });
     }
 
     @org.junit.jupiter.params.ParameterizedTest
