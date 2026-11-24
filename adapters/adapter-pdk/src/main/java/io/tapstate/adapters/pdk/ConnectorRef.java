@@ -19,7 +19,7 @@ import java.util.Objects;
  */
 public record ConnectorRef(
         List<Path> classpath, String className, String pdkApiVersion, String requiredLevel, String spec,
-        String contentHash, boolean shareSafe) {
+        String contentHash, boolean shareSafe, LoaderAccess loaderAccess) {
 
     public ConnectorRef {
         classpath = List.copyOf(Objects.requireNonNull(classpath, "classpath"));
@@ -28,6 +28,20 @@ public record ConnectorRef(
             throw new IllegalArgumentException("a connector certified to be shared names the artifact it was "
                     + "certified for");
         }
+    }
+
+    @FunctionalInterface
+    interface LoaderAccess {
+        ConnectorClassLoader.SharedUse acquire(List<Path> classpath);
+    }
+
+    ConnectorClassLoader.SharedUse acquireLoader() {
+        return loaderAccess == null ? ConnectorClassLoader.acquire(classpath) : loaderAccess.acquire(classpath);
+    }
+
+    public ConnectorRef(List<Path> classpath, String className, String pdkApiVersion, String requiredLevel,
+            String spec, String contentHash, boolean shareSafe) {
+        this(classpath, className, pdkApiVersion, requiredLevel, spec, contentHash, shareSafe, null);
     }
 
     /** A ref to an artifact nothing names by its bytes, run one instance per writer. */

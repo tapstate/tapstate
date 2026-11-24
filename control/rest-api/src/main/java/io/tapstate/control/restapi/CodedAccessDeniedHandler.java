@@ -1,6 +1,5 @@
 package io.tapstate.control.restapi;
 
-import io.tapstate.control.core.Operation;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.security.access.AccessDeniedException;
@@ -21,9 +20,9 @@ final class CodedAccessDeniedHandler implements AccessDeniedHandler {
     @Override
     public void handle(HttpServletRequest request, HttpServletResponse response,
             AccessDeniedException accessDeniedException) throws IOException {
-        Object resolved = request.getAttribute(OperationAuthorizationManager.OPERATION_ATTRIBUTE);
-        if (resolved instanceof Operation operation) {
-            errors.forbidden(request, response, operation.id(), operation.scope().name());
+        Object resolved = request.getAttribute(OperationAuthorizationManager.REQUIREMENT_ATTRIBUTE);
+        if (resolved instanceof OperationAuthorizationManager.Requirement requirement) {
+            errors.forbidden(request, response, requirement.operationId(), requirement.scope().name());
             return;
         }
         errors.forbidden(request, response, "unknown", "unknown");

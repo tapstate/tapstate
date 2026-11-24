@@ -163,6 +163,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ -f deploy/cloud/stage-published-connectors.py ]]; then
+            PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-published-connectors.py \
+              --boot-jar app/target/app-*-boot.jar --profile cloud \
+              --stage-dir "$RUNNER_TEMP/cloud-stage"
+          else
           mkdir -p "$RUNNER_TEMP/cloud-jars"
           assets="$(jq -r '.connectors[].id + "-connector.jar", .licenseFiles[].name' deploy/cloud/connectors.lock.json)"
           patterns=()
@@ -174,6 +179,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py \
             --lock deploy/cloud/connectors.lock.json --jar-dir "$RUNNER_TEMP/cloud-jars" \
             --stage-dir "$RUNNER_TEMP/cloud-stage"
+          fi
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: build the dual-platform Cloud OCI archive
@@ -209,7 +215,7 @@ jobs:
           mkdir "$RUNNER_TEMP/cloud-layout"
           tar -xf "$RUNNER_TEMP/cloud-image.tar" -C "$RUNNER_TEMP/cloud-layout"
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/verify-image.py \
-            --oci-layout "$RUNNER_TEMP/cloud-layout" --lock deploy/cloud/connectors.lock.json \
+            --oci-layout "$RUNNER_TEMP/cloud-layout" --lock "$RUNNER_TEMP/cloud-stage/release/connectors.lock.json" \
             --boot-jar "${boot_jars[0]}" --web-profile cloud --cloud-console-url "$CLOUD_CONSOLE_URL"
           PYTHONDONTWRITEBYTECODE=1 python3 .github/scripts/web-provenance.py create \
             --oci-layout "$RUNNER_TEMP/cloud-layout" --output "$RUNNER_TEMP/cloud-provenance.json" \

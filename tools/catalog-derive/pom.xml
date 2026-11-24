@@ -29,6 +29,8 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>21</maven.compiler.release>
+    <!-- This standalone catalog-refresh tool retains its historical probe baseline. Its dependencies
+         are absent from the server distribution and do not determine the host compatibility ceiling. -->
     <pdk-api.version>2.0.8-SNAPSHOT</pdk-api.version>
     <pdk-entity.version>2.0.9-SNAPSHOT</pdk-entity.version>
     <pdk-runner.version>2.8-SNAPSHOT</pdk-runner.version>

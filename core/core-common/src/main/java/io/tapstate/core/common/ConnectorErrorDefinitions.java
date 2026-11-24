@@ -94,6 +94,9 @@ public final class ConnectorErrorDefinitions {
     public static final ProductErrorDefinition DISCOVERY_AUTHENTICATION_REJECTED =
             DEFINITIONS.define(42, Severity.ERROR, Set.of("connector"));
 
+    public static final ProductErrorDefinition LOCAL_ARTIFACT_UNAVAILABLE =
+            DEFINITIONS.define(43, Severity.ERROR, Set.of("connector", "hash"));
+
     private ConnectorErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

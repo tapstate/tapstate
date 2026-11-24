@@ -65,6 +65,9 @@ class RequestDiagnosticDefinitionGatesTest {
         assertThat(managedBaseline).containsExactlyInAnyOrder("control.ai-managed-provider-auth-failed",
                 "control.ai-managed-provider-input-limit").doesNotContainAnyElementsOf(baseline);
         baseline.addAll(managedBaseline);
+        // The local artifact candidates used these identities before they received standard codes.
+        assertThat(baseline.add("connector.download-target-changed")).isTrue();
+        assertThat(baseline.add("connector.local-artifact-unavailable")).isTrue();
         Set<String> replacements = new TreeSet<>();
         for (String line : Files.readAllLines(Path.of("src/test/resources/product-code-migrations.tsv"))) {
             if (line.isBlank() || line.startsWith("#")) continue;
@@ -73,7 +76,7 @@ class RequestDiagnosticDefinitionGatesTest {
             assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
             assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
         }
-        assertThat(replacements).hasSize(490);
+        assertThat(replacements).hasSize(492);
         baseline.addAll(replacements);
         // Existing migrated contracts stay present; new product identities are append-only.
         assertThat(readCodes("error-codes.golden")).containsAll(baseline);

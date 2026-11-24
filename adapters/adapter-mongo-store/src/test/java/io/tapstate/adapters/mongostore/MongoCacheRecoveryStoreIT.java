@@ -32,6 +32,37 @@ class MongoCacheRecoveryStoreIT {
         return new PipelineResource(id, null, List.of(SourceRef.spec("source", false)), null, null,
                 new ServeBlock.Inline("serve", FromRef.literal("orders"), List.of(new SyncElement("sync", "views", null, null, null)), null, null), null, null);
     }
+    @Test void cacheReplacementRetainsExactArtifactCoordinatesOnlyForItsAuthorizedPredecessor() {
+        String hash = "c".repeat(64);
+        fixture(f -> {
+            var intent = f.domain.intents().load("a").orElseThrow();
+            var owner = RequiredNoteOwner.forArtifact(1, new PipelineNode("a", "source"),
+                    PipelineNode.Purpose.CAPTURE, 1, hash, 1);
+            var artifact = new ConnectorRunBindings.Binding("source", PipelineNode.Purpose.CAPTURE,
+                    "mysql", "2.0", hash, new RequiredNoteScope(owner, 1), null, null);
+            f.domain.intents().connectorBindings().seed(intent, List.of(artifact));
+        }, f -> {
+            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(f.config).find(new Document("_id", "a")).first();
+            var original = mapping.get("connectorBindings", Document.class);
+            var changes = f.domain.cacheRecoveries().stageCluster(f.confirmed());
+            var target = changes.stream().filter(change -> change.targetScope().pipelineId().equals("a")).findFirst().orElseThrow().targetScope();
+            assertThat(f.domain.pipelineStates().read("a")).get().extracting(PipelineStateMapping::stateGeneration).isEqualTo(2L);
+            var bindings = f.domain.intents().connectorBindings();
+            assertThat(bindings.load(target)).isEmpty();
+            assertThat(bindings.loadAll()).isEmpty();
+            var retained = bindings.previousForRecovery(target).orElseThrow();
+            assertThat(retained.scope().stateGeneration()).isEqualTo(1);
+            assertThat(retained.effective()).singleElement().extracting(ConnectorRunBindings.Binding::sha256).isEqualTo(hash);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.config).find(new Document("_id", "a")).first()
+                    .get("connectorBindings", Document.class)).isEqualTo(original);
+            var current = f.domain.intents().load("a").orElseThrow();
+            assertThatThrownBy(() -> f.domain.intents().compareAndSetExplicitStart(target, current.intentRevision(),
+                    new DesiredState("a", PipelineState.RUNNING, CanonicalHash.of(pipeline("a")), false)))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(bindings.previousForRecovery(target)).contains(retained);
+        });
+    }
+
     @Test void oneTransactionRebindsAllPipelinesStoppedWithoutCreatingRuntimeHistory() {
         fixture(f -> {
             var changes = f.domain.cacheRecoveries().inspectCluster(f.current());
