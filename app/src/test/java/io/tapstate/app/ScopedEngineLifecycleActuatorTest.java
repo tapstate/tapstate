@@ -158,6 +158,60 @@ class ScopedEngineLifecycleActuatorTest {
         verify(root).clearDirectRetries(SCOPE);
     }
 
+    @Test void aRefusedRecoveryBeforeReplacementSurfacesTheStartFailure() {
+        var time = new java.util.concurrent.atomic.AtomicLong();
+        var retry = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));
+        var otherSource = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));
+        retry.interrupted(new io.tapstate.core.common.FailureFact(new java.io.IOException("source interrupted")));
+        otherSource.interrupted(new io.tapstate.core.common.FailureFact(new java.io.IOException("another source interrupted")));
+        time.set(Duration.ofSeconds(3).toNanos());
+        var root = mock(ScopedPipelineCaptureCoordinator.class);
+        when(root.forRun(any(), any(), any())).thenReturn(fixedCapture);
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(1))))
+                .thenAnswer(call -> Optional.of(retry.waiting() ? retry : otherSource));
+        when(root.streamRetryPolicy()).thenReturn(new io.tapstate.core.common.RetryPolicy(
+                true, Duration.ofSeconds(2), Duration.ofSeconds(8)));
+        var refused = new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "recovery preparation refused"), null);
+        when(dags.prepareStart(eq(pass), eq("cache"))).thenThrow(refused);
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, root, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+
+        assertThat(actor.recoverSource("p", () -> true)).hasValueSatisfying(result ->
+                assertThat(result.failure()).isNotNull().satisfies(fact -> assertThat(fact.cause()).isSameAs(refused)));
+        verify(root).clearDirectRetries(SCOPE);
+        verify(ownership, never()).beginExecution(eq(SCOPE), any());
+    }
+
+    @Test void aMatchingReplacementFailureKeepsItsPendingRetry() {
+        var time = new java.util.concurrent.atomic.AtomicLong();
+        var retry = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));
+        var policy = new io.tapstate.core.common.RetryPolicy(true, Duration.ofSeconds(2), Duration.ofSeconds(8));
+        retry.interrupted(new io.tapstate.core.common.FailureFact(new java.io.IOException("source interrupted")));
+        time.set(Duration.ofSeconds(3).toNanos());
+        var root = mock(ScopedPipelineCaptureCoordinator.class);
+        when(root.forRun(any(), any(), any())).thenReturn(fixedCapture);
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(1)))).thenReturn(Optional.of(retry));
+        when(root.streamRetryPolicy()).thenReturn(policy);
+        var failure = new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "source still unavailable"), null);
+        var fact = new io.tapstate.core.common.FailureFact(failure);
+        doAnswer(call -> {
+            retry.interrupted(fact);
+            throw failure;
+        }).when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        when(root.hasDirectRetryFor(eq(new ExecutionFence(SCOPE, claim(2))), any()))
+                .thenAnswer(call -> retry.waitingFor(call.getArgument(1)));
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, root, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+
+        assertThat(actor.recoverSource("p", () -> true)).contains(new LifecycleActuator.SourceRecovery(null));
+        assertThat(retry.decision(policy)).isEqualTo(new CaptureReadRetry.Pending(fact, Duration.ofSeconds(2)));
+        assertThat(retry.waitingFor(new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "source still unavailable"), null))).isFalse();
+        verify(root, never()).clearDirectRetries(SCOPE);
+    }
+
     @Test void failedSubmissionKeepsItsDiagnosticReadableAfterInvalidatingActuation() {
         var failure = new TapstateException(EngineError.JOB_FAILED,
                 Map.of("pipeline", "p", "cause", "submission refused"), null);

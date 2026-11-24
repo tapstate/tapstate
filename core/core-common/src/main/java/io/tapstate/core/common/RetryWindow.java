@@ -73,6 +73,7 @@ public final class RetryWindow {
                 if (prepare.isEmpty()) throw failure;
                 awaitAttempt(window, policies, guard, failure);
                 prepare.orElseThrow().run();
+                awaitAttempt(window, policies, guard, failure);
             }
         }
     }

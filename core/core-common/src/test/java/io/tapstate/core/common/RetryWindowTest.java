@@ -47,6 +47,24 @@ class RetryWindowTest {
     }
 
     @Test
+    void preparationCannotStartAnotherAttemptAfterTheCurrentWindowExpires() {
+        var original = new IOException("source failed");
+        var calls = new AtomicInteger();
+        var preparations = new AtomicInteger();
+        var initial = new RetryPolicy(true, Duration.ofNanos(1), Duration.ofSeconds(30));
+        var policy = new java.util.concurrent.atomic.AtomicReference<>(initial);
+        assertThatThrownBy(() -> RetryWindow.execute(policy::get, failure -> Optional.of(() -> {
+            preparations.incrementAndGet();
+            policy.set(new RetryPolicy(true, initial.interval(), Duration.ofNanos(1)));
+        }), () -> {}, () -> {
+            if (calls.incrementAndGet() == 1) throw original;
+            return "unexpected retry outside the window";
+        })).isSameAs(original);
+        assertThat(preparations).hasValue(1);
+        assertThat(calls).hasValue(1);
+    }
+
+    @Test
     void disabledWrapperPreservesTheCauseAndNeverPreparesAnotherAttempt() {
         var failure = new IOException("source failed");
         var policy = new RetryPolicy(false, Duration.ofMillis(1), Duration.ofSeconds(3));

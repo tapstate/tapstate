@@ -1071,6 +1071,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 .map(entry -> entry.getValue().retry()).findFirst();
     }
 
+    boolean hasDirectRetryFor(ExecutionFence original, Throwable failure) {
+        return directRetries.values().stream().anyMatch(episode ->
+                episode.execution().equals(original) && episode.retry().waitingFor(failure));
+    }
+
     RetryPolicy streamRetryPolicy() {
         return retryPolicies.apply(RetrySettingsStore.STREAM_READ);
     }

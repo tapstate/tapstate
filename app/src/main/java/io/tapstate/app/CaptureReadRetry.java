@@ -30,6 +30,10 @@ final class CaptureReadRetry {
         return pending;
     }
 
+    synchronized boolean waitingFor(Throwable failure) {
+        return pending && retained.cause() == failure;
+    }
+
     synchronized boolean inProgress() {
         return retained != null;
     }

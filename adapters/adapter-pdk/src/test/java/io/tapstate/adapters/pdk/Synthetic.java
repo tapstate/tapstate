@@ -395,6 +395,24 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.RetryingSnapshotSource", source("RetryingSnapshotSource", "", register));
     }
 
+    static Path asyncFailingStreamSource(Path dir, String channel, boolean interruptDuringDelivery) {
+        String register = "functions.supportTimestampToStreamOffset((context, time) -> 0L);"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + row("a", 1)
+                + "  var events = List.<TapEvent>of(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "  Thread.ofVirtual().start(() -> { try { consumer.accept(events, 1L); } finally {"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".delivered\")).countDown(); } });"
+                + "  if (!((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".entered\")).await(5, java.util.concurrent.TimeUnit.SECONDS))"
+                + "    throw new AssertionError(\"delivery was not admitted\");"
+                + (interruptDuringDelivery ? "" : "  if (!((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel
+                        + ".delivered\")).await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError(\"delivery did not finish\");")
+                + "  throw new java.io.IOException(\"new source interruption\");"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.AsyncFailingStreamSource",
+                source("AsyncFailingStreamSource", "", register));
+    }
+
     static Path emittingSource(Path dir) {
         String register = ""
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"

@@ -107,9 +107,16 @@ final class MongoRetrySettingsStore implements RetrySettingsStore {
     private static Document policy(Boolean enabled, Duration interval, Duration maxDuration) {
         var fields = new Document();
         if (enabled != null) fields.append(ENABLED, enabled);
-        if (interval != null) fields.append(INTERVAL, interval.toMillis());
-        if (maxDuration != null) fields.append(MAX_DURATION, maxDuration.toMillis());
+        if (interval != null) fields.append(INTERVAL, wholeMillis(interval));
+        if (maxDuration != null) fields.append(MAX_DURATION, wholeMillis(maxDuration));
         return fields;
+    }
+
+    private static long wholeMillis(Duration duration) {
+        if (duration.getNano() % 1_000_000 != 0) {
+            throw new IllegalArgumentException("Stored retry durations must use whole milliseconds");
+        }
+        return duration.toMillis();
     }
 
     private static Duration duration(Document value, String field) {

@@ -334,7 +334,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             return Optional.of(new SourceRecovery(null));
         } catch (TapstateException failure) {
             if (invalidated) throw failure;
-            if (original != null && scoped.directRetry(original).isPresent()) return Optional.of(new SourceRecovery(null));
+            if (original != null && scoped.hasDirectRetryFor(original, failure)) return Optional.of(new SourceRecovery(null));
             scoped.clearDirectRetries(pass.scope());
             return Optional.of(new SourceRecovery(actuationFailureFact(pipeline, failure)));
         } finally {

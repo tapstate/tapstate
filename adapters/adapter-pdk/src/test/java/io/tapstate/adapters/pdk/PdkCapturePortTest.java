@@ -972,6 +972,84 @@ class PdkCapturePortTest {
         assertThatCode(sub::close).doesNotThrowAnyException();
     }
 
+    @Test
+    void aDeliveryAdmittedBeforeTheNextInterruptionCannotClearIt(@TempDir Path dir) throws Exception {
+        String channel = "stream-retry-" + java.util.UUID.randomUUID();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var delivered = new CountDownLatch(1);
+        var interrupted = new CountDownLatch(1);
+        var recovered = new java.util.concurrent.atomic.AtomicInteger();
+        System.getProperties().put(channel + ".entered", entered);
+        System.getProperties().put(channel + ".delivered", delivered);
+        var jar = Synthetic.asyncFailingStreamSource(dir, channel, true);
+        var port = new PdkCapturePort(provisioner(jar, "synthetic.AsyncFailingStreamSource", null))
+                .withReadRetries(operation -> io.tapstate.spi.store.RetrySettingsStore.DEFAULT)
+                .withStreamRecovery(failure -> interrupted.countDown(), recovered::incrementAndGet, () -> true);
+        try (var sub = port.cdc(config("t1"), CaptureStart.present(), (events, position) -> {
+            entered.countDown();
+            try {
+                if (!release.await(10, TimeUnit.SECONDS)) throw new AssertionError("delivery never released");
+            } catch (InterruptedException cancelled) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(cancelled);
+            }
+        })) {
+            try {
+                assertThat(interrupted.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(delivered.getCount()).isOne();
+            } finally {
+                release.countDown();
+            }
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(recovered).hasValue(0);
+        } finally {
+            System.getProperties().remove(channel + ".entered");
+            System.getProperties().remove(channel + ".delivered");
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void streamRecoverySurvivesAPreparationWrapper(boolean snapshot, @TempDir Path dir) throws Exception {
+        String channel = "stream-retry-preparation-" + java.util.UUID.randomUUID();
+        var entered = new CountDownLatch(1);
+        var delivered = new CountDownLatch(1);
+        var reported = new CountDownLatch(1);
+        var recovered = new java.util.concurrent.atomic.AtomicInteger();
+        var interruption = new AtomicReference<io.tapstate.core.common.FailureFact>();
+        var terminal = new AtomicReference<io.tapstate.core.common.FailureFact>();
+        System.getProperties().put(channel + ".entered", entered);
+        System.getProperties().put(channel + ".delivered", delivered);
+        var jar = Synthetic.asyncFailingStreamSource(dir, channel, false);
+        try (var original = new PdkCapturePort(provisioner(jar, "synthetic.AsyncFailingStreamSource", null))
+                .withReadRetries(operation -> io.tapstate.spi.store.RetrySettingsStore.DEFAULT)
+                .withStreamRecovery(failure -> {
+                    interruption.set(failure);
+                    reported.countDown();
+                }, recovered::incrementAndGet, () -> true);
+             var configured = snapshot ? original.withSnapshotPreparation((request, seam, actual) -> {})
+                     : original.withStreamPreparation(actual -> {});
+             var sub = configured.cdc(config("t1"), CaptureStart.present(), new CaptureListener() {
+                 @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                     entered.countDown();
+                 }
+                 @Override public void onFailure(io.tapstate.core.common.FailureFact failure) {
+                     terminal.set(failure);
+                     reported.countDown();
+                 }
+             })) {
+            assertThat(reported.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(terminal.get()).isNull();
+            assertThat(interruption.get()).isNotNull();
+            assertThat(recovered).hasValue(1);
+        } finally {
+            System.getProperties().remove(channel + ".entered");
+            System.getProperties().remove(channel + ".delivered");
+        }
+    }
+
     @Test void aRefusedPreflightRetainsItsGatedPluginStopAndCannotOpenAReplacement(@TempDir Path dir) throws Exception {
         String channel="preflight-stop-"+java.util.UUID.randomUUID();
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var ended=new CountDownLatch(1);

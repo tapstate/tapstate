@@ -10,6 +10,7 @@ public final class TcpResetProxy implements AutoCloseable {
     private final String host;
     private final int port;
     private final java.util.Set<Hop> hops = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Object admission = new Object();
     private volatile boolean available = true;
 
     public TcpResetProxy(String host, int port) throws java.io.IOException {
@@ -24,11 +25,19 @@ public final class TcpResetProxy implements AutoCloseable {
     }
 
     public void resetFor(Duration duration) throws Exception {
-        available = false;
-        if (hops.isEmpty()) throw new AssertionError("no live connection to reset");
-        for (Hop hop : hops) hop.reset();
+        java.util.List<Hop> connected;
+        synchronized (admission) {
+            available = false;
+            connected = java.util.List.copyOf(hops);
+        }
+        if (connected.isEmpty()) throw new AssertionError("no live connection to reset");
+        connected.forEach(Hop::reset);
         // Restoration is a fixture event that ends the configured network outage.
-        var restoration = CompletableFuture.runAsync(() -> available = true,
+        var restoration = CompletableFuture.runAsync(() -> {
+            synchronized (admission) {
+                available = true;
+            }
+        },
                 CompletableFuture.delayedExecutor(duration.toMillis(), TimeUnit.MILLISECONDS));
         restoration.get(duration.plusSeconds(10).toMillis(), TimeUnit.MILLISECONDS);
     }
@@ -44,7 +53,15 @@ public final class TcpResetProxy implements AutoCloseable {
                 }
                 var back = new java.net.Socket(host, port);
                 var hop = new Hop(front, back);
-                hops.add(hop);
+                boolean admitted;
+                synchronized (admission) {
+                    admitted = available;
+                    if (admitted) hops.add(hop);
+                }
+                if (!admitted) {
+                    hop.reset();
+                    continue;
+                }
                 Thread.ofVirtual().start(() -> pump(hop, front, back));
                 Thread.ofVirtual().start(() -> pump(hop, back, front));
             } catch (java.io.IOException closedOrUnavailable) {
