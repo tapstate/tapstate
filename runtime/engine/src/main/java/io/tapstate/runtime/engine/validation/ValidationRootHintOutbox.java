@@ -193,34 +193,13 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
         deliveryLock.lock();
         try {
             if (lease.settled) return Settlement.ALREADY_SETTLED;
-            Entry entry = lease.entry;
-            if (buffer.get().first() != entry || entry.lease != lease) throw new IllegalStateException("hint lease ownership was lost");
+            Entry entry = Objects.requireNonNull(lease.entry, "entry");
+            requireActiveLease(entry, lease);
             lease.settled = true; entry.lease = null;
             if (closed) return failure.get() == null ? Settlement.CLOSED : Settlement.FAILED;
             long now = nanoTime.getAsLong();
             if (closed) return failure.get() == null ? Settlement.CLOSED : Settlement.FAILED;
-            if (elapsed(now, entry.createdAt) >= limits.windowNanos()) {
-                fail(invalid("hint.deliveryWindow")); return Settlement.FAILED;
-            }
-            if (receipt != null) {
-                if (!run.equals(receipt.run()) || !sender.equals(receipt.sender()) || receipt.sequence() != entry.batch.sequence()
-                        || receipt.disposition() == null) {
-                    fail(invalid("hint.foreignReceipt")); return Settlement.FAILED;
-                }
-                switch (receipt.disposition()) {
-                    case ACCEPTED, DUPLICATE -> {
-                        buffer.updateAndGet(Buffer::removeFirst);
-                        return Settlement.ACCEPTED;
-                    }
-                    case BUSY -> { }
-                    default -> { fail(invalid("hint.rejectedDelivery")); return Settlement.FAILED; }
-                }
-            }
-            if (entry.attempts == limits.attempts()) {
-                fail(invalid("hint.deliveryAttempts")); return Settlement.FAILED;
-            }
-            entry.dueAt = now + limits.retryNanos();
-            return Settlement.RETRY;
+            return settleEntry(entry, receipt, now);
         } catch (RuntimeException | Error problem) {
             fail(problem); throw problem;
         } finally {
@@ -228,6 +207,44 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
             deliveryLock.unlock();
             if (completeDrain) drained.complete(null);
         }
+    }
+
+    private void requireActiveLease(Entry entry, Lease lease) {
+        if (buffer.get().first() != entry || entry.lease != lease) {
+            throw new IllegalStateException("hint lease ownership was lost");
+        }
+    }
+
+    private Settlement settleEntry(Entry entry, ValidationRootHintInbox.Receipt receipt, long now) {
+        if (elapsed(now, entry.createdAt) >= limits.windowNanos()) {
+            fail(invalid("hint.deliveryWindow")); return Settlement.FAILED;
+        }
+        Settlement receiptResult = settleReceipt(entry, receipt);
+        if (receiptResult != null) return receiptResult;
+        if (entry.attempts == limits.attempts()) {
+            fail(invalid("hint.deliveryAttempts")); return Settlement.FAILED;
+        }
+        entry.dueAt = now + limits.retryNanos();
+        return Settlement.RETRY;
+    }
+
+    private Settlement settleReceipt(Entry entry, ValidationRootHintInbox.Receipt receipt) {
+        if (receipt == null) return null;
+        if (!run.equals(receipt.run()) || !sender.equals(receipt.sender()) || receipt.sequence() != entry.batch.sequence()
+                || receipt.disposition() == null) {
+            fail(invalid("hint.foreignReceipt")); return Settlement.FAILED;
+        }
+        return switch (receipt.disposition()) {
+            case ACCEPTED, DUPLICATE -> {
+                buffer.updateAndGet(Buffer::removeFirst);
+                yield Settlement.ACCEPTED;
+            }
+            case BUSY -> null;
+            default -> {
+                fail(invalid("hint.rejectedDelivery"));
+                yield Settlement.FAILED;
+            }
+        };
     }
 
     /** Safe to sample without completing callbacks on the capture thread. */
