@@ -346,26 +346,29 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
     private Date proveNode(ClientSession session, WorkloadClaimFence node) {
         return proveNode(session, database, business, node);
     }
-    static WorkloadClaim proveNodeForClaim(ClientSession session, MongoDatabase database, CacheBusinessScope business, WorkloadClaimFence node) {
+    static VerifiedNode proveNodeForClaim(ClientSession session, MongoDatabase database, CacheBusinessScope business, WorkloadClaimFence node) {
         if (io.tapstate.spi.store.ProcessNodeSession.owns(node)) {
-            return fenceProcessNode(session, database, business, node).claim();
+            return fenceProcessNode(session, database, business, node);
         }
         Objects.requireNonNull(node, "node");
         if (node.key().type() != WorkloadClaimType.NODE_SESSION || !business.clusterId().equals(node.key().clusterId())
                 || !node.key().resourceId().equals(node.owner().nodeId())) throw claimFenced();
         var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-        var reading = new MongoWorkloadClaimStore(claims).inStrictSession(session).read(node.key()).orElseThrow(MongoCachePipelinePreparations::claimFenced);
+        var row = new MongoWorkloadClaimStore(claims).inStrictSession(session).readWithRemainingLease(node.key());
+        if (row == null) throw claimFenced();
+        var reading = MongoWorkloadClaimStore.nodeSessionReading(row);
         if (!node.equals(WorkloadClaimFence.from(reading.claim())) || !reading.leased()
                 || node.claimGeneration() >= Long.MAX_VALUE - 1 || node.executionGeneration() == Long.MAX_VALUE
                 || node.topologyRevision() == Long.MAX_VALUE) throw claimFenced();
         if (claims.updateOne(session, WorkloadClaimDocuments.live(node),
                 new Document("$inc", new Document("fencedPreparationWrites", 1L))).getMatchedCount() != 1) throw claimFenced();
-        return reading.claim();
+        return new VerifiedNode(reading.claim(), MongoWorkloadClaimStore.sampledAt(row));
     }
 
-    private record ProcessNodeProof(WorkloadClaim claim, Date serverTime) {}
+    /** The node and server time fenced in this transaction callback. */
+    record VerifiedNode(WorkloadClaim claim, java.time.Instant serverTime) {}
 
-    private static ProcessNodeProof fenceProcessNode(ClientSession session, MongoDatabase database, CacheBusinessScope business,
+    private static VerifiedNode fenceProcessNode(ClientSession session, MongoDatabase database, CacheBusinessScope business,
             WorkloadClaimFence node) {
         if (node.key().type() != WorkloadClaimType.NODE_SESSION || !business.clusterId().equals(node.key().clusterId())
                 || !node.key().resourceId().equals(node.owner().nodeId()) || node.claimGeneration() >= Long.MAX_VALUE - 1
@@ -377,11 +380,11 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         if (original == null || !(original.get("serverNow") instanceof Date now)) throw claimFenced();
         var claim = MongoWorkloadClaimStore.decodeStrict(original.get("original", Document.class));
         if (!node.equals(WorkloadClaimFence.from(claim)) || !io.tapstate.spi.store.ProcessNodeSession.owns(node)) throw claimFenced();
-        return new ProcessNodeProof(claim, now);
+        return new VerifiedNode(claim, now.toInstant());
     }
 
     static Date proveNode(ClientSession session, MongoDatabase database, CacheBusinessScope business, WorkloadClaimFence node) {
-        if (io.tapstate.spi.store.ProcessNodeSession.owns(node)) return fenceProcessNode(session, database, business, node).serverTime();
+        if (io.tapstate.spi.store.ProcessNodeSession.owns(node)) return Date.from(fenceProcessNode(session, database, business, node).serverTime());
         proveNodeForClaim(session, database, business, node);
         var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         // This query's $$NOW is server time from the same CACHE client/session, never client wall time.

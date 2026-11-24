@@ -1646,6 +1646,32 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
+    @Test void aProcessBackedChildUsesTheMongoSampleForItsEffectiveDeadline() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, SCOPE.clusterId());
+            var node = claims.acquireProcessNode(key, new WorkloadOwner(key.resourceId(), "sampled-boot"), TTL).claim();
+            io.tapstate.spi.store.ProcessNodeSession.open(node, TTL);
+            try {
+                var child = claims.acquireNodeBackedPipeline(PIPELINE, WorkloadClaimFence.from(node), 1).claim();
+                var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+                var sampledChild = table.aggregate(List.of(new Document("$match", new Document("_id", MongoWorkloadClaimStore.id(child.key()))),
+                        MongoWorkloadClaimStore.leaseRemaining(true))).first();
+                // An intentionally distant server sample distinguishes the forwarded deadline from a JVM wall-clock value.
+                var sample = java.time.Instant.parse("2000-01-01T00:00:00Z");
+                var sampledNode = table.aggregate(List.of(new Document("$match", new Document("_id", MongoWorkloadClaimStore.id(key))),
+                        new Document("$set", new Document("leaseRemainingMillis", new Document("$subtract",
+                                List.of("$leaseUntil", java.util.Date.from(sample))))))).first();
+                var reading = MongoWorkloadClaimStore.observedPipelineReading(sampledChild, sampledNode);
+                assertThat(reading.leaseRemaining()).isEqualTo(TTL);
+                assertThat(reading.claim().leaseUntil()).isEqualTo(sample.plus(TTL));
+                assertThat(WorkloadClaimFence.from(reading.claim())).isEqualTo(WorkloadClaimFence.from(child));
+            } finally {
+                io.tapstate.spi.store.ProcessNodeSession.close(node);
+            }
+        });
+    }
+
     @Test void processRestartUsesANewGenerationAndAnOrphanCannotAuthorizeOldWrites() {
         withBusiness(f -> {
             var store = f.domain().workloadClaims(SCOPE);

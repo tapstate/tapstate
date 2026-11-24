@@ -31,7 +31,7 @@ class NativeRetainedSelectionGuardTest {
         doThrow(f.denied).when(f.preparer).verifyRetainedSourcesAndCheckSinkModels(eq(f.scope), eq(f.inputs),
                 eq(f.fence), any());
         assertThatThrownBy(f::inspect).isSameAs(f.denied);
-        verify(f.summaries).read("flow");
+        verify(f.summaries).readForCaptureStartup("flow");
         verify(f.preparer, never()).verifyRetainedSources(any(), any());
         verify(f.configuration, never()).requiredNotes();
 
@@ -46,7 +46,7 @@ class NativeRetainedSelectionGuardTest {
     void sourceRefusalStillWinsWhenTheRecoveryLookupFails() {
         var f = new Fixture();
         var unavailable = StorageRuntime.unavailable();
-        doThrow(unavailable).when(f.summaries).read("flow");
+        doThrow(unavailable).when(f.summaries).readForCaptureStartup("flow");
         doThrow(f.denied).when(f.preparer).verifyRetainedSources(f.scope, f.inputs);
         assertThatThrownBy(f::inspect).isSameAs(f.denied);
         doNothing().when(f.preparer).verifyRetainedSources(f.scope, f.inputs);
@@ -59,7 +59,7 @@ class NativeRetainedSelectionGuardTest {
     void recoveryStillValidatesSourcesAndUsesThePinnedArtifact() {
         var f = new Fixture();
         var summary = new PipelineCacheRecovery(java.util.UUID.randomUUID().toString(), null, f.scope);
-        when(f.summaries.read("flow")).thenReturn(Optional.of(summary));
+        when(f.summaries.readForCaptureStartup("flow")).thenReturn(Optional.of(summary));
         var notes = mock(RequiredNoteStore.class);
         when(f.configuration.requiredNotes()).thenReturn(notes);
         when(notes.guardedBy(any())).thenReturn(notes);

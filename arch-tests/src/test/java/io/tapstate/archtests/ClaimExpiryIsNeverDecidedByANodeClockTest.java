@@ -83,14 +83,16 @@ class ClaimExpiryIsNeverDecidedByANodeClockTest {
         String claim = "io.tapstate.spi.store.WorkloadClaim";
         var auditedReads = Map.of(
                 ownership + ".permit(java.lang.String, " + ownership + "$Held, boolean)", 3L,
-                ownership + ".renewScoped(" + ownership + "$Held, long)", 4L,
+                ownership + ".renewScoped(" + ownership + "$Held, long, java.util.Set)", 4L,
                 // A lost Stop release reply is resolved by a shortened server deadline on the same fence.
                 ownership + ".releasePending(" + ownership + "$PendingRelease)", 2L,
                 // Confirmation compares two server deadlines for an extension of the same node lease.
                 "io.tapstate.app.NodeSessionLease.confirm(io.tapstate.app.NodeSessionLease$Proof, long, long)", 2L,
                 ownership + ".advanceScopedProof(" + ownership + "$Held, " + claim + ")", 2L,
-                "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore.withLease(" + claim
-                        + ", io.tapstate.spi.store.WorkloadClaimReading)", 1L);
+                // Reconstructs the server sample or forwards the timed parent's stored deadline.
+                "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore.parentDeadline(org.bson.Document, io.tapstate.spi.store.WorkloadClaimReading)", 1L,
+                // Sends the timed Capture parent's deadline back to Mongo for comparison with $$NOW.
+                "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore.nodeBackedFilter(io.tapstate.spi.store.WorkloadClaimFence)", 1L);
         var reads = guardedClasses().stream()
                 .flatMap(type -> type.getCodeUnitAccessesFromSelf().stream())
                 .filter(call -> call.getTargetOwner().isAssignableTo(WorkloadClaim.class)

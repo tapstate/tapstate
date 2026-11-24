@@ -154,7 +154,8 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return updated == null ? WorkloadClaimAttempt.refused(existing.claim()) : WorkloadClaimAttempt.acquired(read(updated));
     }
 
-    WorkloadClaimAttempt acquireNodeBacked(WorkloadClaimKey key, WorkloadClaim verifiedParent, long topologyRevision) {
+    WorkloadClaimAttempt acquireNodeBacked(WorkloadClaimKey key, MongoCachePipelinePreparations.VerifiedNode proof, long topologyRevision) {
+        var verifiedParent = proof.claim();
         var node = WorkloadClaimFence.from(verifiedParent);
         if (session == null || !strict || (key.type() != WorkloadClaimType.PIPELINE_ACTUATION && key.type() != WorkloadClaimType.CAPTURE)
                 || !key.clusterId().equals(node.owner().nodeId())) throw MongoCacheWorkloadClaimStore.claimFenced();
@@ -178,7 +179,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
             // The parent was fenced in this callback and the exact replacement just won its CAS.
             var parent = new WorkloadClaimReading(verifiedParent, ProcessNodeSession.proofWindow(verifiedParent));
             if (!parent.leased()) throw MongoCacheWorkloadClaimStore.claimFenced();
-            return WorkloadClaimAttempt.acquired(withLease(decodeStrict(replacement), parent));
+            return WorkloadClaimAttempt.acquired(withLease(decodeStrict(replacement), proof.serverTime().plus(parent.leaseRemaining())));
         }
         var effective = readPipelineForAdmission(key).filter(WorkloadClaimReading::leased).orElseThrow(MongoCacheWorkloadClaimStore::claimFenced);
         return WorkloadClaimAttempt.acquired(effective.claim());
@@ -349,7 +350,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                     var after = collection.findOneAndUpdate(session, exactNodeBackedFilter(fence, before),
                             List.of(executionAdvanceUpdate(executionNodeIds)),
                             new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
-                    if (after != null) return Optional.of(new ExecutionAdvance(withLease(decodeStrict(after), parent), before, after));
+                    if (after != null) return Optional.of(new ExecutionAdvance(withLease(decodeStrict(after), parentDeadline(captured.node(), parent)), before, after));
                 }
             }
         }
@@ -552,22 +553,45 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     Optional<WorkloadClaimReading> nodeLease(Document row) {
+        return liveParent(row).map(ParentLease::reading);
+    }
+
+    private record ParentLease(WorkloadClaimReading reading, java.time.Instant deadline) {
+        WorkloadClaimReading forChild(WorkloadClaim child) {
+            return new WorkloadClaimReading(withLease(child, deadline), reading.leaseRemaining());
+        }
+    }
+
+    private Optional<ParentLease> liveParent(Document row) {
         var pipeline = decodeStrict(row);
         if (!canUseNodeLease(WorkloadClaimFence.from(pipeline))
                 || !(row.get(NODE_LEASE_GENERATION) instanceof Long generation) || generation < 1) throw unreadableClaim();
         var nodeKey = new WorkloadClaimKey(pipeline.key().clusterId(), WorkloadClaimType.NODE_SESSION, pipeline.owner().nodeId());
-        return read(nodeKey).filter(WorkloadClaimReading::leased)
-                .filter(node -> node.claim().owner().equals(pipeline.owner()) && node.claim().claimGeneration() == generation);
+        var document = readWithRemainingLease(nodeKey);
+        if (document == null) return Optional.empty();
+        var node = nodeSessionReading(document);
+        if (!node.leased() || !node.claim().key().equals(nodeKey) || !node.claim().owner().equals(pipeline.owner())
+                || node.claim().claimGeneration() != generation) return Optional.empty();
+        return Optional.of(new ParentLease(node, parentDeadline(document, node)));
     }
 
     private WorkloadClaim effectiveClaim(Document row) {
         var original = read(row);
-        return nodeBacked(row) ? nodeLease(row).map(node -> withLease(original, node)).orElse(original) : original;
+        return nodeBacked(row) ? liveParent(row).map(parent -> withLease(original, parent.deadline())).orElse(original) : original;
     }
 
-    private static WorkloadClaim withLease(WorkloadClaim claim, WorkloadClaimReading node) {
-        var until = ProcessNodeSession.isProcessIdentity(node.claim())
-                ? java.time.Instant.now().plus(node.leaseRemaining()) : node.claim().leaseUntil();
+    private static java.time.Instant parentDeadline(Document row, WorkloadClaimReading parent) {
+        var stored = parent.claim().leaseUntil();
+        if (!ProcessNodeSession.isProcessIdentity(parent.claim())) return stored;
+        // The original aggregation projected leaseUntil - $$NOW, even for a process identity.
+        return sampledAt(row).plus(parent.leaseRemaining());
+    }
+
+    static java.time.Instant sampledAt(Document row) {
+        return date(row, "leaseUntil").toInstant().minusMillis(number(row, LEASE_REMAINING));
+    }
+
+    private static WorkloadClaim withLease(WorkloadClaim claim, java.time.Instant until) {
         return new WorkloadClaim(claim.key(), claim.owner(), claim.claimGeneration(), claim.executionGeneration(),
                 claim.topologyRevision(), until, claim.contextExecutionGeneration(),
                 claim.executionClaimGeneration(), claim.executionNodeIds(), claim.failureClaimGeneration(), claim.failureAfterMemberLoss());
@@ -665,7 +689,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
             var node=observedReading(observedNode);
             var key=new WorkloadClaimKey(fence.key().clusterId(),WorkloadClaimType.NODE_SESSION,fence.owner().nodeId());
             if(node.leased()&&node.claim().key().equals(key)&&node.claim().owner().equals(fence.owner())&&node.claim().claimGeneration()==generation)
-                return new WorkloadClaimReading(withLease(original.claim(),node),node.leaseRemaining());
+                return new WorkloadClaimReading(withLease(original.claim(),parentDeadline(observedNode, node)),node.leaseRemaining());
         }
         return new WorkloadClaimReading(original.claim(),Duration.ZERO);
     }
@@ -675,7 +699,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         if (strict && !(document.get(LEASE_REMAINING) instanceof Long)) throw unreadableClaim();
         if (nodeBacked(document)) {
             var claim = read(document);
-            return nodeLease(document).map(node -> new WorkloadClaimReading(withLease(claim, node), node.leaseRemaining()))
+            return liveParent(document).map(parent -> parent.forChild(claim))
                     .orElseGet(() -> new WorkloadClaimReading(claim, Duration.ZERO));
         }
         return timedOrProcessReading(read(document), number(document, LEASE_REMAINING));
