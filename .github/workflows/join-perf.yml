@@ -57,9 +57,6 @@ jobs:
           java-version: "21"
           cache: maven
 
-      - name: Set up pinned Maven
-        run: bash .github/scripts/setup-ci-maven.sh
-
       - name: every scenario, on every tier
         run: |
           set -o pipefail
@@ -67,26 +64,10 @@ jobs:
           # that holds no such test. The flag below is the one that governs that, and it does not
           # weaken the lane: a run that measured nothing is caught by the row count in the next
           # step, which is stricter than surefire could be about it.
-          run_join_performance() {
-            mvn -B "$@" -pl runtime/engine -am test -Dtest=JoinPerformanceGateTest \
-                -Dsurefire.failIfNoSpecifiedTests=false -Djacoco.skip=true \
-                -Djoinperf.scenarios=F1,F2,I1,I2,I3,I4,R1,R2,R3,R4,R5 \
-                -Djoinperf.tiers=hot,mixed,cold 2>&1 | tee run.log
-          }
-
-          if run_join_performance; then
-            exit 0
-          else
-            status=$?
-          fi
-          # Retry only when Maven could not build the reactor model due to Central rate limiting.
-          # Keep test failures visible and leave run.log with the measurements from one attempt.
-          if ! grep -Eq 'Non-resolvable import POM:.*from/to central .*status code: 429([, ]|$)' run.log; then
-            exit "$status"
-          fi
-          echo "::warning::Maven Central returned HTTP 429 resolving an import POM; retrying once in 15 seconds."
-          sleep 15
-          run_join_performance -U
+          mvn -B -pl runtime/engine -am test -Dtest=JoinPerformanceGateTest \
+              -Dsurefire.failIfNoSpecifiedTests=false -Djacoco.skip=true \
+              -Djoinperf.scenarios=F1,F2,I1,I2,I3,I4,R1,R2,R3,R4,R5 \
+              -Djoinperf.tiers=hot,mixed,cold 2>&1 | tee run.log
 
       - name: the rows this run measured
         # Extracted rather than scraped later: a lane that finished green having measured nothing is
