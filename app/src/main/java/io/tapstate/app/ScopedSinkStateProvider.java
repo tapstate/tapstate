@@ -37,8 +37,8 @@ final class ScopedSinkStateProvider {
         var authorization=ExecutionAuthorization.of(member);var original=authorization.require(run.original());
         Runnable active=() -> {if(!original.equals(authorization.require(run.original())))throw fenced();};
         active.run();if(!run.node().equals(config.node()))throw fenced();
-        var fixed=Map.of(run.primary().namespace(),run.primary().token(),run.global().namespace(),run.global().token());
-        var scopes=ConnectorNoteScopes.of(notes,namespace -> {var token=fixed.get(namespace);if(token==null)throw fenced();return token;},active);
+        var scopes = ConnectorNoteScopes.forBoundRun(notes, RequiredNoteOwner.namespace(run.node(),run.purpose()),
+                run.primary().token(), run.global().token(), active);
         ConnectorProvisioner exact=id -> {
             active.run();
             if(!config.connectorId().equals(id))throw fenced();

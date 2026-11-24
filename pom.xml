@@ -223,7 +223,9 @@
             <configuration>
               <rules>
                 <dependencyConvergence/>
-                <requireUpperBoundDeps/>
+                <requireUpperBoundDeps>
+                  <uniqueVersions>true</uniqueVersions>
+                </requireUpperBoundDeps>
                 <banDuplicatePomDependencyVersions/>
                 <requirePluginVersions/>
                 <bannedDependencies>

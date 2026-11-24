@@ -1080,6 +1080,185 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return Optional.of(new SrsConsumerProgress(context,own.member().revision(),held.revision(),held.value(),held.snapshot(),held.writerRun(),held.ringDoneThrough()));
     }
 
+    @Override public Optional<SrsConsumerMembership> prepareConnectorHandoff(SrsConsumerProgress original,
+            SrsConsumerContext candidate, WorkloadClaimFence capture, WorkloadClaimFence pipeline,
+            java.time.Instant preparedAt) {
+        Objects.requireNonNull(preparedAt, "preparedAt");
+        requireHandoffCoordinates(original, candidate, pipeline);
+        return changingTheConsumer(() -> transaction(session -> {
+            prove(session, candidate, pipeline);
+            var prior = requireHandoffOriginal(session, original);
+            requireReplacementClaim(prior.member().commandFence(), pipeline);
+            var token = original.cursor().sinkAcked().token();
+            chains.prove(session, capture);
+            var root = chains.requireRoot(session, candidate.key().miningChainId());
+            chains.requireCapture(root, capture);
+            var state = chains.state(session, root);
+            var held = own(session, candidate);
+            if (held != null) {
+                var member = held.member();
+                if (member.detached() || !member.tables().equals(prior.member().tables()))
+                    throw unavailable(candidate.key().miningChainId());
+                if (member.commandFence().equals(pipeline)) return Optional.of(member);
+                requireReplacementClaim(member.commandFence(), pipeline);
+                if (member.revision() >= Long.MAX_VALUE - 1 || state.consumerRevision() >= Long.MAX_VALUE - 1)
+                    throw unavailable(state.miningChainId());
+                var next = new SrsConsumerMembership(candidate, member.revision() + 1, false, member.tables(), pipeline);
+                var progress = held.cursor();
+                var cursor = records.cursor(next, progress.value(), progress.revision(), progress.snapshot(),
+                        progress.writerRun(), progress.ringDoneThrough());
+                writeMember(session, member, next);
+                if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
+                        new Document("_id", records.id(candidate.key())).append("membershipRevision", member.revision())
+                                .append("progressRevision", progress.revision()), cursor).getMatchedCount() != 1)
+                    throw unavailable(state.miningChainId());
+                chains.replace(session, root, new Document(root).append("consumerRevision", state.consumerRevision() + 1));
+                return Optional.of(next);
+            }
+            if (state.epoch() != 0 || state.consumerCount() != 0 || state.consumerRevision() != 0
+                    || state.checkpoint() != null || state.resumeOverride() != null
+                    || !state.requestedTables().isEmpty() || !state.servingTables().isEmpty()) throw unavailable(state.miningChainId());
+            long floor = chains.state(session, prior.root()).epoch();
+            if (floor >= Long.MAX_VALUE - 2) throw unavailable(state.miningChainId());
+            var request = new SourceResumeOverride(token, floor, preparedAt);
+            var member = new SrsConsumerMembership(candidate, 1, false, prior.member().tables(), pipeline);
+            var cursor = records.initial(candidate.key(), member.tables());
+            SystemCollections.SRS_CONSUMERS.on(database).insertOne(session, records.membership(member));
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).insertOne(session, records.cursor(member, cursor, 0));
+            var next = new Document(root).append("epoch", floor).append("consumerCount", 1L).append("consumerRevision", 1L)
+                    .append("resumeOverride", MongoResumeOverrides.stored(request));
+            chains.replace(session, root, next);
+            return Optional.of(member);
+        }));
+    }
+
+    @Override public Optional<SrsChainState> reopenConnectorHandoffEpoch(SrsConsumerProgress original,
+            SrsConsumerContext candidate, WorkloadClaimFence pipeline, WorkloadClaimFence capture,
+            long expectedEpoch, Set<String> tables) {
+        requireHandoffCoordinates(original, candidate, pipeline);
+        Set<String> selected = Set.copyOf(tables);
+        if (expectedEpoch < 0 || expectedEpoch >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid handoff epoch");
+        return changingTheConsumer(() -> transaction(session -> {
+            prove(session, candidate, pipeline);
+            var prior = requireHandoffOriginal(session, original);
+            requireReplacementClaim(prior.member().commandFence(), pipeline);
+            chains.prove(session, capture);
+            var own = requireOwn(session, candidate);
+            var state = chains.state(session, own.root());
+            chains.requireCapture(own.root(), capture);
+            var seeded = state.resumeOverride();
+            var progress = own.cursor();
+            if (!own.member().commandFence().equals(pipeline) || !own.member().tables().equals(selected)
+                    || !selected.equals(prior.member().tables()) || state.consumerCount() != 1
+                    || state.checkpoint() != null || seeded == null
+                    || !seeded.token().equals(original.cursor().sinkAcked().token())
+                    || progress.writerRun() != null
+                    || progress.value().perTableSeq().values().stream().anyMatch(sequence -> sequence != -1L)
+                    || progress.value().sinkAcked() != null && (!seeded.token().equals(progress.value().sinkAcked().token())
+                        || progress.value().sinkAcked().order().seq() != io.tapstate.core.event.SourceOrder.SNAPSHOT_SEQ))
+                throw unavailable(candidate.key().miningChainId());
+            var contexts = new MongoSrsModelContexts(database, scope);
+            var references = new java.util.HashSet<SrsModelKey>();
+            for (var head : contexts.heads(own.root())) {
+                var context = contexts.require(session, head.get("contextId", Document.class));
+                contexts.requireAnchor(session, own.root(), context);
+                var key = context.key();
+                references.add(new SrsModelKey(key.miningChainId(), key.table(), key.cacheIncarnation(),
+                        key.captureEpoch(), context.publishedVersion()));
+            }
+            new MongoSrsModelStore(client, database, scope, requireActive, requireStructure)
+                    .requireSnapshotReferences(session, references);
+            if (state.epoch() == expectedEpoch + 1
+                    && capture.equals(WorkloadClaimDocuments.readCapture(own.root().get("captureFence", Document.class))))
+                return Optional.of(state);
+            if (state.epoch() != expectedEpoch) return Optional.empty();
+            var next = new Document(own.root()).append("epoch", expectedEpoch + 1)
+                    .append("captureFence", WorkloadClaimDocuments.stored(capture))
+                    .append("requestedTables", new ArrayList<>(new java.util.TreeSet<>(selected)))
+                    .append("servingTables", new ArrayList<>(new java.util.TreeSet<>(selected)));
+            chains.replace(session, own.root(), next);
+            return Optional.of(chains.state(session, next));
+        }));
+    }
+
+    @Override public boolean completeConnectorHandoff(SrsConsumerProgress original, SrsConsumerContext candidate,
+            long membershipRevision, long expectedProgressRevision, SrsSnapshotPin snapshot,
+            WorkloadClaimFence pipeline) {
+        requireHandoffCoordinates(original, candidate, pipeline);
+        Objects.requireNonNull(snapshot, "snapshot");
+        requireRevision(membershipRevision); requireRevision(expectedProgressRevision);
+        return changingTheConsumer(() -> transaction(session -> {
+            prove(session, candidate, pipeline);
+            var prior = requireHandoffOriginal(session, original);
+            requireReplacementClaim(prior.member().commandFence(), pipeline);
+            var root = chains.reserveSnapshotPin(session, candidate.key().miningChainId());
+            if (root == null) throw unavailable(candidate.key().miningChainId());
+            var own = requireOwn(session, candidate);
+            if (!bound(own.member(), membershipRevision, pipeline)) return false;
+            var held = own.cursor();
+            if (held.snapshot() != null) return held.snapshot().equals(snapshot);
+            if (held.revision() != expectedProgressRevision) return false;
+            var state = chains.state(session, root);
+            if (snapshot.snapshotEpoch() != state.epoch()
+                    || snapshot.snapshotEpoch() <= original.cursor().sinkAcked().order().epoch()
+                    || !snapshot.sourcePosition().equals(original.cursor().sinkAcked().token())
+                    || !snapshot.models().keySet().equals(own.member().tables()) || held.writerRun() != null
+                    || held.value().sinkAcked() != null
+                    || held.value().perTableSeq().values().stream().anyMatch(value -> value != -1L))
+                throw unavailable(candidate.key().miningChainId());
+            validateSnapshot(session, candidate, snapshot);
+            var baseline = new io.tapstate.core.event.ChainPosition(
+                    io.tapstate.core.event.SourceOrder.snapshotRow(snapshot.snapshotEpoch()), snapshot.sourcePosition());
+            var acknowledgements = new HashMap<String, io.tapstate.core.event.ChainPosition>();
+            var floors = new HashMap<String, Long>();
+            for (String table : own.member().tables()) {
+                acknowledgements.put(table, baseline);
+                floors.put(table, -1L);
+            }
+            var completed = original.cursor().snapshotCompletedTables().stream()
+                    .filter(own.member().tables()::contains).toList();
+            var cursor = new ConsumerOffset(candidate.key().consumerId(), floors, baseline,
+                    completed, snapshot.sourcePosition(), snapshot.snapshotEpoch(),
+                    acknowledgements, io.tapstate.spi.store.ConsumerProgressKind.SRS);
+            var replacement = records.cursor(own.member(), cursor, held.revision() + 1, snapshot, null, floors);
+            if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
+                    new Document("_id", records.id(candidate.key())).append("membershipRevision", membershipRevision)
+                            .append("progressRevision", expectedProgressRevision), replacement).getMatchedCount() != 1)
+                throw unavailable(candidate.key().miningChainId());
+            return true;
+        }));
+    }
+
+    private void requireHandoffCoordinates(SrsConsumerProgress original, SrsConsumerContext candidate,
+            WorkloadClaimFence pipeline) {
+        Objects.requireNonNull(original, "original"); Objects.requireNonNull(candidate, "candidate");
+        var before = original.context();
+        if (before.key().miningChainId().equals(candidate.key().miningChainId())
+                || !before.key().pipelineId().equals(candidate.key().pipelineId())
+                || !before.key().sourceId().equals(candidate.key().sourceId())
+                || before.stateGeneration() != candidate.stateGeneration()) throw fenced();
+        pipelineAccess(candidate, pipeline);
+        var ack = original.cursor().sinkAcked();
+        if (ack == null || ack.token() == null || ack.token().isBlank() || ack.order() == null)
+            throw unavailable(before.key().miningChainId());
+    }
+
+    private static void requireReplacementClaim(WorkloadClaimFence previous, WorkloadClaimFence current) {
+        if (!previous.key().equals(current.key()) || current.claimGeneration() < previous.claimGeneration()
+                || current.executionGeneration() <= previous.executionGeneration()) throw fenced();
+    }
+
+    private Own requireHandoffOriginal(ClientSession session, SrsConsumerProgress original) {
+        var own = requireOwn(session, original.context());
+        var held = own.cursor();
+        var actual = new SrsConsumerProgress(original.context(), own.member().revision(), held.revision(), held.value(),
+                held.snapshot(), held.writerRun(), held.ringDoneThrough());
+        if (!actual.equals(original) || original.snapshot() != null
+                && !original.cursor().snapshotCompletedTables().containsAll(own.member().tables()))
+            throw unavailable(original.context().key().miningChainId());
+        return own;
+    }
+
     @Override public Optional<StartupArrivals> startupArrivals(SrsConsumerContext context, Map<String, String> ringsByTable) {
         var selected = Map.copyOf(ringsByTable);
         return transaction(session -> {

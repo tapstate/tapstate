@@ -191,6 +191,40 @@ class ConnectorClassLoaderTest {
     }
 
     @Test
+    void retiresOnlyAfterEveryUseFinishesAndReopensTheSameJar(@TempDir Path dir) throws Exception {
+        Path jar = messagesJar(dir);
+        ConnectorClassLoader original;
+        try (var first = ConnectorClassLoader.acquire(List.of(jar));
+                var second = ConnectorClassLoader.acquire(List.of(jar))) {
+            original = first.loader();
+            assertThat(second.loader()).isSameAs(original);
+            first.close();
+            first.close();
+            assertThat(ConnectorClassLoader.retireUnused(jar)).isFalse();
+            var entry = second.loader().load("synthetic.Widget");
+            try (var read = entry.getClassLoader().getResourceAsStream(MESSAGES_ENTRY)) {
+                assertThat(read.readAllBytes()).isEqualTo(MESSAGES);
+            }
+        }
+
+        assertThat(ConnectorClassLoader.retireUnused(jar)).isTrue();
+        try (var replacement = ConnectorClassLoader.acquire(List.of(jar))) {
+            assertThat(replacement.loader()).isNotSameAs(original);
+            assertThat(replacement.loader().load("synthetic.Widget").getClassLoader())
+                    .isNotSameAs(original.load("synthetic.Widget").getClassLoader());
+        }
+    }
+
+    @Test
+    void retainsAUseThatCouldNotProveItsStop(@TempDir Path dir) throws Exception {
+        Path jar = messagesJar(dir);
+        try (var use = ConnectorClassLoader.acquire(List.of(jar))) {
+            use.keep();
+        }
+        assertThat(ConnectorClassLoader.retireUnused(jar)).isFalse();
+    }
+
+    @Test
     void closeReleasesTheLoader(@TempDir Path dir) throws Exception {
         Path jar = widgetJar(dir, "A");
         ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(jar));

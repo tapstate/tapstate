@@ -22,7 +22,7 @@ import com.mongodb.client.cursor.TimeoutMode;
 final class MongoCacheMetadataStructure {
     private static final List<SystemCollections> TABLES = List.of(SystemCollections.CACHE_SOURCE_SCHEMAS,
             SystemCollections.CACHE_CONNECTOR_CATALOG, SystemCollections.CACHE_CONNECTOR_SPECS,
-            SystemCollections.CACHE_CONNECTION_TEST_RESULTS, SystemCollections.CACHE_CONNECTOR_ARTIFACTS,
+            SystemCollections.CACHE_CONNECTION_TEST_RESULTS,
             SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY);
     static final List<SystemCollections> BUSINESS_TABLES = java.util.stream.Stream.concat(TABLES.stream(), java.util.stream.Stream.of(
             SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION,
@@ -56,7 +56,8 @@ final class MongoCacheMetadataStructure {
      * structures are only verified; a partial set is unknown and is never repaired by this helper.
      */
     void prepareInTransaction(ClientSession session, Runnable requireActive) {
-        prepareInTransaction(session, requireActive, TABLES);
+        prepareInTransaction(session, requireActive, java.util.stream.Stream.concat(TABLES.stream(),
+                java.util.stream.Stream.of(SystemCollections.CACHE_CONNECTOR_ARTIFACTS)).toList());
     }
 
     void prepareBusinessInTransaction(ClientSession session, Runnable requireActive) {
@@ -79,6 +80,26 @@ final class MongoCacheMetadataStructure {
             for (var index : indexes(table)) IndexEnsure.createInTransaction(session, table.indexTargetOn(database), index);
         }
         requireActive.run();
+    }
+
+    boolean hasAggregateState() {
+        return !collections(Set.of(SystemCollections.CACHE_AGGREGATE_STATE.collectionName())).isEmpty();
+    }
+
+    void prepareRetainedAggregateStateInTransaction(ClientSession session,
+            io.tapstate.spi.store.CacheBusinessScope scope, Runnable requireActive) {
+        if (hasAggregateState()) return;
+        verify(BUSINESS_TABLES.stream().filter(table -> table != SystemCollections.CACHE_AGGREGATE_STATE).toList());
+        var referenced = new Document("_id.clusterId", scope.clusterId()).append("_id.bindingVersion", scope.bindingVersion())
+                .append("_id.cacheIncarnation", scope.cacheIncarnation())
+                .append("placements.resource", io.tapstate.spi.store.OperatorPlacement.Resource.AGGREGATE_STATE.name());
+        if (SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, referenced)
+                .projection(new Document("_id", 1)).first() != null) throw unreadable("collections");
+        prepareInTransaction(session, requireActive, List.of(SystemCollections.CACHE_AGGREGATE_STATE));
+    }
+
+    void prepareLegacyConnectorArtifactsInTransaction(ClientSession session, Runnable requireActive) {
+        prepareInTransaction(session, requireActive, List.of(SystemCollections.CACHE_CONNECTOR_ARTIFACTS));
     }
 
     /** Load-only validation: neither missing collections nor missing or changed indexes cause DDL. */

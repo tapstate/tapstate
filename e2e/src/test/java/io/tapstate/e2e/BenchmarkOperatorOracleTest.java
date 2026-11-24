@@ -74,7 +74,7 @@ class BenchmarkOperatorOracleTest {
     void warmupUsesVerifiedPerInputCountsBeforeMeasurementStarts() {
         var operations = new io.tapstate.e2e.benchmark.MongoWorkloadGenerator.Operations(8, 0, 0);
         var stream = new io.tapstate.e2e.benchmark.MongoWorkloadGenerator.StreamReport(
-                operations, operations, operations, null, null, null, null, 8, 0, "sequence", null);
+                operations, operations, operations, null, null, null, null, 8, 0, "sequence", null, null);
         var report = new io.tapstate.e2e.benchmark.MongoWorkloadGenerator.PhaseReport(
                 "warmup", null, null, 1, 1, null, 8, 8, 8, null, Map.of("records", stream), true);
         var expected = BenchmarkRunIT.expectedCapturedInputs(Map.of("records", 3L), report);

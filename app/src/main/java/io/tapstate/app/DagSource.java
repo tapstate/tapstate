@@ -198,7 +198,8 @@ interface DagSource {
             Planner planner,
             Map<String, String> sinkConnectors,
             Optional<SourceModelSnapshot> sourceModels,
-            Optional<OperatorCoordinatePlan> operatorPlan,Map<String,String> connectorHashes) {
+            Optional<OperatorCoordinatePlan> operatorPlan,Map<String,String> connectorHashes,
+            List<PipelineConnectorExecutions.Node> connectorNodes) {
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
@@ -209,7 +210,13 @@ interface DagSource {
             Objects.requireNonNull(sourceModels,"sourceModels");
             Objects.requireNonNull(operatorPlan,"operatorPlan");
             connectorHashes=Map.copyOf(connectorHashes);
+            connectorNodes=List.copyOf(connectorNodes);
             if (sourceModels.isPresent() && artifactSnapshot.isEmpty()) throw new IllegalArgumentException("captured source models require their original artifacts");
+        }
+        StartPreparation(NestCapacity capacity,Set<OperatorStateLocation> stateLocations,Optional<ArtifactStore> artifactSnapshot,
+                Planner planner,Map<String,String> sinkConnectors,Optional<SourceModelSnapshot> sourceModels,
+                Optional<OperatorCoordinatePlan> operatorPlan,Map<String,String> connectorHashes) {
+            this(capacity,stateLocations,artifactSnapshot,planner,sinkConnectors,sourceModels,operatorPlan,connectorHashes,List.of());
         }
         StartPreparation(NestCapacity capacity,Set<OperatorStateLocation> stateLocations,Optional<ArtifactStore> artifactSnapshot,
                 Planner planner,Map<String,String> sinkConnectors,Optional<SourceModelSnapshot> sourceModels,Optional<OperatorCoordinatePlan> operatorPlan) {

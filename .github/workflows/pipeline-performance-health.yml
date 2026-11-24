@@ -1,0 +1,63 @@
+name: Pipeline Performance Health
+
+on:
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
+
+permissions: {}
+
+concurrency:
+  group: pipeline-performance-health
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: >-
+      github.event_name == 'schedule' &&
+      github.run_attempt == '1' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check the scheduled Nightly, handoff, and report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B benchmarks/actions_watch.py prepare "$RUNNER_TEMP/performance-health"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: performance-notification-intent
+          path: ${{ runner.temp }}/performance-health/next-state.json
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: Deliver scheduled notifications
+        env:
+          PERFORMANCE_FEISHU_WEBHOOK: ${{ secrets.PERFORMANCE_FEISHU_WEBHOOK }}
+        run: python3 -B benchmarks/actions_watch.py send "$RUNNER_TEMP/performance-health"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-notification-receipt
+          path: ${{ runner.temp }}/performance-health/delivery.json
+          if-no-files-found: ignore
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-notification-state
+          path: ${{ runner.temp }}/performance-health/state.json
+          if-no-files-found: ignore
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-health-observation
+          path: ${{ runner.temp }}/performance-health/health.json
+          if-no-files-found: ignore
+          retention-days: 30

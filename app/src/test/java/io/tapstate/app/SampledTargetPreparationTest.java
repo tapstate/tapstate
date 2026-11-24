@@ -65,7 +65,7 @@ class SampledTargetPreparationTest {
             return Map.of("rows",new TargetIdentityPlan(TargetIdentityPlan.AUTOMATIC,"generated-target-identity",physical,"_id","source_id",List.of("source_id","items.id"),false,true));
         });
         try(var preparation=mockStatic(ConfiguredSinkRun.class)) {
-            preparation.when(() -> ConfiguredSinkRun.prepare(eq(ORIGINAL),any(),eq(PipelineNode.Purpose.SYNC),eq(notes),eq(connectors),any(),eq(false))).thenReturn(run);
+            preparation.when(() -> ConfiguredSinkRun.prepare(eq(ORIGINAL),any(),eq(PipelineNode.Purpose.SYNC),eq(notes),eq(connectors),any(),eq(false),isNull())).thenReturn(run);
             var factory=new PdkSinkWriterFactory("mongodb",Map.of(),WriteMode.UPSERT,DdlPolicy.FAIL,Map.of("rows",collision),NODE,OnFullLoad.APPEND,true);
             var bound=(PdkSinkWriterFactory)new StoreBackedDagSource.PdkSinkWriterBinder(notes,connectors).scoped(factory,ORIGINAL,plan,() -> {});
             assertThat(bound.targets()).containsEntry("rows",logical);assertThat(plan.models).containsExactly(original);

@@ -512,6 +512,25 @@ class AuthTest {
     }
 
     @Test
+    void onPremConnectorRefreshAndDownloadRequireAdmin() {
+        String writer = machineToken(Scope.WRITE);
+        String admin = machineToken(Scope.ADMIN);
+        for (String path : List.of("/api/connector-center:refresh", "/api/connector-center/mongodb:download")) {
+            ApiError denied = client().post().uri(path).header(HttpHeaders.AUTHORIZATION, "Bearer " + writer)
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                        return response.bodyTo(ApiError.class);
+                    });
+            assertThat(denied.code()).isEqualTo(ControlError.FORBIDDEN.code());
+            assertThat(denied.params()).containsEntry("required", "admin");
+
+            ApiError admitted = client().post().uri(path).header(HttpHeaders.AUTHORIZATION, "Bearer " + admin)
+                    .exchange((request, response) -> response.bodyTo(ApiError.class));
+            assertThat(admitted.code()).isEqualTo(ControlError.UNREACHABLE.code());
+        }
+    }
+
+    @Test
     void anAdminCanCreateListAndRevokeASecretFreeMachineToken() {
         String admin = machineToken(Scope.ADMIN);
 

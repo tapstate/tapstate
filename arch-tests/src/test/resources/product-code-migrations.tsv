@@ -285,6 +285,7 @@ actuation.shared-recovery-member-unavailable	TS0360034
 actuation.sync-output-identity-unresolved	TS0360035
 cluster.membership-unreadable	TS0370001
 connector.not-found	TS0380001
+connector.download-target-changed	TS0380002
 data-browser.unknown-collection	TS0390001
 data-browser.invalid-limit	TS0390002
 data-browser.unorderable-field	TS0390003
@@ -457,6 +458,7 @@ connector.position-unrenderable	TS0060037
 connector.position-unreadable	TS0060038
 connector.acknowledge-failed	TS0060039
 connector.release-failed	TS0060040
+connector.local-artifact-unavailable	TS0060043
 aggregate.definition-changed	TS0500011
 aggregate.evaluation-failed	TS0500007
 aggregate.expression-invalid	TS0500005

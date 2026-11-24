@@ -82,7 +82,8 @@ public final class MongoWorkloadGenerator {
 
     public record StreamReport(Operations planned, Operations acknowledged, Operations observed,
                                Position startExclusive, Position first, Position last, Position historyBoundary,
-                               int submittedOperations, long hotKeySelections, String sourceSequenceSha256, String error) {
+                               int submittedOperations, long hotKeySelections, String sourceSequenceSha256,
+                               String sourceClockSequenceSha256, String error) {
     }
 
     public record PhaseReport(String name, Instant startedAt, Instant writesFinishedAt, long writeNanos, long historyNanos, Long generatorProcessCpuNanos,
@@ -518,7 +519,7 @@ public final class MongoWorkloadGenerator {
         var zero = new Operations(0, 0, 0);
         for (var stream : streams) {
             result.put(stream.input.name(), new StreamReport(new Operations(stream.requested), zero, zero,
-                    null, null, null, null, 0, 0, null, reason));
+                    null, null, null, null, 0, 0, null, null, reason));
         }
         return new PhaseReport(name, null, null, 0, 0, null, rate, 0, 0, new Delays().report(), Map.copyOf(result), false);
     }
@@ -566,7 +567,10 @@ public final class MongoWorkloadGenerator {
         private final ByteBuffer eventBytes = ByteBuffer.allocate(9);
         private final MessageDigest submittedSequence = SourceInspector.sha256();
         private final MessageDigest observedSequence = SourceInspector.sha256();
+        private final ByteBuffer timedEventBytes = ByteBuffer.allocate(17);
+        private final MessageDigest observedClockSequence = SourceInspector.sha256();
         private String sourceSequenceSha256;
+        private String sourceClockSequenceSha256;
         private int submitted;
         private boolean unknownAcknowledgement;
         private String error;
@@ -662,7 +666,11 @@ public final class MongoWorkloadGenerator {
                         case UPDATE -> new Counts(0, 1, 0);
                         case DELETE -> new Counts(0, 0, 1);
                     });
-                    appendEvent(observedSequence, kind, event.getDocumentKey().getInt64("_id").getValue());
+                    long key = event.getDocumentKey().getInt64("_id").getValue();
+                    appendEvent(observedSequence, kind, key);
+                    timedEventBytes.clear().put((byte) kind.ordinal()).putLong(key)
+                            .putLong(event.getClusterTime().getTime() * 1000L);
+                    observedClockSequence.update(timedEventBytes.array());
                     last = new Position(event.getResumeToken(), event.getClusterTime());
                     if (first == null) {
                         first = last;
@@ -671,6 +679,7 @@ public final class MongoWorkloadGenerator {
                 }
                 var history = observedSequence.digest();
                 sourceSequenceSha256 = HexFormat.of().formatHex(history);
+                sourceClockSequenceSha256 = HexFormat.of().formatHex(observedClockSequence.digest());
                 if (unknownAcknowledgement && historyBoundary == null) {
                     recordError("Source history incomplete: the majority boundary was not observed");
                 }
@@ -690,7 +699,7 @@ public final class MongoWorkloadGenerator {
         StreamReport report() {
             return new StreamReport(new Operations(stream.requested), new Operations(acknowledged), new Operations(observed),
                     start, first, last, historyBoundary, submitted, stream.keys.hotSelections - startingHotKeys,
-                    sourceSequenceSha256, error);
+                    sourceSequenceSha256, sourceClockSequenceSha256, error);
         }
 
         void close() {

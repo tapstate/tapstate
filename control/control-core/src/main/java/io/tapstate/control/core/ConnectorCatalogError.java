@@ -10,6 +10,7 @@ import java.util.Set;
 /** Stable coded failures for the connector catalog read surface. */
 public enum ConnectorCatalogError implements TapstateErrorCode {
 
+    DOWNLOAD_TARGET_CHANGED(ConnectorCatalogErrorDefinitions.DOWNLOAD_TARGET_CHANGED),
     NOT_FOUND(ConnectorCatalogErrorDefinitions.NOT_FOUND);
 
     private final ProductErrorDefinition definition;

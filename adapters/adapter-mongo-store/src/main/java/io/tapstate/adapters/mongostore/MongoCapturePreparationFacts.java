@@ -35,7 +35,8 @@ final class MongoCapturePreparationFacts {
             var scope=new CacheBusinessScope(id.getString("clusterId"),binding,id.getString("cacheIncarnation"));
             CapturePreparation.Mode mode=switch(row.getString("mode")){case "SHARED_SRS" -> CapturePreparation.Mode.SHARED_SRS;case "DIRECT" -> CapturePreparation.Mode.DIRECT;case "SNAPSHOT_ONLY" -> CapturePreparation.Mode.SNAPSHOT_ONLY;default -> throw unreadable();};
             var decoded=new CapturePreparation(scope,mode,OperatorStateText.decode(row.getString("chain")),row.getString("captureId"),row.getString("sourceIdentityHash"),row.getString("preparationId"));
-            if(!row(decoded).equals(row) || !decoded.captureId().equals(OperatorStateText.decode(id.getString("capture"))))throw unreadable();return decoded;
+            if(!withArtifact(row(decoded), artifactHash(row)).equals(row)
+                    || !decoded.captureId().equals(OperatorStateText.decode(id.getString("capture"))))throw unreadable();return decoded;
         }catch(IllegalArgumentException|NullPointerException|ClassCastException bad){throw unreadable();}
     }
     static CapturePreparation available(Document row) {
@@ -70,6 +71,7 @@ final class MongoCapturePreparationFacts {
         try {
             if(row!=null && Integer.valueOf(1).equals(row.get("formatVersion"))){birth(row);return Optional.empty();}
             var expected=new HashSet<>(BIRTH_FIELDS);expected.add("currentRecovery");
+            if (row != null && row.containsKey("artifactHash")) expected.add("artifactHash");
             if(row==null || !Integer.valueOf(2).equals(row.get("formatVersion")) || !row.keySet().equals(expected))throw unreadable();
             var originalRow=new Document(row);originalRow.remove("currentRecovery");originalRow.put("formatVersion",1);
             var original=birth(originalRow);var value=row.get("currentRecovery",Document.class);
@@ -80,7 +82,8 @@ final class MongoCapturePreparationFacts {
             var previous=original.chainId().equals(previousChain)?original:replacement(original,previousChain,previousId);
             if(!previous.preparationId().equals(previousId))throw unreadable();
             var result=new Recovery(previous,next,value.getString("planHash"),RecoveryPhase.valueOf(value.getString("phase")));
-            if(!configurationRow(result).equals(row))throw unreadable();return Optional.of(result);
+            if(!withArtifact(configurationRow(result), artifactHash(row)).equals(row))throw unreadable();
+            return Optional.of(result);
         }catch(IllegalArgumentException|NullPointerException|ClassCastException bad){throw unreadable();}
     }
     static Document configurationRow(Recovery value) {
@@ -89,6 +92,17 @@ final class MongoCapturePreparationFacts {
                 .append("planHash",value.planHash()).append("previousPhysicalChain",value.previous().chainId())
                 .append("previousPreparationId",value.previous().preparationId()).append("physicalChain",value.replacement().chainId()).append("phase",value.phase().name()));
         return row;
+    }
+    static String artifactHash(Document row) {
+        if (!row.containsKey("artifactHash")) return null;
+        if (!(row.get("artifactHash") instanceof String hash) || !hash.matches("[0-9a-f]{64}")
+                || !"SHARED_SRS".equals(row.get("mode"))
+                || !(row.get("chain") instanceof String chain)
+                || !OperatorStateText.decode(chain).matches("mcv-[0-9a-f]{64}")) throw unreadable();
+        return hash;
+    }
+    static Document withArtifact(Document row, String hash) {
+        return hash == null ? row : row.append("artifactHash", hash);
     }
     static String replacementChain(CapturePreparation original,String operationId) {
         if(!UUID.fromString(operationId).toString().equals(operationId))throw new IllegalArgumentException("invalid replacement operation");

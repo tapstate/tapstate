@@ -33,10 +33,19 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         Objects.requireNonNull(original,"original");Objects.requireNonNull(node,"node");Objects.requireNonNull(purpose,"purpose");
         Objects.requireNonNull(primary,"primary");Objects.requireNonNull(global,"global");
         if(original.scope()==null || purpose==PipelineNode.Purpose.CAPTURE || !node.pipelineId().equals(original.pipelineId())
-                || !primary.token().owner().equals(RequiredNoteOwner.forNode(original.scope().bindingVersion(),node,purpose,original.scope().stateGeneration()))
+                || !privateOwnerMatches(primary.token().owner(), original, node, purpose)
                 || !global.token().owner().equals(new RequiredNoteOwner(original.scope().bindingVersion(),"pdk.global-state",RequiredNoteOwner.Kind.GLOBAL,original.scope().clusterId(),0))
                 || artifactHash==null || !artifactHash.matches("[a-f0-9]{64}"))throw new IllegalArgumentException("configured sink coordinates must retain one original execution and note identity");
     }
+    static boolean privateOwnerMatches(RequiredNoteOwner owner, ExecutionFence original, PipelineNode node,
+            PipelineNode.Purpose purpose) {
+        var expected = RequiredNoteOwner.forNode(original.scope().bindingVersion(), node, purpose, original.scope().stateGeneration());
+        return owner.bindingVersion() == expected.bindingVersion() && owner.kind() == expected.kind()
+                && owner.ownerId().equals(expected.ownerId()) && owner.stateGeneration() == expected.stateGeneration()
+                && (owner.namespace().equals(expected.namespace())
+                    || owner.namespace().startsWith(expected.namespace() + ".artifact-"));
+    }
+
     /** Explicit original start preparation, after CONFIG authoring reserved every scope and before plugin code. */
     static ConfiguredSinkRun prepare(ExecutionFence original,SinkConfig config,PipelineNode.Purpose purpose,
             RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable requireActive) {
@@ -44,19 +53,36 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
     }
     static ConfiguredSinkRun prepare(ExecutionFence original,SinkConfig config,PipelineNode.Purpose purpose,
             RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable requireActive,boolean recoveryPinned) {
+        return prepare(original,config,purpose,notes,provisioner,requireActive,recoveryPinned,null);
+    }
+    static ConfiguredSinkRun prepare(ExecutionFence original,SinkConfig config,PipelineNode.Purpose purpose,
+            RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable requireActive,boolean recoveryPinned,
+            ConnectorRunBindings.Binding binding) {
+        return provisioner.withArtifactRetention(() -> prepareRetainingArtifact(
+                original, config, purpose, notes, provisioner, requireActive, recoveryPinned, binding));
+    }
+
+    private static ConfiguredSinkRun prepareRetainingArtifact(ExecutionFence original, SinkConfig config,
+            PipelineNode.Purpose purpose, RequiredNoteStore notes, ConnectorProvisioner provisioner,
+            Runnable requireActive, boolean recoveryPinned, ConnectorRunBindings.Binding binding) {
         Objects.requireNonNull(requireActive,"requireActive");requireActive.run();
         if(original.scope()==null || config.node()==null || !config.node().pipelineId().equals(original.pipelineId()))throw unavailable();
         var fixed=notes.guardedBy(requireActive);var scope=original.scope();
         var opened = fixed.openPipelineScopes(
-                RequiredNoteOwner.forNode(scope.bindingVersion(), config.node(), purpose, scope.stateGeneration()),
+                binding == null ? RequiredNoteOwner.forNode(scope.bindingVersion(), config.node(), purpose, scope.stateGeneration()) : binding.notes().owner(),
                 new RequiredNoteOwner(scope.bindingVersion(), "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, scope.clusterId(), 0));
         var primary = opened.primary();
         var global = opened.global();
-        var pinned=recoveryPinned?fixed.origin(primary):null;
-        var ref=pinned==null?provisioner.resolveStartup(config.connectorId()):provisioner.resolveStartup(config.connectorId(),pinned.artifactHash());requireActive.run();
+        var pinned = recoveryPinned ? fixed.origin(primary) : fixed.originIfPresent(primary).orElse(null);
+        if (binding != null && (pinned == null || !binding.sha256().equals(pinned.artifactHash()))) throw unavailable();
+        if (pinned != null && !pinned.equals(
+                ConnectorNoteOrigin.capture(config.connectorId(), pinned.artifactHash(), config.settings()))) throw unavailable();
+        var ref = pinned == null ? provisioner.resolveStartup(config.connectorId()) : provisioner.resolveRetained(fixed, primary, pinned);
+        requireActive.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),ref.contentHash(),config.settings());
-        if(pinned!=null && !pinned.equals(expected))throw unavailable();
+        if (pinned == null) provisioner.retain(ref);
         if(!expected.equals(fixed.prepareOrigin(primary,expected)))throw unavailable();
+        if (pinned == null) provisioner.markBound(fixed, primary, expected);
         requireActive.run();return new ConfiguredSinkRun(original,config.node(),purpose,new Note(primary),new Note(global),ref.contentHash());
     }
 
@@ -67,10 +93,8 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
     Map<String,TargetIdentityPlan> assessTargets(SinkConfig config,Map<String,io.tapstate.spi.sink.TargetTable> targets,
             RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable active,io.tapstate.spi.capture.SourceOperationObserver observer) {
         active.run();if(!node.equals(config.node()))throw unavailable();
-        var fixed=Map.of(primary.namespace(),primary.token(),global.namespace(),global.token());
-        var scopes=ConnectorNoteScopes.of(notes,namespace -> {
-            var token=fixed.get(namespace);if(token==null)throw unavailable();return token;
-        },active);
+        var scopes = ConnectorNoteScopes.forBoundRun(notes, RequiredNoteOwner.namespace(node,purpose),
+                primary.token(), global.token(), active);
         ConnectorProvisioner exact=id -> {
             active.run();if(!config.connectorId().equals(id))throw unavailable();
             var ref=provisioner.resolveStartup(id,artifactHash);active.run();return ref;

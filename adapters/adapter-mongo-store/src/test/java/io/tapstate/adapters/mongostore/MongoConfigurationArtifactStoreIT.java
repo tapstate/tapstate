@@ -42,6 +42,68 @@ class MongoConfigurationArtifactStoreIT {
     private static final DslParser PARSER = new DslParser();
 
     @Test
+    void retrySettingsRejectLossyDurationsBeforeWriting() {
+        withConfigurationStore((ignored, database) -> {
+            var store = new MongoRetrySettingsStore(database, "retry-cluster", () -> {});
+            var defaults = io.tapstate.spi.store.RetrySettingsStore.DEFAULT;
+            var original = store.replace(0, defaults, Map.of()).orElseThrow();
+            var unrepresentable = Duration.ofNanos(1);
+            var fractionalMillis = Duration.ofMillis(2).plusNanos(1);
+            var intervals = new io.tapstate.core.common.RetryPolicy(true, unrepresentable, defaults.maxDuration());
+            var maxima = new io.tapstate.core.common.RetryPolicy(true, defaults.interval(), fractionalMillis);
+            var intervalOverride = new io.tapstate.spi.store.RetrySettingsStore.OperationOverride(null, fractionalMillis, null);
+            var durationOverride = new io.tapstate.spi.store.RetrySettingsStore.OperationOverride(null, null, unrepresentable);
+
+            assertThatThrownBy(() -> store.replace(1, intervals, Map.of())).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> store.replace(1, maxima, Map.of())).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> store.replace(1, defaults, Map.of("stream-read", intervalOverride)))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> store.replace(1, defaults, Map.of("snapshot-read", durationOverride)))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThat(new MongoRetrySettingsStore(database, "retry-cluster", () -> {}).read()).isEqualTo(original);
+        });
+    }
+
+    @Test
+    void clusterRetrySettingsKeepAnAtomicRevisionAndInheritIndividualOverrides() {
+        withConfigurationStore((ignored, database) -> {
+            var store = new MongoRetrySettingsStore(database, "retry-cluster", () -> {});
+            var defaults = io.tapstate.spi.store.RetrySettingsStore.DEFAULT;
+            assertThat(store.read().revision()).isZero();
+            assertThat(store.read().policy("snapshot-read")).isEqualTo(defaults);
+            var overrides = Map.of("snapshot-read",
+                    new io.tapstate.spi.store.RetrySettingsStore.OperationOverride(false, null, Duration.ofHours(4)));
+            var version = store.replace(0, defaults, overrides).orElseThrow();
+            assertThat(version.revision()).isEqualTo(1);
+            assertThat(store.replace(0, defaults, Map.of())).isEmpty();
+            var reopened = new MongoRetrySettingsStore(database, "retry-cluster", () -> {}).read();
+            assertThat(reopened).isEqualTo(version);
+            assertThat(reopened.policy("snapshot-read").enabled()).isFalse();
+            assertThat(reopened.policy("snapshot-read").interval()).isEqualTo(defaults.interval());
+            assertThat(reopened.policy("snapshot-read").maxDuration()).isEqualTo(Duration.ofHours(4));
+            assertThat(reopened.policy("stream-read")).isEqualTo(defaults);
+            var disabled = store.replace(1, defaults.disabled(), Map.of("stream-read",
+                    new io.tapstate.spi.store.RetrySettingsStore.OperationOverride(true, null, null))).orElseThrow();
+            assertThat(disabled.policy("stream-read").enabled()).isFalse();
+            var documents = SystemCollections.CONFIG_RETRY_SETTINGS.on(database);
+            assertThat(documents.countDocuments()).isEqualTo(1);
+            var saved = documents.find().first();
+            assertThat(saved).isNotNull();
+            for (var malformed : List.of(new Document(saved).append("clusterId", "different-cluster"),
+                    new Document(saved).append("formatVersion", 2),
+                    new Document(saved).append("revision", 0L),
+                    new Document(saved).append("defaults", new Document("intervalMillis", 10L)),
+                    new Document(saved).append("operations", new Document("snapshot-read", new Document("enabled", "no"))),
+                    new Document(saved).append("operations", new Document("unknown", new Document("enabled", false))),
+                    new Document(saved).append("operations", new Document("snapshot-read", new Document("typo", false))))) {
+                documents.replaceOne(new Document("_id", "cluster"), malformed);
+                assertThatThrownBy(store::read).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            }
+        });
+    }
+
+    @Test
     void reusableAuthoringDefinitionsRetainTheirExistingStoreContract() {
         List<Resource> definitions = List.of(
                 PARSER.parse("version: tapstate/v1\nkind: transform\nid: reusable_filter\ntype: filter\nexpr: \"true\"\n"),
@@ -850,7 +912,8 @@ class MongoConfigurationArtifactStoreIT {
                             "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts", "configuration_imports", "nest_dead_letters", "capture_preparations",
                             "alert_rules", "alert_receivers", "alert_subscriptions", "alert_silences", "alert_instances",
                             "alert_episodes", "alert_transitions", "alert_notification_schedules", "alert_delivery_intents",
-                            "alert_target_limits", "alert_test_quotas", "alert_node_lifecycles", "ai_provider_settings");
+                            "alert_target_limits", "alert_test_quotas", "alert_node_lifecycles", "ai_provider_settings",
+                            "retry_settings");
             assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();

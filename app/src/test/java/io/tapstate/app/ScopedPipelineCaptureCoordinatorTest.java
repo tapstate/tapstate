@@ -1401,6 +1401,55 @@ class ScopedPipelineCaptureCoordinatorTest {
             assertThatThrownBy(() -> run.snapshotProgress("flow")).isSameAs(fenced);
         }
     }
+    @Test void retryReopensFromThePersistedCutWhenThePendingCutCannotBeFlushed() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            f.coordinator.withReadRetries(operation -> new io.tapstate.core.common.RetryPolicy(
+                    true, Duration.ofMillis(1), Duration.ofSeconds(30)));
+            var port = mock(PdkCapturePort.class, RETURNS_SELF);
+            var interrupted = new AtomicReference<java.util.function.Consumer<io.tapstate.core.common.FailureFact>>();
+            doAnswer(call -> { interrupted.set(call.getArgument(0)); return port; })
+                    .when(port).withStreamRecovery(any(), any(), any());
+            f.portOverride.set(port);
+            var held = ownedShared(f, true);
+            var persistedToken = "proved-durable-cut";
+            var checkpoint = new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 7), persistedToken),
+                    Map.of("orders", new SrsTableCheckpoint(new SrsModelKey(held.chain(), "orders", "cache", 1, 0), 0)));
+            String capture = held.preparation().captureId();
+            var old = new SrsChainState(held.chain(), capture, "1h", 1, Set.of("orders"), Set.of("orders"),
+                    1, checkpoint, Instant.EPOCH, 1, 1);
+            var next = new SrsChainState(held.chain(), capture, "1h", 2, Set.of("orders"), Set.of("orders"),
+                    1, checkpoint, Instant.EPOCH, 1, 1);
+            var stored = new AtomicReference<>(old);
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            var fence = WorkloadClaimFence.from(held.claim());
+            when(chains.load(held.chain())).thenAnswer(call -> Optional.of(stored.get()));
+            when(chains.requestTables(held.chain(), Set.of("orders"), fence)).thenAnswer(call -> stored.get());
+            when(chains.openEpoch(held.chain(), 1, fence)).thenAnswer(call -> {
+                stored.set(next);
+                return OptionalLong.of(2);
+            });
+            when(chains.publishServingTables(held.chain(), 2, Set.of("orders"), fence)).thenReturn(true);
+            var replacement = mock(NativeSrsCaptureRunUnit.Tail.class);
+            when(replacement.health()).thenReturn(new CaptureHealth());
+            var resume = new AtomicReference<CaptureStart>();
+            doAnswer(call -> {
+                resume.set(call.getArgument(4));
+                return replacement;
+            }).when(f.runtime).startTail(eq(BUSINESS), eq(next), eq(fence), any(), any(), any(), any(), anyBoolean());
+            var blockedFlush = new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,
+                    Map.of("chain", held.chain(), "table", "orders", "version", "0"), null);
+            doThrow(blockedFlush).when(held.tail()).finishCheckpointing();
+
+            interrupted.get().accept(new io.tapstate.core.common.FailureFact(new java.io.IOException("source link failed")));
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() ->
+                    resume.get() != null || held.run().captureFailure("flow").isPresent());
+            assertThat(held.run().captureFailure("flow")).isEmpty();
+            assertThat(resume.get()).isEqualTo(CaptureStart.resume(new SourcePosition(persistedToken)));
+            verify(held.tail()).finishCheckpointing();
+            verify(held.tail()).close();
+        }
+    }
+
     private static OwnedShared ownedShared(Fixture f) {
         return ownedShared(f,false);
     }
@@ -1683,6 +1732,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(f.configuration.read(BUSINESS,captureId)).thenReturn(Optional.of(prepared));
             var origin=ConnectorNoteOrigin.capture("mongodb","a".repeat(64),f.source.config());
             when(f.configuration.inspectSharedOrigin(eq(BUSINESS),eq("input"),anyString(),anyString(),anyString())).thenReturn(Optional.of(origin));
+            when(f.connectors.resolveRetained(any(),any(),eq(origin))).thenCallRealMethod();
             var key=f.streamingProgress.get().snapshot().models().get("orders");
             var pinned=new SourceTable("orders",List.of(new SourceField("old-sample","STRING(100)")),List.of(),List.of());
             var srs=f.sources.srs(BUSINESS,() -> {});
@@ -1785,6 +1835,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(notes.origin(any())).thenAnswer(call -> noteOrigins.get(call.getArgument(0)));
             var artifact=new ConnectorRef(List.of(),connector.equals("mongodb")
                     ?"io.tapdata.mongodb.MongodbConnector":"not.loaded","2.0.8",null,null,"a".repeat(64),false);
+            doCallRealMethod().when(connectors).withArtifactRetention(any());
             when(connectors.resolve(connector)).thenReturn(artifact);
             when(connectors.resolve(connector,"a".repeat(64))).thenReturn(artifact);
             runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,nativeStores,mock(HazelcastInstance.class)));

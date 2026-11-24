@@ -31,6 +31,8 @@ class ConfiguredSinkRunTest {
     void serializedFactoryUsesOnlyCapturedTokensExactArtifactAndIndependentCacheReceipts(boolean certified, @TempDir Path directory)throws Exception {
         var trace=Files.createFile(directory.resolve("trace"));var ref=new ConnectorRef(List.of(SyntheticSinkJars.preparationSink(directory,trace,true)),"synthetic.PreparationSink","2.0.8",null,null,HASH,certified);
         var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolveStartup("demo")).thenReturn(ref);when(provisioner.resolveStartup("demo",HASH)).thenReturn(ref);
+        when(provisioner.withArtifactRetention(any())).thenCallRealMethod();
+        when(provisioner.resolveRetained(any(),any(),any())).thenReturn(ref);
         var notes=notes();var original=factory();var run=ConfiguredSinkRun.prepare(FENCE,original.config(),PipelineNode.Purpose.SYNC,notes,provisioner,() -> {});
         var receipts=new Receipts();receipts.prepareTargets(original.preparationInputs(SCOPE));var cache=mock(PipelineStoreViews.class);
         when(cache.sinkPreparations(eq(SCOPE),eq(CLAIM),any())).thenAnswer(call -> {call.getArgument(2,Runnable.class).run();return receipts;});
@@ -72,6 +74,8 @@ class ConfiguredSinkRunTest {
                 List.of(new TargetIndex(List.of("_unwind_source_id","position"),true)));
         var original=new PdkSinkWriterFactory("mongodb",settings,WriteMode.UPSERT,DdlPolicy.FAIL,Map.of("input",logical),NODE,OnFullLoad.APPEND,false);
         var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolveStartup("mongodb")).thenReturn(ref);when(provisioner.resolveStartup("mongodb",HASH)).thenReturn(ref);
+        when(provisioner.withArtifactRetention(any())).thenCallRealMethod();
+        when(provisioner.resolveRetained(any(),any(),any())).thenReturn(ref);
         var notes=notes();when(notes.origin(any())).thenReturn(ConnectorNoteOrigin.capture("mongodb",HASH,settings));
         var roster=new ArrayList<SinkPreparationStore.Input>();
         var bound=(PdkSinkWriterFactory)new StoreBackedDagSource.PdkSinkWriterBinder(notes,provisioner)

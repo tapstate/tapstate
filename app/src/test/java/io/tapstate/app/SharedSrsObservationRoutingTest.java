@@ -36,6 +36,11 @@ class SharedSrsObservationRoutingTest {
     private final ThreeLayerStorePort port;
     SharedSrsObservationRoutingTest() {
         memory.artifacts().saveAll(List.of(source,pipeline));memory.schemas().save(new DiscoveredSourceModel("input","mongo",1,model));
+        var intents = mock(PipelineIntentStore.class);
+        var bindings = mock(ConnectorBindingStore.class);
+        when(bindings.load(any())).thenReturn(Optional.empty());
+        when(intents.connectorBindings()).thenReturn(bindings);
+        when(configuration.intents()).thenReturn(intents);
         when(configuration.artifacts()).thenReturn(memory.artifacts());when(configuration.pipelineStates()).thenReturn(mappings);
         when(mappings.read("flow")).thenReturn(Optional.of(new PipelineStateMapping("flow",2,PipelineStateMapping.Phase.ACTIVE,null)));
         when(configuration.capturePreparations()).thenReturn(captures);when(captures.read(BUSINESS,preparation.captureId())).thenReturn(Optional.of(preparation));

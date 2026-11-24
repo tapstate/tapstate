@@ -349,6 +349,62 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     @Override
+    public RequiredNoteScope prepareArtifactBinding(RequiredNoteOwner candidate, RequiredNoteOrigin expected,
+            RequiredNoteScope previous) {
+        requireOrdinary();
+        if (candidate.kind() == RequiredNoteOwner.Kind.GLOBAL || previous != null
+                && (candidate.equals(previous.owner()) || candidate.kind() != previous.owner().kind()
+                    || candidate.bindingVersion() != previous.owner().bindingVersion()))
+            throw unavailable();
+        return transactionWithInspection(session -> {
+            var cipher = cipherForWrite(session);
+            var scope = candidate.kind() == RequiredNoteOwner.Kind.CHAIN
+                    ? open(session, candidate) : initialize(session, candidate);
+            var metadata = verifyScope(session, scope, true);
+            var retained = retainedOrigin(session, scope, metadata);
+            if (retained != null) {
+                if (!retained.equals(expected) || !readyMarker(session, scope, retained)) throw originMismatch();
+                return scope;
+            }
+            if (previous != null) {
+                var oldMetadata = verifyScope(session, previous, false);
+                var oldOrigin = retainedOrigin(session, previous, oldMetadata);
+                if (oldOrigin == null || !oldOrigin.connectorId().equals(expected.connectorId())
+                        || !java.util.Arrays.equals(oldOrigin.settings(), expected.settings())
+                        || carryCount(oldMetadata, "outgoingCarries") != 0) throw unavailable();
+                var filters = new Document("_id.bindingVersion", previous.owner().bindingVersion())
+                        .append("_id.namespace", previous.owner().namespace()).append("_id.generation", previous.generation());
+                try (var values = notes.find(session, filters).iterator()) {
+                    while (values.hasNext()) {
+                        var row = values.next();
+                        var key = row.get("_id", Document.class).getString("key");
+                        var value = decode(previous, key, row);
+                        var copied = new Document("_id", noteId(scope, key)).append("revision", 1L)
+                                .append("deleted", !value.present());
+                        if (value.present()) copied.append("value", cipher.encrypt(context(scope, key, 1), "pdk-notes",
+                                Base64.getUrlEncoder().withoutPadding().encodeToString(value.bytes())));
+                        notes.insertOne(session, copied);
+                    }
+                }
+            }
+            origins.insertOne(session, originDocument(scope, expected, cipher).append("localArtifactReady", true));
+            if (scopes.updateOne(session, byScope(candidate).append("generation", scope.generation())
+                    .append("originGeneration", 0L), new Document("$set", new Document("originGeneration", scope.generation())))
+                    .getMatchedCount() != 1) throw unavailable();
+            return scope;
+        });
+    }
+
+    void requireBinding(ClientSession session, io.tapstate.spi.store.ConnectorRunBindings.Binding binding) {
+        var scope = binding.notes();
+        checkOwner(session, scope.owner(), false);
+        var origin = retainedOrigin(session, scope, verifyPhysicalScope(session, scope, true));
+        if (origin == null || !origin.connectorId().equals(binding.connectorId())
+                || !origin.artifactHash().equals(binding.sha256()) || !readyMarker(session, scope, origin))
+            throw unavailable();
+    }
+
+    @Override
     public RequiredNoteOrigin prepareOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin) {
         requireOrdinary();
         requireOriginScope(scope);
@@ -540,6 +596,42 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     @Override
+    public java.util.Optional<RequiredNoteOrigin> originIfPresent(RequiredNoteScope scope) {
+        requireOriginScope(scope);
+        return transactionWithInspection(session -> java.util.Optional.ofNullable(
+                retainedOrigin(session, scope, verifyScope(session, scope, false))));
+    }
+
+    @Override
+    public boolean localArtifactReady(RequiredNoteScope scope, RequiredNoteOrigin expected) {
+        requireOriginScope(scope);
+        return transactionWithInspection(session -> readyMarker(session, scope, expected));
+    }
+
+    @Override
+    public void markLocalArtifactReady(RequiredNoteScope scope, RequiredNoteOrigin expected) {
+        requireOriginScope(scope);
+        transactionWithInspection(session -> {
+            if (readyMarker(session, scope, expected)) return null;
+            verifyScope(session, scope, true);
+            if (origins.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
+                    new Document("$set", new Document("localArtifactReady", true))).getMatchedCount() != 1)
+                throw unavailable();
+            return null;
+        });
+    }
+
+    private boolean readyMarker(ClientSession session, RequiredNoteScope scope, RequiredNoteOrigin expected) {
+        var existing = retainedOrigin(session, scope, verifyScope(session, scope, false));
+        if (!expected.equals(existing)) throw originMismatch();
+        Document row = origins.find(session, byScope(scope.owner()).append("generation", scope.generation())).first();
+        if (row == null) throw unavailable();
+        if (!row.containsKey("localArtifactReady")) return false;
+        if (!Boolean.TRUE.equals(row.get("localArtifactReady"))) throw unreadable("localArtifactReady");
+        return true;
+    }
+
+    @Override
     public RequiredNoteScope clear(RequiredNoteScope scope, boolean blockEarlierValues) {
         requireOrdinary();
         return StoreIo.call(() -> transaction(session -> {
@@ -551,8 +643,12 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                     : retainedOrigin(session, scope, metadata);
             if (scope.owner().kind() != RequiredNoteOwner.Kind.GLOBAL && origin == null) throw unavailable();
             RequiredNoteScope next = new RequiredNoteScope(scope.owner(), scope.generation() + 1);
-            if (origin != null && origins.replaceOne(session, byScope(scope.owner()).append("generation", scope.generation()),
-                    originDocument(next, origin, cipher)).getMatchedCount() != 1) throw unavailable();
+            if (origin != null) {
+                Document replacement = originDocument(next, origin, cipher);
+                if (readyMarker(session, scope, origin)) replacement.append("localArtifactReady", true);
+                if (origins.replaceOne(session, byScope(scope.owner()).append("generation", scope.generation()),
+                        replacement).getMatchedCount() != 1) throw unavailable();
+            }
             if (blockEarlierValues) block(session, scope.owner(), ALL_KEYS);
             long matched = scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
                     new Document("$inc", new Document("generation", 1L))
@@ -1153,8 +1249,24 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         }
         if (stored == null || !Long.valueOf(scope.generation()).equals(stored.get("generation"))
                 || !(stored.get("value") instanceof String value)) throw unreadable("origin");
+        return decodeOrigin(originContext(scope), value);
+    }
+
+    /** Reads every retained origin, including old generations held for recovery or note carry. */
+    void addRetainedArtifactHashes(ClientSession session, java.util.Set<String> retained) {
+        origins.find(session).forEach(row -> {
+            if (!(row.get("_id") instanceof Document id)
+                    || !(id.get("bindingVersion") instanceof Long bindingVersion)
+                    || !(id.get("namespace") instanceof String namespace)
+                    || !(row.get("generation") instanceof Long generation)
+                    || !(row.get("value") instanceof String value)) throw unreadable("origin");
+            retained.add(decodeOrigin(originContext(bindingVersion, namespace, generation), value).artifactHash());
+        });
+    }
+
+    private RequiredNoteOrigin decodeOrigin(String context, String value) {
         try {
-            Object parsed = JsonReader.parse(ciphers.current().decrypt(originContext(scope), "pdk-note-origin", value));
+            Object parsed = JsonReader.parse(ciphers.current().decrypt(context, "pdk-note-origin", value));
             if (!(parsed instanceof Map<?, ?> tree) || !Long.valueOf(1).equals(tree.get("version"))) throw unreadable("origin");
             return new RequiredNoteOrigin((String) tree.get("connectorId"), (String) tree.get("artifactHash"),
                     Base64.getUrlDecoder().decode((String) tree.get("settings")));
@@ -1182,7 +1294,11 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     private static String originContext(RequiredNoteScope scope) {
-        return JsonWriter.write(List.of(scope.owner().bindingVersion(), scope.owner().namespace(), scope.generation()));
+        return originContext(scope.owner().bindingVersion(), scope.owner().namespace(), scope.generation());
+    }
+
+    private static String originContext(long bindingVersion, String namespace, long generation) {
+        return JsonWriter.write(List.of(bindingVersion, namespace, generation));
     }
 
     private static void requireOriginScope(RequiredNoteScope scope) {

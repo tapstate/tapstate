@@ -71,6 +71,8 @@ public enum ConnectorError implements TapstateErrorCode {
      */
     LOAD_FAILED(ConnectorErrorDefinitions.LOAD_FAILED),
 
+    LOCAL_ARTIFACT_UNAVAILABLE(ConnectorErrorDefinitions.LOCAL_ARTIFACT_UNAVAILABLE),
+
     /** The persisted server trust bundle or its verification options cannot be used safely. */
     TLS_TRUST_INVALID(ConnectorErrorDefinitions.TLS_TRUST_INVALID),
     /** Owned temporary trust material could not be removed after its connector use. */

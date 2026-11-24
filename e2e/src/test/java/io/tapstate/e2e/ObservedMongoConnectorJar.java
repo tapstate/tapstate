@@ -20,6 +20,16 @@ final class ObservedMongoConnectorJar {
     private ObservedMongoConnectorJar() {}
 
     static byte[] build(byte[] original, Path witness) throws IOException, URISyntaxException {
+        Path delegate = witness.resolveSibling(witness.getFileName() + ".mongodb.jar");
+        return build(original, witness, delegate, "mongo-write-witness-path.txt");
+    }
+
+    static byte[] buildLatencyProbe(byte[] original, Path witness, Path delegate) throws IOException, URISyntaxException {
+        return build(original, witness, delegate, "mongo-latency-witness-path.txt");
+    }
+
+    private static byte[] build(byte[] original, Path witness, Path delegate, String resourceName)
+            throws IOException, URISyntaxException {
         Manifest manifest;
         byte[] spec = null;
         try (JarInputStream in = new JarInputStream(new ByteArrayInputStream(original))) {
@@ -31,9 +41,8 @@ final class ObservedMongoConnectorJar {
         if (manifest == null || spec == null) throw new AssertionError("real Mongo jar must carry its manifest and spec");
         // The product owns this loader and closes its manifest class path too, even for a capability
         // probe that never initializes or stops the connector. The test directory owns the bytes.
-        Path delegate = witness.resolveSibling(witness.getFileName() + ".mongodb.jar").toAbsolutePath();
         Files.write(delegate, original);
-        manifest.getMainAttributes().put(Attributes.Name.CLASS_PATH, delegate.toUri().toString());
+        manifest.getMainAttributes().put(Attributes.Name.CLASS_PATH, delegate.toAbsolutePath().toUri().toString());
         var resource = ObservedMongoConnectorJar.class.getClassLoader().getResource(PACKAGE);
         if (resource == null) throw new AssertionError("observer package was not compiled");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -43,7 +52,7 @@ final class ObservedMongoConnectorJar {
                 put(out, PACKAGE + file.getFileName(), Files.readAllBytes(file));
             }
             put(out, "observed-mongo-spec.json", spec);
-            put(out, "mongo-write-witness-path.txt", witness.toAbsolutePath().toString().getBytes(StandardCharsets.UTF_8));
+            put(out, resourceName, witness.toAbsolutePath().toString().getBytes(StandardCharsets.UTF_8));
         }
         return bytes.toByteArray();
     }

@@ -33,6 +33,15 @@ public interface PipelineIntentStore {
     /** Expected zero means never written; a refusal leaves the latest value and all versions unchanged. */
     boolean compareAndSet(PipelineIntentScope scope, long expectedIntentRevision, DesiredState desired);
 
+    /** Explicit starts publish their binding selection request in the same CONFIG transaction. */
+    default boolean compareAndSetExplicitStart(PipelineIntentScope scope, long expected, DesiredState desired) {
+        return compareAndSet(scope, expected, desired);
+    }
+
+    default ConnectorBindingStore connectorBindings() {
+        throw new UnsupportedOperationException("connector bindings are not supported");
+    }
+
     /** A durable request to prepare exactly the definition and intent that HTTP accepted. */
     record PendingStart(PipelineIntentSnapshot intent, PipelinePreparationInputs inputs) {}
 
