@@ -683,19 +683,26 @@ class ObservationPublisherTest {
     }
 
     @Test
-    void aFailedStateOnItsOwnPublishesNoFailureMetric() {
+    void aConcurrentSamplerCannotPublishFailedBeforeTheConvergerSuppliesItsDiagnostic() {
+        state.seed("orders", PipelineState.RUNNING);
+        Observation running = publisher.publish("orders").orElseThrow();
         state.seed("orders", PipelineState.FAILED);
-
         publisher.publish("orders");
+        assertThat(observations.read("orders")).contains(running);
+        var cause = new ObservationFailure("engine.job-failed", Map.of("pipeline", "orders", "cause", "original failure"));
+        publisher.publish("orders", cause);
+        Observation failed = observations.read("orders").orElseThrow();
+        assertThat(failed.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(failed.failure()).isEqualTo(cause);
+        publisher.publish("orders");
+        assertThat(observations.read("orders").orElseThrow().failure()).isEqualTo(cause);
+    }
 
-        Observation published = observations.read("orders").orElseThrow();
-        assertThat(published.state()).isEqualTo(PipelineState.FAILED);
-        // The inversion of what this case used to assert, and the point of the change. It used to read
-        // errorCount = 1 here, derived from the state alone: a state wearing a count's name, which could
-        // not say how many times anything had happened and went back down on recovery. Failures are now
-        // counted where one is witnessed, and no cause was handed over on this pass -- the state is
-        // already published as the state, one field up.
-        assertThat(published.metrics()).isEmpty();
+    @Test
+    void aFailedStateOnItsOwnWaitsForItsDiagnosticWithoutInventingAFailureMetric() {
+        state.seed("orders", PipelineState.FAILED);
+        assertThat(publisher.publish("orders")).isEmpty();
+        assertThat(observations.read("orders")).isEmpty();
     }
 
     @Test

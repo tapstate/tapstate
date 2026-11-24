@@ -2,8 +2,13 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.withSettings;
+import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import com.mongodb.internal.dns.DefaultDnsResolver;
+import java.util.List;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
@@ -70,7 +75,16 @@ class ViewStoreModeWiringTest {
         mongo.setUri(metadataUri);
         AtomicBoolean presentAtStart = new AtomicBoolean();
 
-        try (var context = new AnnotationConfigApplicationContext()) {
+        // This checks lifecycle wiring, not a live DNS record. Keep the real driver's
+        // TXT/authSource behavior, with the same deterministic DNS used by the URI tests.
+        var dns = new DefaultDnsResolver((name, type) -> {
+            assertThat(name).isEqualTo("atlas.example");
+            assertThat(type).isEqualTo("TXT");
+            return List.of("authSource=admin");
+        });
+        try (var ignored = mockConstruction(DefaultDnsResolver.class,
+                    withSettings().defaultAnswer(delegatesTo(dns)));
+                var context = new AnnotationConfigApplicationContext()) {
             context.registerBean(ViewStoreSeedRunner.class, () -> runner(store.artifacts(), mongo,
                     CloudRuntimeSettings.resolve(new CloudProperties())));
             context.registerBean(SurfaceStart.class, () -> new SurfaceStart(() -> presentAtStart.set(

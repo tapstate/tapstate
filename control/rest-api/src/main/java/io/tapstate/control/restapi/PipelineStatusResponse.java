@@ -49,7 +49,7 @@ record PipelineStatusResponse(
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog, Clock clock) {
         Instant observedAt = status.observedAt();
         return new PipelineStatusResponse(status.pipelineId(), status.state(), null,
-                failure(status.failure(), catalog), observedAt,
+                failure(status.state(), status.failure(), status.pipelineId(), catalog), observedAt,
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 null, status.observedState(), false, ExecutionPlanResponse.of(status.plan()),
@@ -61,7 +61,7 @@ record PipelineStatusResponse(
         PipelineCatalogItem.Status status = item.status();
         Instant observedAt = runtime.observedAt();
         return new PipelineStatusResponse(item.id(), runtime.state(), status.displayState(),
-                failure(runtime.failure(), catalog),
+                failure(runtime.state(), runtime.failure(), item.id(), catalog),
                 observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, Clock.systemUTC().instant()).toMillis()),
                 status.desiredState(), runtime.observedState(), item.hasArtifact(),
@@ -90,7 +90,7 @@ record PipelineStatusResponse(
         }
         Instant observedAt = status.observedAt();
         return new PipelineStatusResponse(item.id(), state, status.displayState(),
-                failure(status.failure(), catalog), observedAt, observedAt == null ? null
+                failure(state, status.failure(), item.id(), catalog), observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 status.desiredState(), status.observedState(), item.hasArtifact(), null, null,
                 intentReadFailure(status.intentReadFailure(), catalog));
@@ -110,6 +110,14 @@ record PipelineStatusResponse(
         }
         Map<String, Object> params = new TreeMap<>(failure.params());
         return new Failure(failure.code(), params, catalog.render(failure.code(), params).message());
+    }
+
+    private static Failure failure(PipelineState state, ObservationFailure failure, String pipeline, MessageCatalog catalog) {
+        if (failure == null && state == PipelineState.FAILED) {
+            failure = new ObservationFailure(io.tapstate.control.core.MonitorError.FAILURE_DIAGNOSTIC_UNAVAILABLE.code(),
+                    Map.of("pipeline", pipeline));
+        }
+        return failure(failure, catalog);
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {

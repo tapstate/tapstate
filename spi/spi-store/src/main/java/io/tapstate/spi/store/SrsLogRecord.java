@@ -34,7 +34,13 @@ public record SrsLogRecord(
         Map<String, Object> after,
         long schemaVer,
         WorkloadClaimFence captureFence,
-        long epoch) {
+        long epoch,
+        Map<String, Object> schema) {
+
+    public SrsLogRecord(String srcToken, Op op, long ts, Map<String, Object> before,
+            Map<String, Object> after, long schemaVer, WorkloadClaimFence captureFence, long epoch) {
+        this(srcToken, op, ts, before, after, schemaVer, captureFence, epoch, null);
+    }
 
     public SrsLogRecord(
             String srcToken,
@@ -83,6 +89,8 @@ public record SrsLogRecord(
         }
         before = copyOrNull(before);
         after = copyOrNull(after);
+        schema = copyOrNull(schema);
+        if (schema != null && op != Op.DDL) throw new IllegalArgumentException("only DDL carries a schema command");
     }
 
     private static Map<String, Object> copyOrNull(Map<String, Object> map) {

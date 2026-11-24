@@ -75,6 +75,13 @@ still landing.
 `monitor.no-observation` until its first observation is published. History is independent of the
 latest observation and can still return retained samples for a stopped pipeline.
 
+A failed runtime publication carries its diagnostic with its state. A concurrent sampler retains the
+previous complete publication until that diagnostic is available. If a failed checkpoint outlives a
+missing publication (for example, after a process stops in that interval), status reports
+`monitor.failure-diagnostic-unavailable` without inventing an execution cause or refreshing the last
+observation time. Retry status for a diagnostic still being published, or inspect the server logs if
+it remains unavailable.
+
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
 conclusion, read `pipeline.explain`; do not join the other responses and copy its rules.
 

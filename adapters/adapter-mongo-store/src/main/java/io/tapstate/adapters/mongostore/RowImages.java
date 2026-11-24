@@ -60,6 +60,8 @@ final class RowImages {
     private static final String VALUE_KIND = "__tapstate_valueKind";
     private static final String TYPE_DESCRIPTION = "__tapstate_typeDescription";
     private static final String TEMPORAL_DESCRIPTION = "__tapstate_temporalDescription";
+    // Uses the existing reserved carrier namespace; it is not a source value-kind.
+    private static final String EXACT_DECIMAL_KIND = "__tapstate_exactDecimal";
     private static final String INSTANT = "__tapstate_instant";
 
     private RowImages() {
@@ -79,6 +81,17 @@ final class RowImages {
     }
 
     private static Object encoded(Object value) {
+        if (value instanceof java.math.BigDecimal number) {
+            if (number.precision() <= 34) {
+                try {
+                    new Decimal128(number);
+                    return number;
+                } catch (NumberFormatException outsideDecimal128Range) {
+                    // An exact decimal can also exceed BSON's exponent range.
+                }
+            }
+            return new Document(CARRIED, number.toString()).append(VALUE_KIND, EXACT_DECIMAL_KIND);
+        }
         if (value instanceof ConvertedValue carrier) {
             Document held = new Document(CARRIED, encoded(carrier.value()));
             // Written only when present, never as an explicit null: the target's way back tests this, and
@@ -142,6 +155,10 @@ final class RowImages {
             }
         }
         if (value instanceof Map<?, ?> map) {
+            if (map.size() == 2 && EXACT_DECIMAL_KIND.equals(map.get(VALUE_KIND))
+                    && map.get(CARRIED) instanceof String decimal) {
+                return new java.math.BigDecimal(decimal);
+            }
             if (map.get(CARRIED) != null) {
                 return new ConvertedValue(decoded(map.get(CARRIED)), (String) map.get(ORIGIN_TYPE),
                         (String) map.get(VALUE_KIND), (String) map.get(TYPE_DESCRIPTION),

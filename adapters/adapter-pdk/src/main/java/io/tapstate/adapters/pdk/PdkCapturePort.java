@@ -18,6 +18,7 @@ import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.capture.SnapshotPreparation;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SourceSchemaChange;
 import io.tapstate.spi.capture.SnapshotOnlyCapture;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.KeyedStateStore;
@@ -1227,6 +1228,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         try {
             Map<String, TapTable> tables = connector.underLoader(() -> prepareStream(connector, config));
             if (delivery.closed) return;
+            Map<String, SourceTable> evolvingModels = new LinkedHashMap<>();
+            for (SourceTable table : PdkSchemaDiscoverer.structuralModel(new ArrayList<>(tables.values())).tables()) {
+                evolvingModels.put(table.name(), table);
+            }
             if (streamPreparer != null) {
                 try {
                     var selected = new ArrayList<TapTable>();
@@ -1238,6 +1243,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     }
                     var actual = new LinkedHashMap<String,SourceTable>();
                     for (SourceTable model : PdkSchemaDiscoverer.structuralModel(selected).tables()) actual.put(model.name(),model);
+                    LOG.debug("Prepared CDC structural models: {}", actual);
                     streamPreparer.prepare(Map.copyOf(actual));
                 } catch (RuntimeException | Error hostFailure) {
                     preflight.completeExceptionally(hostFailure);
@@ -1278,7 +1284,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                             .filter(Objects::nonNull).distinct().forEach(table->reportOperation(connector,table,SourceOperationObserver.Capability.STREAM_READ,null));
                     try {
                         acknowledgements.applyIfDue();
-                        delivery.accept(() -> handOver(connector, declared, listener, events, offset));
+                        delivery.accept(() -> handOver(connector, declared, evolvingModels, listener, events, offset));
                     } catch (RuntimeException | Error downstreamFailure) {
                         callbackFailed.set(true);
                         throw downstreamFailure;
@@ -1344,7 +1350,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
      * keeping, because everything downstream that costs per act rather than per change -- writing the changes
      * down above all -- costs one act per batch only while the batch still exists.
      */
-    private static void handOver(PdkConnector connector, Map<String, PdkRowSchema> declared,
+    private static void handOver(PdkConnector connector, Map<String, PdkRowSchema> declared, Map<String, SourceTable> models,
             CaptureListener listener, List<TapEvent> events, Object offset) {
         List<TapEvent> changes = new ArrayList<>(events.size());
         for (TapEvent event : events) {
@@ -1354,7 +1360,22 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
         List<Envelope> decoded = new ArrayList<>(changes.size());
         for (TapEvent change : changes) {
-            decoded.add(TapEventCodec.decodeChange(change, connector.conversions(), declaredTypes(declared, change)));
+            PdkRowSchema previous = declaredTypes(declared, change);
+            Envelope envelope = TapEventCodec.decodeChange(change, connector.conversions(), previous);
+            if (change instanceof io.tapdata.entity.event.ddl.TapDDLEvent ddl) {
+                PdkDdlModels.Evolution evolved = PdkDdlModels.apply(connector::fillFieldTypes, previous, models.get(envelope.src()), ddl);
+                LOG.debug("Captured {} for {} has an ordered structural receipt: {}", ddl.getClass().getSimpleName(), envelope.src(), evolved != null);
+                if (evolved != null) {
+                    LOG.debug("Captured successor structural model: {}", evolved.change().after());
+                    Map<String, Object> schema = new LinkedHashMap<>(envelope.schema());
+                    schema.put(SourceSchemaChange.ENVELOPE_KEY, evolved.change());
+                    schema.put(PdkDdlCommand.KEY, PdkDdlCommand.encode(ddl, evolved.change()));
+                    envelope = Envelope.ddl(envelope.ts(), envelope.src(), schema);
+                    declared.put(envelope.src(), evolved.rows());
+                    models.put(envelope.src(), evolved.change().after());
+                }
+            }
+            decoded.add(envelope);
         }
         listener.onBatch(decoded, position(connector, offset));
     }

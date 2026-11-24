@@ -24,6 +24,9 @@ public enum MonitorError implements TapstateErrorCode {
      */
     NO_OBSERVATION("monitor.no-observation", Set.of("pipeline")),
 
+    /** A failed checkpoint is proved, but its original execution diagnostic is unavailable. */
+    FAILURE_DIAGNOSTIC_UNAVAILABLE("monitor.failure-diagnostic-unavailable", Set.of("pipeline")),
+
     /** A history cursor could not be parsed, verified, or matched to the repeated query. */
     INVALID_CURSOR("monitor.invalid-cursor", Set.of("operation", "reason")),
 

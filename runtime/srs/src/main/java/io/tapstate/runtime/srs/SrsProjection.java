@@ -19,8 +19,7 @@ import java.util.Map;
  * than the item because the ring assigns it on append and keeps it.
  *
  * <p>The stream name is injected, not read from the item — the ring is per-table, so the item does not
- * carry one; the reader is bound to a source vertex that knows the logical stream it feeds. Schema stays
- * null in the lean tier: the item points at schema history by version rather than repeating it inline.
+ * carry one; the reader is bound to a source vertex that knows the logical stream it feeds. DDL commands accompany their original event; row models stay in versioned schema history.
  * Snapshot reads never reach here (they bypass the ring), so a projected event always has a position.
  */
 final class SrsProjection {
@@ -33,7 +32,7 @@ final class SrsProjection {
      * the {@code order} the engine assigns it.
      */
     static Envelope toEnvelope(SrsItem item, String src, SourceOrder order) {
-        return new Envelope(item.op(), item.ts(), src, item.before(), item.after(), null,
+        return new Envelope(item.op(), item.ts(), src, item.before(), item.after(), item.schema(),
                 Map.of(src, new ChainPosition(order, item.srcPos() == null ? null : item.srcPos().token())));
     }
 }

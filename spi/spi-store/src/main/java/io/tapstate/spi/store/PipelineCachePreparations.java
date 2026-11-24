@@ -15,6 +15,19 @@ public interface PipelineCachePreparations {
     /** Loads the retained original source manifest and necessary progress; it grants no creation authority. */
     void verifySources(PipelineIntentScope scope, PipelinePreparationInputs expected);
 
+    /** Reads the existing immutable preparation manifest without granting creation authority. */
+    record SourceInputs(PipelinePreparationInputs inputs, boolean expandedByDiscovery) {
+        public SourceInputs { Objects.requireNonNull(inputs, "inputs"); }
+    }
+    default SourceInputs sourceInputs(PipelineIntentScope scope) {
+        throw new UnsupportedOperationException("retained source inputs are not supported");
+    }
+
+    /** Extends only an existing manifest; positions, snapshots and physical scope remain intact. */
+    default boolean expandSources(PipelineTableExpansion permission, WorkloadClaimFence node) {
+        throw new UnsupportedOperationException("dynamic table expansion is not supported");
+    }
+
     /** Rechecks CONFIG outside the CACHE transaction, then verifies or publishes the original initial receipt. */
     PipelinePreparationReceipt seed(Reservation original, PipelineStatePreparations configuration, Instant touchTime);
 

@@ -85,16 +85,76 @@ class SrsCaptureWriterTest {
         assertThat(f.saved).isEmpty(); assertThat(f.log.rows).isEmpty();
     }
     @Test void oneUnprovedDdlRefusesTheWholeBatchBeforeAnyEarlierRowOrCheckpoint() {
-        var f = new Fixture(); var writer = f.writer(); var callback = new AtomicReference<CaptureListener>();
-        try (var source = writer.start(f.port(writer, callback, true), f.config(), CaptureStart.present(), new CaptureHealth())) {
+        var f = new Fixture(); var writer = f.writer(); var callback = new AtomicReference<CaptureListener>(); var health = new CaptureHealth();
+        try (var source = writer.start(f.port(writer, callback, true), f.config(), CaptureStart.present(), health)) {
             assertThatThrownBy(() -> callback.get().onBatch(List.of(Envelope.insert(1, "orders", Map.of("id", 1), null),
                     Envelope.ddl(2, "quiet", Map.of("origin", "alter table"))), Optional.of(new SourcePosition("unsafe"))))
                     .satisfies(error -> code(error, IoError.SRS_MODEL_UNAVAILABLE));
+            assertThat(health.failure()).isPresent().get().satisfies(error -> code(error, IoError.SRS_MODEL_UNAVAILABLE));
             assertThat(f.log.rows).isEmpty(); assertThat(f.saved).hasSize(1);
             assertThatThrownBy(() -> callback.get().onBatch(List.of(), Optional.of(new SourcePosition("late"))))
                     .satisfies(error -> code(error, IoError.CACHE_BUSINESS_FENCED));
         }
     }
+
+    @Test void anOrderedCompleteColumnModelSeparatesRowsBeforeAndAfterTheDdlInTheDurableLog() {
+        var f = new Fixture(); var writer = f.writer(); var callback = new AtomicReference<CaptureListener>();
+        SourceTable discovered = f.actual.get("orders");
+        SourceTable original = new SourceTable(discovered.name(), discovered.fields(), discovered.primaryKey(), discovered.indexes());
+        var fields = new ArrayList<>(original.fields());
+        fields.add(new SourceField("extra", "varchar(64)", io.tapstate.core.common.TapstateType.STRING));
+        SourceTable changed = new SourceTable("orders", fields, original.primaryKey(), original.indexes());
+        try (var source = writer.start(f.port(writer, callback, true), f.config(), CaptureStart.present(), new CaptureHealth())) {
+            callback.get().onBatch(List.of(Envelope.insert(1, "orders", Map.of("id", 1), null),
+                    Envelope.ddl(2, "orders", Map.of(SourceSchemaChange.ENVELOPE_KEY, new SourceSchemaChange(original, changed),
+                            "tapstateDdl", Map.of("format", 1, "action", "add"))),
+                    Envelope.insert(3, "orders", Map.of("id", 2, "extra", "new"), null)),
+                    Optional.of(new SourcePosition("after-column-ddl")));
+            Map<Long, SrsLogRecord> records = f.log.rows.get(f.ring("orders"));
+            assertThat(records).hasSize(3);
+            assertThat(records.get(0L).schemaVer()).isZero();
+            assertThat(records.get(1L).op()).isEqualTo(io.tapstate.core.event.Op.DDL);
+            assertThat(records.get(1L).after()).isNull();
+            assertThat(records.get(1L).schema()).containsOnlyKeys("tapstateDdl");
+            assertThat(records.get(1L).schema().get("tapstateDdl")).isEqualTo(Map.of("format", 1, "action", "add"));
+            assertThat(records.get(1L).schemaVer()).isZero();
+            assertThat(records.get(2L).schemaVer()).isEqualTo(1);
+            var frontier = f.saved.getLast().tables().get("orders");
+            assertThat(frontier.sequence()).isEqualTo(2);
+            assertThat(frontier.model().modelVersion()).isEqualTo(1);
+            assertThat(f.published.get(frontier.model()).table()).isEqualTo(changed);
+            assertThat(f.published.get(frontier.model()).ddlSequence()).isEqualTo(2);
+            assertThat(f.published.get(new SrsModelKey(f.chain, "orders", "cache", f.opened.epoch(), 0)).table()).isEqualTo(original);
+        }
+    }
+    @Test void aQuietDdlCheckpointNamesItsNewModelEvenAfterTheDdlLogHasBeenRetired() {
+        var f = new Fixture(); var writer = f.writer(); var callback = new AtomicReference<CaptureListener>();
+        SourceTable observed = f.actual.get("orders");
+        SourceTable original = new SourceTable(observed.name(), observed.fields(), observed.primaryKey(), observed.indexes());
+        var fields = new ArrayList<>(original.fields()); fields.add(new SourceField("extra", "varchar(64)"));
+        SourceTable changed = new SourceTable("orders", fields, original.primaryKey(), original.indexes());
+        try (var source = writer.start(f.port(writer, callback, true), f.config(), CaptureStart.present(), new CaptureHealth())) {
+            // DDL is the first CDC event and no DML follows it before shutdown.
+            callback.get().onBatch(List.of(Envelope.ddl(1, "orders", Map.of(SourceSchemaChange.ENVELOPE_KEY,
+                    new SourceSchemaChange(original, changed)))), Optional.of(new SourcePosition("quiet-ddl")));
+        }
+        var checkpoint = f.saved.getLast();
+        assertThat(checkpoint.tables().get("orders").sequence()).isZero();
+        assertThat(checkpoint.tables().get("orders").model().modelVersion()).isEqualTo(1);
+        // A consumer may already have confirmed and retired the image-free DDL.
+        f.log.rows.get(f.ring("orders")).remove(0L);
+        var retained = Map.copyOf(f.published);
+        f.opened = new SrsChainState(f.chain, "capture", null, 3, f.actual.keySet(), f.actual.keySet(),
+                1, checkpoint, Instant.EPOCH, 0, 0);
+        f.saved.clear();
+        var recovered = f.writer();
+        recovered.prepare(Map.of("orders", changed, "quiet", f.actual.get("quiet")));
+        retained.forEach((key, model) -> assertThat(f.published).containsEntry(key, model));
+        assertThat(f.published.get(new SrsModelKey(f.chain,"orders","cache",3,0)).table()).isEqualTo(changed);
+        assertThat(f.saved).isEmpty();
+        recovered.close();
+    }
+
     @Test void batchedCheckpointFlushKeepsTheLatestTokenAndAllConfirmedTables() {
         var f = new Fixture();
         var writer = f.writer(true);
@@ -426,7 +486,13 @@ class SrsCaptureWriterTest {
             @Override public SrsModel publish(SrsModel model, WorkloadClaimFence fence) { assertThat(fence).isEqualTo(FENCE); published.putIfAbsent(model.key(), model); return published.get(model.key()); }
             @Override public Optional<SrsModel> load(SrsModelKey key) { return Optional.ofNullable(published.get(key)); }
             @Override public Optional<Map<String, SrsModel>> publishedForNewSnapshot(String chain, Map<String, String> rings) { throw new AssertionError("no latest lookup"); }
-            @Override public SrsModel requireEvent(SrsModelKey key, String ring, long seq, WorkloadClaimFence fence) { throw new AssertionError(); }
+            @Override public SrsModel requireEvent(SrsModelKey key, String ring, long seq, WorkloadClaimFence fence) {
+                var model = require(key);
+                assertThat(model.ringName()).isEqualTo(ring);
+                assertThat(model.ddlSequence()).isLessThanOrEqualTo(seq);
+                assertThat(fence).isEqualTo(FENCE);
+                return model;
+            }
         };
         final SrsChainStore chains = new SrsChainStore() {
             @Override public SrsChainStore guardedBy(Runnable guard) { return this; }

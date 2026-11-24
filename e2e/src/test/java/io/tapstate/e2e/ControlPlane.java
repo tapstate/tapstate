@@ -879,6 +879,13 @@ final class ControlPlane {
         return Optional.of(asObject(map));
     }
 
+    /** Reads the typed applied Pipeline, including explicitly stored execution options. */
+    Map<String, Object> pipeline(String id) {
+        var response = send(authedGet("/api/pipelines/" + urlSegment(id)));
+        expect(response, 200, "read the applied Pipeline " + id);
+        return asObject((Map<?, ?>) JsonReader.parse(response.body()));
+    }
+
     /** The merged catalog that backs the Web list. */
     List<String> pipelineCatalogIds() {
         HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=0"));
@@ -1435,6 +1442,12 @@ final class ControlPlane {
         expect(send(authed("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.STOP.id(),
                         "{\"purgeState\":" + purgeState + "}")),
                 200, LifecycleVerb.STOP.id() + " " + pipelineId);
+    }
+
+    /** The public stop API must refuse an omitted state decision on a real failed run. */
+    Refusal stopWithoutStateChoice(String pipelineId, boolean emptyObject) {
+        var response = send(authed("/api/pipelines/" + urlSegment(pipelineId) + ":stop", emptyObject ? "{}" : ""));
+        return interpretRefusal(response.statusCode(), response.body(), "stop without purgeState");
     }
 
     /** What a start of the pipeline would be asked, read without starting it: its start checks report. */

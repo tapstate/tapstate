@@ -50,6 +50,12 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
 
+# User-installed Db2 connectors need the same system libraries as the Cloud seed.
+COPY deploy/docker/install-native-runtime.sh /tmp/install-native-runtime.sh
+RUN sh /tmp/install-native-runtime.sh && rm /tmp/install-native-runtime.sh
+# Load the shared C++ runtime before the Db2 bridge's older static runtime.
+ENV LD_PRELOAD=libstdc++.so.6
+
 # The standard server uses a fixed, unprivileged uid. The Cloud target deliberately overrides it
 # for bundled Db2 initialization; a numeric id keeps standard host-mount ownership legible.
 RUN groupadd --gid 10001 tapstate \
@@ -107,12 +113,7 @@ FROM runtime-base AS cloud
 # Override the standard user: the bundled Db2 runtime registers its installation and client instance
 # on first use. Keep libstdc++6 explicit as a native requirement, even when the base already supplies it.
 USER root
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libxml2 libstdc++6 \
- && rm -rf /var/lib/apt/lists/*
-# The Db2 bridge embeds an older static C++ runtime. Load the shared runtime first so IBM
-# constructors do not bind to the bridge's incompatible static locale implementation.
-ENV LD_PRELOAD=libstdc++.so.6
+# Native prerequisites and C++ load order are inherited from runtime-base.
 LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
       org.opencontainers.image.description="Tapstate Cloud cluster runtime with a verified connector seed" \
       io.tapstate.source="https://github.com/tapstate/tapstate" \

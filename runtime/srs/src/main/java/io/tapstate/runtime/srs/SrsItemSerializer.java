@@ -44,6 +44,8 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         out.writeLong(item.schemaVer());
         writeFence(out, item.captureFence());
         out.writeLong(item.epoch());
+        out.writeInt(1); // optional, versioned DDL schema extension
+        writeRow(out, item.schema());
     }
 
     @Override
@@ -62,7 +64,18 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         } catch (java.io.EOFException legacy) {
             epoch = 0L;
         }
-        return new SrsItem(srcPos, op, ts, before, after, schemaVer, fence, epoch);
+        Map<String, Object> schema = null;
+        Integer format = null;
+        try {
+            format = in.readInt();
+        } catch (java.io.EOFException legacy) {
+            // Older records ended at epoch. Missing extension is distinct from a truncated command.
+        }
+        if (format != null) {
+            if (format != 1) throw new IOException("unsupported SRS DDL schema format: " + format);
+            schema = readRow(in);
+        }
+        return new SrsItem(srcPos, op, ts, before, after, schemaVer, fence, epoch, schema);
     }
 
     private static void writeFence(ObjectDataOutput out, WorkloadClaimFence fence) throws IOException {

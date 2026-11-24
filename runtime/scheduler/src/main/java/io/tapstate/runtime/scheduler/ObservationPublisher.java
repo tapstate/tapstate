@@ -866,6 +866,12 @@ public final class ObservationPublisher {
                         previous != null ? previous.positions() : Map.of(), carried, at, known,
                         previous != null ? previous.initialLoad() : null);
             }
+            // The checkpoint changes before the converger publishes its cause. A concurrent sampler
+            // must not expose FAILED with no diagnostic, or overwrite a cause published meanwhile.
+            // Keep the last complete publication (and its original timestamp) until the cause arrives.
+            if (actual == PipelineState.FAILED && carried == null) {
+                return observations.read(pipelineId).orElse(null);
+            }
             // Both paths use the original observation port. Its scope, checkpoint and claim checks
             // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.
             save(observations, published, requirePreparedState ? checkpoint.epoch() : null);

@@ -43,6 +43,18 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class RowImagesTest {
 
+    @Test
+    void oraclePrecisionAndLargeDecimalExponentsSurviveTheDurableLogWithoutRounding() {
+        for (String text : List.of("12345678901234567890123456789012345678", "-12345678901234567890123456789012345678.0001",
+                "1E+7000", "1E-7000")) {
+            BigDecimal number = new BigDecimal(text);
+            ConvertedValue carried = new ConvertedValue(number, "NUMBER(38,0)");
+            Map<String, Object> row = Map.of("bare", number, "carried", carried,
+                    "nested", Map.of("value", number), "array", List.of(carried));
+            assertThat(overTheWire(row)).as("exact durable row for " + text).isEqualTo(row);
+        }
+    }
+
     private static final String OID = "650f1a2b3c4d5e6f70819200";
 
     @Test

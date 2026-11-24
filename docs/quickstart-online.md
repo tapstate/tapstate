@@ -76,9 +76,14 @@ snapshot and then capture changes; the database needs archive logging, and each 
 table `DATA CAPTURE CHANGES`. Change capture has two modes. With `useNativeMiner: true` the
 connector reads the log in-process through IBM's db2ReadLog API. That needs the server on
 Linux x86_64, running as root at least for the first Db2 connection, and the IBM Db2 runtime
-client prepared once on that host with `db2-native-runtime-setup.sh` from the same release:
-the published jar carries the native bridge but not the runtime archive it loads. The
-published server image runs as a non-root user and is not prepared for this mode. Without
+client prepared once on that host. Current Db2 connector packages carry their private
+runtime archive and initialize it on first use; older connector packages can require
+`db2-native-runtime-setup.sh` from the matching release. The server image includes
+`libxml2` and the shared C++ runtime needed by user-installed native connectors. It
+still runs as a non-root user: initialize the client separately with root privileges
+and provide an explicitly configured, writable runtime directory, or deliberately
+choose a root initialization environment. Installing system libraries does not grant
+initialization privileges. Without
 `useNativeMiner`, the connector reads changes from a raw log server at the configured
 `rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
 production use, where the native mode is the one to run.

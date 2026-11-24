@@ -32,7 +32,13 @@ import java.util.Objects;
  */
 public record SinkConfig(
         String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
-        TargetTable target, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+        TargetTable target, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad, boolean ddlSourceColumns) {
+
+    /** Legacy callers carry no proof that a row transform preserved source column names. */
+    public SinkConfig(String connectorId, Map<String,Object> settings, WriteMode writeMode, DdlPolicy ddl,
+            TargetTable target, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+        this(connectorId, settings, writeMode, ddl, target, node, onFullLoad, fullLoad, false);
+    }
 
     public SinkConfig {
         Objects.requireNonNull(connectorId, "connectorId");

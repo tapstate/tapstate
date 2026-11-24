@@ -211,7 +211,14 @@ public final class SrsCaptureWriter implements AutoCloseable {
                     try { began(position); } catch (RuntimeException | Error failure) { close(); throw failure; }
                 }
                 @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
-                    try { append(events, position); } catch (RuntimeException | Error failure) { close(); throw failure; }
+                    try { append(events, position); }
+                    catch (RuntimeException | Error failure) {
+                        // Preserve the actual durable-write failure before closing.
+                        // Otherwise a scheduled checkpoint can replace it with the
+                        // secondary "writer closed" fence while the source unwinds.
+                        if (!closed.get()) health.fail(failure);
+                        close(); throw failure;
+                    }
                 }
             }), listener -> port.cdc(config, start, listener));
             sourceHandles.add(source);
@@ -255,25 +262,56 @@ public final class SrsCaptureWriter implements AutoCloseable {
 
     private synchronized void append(List<Envelope> events, Optional<SourcePosition> position) {
         ready();
+        // Validate the complete batch before admitting its first row. Only a typed,
+        // ordered structural receipt can advance history; SQL text alone still fails.
+        Map<String, SourceTable> shapes = new LinkedHashMap<>();
+        published.forEach((name, model) -> shapes.put(name, model.table()));
+        List<SourceSchemaChange> changes = new ArrayList<>(events.size());
+        for (Envelope event : events) {
+            if (!shapes.containsKey(event.src())) throw new TapstateException(CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
+            SourceSchemaChange change = null;
+            if (event.op() == Op.READ) throw unavailable(event.src());
+            if (event.op() == Op.DDL) {
+                Object receipt = event.schema() == null ? null : event.schema().get(SourceSchemaChange.ENVELOPE_KEY);
+                if (!(receipt instanceof SourceSchemaChange captured)
+                        || !event.src().equals(captured.after().name())
+                        || !shapes.get(event.src()).equals(captured.before())) throw unavailable(event.src());
+                change = captured;
+                shapes.put(event.src(), captured.after());
+            }
+            changes.add(change);
+        }
         Map<String, List<SrsItem>> selected = new LinkedHashMap<>();
         for (int i = 0; i < events.size(); i++) {
             Envelope event = events.get(i);
             SrsModel model = published.get(event.src());
-            if (model == null) throw new TapstateException(CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
-            // The connector's DDL origin is not a complete structural model or an ordered model boundary.
-            if (event.op() == Op.DDL || event.op() == Op.READ) throw unavailable(event.src());
             SourcePosition token = i == events.size() - 1 ? position.orElse(null) : null;
             selected.computeIfAbsent(event.src(), ignored -> new ArrayList<>()).add(new SrsItem(token, event.op(), event.ts(),
-                    event.before(), event.after(), model.key().modelVersion(), fence, opened.epoch()));
+                    event.before(), event.after(), model.key().modelVersion(), fence, opened.epoch(), event.op() == io.tapstate.core.event.Op.DDL ? SrsItem.portableSchema(event.schema()) : null));
+            if (changes.get(i) != null) {
+                admitSelected(selected);
+                selected.clear();
+                SourceTable after = changes.get(i).after();
+                if (!model.table().equals(after)) {
+                    if (model.key().modelVersion() == Long.MAX_VALUE) throw unavailable(event.src());
+                    var key = new SrsModelKey(model.key().miningChainId(), model.key().table(),
+                            model.key().cacheIncarnation(), model.key().captureEpoch(), model.key().modelVersion() + 1);
+                    // The DDL carries no row image and uses its preceding model. The
+                    // next row starts the new range, including when DDL is the first
+                    // captured event after a snapshot and the old range was empty.
+                    long first = Math.addExact(log.largestSequence(model.ringName()), 1L);
+                    SrsModel next = new SrsModel(key, model.ringName(), after, first);
+                    SrsModel saved = models.publish(next, fence);
+                    if (!next.equals(saved)) throw unavailable(event.src());
+                    published.put(event.src(), saved);
+                    // No row under this model exists yet. A checkpoint at the
+                    // model's first sequence minus one is the ordinary quiet-table
+                    // frontier, and remains valid after the preceding DDL is trimmed.
+                    frontiers.put(event.src(), new SrsTableCheckpoint(saved.key(), first - 1));
+                }
+            }
         }
-        // Validate every table and model before admitting the first share of this source batch.
-        for (var entry : selected.entrySet()) {
-            requireActive();
-            SrsWriteGate gate = gates.computeIfAbsent(entry.getKey(), table -> new SrsWriteGate(
-                    new SrsRingbuffer(member.getRingbuffer(SrsRingbuffer.ringName(opened.miningChainId(), table)))));
-            long last = CdcPhase.admitDurable(gate, entry.getKey(), entry.getValue(), this::requireActive);
-            frontiers.put(entry.getKey(), new SrsTableCheckpoint(published.get(entry.getKey()).key(), last));
-        }
+        admitSelected(selected);
         position.ifPresent(token -> {
             if (batchOrder >= Long.MAX_VALUE - 1) throw unproven();
             long next = batchOrder + 1;
@@ -281,6 +319,16 @@ public final class SrsCaptureWriter implements AutoCloseable {
             if (!batchCheckpoints || !checkpointInEpoch) flushCheckpoint();
             batchOrder = next;
         });
+    }
+
+    private void admitSelected(Map<String, List<SrsItem>> selected) {
+        for (var entry : selected.entrySet()) {
+            requireActive();
+            SrsWriteGate gate = gates.computeIfAbsent(entry.getKey(), table -> new SrsWriteGate(
+                    new SrsRingbuffer(member.getRingbuffer(SrsRingbuffer.ringName(opened.miningChainId(), table)))));
+            long last = CdcPhase.admitDurable(gate, entry.getKey(), entry.getValue(), this::requireActive);
+            frontiers.put(entry.getKey(), new SrsTableCheckpoint(published.get(entry.getKey()).key(), last));
+        }
     }
 
     private SrsCaptureCheckpoint checkpointAt(ChainPosition position) {

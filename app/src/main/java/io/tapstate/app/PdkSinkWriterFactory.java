@@ -72,6 +72,7 @@ final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSi
     private final Map<String, Object> settings;
     private final WriteMode writeMode;
     private final DdlPolicy ddl;
+    private final boolean ddlSourceColumns;
     private final OnFullLoad onFullLoad;
     private final boolean fullLoad;
     private final Map<String, TargetTable> targets;
@@ -109,6 +110,15 @@ final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSi
     private PdkSinkWriterFactory(String connectorId,Map<String,Object> settings,WriteMode writeMode,DdlPolicy ddl,
             Map<String,TargetTable> targets,PipelineNode node,OnFullLoad onFullLoad,boolean fullLoad,
             PipelineNode.Purpose purpose,ConfiguredSinkRun configured,Map<String,TargetIdentityPlan> identities) {
+        this(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,configured,identities,
+                purpose == PipelineNode.Purpose.SYNC);
+    }
+
+    private PdkSinkWriterFactory(String connectorId,Map<String,Object> settings,WriteMode writeMode,DdlPolicy ddl,
+            Map<String,TargetTable> targets,PipelineNode node,OnFullLoad onFullLoad,boolean fullLoad,
+            PipelineNode.Purpose purpose,ConfiguredSinkRun configured,Map<String,TargetIdentityPlan> identities,
+            boolean ddlSourceColumns) {
+        this.ddlSourceColumns=ddlSourceColumns;
         this.configured=configured;
         this.identities=identities==null?null:Map.copyOf(identities);
         if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
@@ -133,17 +143,21 @@ final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSi
         }).assess(config(),targets);
         return forRun(run,unchanged);
     }
+    PdkSinkWriterFactory withDdlSourceColumns(boolean direct) {
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,
+                purpose,configured,identities,direct);
+    }
     boolean guardsWritesFor(ExecutionFence fence) {
         return configured != null && configured.original().equals(fence);
     }
 
     PdkSinkWriterFactory withTargets(Map<String,TargetTable> restored) {
-        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,restored,node,onFullLoad,fullLoad,purpose,null,null);
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,restored,node,onFullLoad,fullLoad,purpose,null,null,ddlSourceColumns);
     }
     PdkSinkWriterFactory forRun(ConfiguredSinkRun run,Map<String,TargetIdentityPlan> identities) {
         if(!node.equals(run.node()) || purpose!=run.purpose())throw new IllegalArgumentException("configured sink run belongs to another node");
         if(!targets.keySet().equals(identities.keySet()))throw new IllegalArgumentException("frozen identities must cover every input stream");
-        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,run,identities);
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,run,identities,ddlSourceColumns);
     }
     java.util.List<io.tapstate.spi.store.SinkPreparationStore.Input> preparationInputs(io.tapstate.spi.store.PipelineIntentScope scope) {
         var physical=identities==null?targets.values():identities.values().stream().map(TargetIdentityPlan::target).toList();
@@ -198,7 +212,7 @@ final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSi
     }
 
     SinkConfig config() {
-        return new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad);
+        return new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad, ddlSourceColumns);
     }
 
     /**

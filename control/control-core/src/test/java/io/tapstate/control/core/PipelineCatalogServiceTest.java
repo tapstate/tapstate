@@ -29,6 +29,35 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class PipelineCatalogServiceTest {
 
+    @Test void aFailedCheckpointCannotLookRunningWhenItsOriginalDiagnosticWasNotPublished() {
+        var artifacts = new ArtifactQueryService(artifactStore(List.of(pipeline("orders", null))));
+        var desired = new MemoryDesiredStore(); desired.save(intent("orders", PipelineState.RUNNING));
+        var observations = new MemoryObservationStore();
+        var at = Instant.parse("2026-10-23T00:00:00Z");
+        var stored = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, at);
+        observations.save(stored);
+        var query = new PipelineObservationQueryService(artifacts, observations);
+        var facts = new io.tapstate.spi.store.StorePort.PipelineCatalogState(Optional.of(stored),
+                desired.read("orders"), Optional.empty(), false, PipelineState.FAILED);
+        var store = (io.tapstate.spi.store.StorePort) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{io.tapstate.spi.store.StorePort.class}, (proxy, method, args) -> {
+                    return switch (method.getName()) {
+                        case "desired" -> desired;
+                        case "pipelineCatalogStates" -> Map.of("orders", facts);
+                        case "pipelineRecoveryRequired" -> false;
+                        default -> throw new AssertionError("unexpected port " + method.getName());
+                    };
+                });
+        var service = new PipelineCatalogService(artifacts, new PipelineDraftService(new MemoryDraftStore()), query, store);
+        var item = service.find("orders").orElseThrow();
+        var status = query.findStatusWithPlan(item).orElseThrow();
+        assertThat(status.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(status.failure().code()).isEqualTo("monitor.failure-diagnostic-unavailable");
+        assertThat(status.observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(status.observedAt()).isEqualTo(at);
+        assertThat(observations.read("orders")).contains(stored);
+    }
+
     @Test void aStopReadAfterADiagnosisCannotDiscardItsEffectiveFailure() {
         var artifacts = new ArtifactQueryService(artifactStore(List.of(pipeline("orders", null))));
         var desired = new MemoryDesiredStore(); desired.save(intent("orders", PipelineState.RUNNING));

@@ -36,6 +36,11 @@ public interface PipelineStatePreparations {
     /** Read-only same-domain validation of captured Pipeline and Source definitions. */
     void validateSources(PipelineIntentScope scope, PipelinePreparationInputs inputs);
 
+    /** Does not alter a definition or clear state; implementations must validate the unchanged selectors. */
+    default PipelineTableExpansion authorizeTableExpansion(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
+        throw new UnsupportedOperationException("dynamic table expansion is not supported");
+    }
+
     /** Performed after obtaining an existing CACHE reservation and before seeding with its original fence. */
     void requireIssued(PipelineIntentScope scope, String preparationId);
 

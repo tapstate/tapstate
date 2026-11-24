@@ -290,7 +290,7 @@ public final class CdcPhase {
             SourcePosition pos = i == last ? position.orElse(null) : null;
             byTable.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(new SrsItem(
                     pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer(),
-                    route.chain().captureFence(), route.chain().epoch()));
+                    route.chain().captureFence(), route.chain().epoch(), event.op() == io.tapstate.core.event.Op.DDL ? SrsItem.portableSchema(event.schema()) : null));
         }
         String closingTable = events.get(last).src();
         long closingSeq = -1;
@@ -344,7 +344,7 @@ public final class CdcPhase {
      * cursor, so this call -- and with it the source read -- pauses until a consumer frees room, rather
      * than overwriting a change no consumer has read or burning a core spinning while it waits.
      *
-     * <p><strong>A share longer than the ring is admitted in ring-sized pieces.</strong> A run that can
+     * <p><strong>A share longer than the ring or the library batch limit is admitted in bounded pieces.</strong> A run that can
      * never fit at once would otherwise park forever waiting for room that no consumer can free, and the
      * whole capture would stop with nothing thrown -- the source asks for a bounded batch, but what a
      * connector hands over is the connector's to decide.
@@ -360,7 +360,8 @@ public final class CdcPhase {
 
     private static Admitted admit(SrsWriteGate gate, Supplier<Collection<ConsumerOffset>> consumers,
                                    String table, List<SrsItem> items, boolean durable, Runnable requireActive) {
-        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table, requireActive), Integer.MAX_VALUE);
+        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table, requireActive),
+                SrsRingbuffer.MAX_APPEND_BATCH);
         long lastSeq = -1;
         Collection<ConsumerOffset> offsets = List.of();
         for (int from = 0; from < items.size(); from += capacity) {

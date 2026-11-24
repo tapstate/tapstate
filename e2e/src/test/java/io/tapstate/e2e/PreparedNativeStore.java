@@ -61,6 +61,11 @@ final class PreparedNativeStore implements AutoCloseable {
         return install("e2e-" + UUID.randomUUID(), "e2e", "e2e-password", null, mongo::getReplicaSetUrl);
     }
 
+    /** Uses an explicitly supplied external MongoDB fixture with a separate database for each domain. */
+    static PreparedNativeStore createOn(Function<String, String> uriForDatabase) {
+        return install("e2e-" + UUID.randomUUID(), "e2e", "e2e-password", null, uriForDatabase);
+    }
+
     static PreparedNativeStore create(String username, String password) {
         return create("e2e-" + UUID.randomUUID(), username, password);
     }

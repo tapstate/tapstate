@@ -54,7 +54,14 @@ final class ConvergenceDriver {
             Function<PipelineConvergencePass, RebuildAdmission> rebuilds,
             Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts,
             Consumer<PipelineIntentStore.PendingStart> prepareStart,
-            Consumer<String> resumeRebuild) {
+            Consumer<String> resumeRebuild, Consumer<Collection<String>> refreshSources) {
+        ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
+                Function<PipelineConvergencePass, LifecycleActuator> actuators,
+                Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain,
+                PipelineAlertFeed alerts, Consumer<PipelineIntentStore.PendingStart> prepareStart,
+                Consumer<String> resumeRebuild) {
+            this(intents, stores, active, actuators, rebuilds, retain, alerts, prepareStart, resumeRebuild, null);
+        }
         ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
                 Function<PipelineConvergencePass, LifecycleActuator> actuators,
                 Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain) {
@@ -258,7 +265,10 @@ final class ConvergenceDriver {
         // And the rebuilds spent on them, or a pipeline created again under a deleted one's id would start
         // with whatever the deleted one had left of its budget.
         if (scoped == null) converger.retain(pipelineIds);
-        else scoped.retainRebuilds().accept(pipelineIds);
+        else {
+            scoped.retainRebuilds().accept(pipelineIds);
+            if (scoped.refreshSources() != null) scoped.refreshSources().accept(pipelineIds);
+        }
         if (scoped != null) alert(() -> scoped.alerts().retain(pipelineIds));
         publisher.forgetPipelinesOutside(pipelineIds);
         if (sampler != null) {

@@ -338,6 +338,7 @@ migration.changeset-failed
 migration.data-newer-than-binary
 migration.lock-timeout
 monitor.cursor-expired
+monitor.failure-diagnostic-unavailable
 monitor.invalid-cursor
 monitor.no-observation
 monitor.query-budget-exceeded

@@ -28,6 +28,15 @@ class PipelineStatusResponseTest {
     private final MessageCatalog catalog = MessageCatalog.bundled();
 
     @Test
+    void aLegacyFailedObservationHasACodedUnavailableDiagnosticWithoutInventingItsCause() {
+        var response = PipelineStatusResponse.of(new PipelineStatus("orders", PipelineState.FAILED), catalog);
+        assertThat(response.failure().code()).isEqualTo("monitor.failure-diagnostic-unavailable");
+        assertThat(response.failure().params()).containsOnly(java.util.Map.entry("pipeline", "orders"));
+        assertThat(response.failure().message()).contains("unavailable");
+        assertThat(response.observedAt()).isNull();
+    }
+
+    @Test
     void aCurrentDiagnosisKeepsTheLastStoredStateAndAgeExplicit() {
         var failure = new io.tapstate.core.lifecycle.ObservationFailure("engine.out-of-memory", java.util.Map.of("pipeline", "orders"));
         var status = new PipelineStatus("orders", PipelineState.RUNNING, null, OBSERVED_AT).diagnosed(failure);

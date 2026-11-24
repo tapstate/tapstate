@@ -36,8 +36,8 @@ import java.util.concurrent.Executors;
  *
  * <p>The write intent is enforced here: append mode reforges updates and deletes into inserts (an
  * append-only stream), while upsert mode passes them through keyed. A schema-change event is handled by
- * the ddl policy — {@code fail} rejects the batch with a code, {@code ignore} drops it; applying a
- * schema change to the target is a later slice, so {@code apply} drops it for now.
+ * the ddl policy — {@code fail} rejects the batch with a code, {@code ignore} drops it, and
+ * {@code apply} executes a typed target mutation between its preceding and following rows.
  *
  * <p>The connector is driven against the resolved target table model — its columns and the primary key
  * an upsert matches on. When no model was resolved the connector is handed a bare table id and left to
@@ -53,6 +53,7 @@ final class PdkSinkWriter implements SinkWriter {
     private final WriteMode mode;
     private final Map<String,String> writeAlternatives;
     private final DdlPolicy ddl;
+    private boolean ddlSourceColumns = true;
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
     private Map<String, TargetIdentityPlan> identities = Map.of();
@@ -143,6 +144,7 @@ final class PdkSinkWriter implements SinkWriter {
                         config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose, connector::requireActive,receipts), letGo);
         withOperationObserver(observer);
         identityConfig = config;
+        ddlSourceColumns = config.ddlSourceColumns();
         identities = PdkTargetIdentityPlanner.assess(connector, config, this.targets,observer);
         identities.values().forEach(TargetIdentityProjection::requireUsable);
         PdkTargetIdentityPlanner.requireSame(config, plannedIdentities, identities);
@@ -231,11 +233,22 @@ final class PdkSinkWriter implements SinkWriter {
     private synchronized WriteResult deliver(List<Envelope> records) {
         try {
             return connector.underLoader(() -> {
+                Map<Integer, PdkMongoDdl.Plan> ddlPlans = new LinkedHashMap<>();
+                for (int i = 0; i < records.size(); i++) {
+                    Envelope event = records.get(i);
+                    if (event.op() != Op.DDL) continue;
+                    if (ddl == DdlPolicy.FAIL) throw new IllegalStateException("schema change reached a sink whose ddl policy is fail");
+                    if (ddl == DdlPolicy.APPLY) {
+                        var plan = PdkMongoDdl.prepare(connector.connectorId(), event,
+                                projectedTarget(event.src(), targets.get(event.src())), ddlSourceColumns);
+                        if (!plan.mutations().isEmpty() && connector.functions().getExecuteCommandFunction() == null)
+                            throw new UnsupportedOperationException("target DDL mutation function is unavailable for " + plan.table());
+                        ddlPlans.put(i, plan);
+                    }
+                }
+                // Preserve whole-batch identity and append refusal before any row or DDL write.
                 EncodedBatch batch = encodedRows(records);
                 Map<String, List<TapRecordEvent>> rowsByTable = batch.rows();
-                if (rowsByTable.isEmpty()) {
-                    return new WriteResult(0);
-                }
                 if (mode == WriteMode.APPEND && rowsByTable.size() > 1) {
                     // Reject before the first write so a retry cannot duplicate an earlier table.
                     throw writeFailed(connector.connectorId(), new IllegalStateException(
@@ -245,13 +258,45 @@ final class PdkSinkWriter implements SinkWriter {
                     if (!identityPrepared) prepareTargets();
                     batch.keys().forEach((stream, keys) -> PdkMongoIdentityGuard.verify(connector, identities.get(stream), keys));
                 }
-                return writeRows(rowsByTable);
+                if (ddlPlans.isEmpty()) return writeRows(rowsByTable);
+                long written = 0;
+                List<Envelope> pendingRows = new ArrayList<>();
+                for (int i = 0; i < records.size(); i++) {
+                    Envelope event = records.get(i);
+                    if (event.op() != Op.DDL) { pendingRows.add(event); continue; }
+                    written += writeRows(encodedRows(pendingRows).rows()).written();
+                    pendingRows.clear();
+                    var plan = ddlPlans.get(i);
+                    try { PdkMongoDdl.apply(connector, plan); }
+                    catch (Throwable failure) { operation(plan.table(), failure); throw failure; }
+                    operation(plan.table(), null);
+                    updateDdlHints(event, plan);
+                }
+                return new WriteResult(written + writeRows(encodedRows(pendingRows).rows()).written());
             });
         } catch (TapstateException e) {
             throw e;
         } catch (Throwable t) {
             throw writeFailed(connector.connectorId(), t);
         }
+    }
+
+    private void updateDdlHints(Envelope event, PdkMongoDdl.Plan plan) {
+        var table = tableModels.get(event.src());
+        if (table == null || table.getNameFieldMap() == null) return;
+        Set<String> removed = new HashSet<>();
+        if (plan.action().equals("drop") || plan.action().equals("attributes")) removed.add(plan.field());
+        if (plan.action().equals("add") && event.schema().get(PdkDdlCommand.KEY) instanceof Map<?,?> command
+                && command.get("fields") instanceof List<?> fields)
+            for (var value : fields) if (value instanceof Map<?,?> field) removed.add(String.valueOf(field.get("name")));
+        TapTable next = new TapTable(table.getId());
+        for (var value : table.getNameFieldMap().values()) {
+            if (removed.contains(value.getName())) continue;
+            var field = PdkRowSchema.copyField(value);
+            if (plan.action().equals("rename") && field.getName().equals(plan.field())) field.setName(plan.after());
+            next.add(field);
+        }
+        tableModels.put(event.src(), next);
     }
 
     private record EncodedBatch(Map<String, List<TapRecordEvent>> rows,
@@ -261,14 +306,7 @@ final class PdkSinkWriter implements SinkWriter {
         Map<String, List<Map<String, Object>>> keys = new LinkedHashMap<>();
         Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
         for (Envelope env : records) {
-            if (env.op() == Op.DDL) {
-                if (ddl == DdlPolicy.FAIL) {
-                    throw writeFailed(connector.connectorId(),
-                            new IllegalStateException("schema change reached a sink whose ddl policy is fail"));
-                }
-                // ignore: drop the schema change. apply: applying it to the target is a later slice, so drop it too.
-                continue;
-            }
+            if (env.op() == Op.DDL) continue;
             TargetIdentityPlan identity = identities.get(env.src());
             Envelope row = identity == null ? env : TargetIdentityProjection.apply(identity, env);
             collectDocumentKeys(identity, row, keys);

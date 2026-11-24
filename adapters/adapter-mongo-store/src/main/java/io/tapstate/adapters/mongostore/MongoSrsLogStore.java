@@ -614,6 +614,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
         if (record.after() != null) {
             document.append("after", RowImages.toDocument(record.after()));
         }
+        if (record.schema() != null) document.append("schema", RowImages.toDocument(record.schema()));
         return document;
     }
 
@@ -627,7 +628,8 @@ public final class MongoSrsLogStore implements SrsLogStore {
                     rowImage(document, "after"),
                     document.getLong("schemaVer"),
                     readFence(document.get("captureFence", Document.class)),
-                    document.containsKey("epoch") ? document.getLong("epoch") : 0L);
+                    document.containsKey("epoch") ? document.getLong("epoch") : 0L,
+                    rowImage(document, "schema"));
         } catch (RuntimeException e) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                     Map.of("id", String.valueOf(document.get("_id"))), e);

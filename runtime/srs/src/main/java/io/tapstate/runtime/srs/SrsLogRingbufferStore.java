@@ -80,7 +80,7 @@ final class SrsLogRingbufferStore implements RingbufferStore<Object> {
                 item.before(),
                 item.after(),
                 item.schemaVer(),
-                item.captureFence(), item.epoch());
+                item.captureFence(), item.epoch(), item.schema());
     }
 
     private static SrsItem toItem(SrsLogRecord record) {
@@ -91,6 +91,6 @@ final class SrsLogRingbufferStore implements RingbufferStore<Object> {
                 record.before(),
                 record.after(),
                 record.schemaVer(),
-                record.captureFence(), record.epoch());
+                record.captureFence(), record.epoch(), record.schema());
     }
 }

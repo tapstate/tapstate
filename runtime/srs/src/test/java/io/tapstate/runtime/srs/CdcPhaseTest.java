@@ -107,6 +107,9 @@ class CdcPhaseTest {
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
                 .setBackupCount(0));
+        config.addRingBufferConfig(new RingbufferConfig("srs.large-delivery")
+                .setCapacity(4096).setInMemoryFormat(InMemoryFormat.OBJECT)
+                .setTimeToLiveSeconds(0).setBackupCount(0));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         hz = Hazelcast.newHazelcastInstance(config);
@@ -321,6 +324,19 @@ class CdcPhaseTest {
      * buffer assigned, not off a clock: it says all of them were admitted whether or not any is still in
      * memory, which for a burst past the buffer's size is the only honest way to ask.
      */
+    @Test
+    void aNativeDeliveryBeyondTheHazelcastBatchLimitPreservesEveryRowAndClosingPosition() {
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.large-delivery"));
+        List<SrsItem> items = java.util.stream.IntStream.range(0, 2001)
+                .mapToObj(id -> new SrsItem(id == 2000 ? new SourcePosition("committed-burst") : null,
+                        Op.INSERT, id, null, Map.of("id", id), 1L)).toList();
+        assertThat(CdcPhase.admitDurable(new SrsWriteGate(ring), "orders", items, () -> {}))
+                .isEqualTo(2000L);
+        for (int id = 0; id < items.size(); id++) {
+            assertThat(ring.readOne(id)).isEqualTo(items.get(id));
+        }
+    }
+
     @Test
     void aBurstPastTheBufferGetsThroughWholeAndCostsOneWrite() {
         SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.burst"));

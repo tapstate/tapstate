@@ -235,12 +235,14 @@ class FullPdkConversionTest {
         TapTable table = new TapTable("values");
         table.add(new TapField("stamp", "custom-time").tapType(type));
         TapCodecsRegistry source = new TapCodecsRegistry();
+        PdkRowSchema frozen = PdkRowSchema.of(table);
         source.registerToTapValue(Long.class, (raw, schema) -> {
-            assertThat(schema).isSameAs(type);
+            assertThat(schema).isSameAs(frozen.fields().get("stamp").getTapType());
+            assertThat(schema).usingRecursiveComparison().isEqualTo(type);
             return new TapDateTimeValue(new DateTime(PRECISE));
         });
         var cdc = TapEventCodec.decodeChange(TapInsertRecordEvent.create().table("values")
-                .after(Map.of("stamp", 7L)), source, PdkRowSchema.of(table));
+                .after(Map.of("stamp", 7L)), source, frozen);
         assertThat(ConvertedValue.unwrap(cdc.after().get("stamp"))).isEqualTo(PRECISE);
     }
 

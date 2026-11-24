@@ -256,7 +256,7 @@ public final class SrsRingReader {
     private static SrsItem itemOf(SrsLogRecord record) {
         return new SrsItem(record.srcToken() == null ? null : new SourcePosition(record.srcToken()),
                 record.op(), record.ts(), record.before(), record.after(), record.schemaVer(),
-                record.captureFence(), record.epoch());
+                record.captureFence(), record.epoch(), record.schema());
     }
 
     private static long resolveStartSeq(SrsRingbuffer ring, StartFrom start, String retention) {

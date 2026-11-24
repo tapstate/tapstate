@@ -14,6 +14,22 @@ class PipelinePreparationInputsTest {
         return new PipelineResource("flow",metadata,List.of(SourceRef.spec("input",shared)),null,null,null,new Settings(null,null,null,null,mode,start),null);
     }
     private static PipelinePreparationInputs inputs(PipelineResource pipeline,SourceResource source) { return PipelinePreparationInputs.of(SCOPE,pipeline,Map.of("input",source),Map.of("input",Set.of("orders"))); }
+    @Test void discoveryExpansionCannotChangeTheSourceOrDiscardEarlierTables() {
+        var shared = pipeline(true,ReadMode.SNAPSHOT_AND_CDC,null,null);
+        var source = source("x",null);
+        var original = inputs(shared,source);
+        var added = PipelinePreparationInputs.of(SCOPE,shared,Map.of("input",source),Map.of("input",Set.of("orders","new_table")));
+        assertThat(added.expandsDiscoveredTables(original)).isTrue();
+        assertThat(original.expandsDiscoveredTables(original)).isFalse();
+        assertThat(PipelinePreparationInputs.of(SCOPE,shared,Map.of("input",source),Map.of("input",Set.of("new_table")))
+                .expandsDiscoveredTables(original)).isFalse();
+        assertThat(PipelinePreparationInputs.of(SCOPE,shared,Map.of("input",source("other-database",null)),Map.of("input",Set.of("orders","new_table")))
+                .expandsDiscoveredTables(original)).isFalse();
+        var direct = pipeline(false,ReadMode.SNAPSHOT_AND_CDC,null,null);
+        assertThat(PipelinePreparationInputs.of(SCOPE,direct,Map.of("input",source),Map.of("input",Set.of("orders","new_table")))
+                .expandsDiscoveredTables(inputs(direct,source))).isFalse();
+    }
+
     @Test void anExplicitSharedKeyCannotHideAChangedPhysicalSourceBehindTheSamePrivateId() {
         var pipeline = pipeline(false,ReadMode.CDC_ONLY,"latest",null); var old = inputs(pipeline,source("x",null)); var next = inputs(pipeline,source("y",null));
         assertThat(next.directChannels().getFirst().context()).isEqualTo(old.directChannels().getFirst().context());

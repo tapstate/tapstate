@@ -121,6 +121,9 @@ public final class ControlOperations {
             "source.reveal-config", Scope.ADMIN, true, ControlApiSchema.ref("source.reveal-config"),
             "Reserved single-Source plaintext config flow. This release has no successful production "
                     + "authorizer and exposes it on no CLI, MCP, or Web face.", Map.of());
+    public static final Operation PIPELINE_EXPAND_SOURCE_TABLES = new Operation(
+            "pipeline.expand-source-tables", Scope.WRITE, true, null,
+            "Internally admit discovered SRS tables under unchanged selectors and reassemble without clearing progress.", Map.of());
     public static final Operation SOURCE_SCHEMA = new Operation(
             "source.schema", Scope.READ, false, null,
             "Read a Source's latest discovered schema, limited to the tables that Source declares.", CLI_ONLY);
@@ -446,6 +449,7 @@ public final class ControlOperations {
             SOURCE_LIST,
             SOURCE_GET,
             SOURCE_REVEAL_CONFIG,
+            PIPELINE_EXPAND_SOURCE_TABLES,
             SOURCE_SCHEMA,
             SOURCE_UPDATE,
             SOURCE_DELETE,

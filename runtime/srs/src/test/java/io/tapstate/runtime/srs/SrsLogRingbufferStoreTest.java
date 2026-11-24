@@ -139,6 +139,19 @@ class SrsLogRingbufferStoreTest {
         });
     }
 
+    @Test
+    void carriesDdlThroughSerializationAndDurableReadBack() {
+        RecordingLog log = new RecordingLog();
+        var schema = Map.<String,Object>of("tapstateDdl", Map.of("format", 1, "action", "drop", "field", "V"));
+        withMember(log, member -> {
+            member.getRingbuffer(RING).add(new SrsItem(null, Op.DDL, 1L, null, null, 0L, null, 2L, schema));
+            assertThat(log.load(RING, 0L).orElseThrow().schema()).isEqualTo(schema);
+            assertThat(new SrsRingbuffer(member.getRingbuffer(RING)).readOne(0).schema()).isEqualTo(schema);
+            assertThat(new SrsLogRingbufferStore(log, RING).load(0)).isInstanceOfSatisfying(SrsItem.class,
+                    restored -> assertThat(restored.schema()).isEqualTo(schema));
+        });
+    }
+
     /**
      * The read-back half, and it is the one the log exists for. Every other case here says a change was
      * written down; none of them says anybody can get it back once the ring no longer holds it, which is

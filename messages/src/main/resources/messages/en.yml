@@ -932,6 +932,9 @@ position.nothing-to-write:
 monitor.no-observation:
   message: "No observation is available for pipeline {pipeline}."
   solution: "Check the pipeline id for typos; a freshly started pipeline may take a moment to publish its first observation."
+monitor.failure-diagnostic-unavailable:
+  message: "Pipeline {pipeline} is FAILED, but its detailed diagnostic is unavailable."
+  solution: "Retry status to obtain a diagnostic still being published. If it remains unavailable, inspect the server logs before stopping and restarting the pipeline."
 monitor.invalid-cursor:
   message: "The cursor for {operation} is invalid ({reason})."
   solution: "Start a new history query, then repeat every query parameter unchanged when following its next cursor."

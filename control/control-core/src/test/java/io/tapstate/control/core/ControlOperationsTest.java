@@ -33,6 +33,7 @@ class ControlOperationsTest {
                         "source.list",
                         "source.get",
                         "source.reveal-config",
+                        "pipeline.expand-source-tables",
                         "source.schema",
                         "source.update",
                         "source.delete",
@@ -168,6 +169,7 @@ class ControlOperationsTest {
                         "source.update",
                         "source.delete",
                         "source.reveal-config",
+                        "pipeline.expand-source-tables",
                         "connection.test",
                         "connection.discover-schema",
                         "connector.register",
@@ -228,7 +230,7 @@ class ControlOperationsTest {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(85);
-        assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
+        assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id()) && !"pipeline.expand-source-tables".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
@@ -248,7 +250,7 @@ class ControlOperationsTest {
         assertThat(registry.all()).filteredOn(op -> !op.exposure().isEmpty()).allSatisfy(op ->
                 assertThat(op.exposure().values()).as(op.id()).containsOnly(Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.exposure().isEmpty())
-                .extracting(Operation::id).containsExactly("source.reveal-config");
+                .extracting(Operation::id).containsExactly("source.reveal-config", "pipeline.expand-source-tables");
     }
 
     @Test

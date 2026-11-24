@@ -146,7 +146,15 @@ public final class PipelineCatalogService {
         PipelineState observed = observation == null ? null : observation.observedState();
         PipelineState effective = observation == null ? null : observation.state();
         PipelineState checkpoint = stateFacts == null ? null : stateFacts.checkpoint();
-        if (engineState != null) effective = engineState;
+        var reportedFailure = observation == null ? null : observation.failure();
+        boolean diagnosticUnavailable = reportedFailure == null
+                && (checkpoint == PipelineState.FAILED || effective == PipelineState.FAILED);
+        if (diagnosticUnavailable) {
+            effective = PipelineState.FAILED;
+            reportedFailure = new io.tapstate.core.lifecycle.ObservationFailure(
+                    MonitorError.FAILURE_DIAGNOSTIC_UNAVAILABLE.code(), Map.of("pipeline", id));
+        }
+        if (engineState != null && !diagnosticUnavailable) effective = engineState;
         if (effective == null && stateFacts != null && stateFacts.runningObservationUnavailable()
                 && checkpoint == PipelineState.RUNNING) effective = checkpoint;
         PipelineState target;
@@ -175,7 +183,7 @@ public final class PipelineCatalogService {
 
         // The current failure and the later intent projection remain separate even if STOP arrived
         // after diagnosis. Converting this item must not infer runtime truth from the UI transition.
-        PipelineCatalogItem.DisplayState runtimeState = engineState != null
+        PipelineCatalogItem.DisplayState runtimeState = diagnosticUnavailable ? PipelineCatalogItem.DisplayState.FAILED : engineState != null
                 ? PipelineCatalogItem.DisplayState.valueOf(engineState.name())
                 : observation == null && stateFacts != null && stateFacts.scope() != null
                         && !stateFacts.runningObservationUnavailable()
@@ -198,7 +206,7 @@ public final class PipelineCatalogService {
                                 : PipelineCatalogItem.UiState.of(state, hasArtifact),
                         target,
                         observed,
-                        observation == null ? null : observation.failure(),
+                        reportedFailure,
                         observation == null ? null : observation.observedAt(),
                         intentReadFailure));
     }

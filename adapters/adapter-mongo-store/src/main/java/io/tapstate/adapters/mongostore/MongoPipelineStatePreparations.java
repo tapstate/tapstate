@@ -60,6 +60,68 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
                 clusterId, bindings, artifacts, () -> { requireActive.run(); additional.run(); });
     }
 
+    @Override public io.tapstate.spi.store.PipelineTableExpansion authorizeTableExpansion(
+            PipelineIntentScope scope, PipelinePreparationInputs inputs) {
+        Objects.requireNonNull(inputs, "inputs");
+        var dynamic = transaction(session -> expansionSources(session, scope, inputs));
+        return new TableExpansion(scope, inputs, dynamic);
+    }
+
+    private java.util.Set<String> expansionSources(ClientSession session, PipelineIntentScope scope,
+            PipelinePreparationInputs inputs) {
+        var row = requireCurrent(session, scope);
+        var preparation = MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId);
+        if (preparation.phase() != PipelinePreparation.Phase.COMPLETE || !scope.equals(preparation.scope())) throw fenced();
+        var verified = verifiedInputs(session, scope, inputs);
+        var pipeline = verified.pipeline();
+        if (pipeline.view() != null || pipeline.transforms() != null && !pipeline.transforms().isEmpty()
+                || !(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null || serve.sync().isEmpty()
+                || serve.sync().stream().anyMatch(sync -> sync.rename() != null)) throw fenced();
+        if (pipeline.settings() != null && pipeline.settings().readMode() != null
+                && pipeline.settings().readMode() != ReadMode.SNAPSHOT_AND_CDC) throw fenced();
+        var dynamic = new java.util.HashSet<String>();
+        for (var ref : pipeline.sources()) {
+            if (!(ref instanceof SourceRef.Spec spec) || !spec.srs()) continue;
+            var source = verified.sources().get(ref.id());
+            if (source.tables() == null || source.tables().stream().anyMatch(value -> value instanceof TableRef.Regex))
+                dynamic.add(source.id());
+        }
+        return java.util.Set.copyOf(dynamic);
+    }
+
+    private final class TableExpansion implements io.tapstate.spi.store.PipelineTableExpansion {
+        private final PipelineIntentScope scope;
+        private final PipelinePreparationInputs inputs;
+        private final java.util.Set<String> dynamic;
+        TableExpansion(PipelineIntentScope scope, PipelinePreparationInputs inputs, java.util.Set<String> dynamic) {
+            this.scope = scope; this.inputs = inputs; this.dynamic = dynamic;
+        }
+        public PipelineIntentScope scope() { return scope; }
+        public PipelinePreparationInputs inputs() { return inputs; }
+        public java.util.Set<String> dynamicSources() { return dynamic; }
+        public void requireCurrent() {
+            if (!transaction(session -> expansionSources(session, scope, inputs)).equals(dynamic)) throw fenced();
+        }
+        public boolean requestRestart(io.tapstate.spi.store.PipelineIntentSnapshot original, long checkpointEpoch) {
+            if (checkpointEpoch < 0 || !scope.equals(original.scope()) || original.deleted()
+                    || original.desired().targetState() != io.tapstate.core.lifecycle.PipelineState.RUNNING
+                    || original.desired().purgeState() || !inputs.pipelineHash().equals(original.desired().revision())) throw fenced();
+            var next = new io.tapstate.core.lifecycle.DesiredState(scope.pipelineId(),
+                    io.tapstate.core.lifecycle.PipelineState.RUNNING, inputs.pipelineHash(), false,
+                    original.desired().assemblyRevision(), true, checkpointEpoch);
+            return transaction(session -> {
+                if (!expansionSources(session, scope, inputs).equals(dynamic)) throw fenced();
+                return new MongoPipelineIntentStore(client, database, clusterId, bindings)
+                        .changeInTransaction(session, scope, original.intentRevision(), next);
+            });
+        }
+    }
+
+    static void requireTableExpansion(io.tapstate.spi.store.PipelineTableExpansion permission) {
+        if (!(permission instanceof MongoPipelineStatePreparations.TableExpansion)) throw fenced();
+        permission.requireCurrent();
+    }
+
     @Override public Optional<PipelinePreparation> read(String pipelineId) {
         requireId(pipelineId);
         return transaction(session -> {

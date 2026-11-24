@@ -3,3 +3,6 @@
 # image itself.
 *
 !app/target/app-*-boot.jar
+!deploy/
+!deploy/docker/
+!deploy/docker/install-native-runtime.sh

@@ -3756,6 +3756,8 @@ final class StoreBackedDagSource implements DagSource {
                 TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
                 onFullLoad(element.onFullLoad()), freshFullLoad);
+        if (writer instanceof PdkSinkWriterFactory pdk) writer = pdk.withDdlSourceColumns(
+                pipeline.view() == null && (pipeline.transforms() == null || pipeline.transforms().isEmpty()));
         return sinkWriterBinder.scoped(writer,fence,targetPreparations,targetGuard);
     }
 

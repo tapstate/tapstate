@@ -183,6 +183,64 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         return new Receipt(original.scope(), original.preparationId());
     }
 
+    @Override public SourceInputs sourceInputs(PipelineIntentScope scope) {
+        requireScope(scope);
+        var access = new MongoCachePipelineAccess(client, database, scope, null, requireActive);
+        return access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS, false, session -> {
+            var inputs = MongoPipelineSourcePreparations.retained(session, database, scope);
+            var key = new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+            var row = claims.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+            var marker = row.get("discoveredTableExpansion", Document.class);
+            boolean expanded = marker != null && MongoPipelinePreparationFacts.scope(scope).equals(marker.get("scope"))
+                    && MongoPipelineSourcePreparations.encode(inputs).get("contentHash").equals(marker.get("inputsHash"));
+            return new SourceInputs(inputs, expanded);
+        });
+    }
+
+    @Override public boolean expandSources(io.tapstate.spi.store.PipelineTableExpansion permission, WorkloadClaimFence node) {
+        MongoPipelineStatePreparations.requireTableExpansion(permission);
+        var scope = permission.scope(); var next = permission.inputs(); requireScope(scope);
+        var access = new MongoCachePipelineAccess(client, database, scope, null, requireActive);
+        boolean changed = access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS, false, session -> {
+            new MongoCacheBusinessIdentity(database, business).admitMetadataWrite(session);
+            proveNode(session, node);
+            var original = MongoPipelineSourcePreparations.retained(session, database, scope);
+            if (original.equals(next)) return false;
+            if (!next.expandsDiscoveredTables(original)) throw MongoPipelineSourcePreparations.identityUnproven(scope);
+            for (var entry : next.selectedTables().entrySet()) {
+                if (!original.selectedTables().get(entry.getKey()).containsAll(entry.getValue())
+                        && !permission.dynamicSources().contains(entry.getKey()))
+                    throw MongoPipelineSourcePreparations.identityUnproven(scope);
+            }
+            MongoPipelineSourcePreparations.verifyAll(session, client, database, scope, original, requireActive);
+            MongoSnapshotStateStore.order(session, database, scope);
+            var key = new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+            var filter = new Document("_id", MongoWorkloadClaimStore.id(key))
+                    .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope))
+                    .append("pipelineSources", MongoPipelineSourcePreparations.encode(original));
+            var encoded = MongoPipelineSourcePreparations.encode(next);
+            var addedTables = new java.util.TreeSet<String>();
+            for (var entry : next.selectedTables().entrySet())
+                for (String table : entry.getValue())
+                    if (!original.selectedTables().get(entry.getKey()).contains(table)) addedTables.add(table);
+            var heldClaim = claims.find(session, filter).first();
+            if (heldClaim == null) throw claimFenced();
+            var previousExpansion = heldClaim.get("discoveredTableExpansion", Document.class);
+            if (previousExpansion != null && MongoPipelinePreparationFacts.scope(scope).equals(previousExpansion.get("scope")))
+                addedTables.addAll(previousExpansion.getList("addedTables", String.class, java.util.List.of()));
+            var marker = new Document("scope", MongoPipelinePreparationFacts.scope(scope))
+                    .append("inputsHash", encoded.get("contentHash"))
+                    .append("addedTables", java.util.List.copyOf(addedTables));
+            if (claims.updateOne(session, filter, new Document("$set",
+                    new Document("pipelineSources", encoded).append("discoveredTableExpansion", marker))).getMatchedCount() != 1)
+                throw claimFenced();
+            return true;
+        });
+        // Reassembly is separately CASed against the original CONFIG intent and definitions.
+        permission.requireCurrent();
+        return changed;
+    }
+
     @Override public void verifySources(PipelineIntentScope scope,PipelinePreparationInputs expected) {
         Objects.requireNonNull(expected,"expected"); requireScope(scope);
         var access = new MongoCachePipelineAccess(client,database,scope,null,requireActive);

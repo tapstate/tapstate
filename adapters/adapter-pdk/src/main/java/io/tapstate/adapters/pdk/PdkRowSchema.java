@@ -15,8 +15,10 @@ record PdkRowSchema(Map<String, TapField> fields, Map<String, String> declared,
     static final PdkRowSchema EMPTY = new PdkRowSchema(Map.of(), Map.of(), Map.of());
 
     static PdkRowSchema of(TapTable table) {
-        Map<String, TapField> fields = table == null || table.getNameFieldMap() == null
-                ? Map.of() : table.getNameFieldMap();
+        Map<String, TapField> fields = new LinkedHashMap<>();
+        if (table != null && table.getNameFieldMap() != null) {
+            table.getNameFieldMap().forEach((name, field) -> fields.put(name, field == null ? null : copyField(field)));
+        }
         if (fields.isEmpty()) return EMPTY;
         Map<String, String> names = new LinkedHashMap<>();
         Map<TapType, PdkTypeDescription> descriptions = new IdentityHashMap<>();
@@ -27,6 +29,16 @@ record PdkRowSchema(Map<String, TapField> fields, Map<String, String> declared,
             }
         });
         return new PdkRowSchema(fields, names, Collections.unmodifiableMap(descriptions));
+    }
+
+    static TapField copyField(TapField field) {
+        TapField copy = field.clone();
+        TapType type = field.getTapType();
+        if (type != null) {
+            // PDK TapNumber.clone() drops fixed; preserve the complete codec type description.
+            copy.setTapType(PdkJsonProvider.parser().fromJson(PdkTypeDescription.describe(type), type.getClass()));
+        }
+        return copy;
     }
 
     static PdkRowSchema declared(Map<String, String> names) {

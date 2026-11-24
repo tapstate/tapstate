@@ -681,11 +681,31 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 }, runtime::health, scope, deployment, clock, audit).dispatch(operation, caller, input);
             };
         }
+        @Bean(destroyMethod = "close") DynamicSourceTableRefresh dynamicSourceTableRefresh(
+                NativeBusinessContext owner, NodeSessionLease node, Clock clock,
+                ConnectorProvisioner connectors, Engine engine) {
+            Runnable active = owner.memberStorage::requireNode;
+            var scope = owner.original.preparation().businessScope();
+            var audit = new AuditGate(owner.configuration.audit(), clock);
+            var probe = new io.tapstate.runtime.probe.DelegatingSchemaDiscoveryProbe(
+                    new io.tapstate.adapters.pdk.PdkSchemaDiscoverer(connectors));
+            // The admitted declarations are unchanged; use the original business's metadata and secrets.
+            var discovery = new SchemaDiscoveryService(probe, owner.port.schemas(), audit, clock, null,
+                    new SourceConnectionResolver(owner.port.artifacts()));
+            var refresh = new DynamicSourceTableRefresh.Refresh(owner.port.artifacts(), owner.port.schemas(),
+                    owner.configuration.intents().guardedBy(active), owner.configuration.preparations().guardedBy(active),
+                    owner.original.cache().pipelinePreparations(scope, active), owner.original.cache(),
+                    owner.context.getBean(SrsStores.class).consumers().guardedBy(active), discovery, audit, engine,
+                    () -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused), active);
+            return new DynamicSourceTableRefresh(refresh, Duration.ofSeconds(30));
+        }
+
         @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
-                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,ClusterNodeAlertSource resourceAlerts) {
+                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,ClusterNodeAlertSource resourceAlerts,
+                DynamicSourceTableRefresh refresh) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
@@ -720,7 +740,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                         try (var ignored = ownership.enterPass(intent.scope())) {
                                             rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
                                         }
-                                    })));
+                                    }), refresh::consider));
         }
         @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {

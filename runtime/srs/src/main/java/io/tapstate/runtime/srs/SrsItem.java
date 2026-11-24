@@ -41,7 +41,13 @@ public record SrsItem(
         Map<String, Object> after,
         long schemaVer,
         WorkloadClaimFence captureFence,
-        long epoch) {
+        long epoch,
+        Map<String, Object> schema) {
+
+    public SrsItem(SourcePosition srcPos, Op op, long ts, Map<String, Object> before,
+            Map<String, Object> after, long schemaVer, WorkloadClaimFence captureFence, long epoch) {
+        this(srcPos, op, ts, before, after, schemaVer, captureFence, epoch, null);
+    }
 
     public SrsItem(SourcePosition srcPos, Op op, long ts, Map<String, Object> before,
             Map<String, Object> after, long schemaVer, WorkloadClaimFence captureFence) {
@@ -71,6 +77,16 @@ public record SrsItem(
         }
         before = copyOrNull(before);
         after = copyOrNull(after);
+        schema = copyOrNull(schema);
+        if (schema != null && op != Op.DDL) throw new IllegalArgumentException("only DDL carries a schema command");
+    }
+
+    /** Local model receipts never cross the change-log boundary. */
+    static Map<String, Object> portableSchema(Map<String, Object> schema) {
+        if (schema == null) return null;
+        Map<String, Object> portable = new LinkedHashMap<>(schema);
+        portable.remove(io.tapstate.spi.store.SourceSchemaChange.ENVELOPE_KEY);
+        return portable.isEmpty() ? null : portable;
     }
 
     private static Map<String, Object> copyOrNull(Map<String, Object> map) {

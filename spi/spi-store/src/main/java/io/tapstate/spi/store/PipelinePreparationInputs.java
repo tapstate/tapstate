@@ -36,6 +36,13 @@ public record PipelinePreparationInputs(String pipelineHash,Map<String,String> s
         }
         return new PipelinePreparationInputs(CanonicalHash.of(pipeline),hashes,selections,direct);
     }
+    /** No connection, declaration, Pipeline, private-channel or prior table may change with discovery. */
+    public boolean expandsDiscoveredTables(PipelinePreparationInputs original) {
+        return pipelineHash.equals(original.pipelineHash) && sourceHashes.equals(original.sourceHashes)
+                && directChannels.equals(original.directChannels) && !selectedTables.equals(original.selectedTables)
+                && original.selectedTables.entrySet().stream().allMatch(entry ->
+                        selectedTables.get(entry.getKey()).containsAll(entry.getValue()));
+    }
     public boolean sameRecovery(PipelinePreparationInputs other) { return directChannels.equals(Objects.requireNonNull(other,"other").directChannels); }
     private static boolean hash(String value) { return value != null && value.matches("[0-9a-f]{64}"); }
 }

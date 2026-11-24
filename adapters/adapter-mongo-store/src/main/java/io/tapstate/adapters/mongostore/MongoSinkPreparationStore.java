@@ -62,7 +62,10 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
                     var before = marker(claim);
                     String operation = before.getString(PREPARATION_ID);
                     if (before.get(TARGETS) != null) {
-                        if (!manifest.equals(before.get(TARGETS))) throw rebuild(access.scope);
+                        if (!manifest.equals(before.get(TARGETS))) {
+                            expandTargets(session, claim, before, manifest, Map.of());
+                            return null;
+                        }
                         verifyClosure(session, manifest, operation);
                         return null;
                     }
@@ -135,6 +138,9 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
                         .on(access.database)
                         .find(session, new Document("_id", id(candidate.input().key())))
                         .first();
+        if (raw == null && authoring != null
+                && MongoPipelineSourcePreparations.retained(session, access.database, access.scope).equals(authoring)
+                && admitsDiscoveredTarget(claim(session), manifest, candidate.input())) return candidate;
         var held = decode(raw);
         var original = held.input();
         if (!held.operationId().equals(control.getString(PREPARATION_ID))
@@ -259,10 +265,14 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
                 true,
                 session -> {
                     var table = SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database);
-                    var before = marker(claim(session));
+                    var heldClaim = claim(session);
+                    var before = marker(heldClaim);
                     String operation = before.getString(PREPARATION_ID);
                     if (before.get(TARGETS) != null) {
-                        if (!manifest.equals(before.get(TARGETS))) throw rebuild(access.scope);
+                        if (!manifest.equals(before.get(TARGETS))) {
+                            expandTargets(session, heldClaim, before, manifest, bodies);
+                            return null;
+                        }
                         verifyClosure(session, manifest, operation);
                         backfillModels(session, table, operation, sorted, bodies);
                         return null;
@@ -283,6 +293,54 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
                     publishManifest(session, before, manifest);
                     return null;
                 });
+    }
+
+    /** Admit only newly discovered, identity-named tables on an existing sync node.
+     * The CONFIG-issued marker binds this exception to the unchanged declaration and exact inventory.
+     * Original rows, including issued/ready attempts and canonical models, remain untouched.
+     */
+    static boolean admitsDiscoveredTarget(Document claim, List<Document> original, Input candidate) {
+        var marker = claim.get("discoveredTableExpansion", Document.class);
+        var sources = claim.get("pipelineSources", Document.class);
+        if (marker == null || sources == null
+                || !Objects.equals(marker.get("scope"), MongoPipelinePreparationFacts.scope(candidate.key().scope()))
+                || !Objects.equals(marker.get("inputsHash"), sources.get("contentHash"))
+                || !marker.getList("addedTables", String.class, List.of()).contains(candidate.key().target())
+                || candidate.key().purpose() != PipelineNode.Purpose.SYNC) return false;
+        return original.stream().map(MongoSinkPreparationStore::decodeInput).anyMatch(held ->
+                held.key().scope().equals(candidate.key().scope())
+                && held.key().purpose() == candidate.key().purpose()
+                && held.key().nodeId().equals(candidate.key().nodeId())
+                && held.policy() == candidate.policy() && held.fullLoad() == candidate.fullLoad());
+    }
+
+    private void expandTargets(ClientSession session, Document claim, Document before,
+            List<Document> manifest, Map<String, byte[]> bodies) {
+        var original = documents(before.get(TARGETS));
+        if (!manifest.containsAll(original) || manifest.size() <= original.size()) throw rebuild(access.scope);
+        String operation = before.getString(PREPARATION_ID);
+        var rows = verifyClosure(session, original, operation);
+        long total = rows.values().stream().map(MongoSinkPreparationStore::storedModel)
+                .filter(Optional::isPresent).mapToLong(value -> value.orElseThrow().length).sum();
+        for (var entry : rows.entrySet()) {
+            var proposed = bodies.get(id(entry.getKey()).toJson());
+            // Existing preparation models cannot change as a side effect of admission.
+            if (proposed != null) retainedBody(entry.getValue(), proposed);
+        }
+        var table = SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database);
+        var additions = new ArrayList<Document>();
+        for (var encoded : manifest) {
+            if (original.contains(encoded)) continue;
+            var input = decodeInput(encoded);
+            if (!admitsDiscoveredTarget(claim, original, input)) throw rebuild(access.scope);
+            var held = new Snapshot(input, operation, 0, Phase.PREPARING, null, null);
+            var bytes = bodies.get(id(input.key()).toJson());
+            if (bytes != null) { requirePublicationBudget(held, bytes); total += bytes.length; }
+            additions.add(row(held, bytes));
+        }
+        requireScopeBudget(total);
+        for (var row : additions) table.insertOne(session, row);
+        publishManifest(session, before, manifest);
     }
 
     private Map<String, Input> sortedTargets(List<Input> targets) {

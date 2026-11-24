@@ -27,6 +27,8 @@ import java.util.concurrent.CompletionException;
 public final class SrsRingbuffer {
 
     private static final String NAME_PREFIX = "srs.";
+    // Hazelcast RingbufferProxy rejects larger addAllAsync calls, regardless of ring capacity.
+    static final int MAX_APPEND_BATCH = 1000;
 
     private final Ringbuffer<SrsItem> ringbuffer;
 

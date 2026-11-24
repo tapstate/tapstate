@@ -85,6 +85,18 @@ class MongoSrsLogStoreIT {
     }
 
     @Test
+    void durableStoragePreservesTheOrderedDdlCommand() {
+        withStoreCollection((store, collection) -> {
+            var schema = Map.<String,Object>of("tapstateDdl", Map.of("format", 1, "action", "add",
+                    "fields", java.util.List.of(Map.of("name", "C", "kind", "INT32", "default", "99"))));
+            store.store(RING, 41L, new SrsLogRecord("ddl-pos", Op.DDL, 3L, null, null, 2L, null, 7L, schema));
+            assertThat(store.load(RING, 41L).orElseThrow().schema()).isEqualTo(schema);
+            assertThat(collection.find(new Document("_id", new Document("ring", RING).append("seq", 41L))).first())
+                    .containsKey("schema");
+        });
+    }
+
+    @Test
     void replacingARecordDoesNotKeepImagesOrGenerationThatTheReplacementLacks() {
         withStoreCollection((store, collection) -> {
             store.store(RING, 40L, new SrsLogRecord("first", Op.UPDATE, 1L,

@@ -15,6 +15,15 @@ class SourceModelComparisonTest {
         assertThat(SourceModelComparison.DECLARED_STRUCTURE.acceptsObservation(old, old)).isTrue();
     }
 
+    @Test void builtinSqlTypeCaseDoesNotChangeTheDeclaredStructureOrRewriteItsSavedSpelling() {
+        var captured = text("varchar(64)", 64); var discovered = text("VARCHAR(64)", 64);
+        assertThat(SourceModelComparison.DECLARED_STRUCTURE.acceptsObservation(captured, discovered)).isTrue();
+        assertThat(captured.fields().getFirst().dataType()).isEqualTo("varchar(64)");
+        assertThat(SourceModelComparison.DECLARED_STRUCTURE.acceptsObservation(captured, text("VARCHAR(65)", 65))).isFalse();
+        assertThat(SourceModelComparison.DECLARED_STRUCTURE.acceptsObservation(text("\"CaseType\"", 64), text("\"CASETYPE\"", 64))).isFalse();
+        assertThat(SourceModelComparison.DECLARED_STRUCTURE.acceptsObservation(text("enum('a')", 64), text("ENUM('A')", 64))).isFalse();
+    }
+
     @Test void sampledMembershipOrderKindsAndWidthsAreNotCollectionDeclarations() {
         var old = text("STRING(20480)", 20480);
         var changed = new SourceTable("orders", List.of(new SourceField("new", "INT32", TapstateType.INT64),
