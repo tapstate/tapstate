@@ -196,7 +196,7 @@ class AFailTargetIsRefusedAtStartIT {
     /** A synchronous refusal that names the target and is not a question: no answer changes it. */
     private static void assertRefusedOver(ControlPlane.StartAnswer answer, String findingKey) {
         assertThat(answer.status()).as("the start's status, answered %s", answer.body()).isEqualTo(409);
-        assertThat(answer.body().get("code")).isEqualTo("lifecycle.start-blocked");
+        assertThat(answer.body().get("code")).isEqualTo("TS0280007");
         assertThat(answer.findings())
                 .filteredOn(finding -> findingKey.equals(finding.get("key")))
                 .singleElement()

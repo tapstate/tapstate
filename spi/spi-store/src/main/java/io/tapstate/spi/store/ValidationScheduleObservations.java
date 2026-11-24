@@ -17,7 +17,7 @@ public interface ValidationScheduleObservations {
         public Fact(ValidationReportAdmission.Task task,long revision,Origin origin,Instant observedAt,Instant nextDue,Instant lastDue,State state,String reason,UUID command,String run){this(task,revision,origin,observedAt,nextDue,lastDue,state,reason,command,run,0);}
         public Fact{Objects.requireNonNull(task);Objects.requireNonNull(origin);Objects.requireNonNull(observedAt);Objects.requireNonNull(state);
             if(revision<1||revision==Long.MAX_VALUE||sequence<0||sequence==Long.MAX_VALUE)throw invalid("revision");
-            if(reason!=null&&!reason.matches("[a-z][a-z0-9.-]{0,127}"))throw invalid("reason");
+            if(reason!=null&&!reason.matches("(?:[a-z][a-z0-9.-]{0,127}|TS(?!000)[0-9]{3}(?!0000)[0-9]{4})"))throw invalid("reason");
             if(origin.node().length()>512||origin.boot().length()>512||run!=null&&run.length()>512)throw invalid("size");
         }
     }

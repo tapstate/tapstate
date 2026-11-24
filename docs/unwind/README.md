@@ -36,7 +36,7 @@ If both locator options are present, `element_key` supplies identity and
 `element_key` and use `include_array_index`; the key becomes `(id, item_no)`.
 At least one locator is required. Generated column names must differ from parent
 column names, the array path, and each other. Assembly refuses a known collision with
-`dsl.unwind-column-already-exists` before the job runs. If an extra field absent from
+`TS0010027` before the job runs. If an extra field absent from
 the discovered model appears in a row, the same check stops expansion before that
 row can overwrite it. Choose another generated name or rename the parent field in
 an earlier `map`.
@@ -115,7 +115,7 @@ suitable for the rows and key comparisons used by the pipeline. This check does
 not require `$indexStats` or the `indexStats` privilege.
 
 If index querying is unavailable, fails or returns malformed metadata, START is
-blocked with `connector.target-identity-check-failed`. A required logical index
+blocked with `TS0060003`. A required logical index
 may be prepared for a new or empty collection, or when the existing full-load
 policy explicitly clears the collection. Preparation is followed by another
 index query before writes begin. A populated collection without the matching
@@ -199,20 +199,20 @@ or removal of an element from the middle of an indexed array.
 The source must provide a complete previous image for updates and deletes. The
 runtime requires every parent key column and at least one other column. A missing,
 empty or key-only previous image stops with
-`transform.unwind-needs-a-complete-before-image`. For MySQL CDC, configure full
+`TS0450007`. For MySQL CDC, configure full
 binlog row images. For MongoDB CDC, enable source collection pre-images.
 A full document without the optional array field is allowed when it has another
 non-key field. A document consisting only of its key cannot be distinguished from
 a partial image and is refused.
 
 Duplicate element keys still emit all rows. The log reports
-`transform.unwind-rows-share-a-key` at WARNING severity, and the target may keep
+`TS0450008` at WARNING severity, and the target may keep
 only the last row for that key. The warning is not an `error_count` increment.
 Choose element keys unique within each parent.
 
 A declaration with neither locator fails validation with
-`dsl.unwind-needs-an-element-key`. An append target fails validation with
-`dsl.unwind-needs-an-upsert-target`: appending a delete would add a row instead of
+`TS0010024`. An append target fails validation with
+`TS0010025`: appending a delete would add a row instead of
 removing the old one. One-time expansion into an append target is also unsupported.
 
 A `map` before or after `unwind` can rename parent key columns; their identity follows

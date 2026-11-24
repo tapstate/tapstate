@@ -455,6 +455,26 @@ class ClusterRebuildAdmissionTest {
     }
 
     @Test
+    void onlyAConfirmedNewLifetimeResetsTheRetainedBudget() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a");
+        var original = new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        admission.observeScope(original, java.util.Optional::empty);
+        for (int attempt = 0; attempt < ClusterRebuildAdmission.MAX_ATTEMPTS; attempt++) {
+            assertThat(admission.admits("orders")).isTrue();
+            nanos.addAndGet(BACKOFF.toNanos());
+        }
+        admission.retain(List.of("orders"));
+        var rebuilt = new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "orders", 2);
+        admission.observeScope(rebuilt, () -> java.util.Optional.of(new io.tapstate.spi.store.PipelineStateMappings.LogWindow(1, 2)));
+        assertThat(admission.admits("orders")).isFalse();
+        var recreated = new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "orders", 3);
+        admission.observeScope(recreated, () -> java.util.Optional.of(new io.tapstate.spi.store.PipelineStateMappings.LogWindow(3, 3)));
+        assertThat(admission.admits("orders")).isTrue();
+    }
+
+    @Test
     void aPipelineCreatedUnderTheIdOfOneThatSpentItsBudgetGetsABudgetOfItsOwn() {
         committed(7, "node-a", "node-b");
         submitRunUnder(7);

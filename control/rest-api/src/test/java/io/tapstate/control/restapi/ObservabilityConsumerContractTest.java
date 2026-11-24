@@ -17,6 +17,7 @@ import io.tapstate.control.core.PipelineMetricsHistory.Status;
 import io.tapstate.control.core.PipelineMetricsHistory.Unavailable;
 import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.messages.MessageCatalog;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.ObjectMapper;
 
@@ -28,6 +29,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 import java.util.TreeMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -39,6 +41,27 @@ class ObservabilityConsumerContractTest {
     private static final Instant FROM = Instant.parse("2026-09-20T10:00:00Z");
     private static final Instant TO = Instant.parse("2026-09-20T11:00:00Z");
     private static final Instant CUTOFF = Instant.parse("2026-09-05T11:00:00Z");
+
+    @Test
+    void explainProjectionLocalizesARegisteredRuntimeFailureWithoutChangingItsIdentity() {
+        var diagnostic = Map.<String, Object>of("rawMessage", "captured driver detail");
+        var sourceFailure = new PipelineExplanation.Failure("TS0440009", Map.of("pipeline", "orders"),
+                "Pipeline orders stopped because the engine ran out of memory and shut down.", diagnostic);
+        var explanation = new PipelineExplanation("orders", PipelineState.FAILED,
+                PipelineExplanation.Kind.CODED_FAILURE, "The run failed, and said why: TS0440009.", FROM,
+                2_000L, PipelineExplanation.Freshness.FRESH,
+                List.of(evidence(PipelineExplanation.Source.STATUS, "failure", sourceFailure)), List.of(), null, null);
+
+        PipelineExplanationResponse response = PipelineExplanationResponse.of(explanation,
+                MessageCatalog.bundled(), Locale.forLanguageTag("zh-CN"));
+        var failure = (ApiError) response.evidence().getFirst().value();
+
+        assertThat(failure.code()).isEqualTo("TS0440009");
+        assertThat(failure.params()).containsEntry("pipeline", "orders");
+        assertThat(failure.message()).contains("\u5df2\u505c\u6b62", "\u5185\u5b58\u8017\u5c3d");
+        assertThat(failure.solution()).contains("\u91cd\u542f\u670d\u52a1");
+        assertThat(failure.diagnostic()).isEqualTo(diagnostic);
+    }
 
     @Test
     void manifestPinsTheFirstBackendRevisionAndEveryFixture() throws Exception {

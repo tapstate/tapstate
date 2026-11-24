@@ -63,7 +63,7 @@ redraws exactly the documents it affects:
 - `orOn` is for embeds that point at one shared row (many to one), such as a location looked up
   by code or by hub id. Every alternative must find at most one row, the same rule as any such
   embed. An embed that gathers several rows under its parent matches on one condition; an
-  alternative that matches on the parent's own key is refused with `nest.or-on-not-a-reference`.
+  alternative that matches on the parent's own key is refused with `TS0490028`.
 - `orOn` must hold at least one alternative, and each alternative at least one field.
 - Row-level validation of a pipeline does not yet cover an embed with `orOn`, and says so.
 - The join step has the same feature in SQL: `LEFT JOIN … ON a = b OR c = d`. See

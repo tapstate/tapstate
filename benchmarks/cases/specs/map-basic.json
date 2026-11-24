@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "project",
+      "operator": "map"
+    }
+  ],
+  "inputs": {
+    "records": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "required_fields": {
+        "id": "integer primary key",
+        "value": "integer",
+        "label": "string",
+        "payload": "string"
+      }
+    }
+  },
+  "parameters": {
+    "allow_manual_mix_override": true,
+    "projection": {
+      "keep": [
+        "id",
+        "payload"
+      ],
+      "rename": {
+        "label": "display_label"
+      },
+      "constant": {
+        "marker": "mapped"
+      },
+      "integer_expression": {
+        "adjusted_value": "value + 1"
+      }
+    },
+    "protected_fields": [
+      "id"
+    ]
+  },
+  "expected": {
+    "readback": [
+      "Compute the projection independently for each input key; compare the renamed field, fixed value and integer result.",
+      "Verify dropped fields are absent; CDC updates change projected values and deletes remove the row."
+    ]
+  },
+  "completion": {
+    "target_unit": "target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

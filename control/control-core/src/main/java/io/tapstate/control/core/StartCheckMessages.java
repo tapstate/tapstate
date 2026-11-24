@@ -12,4 +12,13 @@ import java.util.Map;
 public interface StartCheckMessages {
 
     String render(TapstateErrorCode code, Map<String, Object> params);
+
+    /** Render only declared text parameters while keeping report metadata in its original payload. */
+    default String renderText(TapstateErrorCode code, Map<String, Object> params) {
+        Map<String, Object> text = new java.util.LinkedHashMap<>();
+        for (String name : code.placeholders()) {
+            if (params.containsKey(name)) text.put(name, params.get(name));
+        }
+        return render(code, text);
+    }
 }

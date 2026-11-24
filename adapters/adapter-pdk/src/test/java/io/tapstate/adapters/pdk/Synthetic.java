@@ -370,6 +370,74 @@ final class Synthetic {
     }
 
     /** Batch-reads two snapshot rows and streams an insert / update / delete; a full source connector. */
+    static Path retryingSnapshotSource(Path dir, String counter, boolean withOffset) {
+        String offset = withOffset ? "1L" : "null";
+        String firstRow = "evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r1));";
+        String register = "functions.supportErrorHandleFunction((context, method, failure) -> {"
+                + "  if (method != io.tapdata.pdk.apis.functions.PDKMethod.SOURCE_BATCH_READ) throw new AssertionError(method);"
+                + "  return io.tapdata.pdk.apis.functions.connection.RetryOptions.create().needRetry(false).beforeRetryMethod(() -> "
+                + "{ ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + ".prepare\")).incrementAndGet();"
+                + "  if (System.getProperties().containsKey(\"" + counter + ".prepareFailure\")) throw new java.io.UncheckedIOException(new java.io.IOException(\"re-open temporarily failed\"));"
+                + "});"
+                + "});"
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  int call = ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + "\")).incrementAndGet();"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + row("r1", 1)
+                + row("r2", 2)
+                + "  if (call % 2 == 1) {" + firstRow
+                + "    consumer.accept(evs, " + offset + "); throw new java.io.IOException(\"transient snapshot fault\");"
+                + "  }"
+                + "  if (!java.util.Objects.equals(" + offset + ", offset)) throw new IllegalStateException(\"wrong retry offset\");"
+                + (withOffset ? "" : firstRow)
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r2));"
+                + "  consumer.accept(evs, " + (withOffset ? "2L" : "null") + ");"
+                + "});"
+                + "functions.supportTimestampToStreamOffset((context, time) -> 0L);";
+        return SyntheticJar.compileToJar(dir, "synthetic.RetryingSnapshotSource", source("RetryingSnapshotSource", "", register));
+    }
+
+    static Path asyncFailingStreamSource(Path dir, String channel, boolean interruptDuringDelivery) {
+        String register = "functions.supportTimestampToStreamOffset((context, time) -> 0L);"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + row("a", 1)
+                + "  var events = List.<TapEvent>of(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "  Thread.ofVirtual().start(() -> { try { consumer.accept(events, 1L); } finally {"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".delivered\")).countDown(); } });"
+                + "  if (!((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".entered\")).await(5, java.util.concurrent.TimeUnit.SECONDS))"
+                + "    throw new AssertionError(\"delivery was not admitted\");"
+                + (interruptDuringDelivery ? "" : "  if (!((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel
+                        + ".delivered\")).await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError(\"delivery did not finish\");")
+                + "  throw new java.io.IOException(\"new source interruption\");"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.AsyncFailingStreamSource",
+                source("AsyncFailingStreamSource", "", register));
+    }
+
+    static Path recoverySignalStreamSource(Path dir, String channel) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  String mode = (String) System.getProperties().get(\"" + channel + ".mode\");"
+                + "  ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".entered\")).countDown();"
+                + "  if (mode.equals(\"started\") || mode.equals(\"started-heartbeat\")) {"
+                + "    consumer.streamReadStarted();"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".started\")).countDown();"
+                + "  }"
+                + "  if (mode.equals(\"started-heartbeat\")) {"
+                + "    consumer.accept(List.of(new io.tapdata.entity.event.control.HeartbeatEvent().init()), null);"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".heartbeat\")).countDown();"
+                + "  }"
+                + "  if (mode.equals(\"return\")) {"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".ended\")).countDown(); return; }"
+                + "  String command = ((java.util.concurrent.BlockingQueue<String>) System.getProperties().get(\"" + channel + ".commands\")).take();"
+                + "  if (command.equals(\"fail\")) throw new java.io.IOException(\"controlled source interruption\");"
+                + "  if (command.equals(\"return\")) { consumer.streamReadEnded();"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".ended\")).countDown(); }"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.RecoverySignalStreamSource",
+                source("RecoverySignalStreamSource", "", register));
+    }
+
     static Path emittingSource(Path dir) {
         String register = ""
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
@@ -1248,6 +1316,23 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.StaticThrows", src);
     }
 
+    static Path refusedInitSource(Path dir, String channel) {
+        String code = source("RefusedInitSource", "",
+                "functions.supportBatchRead((a,b,c,d,e) -> {});functions.supportStreamRead((a,b,c,d,e) -> {});")
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) { throw (RuntimeException) System.getProperties().get(\""
+                                + channel + "\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.RefusedInitSource", code);
+    }
+
+    static Path fatalInitSource(Path dir, String channel) {
+        String code = source("FatalInitSource", "", "functions.supportBatchRead((a,b,c,d,e) -> {});")
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) { throw (Error) System.getProperties().get(\""
+                                + channel + "\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.FatalInitSource", code);
+    }
+
     /**
      * A source that registers batch read but throws from every lifecycle method (init / stop /
      * discover / connectionTest / tableCount). A capability derive reads only the registered ids, so a
@@ -1540,6 +1625,16 @@ final class Synthetic {
     }
 
     /** A connector whose discoverSchema throws — discovery could not complete, a coded drive failure. */
+    static Path declaredAuthenticationRejectedDiscoverSource(Path dir) {
+        String body = "throw new RuntimeException(new io.tapdata.exception.TapPdkUserPwdInvalidEx(\"demo\", \"fixture\", new java.sql.SQLException(\"password rejected marker\", \"72000\")));";
+        return SyntheticJar.compileToJar(dir, "synthetic.DeclaredAuthenticationDiscover", discoverSource("DeclaredAuthenticationDiscover", body));
+    }
+
+    static Path authenticationRejectedDiscoverSource(Path dir, String sqlState) {
+        String body = "throw new RuntimeException(new java.sql.SQLException(\"password rejected marker\", \"" + sqlState + "\"));";
+        return SyntheticJar.compileToJar(dir, "synthetic.AuthenticationDiscover", discoverSource("AuthenticationDiscover", body));
+    }
+
     static Path throwingDiscoverSource(Path dir) {
         String body = "throw new RuntimeException(\"discover boom\");";
         return SyntheticJar.compileToJar(dir, "synthetic.ThrowingDiscover", discoverSource("ThrowingDiscover", body));

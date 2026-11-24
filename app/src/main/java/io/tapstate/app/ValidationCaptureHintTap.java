@@ -119,7 +119,13 @@ public final class ValidationCaptureHintTap {
         private void failAll(Throwable failure) {
             for (Binding binding : bindings) if (binding.outbox().isOpen()) binding.outbox().reportFailure(failure);
         }
+        @Override public void onFailure(io.tapstate.core.common.FailureFact fact) {
+            failAll(fact.cause()); listener.onFailure(fact);
+        }
         @Override public void onError(Throwable failure) { failAll(failure); listener.onError(failure); }
+        @Override public void onError(Throwable failure, Map<String, Object> diagnostic) {
+            failAll(failure); listener.onError(failure, diagnostic);
+        }
         @Override public void onAcknowledged(SourcePosition position) { listener.onAcknowledged(position); }
         @Override public void onAcknowledgeFailed(Throwable failure) { listener.onAcknowledgeFailed(failure); }
     }

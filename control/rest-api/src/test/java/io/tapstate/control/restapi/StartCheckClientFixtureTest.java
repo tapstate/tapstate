@@ -76,9 +76,9 @@ class StartCheckClientFixtureTest {
                 List.of(new StartCheckReport.Finding("target-not-empty/views/lead", "target-not-empty",
                         new StartCheckReport.Subject("TARGET", "views/lead", "lead", "view lead (views)"),
                         StartFinding.Behavior.CONFIRM, StartFinding.Evaluation.COMPLETE,
-                        "start-check.target-not-empty", Map.of("rows", 5), "a message",
+                        "TS0290006", Map.of("rows", 5), "a message",
                         List.of(new StartCheckReport.Action("clear", StartAction.CHANGE_DEFINITION, true,
-                                "start-check.clear-before-full-load", "a label",
+                                "TS0290011", "a label",
                                 List.of(new StartAction.Change("lead", "on_full_load", "append", "clear")))))));
     }
 

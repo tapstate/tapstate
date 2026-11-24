@@ -1,0 +1,18 @@
+{
+  "TS0260001": {
+    "message": "Connector {connector} does not provide a complete live spec.",
+    "solution": "Register the connector runtime and retry connector_get before using the connector."
+  },
+  "TS0260002": {
+    "message": "Environment variable {variable} is required by the Source config.",
+    "solution": "Inject the variable into the MCP process environment and retry the connection operation."
+  },
+  "TS0260003": {
+    "message": "The Tapstate Server returned an invalid response for MCP operation {operation}.",
+    "solution": "Verify that the MCP sidecar and Server use compatible control contracts, then retry."
+  },
+  "TS0260004": {
+    "message": "The Tapstate Server rejected the request with HTTP status {status} without a structured error code.",
+    "solution": "Inspect the Server logs and verify that the MCP sidecar and Server use compatible control contracts."
+  }
+}

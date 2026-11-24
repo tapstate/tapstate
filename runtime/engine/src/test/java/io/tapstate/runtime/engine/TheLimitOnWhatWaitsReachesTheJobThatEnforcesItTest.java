@@ -97,7 +97,7 @@ class TheLimitOnWhatWaitsReachesTheJobThatEnforcesItTest {
         DAG dag = customersWithPoliciesAndClaims(LIMIT + 1);
 
         assertThatThrownBy(() -> member.getJet().newJob(dag).join())
-                .hasStackTraceContaining("nest.pending-limit-exceeded")
+                .hasStackTraceContaining("TS0490021")
                 .hasStackTraceContaining("pending=" + (LIMIT + 1))
                 .hasStackTraceContaining("limit=" + LIMIT);
     }

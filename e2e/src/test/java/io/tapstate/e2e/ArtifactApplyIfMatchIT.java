@@ -53,7 +53,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ArtifactApplyIfMatchIT {
 
     private static final String SOURCE_ID = "src_file";
-    private static final String VERSION_CONFLICT = "artifact.version-conflict";
+    private static final String VERSION_CONFLICT = "TS0240003";
 
     @BeforeAll
     static void requireDocker() {

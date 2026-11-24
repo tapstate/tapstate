@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.EngineError;
@@ -24,8 +25,8 @@ class DeferredCaptureStartFailureTest {
         Engine engine = mock(Engine.class);
         TapstateException oldFailure = new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
                 Map.of("pipeline", PIPELINE), null);
-        when(engine.failureOf(PIPELINE)).thenReturn(Optional.of(oldFailure));
-        when(engine.failureOf("other-pipe")).thenReturn(Optional.of(oldFailure));
+        when(engine.failureFactOf(PIPELINE)).thenReturn(Optional.of(new FailureFact(oldFailure)));
+        when(engine.failureFactOf("other-pipe")).thenReturn(Optional.of(new FailureFact(oldFailure)));
         WaitingCapture captures = new WaitingCapture();
         EngineLifecycleActuator actuator = new EngineLifecycleActuator(
                 engine, new IdleDagSource(), captures, teardown());
@@ -41,7 +42,7 @@ class DeferredCaptureStartFailureTest {
         TapstateException lost = new TapstateException(EngineError.OUT_OF_MEMORY,
                 Map.of("pipeline", PIPELINE), new OutOfMemoryError("fixture"));
         when(engine.isLost()).thenReturn(true);
-        when(engine.failureOf(PIPELINE)).thenReturn(Optional.of(lost));
+        when(engine.failureFactOf(PIPELINE)).thenReturn(Optional.of(new FailureFact(lost)));
         assertThat(actuator.failure(PIPELINE)).contains(lost);
     }
 
@@ -50,7 +51,7 @@ class DeferredCaptureStartFailureTest {
         Engine engine = mock(Engine.class);
         TapstateException oldFailure = new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
                 Map.of("pipeline", PIPELINE), null);
-        when(engine.failureOf(PIPELINE)).thenReturn(Optional.of(oldFailure));
+        when(engine.failureFactOf(PIPELINE)).thenReturn(Optional.of(new FailureFact(oldFailure)));
         EngineLifecycleActuator actuator = new EngineLifecycleActuator(
                 engine, new IdleDagSource(), new WaitingCapture(), teardown());
 

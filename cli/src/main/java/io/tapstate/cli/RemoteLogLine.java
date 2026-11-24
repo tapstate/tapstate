@@ -8,5 +8,11 @@ package io.tapstate.cli;
  * @param level           the log level (for example {@code INFO}, {@code WARN}, {@code ERROR})
  * @param message         the formatted log message
  */
-record RemoteLogLine(long timestampMillis, String level, String message) {
+record RemoteLogLine(long timestampMillis, String level, String message, java.util.Map<String, Object> diagnostic) {
+    RemoteLogLine(long timestampMillis, String level, String message) {
+        this(timestampMillis, level, message, java.util.Map.of());
+    }
+    RemoteLogLine {
+        diagnostic = io.tapstate.core.common.RuntimeDiagnosticProjection.read(diagnostic);
+    }
 }

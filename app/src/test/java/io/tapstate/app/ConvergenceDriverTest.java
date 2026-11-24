@@ -303,7 +303,65 @@ class ConvergenceDriverTest {
         }
 
         assertThat(sink.tail("orders")).extracting(LogLine::level).contains("WARN");
+        assertThat(sink.tail("orders")).allSatisfy(line -> assertThat(line.diagnostic()).doesNotContainKey("code"));
         assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+    }
+
+    @Test
+    void aFirstPartyFailureWithoutConnectorContextKeepsItsStructuredLogCode() {
+        var logger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
+        var captured = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
+        captured.start(); logger.addAppender(captured);
+        var actuator = new FailingActuator();
+        var current = new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
+        var driver = new ConvergenceDriver(current, desired, new ObservationPublisher(state, observations));
+        var code = ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED;
+        try {
+            desired.save(new DesiredState("orders", RUNNING, "rev-1")); driver.reconcile();
+            actuator.fact = new io.tapstate.core.common.FailureFact(new io.tapstate.core.common.TapstateException(
+                    code, Map.of("source", "original_source"), null));
+            driver.reconcile();
+        } finally { logger.detachAppender(captured); captured.stop(); logger.setLevel(previousLevel); }
+        assertThat(captured.list).singleElement().satisfies(event -> {
+            var diagnostic = PipelineLogAppender.diagnostic(event, new io.tapstate.core.logging.SecretRedactor());
+            assertThat(diagnostic).containsEntry("code", code.code()).containsEntry("codeSource", "tapstate-standard")
+                    .containsEntry("params", Map.of("source", "original_source"));
+            assertThat(diagnostic.get("message")).asString().contains("original_source");
+            assertThat(diagnostic.get("stackTrace")).asString().contains("TapstateException");
+        });
+        assertThat(observations.read("orders").orElseThrow().failure().code()).isEqualTo(code.code());
+    }
+
+    @Test
+    void aCapturedConnectorFailureDoesNotSendRawSecretsToAnyLogAppender() {
+        var logger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
+        var captured = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
+        captured.start(); logger.addAppender(captured);
+        var actuator = new FailingActuator();
+        var current = new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
+        var driver = new ConvergenceDriver(current, desired, new ObservationPublisher(state, observations));
+        var code = io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED;
+        var raw = new io.tapstate.core.common.TapstateException(code,
+                Map.of("connector", "fixture", "detail", "log-secret"), new IllegalStateException("log-secret"));
+        var safe = Map.of("connector", "fixture", "detail", "access denied");
+        var diagnostic = Map.<String, Object>of("code", code.code(), "codeSource", "tapstate-standard", "params", safe, "message", "captured connector message");
+        try {
+            desired.save(new DesiredState("orders", RUNNING, "rev-1")); driver.reconcile();
+            actuator.fact = new io.tapstate.core.common.FailureFact(raw, diagnostic,
+                    new io.tapstate.core.common.FailureFact.PublicFailure(code.code(), safe));
+            driver.reconcile();
+        } finally { logger.detachAppender(captured); captured.stop(); logger.setLevel(previousLevel); }
+        assertThat(captured.list).singleElement().satisfies(event -> {
+            assertThat(PipelineLogAppender.diagnostic(event, new io.tapstate.core.logging.SecretRedactor()))
+                    .containsAllEntriesOf(diagnostic);
+            assertThat(event.getThrowableProxy()).isNull();
+            assertThat(event.getFormattedMessage()).contains(code.code(), "access denied").doesNotContain("log-secret");
+        });
+        assertThat(observations.read("orders").orElseThrow().failure().params()).isEqualTo(safe);
     }
 
     @Test
@@ -324,7 +382,7 @@ class ConvergenceDriverTest {
 
         ObservationFailure failure = observations.read("orders").orElseThrow().failure();
         assertThat(failure).isNotNull();
-        assertThat(failure.code()).isEqualTo("engine.job-failed");
+        assertThat(failure.code()).isEqualTo("TS0440008");
         assertThat(failure.params()).containsEntry("cause", "sink write failed");
     }
 
@@ -349,13 +407,13 @@ class ConvergenceDriverTest {
 
         ObservationFailure failure = observations.read("orders").orElseThrow().failure();
         assertThat(failure).isNotNull();
-        assertThat(failure.code()).isEqualTo("engine.job-failed");
+        assertThat(failure.code()).isEqualTo("TS0440008");
         assertThat(failure.params()).containsEntry("cause", "sink write failed");
         // One death is one count, driven through the real converger rather than asserted against a
         // publisher fed by hand: the cause arrives on one pass and the three after it carry none, so a
         // count taken from the state instead of from the witness would read four here.
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errors.engine.job-failed", 1L));
+                .containsOnly(entry("errors.TS0440008", 1L));
     }
 
     @Test
@@ -373,7 +431,7 @@ class ConvergenceDriverTest {
         actuator.failWith(new IllegalStateException("sink write failed"));
         driver.reconcile(); // orders -> FAILED, one failure counted
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errors.engine.job-failed", 1L));
+                .containsOnly(entry("errors.TS0440008", 1L));
 
         // Deleted: its intent is removed, which is the only thing that takes a pipeline out of the set the
         // pass reads. A stopped pipeline would still be in it and would keep its counts.
@@ -443,7 +501,7 @@ class ConvergenceDriverTest {
 
         ObservationFailure failure = observations.read("orders").orElseThrow().failure();
         assertThat(failure).isNotNull();
-        assertThat(failure.code()).isEqualTo("engine.job-failed");
+        assertThat(failure.code()).isEqualTo("TS0440008");
         assertThat(failure.params()).containsEntry("cause", "sink write failed");
     }
 
@@ -477,6 +535,10 @@ class ConvergenceDriverTest {
     /** A no-op actuator whose failure() a test can arm, to drive a pipeline to FAILED without a real job. */
     private static final class FailingActuator implements LifecycleActuator {
         private Throwable failure;
+        private io.tapstate.core.common.FailureFact fact;
+        @Override public Optional<io.tapstate.core.common.FailureFact> failureFact(String pipelineId) {
+            return fact == null ? LifecycleActuator.super.failureFact(pipelineId) : Optional.of(fact);
+        }
         private boolean completed;
         private Runnable cleanup = () -> { };
         private int cleanupCalls;

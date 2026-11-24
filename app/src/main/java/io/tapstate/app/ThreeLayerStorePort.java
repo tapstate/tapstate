@@ -422,7 +422,9 @@ final class ThreeLayerStorePort implements StorePort {
     }
     private static Optional<Observation> startFailure(String pipeline, MongoConfigurationDomain.PipelineDisplayHeader header) {
         return header.startFailure().map(code -> new Observation(pipeline, PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
-                new io.tapstate.core.lifecycle.ObservationFailure(code.code(), Map.of()), null, List.of()));
+                new io.tapstate.core.lifecycle.ObservationFailure(code.code(),
+                        code == io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED ? Map.of("pipeline", pipeline) : header.startFailureParams()),
+                null, List.of()));
     }
     private Optional<Observation> readObservation(String pipeline, PipelineIntentScope original) {
         var preparation = configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);

@@ -146,6 +146,25 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         return transaction(session -> completedInTransaction(session, original));
     }
 
+    void requireCompletedStopPurge(PipelineIntentSnapshot purge, String operation, WorkloadClaimFence node) {
+        transaction(session -> {
+            var id = purge.scope().pipelineId();
+            var row = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", id)).first();
+            var state = MongoPipelineStateMappings.decode(id, row);
+            if (state.phase() != PipelineStateMapping.Phase.ACTIVE || !operation.equals(state.operationId())
+                    || state.stateGeneration() != purge.scope().stateGeneration() + 1 || !row.containsKey("stateRebuild")) throw fenced();
+            var prepared = MongoPipelinePreparationFacts.decode(id, row, clusterId);
+            requireCompletedPrior(row, prepared);
+            var annex = row.get("stateRebuild", Document.class);
+            var claim = annex.get("originalClaim", Document.class);
+            if (!purge.scope().equals(MongoPipelinePreparationFacts.scope(annex.get("originalScope", Document.class)))
+                    || !Long.valueOf(purge.intentRevision()).equals(annex.get("intentRevision"))
+                    || !node.equals(prepared.issuerNode()) || claim == null
+                    || !node.owner().nodeId().equals(claim.get("nodeId")) || !node.owner().bootId().equals(claim.get("bootId"))) throw fenced();
+            return null;
+        });
+    }
+
     @Override public java.util.Optional<CompletedPipelineFull> completedFull(PipelineIntentScope target,
             PipelinePreparationInputs inputs, Map<String, String> dependencyHashes) {
         Objects.requireNonNull(target, "target"); Objects.requireNonNull(inputs, "inputs");

@@ -417,7 +417,7 @@ class PipelineAssistantControllerTest {
         assertThat(schemaReads.get()).isEqualTo(sourceCount > 3 ? 0 : discovered ? sourceCount : 0);
         assertThat(stream).contains("Connect a PostgreSQL or MySQL Source", "data-status", "complete",
                 "\"finishReason\":\"stop\"")
-                .doesNotContain("data-proposal", "control.malformed-request", "\\\"type\\\":\\\"error\\\"");
+                .doesNotContain("data-proposal", "TS0210001", "\\\"type\\\":\\\"error\\\"");
         if (sourceCount == 2 && tableCount == 1) {
             var candidate = AssistantWizardJson.view(AssistantWizardJson.object(
                     PipelineDraftJson.write(JsonMapper.builder().build(), configured).get("wizard")));
@@ -826,7 +826,7 @@ class PipelineAssistantControllerTest {
         var invalidExpressionStreamOutput = new ByteArrayOutputStream();
         controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse()).getBody().writeTo(invalidExpressionStreamOutput);
         String invalidExpressionStream = invalidExpressionStreamOutput.toString(StandardCharsets.UTF_8);
-        assertThat(invalidExpressionStream).contains("dsl.illegal-expression", "transforms[0].expr", "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
+        assertThat(invalidExpressionStream).contains("TS0010010", "transforms[0].expr", "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
                 .doesNotContain("data-proposal", "afterr.region");
         assertThat(invalidExpressionStream).doesNotContain("\"type\":\"error\"");
         assertThat(store.get("orders")).contains(base);
@@ -980,7 +980,7 @@ class PipelineAssistantControllerTest {
         List<?> expressionDiagnostics = (List<?>) expressionValidation.get("diagnostics");
         assertThat(expressionDiagnostics).hasSize(1);
         Map<String, Object> expressionDiagnostic = AssistantWizardJson.object(expressionDiagnostics.getFirst());
-        assertThat(expressionDiagnostic).containsEntry("code", "dsl.illegal-expression");
+        assertThat(expressionDiagnostic).containsEntry("code", "TS0010010");
         assertThat(AssistantWizardJson.object(expressionDiagnostic.get("params")))
                 .containsEntry("path", "transforms[0].expr")
                 .doesNotContainKeys("expr", "detail");
@@ -1223,6 +1223,20 @@ class PipelineAssistantControllerTest {
             String stream = output.toString(StandardCharsets.UTF_8);
             assertThat(stream).contains(ControlError.AI_OVERLOADED.code(), "\"finishReason\":\"error\"", "[DONE]")
                     .doesNotContain("data-proposal");
+            var mapper = JsonMapper.builder().build();
+            var frames = stream.lines().filter(line -> line.startsWith("data: {")).map(line ->
+                    mapper.readTree(line.substring(6))).toList();
+            assertThat(frames).hasSize(3);
+            assertThat(frames.getFirst().path("type").asText()).isEqualTo("data-status");
+            var failure = frames.getFirst().path("data");
+            var rendered = io.tapstate.messages.MessageCatalog.bundled().render(ControlError.AI_OVERLOADED,
+                    Map.of(), java.util.Locale.ENGLISH);
+            assertThat(failure.path("code").asText()).isEqualTo(ControlError.AI_OVERLOADED.code());
+            assertThat(failure.path("params").isObject()).isTrue();
+            assertThat(failure.path("message").asText()).isEqualTo(rendered.message());
+            assertThat(failure.path("solution").asText()).isEqualTo(rendered.solution());
+            assertThat(frames.get(1).path("errorText").asText()).isEqualTo(ControlError.AI_OVERLOADED.code());
+            assertThat(frames.getLast().path("finishReason").asText()).isEqualTo("error");
             assertThat(schemaReads).hasValue(0);
             assertThat(capacity.availablePermits()).isZero();
         } finally {
@@ -1237,6 +1251,54 @@ class PipelineAssistantControllerTest {
             assertThat(capacity.availablePermits()).isEqualTo(4);
         }
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "AI_MANAGED_PROVIDER_AUTH_FAILED,en", "AI_MANAGED_PROVIDER_AUTH_FAILED,zh-CN",
+            "AI_MANAGED_PROVIDER_AUTH_FAILED,zh-TW", "AI_MANAGED_PROVIDER_INPUT_LIMIT,en",
+            "AI_MANAGED_PROVIDER_INPUT_LIMIT,zh-CN", "AI_MANAGED_PROVIDER_INPUT_LIMIT,zh-TW"})
+    void streamFailuresUseTheHttpErrorProjection(ControlError code, String language) throws Exception {
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        store.create(draft());
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(store));
+        var checks = new AtomicInteger();
+        var failure = new TapstateException(code, Map.of(), new IllegalStateException("private-provider-detail"));
+        var client = new OpenAiCompatibleClient();
+        var providers = providerController(client, () -> {
+            if (checks.incrementAndGet() > 1) throw failure;
+        });
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), providers,
+                client, JsonMapper.builder().build());
+        var request = new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant");
+        request.addHeader("Accept-Language", language);
+        var output = new ByteArrayOutputStream();
+        controller.assistant("orders", Map.of("revision", 1, "messages",
+                List.of(Map.of("role", "user", "text", "Explain the pipeline"))), request,
+                new MockHttpServletResponse()).getBody().writeTo(output);
+        String wire = output.toString(StandardCharsets.UTF_8);
+        var mapper = JsonMapper.builder().build();
+        var status = wire.lines().filter(line -> line.startsWith("data: {")).map(line ->
+                mapper.readTree(line.substring(6))).filter(frame -> "data-status".equals(frame.path("type").asText()))
+                .findFirst().orElseThrow().path("data");
+        var expected = io.tapstate.messages.MessageCatalog.bundled().render(code, Map.of(),
+                java.util.Locale.forLanguageTag(language));
+        assertThat(status.path("code").asText()).isEqualTo(code.code());
+        assertThat(status.path("params").isObject()).isTrue();
+        assertThat(status.path("message").asText()).isEqualTo(expected.message());
+        assertThat(status.path("solution").asText()).isEqualTo(expected.solution()).isNotBlank();
+        assertThat(wire).contains("\"errorText\":\"" + code.code() + "\"", "[DONE]")
+                .doesNotContain("private-provider-detail");
+        assertThat(checks).hasValue(2);
+        String directory = System.getProperty("tapstate.assistant.failure-stream-dir");
+        if (directory != null) {
+            var path = Path.of(directory);
+            Files.createDirectories(path);
+            Files.writeString(path.resolve(code.code() + "-" + language + ".sse"), wire, StandardCharsets.UTF_8);
+        }
+    }
+
     @Test void missingDraftCannotProduceAProposal() {
         var controller = controller(new PipelineDraftService(new PipelineApiTest.FakePipelineDraftStore()));
         assertThatThrownBy(() -> controller.validate("orders", 1, Map.of()))

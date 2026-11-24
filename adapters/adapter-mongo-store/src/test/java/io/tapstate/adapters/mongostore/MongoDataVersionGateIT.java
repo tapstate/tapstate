@@ -55,7 +55,7 @@ class MongoDataVersionGateIT {
             TapstateException refusal =
                     catchThrowableOfType(connection::verify, TapstateException.class);
             assertThat(refusal).isNotNull();
-            assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
+            assertThat(refusal.code().code()).isEqualTo("TS0420001");
             assertThat(refusal.args()).containsEntry("installed", "99");
         }
     }
@@ -86,7 +86,7 @@ class MongoDataVersionGateIT {
             TapstateException refusal =
                     catchThrowableOfType(connection::verify, TapstateException.class);
             assertThat(refusal).isNotNull();
-            assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
+            assertThat(refusal.code().code()).isEqualTo("TS0420001");
             assertThat(refusal.args()).containsEntry("installed", "three");
         }
     }

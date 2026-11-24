@@ -109,7 +109,7 @@ class PipelineStatusWatchHandlerTest {
 
     @Test
     void aPipelineAppliedButNotYetConvergedKeepsThePollLoopOpen() {
-        // monitor.no-observation is transient: nothing to stream yet, but the watch must not give up.
+        // TS0400001 is transient: nothing to stream yet, but the watch must not give up.
         PipelineObservationQueryService observations = serviceWith(emptyObservations(), "orders");
         PipelineStatusWatchHandler handler = handler(observations);
         FakeWebSocketSession session = new FakeWebSocketSession();
@@ -134,7 +134,7 @@ class PipelineStatusWatchHandlerTest {
 
     @Test
     void aPipelineThatWasNeverAppliedClosesTheSessionInsteadOfPollingForever() {
-        // lifecycle.unknown-pipeline is permanent -- no future tick will ever answer differently, so
+        // TS0280005 is permanent -- no future tick will ever answer differently, so
         // treating it like the transient case would hang the watch silently for as long as the client
         // holds the socket open.
         PipelineObservationQueryService observations = serviceWith(emptyObservations());
@@ -144,7 +144,7 @@ class PipelineStatusWatchHandlerTest {
         handler.poll(session, "ghost");
 
         assertThat(session.closeStatus).isNotNull();
-        assertThat(session.closeStatus.getReason()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(session.closeStatus.getReason()).isEqualTo("TS0280005");
         assertThat(session.sent).isEmpty();
     }
 
@@ -184,7 +184,7 @@ class PipelineStatusWatchHandlerTest {
         handler.poll(session, "src_orders");
 
         assertThat(session.closeStatus).isNotNull();
-        assertThat(session.closeStatus.getReason()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(session.closeStatus.getReason()).isEqualTo("TS0280005");
     }
 
     @Test
@@ -257,7 +257,7 @@ class PipelineStatusWatchHandlerTest {
         // reasonless the watcher never learns why, no matter how long it keeps watching.
         Observation dead = new Observation("orders", PipelineState.FAILED, Map.of("errorCount", 1L),
                 Map.of(), Map.of(), new io.tapstate.core.lifecycle.ObservationFailure(
-                        "engine.job-failed", Map.of("pipeline", "orders", "cause", "sink refused the batch")));
+                        "TS0440008", Map.of("pipeline", "orders", "cause", "sink refused the batch")));
         ObservationStore store = new ObservationStore() {
             @Override
             public void delete(String pipelineId) {
@@ -281,7 +281,7 @@ class PipelineStatusWatchHandlerTest {
 
         assertThat(session.sent).hasSize(1);
         String frame = ((org.springframework.web.socket.TextMessage) session.sent.get(0)).getPayload();
-        assertThat(frame).contains("\"code\":\"engine.job-failed\"");
+        assertThat(frame).contains("\"code\":\"TS0440008\"");
         assertThat(frame).contains("\"cause\":\"sink refused the batch\"");
     }
 

@@ -217,6 +217,7 @@ class EngineRunHandleTest {
             member = proxy(HazelcastInstance.class, (method, args) -> switch (method) {
                 case "getJet" -> jet;
                 case "getConfig" -> config;
+                case "getCluster" -> null;
                 case "getDistributedObjects" -> java.util.List.of();
                 case "getUserContext" -> context;
                 default -> throw new AssertionError("unexpected member operation: " + method);

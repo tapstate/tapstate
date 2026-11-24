@@ -17,6 +17,11 @@ import io.tapstate.core.common.TapstateException;
 @FunctionalInterface
 public interface SnapshotSession extends AutoCloseable {
 
+    /** A process-local failure captured by this reader; unrelated failures retain their own attribution. */
+    default io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
+    }
+
     /** A bounded close returned while its original attempt still runs; completion permits retrying only that close. */
     final class PendingClose extends TapstateException {
         private final transient CompletionStage<Void> completion;

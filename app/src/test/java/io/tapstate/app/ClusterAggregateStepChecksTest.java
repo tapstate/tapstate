@@ -171,7 +171,7 @@ class ClusterAggregateStepChecksTest {
     @DisplayName("what the step refuses comes back under the step's own code")
     void theStepsRefusalKeepsItsCode() {
         runStep();
-        answer = request -> AggregateRequests.Report.refused("aggregate.group-invalid",
+        answer = request -> AggregateRequests.Report.refused("TS0500015",
                 Map.of("step", "by_region", "reason", "`country` is not one of its group names [region]"));
 
         assertRefused(() -> checks().check("sales", "by_region",

@@ -37,7 +37,7 @@ class LoginServiceTest {
                 () -> login.login("alice", "wrong"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("control.auth-failed");
+        assertThat(thrown.code().code()).isEqualTo("TS0210002");
         // No argument may reveal whether the username existed or which check failed.
         assertThat(thrown.args()).isEmpty();
     }
@@ -55,7 +55,7 @@ class LoginServiceTest {
                 () -> login.login("nobody", "whatever"));
 
         assertThat(unknownUser).isNotNull();
-        assertThat(unknownUser.code().code()).isEqualTo("control.auth-failed");
+        assertThat(unknownUser.code().code()).isEqualTo("TS0210002");
         assertThat(unknownUser.args()).isEmpty();
         // Identical code for both: an attacker learns only "authentication failed", never existence.
         assertThat(unknownUser.code().code()).isEqualTo(wrongPassword.code().code());

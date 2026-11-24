@@ -22,6 +22,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLServerSocket;
 import org.junit.jupiter.api.BeforeAll;
@@ -60,7 +61,20 @@ class WebhookChannelTest {
             assertThat(result.protocolStatus()).isEqualTo(202);
             assertThat(peerClosed.await(2, TimeUnit.SECONDS)).isTrue();
             assertThat(channel.activeAttempts()).isZero();
-            assertThat(channel.queuedClientTasks()).isZero();
+            // A cancelled periodic task can briefly reenter the executor queue.
+            long cleanupDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            int emptyReads = 0;
+            int queuedTasks;
+            do {
+                queuedTasks = channel.queuedClientTasks();
+                emptyReads = queuedTasks == 0 ? emptyReads + 1 : 0;
+                if (emptyReads == 2) {
+                    break;
+                }
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+            } while (System.nanoTime() - cleanupDeadline < 0);
+            assertThat(emptyReads).as("consecutive empty timer queue reads (last count: %s)", queuedTasks)
+                    .isEqualTo(2);
             assertThat(body.get()).isEqualTo(new String(request.payload(), StandardCharsets.UTF_8));
             assertThat(headers.get().toLowerCase()).contains("authorization: bearer fixture-token", "x-tapstate-delivery-id: delivery", "x-tapstate-signature: v1=");
             assertThat(fixture.calls).hasValue(1);

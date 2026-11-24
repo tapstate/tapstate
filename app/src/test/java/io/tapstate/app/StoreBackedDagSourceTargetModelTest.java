@@ -181,7 +181,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.sync-output-identity-unresolved");
+                .hasMessageContaining("TS0360035");
     }
 
     /** Append never matches a write to an existing row, so a key it never needs is not required. */
@@ -320,7 +320,7 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
-    void aScriptThatWidensADecimalCannotPublishTheSourcesDeclaredRange() {
+    void aScriptDoesNotDeclareItsSourceDecimalRangeAsAnOutputType() {
         String script = "function process(r, ctx) { r.after.amount = 100000000.00; return r; }";
         var sourceValue = new java.math.BigDecimal("1.00");
         var output = io.tapstate.adapters.transform.StatelessTransforms.js(script)
@@ -340,18 +340,20 @@ class StoreBackedDagSourceTargetModelTest {
         var decimal = new io.tapstate.core.common.NumericType(null, true, null, null,
                 new java.math.BigDecimal("-99999999.99"), new java.math.BigDecimal("99999999.99"), 10, 2);
         store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
-                new SourceField("id", "INT", io.tapstate.core.common.TapstateType.INT64),
+                new SourceField("id", "decimal(10,2)", io.tapstate.core.common.TapstateType.DECIMAL,
+                        null, decimal),
                 new SourceField("amount", "decimal(10,2)", io.tapstate.core.common.TapstateType.DECIMAL,
-                        null, decimal)), List.of("id"), List.of())));
+                        null, decimal),
+                new SourceField("unbounded", "decimal", io.tapstate.core.common.TapstateType.DECIMAL)),
+                List.of("id"), List.of())));
         List<TargetTable> bound = new ArrayList<>();
 
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
 
-        TargetField amount = bound.getFirst().fields().stream()
-                .filter(field -> field.name().equals("amount")).findFirst().orElseThrow();
-        assertThat(amount.inferredType()).isEqualTo(io.tapstate.core.common.TapstateType.DECIMAL);
-        assertThat(amount.numericType()).isNull();
-        assertThat(amount.type()).isNull();
+        assertThat(bound.getFirst().fields()).containsExactlyInAnyOrder(
+                TargetField.deferredDecimal("amount", decimal),
+                new TargetField("id", null, true, io.tapstate.core.common.TapstateType.DECIMAL),
+                new TargetField("unbounded", null, false, io.tapstate.core.common.TapstateType.DECIMAL));
     }
 
     @Test
@@ -475,7 +477,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -511,7 +513,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -528,7 +530,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -538,7 +540,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -736,7 +738,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-table-ambiguous");
+                .hasMessageContaining("TS0360009");
     }
 
     @Test

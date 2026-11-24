@@ -332,7 +332,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
-    public Optional<Throwable> failure(String pipelineId) {
+    public Optional<Throwable> failure(String pipelineId) { return failureFact(pipelineId).map(io.tapstate.core.common.FailureFact::cause); }
+
+    @Override
+    public Optional<io.tapstate.core.common.FailureFact> failureFact(String pipelineId) {
         requireLegacy();
         // A deferred start submitted no job of its own. Ignore the previous terminal job only while the
         // claim still carries that start's execution: another holder's replacement run can fail normally.
@@ -340,7 +343,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         Long waitingGeneration = waitingForCapture.get(pipelineId);
         if (waitingGeneration != null && waitingGeneration == actuation.heldExecutionGeneration(pipelineId)
                 && !engine.isLost()) {
-            return captureCoordinator.captureFailure(pipelineId);
+            return captureCoordinator.captureFailureFact(pipelineId);
         }
         if (waitingGeneration != null) {
             waitingForCapture.remove(pipelineId, waitingGeneration);
@@ -348,7 +351,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // A pipeline fails two ways the converge loop must see as one: the Jet job itself dies (engine), or the
         // cdc capture feeding its ring dies while the job keeps running over a ring gone quiet (coordinator).
         // Either surfaces here so the converge side drives the pipeline into the observable FAILED state.
-        return engine.failureOf(pipelineId).or(() -> captureCoordinator.captureFailure(pipelineId));
+        return engine.failureFactOf(pipelineId).or(() -> captureCoordinator.captureFailureFact(pipelineId));
     }
 
     @Override

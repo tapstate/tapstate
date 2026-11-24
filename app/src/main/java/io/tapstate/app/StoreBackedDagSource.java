@@ -1550,12 +1550,16 @@ final class StoreBackedDagSource implements DagSource {
                 published.put(stream, publishedAs(base, produced, atTheSource(
                         pipelineId, stream, sourceVertices, sourceColumns)));
             } else if (produced != null) {
-                // Unknown lineage cannot preserve source attributes or secondary uniqueness. A decimal
-                // type token also declares bounds, so it cannot survive a script that may replace it.
+                // A script may rewrite any field. Preserve a non-key decimal description as a
+                // candidate, without declaring the result of the script to be a decimal.
                 published.put(stream, TargetModelResolver.keyedOn(new TargetTable(base.name(), base.fields().stream()
-                        .map(field -> new TargetField(field.name(),
-                                field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL
-                                        ? null : field.type(), field.primaryKey(), field.inferredType()))
+                        .map(field -> {
+                            boolean decimal = field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL;
+                            return decimal && !field.primaryKey() && field.numericType() != null
+                                    ? TargetField.deferredDecimal(field.name(), field.numericType())
+                                    : new TargetField(field.name(), decimal ? null : field.type(),
+                                            field.primaryKey(), field.inferredType());
+                        })
                         .toList(), List.of()), base.fields().stream().filter(TargetField::primaryKey)
                         .map(TargetField::name).toList()));
             }
@@ -2400,7 +2404,9 @@ final class StoreBackedDagSource implements DagSource {
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)
                                 .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests())).withSnapshotEpochs(snapshotEpochs),
-                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)))
+                joinBinding(compiledJoins, manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest),
+                        manifest != null && manifest.executionIdentity() instanceof ExecutionFence scoped && scoped.scope() != null
+                                ? scoped.scope().stateGeneration() : 0))
                 .withAggregate(aggregateBinding);
     }
 
@@ -3401,15 +3407,15 @@ final class StoreBackedDagSource implements DagSource {
      * <p>A pipeline with no join step compiles nothing and asks nothing of the schema store.
      */
     private JoinBinding joinBinding(Map<String,CompiledJoin> byStep) {
-        return joinBinding(byStep,JoinStoresBinding.onTheCluster());
+        return joinBinding(byStep, JoinStoresBinding.onTheCluster(), 0);
     }
-    private JoinBinding joinBinding(Map<String,CompiledJoin> byStep,JoinStoresBinding stores) {
+    private JoinBinding joinBinding(Map<String, CompiledJoin> byStep, JoinStoresBinding stores, long stateGeneration) {
         return new JoinBinding(
                 step -> compiledJoin(byStep, step).plan(),
                 step -> compiledJoin(byStep, step).factKeyColumns(),
                 step -> compiledJoin(byStep, step).dimensionRowKeyColumns(),
                 stores,
-                new LoggingDimensionRowDisplacedAlert());
+                new LoggingDimensionRowDisplacedAlert(stateGeneration));
     }
 
     /**

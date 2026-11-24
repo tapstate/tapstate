@@ -99,7 +99,7 @@ class CloudSdkBridgeTest {
         assertThatThrownBy(() -> bridge.exchange("one-time-code", "other-cluster"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.cloud-auth-unavailable");
+                .isEqualTo("TS0210021");
     }
 
     @Test

@@ -68,17 +68,20 @@ final class DeferredSinkAck implements SinkAck {
     }
 
     @Override public void flush(boolean complete) {
-        if (pending.isEmpty() || failed || (!complete && clock.getAsLong() - pendingSince < INTERVAL)) return;
+        if (failed) return;
         try {
-            for (var entry : pending.entrySet()) {
-                String stream = entry.getKey();
-                Progress progress = entry.getValue();
-                if (progress.token != null) delegate.advance(stream, progress.token);
-                if (progress.token == null || progress.through.compareTo(progress.token.order()) > 0) {
-                    delegate.bounded(stream, progress.through);
+            if (!pending.isEmpty() && (complete || clock.getAsLong() - pendingSince >= INTERVAL)) {
+                for (var entry : pending.entrySet()) {
+                    String stream = entry.getKey();
+                    Progress progress = entry.getValue();
+                    if (progress.token != null) delegate.advance(stream, progress.token);
+                    if (progress.token == null || progress.through.compareTo(progress.token.order()) > 0) {
+                        delegate.bounded(stream, progress.through);
+                    }
                 }
+                pending.clear();
             }
-            pending.clear();
+            delegate.flush(complete);
         } catch (RuntimeException | Error failure) {
             failed = true;
             throw failure;
@@ -86,7 +89,7 @@ final class DeferredSinkAck implements SinkAck {
     }
 
     @Override public void flushOnClose() {
-        if (!pending.isEmpty() && !failed && authorized.getAsBoolean()) flush(true);
+        if (!failed && authorized.getAsBoolean()) CheckpointWriteAcks.close(() -> flush(true));
     }
 
     private static final class Progress {

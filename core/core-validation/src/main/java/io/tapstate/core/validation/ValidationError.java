@@ -1,6 +1,8 @@
 package io.tapstate.core.validation;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.ValidationErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import java.util.Map;
@@ -8,37 +10,35 @@ import java.util.Set;
 
 /** Diagnosable refusals at independent validation boundaries. */
 public enum ValidationError implements TapstateErrorCode {
-    SCHEDULE_FIELD_COUNT("validation.schedule-field-count", Set.of("count")),
-    SCHEDULE_INVALID("validation.schedule-invalid", Set.of("field", "position", "value")),
-    SCHEDULE_NO_DATE("validation.schedule-no-date", Set.of()),
-    SCHEDULE_SEARCH_EXHAUSTED("validation.schedule-search-exhausted", Set.of("limit")),
-    EXECUTION_CANCELLED("validation.execution-cancelled", Set.of("node")),
-    SOURCE_FIELD_CONFLICT("validation.source-field-conflict", Set.of("node", "field")),
-    RULE_UNSUPPORTED("validation.rule-unsupported", Set.of("node", "field", "rule")),
-    INVALID_CONTRACT("validation.invalid-contract", Set.of("field")),
-    KEY_LIMIT_EXCEEDED("validation.key-limit-exceeded", Set.of("limit")),
-    INCOMPATIBLE_KEY("validation.incompatible-key", Set.of("component")),
-    ILLEGAL_TRANSITION("validation.illegal-transition", Set.of("from", "to", "mode")),
-    VALUE_LIMIT_EXCEEDED("validation.value-limit-exceeded", Set.of("limit")),
-    VALUE_TYPE_UNSUPPORTED("validation.value-type-unsupported", Set.of("type")),
-    OWNER_NOT_AUTHORIZED("validation.owner-not-authorized", Set.of("pipeline")),
-    READ_FAILED("validation.read-failed", Set.of("table")),
-    READ_PROTOCOL_VIOLATION("validation.read-protocol-violation", Set.of("table")),
-    READ_CANCELLED("validation.read-cancelled", Set.of("table")),
-    CODEC_FAILED("validation.codec-failed", Set.of("connector", "field")),
-    CODEC_VALUE_UNAVAILABLE("validation.codec-value-unavailable", Set.of("connector", "field"));
+    SCHEDULE_FIELD_COUNT(ValidationErrorDefinitions.SCHEDULE_FIELD_COUNT),
+    SCHEDULE_INVALID(ValidationErrorDefinitions.SCHEDULE_INVALID),
+    SCHEDULE_NO_DATE(ValidationErrorDefinitions.SCHEDULE_NO_DATE),
+    SCHEDULE_SEARCH_EXHAUSTED(ValidationErrorDefinitions.SCHEDULE_SEARCH_EXHAUSTED),
+    EXECUTION_CANCELLED(ValidationErrorDefinitions.EXECUTION_CANCELLED),
+    SOURCE_FIELD_CONFLICT(ValidationErrorDefinitions.SOURCE_FIELD_CONFLICT),
+    RULE_UNSUPPORTED(ValidationErrorDefinitions.RULE_UNSUPPORTED),
+    INVALID_CONTRACT(ValidationErrorDefinitions.INVALID_CONTRACT),
+    KEY_LIMIT_EXCEEDED(ValidationErrorDefinitions.KEY_LIMIT_EXCEEDED),
+    INCOMPATIBLE_KEY(ValidationErrorDefinitions.INCOMPATIBLE_KEY),
+    ILLEGAL_TRANSITION(ValidationErrorDefinitions.ILLEGAL_TRANSITION),
+    VALUE_LIMIT_EXCEEDED(ValidationErrorDefinitions.VALUE_LIMIT_EXCEEDED),
+    VALUE_TYPE_UNSUPPORTED(ValidationErrorDefinitions.VALUE_TYPE_UNSUPPORTED),
+    OWNER_NOT_AUTHORIZED(ValidationErrorDefinitions.OWNER_NOT_AUTHORIZED),
+    READ_FAILED(ValidationErrorDefinitions.READ_FAILED),
+    READ_PROTOCOL_VIOLATION(ValidationErrorDefinitions.READ_PROTOCOL_VIOLATION),
+    READ_CANCELLED(ValidationErrorDefinitions.READ_CANCELLED),
+    CODEC_FAILED(ValidationErrorDefinitions.CODEC_FAILED),
+    CODEC_VALUE_UNAVAILABLE(ValidationErrorDefinitions.CODEC_VALUE_UNAVAILABLE);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    ValidationError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
+    ValidationError(ProductErrorDefinition definition) {
+        this.definition = definition;
     }
 
-    @Override public String code() { return code; }
-    @Override public Severity severity() { return Severity.ERROR; }
-    @Override public Set<String> placeholders() { return placeholders; }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 
     static TapstateException invalid(String field) {
         return new TapstateException(INVALID_CONTRACT, Map.of("field", field), null);

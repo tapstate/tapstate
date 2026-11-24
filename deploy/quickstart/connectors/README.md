@@ -93,7 +93,7 @@ Other managed variants of Oracle, SQL Server and Db2 are outside the default acc
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
 on this server. Configuring it puts that server outside the supported configuration;
 acceptance does not certify the added connectors. The setting is empty by default and
-is not configured in release or quickstart artifacts. A `connector.not-official` refusal
+is not configured in release or quickstart artifacts. A `TS0060008` refusal
 reports the server's actual accepted set, including any additional ids configured there.
 Registration through an upload and registration through the seed directory use the same
 acceptance check.

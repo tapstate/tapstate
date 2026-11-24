@@ -122,7 +122,7 @@ class CloudAtlasObservabilityRecoveryIT {
                             Map<?, ?> explain = read(control, path("explain"), credentials);
                             return "FAILED".equals(status.get("state"))
                                     && status.get("failure") instanceof Map<?, ?> failure
-                                    && "connector.capture-failed".equals(failure.get("code"))
+                                    && "TS0060024".equals(failure.get("code"))
                                     && "CODED_FAILURE".equals(explain.get("kind"))
                                     && "FRESH".equals(explain.get("freshness"));
                         }, () -> "no matching fresh coded failure yet");
@@ -191,7 +191,7 @@ class CloudAtlasObservabilityRecoveryIT {
                 var response = client.send(request.GET().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(response.statusCode()).isEqualTo(401);
                 assertThat(((Map<?, ?>) JsonReader.parse(response.body())).get("code"))
-                        .isEqualTo("control.unauthenticated");
+                        .isEqualTo("TS0210003");
             }
         }
     }

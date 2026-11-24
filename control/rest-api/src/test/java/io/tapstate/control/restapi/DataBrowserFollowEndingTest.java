@@ -63,7 +63,7 @@ class DataBrowserFollowEndingTest {
                 .as("the stream is over and the connection is not; a reader left on it is watching "
                         + "what a collection nobody is changing looks like")
                 .isNotNull();
-        assertThat(session.closedWith.getReason()).isEqualTo("data-browser.follow-stopped");
+        assertThat(session.closedWith.getReason()).isEqualTo("TS0390006");
         assertThat(session.closedWith.getCode())
                 .as("closed as a refusal the client cannot fix by reconnecting, so it stops rather "
                         + "than re-attaching into the same failure")
@@ -88,7 +88,7 @@ class DataBrowserFollowEndingTest {
         handler.sweepIdle();
 
         assertThat(session.closedWith).isNotNull();
-        assertThat(session.closedWith.getReason()).isEqualTo("data-browser.follow-idle");
+        assertThat(session.closedWith.getReason()).isEqualTo("TS0390007");
         assertThat(closes.get()).isEqualTo(1);
     }
 
