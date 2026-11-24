@@ -43,6 +43,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -209,29 +210,70 @@ class MongoConfigurationDraftStoreIT {
             domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
             long before = revision(database);
             var publication = publication("orders", 1, null, Map.of());
-            var ciphers = SourceConfigCipherProvider.fixed(cipher(database));
-            List<BsonDocument> commands = new CopyOnWriteArrayList<>();
-            var witness = new CommandListener() {
-                @Override public void commandStarted(CommandStartedEvent event) {
-                    if (event.getCommand().containsKey("autocommit")) commands.add(event.getCommand().clone());
-                }
-            };
-            String appName = database.getName();
-            try (var observed = MongoClients.create(MongoClientSettings.builder()
-                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).applicationName(appName)
-                    .addCommandListener(witness).build())) {
-                var target = observed.getDatabase(database.getName());
-                var store = new MongoConfigurationDraftStore(observed, target, ciphers, new MongoConfigurationArtifactStore(observed, target, ciphers));
-                var admin = observed.getDatabase("admin");
-                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", times))
-                        .append("data", fault.append("failCommands", List.of(command)).append("appName", appName)));
-                try { scenario.run(store, publication, commands); }
-                finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
-            }
+            withObservedFault(database, command, times, fault, (store, commands) -> scenario.run(store, publication, commands));
             assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
             assertThat(domain.drafts().get("orders").orElseThrow().publishedArtifactHash()).isEqualTo(publication.publishedArtifactHash());
             assertThat(revision(database)).isEqualTo(before + 1);
         });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"2, true", "4, false"})
+    void definitionChangesBoundAmbiguousCommits(int unknownReplies, boolean confirmed) {
+        withConfiguration((domain, database) -> {
+            var publication = publishedDefinition(domain);
+            var changed = changedDefinition();
+            var hash = CanonicalHash.of(changed);
+            var change = new PipelineDraft.DefinitionChange("orders", publication.publishedArtifactHash(),
+                    changed, hash, Map.of(), draft -> changedDraft(draft, hash));
+            long before = revision(database);
+            var fault = new Document("writeConcernError", new Document("code", 64).append("errmsg", "acknowledgement lost"))
+                    .append("errorLabels", List.of(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL));
+            withObservedFault(database, "commitTransaction", unknownReplies, fault, (store, commands) -> {
+                if (confirmed) {
+                    assertThat(store.changeDefinition(change)).isEqualTo(PipelineDraftMutation.REPLACED);
+                } else {
+                    assertThatThrownBy(() -> store.changeDefinition(change))
+                            .isInstanceOfSatisfying(TapstateException.class, error -> {
+                                assertThat(error.code()).isEqualTo(IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN);
+                                assertThat(error.args()).containsExactlyEntriesOf(Map.of("pipeline", "orders"));
+                            });
+                }
+                var starts = commands.stream().filter(command -> command.containsKey("startTransaction")).toList();
+                assertThat(starts).hasSize(1);
+                assertThat(commands.stream().filter(command -> command.containsKey("commitTransaction")))
+                        .hasSize(3).allSatisfy(commit -> {
+                            assertThat(commit.get("lsid")).isEqualTo(starts.getFirst().get("lsid"));
+                            assertThat(commit.get("txnNumber")).isEqualTo(starts.getFirst().get("txnNumber"));
+                        });
+            });
+            assertThat(domain.artifacts().get("orders")).contains(changed);
+            assertThat(domain.drafts().get("orders").orElseThrow().revision()).isEqualTo(2);
+            assertThat(revision(database)).isEqualTo(before + 1);
+        });
+    }
+
+    private static void withObservedFault(MongoDatabase database, String command, int times, Document fault,
+            BiConsumer<MongoConfigurationDraftStore, List<BsonDocument>> scenario) {
+        var ciphers = SourceConfigCipherProvider.fixed(cipher(database));
+        List<BsonDocument> commands = new CopyOnWriteArrayList<>();
+        var witness = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommand().containsKey("autocommit")) commands.add(event.getCommand().clone());
+            }
+        };
+        String appName = database.getName();
+        try (var observed = MongoClients.create(MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).applicationName(appName)
+                .addCommandListener(witness).build())) {
+            var target = observed.getDatabase(database.getName());
+            var store = new MongoConfigurationDraftStore(observed, target, ciphers, new MongoConfigurationArtifactStore(observed, target, ciphers));
+            var admin = observed.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", times))
+                    .append("data", fault.append("failCommands", List.of(command)).append("appName", appName)));
+            try { scenario.accept(store, commands); }
+            finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+        }
     }
 
     @FunctionalInterface
