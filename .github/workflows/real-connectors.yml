@@ -211,7 +211,8 @@ jobs:
   connector-witnesses:
     needs: [connector-plan, connector-jars]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Step budgets total 86 minutes, leaving four for runner and action overhead.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -222,58 +223,69 @@ jobs:
       TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 2
         with:
           ref: ${{ inputs.source-sha }}
       - uses: actions/setup-java@v4
+        timeout-minutes: 3
         with:
           distribution: temurin
           java-version: "21"
           cache: maven
       - name: Set up the pinned reactor Maven
+        timeout-minutes: 3
         run: bash .github/scripts/setup-ci-maven.sh
       - uses: actions/download-artifact@v4
+        timeout-minutes: 2
         with:
           name: connector-maven-inputs
           path: ${{ runner.temp }}/connector-maven-inputs
       - uses: actions/download-artifact@v4
+        timeout-minutes: 2
         with:
           name: connector-shard-plan
           path: ${{ runner.temp }}
       - uses: actions/download-artifact@v4
+        timeout-minutes: 2
         with:
           name: connector-jars
           path: ${{ runner.temp }}/connectors
       - name: Seed isolated Maven dependencies
+        timeout-minutes: 2
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Seed verified install plugin dependencies
+        timeout-minutes: 2
         working-directory: ${{ runner.temp }}/connector-maven-inputs
         run: |
           set -euo pipefail
           sha256sum --check --strict connector-maven-inputs.tar.gz.sha256
           tar -xzf connector-maven-inputs.tar.gz -C "$RUNNER_TEMP/m2"
       - name: Prepare pinned public inputs for Cloud connector witnesses
+        timeout-minutes: 3
         run: |
           python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
           echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
       - name: Install the reactor without executing tests
+        timeout-minutes: 8
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Run this exact connector witness shard
+        timeout-minutes: 45
         # Docker 29 requires a newer API than the pinned testcontainers default.
         env:
           MAVEN_ARGS: -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=${{ runner.temp }}/connectors -Dtapstate.dummy.jar=${{ runner.temp }}/cloud-test-release/connectors/dummy-connector.jar
         run: .github/scripts/connector-witnesses.sh run --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connectors/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
       - name: Admit reports and the sweep's witness ledger
+        timeout-minutes: 3
         run: .github/scripts/connector-witnesses.sh pack --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connectors/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/connector-results/$SHARD"
-      - name: Retain only third-party Maven dependencies
-        if: always()
-        run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - uses: actions/upload-artifact@v4
+        timeout-minutes: 4
         with:
           name: connector-results-${{ matrix.shard }}
           path: ${{ runner.temp }}/connector-results
           if-no-files-found: error
           retention-days: 7
       - name: The scene where an end-to-end case failed
+        timeout-minutes: 3
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -285,6 +297,11 @@ jobs:
             e2e/target/witness-ledgers/
           if-no-files-found: ignore
           retention-days: 7
+      - name: Retain only third-party Maven dependencies
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
 
   # Each input policy has its own non-matrix verdict, including on missing shards.
   real-connectors:
