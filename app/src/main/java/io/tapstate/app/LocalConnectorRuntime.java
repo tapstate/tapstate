@@ -1,9 +1,11 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.adapters.pdk.LocalConnectorArtifacts;
 import io.tapstate.adapters.pdk.SeedOutcome;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.BundledConnectorIcon;
 import io.tapstate.spi.store.ConnectorArtifactMetadata;
 import io.tapstate.spi.store.ConnectorCatalogStore;
@@ -11,14 +13,20 @@ import io.tapstate.spi.store.ContentHash;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.annotation.AnnotationFormatError;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.zip.ZipException;
 
 /** Owns incremental registration of the immutable image and the on-premises drop directory. */
 final class LocalConnectorRuntime implements AutoCloseable {
@@ -27,6 +35,7 @@ final class LocalConnectorRuntime implements AutoCloseable {
     private final Path seed;
     private final Path drop;
     private final Maintenance maintenance;
+    private final Map<Path, RejectedDrop> rejectedDrops = new HashMap<>();
     private Thread worker;
 
     @FunctionalInterface
@@ -115,7 +124,7 @@ final class LocalConnectorRuntime implements AutoCloseable {
     private static List<Path> jars(Path directory) throws IOException {
         if (!Files.isDirectory(directory)) return List.of();
         try (var paths = Files.list(directory)) {
-            return paths.filter(file -> Files.isRegularFile(file, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+            return paths.filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)
                     && file.getFileName().toString().endsWith(".jar")).sorted().toList();
         }
     }
@@ -140,15 +149,54 @@ final class LocalConnectorRuntime implements AutoCloseable {
         }
     }
 
-    private void pollDrops() throws IOException {
-        for (Path file : jars(drop)) {
-            try {
-                local.installDrop(file);
-            } catch (io.tapstate.core.common.TapstateException failure) {
-                LOG.warn("Could not install dropped connector {} ({})", file.getFileName(), failure.code().code());
-            }
+    void pollDrops() throws IOException {
+        var files = jars(drop);
+        rejectedDrops.keySet().retainAll(Set.copyOf(files));
+        for (Path file : files) {
+            pollDrop(file);
         }
     }
+
+    private void pollDrop(Path file) {
+        BasicFileAttributes attributes;
+        try {
+            attributes = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (IOException unavailable) {
+            LOG.warn("Could not read dropped connector {}", file.getFileName(), unavailable);
+            return;
+        }
+        if (!attributes.isRegularFile()) return;
+        var stamp = new DropStamp(attributes.fileKey(), attributes.size(), attributes.lastModifiedTime());
+        var rejected = rejectedDrops.get(file);
+        if (rejected != null && rejected.stamp().equals(stamp)
+                && (rejected.unlistedId() == null || !local.admits(rejected.unlistedId()))) return;
+        rejectedDrops.remove(file);
+        try {
+            local.installDrop(file);
+        } catch (TapstateException failure) {
+            if (failure.code() == ConnectorError.NOT_OFFICIAL
+                    && failure.args().get("connector") instanceof String id) {
+                rejectedDrops.put(file, new RejectedDrop(stamp, id));
+            } else if (invalidArtifact(failure)) {
+                rejectedDrops.put(file, new RejectedDrop(stamp, null));
+            }
+            LOG.warn("Could not install dropped connector {} ({})", file.getFileName(), failure.code().code());
+        }
+    }
+
+    private static boolean invalidArtifact(TapstateException failure) {
+        return failure.code() instanceof ConnectorError code && switch (code) {
+            case NO_CONNECTOR_CLASS, AMBIGUOUS_CONNECTOR_CLASS, API_LEVEL_UNKNOWN -> true;
+            case ARTIFACT_UNREADABLE -> failure.getCause() instanceof ZipException;
+            case LOAD_FAILED -> failure.getCause() instanceof LinkageError
+                    || failure.getCause() instanceof AnnotationFormatError;
+            default -> false;
+        };
+    }
+
+    private record DropStamp(Object fileKey, long size, FileTime modified) {}
+
+    private record RejectedDrop(DropStamp stamp, String unlistedId) {}
 
     ConnectorCatalogStore view(ConnectorCatalogStore underlying, ConnectorCatalogBackground support) {
         return new ConnectorCatalogStore() {

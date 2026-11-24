@@ -152,6 +152,10 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         }
     }
 
+    public boolean admits(String connectorId) {
+        return admission.get().contains(connectorId);
+    }
+
     public RegistrationOutcome installDrop(Path artifact) {
         try (var input = Files.newInputStream(artifact)) {
             var result = install(input, Origin.DROP_DIRECTORY, null, null);

@@ -233,13 +233,21 @@ func start(dataDir, javaHome string) (bool, error) {
 func waitForStart(l locations) error {
 	for deadline := time.Now().Add(startTimeout); time.Now().Before(deadline); {
 		result, err := control(l, "status", statusTimeout)
-		if err == nil && result.Phase != "Starting" && result.Phase != "Stopping" {
-			printStatus(result, l.DataDir)
-			if result.Phase == "Waiting for storage setup" || result.Phase == "Waiting for first administrator" {
+		if err == nil {
+			switch result.Phase {
+			case "Ready":
+				printStatus(result, l.DataDir)
+				return nil
+			case "Waiting for storage setup", "Waiting for first administrator":
+				printStatus(result, l.DataDir)
 				fmt.Printf("If the wizard asks for installation authorization, use %s.\n",
 					filepath.Join(l.installation(), "capability.json"))
+				return nil
+			case "Starting", "Stopping":
+				// Keep polling until the supervisor reports an entry point or exits.
+			default:
+				err = fmt.Errorf("service did not start (status %q)", result.Phase)
 			}
-			return nil
 		}
 		if err != nil && !errors.Is(err, errBusy) {
 			return fmt.Errorf("%v; use tapstate-ctl logs --data-dir %s", err, shellQuote(l.DataDir))

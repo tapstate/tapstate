@@ -52,7 +52,8 @@ def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS, *,
+              profile: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     try:
         lock = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -61,6 +62,11 @@ def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS) -> tuple
         raise StageError("connector lock must have schemaVersion, connectors, and licenseFiles")
     if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] not in (2, 3):
         raise StageError("connector lock schemaVersion must be 2 or 3")
+    if profile is not None:
+        if lock["schemaVersion"] == 3:
+            required_ids = PUBLISHED_ONPREM_IDS if profile == "onprem" else CLOUD_IDS
+        else:
+            required_ids = ONPREM_IDS if profile == "onprem" else REQUIRED_IDS
     entries = lock["connectors"]
     if not isinstance(entries, list) or len(entries) != len(required_ids):
         raise StageError(f"connector lock must contain exactly {len(required_ids)} entries")
@@ -198,8 +204,9 @@ def verify_companion_license(path: Path, entry: dict[str, Any]) -> None:
         raise StageError(f"{name}: companion license bytes differ from the release lock")
 
 
-def stage(lock_path: Path, jar_dir: Path, stage_dir: Path, required_ids: tuple[str, ...] = REQUIRED_IDS) -> None:
-    entries, license_files = read_lock(lock_path, required_ids)
+def stage(lock_path: Path, jar_dir: Path, stage_dir: Path, required_ids: tuple[str, ...] = REQUIRED_IDS, *,
+          profile: str | None = None) -> int:
+    entries, license_files = read_lock(lock_path, required_ids, profile=profile)
     expected_names = {f"{entry['id']}-connector.jar" for entry in entries}
     if not jar_dir.is_dir():
         raise StageError("connector JAR directory is missing")
@@ -241,6 +248,7 @@ def stage(lock_path: Path, jar_dir: Path, stage_dir: Path, required_ids: tuple[s
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
+    return len(entries)
 
 
 def main() -> int:
@@ -250,17 +258,12 @@ def main() -> int:
     parser.add_argument("--stage-dir", required=True, type=Path)
     parser.add_argument("--profile", choices=("cloud", "onprem"), default="cloud")
     args = parser.parse_args()
-    version = json.loads(args.lock.read_text())["schemaVersion"]
-    if version == 3:
-        required_ids = PUBLISHED_ONPREM_IDS if args.profile == "onprem" else CLOUD_IDS
-    else:
-        required_ids = ONPREM_IDS if args.profile == "onprem" else REQUIRED_IDS
     try:
-        stage(args.lock, args.jar_dir, args.stage_dir, required_ids)
+        count = stage(args.lock, args.jar_dir, args.stage_dir, profile=args.profile)
     except StageError as exc:
         print(f"connector staging refused: {exc}", file=sys.stderr)
         return 1
-    print(f"staged {len(required_ids)} locked connectors in {args.stage_dir}")
+    print(f"staged {count} locked connectors in {args.stage_dir}")
     return 0
 
 

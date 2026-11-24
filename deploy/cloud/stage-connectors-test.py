@@ -298,6 +298,26 @@ class StageConnectorsTest(unittest.TestCase):
             staged_license = self.staged / "release/licenses" / entry["name"]
             self.assertEqual(staged_license.read_bytes(), (self.jars / entry["name"]).read_bytes())
 
+    def test_cli_reports_invalid_lock_with_staging_refusal(self) -> None:
+        cases = (
+            (None, "cannot read connector lock"),
+            ("{", "cannot read connector lock"),
+            ("[]", "connector lock must have schemaVersion"),
+            ('{"schemaVersion":2,"schemaVersion":3}', "duplicate JSON field: schemaVersion"),
+        )
+        for index, (payload, expected) in enumerate(cases):
+            with self.subTest(payload=payload):
+                lock = self.root / f"invalid-{index}.json"
+                if payload is not None:
+                    lock.write_text(payload, encoding="utf-8")
+                result = subprocess.run([sys.executable, str(SCRIPT), "--lock", str(lock),
+                                         "--jar-dir", str(self.jars), "--stage-dir", str(self.staged)],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.startswith(f"connector staging refused: {expected}"), result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(self.staged.exists())
+
     def test_bundled_db2_runtime_has_a_bound_without_expanding_other_connector_budgets(self) -> None:
         db2 = next(entry for entry in self.entries if entry["id"] == "db2")
         db2["bytes"] = 203_082_147

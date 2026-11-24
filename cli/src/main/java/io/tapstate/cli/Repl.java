@@ -2698,11 +2698,13 @@ final class Repl {
             return registerDirectory(artifactPath, parsed.format());
         }
         PrintWriter err = commandLine.getErr();
-        if (!Files.exists(artifactPath)) {
+        boolean catalogCandidate = !Files.exists(artifactPath)
+                && !parsed.path().toLowerCase(Locale.ROOT).endsWith(".jar");
+        if (catalogCandidate) {
             var installed = controlPlane.downloadConnector(session.landingNode(), session.credential(), parsed.path());
             if (installed.isPresent()) return renderRegistrationOutcome(installed.get(), parsed.format());
         }
-        boolean publishedId = !Files.exists(artifactPath) && PublishedConnectorArtifacts.contains(parsed.path());
+        boolean publishedId = catalogCandidate && PublishedConnectorArtifacts.contains(parsed.path());
         byte[] artifact;
         String artifactName;
         if (publishedId) {

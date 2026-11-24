@@ -16,12 +16,14 @@ import io.tapstate.spi.store.RegistrationSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.zip.ZipException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -30,6 +32,8 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
@@ -103,6 +107,60 @@ class LocalConnectorRuntimeTest {
             assertThat(runtime.initialize(null)).containsExactly(
                     new SeedOutcome.Failed(rejected, failure), new SeedOutcome.Seeded(admitted, registered));
             assertThat(rejected).exists();
+        }
+    }
+
+    @Test
+    void anInvalidDropIsRetriedOnlyWhenTheFileChanges() throws IOException {
+        Path drop = Files.writeString(root.resolve("broken.jar"), "invalid JAR");
+        var local = mock(LocalConnectorArtifacts.class);
+        when(local.installDrop(drop)).thenThrow(new TapstateException(
+                ConnectorError.ARTIFACT_UNREADABLE, Map.of(), new ZipException("invalid JAR")));
+
+        try (var runtime = new LocalConnectorRuntime(local, root, root, () -> {})) {
+            runtime.pollDrops();
+            runtime.pollDrops();
+            verify(local).installDrop(drop);
+
+            Files.writeString(drop, "replacement dropped JAR");
+            runtime.pollDrops();
+            verify(local, times(2)).installDrop(drop);
+        }
+    }
+
+    @Test
+    void anUnlistedDropIsRetriedWhenItsConnectorIsAdmitted() throws IOException {
+        Path drop = Files.writeString(root.resolve("mysql.jar"), "connector JAR");
+        var local = mock(LocalConnectorArtifacts.class);
+        when(local.installDrop(drop)).thenThrow(new TapstateException(
+                ConnectorError.NOT_OFFICIAL, Map.of("connector", "mysql"), null)).thenAnswer(call -> {
+                    Files.delete(drop);
+                    return null;
+                });
+
+        try (var runtime = new LocalConnectorRuntime(local, root, root, () -> {})) {
+            runtime.pollDrops();
+            runtime.pollDrops();
+            verify(local).installDrop(drop);
+            assertThat(drop).exists();
+
+            when(local.admits("mysql")).thenReturn(true);
+            runtime.pollDrops();
+            verify(local, times(2)).installDrop(drop);
+            assertThat(drop).doesNotExist();
+        }
+    }
+
+    @Test
+    void aTransientDropFailureIsRetriedWithoutChangingTheFile() throws IOException {
+        Path drop = Files.writeString(root.resolve("pending.jar"), "connector JAR");
+        var local = mock(LocalConnectorArtifacts.class);
+        when(local.installDrop(drop)).thenThrow(new TapstateException(
+                ConnectorError.ARTIFACT_UNREADABLE, Map.of(), new IOException("temporary read failure")));
+        try (var runtime = new LocalConnectorRuntime(local, root, root, () -> {})) {
+            runtime.pollDrops();
+            runtime.pollDrops();
+            verify(local, times(2)).installDrop(drop);
         }
     }
 
