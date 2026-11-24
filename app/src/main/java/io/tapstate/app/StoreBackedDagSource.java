@@ -1547,58 +1547,47 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, TargetTable> bases, Set<String> assemblies, Map<String, SourceVertex> sourceVertices,
             Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
             Set<String> stepIds, Function<SourceVertex, NodeColumns> sourceColumns) {
+        var graph = new StreamGraph(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds);
         Map<String, TargetTable> published = new LinkedHashMap<>();
         for (String stream : streams) {
             TargetTable base = bases.get(stream);
-            if (base == null) {
-                continue;
-            }
-            boolean assembled = assemblies.contains(stream);
-            NodeColumns original = assembled ? assembledColumns(base) : atTheSource(stream, sourceVertices, sourceColumns);
-            if (original == null) {
-                continue;
-            }
-            Map<String, io.tapstate.core.common.NumericType> numbers = new LinkedHashMap<>();
-            Map<String, io.tapstate.core.common.StringType> strings = new LinkedHashMap<>();
-            for (TargetField field : base.fields()) {
-                if (field.numericType() != null) numbers.put(field.name(), field.numericType());
-                if (field.stringType() != null) strings.put(field.name(), field.stringType());
-            }
-            NodeColumns origin = original.withNumericTypes(numbers).withStringTypes(strings);
-            Map<String, NodeColumns> inputs = new LinkedHashMap<>();
-            for (FromRef ref : refsOf(from)) {
-                NodeColumns columns = streamColumnsAt(pipeline, ref, stream, sourceVertices,
-                        sourceKeyByTable, sourceKeysById, stepIds, new HashSet<>(), origin);
-                if (columns != null) {
-                    inputs.put(Integer.toString(inputs.size()), columns);
-                }
-            }
-            if (inputs.isEmpty()) {
-                continue;
-            }
-            NodeColumns produced = inputs.size() == 1 ? inputs.values().iterator().next()
-                    : NodeColumns.of(new TransformBody.Union(), inputs, null);
-            if (assembled && origin.equals(produced)) {
-                continue;
-            }
-            if (produced.known()) {
-                published.put(stream, publishedAs(base, produced, origin));
-            } else {
-                // A script may rewrite any field. Preserve a non-key decimal description as a
-                // candidate, without declaring the result of the script to be a decimal.
-                published.put(stream, TargetModelResolver.keyedOn(new TargetTable(base.name(), base.fields().stream()
-                        .map(field -> {
-                            boolean decimal = field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL;
-                            return decimal && !field.primaryKey() && field.numericType() != null
-                                    ? TargetField.deferredDecimal(field.name(), field.numericType())
-                                    : new TargetField(field.name(), decimal ? null : field.type(),
-                                            field.primaryKey(), field.inferredType());
-                        })
-                        .toList(), List.of()), base.fields().stream().filter(TargetField::primaryKey)
-                        .map(TargetField::name).toList()));
+            if (base != null) {
+                var target = publishedTarget(graph, from, stream, base, assemblies.contains(stream), sourceColumns);
+                if (target != null) published.put(stream, target);
             }
         }
         return published;
+    }
+
+    private TargetTable publishedTarget(StreamGraph graph, FromClause from, String stream, TargetTable base,
+            boolean assembled, Function<SourceVertex, NodeColumns> sourceColumns) {
+        NodeColumns original = assembled ? assembledColumns(base) : atTheSource(stream, graph.vertices(), sourceColumns);
+        if (original == null) return null;
+        Map<String, io.tapstate.core.common.NumericType> numbers = new LinkedHashMap<>();
+        Map<String, io.tapstate.core.common.StringType> strings = new LinkedHashMap<>();
+        for (TargetField field : base.fields()) {
+            if (field.numericType() != null) numbers.put(field.name(), field.numericType());
+            if (field.stringType() != null) strings.put(field.name(), field.stringType());
+        }
+        var origin = original.withNumericTypes(numbers).withStringTypes(strings);
+        var inputs = streamInputs(graph, from, stream, origin, new HashSet<>());
+        if (inputs.isEmpty()) return null;
+        NodeColumns produced = inputs.size() == 1 ? inputs.values().iterator().next()
+                : NodeColumns.of(new TransformBody.Union(), inputs, null);
+        if (assembled && origin.equals(produced)) return null;
+        return produced.known() ? publishedAs(base, produced, origin) : unknownTarget(base);
+    }
+
+    private static TargetTable unknownTarget(TargetTable base) {
+        // A script may rewrite any field. Retain non-key decimals as candidates until their type is known.
+        List<TargetField> fields = base.fields().stream().map(field -> {
+            boolean decimal = field.inferredType() == TapstateType.DECIMAL;
+            return decimal && !field.primaryKey() && field.numericType() != null
+                    ? TargetField.deferredDecimal(field.name(), field.numericType())
+                    : new TargetField(field.name(), decimal ? null : field.type(), field.primaryKey(), field.inferredType());
+        }).toList();
+        return TargetModelResolver.keyedOn(new TargetTable(base.name(), fields, List.of()),
+                base.fields().stream().filter(TargetField::primaryKey).map(TargetField::name).toList());
     }
 
     private static NodeColumns assembledColumns(TargetTable model) {
@@ -1626,57 +1615,45 @@ final class StoreBackedDagSource implements DagSource {
      * <p>An assembly publishes its own stream under its step id. Its model starts there, and the
      * streams it consumes stop there.
      */
-    private NodeColumns streamColumnsAt(
-            PipelineResource pipeline, FromRef from, String stream,
-            Map<String, SourceVertex> sourceVertices, Map<String, String> sourceKeyByTable,
-            Map<String, List<String>> sourceKeysById, Set<String> stepIds, Set<String> visiting,
-            NodeColumns origin) {
-        ViewBlock.Inline view = inlineViewNamed(pipeline, from);
+    private static NodeColumns streamColumnsAt(StreamGraph graph, FromRef from, String stream,
+            NodeColumns origin, Set<String> visiting) {
+        ViewBlock.Inline view = inlineViewNamed(graph.pipeline(), from);
         if (view != null) {
-            NodeColumns upstream = streamColumnsAt(pipeline, view.from(), stream,
-                    sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, origin);
+            NodeColumns upstream = streamColumnsAt(graph, view.from(), stream, origin, visiting);
             return upstream == null ? null : NodeColumns.of(view, upstream);
         }
         List<NodeColumns> reached = new ArrayList<>();
-        for (String key : upstreams(from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds)) {
-            SourceVertex vertex = sourceVertices.get(key);
-            if (vertex != null) {
-                if (vertex.stream().equals(stream)) {
-                    reached.add(origin);
-                }
-                continue;
-            }
-            if (!(stepOf(pipeline, key) instanceof Step.Inline inline)) {
-                continue;
-            }
-            if (publishesOwnStream(inline.body())) {
-                if (inline.id().equals(stream)) {
-                    reached.add(origin);
-                }
-                continue;
-            }
-            if (!visiting.add(key)) {
-                continue;
-            }
-            try {
-                Map<String, NodeColumns> inputs = new LinkedHashMap<>();
-                for (FromRef upstreamRef : refsOf(inline.from())) {
-                    NodeColumns upstream = streamColumnsAt(pipeline, upstreamRef, stream,
-                            sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, origin);
-                    if (upstream != null) {
-                        inputs.put(Integer.toString(inputs.size()), upstream);
-                    }
-                }
-                if (!inputs.isEmpty()) {
-                    reached.add(NodeColumns.of(inline.id(), inline.body(), inputs, null));
-                }
-            } finally {
-                // A shared ancestor must be visited again from another fork. Only cycles on the
-                // current path are excluded, otherwise a later branch can silently lose its model.
-                visiting.remove(key);
-            }
+        for (String key : graph.upstreamsOf(from)) {
+            NodeColumns columns = streamColumnsAtKey(graph, key, stream, origin, visiting);
+            if (columns != null) reached.add(columns);
         }
         return reached.isEmpty() ? null : NodeColumns.merged(reached);
+    }
+
+    private static NodeColumns streamColumnsAtKey(StreamGraph graph, String key, String stream,
+            NodeColumns origin, Set<String> visiting) {
+        SourceVertex vertex = graph.vertices().get(key);
+        if (vertex != null) return vertex.stream().equals(stream) ? origin : null;
+        if (!(stepOf(graph.pipeline(), key) instanceof Step.Inline inline)) return null;
+        if (publishesOwnStream(inline.body())) return inline.id().equals(stream) ? origin : null;
+        if (!visiting.add(key)) return null;
+        try {
+            var inputs = streamInputs(graph, inline.from(), stream, origin, visiting);
+            return inputs.isEmpty() ? null : NodeColumns.of(inline.id(), inline.body(), inputs, null);
+        } finally {
+            // A shared ancestor must be visited again from another fork.
+            visiting.remove(key);
+        }
+    }
+
+    private static Map<String, NodeColumns> streamInputs(StreamGraph graph, FromClause from, String stream,
+            NodeColumns origin, Set<String> visiting) {
+        Map<String, NodeColumns> inputs = new LinkedHashMap<>();
+        for (FromRef ref : refsOf(from)) {
+            NodeColumns columns = streamColumnsAt(graph, ref, stream, origin, visiting);
+            if (columns != null) inputs.put(Integer.toString(inputs.size()), columns);
+        }
+        return inputs;
     }
 
     /**
@@ -2399,7 +2376,7 @@ final class StoreBackedDagSource implements DagSource {
         var allStreams = new HashSet<String>(targets.keySet());
         allStreams.addAll(viewTargets.keySet());
         observeTargetOrigins(
-                new TargetOriginGraph(
+                new StreamGraph(
                         pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 allStreams,
                 targetPreparations);
@@ -3296,53 +3273,60 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, List<String>> sourceKeysById, Map<String, SourceVertex> sourceVertices,
             Set<String> stepIds, Set<String> streams, Set<String> visiting,
             StreamWalk walk, java.util.function.Predicate<FromRef> available) {
-        boolean sourceInputs = walk != StreamWalk.TERMINAL;
-        ViewBlock.Inline view = inlineViewNamed(pipeline, from);
-        if (view != null) {
+        var graph = new StreamGraph(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds);
+        return new StreamTraversal(graph, streams, visiting, walk, available).collect(from);
+    }
+
+    private record StreamTraversal(StreamGraph graph, Set<String> streams, Set<String> visiting,
+            StreamWalk walk, Predicate<FromRef> available) {
+        private boolean collect(FromRef from) {
+            ViewBlock.Inline view = inlineViewNamed(graph.pipeline(), from);
+            if (view != null) return collectView(view);
+            if (!available.test(from)) return false;
+            List<String> keys = graph.upstreamsOf(from);
+            if (walk == StreamWalk.INPUTS && keys.isEmpty()) return false;
+            for (String key : keys) {
+                if (!collectKey(key)) return false;
+            }
+            return true;
+        }
+
+        private boolean collectView(ViewBlock.Inline view) {
+            if (walk == StreamWalk.TERMINAL) return collect(view.from());
             String alias = "view:" + view.id();
-            if (sourceInputs && !visiting.add(alias)) return false;
+            if (!visiting.add(alias)) return false;
             try {
-                return collectStreams(pipeline, view.from(), sourceKeyByTable, sourceKeysById, sourceVertices,
-                        stepIds, streams, visiting, walk, available);
+                return collect(view.from());
             } finally {
-                if (sourceInputs) visiting.remove(alias);
+                visiting.remove(alias);
             }
         }
-        if (!available.test(from)) return false;
-        List<String> upstreamKeys = upstreams(from, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
-        if (walk == StreamWalk.INPUTS && upstreamKeys.isEmpty()) return false;
-        for (String key : upstreamKeys) {
-            SourceVertex source = sourceVertices.get(key);
+
+        private boolean collectKey(String key) {
+            SourceVertex source = graph.vertices().get(key);
             if (source != null) {
                 streams.add(source.stream());
-                continue;
+                return true;
             }
-            Step step = stepOf(pipeline, key);
-            if (step == null) {
-                if (sourceInputs) return false;
-                continue;
-            }
+            Step step = stepOf(graph.pipeline(), key);
+            if (step == null) return walk == StreamWalk.TERMINAL;
             // Assemblies replace terminal streams, but every source feeding them contributes freshness.
-            if (!sourceInputs && step instanceof Step.Inline inline && publishesOwnStream(inline.body())) {
+            if (walk == StreamWalk.TERMINAL && step instanceof Step.Inline inline && publishesOwnStream(inline.body())) {
                 streams.add(step.id());
-                continue;
+                return true;
             }
-            if (!visiting.add(key)) {
-                if (sourceInputs) return false;
-                continue;
-            }
+            if (!visiting.add(key)) return walk == StreamWalk.TERMINAL;
             try {
                 FromRef root = walk == StreamWalk.OUTPUT_ROOTS ? assemblyRoot(step) : null;
-                List<FromRef> upstreamRefs = root == null ? refsOf(step.from()) : List.of(root);
-                for (FromRef upstream : upstreamRefs) {
-                    if (!collectStreams(pipeline, upstream, sourceKeyByTable, sourceKeysById,
-                            sourceVertices, stepIds, streams, visiting, walk, available)) return false;
+                if (root != null) return collect(root);
+                for (FromRef upstream : refsOf(step.from())) {
+                    if (!collect(upstream)) return false;
                 }
+                return true;
             } finally {
-                if (sourceInputs) visiting.remove(key);
+                if (walk != StreamWalk.TERMINAL) visiting.remove(key);
             }
         }
-        return true;
     }
 
     private static boolean publishesOwnStream(TransformBody body) {
@@ -5139,15 +5123,19 @@ final class StoreBackedDagSource implements DagSource {
      * shipped onto the DAG. Production binds the PDK factory that resolves the connector member-side; a test
      * can bind a capturing sink so the topology runs without a real connector.
      */
-    private record TargetOriginGraph(
+    private record StreamGraph(
             PipelineResource pipeline,
             Map<String, SourceVertex> vertices,
             Map<String, String> tables,
             Map<String, List<String>> sources,
-            Set<String> steps) {}
+            Set<String> steps) {
+        private List<String> upstreamsOf(FromRef from) {
+            return upstreams(from, tables, sources, vertices, steps);
+        }
+    }
 
     private static void observeTargetOrigins(
-            TargetOriginGraph graph, Set<String> streams, TargetPreparations preparations) {
+            StreamGraph graph, Set<String> streams, TargetPreparations preparations) {
         for (String stream : streams) {
             var origins = new HashSet<String>();
             graph.vertices().values().stream()
@@ -5159,7 +5147,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private static void collectTargetOrigins(
-            TargetOriginGraph graph, String key, Set<String> result, Set<String> visited) {
+            StreamGraph graph, String key, Set<String> result, Set<String> visited) {
         var vertex = graph.vertices().get(key);
         if (vertex != null) {
             result.add(vertex.sourceId());
