@@ -345,7 +345,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         return StoreIo.call(() -> transaction(session -> {
             verifyScope(session, scope, false);
             return decode(scope, key, notes.find(session, byNote(scope, key)).first());
-        }));
+        }, true));
     }
 
     @Override

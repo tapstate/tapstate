@@ -93,9 +93,47 @@ class MongoRequiredNoteStoreIT {
         });
     }
 
+    @org.junit.jupiter.api.RepeatedTest(2)
+    void readingTheMysqlReaderIdentityRecoversOneUnsentCheckout() {
+        withNotes(f -> {
+            var scope = f.initialize(chain("reader-identity"));
+            assertThat(f.notes.compareAndSet(scope, "SERVER_NAME", 0, bytes("original-reader"), false)).isTrue();
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var failedCheckouts = new AtomicInteger();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            failedCheckouts.incrementAndGet();
+                            resume.get().run();
+                        }
+                    })).addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) { commands.add(event.getCommandName()); }
+                    });
+            try (var client = MongoClients.create(settings.build())) {
+                var notes = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher());
+                var expected = notes.read(scope, "SERVER_NAME");
+                var pool = notePool(client);
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                commands.clear();
+                poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null});
+                var result = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.RequiredNoteValue>();
+                var failure = org.assertj.core.api.Assertions.catchThrowable(() -> result.set(notes.read(scope, "SERVER_NAME")));
+                assertThat(failedCheckouts).hasValue(1);
+                assertThat(notes.read(scope, "SERVER_NAME")).isEqualTo(expected);
+                assertThat(commands).doesNotContain("insert", "update", "findAndModify", "delete");
+                assertThat(failure).isNull();
+                assertThat(result.get()).isEqualTo(expected);
+            }
+        });
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings = {"first-checkout", "twice", "guard", "owner", "deadline", "ordinary-write"})
-    void aReadOnlyOpenRecoversOnlyOneCheckoutWithinItsOriginalAuthority(String stage) {
+    @org.junit.jupiter.params.provider.CsvSource({
+            "first-checkout,false", "twice,false", "guard,false", "owner,false", "deadline,false", "ordinary-write,false",
+            "twice,true", "guard,true", "owner,true", "deadline,true"})
+    void aReadRecoversOnlyOneCheckoutWithinItsOriginalAuthority(String stage, boolean readValue) {
         withNotes(f -> {
             f.pipelineGeneration("p1", 1);
             var scope = f.initialize(stage.equals("owner") ? pipeline("p1", 1) : chain("pool-recovery"));
@@ -140,6 +178,7 @@ class MongoRequiredNoteStoreIT {
                 long began = System.nanoTime();
                 var failure = org.assertj.core.api.Assertions.catchThrowable(() -> {
                     if (stage.equals("ordinary-write")) notes.compareAndSet(scope, "late", 0, bytes("refused"), false);
+                    else if (readValue) notes.read(scope, "SERVER_NAME");
                     else opened.set(notes.open(scope.owner()));
                 });
                 assertThat(failures).hasValue(stage.equals("twice") ? 2 : 1);
