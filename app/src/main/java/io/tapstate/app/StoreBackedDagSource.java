@@ -1574,7 +1574,8 @@ final class StoreBackedDagSource implements DagSource {
         if (inputs.isEmpty()) return null;
         NodeColumns produced = inputs.size() == 1 ? inputs.values().iterator().next()
                 : NodeColumns.of(new TransformBody.Union(), inputs, null);
-        if (assembled && origin.equals(produced)) return null;
+        // The caller already has the assembly's target. Only a known change overrides it.
+        if (assembled && (!produced.known() || origin.equals(produced))) return null;
         return produced.known() ? publishedAs(base, produced, origin) : unknownTarget(base);
     }
 
