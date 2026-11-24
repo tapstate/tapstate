@@ -52,7 +52,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoConfigurationCatalogStore catalog;
     private final PipelineLayoutStore layouts;
     private final PipelineStateMappings pipelineStates;
-    private final RequiredNoteStore requiredNotes;
+    private final MongoRequiredNoteStore requiredNotes;
     private final MongoStorageBindingStore bindings;
     private final MongoConfigurationSecurityStores security;
     private final MongoFirstAdminStore firstAdmin;
@@ -649,6 +649,19 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return requiredNotes;
     }
 
+    /** Durable references are read from one CONFIG snapshot before the member unlinks a local JAR. */
+    public java.util.Set<String> retainedConnectorArtifacts() {
+        requireOpen();
+        var database = connection.database();
+        return new MongoReadBudget(java.time.Duration.ofSeconds(5)).transaction(connection.client(), session -> {
+            var hashes = new java.util.HashSet<String>();
+            MongoPipelineIntentStore.addRetainedArtifactHashes(session, database, hashes);
+            MongoCaptureStatePreparations.addRetainedArtifactHashes(session, database, hashes);
+            requiredNotes.addRetainedArtifactHashes(session, hashes);
+            return java.util.Set.copyOf(hashes);
+        });
+    }
+
     public record StartSnapshot(io.tapstate.core.model.PipelineResource pipeline, PipelineStateMapping mapping,
             PipelinePreparation preparation, Optional<io.tapstate.spi.store.PipelineIntentSnapshot> intent) {}
 
@@ -1229,7 +1242,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public io.tapstate.spi.store.PipelineIntentStore intents() {
         requireOpen();
-        return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings).guardedBy(this::requireOpen);
+        return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings,
+                (MongoRequiredNoteStore) requiredNotes).guardedBy(this::requireOpen);
     }
 
     public io.tapstate.spi.store.PipelineStateRebuilds rebuilds() {

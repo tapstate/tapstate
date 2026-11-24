@@ -4,7 +4,19 @@ import java.util.Objects;
 
 /** A fixed submitting Pipeline and Source snapshot, with the existing Pipeline and node authority. */
 public record CapturePreparationRequest(PipelineIntentScope pipeline,WorkloadClaimFence originalPipeline,
-        WorkloadClaimFence originalNode,String sourceId,PipelinePreparationInputs inputs) {
+        WorkloadClaimFence originalNode,String sourceId,PipelinePreparationInputs inputs,SharedArtifact sharedArtifact) {
+    public record SharedArtifact(String sha256, Long handoffIntentRevision) {
+        public SharedArtifact {
+            if (sha256 == null || !sha256.matches("[0-9a-f]{64}")
+                    || handoffIntentRevision != null && handoffIntentRevision < 1)
+                throw new IllegalArgumentException("invalid versioned shared capture request");
+        }
+    }
+
+    public CapturePreparationRequest(PipelineIntentScope pipeline,WorkloadClaimFence originalPipeline,
+            WorkloadClaimFence originalNode,String sourceId,PipelinePreparationInputs inputs) {
+        this(pipeline,originalPipeline,originalNode,sourceId,inputs,null);
+    }
     public CapturePreparationRequest {
         Objects.requireNonNull(pipeline,"pipeline");Objects.requireNonNull(originalPipeline,"originalPipeline");Objects.requireNonNull(originalNode,"originalNode");
         Objects.requireNonNull(inputs,"inputs");

@@ -27,6 +27,17 @@ public final class SourceCaptureIdentity {
     public static String sharedCapture(String chainId) {
         named(chainId);return "capture-"+CanonicalHash.ofText(chainId+"|tail:ring");
     }
+    public static String versionedSharedChain(String canonical, String artifactHash, String handoff) {
+        named(canonical);
+        if (artifactHash == null || !artifactHash.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("invalid shared capture artifact hash");
+        }
+        var input = new StringBuilder();
+        token(input, canonical);
+        token(input, artifactHash);
+        token(input, handoff == null ? "" : handoff);
+        return "mcv-" + CanonicalHash.ofText(input.toString());
+    }
     public static String snapshotCapture(String chainId,Collection<String> streams) {
         named(chainId);var input=new StringBuilder(chainId).append("|snapshot");
         var sorted=new ArrayList<>(streams);sorted.sort(String::compareTo);input.append('|').append(sorted.size());

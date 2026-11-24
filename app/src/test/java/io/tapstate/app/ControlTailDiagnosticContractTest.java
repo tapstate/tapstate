@@ -20,7 +20,7 @@ class ControlTailDiagnosticContractTest {
         codes.addAll(List.of(PositionError.values()));
         codes.addAll(List.of(MigrationError.values()));
         codes.addAll(List.of(RowValueError.values()));
-        assertThat(codes).hasSize(21);
+        assertThat(codes).hasSize(22);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String domain = code instanceof ClusterError ? "cluster" : code instanceof ConnectorCatalogError ? "connector"

@@ -10,6 +10,9 @@ public final class ConnectorCatalogErrorDefinitions {
     public static final ProductErrorDefinition NOT_FOUND =
             DEFINITIONS.define(1, Severity.ERROR, Set.of("connector"));
 
+    public static final ProductErrorDefinition DOWNLOAD_TARGET_CHANGED =
+            DEFINITIONS.define(2, Severity.ERROR, Set.of("connector"));
+
     private ConnectorCatalogErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

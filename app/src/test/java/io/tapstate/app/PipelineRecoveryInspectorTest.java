@@ -32,6 +32,7 @@ class PipelineRecoveryInspectorTest {
     PipelineRecoveryInspectorTest() {
         when(configuration.cacheRecoveries()).thenReturn(recoveries);when(configuration.preparations()).thenReturn(preparations);
         when(configuration.bindings()).thenReturn(bindings);when(configuration.intents()).thenReturn(intents);
+        when(intents.connectorBindings()).thenReturn(mock(ConnectorBindingStore.class));
         when(configuration.capturePreparations()).thenReturn(mock(CaptureStatePreparations.class));
         when(bindings.cachePreparation()).thenReturn(Optional.of(new CachePreparation("auth",AUTH)));
         when(recoveries.read("flow")).thenReturn(Optional.of(new PipelineCacheRecovery(UUID.randomUUID().toString(),new PipelineIntentScope("cluster",1,"old-cache","flow",1),SCOPE)));

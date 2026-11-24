@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineStatus;
+import io.tapstate.control.core.ConnectorUsageQuery;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
 
@@ -32,7 +33,8 @@ record PipelineStatusResponse(
         boolean hasArtifact,
         ExecutionPlanResponse plan,
         List<String> awaitingRebalance,
-        ApiError intentReadFailure) {
+        ApiError intentReadFailure,
+        List<ConnectorUsageQuery.Version> connectorVersions) {
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog) {
         return of(status, catalog, Clock.systemUTC(), Locale.ENGLISH);
@@ -50,7 +52,7 @@ record PipelineStatusResponse(
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 null, status.observedState(), false, ExecutionPlanResponse.of(status.plan()),
-                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), null);
+                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), null, null);
     }
 
     static PipelineStatusResponse of(
@@ -69,7 +71,7 @@ record PipelineStatusResponse(
                 status.desiredState(), runtime.observedState(), item.hasArtifact(),
                 ExecutionPlanResponse.of(runtime.plan()),
                 runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance(),
-                ApiError.from(status.intentReadFailure(), catalog, locale));
+                ApiError.from(status.intentReadFailure(), catalog, locale), null);
     }
 
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
@@ -100,7 +102,12 @@ record PipelineStatusResponse(
                 ApiError.from(status.failure(), catalog, locale), observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 status.desiredState(), status.observedState(), item.hasArtifact(), null, null,
-                ApiError.from(status.intentReadFailure(), catalog, locale));
+                ApiError.from(status.intentReadFailure(), catalog, locale), null);
+    }
+
+    PipelineStatusResponse withConnectorVersions(List<ConnectorUsageQuery.Version> versions) {
+        return new PipelineStatusResponse(pipelineId, state, displayState, failure, observedAt, observedAgeMillis,
+                desiredState, observedState, hasArtifact, plan, awaitingRebalance, intentReadFailure, List.copyOf(versions));
     }
 
     private static boolean knownTransition(PipelineCatalogItem.UiState state) {

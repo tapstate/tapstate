@@ -1314,6 +1314,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(f.configuration.read(BUSINESS,captureId)).thenReturn(Optional.of(prepared));
             var origin=ConnectorNoteOrigin.capture("mongodb","a".repeat(64),f.source.config());
             when(f.configuration.inspectSharedOrigin(eq(BUSINESS),eq("input"),anyString(),anyString(),anyString())).thenReturn(Optional.of(origin));
+            when(f.connectors.resolveRetained(any(),any(),eq(origin))).thenCallRealMethod();
             var key=f.streamingProgress.get().snapshot().models().get("orders");
             var pinned=new SourceTable("orders",List.of(new SourceField("old-sample","STRING(100)")),List.of(),List.of());
             var srs=f.sources.srs(BUSINESS,() -> {});
@@ -1413,6 +1414,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(notes.origin(any())).thenAnswer(call -> noteOrigins.get(call.getArgument(0)));
             var artifact=new ConnectorRef(List.of(),connector.equals("mongodb")
                     ?"io.tapdata.mongodb.MongodbConnector":"not.loaded","2.0.8",null,null,"a".repeat(64),false);
+            doCallRealMethod().when(connectors).withArtifactRetention(any());
             when(connectors.resolve(connector)).thenReturn(artifact);
             when(connectors.resolve(connector,"a".repeat(64))).thenReturn(artifact);
             runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,nativeStores,mock(HazelcastInstance.class)));

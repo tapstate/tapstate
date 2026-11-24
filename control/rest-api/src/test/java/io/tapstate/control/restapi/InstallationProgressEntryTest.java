@@ -16,16 +16,17 @@ class InstallationProgressEntryTest {
         var body = new StorageEntryController(factory.getBeanProvider(StorageEntryStatus.class),
                 factory.getBeanProvider(InstallationHttpAccess.class)).entry(new MockHttpServletRequest()).getBody();
         assertThat(reads.get()).isZero(); assertThat(guards.get()).isEqualTo(1);
-        assertThat(body).containsEntry("management", true).containsEntry("entry", "UNAVAILABLE")
+        assertThat(body).containsEntry("management", true).containsEntry("entry", "UNAVAILABLE").containsEntry("businessReady", false)
                 .containsEntry("initializationProgress", Map.of("state", "RUNNING"));
         assertThat(body).doesNotContainKeys("allowedActions", "capability");
     }
     @Test void thePublicListenerNeverDisclosesInstallationProgress() {
-        StorageEntryStatus state = () -> new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.LOGIN);
+        StorageEntryStatus state = () -> new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.LOGIN, true);
         var factory = new StaticListableBeanFactory(Map.of("state", state, "installation", access(false, new AtomicInteger())));
         var body = new StorageEntryController(factory.getBeanProvider(StorageEntryStatus.class),
                 factory.getBeanProvider(InstallationHttpAccess.class)).entry(new MockHttpServletRequest()).getBody();
-        assertThat(body).containsEntry("management", false).doesNotContainKey("initializationProgress");
+        assertThat(body).containsEntry("management", false).containsEntry("entry", "LOGIN")
+                .containsEntry("businessReady", true).doesNotContainKey("initializationProgress");
     }
     private InstallationHttpAccess access(boolean management, AtomicInteger guards) {
         return new InstallationHttpAccess() {

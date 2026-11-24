@@ -241,6 +241,7 @@ class ApiExceptionHandler {
             Map.entry(ArtifactError.PIPELINE_NOT_STOPPED.code(), HttpStatus.CONFLICT),
             Map.entry(ArtifactError.RECLAIM_INCOMPLETE.code(), HttpStatus.INTERNAL_SERVER_ERROR),
             Map.entry(ConnectorCatalogError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),
+            Map.entry(ConnectorCatalogError.DOWNLOAD_TARGET_CHANGED.code(), HttpStatus.PRECONDITION_FAILED),
             Map.entry("connector.test-timeout", HttpStatus.GATEWAY_TIMEOUT),
             Map.entry(io.tapstate.core.common.ConnectorErrorDefinitions.TEST_TIMEOUT.code(), HttpStatus.GATEWAY_TIMEOUT),
             Map.entry(PipelineError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),

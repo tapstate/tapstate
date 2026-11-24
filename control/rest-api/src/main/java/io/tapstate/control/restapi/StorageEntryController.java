@@ -25,10 +25,11 @@ class StorageEntryController {
         var progress = management ? installation.initializationProgress() : Map.<String,Object>of();
         var state = "RUNNING".equals(progress.get("state")) ? null : states.getIfAvailable();
         var summary = "RUNNING".equals(progress.get("state"))
-                ? new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.UNAVAILABLE)
-                : state == null ? new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.UNAVAILABLE) : state.read();
+                ? new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.UNAVAILABLE, false)
+                : state == null ? new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.UNAVAILABLE, false) : state.read();
         var body = new java.util.LinkedHashMap<String,Object>();
         body.put("mode", summary.mode()); body.put("entry", summary.entry().name()); body.put("management", management);
+        body.put("businessReady", summary.businessReady());
         if (management && summary.entry() == StorageEntryStatus.Entry.LOGIN && installation.normalLoginUrl() != null)
             body.put("normalLoginUrl", installation.normalLoginUrl());
         if (management && installation.automaticAuthorization()) body.put("automaticAuthorization", true);
