@@ -86,7 +86,7 @@ class ACopyPipelineStartsAfterSlowPlanningIT {
                 assertThat(clock.slowNextPlan).as("the real target planner consumed the injected delay").isFalse();
                 if (policy.equals("append")) {
                     assertThat(answer.status()).as("the start response: %s", answer.body()).isEqualTo(409);
-                    assertThat(answer.body().get("code")).isEqualTo("lifecycle.start-needs-confirmation");
+                    assertThat(answer.body().get("code")).isEqualTo("TS0280006");
                     assertThat(answer.findings()).singleElement().satisfies(finding -> {
                         assertThat(finding).containsEntry("check", "target-not-empty")
                                 .containsEntry("evaluation", "COMPLETE").containsEntry("behavior", "CONFIRM");

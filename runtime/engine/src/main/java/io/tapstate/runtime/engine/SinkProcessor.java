@@ -8,9 +8,11 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
@@ -78,13 +80,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     }
 
     /**
-     * Not cooperative where there is an ack to report to. A write that settles hands the positions it earned
-     * to the ack there and then, and the ack a pipeline is built with writes them to the durable store and
-     * waits for the store to answer - for as long as the store takes, which is as long as it goes on holding
-     * a document for a writer that stopped halfway through writing it. A cooperative processor shares its
-     * thread with every other cooperative vertex on the member, of every run, so a report waiting there stops
-     * all of them with it, and nothing fails or says why. A sink with no ack only hands rows to its writer,
-     * which writes them off this thread, so it keeps its place in the cooperative pool.
+     * A sink with an ack may wait for its checkpoint at load and job completion. Those waits need their
+     * own thread. A sink with no ack only hands rows to its writer, which writes them off this thread.
      */
     @Override
     public boolean isCooperative() {
@@ -107,6 +104,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // The ack this processor reports through: the one supplied, bound to this processor as a writer once
     // init knows its index. See init.
     private SinkAck ack;
+    // Frontiers only advance positions. Bounds, flushes and writer registration still use the bound ack directly.
+    private final SinkAck frontierAck = this::advanceAfterSnapshot;
     private final SinkFrontier frontier;
     private final FrontierGauge suppliedGauge;
     // Which of the two the frontier readings go to, settled at init for the reason the delivery readings'
@@ -153,6 +152,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // first on an axis, each waiting for its own rows only: a newer bound that replaced an older one would
     // make it wait for the newer one's rows too, and on a chain whose rows never stop coming that is for good.
     private final Map<Byte, ArrayDeque<Held<Watermark>>> heldBounds = new LinkedHashMap<>();
+    private final Map<String, List<String>> pendingAssembledSnapshots = new LinkedHashMap<>();
+    private final Map<String, Long> deliveredSnapshots = new LinkedHashMap<>();
     // Words that chains got past positions with nothing to deliver, each waiting, as a bound does, for every
     // row taken in before it to land; the highest position per chain among words waiting for the same rows.
     private final ArrayDeque<Held<Map<String, ChainPosition>>> heldWords = new ArrayDeque<>();
@@ -184,6 +185,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // with its totals back at zero, and a start that did not move with them would describe a stream that
     // no longer exists.
     private long countingSince;
+    private StopWaitLog.Site closeSite;
 
     /** No sink-ack watermark: the order-independent or append-only path (any in-flight bound is allowed). */
     public SinkProcessor(SinkWriter writer, int maxInFlight, int maxBatchSize) {
@@ -347,13 +349,22 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
             SupplierEx<LevelBounds> edgesFactory, int maxRecords, long maxWaitMillis) {
+        return metaSupplier(vertexName, writerFactory, sinkAckFactory, frontierFactory, edgesFactory, maxRecords,
+                maxWaitMillis, Map.of());
+    }
+
+    static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
+            SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
+            SupplierEx<LevelBounds> edgesFactory, int maxRecords, long maxWaitMillis,
+            Map<String, List<String>> assembledOutputs) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         Objects.requireNonNull(sinkAckFactory, "sinkAckFactory");
         Objects.requireNonNull(frontierFactory, "frontierFactory");
         return ProcessorMetaSupplier.forceTotalParallelismOne(
                 new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory, edgesFactory, vertexName, true,
-                        maxRecords, maxWaitMillis),
+                        maxRecords, maxWaitMillis, assembledOutputs),
                 vertexName);
     }
 
@@ -372,12 +383,12 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     static ProcessorMetaSupplier nativeMetaSupplier(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory, SinkAckFactory sinkAckFactory,
             SupplierEx<SinkFrontier> frontierFactory, SupplierEx<LevelBounds> edgesFactory, int plannedMembers,
-            int maxRecords, long maxWaitMillis) {
+            int maxRecords, long maxWaitMillis, Map<String, List<String>> assembledOutputs) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         ProcessorSupplier supplier = new AckSinkSupplier(writerFactory,sinkAckFactory,
                 sinkAckFactory==null?()->null:Objects.requireNonNull(frontierFactory,"frontierFactory"),
-                edgesFactory,vertexName,false,maxRecords,maxWaitMillis);
+                edgesFactory, vertexName, false, maxRecords, maxWaitMillis, assembledOutputs);
         return PlannedMembersGuard.of(ProcessorMetaSupplier.of(supplier), plannedMembers);
     }
 
@@ -396,19 +407,28 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             ack = sinkAck.forWriter(writerId(writerOf, totalOne ? 0 : context.globalProcessorIndex()));
         }
         HazelcastInstance instance = context.hazelcastInstance();
-        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forJob(context.jobId(), context.jobConfig()) : null;
+        if (instance != null && instance.getCluster() != null) {
+            String member = instance.getCluster().getLocalMember().getUuid().toString();
+            closeSite = new StopWaitLog.Site(pipelineId, context.jobId() + "/" + context.executionId(), member, "SinkProcessor.close");
+        }
+        this.failureRegistry = JobFailureRegistry.forProcessor(instance, context);
+        configureJobGauges(instance);
+        if (ack != null) ack.started(context.jobId(), context.executionId());
+        notifyReadyAssembledSnapshots();
+    }
+
+    private void configureJobGauges(HazelcastInstance member) {
         // A gauge that writes into a job's statistics can only do so from that job's own threads, and a
         // sink is also driven by hand - which is how its behaviour is pinned at all. Outside a job there
         // is nothing to write into and asking for a handle fails outright, taking the sink down with it,
-        // so the readings go nowhere instead. The same absence already decides the failure registry
-        // above, and for the same reason: neither exists until there is a job to hold it.
-        if (instance == null && supplied.readableOnlyOnAJobThread()) {
+        // so the readings go nowhere instead.
+        if (member != null) return;
+        if (supplied.readableOnlyOnAJobThread()) {
             this.delivery = DeliveryGauge.none();
         }
-        if (instance == null && suppliedGauge.readableOnlyOnAJobThread()) {
+        if (suppliedGauge.readableOnlyOnAJobThread()) {
             this.gauge = FrontierGauge.none();
         }
-        if (ack != null) ack.started(context.jobId(), context.executionId());
     }
 
     /** What this stage has timed so far, for a witness driving it by hand. */
@@ -550,7 +570,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         } while (writeWhatIsDue());
         reportWaiting();
         boolean done = inFlight.isEmpty() && queued.isEmpty();
-        if (ack != null && done) ack.flush(true);
+        if (done) flushCheckpoint(true);
         return done;
     }
 
@@ -614,7 +634,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         ArrayDeque<Held<Watermark>> held = heldBounds.computeIfAbsent(bound.key(), axis -> new ArrayDeque<>());
         // The newer bound on an axis subsumes an older one waiting for the same rows. One waiting for fewer
         // rows is kept: it goes as soon as those have landed, rather than waiting on rows taken in after it.
-        if (!held.isEmpty() && held.peekLast().before() == nextOrder) {
+        // Snapshot delivery is a separate milestone even when a later bound covers the same rows.
+        if (!held.isEmpty() && held.peekLast().before() == nextOrder
+                && !isSnapshotBound(held.peekLast().value())) {
             held.pollLast();
         }
         held.add(new Held<>(nextOrder, bound));
@@ -627,34 +649,85 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * after the events beneath it, and a word travels behind the records it must not overtake, so each covers
      * exactly the rows taken in before it; once every one of those has landed, so has everything it speaks for.
      *
-     * <p>Words go before bounds. For bounds, every axis with one due, and the newest due on each: they are
-     * bounds on different chains, and a chain whose bound was dropped here has no second one coming while it
-     * stays quiet.
+     * <p>Words go before bounds. Each axis advances through its newest due bound. Earlier snapshot bounds
+     * also reach the acknowledgement so observers can record initial landing before the CDC boundary.
      */
     private void releaseHeld() {
         long landedBelow = firstUnlanded();
         while (!heldWords.isEmpty() && heldWords.peek().before() <= landedBelow) {
             List<ChainEntry> entries = new ArrayList<>();
             heldWords.poll().value().forEach((chain, position) -> entries.add(new ChainEntry(chain, position)));
-            frontier.settled(entries, ack);
+            frontier.settled(entries, frontierAck);
         }
         for (ArrayDeque<Held<Watermark>> held : heldBounds.values()) {
-            Watermark due = null;
             while (!held.isEmpty() && held.peek().before() <= landedBelow) {
-                due = held.poll().value();
-            }
-            if (due == null) {
-                continue;
-            }
-            frontier.bound(due, ack);
-            // Every change this writer was given at or below the bound has landed, whatever the frontier made
-            // of it: a writer given none of a chain's rows says so here and holds no chain back by having
-            // nothing to write for it.
-            String chain = frontier.chainOf(due);
-            if (chain != null) {
-                ack.bounded(chain, FrontierOrders.unpack(due.timestamp()));
+                Watermark due = held.poll().value();
+                if (isSnapshotBound(due) || held.isEmpty() || held.peek().before() > landedBelow) {
+                    releaseBound(due);
+                }
             }
         }
+    }
+
+    private void releaseBound(Watermark bound) {
+        String chain = frontier.chainOf(bound);
+        SourceOrder through = chain == null ? null : FrontierOrders.unpack(bound.timestamp());
+        if (through != null && through.seq() == SourceOrder.SNAPSHOT_SEQ) {
+            notifySnapshotDelivered(chain, through);
+        }
+        frontier.bound(bound, frontierAck);
+        // A writer can acknowledge coverage through a bound even when it received none of the chain's rows.
+        if (chain != null) {
+            ack.bounded(chain, through);
+        }
+    }
+
+    private void advanceAfterSnapshot(String chain, ChainPosition position) {
+        SourceOrder order = position.order();
+        if (order != null && order.seq() == SourceOrder.SNAPSHOT_SEQ) {
+            notifySnapshotDelivered(chain, order);
+        }
+        ack.advance(chain, position);
+    }
+
+    private void notifySnapshotDelivered(String chain, SourceOrder order) {
+        if (deliveredSnapshots.getOrDefault(chain, Long.MIN_VALUE) < order.epoch()) {
+            notifyWriterSnapshotDelivered(chain);
+            deliveredSnapshots.put(chain, order.epoch());
+        }
+        notifyReadyAssembledSnapshots();
+    }
+
+    private void notifyReadyAssembledSnapshots() {
+        pendingAssembledSnapshots.entrySet().removeIf(output -> {
+            if (!deliveredSnapshots.keySet().containsAll(output.getValue())) return false;
+            notifyWriterSnapshotDelivered(output.getKey());
+            return true;
+        });
+    }
+
+    private void notifyWriterSnapshotDelivered(String stream) {
+        try {
+            writer.snapshotDelivered(stream);
+        } catch (RuntimeException | Error failure) {
+            recordWriterFailure(failure);
+            throw failure;
+        }
+    }
+
+    private boolean isSnapshotBound(Watermark bound) {
+        return frontier.chainOf(bound) != null && FrontierOrders.unpack(bound.timestamp()).seq() == SourceOrder.SNAPSHOT_SEQ;
+    }
+
+    SinkProcessor withAssembledOutputs(Map<String, List<String>> assembledOutputs) {
+        pendingAssembledSnapshots.putAll(assembledOutputs);
+        return this;
+    }
+
+    SinkProcessor withCompletedSnapshotInputs(Set<String> completedInputs) {
+        // Recovered inputs already satisfy the fan-in. A later bound can still carry a new epoch.
+        completedInputs.forEach(stream -> deliveredSnapshots.putIfAbsent(stream, Long.MIN_VALUE));
+        return this;
     }
 
     /** The number of the oldest row not yet landed - queued or being written - or the next number if none is. */
@@ -693,10 +766,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
         closed = true;
         try {
-            if (ack != null) ack.flushOnClose();
+            if (ack != null) closeStep("SinkAck.flushOnClose", ack::flushOnClose);
         } finally {
-            writer.close();
+            closeStep("SinkWriter.close", writer::close);
         }
+    }
+
+    private void closeStep(String operation, Runnable close) {
+        StopWaitLog.around(closeSite == null ? null : closeSite.at(operation), close);
     }
 
     /** Removes every settled write, surfacing the cause of a failed one so it fails the job. */
@@ -712,13 +789,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // machinery: once the job's terminal result is durable Jet can no longer hand back this
                 // exact cause (see JobFailureRegistry), so the last point this processor still holds the
                 // real, unwrapped cause is the only reliable place to keep it.
-                if (failureRegistry != null) {
-                    failureRegistry.record(failure);
-                }
+                recordWriterFailure(failure);
                 throw failure;
             }
             if (frontier != null) {
-                frontier.settled(batch.positions(), ack);
+                frontier.settled(batch.positions(), frontierAck);
             }
             // Counted here and nowhere earlier: this is the first line after the write is known to have
             // succeeded, which is the boundary the count is defined at. A row counted on hand-off would be
@@ -734,9 +809,33 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         });
         if (frontier != null) {
             releaseHeld();
-        if (ack != null) ack.flush(false);
+            flushCheckpoint(false);
             reportTrailing();
         }
+    }
+
+    private void flushCheckpoint(boolean complete) {
+        if (ack == null) return;
+        try {
+            ack.flush(complete);
+        } catch (RuntimeException | Error failure) {
+            if (failureRegistry != null) failureRegistry.record(new FailureFact(failure));
+            throw failure;
+        }
+    }
+
+    private void recordWriterFailure(Throwable failure) {
+        if (failureRegistry == null) {
+            return;
+        }
+        io.tapstate.core.common.FailureFact fact;
+        try {
+            fact = writer.failureFact(failure);
+            if (fact.cause() != failure) throw new IllegalArgumentException("failure owner changed the cause");
+        } catch (RuntimeException | LinkageError unavailable) {
+            fact = io.tapstate.core.common.FailureFact.unavailable(failure);
+        }
+        failureRegistry.record(fact);
     }
 
     /**
@@ -943,13 +1042,15 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         private final boolean totalOne;
         private final int maxRecords;
         private final long maxWaitMillis;
+        private final Map<String, List<String>> assembledOutputs;
         private transient SinkAck sinkAck;
         private transient int memberIndex;
+        private transient Set<String> completedSnapshotInputs;
 
         AckSinkSupplier(SupplierEx<? extends SinkWriter> writerFactory,
                 SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
                 SupplierEx<LevelBounds> edgesFactory, String vertexName, boolean totalOne,
-                int maxRecords, long maxWaitMillis) {
+                int maxRecords, long maxWaitMillis, Map<String, List<String>> assembledOutputs) {
             this.writerFactory = writerFactory;
             this.sinkAckFactory = sinkAckFactory;
             this.frontierFactory = frontierFactory;
@@ -958,12 +1059,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             this.totalOne = totalOne;
             this.maxRecords = maxRecords;
             this.maxWaitMillis = maxWaitMillis;
+            this.assembledOutputs = assembledOutputs;
         }
 
         @Override
         public void init(Context context) {
             memberIndex=context.memberIndex();
-            sinkAck = sinkAckFactory==null?null:sinkAckFactory.resolve(context.hazelcastInstance());
+            HazelcastInstance member = context.hazelcastInstance();
+            sinkAck = sinkAckFactory==null?null:sinkAckFactory.resolve(member);
+            completedSnapshotInputs = Set.of();
+            if (sinkAckFactory != null && !assembledOutputs.isEmpty()) {
+                var streams = new java.util.LinkedHashSet<String>();
+                assembledOutputs.values().forEach(streams::addAll);
+                completedSnapshotInputs = sinkAckFactory.completedSnapshotInputs(member, streams);
+            }
         }
 
         @Override
@@ -976,7 +1085,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             return openedTogether(count, () -> new SinkProcessor(opening.open(totalOne?0:memberIndex,next.getAndIncrement()), sinkAck, frontierFactory.get(),
                     DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
                     new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
-                    edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime));
+                    edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime)
+                    .withAssembledOutputs(assembledOutputs).withCompletedSnapshotInputs(completedSnapshotInputs));
         }
     }
 

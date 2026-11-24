@@ -2,7 +2,7 @@
 #
 # Test harness for deploy/quickstart/quickstart.sh. Black-box, against local file:// stubs, with no
 # network and no Docker. It covers the platform gate (reused from install.sh), the prepare phase (fetch
-# the compose file, the CLI, and the connector jars; generate .env and the demo work/), the demo
+# the compose file and the CLI; generate .env and the demo work/), the demo
 # workspace itself, and idempotency. The live run phase (docker compose up + the online verbs) is out of
 # scope here -- the live end-to-end test covers it -- so the script runs with TAPSTATE_QUICKSTART_PREPARE_ONLY=1,
 # which stops before Docker. A fake `uname` (and, for the musl case, a fake `ldd`) placed first on PATH
@@ -34,7 +34,20 @@ CLI_STUB="$(mktemp -d)"
 make_cli() {   # $1 = platform; the fake binary just echoes, so a run phase (if ever reached) won't hang
   d="$CLI_STUB/download/v$VERSION"; mkdir -p "$d"; stage="$(mktemp -d)"
   mkdir -p "$stage/tapstate-cli-$VERSION/bin" "$stage/tapstate-cli-$VERSION/libexec"
-  printf '#!/bin/sh\necho "tapstate %s %s"\n' "$VERSION" "$1" > "$stage/tapstate-cli-$VERSION/bin/tapstate"
+  {
+    printf '#!/bin/sh\n'
+    cat <<'CLI'
+case " $* " in
+  *" -w "*" connectors -o json "*)
+    printf '%s\n' 'The CLI refuses -w before a one-shot command' >&2
+    exit 2 ;;
+  *" connectors -o json "*)
+    printf '%s\n' '{"connectors":[{"id":"mongodb","origin":"registered"},{"id":"mysql","origin":"registered"},{"id":"postgres","origin":"registered"}]}'
+    exit 0 ;;
+esac
+CLI
+    printf 'echo "tapstate %s %s"\n' "$VERSION" "$1"
+  } > "$stage/tapstate-cli-$VERSION/bin/tapstate"
   chmod +x "$stage/tapstate-cli-$VERSION/bin/tapstate"
   printf '#!/bin/sh\necho mcp\n' > "$stage/tapstate-cli-$VERSION/libexec/tapstate-mcp"
   chmod +x "$stage/tapstate-cli-$VERSION/libexec/tapstate-mcp"
@@ -44,19 +57,16 @@ make_cli() {   # $1 = platform; the fake binary just echoes, so a run phase (if 
 }
 for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do make_cli "$p"; done
 
-# --- quickstart asset stub: the REAL repo files (install.sh, compose, mysql-init) + fake conn jars ---
+# --- quickstart asset stub: the REAL repo files (install.sh, compose, mysql-init) ---
 # Serving the real files means the smoke also proves the script fetches assets that actually exist at the
 # paths it expects, and that the generated demo matches the real seed schema.
 QS_STUB="$(mktemp -d)"
 mkdir -p "$QS_STUB/install" "$QS_STUB/deploy/quickstart/mysql-init" \
-         "$QS_STUB/deploy/quickstart/postgres-init" "$QS_STUB/connectors-preview"
+         "$QS_STUB/deploy/quickstart/postgres-init"
 cp "$REPO/install/install.sh"                              "$QS_STUB/install/install.sh"
 cp "$REPO/deploy/quickstart/docker-compose.yml"           "$QS_STUB/deploy/quickstart/docker-compose.yml"
 cp "$REPO/deploy/quickstart/mysql-init/01-orders.sql"     "$QS_STUB/deploy/quickstart/mysql-init/01-orders.sql"
 cp "$REPO/deploy/quickstart/postgres-init/01-shipments.sql" "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql"
-printf 'fake-mysql-connector-jar\n'   > "$QS_STUB/connectors-preview/mysql-connector.jar"
-printf 'fake-mongodb-connector-jar\n' > "$QS_STUB/connectors-preview/mongodb-connector.jar"
-printf 'fake-postgres-connector-jar\n' > "$QS_STUB/connectors-preview/postgres-connector.jar"
 
 trap 'rm -rf "$CLI_STUB" "$QS_STUB"' EXIT
 
@@ -94,7 +104,6 @@ EOF
     TAPSTATE_VERSION="${PIN_VERSION-$VERSION}" \
     TAPSTATE_BASE_URL="file://$CLI_STUB" \
     TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
-    TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
     TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
     sh "$DEMO/quickstart.sh" 2>&1)"
   RC=$?
@@ -132,14 +141,11 @@ have mysql-init/01-orders.sql         "fetches the demo seed SQL"
 # it creates an empty directory and starts a database with no demo data, which surfaces much later as
 # a pipeline that reads nothing.
 have postgres-init/01-shipments.sql   "fetches the second engine's seed SQL"
-have mysql-connector.jar              "fetches the mysql connector jar"
-have mongodb-connector.jar            "fetches the mongodb connector jar"
-# The connector seed dir must exist (compose bind-mounts it) but stay empty: registration goes through
-# the CLI upload path, and an empty seed dir is the documented expected case.
-if [ -d "$PREP/connectors" ] && [ -z "$(ls -A "$PREP/connectors" 2>/dev/null)" ]; then
-  ok "creates an empty connectors/ seed dir (registration is via the CLI, not the seed)"
+if [ ! -e "$PREP/connectors" ] && [ -z "$(find "$PREP" -name '*-connector.jar' -print)" ] \
+   && ! grep -q TAPSTATE_CONNECTORS_SEED_DIR "$PREP/docker-compose.yml"; then
+  ok "uses the image's connector seeds without downloading JARs or overriding the seed directory"
 else
-  bad "connectors/ seed dir missing or non-empty: $(ls -A "$PREP/connectors" 2>/dev/null)"
+  bad "quickstart prepared a legacy connector seed or override"
 fi
 
 # --- the pinned CLI version: it must resolve with TAPSTATE_VERSION unset, and match the build ---------
@@ -168,29 +174,11 @@ fi
 unset PIN_VERSION
 RC="$saved_rc"; OUT="$saved_out"; DEMO="$saved_demo"
 
-# --- .env: a random admin password, saved with tight perms and announced once ------------------------
-# Replaces the shipped admin/admin default so a demo left running is not trivially reachable, and the
-# password lives only in a user-readable-only file plus a single line of output -- never a CLI argument
-# or shell history.
-env_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$PREP/.env" 2>/dev/null || true)"
-if [ -n "$env_pw" ] && [ "$env_pw" != admin ] && [ "${#env_pw}" -ge 16 ]; then
-  ok "generates a random admin password in .env (not the shipped default)"
+if [ ! -e "$PREP/.env" ]; then
+  ok "preparation needs no administrator credentials"
 else
-  bad ".env password weak or absent: '$env_pw'"
+  bad "preparation created an administrator credential file"
 fi
-# ls -l is the portable way to read the mode string here (macOS find has no -printf).
-# shellcheck disable=SC2012
-perms="$(ls -l "$PREP/.env" 2>/dev/null | awk '{print $1}')"
-case "$perms" in
-  -rw-------*) ok "writes .env readable only by the user (600)" ;;
-  *)          bad ".env perms = '$perms', want -rw-------" ;;
-esac
-count="$(printf '%s\n' "$OUT" | grep -Fc "$env_pw" || true)"
-if [ "$count" = 1 ]; then ok "announces the password exactly once"; else bad "password printed $count times (want 1)"; fi
-# two fresh runs get different passwords -- a randomness proxy that a fixed or predictable value fails
-run_prepare Darwin arm64 glibc; pw_a="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$DEMO/.env" 2>/dev/null || true)"
-run_prepare Darwin arm64 glibc; pw_b="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$DEMO/.env" 2>/dev/null || true)"
-if [ -n "$pw_a" ] && [ "$pw_a" != "$pw_b" ]; then ok "each fresh run gets a different password"; else bad "passwords not distinct: '$pw_a' vs '$pw_b'"; fi
 
 # --- the demo workspace is generated, uses in-network addresses, and honours the CEL constraint ------
 WORK="$PREP/work"
@@ -224,15 +212,11 @@ if grep -q 'host: mysql' "$WORK/source/orders_db.tap.yml" 2>/dev/null && ! grep 
 else
   bad "source is not addressed by service name: $(cat "$WORK/source/orders_db.tap.yml" 2>/dev/null)"
 fi
-# The store the server seeds is derived from its own store URI, so that URI has to be reachable from
-# inside the container for the derived one to be too. Checked on the compose file, which is where it is
-# set: loopback here would point the server at itself and the derived views URI would inherit exactly
-# that mistake, one indirection further from anyone looking for it.
-if grep -q 'TAPSTATE_STORE_MONGO_URI:.*mongo:27017' "$PREP/docker-compose.yml" 2>/dev/null \
-   && ! grep -q 'TAPSTATE_STORE_MONGO_URI:.*127.0.0.1' "$PREP/docker-compose.yml" 2>/dev/null; then
-  ok "the server's store URI addresses mongo by its compose service name, not loopback"
+if grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' "$PREP/docker-compose.yml" \
+   && ! grep -q 'TAPSTATE_STORE_MONGO_URI:' "$PREP/docker-compose.yml"; then
+  ok "the server reads its storage configuration from the installation directory"
 else
-  bad "server store URI is not addressed by service name: $(grep TAPSTATE_STORE_MONGO_URI "$PREP/docker-compose.yml" 2>/dev/null)"
+  bad "the server is still configured for legacy storage bootstrap"
 fi
 stale="$(grep -rl 'warehouse' "$WORK" 2>/dev/null || true)"
 if [ -z "$stale" ]; then
@@ -310,18 +294,16 @@ fi
 
 # --- idempotency: a re-run keeps generated state and does not re-download verified assets ------------
 run_prepare Linux x86_64 glibc; RE="$DEMO"
-pw_before="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$RE/.env")"
 printf '# user-marker\n' >> "$RE/docker-compose.yml"   # a marker a re-download would erase
 printf 'user-edit\n' > "$RE/work/marker"               # a user edit to the workspace
 run_prepare Linux x86_64 glibc "$RE"                   # re-run over the same dir
-pw_after="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$RE/.env")"
 if [ "$RC" -eq 0 ] \
-   && [ -n "$pw_before" ] && [ "$pw_before" = "$pw_after" ] \
+   && [ ! -e "$RE/.env" ] \
    && [ -f "$RE/work/marker" ] \
    && grep -q '# user-marker' "$RE/docker-compose.yml"; then
-  ok "a re-run keeps the password and workspace, and does not re-download assets"
+  ok "a re-run keeps the workspace, and does not re-download assets"
 else
-  bad "re-run not idempotent (rc=$RC, pw_same=$([ "$pw_before" = "$pw_after" ] && echo y || echo n), work_marker=$([ -f "$RE/work/marker" ] && echo y || echo n), compose_marker=$(grep -q '# user-marker' "$RE/docker-compose.yml" && echo y || echo n))"
+  bad "re-run not idempotent (rc=$RC, work_marker=$([ -f "$RE/work/marker" ] && echo y || echo n), compose_marker=$(grep -q '# user-marker' "$RE/docker-compose.yml" && echo y || echo n))"
 fi
 
 # --- macOS quarantine: the strip fires on Darwin, and only there -------------------------------------
@@ -347,7 +329,7 @@ fi
 run_phase_fakes() {
   run_prepare Linux x86_64 glibc "${RUN_REUSE:-}"   # prepare a dir (installs the stub CLI); RUN_REUSE re-runs one
   RUN="$DEMO"
-  RUN_PW="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$RUN/.env")"
+  RUN_PW="quickstart-smoke-password"
   cat > "$RUN/tapstate" <<'CLI'
 #!/bin/sh
 printf '%s\n' "$*" >> .cli-argv
@@ -361,7 +343,20 @@ case " $* " in
       && printf '{\n  "tokenId" : "tok-1",\n  "scope" : "WRITE",\n  "token" : "%s"\n}\n' "$FAKE_AGENT_TOKEN"
     exit 0 ;;
   *" ls ") [ "${FAKE_TOKEN_ACCEPTED:-no}" = yes ]; exit $? ;;
+  *" -w "*" connectors -o json "*)
+    printf '%s\n' 'The CLI refuses -w before a one-shot command' >&2
+    exit 2 ;;
+  *" connectors -o json "*)
+    printf 'connectors -o json\n' >> .cli-stdin
+    if [ "${FAKE_CATALOG_UNAVAILABLE:-no}" = yes ] ||
+       { [ "${FAKE_BUSINESS_READINESS:-}" = delayed ] && [ ! -e .business-ready ]; }; then
+      printf '%s\n' 'error: control.storage-unavailable' >&2
+      exit 1
+    fi
+    printf '%s\n' '{"connectors":[{"id":"mongodb","origin":"registered"},{"id":"mysql","origin":"registered"},{"id":"postgres","origin":"registered"}]}'
+    exit 0 ;;
 esac
+printf '%s\n' "${TAPSTATE_PASSWORD:-}" >> .login-env
 cat >> .cli-stdin
 # A REPL keeps reading after a refusal but retains its status when the session ends.
 # Keep output and status independent so cases can exercise both non-zero exits and
@@ -384,26 +379,54 @@ JAVA
   cp "$shim/java" "$shim/jdk/bin/java"; chmod +x "$shim/jdk/bin/java"
   cat > "$shim/docker" <<'DOCK'
 #!/bin/sh
-# `compose ps ... server` -> report healthy so the wait loop ends; `compose ps -a ... bootstrap` -> report
-# the one-shot admin-creation container in whatever state the case asked for; `compose exec ... mongosh`
-# (the snapshot count read) -> report the row count the case asked for, so a run that delivers and a run
-# that delivers nothing can both be driven; every other subcommand no-ops.
-#
-# The two `ps` answers are deliberately different shapes. A server reports Health; a one-shot container
-# reports State and ExitCode and never reports Health at all. A script that waited on the wrong one would
-# read a field the other never publishes, which is exactly the confusion these fakes have to be able to
-# expose rather than paper over.
-# A brace inside ${VAR:-default} would close the expansion, so the default is set on its own line.
-bs="${FAKE_BOOTSTRAP_PS:-}"
-[ -n "$bs" ] || bs='{"State":"exited","ExitCode":0}'
-# Which container is being asked about is decided before the subcommand is, because `ps` appears in the
-# bootstrap query too -- answering on the subcommand alone would hand the server's Health line back for
-# every query and quietly make the two indistinguishable.
-# `logs` is answered before the container is looked at, because the bootstrap log query names the
-# container too -- deciding on the container alone would hand a ps line back to a log query.
-case " $* " in *" logs "*) echo "${FAKE_BOOTSTRAP_LOG:-bootstrap: first admin created}"; exit 0 ;; esac
-case " $* " in *" bootstrap "*) echo "$bs"; exit 0 ;; esac
-case "$*" in *"{{.Name}}"*) echo "${FAKE_SERVER_NAME:-tapstate-demo-server-1}"; exit 0 ;; esac
+case "$*" in
+  *"/auth/storage-entry"*)
+    entry="${FAKE_INITIAL_ENTRY:-SETUP_REQUIRED}"
+    [ ! -f .storage-committed ] || entry=FIRST_ADMIN_REQUIRED
+    [ ! -f .first-admin-created ] || entry=LOGIN
+    business_ready=false
+    if [ "$entry" = LOGIN ]; then
+      business_ready=true
+      case "${FAKE_BUSINESS_READINESS:-}" in
+        delayed)
+          if [ -e .business-probed ]; then
+            touch .business-ready
+          else
+            touch .business-probed
+            business_ready=false
+          fi ;;
+        stalled) business_ready=false ;;
+      esac
+    fi
+    printf '{"entry":"%s","businessReady":%s}\n' "$entry" "$business_ready"
+    exit 0 ;;
+  *'stage.json'*)
+    printf '%s\n' '{"managementUrl":"http://127.0.0.1:31917"}'
+    exit 0 ;;
+  *"/api/storage/status"*)
+    cat >/dev/null
+    printf '%s\n200' '{"setupPhase":"LOCAL_SETUP","operationId":"test-operation","setupGeneration":1}'
+    exit 0 ;;
+  *"/api/storage/test"*)
+    cat > .storage-test
+    printf '%s\n200' '{"testStamp":"storage-test-proof"}'
+    exit 0 ;;
+  *"/api/storage/setup/commit"*)
+    cat > .storage-commit
+    touch .storage-committed
+    printf '%s\n200' '{"setupPhase":"STORAGE_BOUND"}'
+    exit 0 ;;
+  *"/installation/first-admin"*)
+    cat > .first-admin-request
+    if [ "${FAKE_ADMIN_FAILURE:-no}" = yes ]; then
+        printf '%s\n403' '{"code":"TS0210017"}'
+    else
+        touch .first-admin-created
+        printf '%s\n200' '{"phase":"COMPLETE"}'
+    fi
+    exit 0 ;;
+  *"{{.Name}}"*) echo "${FAKE_SERVER_NAME:-tapstate-demo-server-1}"; exit 0 ;;
+esac
 # The count is answered per collection rather than once for all of them. That is what lets a case drive
 # "the first engine arrived and the second did not" - the shape a demo wired to only one of its two
 # sources actually produces, and the one a check on a single total cannot tell apart from success.
@@ -422,11 +445,13 @@ DOCK
   chmod +x "$shim/uname" "$shim/docker" "$shim/java"
   RUN_OUT="$(cd "${RUN_CWD:-$RUN}" && PATH="$shim:$PATH" \
     TAPSTATE_VERSION="$VERSION" TAPSTATE_BASE_URL="file://$CLI_STUB" \
-    TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
+    TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
     FAKE_TARGET_ROWS="${1:-5}" FAKE_SHIPMENT_ROWS="${2:-6}" \
-    FAKE_BOOTSTRAP_PS="${FAKE_BOOTSTRAP_PS:-}" FAKE_CLI_OUT="${FAKE_CLI_OUT:-}" \
+    TAPSTATE_ADMIN_USER=smoke-owner TAPSTATE_ADMIN_PASSWORD="$RUN_PW" \
+    FAKE_INITIAL_ENTRY="${FAKE_INITIAL_ENTRY:-}" FAKE_ADMIN_FAILURE="${FAKE_ADMIN_FAILURE:-}" \
+    FAKE_CLI_OUT="${FAKE_CLI_OUT:-}" \
     FAKE_CLI_STATUS="${FAKE_CLI_STATUS:-0}" \
-    FAKE_BOOTSTRAP_LOG="${FAKE_BOOTSTRAP_LOG:-}" \
+    FAKE_BUSINESS_READINESS="${FAKE_BUSINESS_READINESS:-}" FAKE_CATALOG_UNAVAILABLE="${FAKE_CATALOG_UNAVAILABLE:-no}" \
     FAKE_AGENT_TOKEN="${FAKE_AGENT_TOKEN-tsk_fake_agent_token}" FAKE_TOKEN_ACCEPTED="${FAKE_TOKEN_ACCEPTED:-no}" \
     FAKE_JAVA_MAJOR="${FAKE_JAVA_MAJOR:-17}" JAVA_HOME='' \
     TAPSTATE_QUICKSTART_POLL_SECONDS=0 \
@@ -446,6 +471,43 @@ running_rerun_case() {
   fi
 }
 
+business_readiness_cases() {
+  FAKE_INITIAL_ENTRY=LOGIN FAKE_BUSINESS_READINESS=delayed run_phase_fakes
+  if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.business-ready" ] \
+     && [ "$(grep -c '^connectors -o json$' "$RUN/.cli-stdin")" -eq 1 ] \
+     && grep -Fq 'apply source/orders_db.tap.yml' "$RUN/.cli-stdin" \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'waiting for the business services to start'; then
+    ok "waits for the business signal before making one catalog query"
+  else
+    bad "the configured stack ran before business readiness (rc=$RUN_RC): $RUN_OUT"
+  fi
+
+  FAKE_INITIAL_ENTRY=LOGIN FAKE_BUSINESS_READINESS=stalled run_phase_fakes
+  if [ "$RUN_RC" -ne 0 ] && [ ! -e "$RUN/.cli-stdin" ] \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'the business services did not finish starting' \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'docker compose logs --tail=80 server' \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'rerun Quickstart from this directory'; then
+    ok "names the stalled business startup and gives log and recovery commands"
+  else
+    bad "stalled startup ran commands or omitted recovery guidance (rc=$RUN_RC): $RUN_OUT"
+  fi
+
+  FAKE_INITIAL_ENTRY=LOGIN FAKE_CATALOG_UNAVAILABLE=yes run_phase_fakes
+  if [ "$RUN_RC" -ne 0 ] && [ "$(grep -c '^connectors -o json$' "$RUN/.cli-stdin")" -eq 1 ] \
+     && printf '%s' "$RUN_OUT" | grep -Fq 'control.storage-unavailable' \
+     && ! grep -Fq 'apply source/orders_db.tap.yml' "$RUN/.cli-stdin"; then
+    ok "reports a catalog refusal after readiness without retrying or applying"
+  else
+    bad "catalog refusal was retried, hidden, or ignored (rc=$RUN_RC): $RUN_OUT"
+  fi
+}
+
+if [ "${1:-}" = --business-readiness ]; then
+  business_readiness_cases
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 # Run only this regression, sharing the suite's local assets and run-phase fakes.
 if [ "${1:-}" = --running-rerun ]; then
   running_rerun_case
@@ -454,26 +516,25 @@ if [ "${1:-}" = --running-rerun ]; then
 fi
 
 run_phase_fakes
-if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.cli-argv" ] && ! grep -Fq "$RUN_PW" "$RUN/.cli-argv" && grep -Fq "$RUN_PW" "$RUN/.cli-stdin"; then
-  ok "the admin password reaches the CLI over stdin, never as a command argument"
+if [ "$RUN_RC" -eq 0 ] && grep -Fq -- '-u smoke-owner' "$RUN/.cli-argv" \
+   && ! grep -Fq "$RUN_PW" "$RUN/.cli-argv" && grep -Fqx "$RUN_PW" "$RUN/.login-env" \
+   && ! grep -Fq "$RUN_PW" "$RUN/.cli-stdin" && [ ! -e "$RUN/.env" ]; then
+  ok "the supplied administrator credentials reach the CLI without saving or printing the password"
 else
-  bad "password handling (rc=$RUN_RC, argv=$(grep -Fq "$RUN_PW" "$RUN/.cli-argv" 2>/dev/null && echo LEAK || echo ok), stdin=$(grep -Fq "$RUN_PW" "$RUN/.cli-stdin" 2>/dev/null && echo ok || echo MISSING)): $RUN_OUT"
+  bad "the CLI did not receive the administrator credentials as expected"
 fi
-# Failure branches print the driven command stream to say what went wrong -- and that stream contains
-# the admin password by design (the assertion above requires it there). Print it redacted, always.
-redacted_stdin() { sed "s/$RUN_PW/<redacted>/g" "$RUN/.cli-stdin" 2>/dev/null; }
-# The second engine is driven as far as the first is. It no longer has a pipeline of its own -- there
-# is one pipeline over both -- so what is left to check is its connector and its discovery, and the
-# ordering check below then holds it to the same sequence as the first.
-if grep -q 'register \.\./postgres-connector.jar' "$RUN/.cli-stdin" 2>/dev/null \
+
+redacted_stdin() { cat "$RUN/.cli-stdin"; }
+
+if grep -q '^connectors -o json$' "$RUN/.cli-stdin" 2>/dev/null \
    && grep -q 'discover-schema fulfillment_db' "$RUN/.cli-stdin" 2>/dev/null \
    && grep -q 'apply source/fulfillment_db.tap.yml' "$RUN/.cli-stdin" 2>/dev/null; then
   ok "drives the second engine's connector, source and discovery too"
 else
   bad "the second engine is not driven: $(redacted_stdin)"
 fi
-if grep -q 'register \.\./mysql-connector.jar' "$RUN/.cli-stdin" 2>/dev/null && grep -q '^apply' "$RUN/.cli-stdin" 2>/dev/null && grep -q 'start order_pipeline' "$RUN/.cli-stdin" 2>/dev/null; then
-  ok "drives register / apply / start through the REPL"
+if ! grep -q '^register ' "$RUN/.cli-stdin" && grep -q '^apply' "$RUN/.cli-stdin" 2>/dev/null && grep -q 'start order_pipeline' "$RUN/.cli-stdin" 2>/dev/null; then
+  ok "applies and starts using the preinstalled connectors"
 else
   bad "online verbs not driven: $(redacted_stdin)"
 fi
@@ -646,63 +707,54 @@ else
   bad "the demo does not name the single collection a reader should find: $RUN_OUT"
 fi
 
-# --- the first admin exists before anyone tries to log in ---------------------------------------------
-# The bootstrap sidecar depends_on the server being *healthy*, so it only starts at the moment the server
-# reports healthy. Waiting on server health therefore proves the opposite of what it looks like it proves:
-# it is the moment the admin is guaranteed NOT to exist yet. Observed as a real flake -- two runs of the
-# same commit, one logged in fine and one drew control.auth-failed, after which every following verb
-# reported cli.not-authenticated and the run died on the row count with the real cause scrolled off the top.
-FAKE_BOOTSTRAP_PS='{"State":"running","ExitCode":0}' run_phase_fakes
-unset FAKE_BOOTSTRAP_PS
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -qi 'admin'; then
-  ok "refuses to drive the verbs while the admin has not been created yet, and says so"
+# The three-layer storage setup must finish before first-admin and login.
+run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && jq -e '.layer == "CACHE" and .candidate.configuration.database == "tapstate_config" and .candidate.cache.database == "tapstate_cache" and .candidate.master.database == "views"' "$RUN/.storage-test" >/dev/null \
+   && jq -e '.testStamps.CACHE == "storage-test-proof"' "$RUN/.storage-commit" >/dev/null \
+   && jq -e --arg pw "$RUN_PW" '.username == "smoke-owner" and .password == $pw' "$RUN/.first-admin-request" >/dev/null; then
+  ok "tests the bundled MongoDB, commits storage and creates the requested administrator"
 else
-  bad "raced the bootstrap instead of waiting (rc=$RUN_RC): $RUN_OUT"
+  bad "native setup did not complete as expected (rc=$RUN_RC): $RUN_OUT"
 fi
-# A bootstrap that ran and *failed* is a different condition from one still running, and it must not be
-# waited out until the timeout: the container is gone, so waiting can only end one way.
-FAKE_BOOTSTRAP_PS='{"State":"exited","ExitCode":1}' run_phase_fakes
-unset FAKE_BOOTSTRAP_PS
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'docker compose logs bootstrap'; then
-  ok "a bootstrap that exited non-zero fails the run and points at its log"
+
+FAKE_INITIAL_ENTRY=UNAVAILABLE run_phase_fakes
+if [ "$RUN_RC" -ne 0 ] && [ ! -e "$RUN/.cli-stdin" ]; then
+  ok "does not start the pipeline before installation is ready"
 else
-  bad "a failed bootstrap was not surfaced (rc=$RUN_RC): $RUN_OUT"
+  bad "the pipeline ran while installation was unavailable"
 fi
+
+FAKE_ADMIN_FAILURE=yes run_phase_fakes
+if [ "$RUN_RC" -ne 0 ] && [ ! -e "$RUN/.cli-stdin" ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'HTTP 403, TS0210017'; then
+  ok "reports the administrator setup refusal before driving the CLI"
+else
+  bad "the administrator setup refusal was lost (rc=$RUN_RC): $RUN_OUT"
+fi
+
 # An authentication failure must be named where it happens. Without this the run still fails -- but it
 # fails 30 seconds later on "did not reach the target (0 of 5 rows)", which sends the reader to the server
 # log to investigate a pipeline that was never started. The discriminating part is that the run below
 # delivers its rows: a check that merely required a non-zero exit would pass on the row count alone.
-FAKE_CLI_OUT='error: control.auth-failed' run_phase_fakes
-unset FAKE_CLI_OUT
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'could not log in' \
-   && ! printf '%s' "$RUN_OUT" | grep -q 'did not reach the target'; then
-  ok "an auth failure is diagnosed as an auth failure, not as an empty target"
-else
-  bad "auth failure not named at the point it happened (rc=$RUN_RC): $RUN_OUT"
-fi
+for auth_code in control.auth-failed TS0210002 cli.not-authenticated TS0330021; do
+  for auth_status in 0 1; do
+    FAKE_CLI_OUT="error: $auth_code" FAKE_CLI_STATUS="$auth_status" run_phase_fakes
+    unset FAKE_CLI_OUT FAKE_CLI_STATUS
+    if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'could not log in' \
+       && ! printf '%s' "$RUN_OUT" | grep -q 'did not reach the target'; then
+      ok "auth failure $auth_code with exit $auth_status retains credential recovery guidance"
+    else
+      bad "auth failure $auth_code with exit $auth_status not named at the point it happened (rc=$RUN_RC): $RUN_OUT"
+    fi
+  done
+done
 
-# An admin left over from an earlier run is the likely reason a demo whose password is generated cannot
-# log in, and it is the one case the user can act on without reading anything. The bootstrap step reports
-# success either way -- creating the admin and finding one already there are both "an admin exists" -- so
-# a run against a stack whose volume outlived its .env fails at login with both facts true and filed in
-# different places. Reported here as the remedy rather than as a log to go and read.
-FAKE_CLI_OUT='error: control.auth-failed' \
-  FAKE_BOOTSTRAP_LOG='bootstrap: an admin already exists, nothing to do' run_phase_fakes
-unset FAKE_CLI_OUT FAKE_BOOTSTRAP_LOG
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'down -v'; then
-  ok "an auth failure against a pre-existing admin names the reset that fixes it"
+FAKE_INITIAL_ENTRY=LOGIN run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.cli-stdin" ] && [ ! -e "$RUN/.first-admin-request" ] \
+   && [ ! -e "$RUN/.storage-commit" ]; then
+  ok "a configured stack signs in without recreating storage or an administrator"
 else
-  bad "stale-admin auth failure did not name the remedy (rc=$RUN_RC): $RUN_OUT"
-fi
-# ...and the generic message is kept for an auth failure with no such history, which is a different
-# situation with a different answer: wiping the volume there would destroy data to fix nothing.
-FAKE_CLI_OUT='error: control.auth-failed' \
-  FAKE_BOOTSTRAP_LOG='bootstrap: first admin created' run_phase_fakes
-unset FAKE_CLI_OUT FAKE_BOOTSTRAP_LOG
-if [ "$RUN_RC" -ne 0 ] && ! printf '%s' "$RUN_OUT" | grep -q 'down -v'; then
-  ok "an auth failure with a freshly created admin does not prescribe wiping the volume"
-else
-  bad "the stale-admin remedy leaked into an unrelated auth failure (rc=$RUN_RC): $RUN_OUT"
+  bad "the configured stack did not resume correctly (rc=$RUN_RC): $RUN_OUT"
 fi
 
 # A verb the server refused has to stop the run where it was refused, and the session's exit status is
@@ -752,6 +804,7 @@ fi
 # A re-run reaches the same START refusal as the real lifecycle machine. Only that
 # exact diagnostic is benign; another failed verb in the session must still stop it.
 running_rerun_case
+business_readiness_cases
 for refusal in 'error: connector.not-registered' \
                'error: lifecycle.illegal-transition
   Cannot start a pipeline in state FAILED.' \
@@ -1037,16 +1090,7 @@ else
 fi
 
 # --- a dropped transfer leaves no stump, and the run survives one -----------------------------------
-# Reported from a from-scratch install of a published release: the postgres jar transfer dropped
-# mid-flight three runs in a row, at three different offsets. Two things then went wrong, and the
-# second is the expensive one. The transfer wrote in place, so the partial bytes landed at the real
-# path; the guard below is `[ -f ... ] ||`, existence only, so every later run read the stump as
-# "already have it" and never re-fetched it. The stack came up with a corrupt connector and the
-# failure surfaced three steps downstream, naming a remedy that was the step that had just failed.
-#
-# The fake curl reproduces the drop rather than describing it: it writes a few bytes to wherever -o
-# points and exits 18 (partial file), the code the real one gave, for the first $FAIL_TIMES attempts
-# at that URL. Every other transfer is passed through to the real curl untouched.
+# Drop the PostgreSQL seed SQL transfer to check partial-file recovery for an asset the demo fetches.
 REAL_CURL="$(command -v curl 2>/dev/null || true)"
 DROP_DIR="$(mktemp -d)"
 cat > "$DROP_DIR/curl" <<EOF
@@ -1058,11 +1102,11 @@ for a in "\$@"; do
   prev="\$a"
 done
 case "\$url" in
-  *postgres-connector.jar)
+  *01-shipments.sql)
     n=0; [ -f "$DROP_DIR/n" ] && n="\$(cat "$DROP_DIR/n")"
     if [ "\$n" -lt "\$(cat "$DROP_DIR/fail_times")" ]; then
       echo "\$((n + 1))" > "$DROP_DIR/n"
-      [ -n "\$out" ] && printf 'fake-pos' > "\$out"
+      [ -n "\$out" ] && head -c 8 "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql" > "\$out"
       echo "curl: (18) Transferred a partial file" >&2
       exit 18
     fi ;;
@@ -1070,7 +1114,7 @@ esac
 exec "$REAL_CURL" "\$@"
 EOF
 chmod +x "$DROP_DIR/curl"
-JAR_BYTES="$(wc -c < "$QS_STUB/connectors-preview/postgres-connector.jar" | tr -d ' ')"
+SEED_BYTES="$(wc -c < "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql" | tr -d ' ')"
 
 if [ -z "$REAL_CURL" ]; then
   bad "no curl on PATH, so the dropped-transfer cases never ran"
@@ -1080,10 +1124,10 @@ else
   CURL_SHIM="$DROP_DIR/curl"; echo 1 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
   run_prepare Linux x86_64 glibc
   DROP1="$DEMO"
-  if [ "$RC" -eq 0 ] && cmp -s "$DROP1/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP1/postgres-init/01-shipments.sql" "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql"; then
     ok "a transfer that drops once is retried, and the run completes on its own"
   else
-    bad "one dropped transfer ended the run (rc=$RC, jar=$(wc -c < "$DROP1/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes)"
+    bad "one dropped transfer ended the run (rc=$RC, seed=$(wc -c < "$DROP1/postgres-init/01-shipments.sql" 2>/dev/null | tr -d ' ') of $SEED_BYTES bytes)"
   fi
 
   # A link that never recovers. The run must fail -- but it must not leave a partial file at the real
@@ -1091,20 +1135,20 @@ else
   CURL_SHIM="$DROP_DIR/curl"; echo 99 > "$DROP_DIR/fail_times"; rm -f "$DROP_DIR/n"
   run_prepare Linux x86_64 glibc
   DROP2="$DEMO"
-  if [ "$RC" -ne 0 ] && [ ! -f "$DROP2/postgres-connector.jar" ]; then
+  if [ "$RC" -ne 0 ] && [ ! -f "$DROP2/postgres-init/01-shipments.sql" ]; then
     ok "a transfer that never completes leaves nothing at the final path"
   else
-    bad "a stump survived a failed transfer (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes at the real path)"
+    bad "a stump survived a failed transfer (rc=$RC, $(wc -c < "$DROP2/postgres-init/01-shipments.sql" 2>/dev/null | tr -d ' ') of $SEED_BYTES bytes at the real path)"
   fi
 
   # And the run after it recovers, which is the half the user actually hits: same directory, working
   # link, no manual deletion. Under the old guard the stump was read as "already have it" forever.
   CURL_SHIM=""
   run_prepare Linux x86_64 glibc "$DROP2"
-  if [ "$RC" -eq 0 ] && cmp -s "$DROP2/postgres-connector.jar" "$QS_STUB/connectors-preview/postgres-connector.jar"; then
-    ok "re-running after a failed transfer re-fetches the jar instead of accepting the stump"
+  if [ "$RC" -eq 0 ] && cmp -s "$DROP2/postgres-init/01-shipments.sql" "$QS_STUB/deploy/quickstart/postgres-init/01-shipments.sql"; then
+    ok "re-running after a failed transfer re-fetches the seed instead of accepting the stump"
   else
-    bad "the re-run did not recover the jar (rc=$RC, $(wc -c < "$DROP2/postgres-connector.jar" 2>/dev/null | tr -d ' ') of $JAR_BYTES bytes): $OUT"
+    bad "the re-run did not recover the seed (rc=$RC, $(wc -c < "$DROP2/postgres-init/01-shipments.sql" 2>/dev/null | tr -d ' ') of $SEED_BYTES bytes): $OUT"
   fi
   CURL_SHIM=""
 fi
@@ -1147,8 +1191,7 @@ else
       TAPSTATE_VERSION="$VERSION" \
       TAPSTATE_BASE_URL="file://$CLI_STUB" \
       TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
-      TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
-      TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
+        TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
       TAPSTATE_TELEMETRY_URL="$SINK_URL" \
       sh "$DEMO/quickstart.sh" >"$outf" 2>"$errf" )
     rm -rf "$shim"

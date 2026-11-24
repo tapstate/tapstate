@@ -77,6 +77,40 @@ class ThreeLayerObservationTest {
         verify(f.cache).pipelineObservations(f.scope);
     }
 
+    @ParameterizedTest
+    @EnumSource(value = IoError.class, names = {"DOCUMENT_UNREADABLE", "PIPELINE_STATE_REBUILD_REQUIRED"})
+    void aRecordedStartFailureUsesOnlyItsKnownPipelineIdentity(IoError code) {
+        var f = new Fixture();
+        var pending = new PipelinePreparation("pipeline", 1,
+                PipelinePreparation.Phase.UNASSIGNED, null, null, null);
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), pending,
+                Optional.empty(), Optional.empty(), false, Optional.of(code), 1);
+        when(f.configuration.pipelineDisplayHeaders(List.of("pipeline"), false))
+                .thenReturn(Map.of("pipeline", header));
+        var observation = f.port.observations().readAll(List.of("pipeline")).get("pipeline");
+        assertThat(observation.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(observation.failure().code()).isEqualTo(code.code());
+        assertThat(observation.failure().params()).isEqualTo(code == IoError.PIPELINE_STATE_REBUILD_REQUIRED
+                ? Map.of("pipeline", "pipeline") : Map.of());
+        assertThat(observation.failure().diagnostic()).isEmpty();
+        verifyNoInteractions(f.cache);
+    }
+
+    @Test void aRecordedStartFailureProjectsTheStoredDocumentAndField() {
+        var f = new Fixture();
+        var pending = new PipelinePreparation("pipeline", 1, PipelinePreparation.Phase.UNASSIGNED, null, null, null);
+        var params = Map.of("id", "doc-42", "field", "revision");
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), pending,
+                Optional.empty(), Optional.empty(), false, Optional.of(IoError.DOCUMENT_UNREADABLE), 1, params);
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeaders(ids, true)).thenReturn(Map.of("pipeline", header));
+
+        var failure = f.port.pipelineCatalogStates(ids).get("pipeline").observation().orElseThrow().failure();
+        assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+        assertThat(failure.params()).isEqualTo(params);
+        verifyNoInteractions(f.cache);
+    }
+
     @Test void aBatchCannotPublishAnObservationAfterItsConfigurationFenceChanges() {
         var f = new Fixture();
         var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(),

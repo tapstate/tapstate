@@ -78,7 +78,7 @@ class UnreadableArtifactIsolationIT {
             assertThatThrownBy(() -> control.deleteArtifact(SOURCE_ID, source.contentHash()))
                     .isInstanceOf(AssertionError.class)
                     .hasMessageContaining("got 500")
-                    .hasMessageContaining("io.document-unreadable");
+                    .hasMessageContaining("TS0480004");
             assertThat(control.artifact(SOURCE_ID)).contains(source);
         }
     }
@@ -102,7 +102,7 @@ class UnreadableArtifactIsolationIT {
             assertThatThrownBy(() -> control.apply(Map.of("source.tap.yml", replacement)))
                     .isInstanceOf(AssertionError.class)
                     .hasMessageContaining("got 500")
-                    .hasMessageContaining("io.document-unreadable");
+                    .hasMessageContaining("TS0480004");
             assertThat(control.artifact(running.sourceId())).contains(source);
         }
     }

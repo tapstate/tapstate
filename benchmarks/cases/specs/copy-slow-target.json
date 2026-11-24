@@ -1,0 +1,42 @@
+{
+  "version": 2,
+  "graph": [],
+  "inputs": {
+    "records": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers"
+    }
+  },
+  "parameters": {
+    "paired_control": {
+      "baseline": "unlimited target",
+      "variant": "limited target",
+      "changed_parameter": "target connection write limit"
+    },
+    "environments": {
+      "preferred": "limit only the target connection on the shared replica set",
+      "fallback": "use the same dedicated target topology for both arms if isolation cannot be demonstrated"
+    },
+    "trial_parameters": [
+      "target limit",
+      "limit window",
+      "drain timeout"
+    ],
+    "trial_target_command_delay_ms": 1200
+  },
+  "expected": {
+    "readback": [
+      "Verify unchanged source injection while target acknowledgements slow and in-flight work builds.",
+      "Remove the target limit, drain with a bound and compare every remaining target key and value."
+    ]
+  },
+  "completion": {
+    "target_unit": "target write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

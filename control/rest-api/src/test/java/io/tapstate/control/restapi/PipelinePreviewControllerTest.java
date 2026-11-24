@@ -1,5 +1,6 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.core.common.ActuationErrorDefinitions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.control.core.PipelinePreviewCommand;
 import io.tapstate.control.core.ArtifactDraft;
@@ -15,6 +16,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.time.Instant;
+import java.util.Locale;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Map;
@@ -40,7 +42,7 @@ class PipelinePreviewControllerTest {
         assertThatThrownBy(() -> PipelinePreviewController.readBounded(new ByteArrayInputStream(body), 4))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test
@@ -129,6 +131,25 @@ class PipelinePreviewControllerTest {
                 .isInstanceOf(IOException.class).hasMessageContaining("interrupted");
         assertThat(interrupted.cancelled.get()).isTrue();
         Thread.interrupted();
+    }
+
+    @Test
+    void localizesTheStreamRefusalWithoutChangingItsIdentityOrParameters() throws IOException {
+        var definition = ActuationErrorDefinitions.PREVIEW_ASSOCIATION_KEY_DROPPED;
+        var parameters = Map.<String, Object>of("relation", "orders", "field", "customer_id",
+                "transform", "orders_pre", "droppedField", "customer_id");
+        var failure = new PipelinePreviewEvent("run", "candidate", 1, "run.failed", Instant.EPOCH,
+                Map.of("code", definition.code(), "reason", "Original reason", "params", parameters));
+        var json = new ObjectMapper();
+        for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+            var output = new ByteArrayOutputStream();
+            PipelinePreviewController.writeEvents(json, output, new TestSession(failure), locale);
+            var payload = json.readTree(output.toByteArray()).get("payload");
+            assertThat(payload.get("code").asText()).isEqualTo(definition.code());
+            assertThat(payload.get("params")).isEqualTo(json.valueToTree(parameters));
+            assertThat(payload.get("reason").asText()).isEqualTo(
+                    io.tapstate.messages.MessageCatalog.bundled().render(definition.code(), parameters, locale).message());
+        }
     }
 
     @Test

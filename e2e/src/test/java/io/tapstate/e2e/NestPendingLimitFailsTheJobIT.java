@@ -57,7 +57,7 @@ class NestPendingLimitFailsTheJobIT {
     private static final String PARENT_TABLE = "orders";
     private static final String CHILD_TABLE = "order_items";
     private static final String PIPELINE_ID = "pending_orders";
-    private static final String EXPECTED_CODE = "nest.pending-limit-exceeded";
+    private static final String EXPECTED_CODE = "TS0490021";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,

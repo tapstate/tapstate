@@ -114,8 +114,8 @@ final class ControlPlane {
     boolean alertCenterAvailable() {
         var response = send(authed("/api/alerts/center", "{\"limit\":1}"));
         String code = codeOf(response.body());
-        if ("control.storage-unavailable".equals(code)) return false;
-        if ("io.document-unreadable".equals(code)) {
+        if ("TS0210030".equals(code)) return false;
+        if ("TS0480004".equals(code) || "io.document-unreadable".equals(code)) {
             var params = paramsOf(response.body());
             if ("alert-store".equals(params.get("id")) && "schema-capability".equals(params.get("field"))) {
                 return false;
@@ -201,6 +201,19 @@ final class ControlPlane {
     /** Reads admission through the same native snapshot used by the application. */
     Map<?, ?> storageStatus() {
         var response = send(authed("/api/storage/status", "{}"));
+        return readStorageStatus(response);
+    }
+
+    Optional<Map<?, ?>> storageStatusDuringStartup() {
+        var response = send(authed("/api/storage/status", "{}"));
+        if (response.statusCode() == 503
+                && io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        return Optional.of(readStorageStatus(response));
+    }
+
+    private static Map<?, ?> readStorageStatus(HttpResponse<String> response) {
         expect(response, 200, "read native storage admission");
         return (Map<?, ?>) JsonReader.parse(response.body());
     }
@@ -276,6 +289,12 @@ final class ControlPlane {
      */
     List<Map<String, Object>> preview(
             String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts) {
+        return preview(pipelineId, outputId, rootLimit, sampleId, drafts, null);
+    }
+
+    List<Map<String, Object>> preview(
+            String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts,
+            String language) {
         List<Map<String, String>> encodedDrafts = drafts.stream()
                 .map(draft -> Map.of("source", draft.source(), "content", draft.content()))
                 .toList();
@@ -285,7 +304,7 @@ final class ControlPlane {
         request.put("rootLimit", rootLimit);
         request.put("sampleId", sampleId);
         request.put("drafts", encodedDrafts);
-        HttpResponse<String> response = send(authed("/api/artifacts:preview", JsonWriter.write(request)));
+        HttpResponse<String> response = sourceResponse("POST", "/api/artifacts:preview", request, null, language);
         expect(response, 200, "preview Pipeline " + pipelineId);
         String contentType = response.headers().firstValue("content-type").orElse("");
         if (!contentType.startsWith("application/x-ndjson")) {
@@ -959,6 +978,17 @@ final class ControlPlane {
         expect(send(authedDelete(id, expectedContentHash)), 204, "delete " + id);
     }
 
+    /** Returns false only when the current server refuses the deletion with its workload claim fence. */
+    boolean deleteArtifactWhenClaimAvailable(String id, String expectedContentHash) {
+        var response = send(authedDelete(id, expectedContentHash));
+        if (response.statusCode() == 500
+                && io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED.code().equals(codeOf(response.body()))) {
+            return false;
+        }
+        expect(response, 204, "delete " + id);
+        return true;
+    }
+
     /**
      * Attempts a removal the product is expected to refuse, and returns the refusal it answered with. A
      * null {@code expectedContentHash} sends no {@code If-Match} at all, which is the unconditional
@@ -1422,7 +1452,7 @@ final class ControlPlane {
 
     private static boolean refusedAsAlreadyRunning(String body) {
         return JsonReader.parse(body) instanceof Map<?, ?> refusal
-                && "lifecycle.illegal-transition".equals(refusal.get("code"))
+                && "TS0280001".equals(refusal.get("code"))
                 && refusal.get("params") instanceof Map<?, ?> params
                 && PipelineState.RUNNING.name().equals(params.get("from"));
     }
@@ -2421,6 +2451,22 @@ final class ControlPlane {
     }
 
     /** The same request as a replacement rather than a submission, for the one face that takes a PUT. */
+    HttpResponse<String> retrySettings() {
+        var response = send(authedGet("/api/retry-settings"));
+        expect(response, 200, "read the cluster retry settings");
+        return response;
+    }
+
+    HttpResponse<String> replaceRetrySettings(long revision, Map<String, Object> defaults) {
+        return replaceRetrySettings(revision, defaults, Map.of());
+    }
+
+    HttpResponse<String> replaceRetrySettings(long revision, Map<String, Object> defaults,
+            Map<String, Map<String, Object>> operations) {
+        return send(authedPut("/api/retry-settings", JsonWriter.write(
+                Map.of("revision", revision, "defaults", defaults, "operations", operations))));
+    }
+
     private HttpRequest authedPut(String path, String body) {
         return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(TIMEOUT)
@@ -2460,8 +2506,22 @@ final class ControlPlane {
 
     /** Leaves an explicitly tested alternative outcome to the calling witness's own assertions. */
     HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag) {
-        HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(TIMEOUT))
+        return sourceResponse(method, path, body, etag, TIMEOUT, null);
+    }
+
+    HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag,Duration timeout) {
+        return sourceResponse(method, path, body, etag, timeout, null);
+    }
+
+    HttpResponse<String> sourceResponse(String method, String path, Map<String, ?> body, String etag, String language) {
+        return sourceResponse(method, path, body, etag, TIMEOUT, language);
+    }
+
+    private HttpResponse<String> sourceResponse(String method, String path, Map<String, ?> body, String etag,
+                                              Duration timeout, String language) {
+        HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(timeout))
                 .header("Content-Type", "application/json");
+        if (language != null) request.header("Accept-Language", language);
         if (etag != null) request.header("If-Match", etag);
         request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8));

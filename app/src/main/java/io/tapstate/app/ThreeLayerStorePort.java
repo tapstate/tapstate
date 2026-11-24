@@ -21,6 +21,10 @@ final class ThreeLayerStorePort implements StorePort {
     private final BiConsumer<PipelineIntentScope, PipelinePreparationInputs> prepareCaptured;
     private final Control control;
     private final boolean deferFirstStart;
+    private SrsStores metadataStores;
+    private synchronized SrsStores metadataStores(){
+        active();if(metadataStores==null)metadataStores=bound.cache().srs(business(),this::active);return metadataStores;
+    }
     private record Control(PipelineIntentScope scope, WorkloadClaimFence claim, Runnable active,
             MongoConfigurationDomain.AuthoringModels models) {}
 
@@ -117,7 +121,7 @@ final class ThreeLayerStorePort implements StorePort {
     Optional<SourceCaptureResolution> sharedReading(io.tapstate.core.model.PipelineResource pipeline,
             io.tapstate.core.model.SourceResource source,SourceCaptureResolution canonical,boolean requireAttachment) {
         return sharedReading(pipeline, source, canonical, requireAttachment,
-                () -> bound.cache().srs(business(), this::active), true);
+                this::metadataStores, true);
     }
 
     SrsStores startPlanningSrs() {
@@ -134,11 +138,16 @@ final class ThreeLayerStorePort implements StorePort {
             io.tapstate.core.model.SourceResource source, SourceCaptureResolution canonical, boolean requireAttachment,
             Supplier<SrsStores> stores, boolean verifyMissingCapture) {
         active();
-        if(pipeline.sources().stream().anyMatch(reference -> reference.id().equals(source.id())
-                && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs())
+        if(pipeline.sourceReference(canonical.sourceId()) instanceof io.tapstate.core.model.SourceRef.Spec spec
+                && Boolean.FALSE.equals(spec.srs())
                 || pipeline.settings()!=null && pipeline.settings().readMode()==io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY)
             return Optional.of(canonical);
-        var original=scope(pipeline.id());String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
+        var original=scope(pipeline.id());
+        var binding = configuration.intents().connectorBindings().load(original)
+                .flatMap(value -> value.find(canonical.sourceId(), io.tapstate.core.model.PipelineNode.Purpose.CAPTURE)).orElse(null);
+        String capture = binding == null ? io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value())
+                : binding.captureId();
+        if (capture == null) throw refused();
         var prepared=configuration.capturePreparations().read(business(),capture);
         if(prepared.isEmpty()) {
             // Start planning can leave the absent-history proof to the transaction that creates capture.
@@ -150,15 +159,16 @@ final class ThreeLayerStorePort implements StorePort {
         }
         var fixed=prepared.orElseThrow();
         if(fixed.mode()!=CapturePreparation.Mode.SHARED_SRS || !business().equals(fixed.scope()) || !capture.equals(fixed.captureId())
-                || !canonical.chainId().value().equals(fixed.canonicalChainId())
-                || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),source.config())))throw refused();
+                || binding == null && !canonical.chainId().value().equals(fixed.canonicalChainId())
+                || binding != null && !binding.chainId().equals(fixed.chainId())
+                || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),canonical.config().settings())))throw refused();
         var topology=stores.get().consumers().attached(fixed.chainId());
         var reader=topology.consumers().stream().filter(member -> member.context().key().pipelineId().equals(pipeline.id())
-                && member.context().key().sourceId().equals(source.id())).findFirst();
+                && member.context().key().sourceId().equals(canonical.sourceId())).findFirst();
         active();if(!original.equals(scope(pipeline.id())))throw refused();
         if(reader.isEmpty() && requireAttachment)return Optional.empty();
         if(reader.isPresent() && reader.orElseThrow().context().stateGeneration()!=original.stateGeneration())throw refused();
-        return Optional.of(canonical.onPhysicalChain(fixed.canonicalChainId(),fixed.chainId()));
+        return Optional.of(canonical.onPhysicalChain(canonical.chainId().value(),fixed.chainId()));
     }
     PipelineIntentScope scope(String pipeline) {
         active();
@@ -214,6 +224,21 @@ final class ThreeLayerStorePort implements StorePort {
     @Override public PipelineDraftStore drafts() { active(); return configuration.drafts(); }
     @Override public SchemaStore schemas() { active(); return bound.cache().schemas(business(), this::active); }
     @Override public ConnectorRegistry connectors() { active(); return bound.cache().connectors(business(), this::active); }
+    io.tapstate.spi.store.ConnectorArtifactHoldings connectorHoldings() {
+        active();
+        return bound.cache().connectorArtifactHoldings(business(), this::active);
+    }
+    Set<String> retainedConnectorArtifacts() {
+        active();
+        var retained = configuration.retainedConnectorArtifacts();
+        active();
+        return retained;
+    }
+
+    boolean copyLegacyConnectorArtifact(String hash, java.io.OutputStream output) throws java.io.IOException {
+        active();
+        return bound.cache().copyLegacyConnectorArtifact(business(), this::active, hash, output);
+    }
     @Override public ConnectorCatalogStore connectorCatalog() { active(); return bound.cache().connectorCatalog(business(), this::active); }
     @Override public ConnectorSpecStore connectorSpecs() { active(); return bound.cache().connectorSpecs(business(), this::active); }
     @Override public ConnectionTestResultStore connectionTestResults() { active(); return bound.cache().connectionTestResults(business(), this::active); }
@@ -246,7 +271,7 @@ final class ThreeLayerStorePort implements StorePort {
                 var previous = intents.load(desired.pipelineId());
                 if (previous.isPresent() && !previous.orElseThrow().scope().equals(original)) throw refused();
                 submit(desired, original, previous.map(PipelineIntentSnapshot::desired),
-                        previous.map(PipelineIntentSnapshot::intentRevision).orElse(0L), Optional.empty());
+                        previous.map(PipelineIntentSnapshot::intentRevision).orElse(0L), Optional.empty(), false);
             }
             @Override public Optional<StartEntry> startEntry(String pipeline) {
                 if (!deferFirstStart) return Optional.empty();
@@ -289,10 +314,10 @@ final class ThreeLayerStorePort implements StorePort {
                             .compareAndSetStart(scope, original.revision(), desired, inputs.inputs())) throw refused();
                     return;
                 }
-                submit(desired, scope, original.desired(), original.revision(), captured);
+                submit(desired, scope, original.desired(), original.revision(), captured, true);
             }
             private void submit(DesiredState desired, PipelineIntentScope original, Optional<DesiredState> previous,
-                    long revision, Optional<StartPreparation> captured) {
+                    long revision, Optional<StartPreparation> captured, boolean explicitStart) {
                 // An immediate start may supersede an explicitly clearing stop before convergence.
                 // That same fenced intent must finish replacement before preparing the new selection.
                 boolean clearsFirst = desired.purgeState() && desired.reassemble()
@@ -307,8 +332,11 @@ final class ThreeLayerStorePort implements StorePort {
                         prepareCaptured.accept(original, inputs.inputs());
                     }
                 }
-                if (!configuration.intents().guardedBy(ThreeLayerStorePort.this::active)
-                        .compareAndSet(original, revision, desired)) throw refused();
+                var intents = configuration.intents().guardedBy(ThreeLayerStorePort.this::active);
+                boolean committed = explicitStart && !clearsFirst
+                        ? intents.compareAndSetExplicitStart(original, revision, desired)
+                        : intents.compareAndSet(original, revision, desired);
+                if (!committed) throw refused();
             }
             @Override public Optional<DesiredState> read(String pipeline) {
                 active(); return configuration.intents().load(pipeline).filter(value -> !value.deleted()).map(PipelineIntentSnapshot::desired);
@@ -418,7 +446,9 @@ final class ThreeLayerStorePort implements StorePort {
     }
     private static Optional<Observation> startFailure(String pipeline, MongoConfigurationDomain.PipelineDisplayHeader header) {
         return header.startFailure().map(code -> new Observation(pipeline, PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
-                new io.tapstate.core.lifecycle.ObservationFailure(code.code(), Map.of()), null, List.of()));
+                new io.tapstate.core.lifecycle.ObservationFailure(code.code(),
+                        code == io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED ? Map.of("pipeline", pipeline) : header.startFailureParams()),
+                null, List.of()));
     }
     private Optional<Observation> readObservation(String pipeline, PipelineIntentScope original) {
         var preparation = configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
@@ -481,10 +511,13 @@ final class ThreeLayerStorePort implements StorePort {
                 if (!(reference instanceof io.tapstate.core.model.SourceRef.Spec spec) || spec.srs()) continue;
                 var source = StoredArtifacts.requireSource(configuration.artifacts(), reference.id());
                 var key = source.srs() == null ? null : source.srs().key();
-                if (!chain.equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(source.connector(), source.config(), key, pipeline.id(), source.id()))) continue;
+                var settings = io.tapstate.core.model.PipelineSourceConfig.settings(reference, source);
+                var overrides = io.tapstate.core.model.PipelineSourceConfig.overrides(reference, source);
+                if (!chain.equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(
+                        source.connector(), settings, key, pipeline.id(), reference.binding(), overrides))) continue;
                 if (unprepared(pipeline.id())) return Optional.empty();
-                var tables = PipelineTableSelection.resolve(pipeline, source, SourceDiscovery.model(this, source));
-                var channel = DirectChannelPreparation.of(scope(pipeline.id()), source, mode,
+                var tables = PipelineTableSelection.resolve(pipeline, reference, source, SourceDiscovery.model(this, source));
+                var channel = DirectChannelPreparation.of(scope(pipeline.id()), source, reference, mode,
                         pipeline.settings() == null ? null : pipeline.settings().startFrom(), tables);
                 var original = bound.cache().directChannels(business(), this::active).load(channel.context());
                 return Optional.of(original);
@@ -501,6 +534,14 @@ final class ThreeLayerStorePort implements StorePort {
         });
     }
     Optional<SrsMeta> startProgress(String chain, SrsStores stores) {
+        if(stores.consumers().supportsControlSnapshot()){
+            var held=stores.consumers().controlSnapshot(chain);
+            if(held.isEmpty())return directPosition(chain);
+            var original=held.orElseThrow().chain();
+            return Optional.of(new SrsMeta(chain,original.resumeOverride()!=null?new ChainPosition(null,original.resumeOverride().token())
+                    :original.checkpoint()==null?null:original.checkpoint().position(),held.orElseThrow().cursors(),List.of(),original.retention(),original.epoch(),
+                    original.resumeOverride()!=null?original.resumeOverride().editedAt():original.checkpointAt(),original.resumeOverride()==null&&original.checkpoint()!=null));
+        }
         var shared = stores.chains().load(chain);
         if (shared.isEmpty()) return directPosition(chain);
         return shared.map(original -> {
@@ -517,7 +558,7 @@ final class ThreeLayerStorePort implements StorePort {
 
     @Override public SrsMetaStore meta() {
         return new SrsMetaStore() {
-            private SrsStores stores() { active(); return bound.cache().srs(business(), ThreeLayerStorePort.this::active); }
+            private SrsStores stores() { return metadataStores(); }
             @Override public Optional<SrsMeta> read(String chain) {
                 return startProgress(chain, stores());
             }

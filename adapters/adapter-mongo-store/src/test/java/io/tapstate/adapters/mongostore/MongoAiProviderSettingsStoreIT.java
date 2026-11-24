@@ -21,7 +21,11 @@ class MongoAiProviderSettingsStoreIT {
             var rings = new SourceConfigKeyringStore(client, database); rings.loadOrCreateCipher();
             var store = new MongoAiProviderSettingsStore(client, database);
             var settings = new Settings("openai-compatible", "https://api.openai.com/v1", "model", "sk-integration-secret");
-            store.put("org-a/cluster-a", settings);
+            var managed = new Settings(settings.providerId(), settings.baseUrl(), settings.model(), settings.apiKey(), true);
+            assertThat(store.selectManaged("org-a/cluster-a", true)).isFalse();
+            store.put("org-a/cluster-a", managed);
+            assertThat(store.get("org-a/cluster-a")).contains(managed);
+            assertThat(store.selectManaged("org-a/cluster-a", false)).isTrue();
             assertThat(store.get("org-a/cluster-a")).contains(settings);
             assertThat(store.get("org-b/cluster-b")).isEmpty();
             var meta = SystemCollections.SYSTEM_META.on(database);

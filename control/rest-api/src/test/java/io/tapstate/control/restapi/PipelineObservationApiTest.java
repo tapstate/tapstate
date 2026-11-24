@@ -79,11 +79,15 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -106,7 +110,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>Status returns a catalog projection for a known authoring draft or applied pipeline. A known
  * transition can report a display state before it has a runtime state to report. Metrics, snapshot, and
- * explanation still return {@code monitor.no-observation} when runtime data is not yet available. The tests
+ * explanation still return {@code TS0400001} when runtime data is not yet available. The tests
  * prove the reads round-trip through the real query service, that an unknown id returns the permanent coded
  * error, that the interceptor guards a read like any other verb, and that read endpoints derive from the registry.
  * The context is booted programmatically so the module stays on the reactor's JUnit line; it imports the
@@ -115,23 +119,39 @@ import static org.assertj.core.api.Assertions.assertThat;
 class PipelineObservationApiTest {
 
     private static final Instant NOW = Instant.parse("2026-07-12T12:00:00Z");
+    private static final String MYSQL_POSITION = serializedPosition("mysql-bin.000003:1544");
+    private static final String POSTGRES_POSITION = serializedPosition("0/16B6C50");
 
     /** One running pipeline with a couple of metrics and one in-progress snapshot table. */
     private static final Observation PL1 = new Observation("pl1", PipelineState.RUNNING,
             Map.of("recordCount", 42L, "errorCount", 0L),
             Map.of("orders", new TableSnapshot(10, 100L, 10)));
 
+    // A connector token that shares the Java magic and uses a different version byte.
+    private static final String HEADER_LIKE_POSITION = "rO0ABA==";
+
     /** One running pipeline whose target-acked source positions have advanced, to exercise that field. */
     private static final Observation PL_POS = new Observation("pl2", PipelineState.RUNNING,
             Map.of("recordCount", 6L, "errorCount", 0L),
             Map.of(),
-            Map.of("orders", "w7"));
+            Map.of("orders", "w7", "shipments", MYSQL_POSITION, "events", POSTGRES_POSITION,
+                    "ledger", "binlog.000017:567", "archive", HEADER_LIKE_POSITION));
+
+    private static String serializedPosition(String position) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(position);
+        } catch (IOException ex) {
+            throw new AssertionError(ex);
+        }
+        return Base64.getEncoder().encodeToString(bytes.toByteArray());
+    }
 
     /** One pipeline whose job died, to exercise the coded reason the status face carries. */
     private static final Observation PL_DEAD = new Observation("pl3", PipelineState.FAILED,
             Map.of("errorCount", 1L), Map.of(), Map.of(),
-            new ObservationFailure("engine.job-failed",
-                    Map.of("pipeline", "pl3", "cause", "the sink rejected the batch")));
+            new ObservationFailure("TS0440008",
+                    Map.of("pipeline", "pl3", "cause", "the sink rejected the batch"), Map.of("rawMessage", "safe captured cause")));
 
     private static final Instant COUNTING_SINCE = Instant.parse("2026-07-12T11:00:00Z");
 
@@ -264,7 +284,8 @@ class PipelineObservationApiTest {
 
         assertThat(body.get("state")).isEqualTo("FAILED");
         Map<?, ?> failure = (Map<?, ?>) body.get("failure");
-        assertThat(failure.get("code")).isEqualTo("engine.job-failed");
+        assertThat(failure.get("code")).isEqualTo("TS0440008");
+        assertThat(failure.get("diagnostic")).isEqualTo(Map.of("rawMessage", "safe captured cause"));
         assertThat((String) failure.get("message")).contains("the sink rejected the batch");
         assertThat((Map<String, Object>) failure.get("params"))
                 .containsEntry("cause", "the sink rejected the batch");
@@ -382,7 +403,13 @@ class PipelineObservationApiTest {
         // A source position is a string, and the metrics map is numeric run statistics. Carrying the
         // position as a sibling rather than nested inside that map keeps every metrics cell a number,
         // so a reader never has to type-test a cell before using it.
-        assertThat(body.get("targetAckedPosition")).isEqualTo(Map.of("orders", "w7"));
+        Map<String, String> positions = (Map<String, String>) body.get("targetAckedPosition");
+        assertThat(positions).containsOnlyKeys("orders", "shipments", "events", "ledger", "archive")
+                .containsEntry("orders", "w7")
+                .containsEntry("ledger", "binlog.000017:567")
+                .containsEntry("archive", HEADER_LIKE_POSITION);
+        assertThat(positions.get("shipments")).matches("opaque-v1:[0-9a-f]{64}");
+        assertThat(positions.get("events")).matches("opaque-v1:[0-9a-f]{64}").isNotEqualTo(positions.get("shipments"));
         Map<String, Object> metrics = (Map<String, Object>) body.get("metrics");
         assertThat(metrics).doesNotContainKey("targetAckedPosition");
         assertThat(metrics.get("recordCount")).isNotNull();
@@ -437,6 +464,36 @@ class PipelineObservationApiTest {
 
         assertThat(body.pipelineId()).isEqualTo("pl1");
         assertThat(body.snapshot()).containsEntry("orders", new TableSnapshot(10, 100L, 10));
+    }
+
+    @Test
+    void explanationCarriesTheSameCapturedDiagnosticAsStatus() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl3/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        var evidence = (List<Map<String, Object>>) body.get("evidence");
+        assertThat(evidence).anySatisfy(item -> {
+            assertThat(item.get("field")).isEqualTo("failure");
+            assertThat(((Map<?, ?>) item.get("value")).get("diagnostic"))
+                    .isEqualTo(Map.of("rawMessage", "safe captured cause"));
+        });
+    }
+
+    @Test
+    void explanationLocalizesTheTypedRuntimeFailureAndKeepsCapturedEvidence() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl3/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .header("Accept-Language", "zh-CN, en;q=0.8")
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        List<Map<String, Object>> evidence = (List<Map<String, Object>>) body.get("evidence");
+        Map<?, ?> failure = (Map<?, ?>) evidence.stream().filter(item -> item.get("field").equals("failure"))
+                .findFirst().orElseThrow().get("value");
+
+        assertThat(failure.get("code")).isEqualTo("TS0440008");
+        assertThat(failure.get("params")).isEqualTo(Map.of("pipeline", "pl3", "cause", "the sink rejected the batch"));
+        assertThat((String) failure.get("message")).contains("\u56e0\u4f5c\u4e1a\u5931\u8d25", "the sink rejected the batch");
+        assertThat((String) failure.get("solution")).contains("\u67e5\u770b Pipeline \u65e5\u5fd7");
+        assertThat(failure.get("diagnostic")).isEqualTo(Map.of("rawMessage", "safe captured cause"));
     }
 
     @Test
@@ -519,7 +576,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsEntry("reason", "from is required");
     }
 
@@ -550,7 +607,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("monitor.no-observation");
+        assertThat(body.code()).isEqualTo("TS0400001");
         assertThat(body.params()).containsEntry("pipeline", "pl1");
     }
 
@@ -567,7 +624,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.code()).isEqualTo("TS0280005");
     }
 
     // ---- a known pipeline returns merged status before its first runtime observation ----
@@ -585,7 +642,7 @@ class PipelineObservationApiTest {
 
         // Never applied is permanent: a caller that read this as the transient unconverged window would
         // wait out its whole bound on what is almost always a mistyped id.
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.code()).isEqualTo("TS0280005");
         assertThat(body.params()).containsEntry("pipeline", "ghost");
         assertThat(observations.reads()).isEqualTo(1);
     }
@@ -634,7 +691,7 @@ class PipelineObservationApiTest {
         Object intentReadFailure = body.get("intentReadFailure");
         assertThat(intentReadFailure).isInstanceOf(Map.class);
         assertThat(((Map<?, ?>) intentReadFailure).get("code"))
-                .isEqualTo("io.document-unreadable");
+                .isEqualTo("TS0480004");
     }
 
     @Test
@@ -649,7 +706,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("io.document-unreadable");
+        assertThat(body.code()).isEqualTo("TS0480004");
         assertThat(body.params()).isEqualTo(Map.of("id", "pl1", "field", "checkpoint"));
     }
 
@@ -683,7 +740,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     // ---- the read endpoints are a derivation of the registry ----
@@ -1086,7 +1143,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("position.write-back-while-live");
+        assertThat(body.code()).isEqualTo("TS0410001");
         assertThat(body.message()).contains("pl2");
     }
 

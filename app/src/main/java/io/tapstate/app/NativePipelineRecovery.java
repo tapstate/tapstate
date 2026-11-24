@@ -16,6 +16,7 @@ import io.tapstate.core.lifecycle.StateJson;
 /** Executes only the original explicit Pipeline full and observes actual sink completion under its run fence. */
 final class NativePipelineRecovery {
     private final MongoConfigurationDomain configuration;
+    private final CachePreparation original;
     private final CacheAuthScope auth;
     private final PipelineRecoveryInspector inspector;
     private final PipelineFirstStatePreparer preparer;
@@ -28,10 +29,10 @@ final class NativePipelineRecovery {
     private final StorePort store;
     private final PipelineStoreViews views;
 
-    NativePipelineRecovery(MongoConfigurationDomain configuration,CacheAuthScope auth,StorePort store,
+    NativePipelineRecovery(MongoConfigurationDomain configuration,CachePreparation original,StorePort store,
             PipelineFirstStatePreparer preparer,ConnectorProvisioner connectors,Engine engine,PipelineCaptureCoordinator captures,
             ExecutionAuthorization authorization,Runnable active,BooleanSupplier available,PipelineStoreViews views) {
-        this.configuration=Objects.requireNonNull(configuration);this.auth=Objects.requireNonNull(auth);
+        this.configuration=Objects.requireNonNull(configuration);this.original=Objects.requireNonNull(original);this.auth=original.authScope();
         this.preparer=Objects.requireNonNull(preparer);this.engine=Objects.requireNonNull(engine);this.captures=Objects.requireNonNull(captures);
         this.authorization=Objects.requireNonNull(authorization);this.active=Objects.requireNonNull(active);this.available=Objects.requireNonNull(available);
         this.store=Objects.requireNonNull(store);this.views=Objects.requireNonNull(views);
@@ -91,7 +92,8 @@ final class NativePipelineRecovery {
         if(summary.isEmpty())return Map.of();
         if(!summary.orElseThrow().targetScope().equals(pass.scope()))throw fenced();
         var contexts=new LinkedHashMap<String,SourceResource>();
-        for(String source:pipeline.sourceIds())contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,source),PipelineNode.Purpose.CAPTURE),StoredArtifacts.requireSource(snapshot,source));
+        for(var ref:pipeline.sources())contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE),
+                io.tapstate.core.model.PipelineSourceConfig.effective(ref,sources.get(ref.id())));
         if(pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync()!=null)for(var sync:serve.sync())
             contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,PipelineConnectorNodes.syncNodeId(sync)),PipelineNode.Purpose.SYNC),StoredArtifacts.requireSource(snapshot,sync.source()));
         if(pipeline.view() instanceof ViewBlock.Inline view) {
@@ -103,6 +105,7 @@ final class NativePipelineRecovery {
             var token=notes.open(new RequiredNoteOwner(auth.bindingVersion(),entry.getKey(),RequiredNoteOwner.Kind.PIPELINE,id,pass.scope().stateGeneration()));
             var origin=notes.origin(token);var source=entry.getValue();
             if(!origin.equals(ConnectorNoteOrigin.capture(source.connector(),origin.artifactHash(),source.config())))throw fenced();
+            connectors.resolveRetained(notes, token, origin);
             String prior=hashes.putIfAbsent(source.connector(),origin.artifactHash());if(prior!=null && !prior.equals(origin.artifactHash()))throw fenced();
         }
         ConnectorProvisioner pinned=fixed(hashes);
@@ -151,10 +154,11 @@ final class NativePipelineRecovery {
         var permission=configuration.cacheRecoveries().guardedBy(this::requireAvailable).authorizeFull(running,id);
         ConnectorProvisioner fixed=fixed(inspected.connectorHashes());
         var notes=new PipelinePrivateNoteRetirement(configuration.requiredNotes(),configuration.rebuilds(),fixed);
+        var predecessor = configuration.intents().connectorBindings().previousForRecovery(permission.recovery().targetScope()).orElse(null);
         preparer.prepareRecovered(permission,inspected.inputs(),() -> {
             requireAvailable();
             if(engine.captureRun(id).filter(Engine.Run::isCarryingAJob).isPresent())throw fenced();
-            notes.reconcileRecovered(permission,inspected.privateContexts(),this::requireAvailable);
+            notes.reconcileRecovered(permission,inspected.privateContexts(),predecessor,this::requireAvailable);
         });
         requireAvailable();permission.requireActive();
         if(!inspected.operatorDatabases().isEmpty()) {
@@ -164,11 +168,18 @@ final class NativePipelineRecovery {
         }
         var target=permission.recovery().targetScope();
         var configuredNotes=configuration.requiredNotes().guardedBy(() -> {requireAvailable();permission.requireActive();});
-        for(var entry:inspected.privateContexts().entrySet()) {
-            var token=configuredNotes.open(new RequiredNoteOwner(target.bindingVersion(),entry.getKey(),RequiredNoteOwner.Kind.PIPELINE,id,target.stateGeneration()));
-            var source=entry.getValue();var expected=ConnectorNoteOrigin.capture(source.connector(),fixed.resolve(source.connector()).contentHash(),source.config());
-            configuredNotes.prepareOrigin(token,expected);
-        }
+        connectors.withArtifactRetention(() -> {
+            for(var entry:inspected.privateContexts().entrySet()) {
+                var token=configuredNotes.open(new RequiredNoteOwner(target.bindingVersion(),entry.getKey(),RequiredNoteOwner.Kind.PIPELINE,id,target.stateGeneration()));
+                var source=entry.getValue();
+                var ref = fixed.resolve(source.connector());
+                var expected=ConnectorNoteOrigin.capture(source.connector(),ref.contentHash(),source.config());
+                connectors.retain(ref);
+                configuredNotes.prepareOrigin(token,expected);
+                connectors.markBound(configuredNotes, token, expected);
+            }
+            return null;
+        });
         var intent=configuration.intents().load(id).orElseThrow(NativePipelineRecovery::fenced);
         if(intent.deleted() || intent.intentRevision()!=inspected.intentRevision() || !intent.scope().equals(permission.recovery().targetScope()))throw fenced();
         if(intent.desired().targetState()!=PipelineState.RUNNING && !configuration.intents().guardedBy(this::requireAvailable)
@@ -178,7 +189,7 @@ final class NativePipelineRecovery {
     void observeCompletion() {
         if(!available.getAsBoolean())return;
         try {
-            active.run();var commands=configuration.recoveryCommands();var pending=commands.current(auth);
+            active.run();var commands=configuration.recoveryCommands();var pending=commands.currentForCompletion(original);
             if(pending.isEmpty())return;var plan=pending.orElseThrow();
             if(!plan.originalScope().equals(auth) || plan.phase()!=StorageRecoveryCommands.Phase.RUNNING
                     || plan.manifest().selection().extent()!=StorageRecoveryCommands.Extent.PIPELINE || plan.manifest().selection().pipelineIds().size()!=1)return;

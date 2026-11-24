@@ -237,7 +237,7 @@ class PdkDataBrowserTest {
         assertThatThrownBy(() -> reader.collections(config()))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("connector.capability-missing");
+                .isEqualTo("TS0060031");
     }
 
     // ---- getTableInfo ----------------------------------------------------------------------------
@@ -260,7 +260,7 @@ class PdkDataBrowserTest {
         assertThatThrownBy(() -> reader.stats(config(), "orders"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("connector.capability-missing");
+                .isEqualTo("TS0060031");
     }
 
     // ---- executeCommand --------------------------------------------------------------------------
@@ -708,7 +708,7 @@ class PdkDataBrowserTest {
         assertThatThrownBy(() -> reader.find(config(), new DataBrowserQuery("orders", null, 10)))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("connector.read-abandoned");
+                .isEqualTo("TS0060030");
     }
 
     @Test
@@ -743,7 +743,7 @@ class PdkDataBrowserTest {
         assertThatThrownBy(() -> reader.find(config(), new DataBrowserQuery("orders", null, 10)))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("connector.read-failed");
+                .isEqualTo("TS0060028");
     }
 
     @Test
@@ -753,7 +753,7 @@ class PdkDataBrowserTest {
         assertThatThrownBy(() -> reader.find(config(), new DataBrowserQuery("orders", null, 10)))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("connector.read-failed");
+                .isEqualTo("TS0060028");
     }
 
     @Test
@@ -765,7 +765,7 @@ class PdkDataBrowserTest {
         assertThatThrownBy(() -> reader.find(config(), new DataBrowserQuery("orders", null, 10)))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("connector.capability-missing");
+                .isEqualTo("TS0060031");
     }
 
     /** The value the read-face connector echoed back for {@code what}, or null if it echoed no such row. */

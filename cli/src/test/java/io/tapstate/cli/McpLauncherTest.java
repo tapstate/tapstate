@@ -55,7 +55,7 @@ class McpLauncherTest {
         assertThatThrownBy(() -> McpLauncher.command(
                 cli, Map.of(), Map.of(), null, false))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("cli.mcp-unavailable");
+                .hasMessageContaining("TS0330024");
 
         Path javaHome = Files.createDirectories(bundle.resolve("jdk/bin"));
         Path java = javaHome.resolve("java");
@@ -77,7 +77,7 @@ class McpLauncherTest {
 
         assertThatThrownBy(() -> McpLauncher.command(cli, Map.of(), Map.of(), null, false))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("cli.mcp-unavailable");
+                .hasMessageContaining("TS0330024");
     }
 
     @Test

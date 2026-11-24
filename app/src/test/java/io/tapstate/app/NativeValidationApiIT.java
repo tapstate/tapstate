@@ -1,12 +1,12 @@
 package io.tapstate.app;
 
 import com.mongodb.client.MongoClients;
-import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.core.model.*;
 import io.tapstate.spi.store.*;
 import io.tapstate.testsupport.RequiresDocker;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
@@ -54,8 +54,12 @@ class NativeValidationApiIT {
                 var artifact=Path.of(Objects.requireNonNull(countOnly
                         ? System.getProperty("tapstate.pdk.it.validation-count-jar", defaultArtifact)
                         : defaultArtifact));
-                var registered=child.getBean(ConnectorArtifactRegistrar.class).register(artifact,RegistrationSource.REGISTER);
-                var connector=registered.registration().connectorId();
+                String connector;
+                try (var bytes = Files.newInputStream(artifact)) {
+                    var registered = child.getBean(LocalConnectorRuntime.class).artifacts()
+                            .install(bytes, ConnectorArtifactMetadata.Origin.UPLOAD, null, null);
+                    connector = registered.registration().connectorId();
+                }
                 var stableRow=new Document("id",1L).append("payload","same");
                 observer.getDatabase(sourceDb).getCollection("orders").insertOne(stableRow);
                 observer.getDatabase(targetDb).getCollection("checked_orders").insertOne(new Document(stableRow));

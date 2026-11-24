@@ -36,6 +36,16 @@ public record TargetField(String name, String type, boolean primaryKey, Tapstate
         this(name, type, primaryKey, null);
     }
 
+    /** A source decimal descriptor awaiting confirmation by an unchanged output value. */
+    public static TargetField deferredDecimal(String name, NumericType candidate) {
+        return new TargetField(name, null, false, TapstateType.UNKNOWN,
+                java.util.Objects.requireNonNull(candidate, "candidate"));
+    }
+
+    public boolean isDeferredDecimal() {
+        return !primaryKey && type == null && inferredType == TapstateType.UNKNOWN && numericType != null;
+    }
+
     public TargetField {
         if (name == null || name.isBlank()) {
             throw new IllegalArgumentException("target field name must be non-blank");

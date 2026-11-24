@@ -199,7 +199,9 @@ final class StartFlow {
                             : unreachable.sent() ? reporting.unanswered(id) : reporting.unreachable(), attempt, checks);
                 }
                 case StartAttempt.Rejected rejected -> {
-                    if (VERSION_CONFLICT.equals(rejected.code()) && interactive(answering) && !decided.isEmpty()) {
+                    if ((VERSION_CONFLICT.equals(rejected.code())
+                            || io.tapstate.core.common.PipelineErrorDefinitions.VERSION_CONFLICT.code().equals(rejected.code()))
+                            && interactive(answering) && !decided.isEmpty()) {
                         tellAppliedChanges(id, rejected.decisionsApplied());
                         err.println(verb + ": " + id + " was changed while you were answering; reading its start "
                                 + "checks again");

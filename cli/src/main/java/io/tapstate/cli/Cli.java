@@ -75,6 +75,8 @@ import java.util.function.Supplier;
         })
 public final class Cli implements Runnable {
 
+    private static final String LONG_HELP_OPTION = "--help";
+
     /**
      * What {@code -V} prints, on the root and on every verb alike. A compile-time constant rather than a
      * manifest or bundled-resource lookup: neither survives into the native image without extra
@@ -172,7 +174,11 @@ public final class Cli implements Runnable {
             // the accept would be a second word for the same subject; a flag on the start would not be
             // anybody looking at all.
             Map.entry("pipeline.derived-schema", "derived-schema"),
-            Map.entry("pipeline.accept-derived-schema", "derived-schema"));
+            Map.entry("pipeline.accept-derived-schema", "derived-schema"),
+            // One verb for both, as with the derived schema: a repair is the same look followed by a
+            // decision about what it showed.
+            Map.entry("pipeline.aggregate-check", "aggregate"),
+            Map.entry("pipeline.aggregate-repair", "aggregate"));
 
     /**
      * Verbs that chain several registered operations rather than projecting one, and are not
@@ -285,6 +291,10 @@ public final class Cli implements Runnable {
                     "Show a pipeline's per-table snapshot progress.")),
             Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
                     "Compare a join's recorded and current columns; --accept re-reads the sources.")),
+            // "the rows the step holds" is the load-bearing part. A check that came back clean and was
+            // read as "the view matches the source" would be believed for something it never looked at.
+            Map.entry("aggregate", new VerbHelp("<pipeline-id> <step> [--group <name=value,...>] [--repair]",
+                    "Check an aggregate step's totals against the rows the step holds; --repair rewrites them.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
             // "per chain" is the load-bearing half of this line. A pipeline's position is one value per
@@ -494,7 +504,53 @@ public final class Cli implements Runnable {
             System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
-        System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
+        System.exit(runSession(launch, HttpControlPlaneClient::new));
+    }
+
+    /** Checks for help before creating the client for an online command or interactive session. */
+    static int runSession(LaunchOptions launch, Supplier<ControlPlaneClient> client) {
+        if (launch.isOneShot()) {
+            Integer helpExit = executeHelpRequest(launch.command());
+            if (helpExit != null) {
+                return helpExit;
+            }
+        }
+        return runSession(launch, client.get(), Cli::terminalPrompter);
+    }
+
+    private static Integer executeHelpRequest(List<String> words) {
+        if (words.getFirst().equals(DATA_BROWSER_VERB)) {
+            // The data-browser dispatcher joins every operand into one query. Help or version replaces it.
+            if (words.size() != 2) {
+                return null;
+            }
+            return switch (words.get(1)) {
+                case "-h", LONG_HELP_OPTION, "-V", "--version" ->
+                        newCommandLine().execute(words.toArray(new String[0]));
+                default -> null;
+            };
+        }
+        if (words.stream().noneMatch(Cli::isUsageHelpOption)) {
+            return null;
+        }
+        CommandLine commandLine = newCommandLine();
+        CommandLine verb = commandLine.getSubcommands().get(words.getFirst());
+        if (verb != null && verb.getCommand() instanceof ConnectedVerb) {
+            ConnectedVerb.recognizeValueOptionsForHelp(verb);
+        }
+        CommandLine.ParseResult parsed;
+        try {
+            parsed = commandLine.parseArgs(words.toArray(new String[0]));
+        } catch (CommandLine.ParameterException ignored) {
+            // The session still owns validation and dispatch for ordinary online commands.
+            return null;
+        }
+        return parsed.asCommandLineList().stream().anyMatch(CommandLine::isUsageHelpRequested)
+                ? CommandLine.executeHelpRequest(parsed) : null;
+    }
+
+    private static boolean isUsageHelpOption(String word) {
+        return word.equals("-h") || word.equals(LONG_HELP_OPTION);
     }
 
     /**
@@ -506,8 +562,7 @@ public final class Cli implements Runnable {
         if (launch.isOneShot() && !launch.command().isEmpty()
                 && launch.command().getFirst().equals("explain")
                 && (launch.command().size() == 1
-                        || launch.command().stream().anyMatch(
-                                word -> word.equals("-h") || word.equals("--help")))) {
+                        || launch.command().stream().anyMatch(Cli::isUsageHelpOption))) {
             return true;
         }
         if (!launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {

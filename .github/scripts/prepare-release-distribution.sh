@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run in the selected product checkout after downloading the CLI and OP image artifacts.
+# Run in the selected product checkout after downloading the CLI and server image artifacts.
 set -euo pipefail
 
 version="$1"

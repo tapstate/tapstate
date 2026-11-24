@@ -44,7 +44,7 @@ class ArtifactDeleteRefusalIT {
 
     private static final String SOURCE_ID = "referenced_source";
     private static final String PIPELINE_ID = "referring_pipeline";
-    private static final String IN_USE = "artifact.in-use";
+    private static final String IN_USE = "TS0240004";
 
     @BeforeAll
     static void requireDocker() {
@@ -78,7 +78,7 @@ class ArtifactDeleteRefusalIT {
 
             var sourceRoute = deleteRoute(server, control, "sources", SOURCE_ID, before.contentHash());
             assertThat(sourceRoute.status()).isEqualTo(409);
-            assertThat(sourceRoute.code()).isEqualTo("source.in-use");
+            assertThat(sourceRoute.code()).isEqualTo("TS0220006");
             assertThat(sourceRoute.params()).isEqualTo(Map.of("id", SOURCE_ID, "referrers", List.of(PIPELINE_ID)));
 
             assertThat(control.artifact(SOURCE_ID))
@@ -107,7 +107,7 @@ class ArtifactDeleteRefusalIT {
                 if (kind.equals("sources")) {
                     // The native managed-target gate precedes reference checks on Source authoring.
                     assertThat(refusal.status()).isEqualTo(400);
-                    assertThat(refusal.code()).isEqualTo("control.malformed-request");
+                    assertThat(refusal.code()).isEqualTo("TS0210001");
                     assertThat(refusal.params()).isEqualTo(Map.of("reason",
                             "the managed default target cannot be changed through authoring"));
                 } else {

@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.ClusterErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 
 import java.util.Set;
@@ -28,28 +30,13 @@ public enum ClusterError implements TapstateErrorCode {
      * in none, has been handed a reading nobody took. Telling those two apart is the whole of why this
      * is a code and not a catch.
      */
-    MEMBERSHIP_UNREADABLE("cluster.membership-unreadable", Set.of());
+    MEMBERSHIP_UNREADABLE(ClusterErrorDefinitions.MEMBERSHIP_UNREADABLE);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    ClusterError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    ClusterError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

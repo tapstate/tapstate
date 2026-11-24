@@ -120,7 +120,7 @@ class DataBrowserQueryConfinementIT {
             // with nothing. An empty answer and an absent collection are different facts.
             assertThat(control.findExpectingRefusal(NOT_HERE_SOURCE, NOT_HERE, Map.of()).code())
                     .as("reading a collection this source does not hold")
-                    .isEqualTo("data-browser.unknown-collection");
+                    .isEqualTo("TS0390001");
 
             // The reads that are within the shape still work, so the refusals above are the shape refusing
             // what it has no room for rather than the face being broken.

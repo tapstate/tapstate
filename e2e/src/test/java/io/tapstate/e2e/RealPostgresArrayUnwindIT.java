@@ -134,7 +134,7 @@ class RealPostgresArrayUnwindIT {
                         () -> control.failureCode(pipelineId).isPresent(),
                         () -> control.logs(pipelineId));
                 assertThat(control.failureCode(pipelineId))
-                        .contains("transform.unwind-needs-a-complete-before-image");
+                        .contains("TS0450007");
                 assertThat(mongo.documents(target, "orders"))
                         .as("refusal emits no guessed deletes or partially changed target rows")
                         .containsExactlyInAnyOrderElementsOf(expanded);

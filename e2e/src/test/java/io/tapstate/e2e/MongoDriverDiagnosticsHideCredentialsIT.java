@@ -45,7 +45,7 @@ class MongoDriverDiagnosticsHideCredentialsIT {
                     String output = Files.readString(console);
                     // The minimum root remains available for storage repair; a non-web process then exits normally.
                     assertThat(process.exitValue()).as(output).isZero();
-                    assertThat(output).contains("code=store.unreachable", "Tapstate application is ready");
+                    assertThat(output).contains("code=TS0470001", "Tapstate application is ready");
                     String file = Files.readString(work.resolve("logs/tapstate-server.log"));
                     for (String destination : List.of(output, file)) {
                         assertThat(destination).doesNotContain("packaged-user", "packaged-password", "private-auth",

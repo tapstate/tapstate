@@ -151,7 +151,7 @@ class ConnectorInstancePoolTest {
             assertThatThrownBy(() -> pool.call(config("conn-1", "mongodb://host/db"), instance -> instance))
                     .isInstanceOf(TapstateException.class)
                     .extracting(e -> ((TapstateException) e).code().code())
-                    .isEqualTo("connector.instances-busy");
+                    .isEqualTo("TS0060032");
         } finally {
             release.countDown();
         }
@@ -226,7 +226,7 @@ class ConnectorInstancePoolTest {
         }))
                 .isInstanceOf(TapstateException.class)
                 .extracting(e -> ((TapstateException) e).code().code())
-                .isEqualTo("connector.read-timeout");
+                .isEqualTo("TS0060034");
     }
 
     @Test
@@ -313,7 +313,7 @@ class ConnectorInstancePoolTest {
             assertThatThrownBy(() -> pool.call(config("conn-2", "mongodb://host/two"), instance -> instance))
                     .isInstanceOf(TapstateException.class)
                     .extracting(e -> ((TapstateException) e).code().code())
-                    .isEqualTo("connector.instance-limit-reached");
+                    .isEqualTo("TS0060033");
         } finally {
             release.countDown();
         }
@@ -438,7 +438,7 @@ class ConnectorInstancePoolTest {
         assertThatThrownBy(pool::reserveOutsidePool)
                 .isInstanceOf(TapstateException.class)
                 .satisfies(refused -> assertThat(((TapstateException) refused).code().code())
-                        .isEqualTo("connector.instance-limit-reached"));
+                        .isEqualTo("TS0060033"));
     }
 
     @Test

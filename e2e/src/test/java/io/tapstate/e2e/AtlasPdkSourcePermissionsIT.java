@@ -12,6 +12,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.containers.GenericContainer;
@@ -81,6 +82,36 @@ class AtlasPdkSourcePermissionsIT {
             Await.until("the authenticated source primary", Duration.ofSeconds(30),
                     () -> Boolean.TRUE.equals(admin.getDatabase("admin").runCommand(new Document("hello", 1))
                             .getBoolean("isWritablePrimary")), () -> "the source has not elected its primary");
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(AtlasRuntime.Mode.class)
+    void rejectedCredentialsAreHiddenInImmediateAndLatestReports(AtlasRuntime.Mode mode) throws Exception {
+        String username = "p2-atlas-witness-user";
+        String id = "atlas_wrong_user";
+        try (var prepared = mode == AtlasRuntime.Mode.CLOUD ? PreparedNativeStore.createCloud() : PreparedNativeStore.create();
+             var runtime = new AtlasRuntime(mode, prepared);
+             var server = runtime.launch(Tiers.IN_PROCESS)) {
+            var control = runtime.control(server, true);
+            runtime.register(control, CONNECTOR);
+            assertThat(control.testConnection("atlas_valid_user", CONNECTOR, settings(uri("root", "admin")))
+                    .outcome()).isEqualTo("PASSED");
+            var immediate = control.sourceRequest("POST", "/api/connections:test",
+                    Map.of("id", id, "connectorId", CONNECTOR, "settings", settings(uri(username, "admin"))),
+                    null, 200);
+            var latest = control.sourceRequest("GET", "/api/connections/" + id + "/test-result",
+                    null, null, 200);
+
+            assertThat(immediate.body()).doesNotContain(username, PASSWORD);
+            assertThat(latest.body()).doesNotContain(username, PASSWORD);
+            var report = (Map<?, ?>) JsonReader.parse(immediate.body());
+            assertThat(report.get("outcome")).isEqualTo("FAILED");
+            assertThat(report.get("checks").toString()).contains("Exception authenticating", "MongoCredential<redacted>");
+            assertThat((List<?>) report.get("checks")).anySatisfy(value ->
+                    assertThat(((Map<?, ?>) value).get("diagnostic")).isInstanceOf(Map.class));
+            assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
+            runtime.assertAuthenticationBoundary();
         }
     }
 

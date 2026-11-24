@@ -5,6 +5,8 @@ import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.messages.MessageCatalog;
 import jakarta.servlet.DispatcherType;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -12,16 +14,21 @@ import org.springframework.core.annotation.Order;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.ProviderManager;
+import org.springframework.security.config.ObjectPostProcessor;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.annotation.web.configurers.HeadersConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AuthenticationFilter;
 import org.springframework.security.web.context.SecurityContextHolderFilter;
+import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
 import org.springframework.security.web.util.matcher.DispatcherTypeRequestMatcher;
 import org.springframework.security.web.util.matcher.NegatedRequestMatcher;
+import org.springframework.web.servlet.HandlerInterceptor;
 import org.springframework.web.servlet.handler.HandlerMappingIntrospector;
+import org.springframework.web.servlet.handler.MappedInterceptor;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
@@ -35,6 +42,17 @@ import java.util.List;
  */
 @Configuration
 class RestApiSecurityConfiguration {
+
+    @Bean
+    MappedInterceptor authorizedOptionsDispatch() {
+        return new MappedInterceptor(new String[]{"/api/**"}, new HandlerInterceptor() {
+            @Override
+            public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+                OperationRequestMappingHandlerMapping.requireAuthorizedDispatch(request, handler);
+                return true;
+            }
+        });
+    }
 
     @Bean
     ApiSecurityErrorWriter apiSecurityErrorWriter(MessageCatalog catalog, ObjectMapper json) {
@@ -62,7 +80,7 @@ class RestApiSecurityConfiguration {
                             jakarta.servlet.http.HttpServletResponse response, jakarta.servlet.FilterChain chain)
                             throws jakarta.servlet.ServletException, java.io.IOException {
                         try { installations.getObject().requireManagementRequest(request); }
-                        catch (io.tapstate.core.common.TapstateException refused) { errors.write(response, refused.code(), refused.args()); return; }
+                        catch (io.tapstate.core.common.TapstateException refused) { errors.write(request, response, refused.code(), refused.args()); return; }
                         chain.doFilter(request, response);
                     }
                 }, SecurityContextHolderFilter.class)
@@ -85,6 +103,7 @@ class RestApiSecurityConfiguration {
 
         http
                 .securityMatcher(PathPatternRequestMatcher.pathPattern("/api/**"))
+                .headers(RestApiSecurityConfiguration::writeApiHeadersEagerly)
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
@@ -105,6 +124,17 @@ class RestApiSecurityConfiguration {
                         .permitAll()
                         .anyRequest().access(authorization));
         return http.build();
+    }
+
+    static void writeApiHeadersEagerly(HeadersConfigurer<HttpSecurity> headers) {
+        // Set headers before an asynchronous response can begin streaming on another thread.
+        headers.withObjectPostProcessor(new ObjectPostProcessor<HeaderWriterFilter>() {
+            @Override
+            public <O extends HeaderWriterFilter> O postProcess(O filter) {
+                filter.setShouldWriteHeadersEagerly(true);
+                return filter;
+            }
+        });
     }
 
     @Bean

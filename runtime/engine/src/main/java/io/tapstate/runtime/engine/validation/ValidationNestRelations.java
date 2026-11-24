@@ -90,12 +90,20 @@ public final class ValidationNestRelations {
             Objects.requireNonNull(embed, "embed");
             if (++nodes > limits.nodes()) throw limit("nodes");
             alias(embed.from());
+            // Validation compares a document's rows with the source rows they came from; a rollup field is a value
+            // computed over many of them, which that comparison has no rule for. Refused rather than compared as if
+            // it were a column, which would report every rollup field as a difference or, worse, as none.
+            if (embed.as() == EmbedAs.ROLLUP || !embed.rollupFields().isEmpty()) {
+                throw unsupported(embed.treeSegment(), "nest.rollupFields");
+            }
             String segment = embed.as() == EmbedAs.FLAT ? "$flat[" + embed.from() + "]" : name(embed.path(), "nestRelations.path");
             if (!identities.add(segment)) throw unsupported(segment, "nest.duplicatePath");
             if (embed.as() != EmbedAs.FLAT) {
                 for (String existing : paths) if (overlap(existing, segment)) throw unsupported(segment, "nest.overlappingPaths");
                 paths.add(segment);
             }
+            // A relation with alternatives has no single join to compare by; refused rather than read as its first.
+            if (embed.hasAlternatives()) throw unsupported(segment, "nest.orOn");
             var on = new LinkedHashMap<String, String>();
             if (embed.on().isEmpty() || embed.on().size() > 32) throw unsupported(segment, "nest.onArity");
             for (var pair : embed.on().entrySet()) {

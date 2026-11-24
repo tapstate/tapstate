@@ -98,10 +98,12 @@ def workflow_contract(text):
     jobs = {block.split(':', 1)[0].strip(): block for block in blocks if block.strip()}
     assert 'docs-only: ${{ steps.scope.outputs.docs-only }}' in jobs['shard-plan']
     assert 'steps.scope.outputs.matrix || steps.plan.outputs.matrix' in jobs['shard-plan']
-    for role in ('shard-plan', 'test-shards', 'build', 'installer', 'catalog-scripts', 'image-smoke'):
+    for role in ('shard-plan', 'snapshot-lock', 'test-shards', 'build', 'installer', 'catalog-scripts', 'image-smoke'):
         block = jobs[role]
         selector = 'steps.scope.outputs.docs-only' if role == 'shard-plan' else 'needs.shard-plan.outputs.docs-only'
-        if role not in ('shard-plan', 'build'):
+        if role == 'test-shards':
+            assert 'needs: [shard-plan, snapshot-lock]' in block, role
+        elif role not in ('shard-plan', 'build'):
             assert 'needs: shard-plan' in block, role
         for step in re.split(r'(?m)(?=^      - )', block.split('    steps:\n', 1)[1]):
             if not step.strip():

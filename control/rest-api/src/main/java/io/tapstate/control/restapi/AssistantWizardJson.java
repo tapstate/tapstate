@@ -15,6 +15,7 @@ final class AssistantWizardJson {
     private static final String CONFIG = "config";
     private static final String SOURCE = "source";
     private static final String SOURCE_ID = "sourceId";
+    private static final String SOURCE_NODE_CONFIGS = "sourceNodeConfigs";
     private static final String TABLE = "table";
     private static final String PRIMARY_KEY = "primaryKey";
     private static final String TRANSFORMS = "transforms";
@@ -81,18 +82,32 @@ final class AssistantWizardJson {
         Map<String, Object> root = object(wire.get("root"));
         Map<String, Object> config = object(object(wire.get(OUTPUT)).get(CONFIG));
         Map<String, Object> value = new LinkedHashMap<>();
-        value.put("root", root.isEmpty() ? null : Map.of(SOURCE, text(root.get(SOURCE_ID)),
+        value.put("root", root.isEmpty() ? null : Map.of("nodeId", rootId(root),
+                SOURCE, text(root.get(SOURCE_ID)),
                 TABLE, text(root.get(TABLE)), "keys", list(root.get("key")),
                 PRIMARY_KEY, String.join(", ", list(root.get("key")).stream().map(Object::toString).toList()),
                 "rowCount", "", "columns", List.of(), TRANSFORMS, readTransforms(root.get(PRE_TRANSFORMS))));
         List<Map<String, Object>> rows = list(wire.get("related")).stream().map(AssistantWizardJson::object).toList();
-        value.put("relations", readRelated(rows, "root", text(root.get(TABLE)), 0));
+        value.put("relations", readRelated(rows, rootId(root), text(root.get(TABLE)), 0));
         value.put(TRANSFORMS, readTransforms(wire.get(TRANSFORMS)));
         value.put("destinationSourceId", text(config.get(SOURCE_ID)));
         value.put("destinationTable", text(config.get(TABLE)));
         value.put("destinationWriteMode", text(config.getOrDefault("writeMode", "upsert")));
         return value;
     }
+    static Map<String, Object> candidateView(Map<String, Object> wire) {
+        Map<String, Object> candidate = view(wire);
+        if (wire.containsKey(SOURCE_NODE_CONFIGS)) {
+            candidate.put(SOURCE_NODE_CONFIGS, object(wire.get(SOURCE_NODE_CONFIGS)));
+        }
+        return candidate;
+    }
+
+    private static String rootId(Map<String, Object> root) {
+        String id = text(root.get("id"));
+        return id.isBlank() ? "root" : id;
+    }
+
     private static List<Map<String, Object>> readRelated(List<Map<String, Object>> rows, String parent, String table, int depth) {
         if (depth > PipelineDraftCompiler.MAX_WIZARD_RELATION_DEPTH
                 && rows.stream().anyMatch(row -> parent.equals(row.get("parentId")))) {
@@ -122,17 +137,45 @@ final class AssistantWizardJson {
     }
     static Map<String, Object> wire(Map<String, Object> view, Map<String, Object> original) {
         Map<String, Object> root = object(view.get("root"));
+        var oldRoot = object(original.get("root"));
+        String rootId = rootId(oldRoot);
         List<Map<String, Object>> related = new ArrayList<>();
-        writeRelated(list(view.get("relations")), "root", related, 0);
+        writeRelated(list(view.get("relations")), rootId, related, 0);
         Map<String, Object> oldOutput = object(original.get(OUTPUT));
         Map<String, Object> output = new LinkedHashMap<>(object(oldOutput.get(CONFIG)));
         output.put(SOURCE_ID, text(view.get("destinationSourceId"))); output.put(TABLE, text(view.get("destinationTable")));
         output.put("inputTable", text(root.get(TABLE))); output.put("writeMode", text(view.get("destinationWriteMode")));
-        return Map.of("root", Map.of("id", "root", SOURCE_ID, text(root.get(SOURCE)),
-                TABLE, text(root.get(TABLE)), "key", list(root.get("keys")), PRE_TRANSFORMS, writeTransforms(root.get(TRANSFORMS))),
-                "related", related, TRANSFORMS, writeTransforms(view.get(TRANSFORMS)),
-                OUTPUT, Map.of("kind", oldOutput.getOrDefault("kind", "atlas"), CONFIG, output));
+        var nextRoot = Map.<String, Object>of("id", rootId, SOURCE_ID, text(root.get(SOURCE)),
+                TABLE, text(root.get(TABLE)), "key", list(root.get("keys")),
+                PRE_TRANSFORMS, writeTransforms(root.get(TRANSFORMS)));
+        var candidate = new LinkedHashMap<>(Map.<String, Object>of("root", nextRoot, "related", related,
+                TRANSFORMS, writeTransforms(view.get(TRANSFORMS)),
+                OUTPUT, Map.of("kind", oldOutput.getOrDefault("kind", "atlas"), CONFIG, output)));
+        if (original.containsKey(SOURCE_NODE_CONFIGS)) {
+            candidate.put(SOURCE_NODE_CONFIGS, retainedConfigs(original, nextRoot, related));
+        }
+        return candidate;
     }
+    private static Map<String, Object> retainedConfigs(Map<String, Object> original,
+            Map<String, Object> root, List<Map<String, Object>> related) {
+        Map<String, Object> previous = object(original.get(SOURCE_NODE_CONFIGS));
+        if (previous.isEmpty()) return Map.of();
+        var before = inputSources(object(original.get("root")),
+                list(original.get("related")).stream().map(AssistantWizardJson::object).toList());
+        var retained = new LinkedHashMap<String, Object>();
+        inputSources(root, related).forEach((id, source) -> {
+            if (source.equals(before.get(id)) && previous.containsKey(id)) retained.put(id, previous.get(id));
+        });
+        return retained;
+    }
+
+    private static Map<String, String> inputSources(Map<String, Object> root, List<Map<String, Object>> related) {
+        var sources = new LinkedHashMap<String, String>();
+        sources.put(rootId(root), text(root.get(SOURCE_ID)));
+        related.forEach(node -> sources.put(text(node.get("id")), text(node.get(SOURCE_ID))));
+        return sources;
+    }
+
     private static void writeRelated(List<Object> nodes, String parent, List<Map<String, Object>> rows, int depth) {
         if (depth > PipelineDraftCompiler.MAX_WIZARD_RELATION_DEPTH && !nodes.isEmpty()) {
             throw new IllegalArgumentException("relation nesting is too deep");

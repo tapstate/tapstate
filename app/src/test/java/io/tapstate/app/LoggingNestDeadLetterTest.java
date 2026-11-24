@@ -74,7 +74,7 @@ class LoggingNestDeadLetterTest {
         ILoggingEvent event = only();
         assertThat(event.getLevel()).isEqualTo(Level.WARN);
         assertThat(event.getFormattedMessage())
-                .contains("nest.parent-absent")
+                .contains("TS0490024")
                 .contains("item")
                 .contains("items")
                 // The wait itself. Without this the line reads the same for a reference that has dangled for

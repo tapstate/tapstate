@@ -76,7 +76,7 @@ class ADocumentMayNotKeepMoreDeletionsThanItsLimitTest {
         assertThatThrownBy(() -> feed(processor, FROM_POLICIES,
                 policyGone(5, "c1", "p1"), policyGone(6, "c1", "p2"), policyGone(7, "c1", "p3")))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.tombstone-limit-exceeded")
+                .hasMessageContaining("TS0490022")
                 .hasMessageContaining("tombstones=3")
                 .hasMessageContaining("limit=2");
     }

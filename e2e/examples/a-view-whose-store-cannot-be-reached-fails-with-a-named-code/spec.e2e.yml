@@ -35,5 +35,6 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
-  - assert: { failure_code: actuation.view-store-unreachable }
+  - await: { failure_code: TS0360023 }
+  - assert: { failure_code: TS0360023 }
   - assert: { count: { tgt_file.orders: 0 } }

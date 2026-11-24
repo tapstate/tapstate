@@ -41,6 +41,15 @@ class ThreeLayerSharedCaptureIT {
 
     @Test @Timeout(300)
     void everyMemberEndsTheOriginalSharedTenuresWithoutResettingTheUnrelatedReaderOrLosingAQuietTable() throws Exception {
+        multiMemberSharedRecovery(false);
+    }
+
+    @Test @Timeout(300)
+    void completedMultiMemberSharedRecoveryStillExposesTheStoppedReaders() throws Exception {
+        multiMemberSharedRecovery(true);
+    }
+
+    private void multiMemberSharedRecovery(boolean stopAfterRecovery) throws Exception {
         String suffix=UUID.randomUUID().toString().replace("-","");String clusterId="shared-members-"+suffix;
         String configDb="members_cfg_"+suffix,cacheDb="members_cache_"+suffix,configUri=CONFIG.getReplicaSetUrl(configDb);
         String sourceUri=DATA.getReplicaSetUrl("members_source_"+suffix),secondUri=DATA.getReplicaSetUrl("members_second_"+suffix);
@@ -87,15 +96,23 @@ class ThreeLayerSharedCaptureIT {
                 control.stop(id,false);Await.until(id+" to stop across the original members",BOUND,
                         () -> control.state(id).filter(PipelineState.STOPPED::equals).isPresent(),() -> control.failureCode(id).toString());
             }
-            var remoteClaim=cache.getCollection("workload_claims").find(new Document("resourceType","PIPELINE_ACTUATION").append("resourceId","reader_a")
+            var claims = cache.getCollection("workload_claims");
+            var remoteClaim=claims.find(new Document("resourceType","PIPELINE_ACTUATION").append("resourceId","reader_a")
                     .append("$expr",new Document("$gt",List.of("$leaseUntil","$$NOW")))).first();assertThat(remoteClaim).isNotNull();
+            List<Document> originalClaims = List.of();
+            if (stopAfterRecovery) {
+                var readerBClaim = claims.find(new Document("resourceType", "PIPELINE_ACTUATION")
+                        .append("resourceId", "reader_b")).first();
+                assertThat(readerBClaim).as("original claim for reader_b").isNotNull();
+                originalClaims = List.of(remoteClaim, readerBClaim);
+            }
             String originalOwner=remoteClaim.getString("ownerNodeId");assertThat(nodes).contains(originalOwner);
             String requester=nodes.stream().filter(node -> !node.equals(originalOwner)).findFirst().orElseThrow();
             var recovery=cluster.member(requester);assertThat(requester).isNotEqualTo(originalOwner);
             var lost=cache.getCollection("srs_models").find(new Document("_id.chain",canonical)).into(new ArrayList<>());assertThat(lost).isNotEmpty();
             for(var model:lost)assertThat(cache.getCollection("srs_models").deleteOne(new Document("_id",model.get("_id"))).getDeletedCount()).isOne();
             Map<?,?> preview;
-            try {preview=explicitSharedPreview(recovery,canonical);}
+            try {preview=stopAfterRecovery?explicitSharedPreview(recovery,canonical,BOUND):explicitSharedPreview(recovery,canonical);}
             catch(RuntimeException|Error failed){captureDiagnostic(config,cache,canonical);throw failed;}
             assertThat(preview.get("affectedPipelineIds")).isEqualTo(List.of("reader_a","reader_b"));assertThat(preview.get("preflightCurrent")).isEqualTo(true);
             var beforeConfirmation=storage(recovery,"status",Map.of("operationId",preview.get("operationId")));
@@ -109,25 +126,50 @@ class ThreeLayerSharedCaptureIT {
             for(String field:List.of("clusterId","resourceType","resourceId","ownerNodeId","ownerBootId","claimGeneration","executionGeneration","topologyRevision"))
                 assertThat(ended.get(field)).as("the exact remotely ended tenure's %s",field).isEqualTo(remoteClaim.get(field));
             assertThat(ended.getDate("leaseUntil")).isBefore(remoteClaim.getDate("leaseUntil"));
-            assertThat(cache.getCollection("workload_claims").find(new Document("_id",remoteClaim.get("_id"))
+            if(!stopAfterRecovery)assertThat(cache.getCollection("workload_claims").find(new Document("_id",remoteClaim.get("_id"))
                     .append("$expr",new Document("$gt",List.of(remoteClaim.getDate("leaseUntil"),"$$NOW"))))).isNotEmpty();
             assertThat(cache.getCollection("workload_claims").find(new Document("_id",remoteClaim.get("_id"))
                     .append("$expr",new Document("$gt",List.of("$leaseUntil","$$NOW")))).first()).isNull();
             mongo.update(second,"items",Map.of("id",2L),Map.of("seq",222L));awaitRows(mongo,second,c,"items",BOUND);
             storage(recovery,"confirm",Map.of("operationId",preview.get("operationId"),"planHash",preview.get("planHash"),
                     "controlRevision",preview.get("controlRevision"),"confirmed",true));
-            Await.until("every original member's verified shared recovery to complete",BOUND,() -> {
+            var completed=Await.answered("every original member's verified shared recovery to complete",BOUND,() -> {
                 var status=storage(recovery,"status",Map.of("operationId",preview.get("operationId")));
                 if(status.get("executionErrorCode")!=null)throw new AssertionError("multi-member shared recovery failed: "+status);
-                return "COMPLETE".equals(status.get("phase"));
-            },() -> String.valueOf(storage(recovery,"status",Map.of("operationId",preview.get("operationId")))));
+                return "COMPLETE".equals(status.get("phase"))?Optional.of(status):Optional.empty();
+            });
             var mapping=config.getCollection("capture_preparations").find(new Document("currentRecovery.operationId",preview.get("operationId"))).first();assertThat(mapping).isNotNull();
             var replacement=mapping.get("currentRecovery",Document.class);String physical=replacement.getString("physicalChain");
             assertThat(physical).isNotBlank().isNotEqualTo(canonical);assertThat(replacement).containsEntry("phase","READY");
             assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first().get("recoveryControl",Document.class))
                     .containsEntry("operationId",preview.get("operationId")).containsEntry("phase","RETIRED").containsEntry("replacementChain",physical);
+            if(stopAfterRecovery) {
+                for (var originalClaim : originalClaims) {
+                    String id = originalClaim.getString("resourceId");
+                    var claimId = new Document("_id", originalClaim.get("_id"));
+                    long originalGeneration = originalClaim.getLong("claimGeneration");
+                    Await.until(id + " to acquire a claim after generation " + originalGeneration, BOUND, () -> {
+                        var claim = claims.find(claimId).first();
+                        return claim != null && claim.getLong("claimGeneration") > originalGeneration;
+                    }, () -> String.valueOf(claims.find(claimId).first()));
+                    var observed=Await.answered(id+" to publish its state after the shared recovery handoff",BOUND,() -> {
+                        var response=control.sourceResponse("GET","/api/pipelines/"+id+"/status",null,null);
+                        System.err.println("SHARED_RECOVERY_STOPPED_READER "+new Document("pipelineId",id)
+                                .append("recoveryStatus",completed).append("httpStatus",response.statusCode()).append("statusBody",response.body())
+                                .append("mapping",config.getCollection("operator_generations").find(new Document("_id",id)).first())
+                                .append("checkpoint",cache.getCollection("pipeline_state").find(new Document("_id",id)).first())
+                                .append("claims",cache.getCollection("workload_claims").find(new Document("resourceType","PIPELINE_ACTUATION").append("resourceId",id)).into(new ArrayList<>()))
+                                .append("observations",cache.getCollection("pipeline_observation").find(new Document("pipelineId",id)).into(new ArrayList<>())).toJson());
+                        return ControlPlane.interpretState(response.statusCode(),response.body(),id);
+                    });
+                    assertThat(observed).as("reader %s after shared recovery COMPLETE",id).isEqualTo(PipelineState.STOPPED);
+                }
+                return;
+            }
             for(String id:List.of("reader_a","reader_b")) {
-                assertThat(control.state(id)).contains(PipelineState.STOPPED);
+                var observed = Await.answered(id + " to publish its state after multi-member shared recovery", BOUND,
+                        () -> control.state(id));
+                assertThat(observed).isEqualTo(PipelineState.STOPPED);
                 assertThat(config.getCollection("operator_generations").find(new Document("_id",id)).first()).containsEntry("stateGeneration",1L);
                 assertThat(control.startExpectingRefusal(id).code()).isEqualTo(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
             }
@@ -342,7 +384,7 @@ class ThreeLayerSharedCaptureIT {
                 var lost=cache.getCollection("srs_models").find(new Document("_id.chain",canonical)).into(new ArrayList<>());
                 assertThat(lost).isNotEmpty();for(var row:lost)assertThat(cache.getCollection("srs_models").deleteOne(new Document("_id",row.get("_id"))).getDeletedCount()).isOne();
                 Map<?,?> preview;
-                try {preview=storage(control,"plan",Map.of("scope","SHARED_SRS","pipelineIds",List.of(),"canonicalChain",canonical,"physicalChain",canonical));}
+                try {preview=explicitSharedPreview(control,canonical);}
                 catch(RuntimeException|Error failed) {
                     captureDiagnostic(config,cache,canonical);
                     FailureScene.writeMemberLogs(cluster,Map.of("runtime",server.output()));FailureScene.writeThreads(cluster,server);throw failed;
@@ -368,7 +410,9 @@ class ThreeLayerSharedCaptureIT {
                 assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first().get("recoveryControl",Document.class))
                         .containsEntry("phase","RETIRED").containsEntry("operationId",operation).containsEntry("replacementChain",replacement);
                 for(String id:List.of("reader_a","reader_b")) {
-                    assertThat(control.state(id)).contains(PipelineState.STOPPED);
+                    var observed = Await.answered(id + " to publish its state after shared recovery", BOUND,
+                            () -> control.state(id));
+                    assertThat(observed).isEqualTo(PipelineState.STOPPED);
                     assertThat(generations.find(new Document("_id",id)).first()).containsEntry("stateGeneration",1L);
                     var refusal=control.startExpectingRefusal(id);assertThat(refusal.status()).isEqualTo(409);
                     assertThat(refusal.code()).isEqualTo(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
@@ -429,8 +473,11 @@ class ThreeLayerSharedCaptureIT {
         return (Map<?,?>)io.tapstate.core.common.JsonReader.parse(control.sourceRequest("POST","/api/storage/recovery/"+action,request,null,200).body());
     }
     private static Map<?,?> explicitSharedPreview(ControlPlane control,String canonical) {
+        return explicitSharedPreview(control,canonical,Duration.ofSeconds(20));
+    }
+    private static Map<?,?> explicitSharedPreview(ControlPlane control,String canonical,Duration requestTimeout) {
         var request=Map.<String,Object>of("scope","SHARED_SRS","pipelineIds",List.of(),"canonicalChain",canonical,"physicalChain",canonical);
-        var response=control.sourceResponse("POST","/api/storage/recovery/plan",request,null);
+        var response=control.sourceResponse("POST","/api/storage/recovery/plan",request,null,requestTimeout);
         var result=(Map<?,?>)io.tapstate.core.common.JsonReader.parse(response.body());
         if(response.statusCode()==200) {
             assertThat(result.get("phase")).isEqualTo("PLANNED");return result;
@@ -447,7 +494,7 @@ class ThreeLayerSharedCaptureIT {
             assertThat(pending.get("phase")).isEqualTo("PLANNED");
             assertThat(pending.get("canonicalChain")).isEqualTo(canonical);
             assertThat(pending.get("physicalChain")).isEqualTo(canonical);
-            var retry = control.sourceResponse("POST", "/api/storage/recovery/plan", recheck, null);
+            var retry = control.sourceResponse("POST", "/api/storage/recovery/plan", recheck, null,requestTimeout);
             var body = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(retry.body());
             if (retry.statusCode() == 200) return Optional.of(body);
             assertSharedPreflightFence(retry.statusCode(), body);
@@ -462,8 +509,7 @@ class ThreeLayerSharedCaptureIT {
 
     private static void assertSharedPreflightFence(int status, Map<?, ?> response) {
         assertThat(status).as("shared recovery preflight: %s", response).isEqualTo(500);
-        assertThat(response.get("code")).isEqualTo("actuation.shared-recovery-member-unavailable");
-        assertThat(((Map<?, ?>) response.get("params")).get("reason")).isEqualTo("io.workload-claim-fenced");
+        assertThat(response.get("code")).as("shared recovery preflight: %s", response).isEqualTo("TS0360034");
     }
     private static void restartClaimDiagnostic(MongoDatabase cache,String cluster,String phase) {
         var fields=new Document("_id",0);

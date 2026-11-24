@@ -1,0 +1,6 @@
+{
+  "TS0430001": {
+    "message": "Row object at `{path}` contains an unsupported map key of type `{keyType}`.",
+    "solution": "Use non-null string map keys at every nesting level. The row was refused without coercing its keys."
+  }
+}

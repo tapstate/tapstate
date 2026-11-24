@@ -76,6 +76,7 @@ jobs:
       tag: ${{ steps.next.outputs.tag }}
       is_latest: ${{ steps.next.outputs.is_latest }}
       sha: ${{ steps.sha.outputs.sha }}
+      full_ci_already_required: ${{ steps.sha.outputs.full_ci_already_required }}
       web_sha: ${{ steps.web-pin.outputs.sha }}
       # The tag the version was counted up from. Two jobs downstream need the same range -- the
       # documentation gate and the notes -- and working it out a second time is a second chance to
@@ -104,6 +105,10 @@ jobs:
             exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # Earlier commits already had to pass the full reactor in their main build.
+          if [[ ! -f .github/ci-fast-integration.json ]]; then
+            echo "full_ci_already_required=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - id: next
         run: .github/scripts/next-version.sh "${{ inputs.bump }}" HEAD >> "$GITHUB_OUTPUT"
@@ -273,10 +278,17 @@ jobs:
       source-sha: ${{ needs.version.outputs.sha }}
       trend-workflow: release.yml
 
+  reactor-regression:
+    needs: version
+    uses: ./.github/workflows/reactor-regression.yml
+    with:
+      source-sha: ${{ needs.version.outputs.sha }}
+      full-ci-already-verified: ${{ needs.version.outputs.full_ci_already_required == 'true' }}
+
   gates:
-    # The native CLI, paired Cloud/OP smoke, connector shards and full join matrix must
+    # The reactor regression, native CLI, paired Cloud/OP smoke, connector shards and full join matrix must
     # succeed in this run on the selected source before the draft or approval can open.
-    needs: [version, connectors, join-perf, cli-native, release-images]
+    needs: [version, reactor-regression, connectors, join-perf, cli-native, release-images]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -382,12 +394,10 @@ jobs:
       # asks has to be the tree this release was built from.
       - name: write the release version into every file that pins one
         run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
-      # Take only the CLI assets. An unfiltered download pulls in whatever else the other jobs upload,
-      # so this job's success came to depend on artifacts it never uses, and one that failed to download
-      # sank the whole release step.
+      # Select only the CLI archives for this release version.
       - uses: actions/download-artifact@v4
         with:
-          pattern: tapstate-*.tar.gz
+          pattern: tapstate-${{ needs.version.outputs.version }}-*.tar.gz
           path: staging
           merge-multiple: true
       - uses: actions/download-artifact@v4
@@ -471,8 +481,8 @@ jobs:
           # writes a "## What's Changed" of its own.
           generate_release_notes: true
           files: |
-            staging/tapstate-*.tar.gz
-            staging/tapstate-*.tar.gz.sha256
+            staging/tapstate-${{ needs.version.outputs.version }}-*.tar.gz
+            staging/tapstate-${{ needs.version.outputs.version }}-*.tar.gz.sha256
             staging/checksums.txt
             staging/platform-minimums.txt
             staging/tapstate-${{ needs.version.outputs.version }}-provenance.json
@@ -753,6 +763,7 @@ jobs:
           CLOUD_IMAGE: ${{ steps.image.outputs.image }}
           CLOUD_IMAGE_TAG: ${{ steps.image.outputs.tag }}
           CLOUD_IMAGE_DIGEST: ${{ needs.release-images.outputs.cloud_digest }}
+          CLOUD_MANAGED_BEDROCK: ${{ needs.release-images.outputs.cloud_managed_bedrock }}
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |

@@ -472,7 +472,18 @@ public final class TapEventCodec {
         // for bytes declares no equality of its own, so a join key built from a binary column would
         // compare by identity and match nothing, silently. Its tag comes along, because a target of the
         // same kind writes it back, and the way out builds the box again.
-        return new ConvertedValue(portable(value, converted.getValue()), originType);
+        Object result = portable(value, converted.getValue());
+        return new ConvertedValue(result, portableOriginType(value, result, originType));
+    }
+
+    // The portable Double alone cannot distinguish a Decimal128 special value from a binary float.
+    static String portableOriginType(Object original, Object portable, String declared) {
+        if (declared == null && portable instanceof Double number && original != null
+                && BSON_DECIMAL128.equals(original.getClass().getName())
+                && (!Double.isFinite(number) || Double.doubleToRawLongBits(number) == Long.MIN_VALUE)) {
+            return "DECIMAL128";
+        }
+        return declared;
     }
 
     /**
@@ -549,16 +560,21 @@ public final class TapEventCodec {
     }
 
     static TapEvent encode(Envelope env, PdkValueConversions conversions, Map<String, TapField> targetFields) {
+        return encode(env, conversions, targetFields, targetFields);
+    }
+
+    static TapEvent encode(Envelope env, PdkValueConversions conversions, Map<String, TapField> beforeFields,
+            Map<String, TapField> afterFields) {
         return switch (env.op()) {
             case INSERT, READ -> TapInsertRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), conversions, targetFields))
+                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), conversions, afterFields))
                     .removedFields(dropped(env));
             case UPDATE -> TapUpdateRecordEvent.create()
                     .table(env.src()).referenceTime(env.ts())
-                    .before(mutable(env.before(), conversions, targetFields)).after(mutable(env.after(), conversions, targetFields))
+                    .before(mutable(env.before(), conversions, beforeFields)).after(mutable(env.after(), conversions, afterFields))
                     .removedFields(dropped(env));
             case DELETE -> TapDeleteRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), conversions, targetFields));
+                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), conversions, beforeFields));
             case DDL -> encodeDdl(env);
         };
     }

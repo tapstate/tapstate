@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "join-facts",
+      "operator": "join"
+    }
+  ],
+  "inputs": {
+    "facts": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": false,
+      "key_space": "consecutive integers",
+      "trial_rows": 10000,
+      "join_key": "dimension_id",
+      "required_fields": {
+        "payload": "string"
+      }
+    },
+    "dimensions": {
+      "primary_key": "id",
+      "trial_rows": 1000,
+      "receives_changes": true,
+      "required_fields": {
+        "score": "integer"
+      }
+    }
+  },
+  "parameters": {
+    "engine": "builtin",
+    "dimension_keys": "unique",
+    "match_percent": 90,
+    "operations": [
+      "update",
+      "delete"
+    ],
+    "paired_control": {
+      "baseline": "uniform dimension keys",
+      "variant": "hot dimension keys",
+      "changed_parameter": "dimension-key distribution"
+    },
+    "initial_state": "Create matched facts and unique reference keys through the normal pipeline.",
+    "trial_parameters": [
+      "hot-key fraction",
+      "steady injection and operation counts"
+    ]
+  },
+  "expected": {
+    "readback": [
+      "Compute impacted facts by dimension key and check unaffected facts, updated joined values and retractions after dimension deletes.",
+      "Compare output amplification and acknowledgement across arms with equivalent initial data and operations."
+    ]
+  },
+  "completion": {
+    "target_unit": "joined write group per changed dimension",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

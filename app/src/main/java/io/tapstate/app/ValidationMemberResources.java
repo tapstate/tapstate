@@ -227,7 +227,10 @@ final class ValidationMemberResources implements AutoCloseable {
             synchronized(this){require();if(submitted)throw invalid("resources.controlSubmitted");submitted=true;}
             Runnable original=()->{
                 Throwable failure=null;
-                try{require();command.run();}catch(RuntimeException|Error failed){failure=failed;throw failed;}
+                try{
+                    try{require();}catch(TapstateException refused){failure=refused;return;}
+                    command.run();
+                }catch(RuntimeException|Error failed){failure=failed;throw failed;}
                 finally{finish(failure);}
             };
             try{controls.execute(original);}
@@ -494,6 +497,11 @@ final class ValidationMemberResources implements AutoCloseable {
         queries.shutdown(); decoders.shutdown(); checks.shutdown(); controls.shutdown();
         boolean stopCleanup;synchronized(this){stopCleanup=probes.isEmpty();}
         if(stopCleanup){controlTicks.shutdown();cleanup.shutdown();}
+    }
+    void awaitStopped(long deadline) {
+        for (var worker : List.of(queries, decoders, checks, controls, controlTicks, cleanup)) {
+            ShutdownAwait.executor(worker, deadline);
+        }
     }
     private static ExecutorService pool(String name, int workers, int queue) {
         return new ThreadPoolExecutor(workers, workers, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(queue), task -> {

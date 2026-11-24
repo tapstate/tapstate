@@ -191,7 +191,7 @@ async function jsonRequest(base, path, body, cookie) {
     headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify(body) });
   const value = await response.json();
   if (response.status !== 200) {
-    const code = /^[a-z][a-z0-9.-]{0,100}$/.test(value.code) ? value.code : 'unavailable';
+    const code = typeof value.code === 'string' && /^(?:[a-z][a-z0-9.-]{0,100}|TS(?!000)[0-9]{3}(?!0000)[0-9]{4})$/.test(value.code) ? value.code : 'unavailable';
     stage += ` (HTTP ${response.status}, code ${code})`;
   }
   assert.equal(response.status, 200);
@@ -303,7 +303,7 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
     const response = await request(base, '/api/connectors');
     assert.equal(response.status, 503);
     assert((response.headers.get('content-type') ?? '').includes('application/json'));
-    assert.equal((await response.json()).code, 'control.storage-unavailable');
+    assert(['TS0210030', 'control.storage-unavailable'].includes((await response.json()).code));
     assert.equal((await request(base, '/auth/bootstrap', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
   } else if (phase === 'onprem') {
@@ -317,7 +317,10 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
     assert.equal(typeof login.token, 'string');
     const rows = await request(base, '/api/connectors', { headers: { Authorization: `Bearer ${login.token}` } });
     assert.equal(rows.status, 200);
-    assert.deepEqual((await rows.json()).connectors.map((row) => row.id), ['mongodb']);
+    const registered = (await rows.json()).connectors;
+    assert.deepEqual(registered.map((row) => row.id).sort(), [...metadata.connectorIds].sort());
+    assert(registered.every((row) => row.origin === 'registered'));
+    console.log(`PASS: on-prem registered ${registered.length} connectors from its packaged seed`);
     assert.equal((await request(base, '/auth/exchange?code=onprem-refused')).status, 403);
     save(statePath, { token: login.token, issuer: login.issuer });
   } else if (phase === 'onprem-restart') {
@@ -336,7 +339,9 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
     assert.equal(login.issuer, saved.issuer);
     const rows = await request(base, '/api/connectors', { headers: { Authorization: `Bearer ${login.token}` } });
     assert.equal(rows.status, 200);
-    assert.deepEqual((await rows.json()).connectors.map((row) => row.id), ['mongodb']);
+    const registered = (await rows.json()).connectors;
+    assert.deepEqual(registered.map((row) => row.id).sort(), [...metadata.connectorIds].sort());
+    assert(registered.every((row) => row.origin === 'registered'));
   } else {
     throw new Error('unknown runtime probe phase');
   }

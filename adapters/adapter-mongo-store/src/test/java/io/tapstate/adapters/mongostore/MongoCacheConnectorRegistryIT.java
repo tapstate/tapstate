@@ -11,7 +11,13 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandSucceededEvent;
+import io.tapstate.core.catalog.ConnectorCatalogEntry;
+import io.tapstate.core.catalog.Provenance;
+import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.BundledConnectorIcon;
+import io.tapstate.spi.store.ConnectorArtifactHoldings;
+import io.tapstate.spi.store.ConnectorArtifactMetadata;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ConnectorRegistry;
@@ -40,6 +46,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -122,6 +129,60 @@ class MongoCacheConnectorRegistryIT {
                     assertThat(f.database.listCollectionNames().into(new ArrayList<>())).containsExactlyInAnyOrderElementsOf(names);
                 }
             }
+        });
+    }
+
+    @Test void exactCatalogRowsKeepDistinctHashesWithTheSameVersionAndSpec() {
+        withFixture(f -> {
+            var catalog = f.domain.connectorCatalog(SCOPE, ACTIVE);
+            var specs = f.domain.connectorSpecs(SCOPE, ACTIVE);
+            byte[] spec = "{\"properties\":{\"id\":\"mongodb\"}}".getBytes(StandardCharsets.UTF_8);
+            String specHash = ContentHash.of(spec);
+            var bundled = TapstateCatalog.load().byId("mongodb");
+            var provenance = new Provenance(null, null, "spec.json", specHash, "2.0.11", null,
+                    bundled.provenance().modeSource());
+            var row = new ConnectorCatalogEntry(bundled.id(), bundled.name(), bundled.displayName(), bundled.icon(),
+                    bundled.group(), bundled.modes(), bundled.discovery(), bundled.sink(), bundled.pushOut(),
+                    bundled.config(), provenance);
+            specs.put(specHash, spec);
+            catalog.upsert(row);
+            var first = new ConnectorArtifactMetadata(row, HASH, "2.11.0", "2.0.11",
+                    ConnectorArtifactMetadata.Origin.BUNDLE, JAR.length,
+                    Optional.of(new BundledConnectorIcon("image/png", new byte[]{1})));
+            var second = new ConnectorArtifactMetadata(row, "b".repeat(64), "2.11.0", "2.0.11",
+                    ConnectorArtifactMetadata.Origin.UPLOAD, JAR.length,
+                    Optional.of(new BundledConnectorIcon("image/png", new byte[]{2})));
+            catalog.upsertArtifact(first);
+            specs.put(specHash, spec);
+            catalog.upsertArtifact(second);
+
+            assertThat(catalog.artifact(row.id(), first.sha256())).contains(first);
+            assertThat(catalog.artifact(row.id(), second.sha256())).contains(second);
+            assertThat(catalog.artifact(row.id(), "c".repeat(64))).isEmpty();
+            assertThat(catalog.list()).containsExactly(row);
+            assertThat(SystemCollections.CACHE_CONNECTOR_CATALOG.on(f.database).countDocuments()).isEqualTo(3);
+            assertThat(SystemCollections.CACHE_CONNECTOR_SPECS.on(f.database).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test void preparesAndRecordsOnePossessionPerNodeAndHash() {
+        withFixture(f -> {
+            var holdings = f.domain.connectorArtifactHoldings(SCOPE, ACTIVE);
+            var artifact = new ConnectorArtifactHoldings.Held(HASH, "mongodb", "2.11.0");
+            holdings.publish("one", artifact);
+            holdings.publish("one", artifact);
+            holdings.publish("two", artifact);
+
+            assertThat(holdings.forNode("one")).containsExactly(artifact);
+            assertThat(holdings.forNode("two")).containsExactly(artifact);
+            assertThat(SystemCollections.CACHE_CONNECTOR_ARTIFACT_HOLDINGS.on(f.database).countDocuments()).isEqualTo(2);
+            long beforeReadmission = f.admissions();
+            var afterRestart = f.domain.connectorArtifactHoldings(SCOPE, ACTIVE);
+            assertThat(f.admissions()).isEqualTo(beforeReadmission);
+
+            afterRestart.withdraw("one", HASH);
+            assertThat(afterRestart.forNode("one")).isEmpty();
+            assertThat(afterRestart.forNode("two")).containsExactly(artifact);
         });
     }
 

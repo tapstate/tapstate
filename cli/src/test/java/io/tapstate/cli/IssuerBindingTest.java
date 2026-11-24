@@ -79,7 +79,7 @@ class IssuerBindingTest {
                     return null;
                 }))
                 .isInstanceOfSatisfying(TapstateException.class, error ->
-                        assertThat(error.code().code()).isEqualTo("cli.auth-issuer-mismatch"));
+                        assertThat(error.code().code()).isEqualTo("TS0330059"));
 
         assertThat(client.authorizationHeaders).containsExactly(null, null);
         assertThat(credentialBytes).hasValue(0);
@@ -92,7 +92,7 @@ class IssuerBindingTest {
 
         assertThatThrownBy(() -> new IssuerBinding(remoteClient).verify(context(remote), ISSUER))
                 .isInstanceOfSatisfying(TapstateException.class, error ->
-                        assertThat(error.code().code()).isEqualTo("cli.remote-plaintext"));
+                        assertThat(error.code().code()).isEqualTo("TS0330055"));
         assertThat(remoteClient.requests).hasValue(0);
 
         for (URI loopback : List.of(
@@ -115,7 +115,7 @@ class IssuerBindingTest {
 
         assertThatThrownBy(() -> new IssuerBinding(client).verify(context(seed), ISSUER))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("cli.issuer-discovery-invalid");
+                    assertThat(error.code().code()).isEqualTo("TS0330057");
                     assertThat(error.args()).containsEntry("seed", seed.toString());
                 });
     }
@@ -129,7 +129,7 @@ class IssuerBindingTest {
 
         assertThatThrownBy(() -> new IssuerBinding(client).verify(context(seed), null))
                 .isInstanceOfSatisfying(TapstateException.class, error ->
-                        assertThat(error.code().code()).isEqualTo("cli.issuer-discovery-invalid"));
+                        assertThat(error.code().code()).isEqualTo("TS0330057"));
     }
 
     @Test
@@ -143,7 +143,7 @@ class IssuerBindingTest {
 
         assertThatThrownBy(() -> new IssuerBinding(client).verify(context(seed), null))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("cli.issuer-discovery-rejected");
+                    assertThat(error.code().code()).isEqualTo("TS0330058");
                     assertThat(error.args()).containsEntry("seed", seed.toString());
                     assertThat(error.args())
                             .containsEntry("reason", "Issuer discovery was refused by the server.");

@@ -87,12 +87,14 @@ for profile in cloud onprem; do
   new_container "export-$profile"
   docker create --name "$CURRENT" "${LABELS[@]}" "$image" >/dev/null
   docker cp "$CURRENT:/opt/tapstate/tapstate.jar" "$WORK/$profile.jar"
+  docker cp "$CURRENT:/opt/tapstate/release/connectors.lock.json" "$WORK/$profile-connectors.lock.json"
   docker image inspect "$image" >"$WORK/$profile-image.json"
 done
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/deploy/cloud/image-runtime-metadata.py" \
   --cloud-jar "$WORK/cloud.jar" --onprem-jar "$WORK/onprem.jar" \
   --cloud-image "$WORK/cloud-image.json" --onprem-image "$WORK/onprem-image.json" \
-  --lock "$ROOT/deploy/cloud/connectors.lock.json" --output "$WORK"
+  --lock "$WORK/cloud-connectors.lock.json" \
+  --onprem-lock "$WORK/onprem-connectors.lock.json" --output "$WORK"
 VERSION="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).version)' "$WORK/cloud.json")"
 
 docker network create "${LABELS[@]}" "$NETWORK" >/dev/null
@@ -213,11 +215,8 @@ fi
 curl --noproxy '*' -fsS --max-time 10 "$FIXTURE_URL/proof" >"$WORK/proof-after-cloud.json"
 
 onprem_lifecycle() {
-  mkdir -p "$WORK/op-input/connectors" "$WORK/op-input/release" || return 1
-  docker cp "$SERVER:/opt/tapstate/connectors/mongodb-connector.jar" "$WORK/op-input/connectors/" || return 1
-  cp "$ROOT/deploy/cloud/connectors.lock.json" "$WORK/op-input/release/" || return 1
   new_volume onprem || return 1
-  python3 "$ROOT/deploy/docker/native-install-smoke.py" prepare --image "$ONPREM" --volume "$VOLUME" --release "$WORK/op-input" || return 1
+  python3 "$ROOT/deploy/docker/native-install-smoke.py" initialize --image "$ONPREM" --volume "$VOLUME" || return 1
   new_container onprem || return 1
   OP_SERVER="$CURRENT" || return 1
   docker run -d --name "$OP_SERVER" "${LABELS[@]}" --network "$NETWORK" \
@@ -225,7 +224,6 @@ onprem_lifecycle() {
     "$ONPREM" "${BASE_ARGS[@]}" --tapstate.installation.directory=/var/lib/tapstate/installation >/dev/null || return 1
   ready "$OP_SERVER" || return 1
   [[ "$(docker exec "$OP_SERVER" id -u)" = 10001 ]] || return 1
-  docker exec "$OP_SERVER" sh -ec 'test ! -e /opt/tapstate/connectors; test -z "${TAPSTATE_CONNECTORS_SEED_DIR:-}"' || return 1
   python3 "$ROOT/deploy/docker/native-install-smoke.py" install --server "$OP_SERVER" \
     --mongo 'mongodb://fixture:fixture-mongo-password@mongo:27017/{database}?replicaSet=rs0&authSource=admin' \
     --username image-runtime-admin --password image-runtime-onprem-password-sentinel || return 1
@@ -273,9 +271,9 @@ refuses() {
   esac
   echo "PASS: real image refuses $scenario before Ready"
 }
-refuses cloud-without-config "$CLOUD" boot.web-profile-mode-mismatch || FAILED=1
-refuses cloud-partial-config "$CLOUD" boot.cloud-config-incomplete "${CLOUD_ENV[@]}" || FAILED=1
-refuses onprem-with-cloud-config "$ONPREM" boot.web-profile-mode-mismatch "${CLOUD_ENV[@]}" \
+refuses cloud-without-config "$CLOUD" TS0310006 || FAILED=1
+refuses cloud-partial-config "$CLOUD" TS0310002 "${CLOUD_ENV[@]}" || FAILED=1
+refuses onprem-with-cloud-config "$ONPREM" TS0310006 "${CLOUD_ENV[@]}" \
   -e 'TAPSTATE_CLOUD_ATLAS_URI=mongodb://mongo:27017/image_crossed?replicaSet=rs0' || FAILED=1
 mkdir "$WORK/missing" "$WORK/damaged"
 docker cp "$SERVER:/opt/tapstate/connectors/." "$WORK/damaged/"
@@ -295,7 +293,7 @@ seed_refuses() {
     "$CLOUD" "${BASE_ARGS[@]}" >/dev/null || return 1
   ready "$CURRENT" || return 1
   logs "$CURRENT" "cloud-$scenario-seed" || return 1
-  grep -qF 'boot.cloud-connectors-invalid' "$WORK/cloud-$scenario-seed.log" || return 1
+  grep -qF 'TS0310013' "$WORK/cloud-$scenario-seed.log" || return 1
   python3 - "$WORK/cloud-$scenario-seed.log" <<'PY_MEMBER' || return 1
 import pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
@@ -329,4 +327,4 @@ for sentinel in image-runtime-static-token-sentinel image-runtime-one-time-code-
   fi
 done
 [[ "$FAILED" = 0 ]] || exit 1
-echo 'PASS: real Cloud/onprem images, eight locked registrations, restart/session/C2, shutdown and five fail-closed scenarios'
+echo 'PASS: real Cloud/onprem images, locked registrations, restart/session/C2, shutdown and five fail-closed scenarios'

@@ -46,7 +46,7 @@ class RealManagedAtlasStoreStartupIT {
     private static final String COLLECTION = "bootstrap_proof";
     private static final String AUTHORED_SOURCE = "authored-proof";
     private static final List<String> CONNECTORS = List.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy");
     private static final byte[] COLD_STATE = "stored-before-restart".getBytes(StandardCharsets.UTF_8);
 
     @Test

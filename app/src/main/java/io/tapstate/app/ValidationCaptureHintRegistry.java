@@ -279,9 +279,16 @@ public final class ValidationCaptureHintRegistry implements AutoCloseable {
                 callbackActive.set(false);
             }
         }
+        @Override public void onFailure(io.tapstate.core.common.FailureFact fact) {
+            invalidate(fact.cause()); original.onFailure(fact);
+        }
         @Override public void onError(Throwable problem) {
             invalidate(problem);
             original.onError(problem);
+        }
+        @Override public void onError(Throwable problem, Map<String, Object> diagnostic) {
+            invalidate(problem);
+            original.onError(problem, diagnostic);
         }
         @Override public void onAcknowledged(SourcePosition position) { original.onAcknowledged(position); }
         @Override public void onAcknowledgeFailed(Throwable problem) { original.onAcknowledgeFailed(problem); }

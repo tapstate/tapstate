@@ -198,7 +198,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "--yes", "-w", ws.toString());
 
         assertThat(r.code()).isNotZero();
-        assertThat(r.err()).contains("cli.server-not-named");
+        assertThat(r.err()).contains("TS0330010");
         assertThat(new ContextManager(ContextConfigStore.underHome(home)).contextBoundExactlyTo(ws)).isEmpty();
     }
 
@@ -222,7 +222,7 @@ class UpCmdTest {
                 "--yes", "-w", ws.toString());
 
         assertThat(client.calls).as(r.all()).contains("login ada");
-        assertThat(r.err()).contains("cli.auth-login-rejected");
+        assertThat(r.err()).contains("TS0330044");
         assertThat(new ContextManager(ContextConfigStore.underHome(home)).contextBoundExactlyTo(ws)).isEmpty();
     }
 
@@ -244,7 +244,7 @@ class UpCmdTest {
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(r.out())
-                .contains("\"code\": \"cli.server-not-named\"")
+                .contains("\"code\": \"TS0330010\"")
                 .contains("\"severity\": \"ERROR\"")
                 .contains("\"stage\": \"preflight\"")
                 .contains("\"on\": \"" + ws + "\"")
@@ -289,7 +289,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on orders_src: connector.not-registered")
+        assertThat(r.err()).contains("up: preflight failed on orders_src: TS0060004")
                 .contains("mysql")
                 .containsIgnoringCase("register");
         assertThat(client.calls).containsExactly("isHealthy", "connectorList");
@@ -307,7 +307,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on orders_src: connector.not-registered")
+        assertThat(r.err()).contains("up: preflight failed on orders_src: TS0060004")
                 .contains("mysql");
         assertThat(client.calls).containsExactly("isHealthy", "connectorList");
     }
@@ -393,7 +393,7 @@ class UpCmdTest {
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(r.out())
-                .contains("\"code\": \"connector.not-registered\"")
+                .contains("\"code\": \"TS0060004\"")
                 .contains("\"stage\": \"preflight\"")
                 .contains("\"on\": \"orders_src\"")
                 .doesNotContain("Next:");
@@ -409,7 +409,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("cli.server-not-named").contains("preflight failed on " + ws);
+        assertThat(r.err()).contains("TS0330010").contains("preflight failed on " + ws);
         assertThat(new ContextManager(ContextConfigStore.underHome(home)).contextBoundExactlyTo(ws)).isEmpty();
         assertThat(client.calls).as("no stage ran").doesNotContain("apply[source]");
     }
@@ -424,7 +424,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.workspace-has-no-pipeline")
+        assertThat(r.err()).contains("up: preflight failed on " + ws + ": TS0330005")
                 .contains("tapstate new");
         // Nothing beyond the connect's own probe: the workspace is read before the server is asked anything.
         assertThat(client.calls).containsExactly("isHealthy");
@@ -445,7 +445,7 @@ class UpCmdTest {
             Run r = up(home, client, "up", "-w", ws.toString());
 
             assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-            assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.workspace-unreadable")
+            assertThat(r.err()).contains("up: preflight failed on " + ws + ": TS0330004")
                     .contains(pipelines.toString());
             assertThat(client.calls).containsExactly("isHealthy");
             assertThat(r.out()).isEmpty();
@@ -507,7 +507,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on orders_src: cli.connect-failed");
+        assertThat(r.err()).contains("up: preflight failed on orders_src: TS0330018");
         // Failover re-probes and retries the one call before giving up, as it does for every stage.
         assertThat(client.calls).startsWith("isHealthy", "connectorList", "test orders_src")
                 .doesNotContain("apply[source]");
@@ -523,7 +523,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on orders_src: cli.request-timed-out");
+        assertThat(r.err()).contains("up: preflight failed on orders_src: TS0330019");
         assertThat(client.calls).containsExactly("isHealthy", "connectorList", "test orders_src");
     }
 
@@ -619,6 +619,88 @@ class UpCmdTest {
                 .contains("target-not-empty/warehouse/orders");
     }
 
+    @Test
+    void anUnreachableStartRetainsItsEndpointAfterAllMembersDisappear(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        new ContextManager(ContextConfigStore.underHome(home)).edit("local",
+                List.of(SERVER, URI.create("http://127.0.0.1:8081")), true);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.startResponder = decisions -> {
+            client.healthy = false;
+            return new StartAttempt.Unreachable(false);
+        };
+
+        Run result = up(home, client, "up", "--yes", "-w", ws.toString(), "-o", "json");
+
+        assertThat(result.code()).as(result.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(result.out()).contains("\"stage\": \"start\"", CliError.CONNECT_FAILED.code(),
+                "127.0.0.1:8080, 127.0.0.1:8081");
+        assertThat(result.all()).doesNotContain("NullPointerException");
+        assertThat(client.calls).filteredOn(call -> call.startsWith("start "))
+                .containsExactly("start orders_sync []");
+    }
+
+    @Test
+    void anUnansweredStartNamesTheMemberThatActuallyReceivedIt(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        URI second = URI.create("http://127.0.0.1:8081");
+        new ContextManager(ContextConfigStore.underHome(home)).edit("local", List.of(SERVER, second), true);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.startResponder = decisions -> {
+            client.healthOverride = node -> !SERVER.equals(node);
+            return new StartAttempt.Unreachable(client.startedNodes.size() > 1);
+        };
+
+        Run result = up(home, client, "up", "--yes", "-w", ws.toString(), "-o", "json");
+
+        assertThat(result.code()).as(result.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(result.out()).contains(CliError.START_MAY_HAVE_GONE_AHEAD.code(), "\"server\": \"127.0.0.1:8081\"")
+                .doesNotContain("\"server\": \"127.0.0.1:8080\"");
+        assertThat(client.startedNodes).containsExactly(SERVER, second);
+        assertThat(client.calls).doesNotContain("status orders_sync");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void anUnreachableStartRetainsWhetherTheRequestWasSent(boolean sent, @TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        client.startResponder = decisions -> new StartAttempt.Unreachable(sent);
+
+        Run result = up(home, client, "up", "--yes", "-w", ws.toString(), "-o", "json");
+
+        assertThat(result.code()).as(result.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(result.out()).contains("\"stage\": \"start\"");
+        assertThat(result.out()).contains((sent ? CliError.START_MAY_HAVE_GONE_AHEAD : CliError.CONNECT_FAILED).code());
+        assertThat(client.calls).filteredOn(call -> call.startsWith("start "))
+                .containsExactlyElementsOf(sent ? List.of("start orders_sync []")
+                        : List.of("start orders_sync []", "start orders_sync []"));
+        assertThat(client.calls).doesNotContain("status orders_sync");
+    }
+
+    @Test
+    void startedUpKeepsOnlyWarningsInTheirReportedOrder(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        var report = StartCheckReports.report("READY",
+                StartCheckReports.warning("first", "first warning"),
+                StartCheckReports.passed("orders"),
+                StartCheckReports.warning("second", "second warning"));
+        client.startResponder = decisions -> StartCheckReports.started(report, List.of(), List.of());
+
+        Run result = up(home, client, "up", "--yes", "-w", ws.toString());
+
+        assertThat(result.code()).as(result.all()).isZero();
+        assertThat(result.out()).contains("start check: first warning", "start check: second warning")
+                .doesNotContain("start check: orders on warehouse is empty.");
+        assertThat(result.out().indexOf("start check: first warning"))
+                .isLessThan(result.out().indexOf("start check: second warning"));
+    }
+
     // ---- the machine surface and the help -----------------------------------------------------------
 
     @Test
@@ -688,6 +770,7 @@ class UpCmdTest {
      */
     static final class FakeUpControlPlane implements ControlPlaneClient {
         final List<String> calls = new ArrayList<>();
+        final List<URI> startedNodes = new ArrayList<>();
         /** Every session token presented for exchange, in order. */
         final List<String> exchanged = new ArrayList<>();
         /** The drafts each apply carried, kept whole: what reaches the wire is the thing under test. */
@@ -713,6 +796,7 @@ class UpCmdTest {
 
         /** Whether the server answers its health probe; false is how an unbound run is refused. */
         boolean healthy = true;
+        java.util.function.Predicate<URI> healthOverride;
 
         /** What a sign-in during binding answers; refused by default, so a test says when it succeeds. */
         LoginOutcome loginOutcome = new LoginOutcome.Rejected("control.auth-failed", "admin");
@@ -720,7 +804,7 @@ class UpCmdTest {
         @Override
         public boolean isHealthy(URI baseUrl) {
             calls.add("isHealthy");
-            return healthy;
+            return healthOverride == null ? healthy : healthOverride.test(baseUrl);
         }
 
         @Override
@@ -796,6 +880,7 @@ class UpCmdTest {
             if (startResponder == null) {
                 return ControlPlaneClient.super.start(u, c, id, decisions, ifMatch);
             }
+            startedNodes.add(u);
             calls.add("start " + id + " " + decisions.stream().map(d -> d.finding() + "=" + d.action()).toList());
             StartAttempt answer = startResponder.apply(decisions);
             if (answer instanceof StartAttempt.Started) {

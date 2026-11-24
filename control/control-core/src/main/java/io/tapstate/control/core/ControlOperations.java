@@ -33,7 +33,10 @@ public final class ControlOperations {
 
     public static final Operation AI_PROVIDER_GET = new Operation("ai-provider.get", Scope.READ, false, null, "Read the current caller provider metadata without a credential.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_REPLACE = new Operation("ai-provider.replace", Scope.WRITE, true, null, "Replace the current caller encrypted provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_SELECT = new Operation("ai-provider.select", Scope.WRITE, true, null,
+            "Select the existing workspace provider or Tapstate-managed AI.", REST_ONLY);
     public static final Operation AI_PROVIDER_DELETE = new Operation("ai-provider.delete", Scope.WRITE, true, null, "Delete the current caller provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_MODELS = new Operation("ai-provider.models", Scope.WRITE, false, null, "Discover provider model identifiers without persisting credentials.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_CHECK = new Operation("ai-provider.check", Scope.WRITE, false, null, "Test an ephemeral provider credential without persisting it.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_ASSISTANT = new Operation("pipeline-draft.assistant", Scope.WRITE, false, null, "Stream a validated Pipeline Builder proposal without saving it.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_ASSISTANT_VALIDATE = new Operation("pipeline-draft.assistant-validate", Scope.READ, false, null, "Validate a Pipeline Builder proposal against the current draft revision.", CLI_AND_REST);
@@ -64,6 +67,9 @@ public final class ControlOperations {
             "Preview five future full validation occurrences in the selected time zone.", REST_ONLY);
 
     // system domain
+    public static final Operation SYSTEM_PDK_VERSION = new Operation(
+            "system.pdk-version", Scope.READ, false, null, "Read the packaged host PDK versions and checksums.", REST_ONLY);
+
     public static final Operation SYSTEM_VERSION = new Operation(
             "system.version", Scope.READ, false, ControlApiSchema.ref("system.version"),
             "Report which version of Tapstate this server is, plus the authoring grammar versions it "
@@ -193,6 +199,32 @@ public final class ControlOperations {
     public static final Operation CONNECTOR_ICON = new Operation(
             "connector.icon", Scope.READ, false, null,
             "Read the registered connector icon asset.", CLI_ONLY);
+
+    public static final Operation CONNECTOR_CENTER_LIST = new Operation(
+            "connector-center.list", Scope.READ, false, null,
+            "Read supported connectors and their download and local installation availability.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_REFRESH = new Operation(
+            "connector-center.refresh", Scope.ADMIN, true, null,
+            "Refresh the official connector support and Maven download catalog.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_DOWNLOAD = new Operation(
+            "connector-center.download", Scope.ADMIN, true, null,
+            "Install the selected compatible connector release and report its progress.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_OPERATION = new Operation(
+            "connector-center.operation", Scope.READ, false, null,
+            "Read the transfer and installation progress of one connector operation.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_UPLOAD = new Operation(
+            "connector-center.upload", Scope.ADMIN, true, null,
+            "Upload an on-prem connector JAR for verified local installation.", REST_ONLY);
+
+    /** Cloud sessions use the workload write capability to fetch and install official releases. */
+    public static Scope requiredScope(Operation operation, CredentialType credential) {
+        if (credential == CredentialType.CLOUD_SESSION
+                && (operation.id().equals(CONNECTOR_CENTER_REFRESH.id())
+                    || operation.id().equals(CONNECTOR_CENTER_DOWNLOAD.id()))) {
+            return Scope.WRITE;
+        }
+        return operation.scope();
+    }
 
     // data-browser domain: the read face over a declared source's own database — list its collections,
     // read one collection's rows, report one collection's size. All three read through to the connector
@@ -397,6 +429,16 @@ public final class ControlOperations {
     public static final Operation PIPELINE_ACCEPT_DERIVED_SCHEMA = new Operation(
             "pipeline.accept-derived-schema", Scope.WRITE, true, null, CLI_ONLY);
 
+    // A running aggregate step compared with its own rows, and written again from them. The check reads
+    // only; the repair rewrites stored totals and sends rows to the target, so it is write-scoped and
+    // audited. Both stay off the model-facing surface: what a check proves is narrow -- the totals match
+    // the rows the step holds, not the source -- and a repair is a decision about a finding, taken by the
+    // person looking at it.
+    public static final Operation PIPELINE_AGGREGATE_CHECK = new Operation(
+            "pipeline.aggregate-check", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_AGGREGATE_REPAIR = new Operation(
+            "pipeline.aggregate-repair", Scope.WRITE, true, null, CLI_ONLY);
+
     // The HTTP face projects the CLI-staged inventory; the current user read stays off MCP.
     public static final Operation AUTH_CURRENT_USER = new Operation(
             "auth.current-user", Scope.READ, false, null,
@@ -426,16 +468,24 @@ public final class ControlOperations {
     public static final Operation ALERT_TEST_RESULT = new Operation("alert.test-result", Scope.ADMIN, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
     public static final Operation ALERT_RETRY = new Operation("alert.retry", Scope.ADMIN, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
 
+    public static final Operation RETRY_SETTINGS_GET = new Operation("retry-settings.get", Scope.ADMIN, false, null,
+            "Read the cluster retry settings and revision.", REST_ONLY);
+    public static final Operation RETRY_SETTINGS_REPLACE = new Operation("retry-settings.replace", Scope.ADMIN, true, null,
+            "Replace the cluster retry settings at the supplied revision.", REST_ONLY);
+
     private static final List<Operation> ALL = List.of(
+            RETRY_SETTINGS_GET, RETRY_SETTINGS_REPLACE,
             VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP, VALIDATION_HISTORY, VALIDATION_REPORT, VALIDATION_ROOTS, VALIDATION_ROOT, VALIDATION_SCHEDULE_DISABLE,
             ALERT_RULE_PREVIEW, ALERT_ROUTE_PREVIEW, ALERT_RESOURCES, ALERT_CATALOG, ALERT_CENTER, ALERT_DETAIL, ALERT_DELIVERIES, ALERT_HEALTH, ALERT_CONFIGURATION_LIST, ALERT_CONFIGURATION_SAVE, ALERT_CONFIGURATION_RETIRE, ALERT_PREVIEW, ALERT_TEST, ALERT_TEST_RESULT, ALERT_RETRY,
             AI_PROVIDER_GET,
             AI_PROVIDER_REPLACE,
+            AI_PROVIDER_SELECT,
             AI_PROVIDER_DELETE,
             AI_PROVIDER_CHECK,
+            AI_PROVIDER_MODELS,
             PIPELINE_DRAFT_ASSISTANT,
             PIPELINE_DRAFT_ASSISTANT_VALIDATE,
-            SYSTEM_VERSION,
+            SYSTEM_VERSION, SYSTEM_PDK_VERSION,
             ARTIFACT_APPLY,
             ARTIFACT_VALIDATE,
             ARTIFACT_GET,
@@ -463,6 +513,8 @@ public final class ControlOperations {
             CONNECTOR_LIST,
             CONNECTOR_GET,
             CONNECTOR_ICON,
+            CONNECTOR_CENTER_LIST, CONNECTOR_CENTER_REFRESH, CONNECTOR_CENTER_DOWNLOAD,
+            CONNECTOR_CENTER_OPERATION, CONNECTOR_CENTER_UPLOAD,
             DATA_BROWSER_COLLECTIONS,
             DATA_BROWSER_FIND,
             DATA_BROWSER_STATS,
@@ -501,6 +553,8 @@ public final class ControlOperations {
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,
             PIPELINE_ACCEPT_DERIVED_SCHEMA,
+            PIPELINE_AGGREGATE_CHECK,
+            PIPELINE_AGGREGATE_REPAIR,
             AUTH_CURRENT_USER,
             USER_CREATE,
             USER_PASSWD,

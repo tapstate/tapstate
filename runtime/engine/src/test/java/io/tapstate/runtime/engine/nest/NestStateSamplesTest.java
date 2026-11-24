@@ -70,6 +70,26 @@ class NestStateSamplesTest {
         assertThat(result.commits().keys().bucketCounts().stream().mapToLong(Long::longValue).sum()).isEqualTo(7);
     }
 
+    @Test void weightDistributionsAddAcrossMembersAndTheLargestDocumentIsTheLargerOfThem() {
+        var f = new Samples();
+        f.weight("a", "0", 2, 3, 900_000L, 2);
+        f.weight("a", "1", 2, 3, 900_000L, 2);   // a sibling processor's copy of the same member's counters
+        f.weight("b", "0", 2, 4, 1_500_000L, 0); // a member that folded nothing
+        f.point("a", "0", 3, NestStateMetricNames.COMMIT_BYTES_COUNT, 99); // a partial newer scrape
+        var weight = NestStateSamples.diagnostics(f.metrics()).get("ns").weight();
+        assertThat(weight.documentBytes().count()).isEqualTo(7);
+        assertThat(weight.commitBytes().count()).isEqualTo(7);
+        assertThat(weight.largestDocumentBytes()).isEqualTo(1_500_000L);
+        assertThat(weight.foldDuration().count()).isEqualTo(2);
+        assertThat(weight.documentBytes().bucketCounts().stream().mapToLong(Long::longValue).sum()).isEqualTo(7);
+    }
+
+    @Test void aLevelThatFoldsNothingCarriesNoFoldDistribution() {
+        var f = new Samples();
+        f.weight("a", "0", 1, 2, 10_000L, 0);
+        assertThat(NestStateSamples.diagnostics(f.metrics()).get("ns").weight().foldDuration()).isNull();
+    }
+
     private static final class Samples {
         final Map<String, List<Measurement>> values = new HashMap<>();
         void add(String member, String processor, long at, long reads, long writes, long cold) {
@@ -96,6 +116,19 @@ class NestStateSamplesTest {
         }
         void buckets(String member, String processor, long at, String kind, HistogramBounds bounds, long groups) {
             for (int i = 0; i < bounds.buckets(); i++) point(member, processor, at, kind + i, i == 1 ? groups : 0);
+        }
+        void weight(String member, String processor, long at, long written, long largest, long folds) {
+            point(member, processor, at, NestStateMetricNames.WEIGHT_SINCE, 1);
+            point(member, processor, at, NestStateMetricNames.DOCUMENT_COUNT, written);
+            point(member, processor, at, NestStateMetricNames.DOCUMENT_BYTES_SUM, written * 1000);
+            point(member, processor, at, NestStateMetricNames.LARGEST_DOCUMENT_BYTES, largest);
+            point(member, processor, at, NestStateMetricNames.COMMIT_BYTES_COUNT, written);
+            point(member, processor, at, NestStateMetricNames.COMMIT_BYTES_SUM, written * 1000);
+            point(member, processor, at, NestStateMetricNames.FOLD_COUNT, folds);
+            point(member, processor, at, NestStateMetricNames.FOLD_NANOS_SUM, folds * 50_000);
+            buckets(member, processor, at, NestStateMetricNames.DOCUMENT_BYTES_BUCKET, HistogramBounds.STATE_DOCUMENT_BYTES, written);
+            buckets(member, processor, at, NestStateMetricNames.COMMIT_BYTES_BUCKET, HistogramBounds.STATE_COMMIT_BYTES, written);
+            buckets(member, processor, at, NestStateMetricNames.FOLD_NANOS_BUCKET, HistogramBounds.ROLLUP_FOLD_DURATION, folds);
         }
         JobMetrics metrics() { return JobMetrics.of(values); }
     }

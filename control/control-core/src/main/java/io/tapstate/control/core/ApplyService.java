@@ -89,6 +89,7 @@ public final class ApplyService {
     }
 
     private final Supplier<TapstateCatalog> catalog;
+    private final java.util.function.Function<String, ConnectorDetail> connectorDetail;
     private final ArtifactStore store;
     private final AuditGate auditGate;
     private final SchemaStore schemas;
@@ -153,7 +154,17 @@ public final class ApplyService {
             PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
             ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy,
             DeploymentProfile deploymentProfile) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, attribution,
+                stateDatabasePolicy, deploymentProfile, id -> null);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy,
+            DeploymentProfile deploymentProfile, java.util.function.Function<String, ConnectorDetail> connectorDetail) {
         this.live = live;
+        this.connectorDetail = Objects.requireNonNull(connectorDetail, "connectorDetail");
         this.deploymentProfile = Objects.requireNonNull(deploymentProfile, "deploymentProfile");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
@@ -233,6 +244,15 @@ public final class ApplyService {
                 if (merged.storedHash() != null && draft.expectedContentHash() == null) {
                     preconditions.put(source.id(), merged.storedHash());
                 }
+            }
+        }
+        if (scope == ValidationScope.ONLINE_SOURCE && resources.size() == 1
+                && resources.getFirst() instanceof PipelineResource pipeline) {
+            // A standalone Pipeline preview can use the same persisted dependencies as draft compilation.
+            var inventory = store.draftPublicationInventory(pipeline);
+            if (inventory.isPresent()) {
+                return planResourcesAndWorkspace(resources, preconditions, scope,
+                        publicationReads(pipeline, inventory.orElseThrow(), true));
             }
         }
         return planResourcesAndWorkspace(resources, preconditions, scope);
@@ -369,6 +389,24 @@ public final class ApplyService {
                 batchSources.put(source.id(), source);
             }
         }
+        Set<String> replacedConnectors = submitted.stream()
+                .filter(resource -> resource instanceof SourceResource source
+                        && connectorChanged(storedResources, source))
+                .map(Resource::id).collect(java.util.stream.Collectors.toSet());
+        for (Resource resource : candidate) {
+            if (!(resource instanceof PipelineResource pipeline)) {
+                continue;
+            }
+            boolean submittedPipeline = submittedIds.contains(pipeline.id());
+            for (SourceRef ref : pipeline.sources()) {
+                if (!ref.nodeConfig().isEmpty() && (submittedPipeline || replacedConnectors.contains(ref.id()))) {
+                    SourceNodeConfigRules.validate(batchSources.get(ref.id()), ref.nodeConfig(), connectorDetail);
+                    if (!submittedPipeline && !workspacePreconditions.containsKey(pipeline.id())) {
+                        workspacePreconditions.put(pipeline.id(), storedHash(pipeline));
+                    }
+                }
+            }
+        }
         List<PreparedArtifact> prepared = new ArrayList<>();
         for (Resource submittedResource : submitted) {
             Resource resource = validatedById.get(submittedResource.id());
@@ -384,6 +422,20 @@ public final class ApplyService {
         ApplyPlan plan = new ApplyPlan(
                 prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
         return new CandidateWorkspacePlan(plan, List.copyOf(candidateById.values()));
+    }
+
+    private static boolean connectorChanged(List<Resource> stored, SourceResource replacement) {
+        SourceResource previous = storedSource(stored, replacement.id());
+        return previous != null && !previous.connector().equals(replacement.connector());
+    }
+
+    void validateDraftSourceNodeConfigs(Map<String, String> inputs, Map<String, Map<String, Object>> configs) {
+        configs.forEach((id, config) -> {
+            String sourceId = inputs.get(id);
+            SourceResource source = sourceId == null ? null : store.get(sourceId).filter(SourceResource.class::isInstance)
+                    .map(SourceResource.class::cast).orElse(null);
+            SourceNodeConfigRules.validate(source, config, connectorDetail);
+        });
     }
 
     /**
@@ -406,23 +458,27 @@ public final class ApplyService {
      */
     private PipelineResource withOwnSrsSwitches(
             PipelineResource pipeline, Map<String, SourceResource> batchSources, Resource existing) {
-        Map<String, Boolean> alreadyRecorded = new LinkedHashMap<>();
+        Map<String, SourceRef.Spec> previousBindings = new LinkedHashMap<>();
+        Map<String, Boolean> previousSources = new LinkedHashMap<>();
         if (existing instanceof PipelineResource stored) {
             for (SourceRef ref : stored.sources()) {
                 if (ref instanceof SourceRef.Spec spec) {
-                    alreadyRecorded.put(spec.id(), spec.srs());
+                    previousBindings.put(spec.binding(), spec);
+                    previousSources.putIfAbsent(spec.id(), spec.srs());
                 }
             }
         }
         List<SourceRef> refs = new ArrayList<>();
         boolean anyRecorded = false;
         for (SourceRef ref : pipeline.sources()) {
-            if (ref instanceof SourceRef.Spec) {
+            if (ref instanceof SourceRef.Spec spec && spec.srs() != null) {
                 refs.add(ref);
                 anyRecorded = true;
                 continue;
             }
-            Boolean own = alreadyRecorded.get(ref.id());
+            SourceRef.Spec previous = previousBindings.get(ref.binding());
+            Boolean own = previous != null && previous.id().equals(ref.id())
+                    ? previous.srs() : previousSources.get(ref.id());
             if (own == null) {
                 // The source is read from the batch alone, because the batch is the closure: a pipeline
                 // referencing a source that is not in it is refused before this runs. A reference left
@@ -431,7 +487,7 @@ public final class ApplyService {
                 SourceResource declaring = batchSources.get(ref.id());
                 own = declaring == null ? null : declaring.srsEnabled();
             }
-            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own));
+            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own, ref.nodeConfig(), ref.alias()));
             anyRecorded |= own != null;
         }
         return anyRecorded
@@ -648,7 +704,12 @@ public final class ApplyService {
         var dependencySlice = resource instanceof PipelineResource pipeline
                 ? store.draftPublicationInventory(pipeline) : Optional.<ArtifactStore.ReadableInventory>empty();
         var inventory = dependencySlice.orElseGet(store::readableInventory);
-        var previous = dependencySlice.isPresent() || inventory.exactLookupIds().contains(resource.id())
+        return publicationReads(resource, inventory, dependencySlice.isPresent());
+    }
+
+    private PublicationReads publicationReads(
+            Resource resource, ArtifactStore.ReadableInventory inventory, boolean includesPrevious) {
+        var previous = includesPrevious || inventory.exactLookupIds().contains(resource.id())
                 ? inventory.resources().stream().filter(value -> value.id().equals(resource.id())).findFirst()
                 : store.get(resource.id());
         return new PublicationReads(inventory, previous.orElse(null), store.managedDefaultSourceId(),
@@ -690,7 +751,7 @@ public final class ApplyService {
         List<ArtifactOutcome> outcomes = new ArrayList<>();
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
-        Map<String, String> enforced = new LinkedHashMap<>();
+        Map<String, String> enforced = new LinkedHashMap<>(plan.workspacePreconditions());
         // Read once for the refusal below, and only when there is a reading to judge against.
         ReadableArtifactInventory.Snapshot inventory = live == null
                 ? null : ReadableArtifactInventory.scan(store);
@@ -736,7 +797,10 @@ public final class ApplyService {
         // survives a concurrent writer.
         ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
             String conflicted;
-            if (attribution.requiresSnapshotFence() && !toWrite.isEmpty()) {
+            if (toWrite.isEmpty()) {
+                return new ApplyResult(outcomes, plan.warnings());
+            }
+            if (attribution.requiresSnapshotFence()) {
                 List<ArtifactWrite> writes = new ArrayList<>(toWrite.stream().map(attributed::write).toList());
                 writes.set(0, writes.getFirst().guardedBy(enforced));
                 conflicted = store.writeAll(writes).refusedId();

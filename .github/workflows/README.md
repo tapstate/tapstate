@@ -6,10 +6,13 @@ explains the placement; the reviewer assesses the cost. `catalog-scripts` runs
 `one-verify.sh` and its smoke cases against the actual workflows. Changes to the
 trigger policy or test ownership must retain those regressions.
 
-`ci.yml` owns one complete reactor test suite, distributed over its existing
-shards and admitted by the `build` aggregate. Automatic feature-branch testing
-runs on pull request creation and updates. `push` tests the integration branch
-`main` and release tags `v*`; it does not also run the suite for a feature branch.
+`ci.yml` owns the sharded reactor suite admitted by the `build` aggregate.
+Pull requests and pushes to `main` run all discovered unit and architecture
+tests plus the integration methods, examples, and classes in
+[`ci-fast-integration.json`](../ci-fast-integration.json). New integration
+tests join full regression automatically. Manual CI and `v*` tags run the
+full reactor. Automatic feature-branch testing runs on pull request creation
+and updates.
 This avoids a second suite both when a pull request already exists and when it
 is opened after a branch push. Before opening a pull request, explicitly run
 `gh workflow run ci.yml --ref <branch>` when CI validation is needed. Manual runs
@@ -63,13 +66,22 @@ admission.
 
 ## Nightly Test
 
-`nightly-test.yml` runs at 01:00 Asia/Shanghai and can be run manually from
-`main`. It checks real connectors, the full Join performance matrix, native
-CLI and MCP bundles for four platforms, the paired Cloud and OP image smoke,
-release-script self-tests, and distribution completeness. Release calls the
-same checks for its own selected source and Web revisions. Nightly only stores
+`nightly-test.yml` is scheduled for 18:00 Asia/Shanghai and can be run manually from
+`main`. The full reactor regression runs in parallel with real connectors,
+the full Join performance matrix, native CLI and MCP bundles for four
+platforms, the paired Cloud and OP image smoke, release-script self-tests,
+and distribution completeness. A manual run with `reactor-only` validates
+only the full reactor on the selected branch. The release gate requires the
+shared full reactor regression on the pinned release commit; its existing
+required status checks include Sonar. Nightly only stores
 Actions artifacts. GitHub Release, GHCR pushes and Cloud registration belong
 to the separate release workflow.
+
+For a pre-merge OP candidate, select the Runtime work branch and pass the
+matching full Web commit SHA as `candidate-op-web-sha`. Nightly runs the same
+on-prem image and native archive build used for release. Download the archive
+and checksum from the run's Actions artifacts. The candidate runs only the
+on-prem build and its packaging checks.
 
 Configure the repository Actions secret `NIGHTLY_FEISHU_WEBHOOK` with the
 target Feishu group's bot URL. Scheduled failures send one message with the
@@ -131,7 +143,9 @@ the repository's Actions secrets before using that notification:
 
 The request carries the version and source revision; `git.extra` records the
 image tag, immutable image reference, digest, release URL, and workflow URL.
-Cloud provisioning continues to select the image by its version tag. Publication
+It also records whether the checked Cloud Boot JAR contains the managed
+Bedrock runtime configuration. The Cloud control plane can use this record
+to pin managed Bedrock launches to the approved image digest. Publication
 and registration share a cross-version concurrency queue so a delayed older
 insert cannot overtake the newer version's registration. Older
 release lines and releases already overtaken when the notification checks
@@ -222,19 +236,70 @@ with its own environment configuration and approval. This lane adds no automatic
 PR/main test suite; its runner cost is incurred on manual dev dispatch and once
 per release attempt after the release gates pass.
 
-Choose a location for new work before adding a workflow:
+## Cluster image from selected branches
 
-- Add ordinary unit, integration, or specification tests to the existing
-  reactor. Source discovery assigns them to the existing shards; do not copy a
-  full-reactor Maven test invocation into another automatic job or workflow.
-- Use a separate path- or label-gated lane for a distinct, expensive capability
-  whose evidence cannot come from the ordinary suite. Run only that capability's
-  selected tests, and explain its trigger and additional runner cost in review.
-- Put broad external-system, upstream-drift, and trend measurements in a
-  scheduled lane, with manual dispatch for investigation and release consumers.
-  Preserve a stable, non-matrix aggregate name when another workflow requires
-  its check. New required checks must execute on every event that requires them;
-  do not hide one behind a path or label filter.
+`build-cluster-image.yml` is the manual lane for packaging a Cloud cluster image
+from any Tapstate and tapstate-web branch pair. Fill `tapstate_branch` and
+`tapstate_web_branch` (default `main`); the run builds the Cloud Web bundle from
+the Web commit, the Boot JAR from the Tapstate commit, stages the locked
+connector seed, verifies both image platforms, and publishes
+`ghcr.io/tapstate/tapstate-cloud:<next-minor>-dev`. The version calculator counts
+up from the tagged `main` history, so a feature branch needs no release tag of
+its own. The lane runs no test suite: the Boot JAR is packaged with
+`-DskipTests`, so test sources still compile for the modules that publish
+test-jars but no test executes. The Web step only bundles its pinned checkout,
+and the image check before the push is a packaging assertion.
+
+The job summary and the `json` job output carry the branch pair, build version,
+digest reference, tag, Web commit id, and run URL. Unlike the dev lane above,
+this workflow always publishes the plain `-dev` tag for the selected branches and
+does not register the image in the dev release catalog. It uses the same
+`cloud-ghcr-dev` environment and Public `tapstate-cloud` package, so the branch
+policy of that environment must allow the selected Tapstate ref.
+
+## Test placement
+
+Add new tests to the existing Maven reactor. Choose their placement by the
+behavior they verify and the feedback needed on each change.
+
+| Test | Where it runs | What belongs there |
+| --- | --- | --- |
+| Unit and architecture tests | PR, main, and Nightly | Use the existing unit test naming convention, such as `*Test`, for focused checks of parsing, validation, state transitions, error codes, and architecture rules. CI discovers these tests automatically. |
+| Essential integration or end-to-end smoke | PR, main, and Nightly | Cover a critical path that every change must preserve, such as application startup, basic store reads and writes, or snapshot and CDC delivery. Keep the fixture and execution small. Add the reviewed selection to [the fast integration list](../ci-fast-integration.json). |
+| Integration and end-to-end regression | Nightly by default | Add a discovered `*IT` or a published `spec.e2e.yml` under `e2e/examples/`. Put multi-node recovery, connector combinations, long observation windows, large datasets, and performance regression here. Use the existing specialized lane for tests that require external systems or inputs. |
+
+Nightly full regression also runs the PR/main selection. When expanding the fast
+list, reuse a smoke test where practical, or select a single-invocation method
+or one published example. A published example selected for fast CI runs on both
+tiers. A class listed without a method or example qualifier runs as a whole,
+including new methods. Put heavier scenarios in separate integration test
+classes. The existing hundred-table witness is an approved fast smoke case.
+
+A product change still needs a discriminating end-to-end case under the
+[contribution guide](../../CONTRIBUTING.md#end-to-end-cases). For a case selected
+only for Nightly, add or update it in the PR, run it locally with a focused test
+command, and record the command and result in the PR. Leave full regression to
+the scheduled Nightly. Use the existing mutation evidence when introducing or
+changing an end-to-end assertion. A bug regression should fail before the fix
+and pass afterward.
+
+During PR review, address failures from that PR's own CI, including build and
+Sonar. Follow up failures from the scheduled Nightly separately.
+
+In the PR's **CI cost delta and lane placement** field, list where new tests run.
+For a fast-list addition, state which critical path it protects, why it needs
+per-change feedback, and the measured cost. Use roughly 20 minutes as the PR
+feedback target during review. Build and Sonar still run on PR and main.
+
+Use a separate path- or label-gated lane for a distinct, expensive capability
+whose evidence requires its own inputs or execution. Run that capability's
+selected tests and explain its trigger and runner cost in review. Keep broad
+external-system, upstream-drift, and trend measurements on scheduled lanes with
+manual dispatch for investigation. Preserve a stable, non-matrix aggregate
+name when another workflow requires its check. Required checks run on every
+event that requires them.
+
+### Measuring CI cost
 
 Measure with the same tool for the current change and its baseline, for example:
 
@@ -253,8 +318,10 @@ For a new lane, also state its selected scope and why its placement fits above.
 The timing delta is review evidence, never a fixed-duration pass/fail threshold.
 The structural gate checks executable Maven lifecycle and shard-driver calls in
 automatic push/PR workflows, rather than workflow comments or diagnostic text.
-The existing shard and aggregate gates prove that the one logical suite covers
-the entire discovered test set.
+Shard and aggregate admission independently rediscover the expected set for
+the selected mode and require a report from each planned class. Selected
+integration smoke cases must execute, including both tiers for each selected
+published example.
 
 The analysis job caches only `~/.sonar/cache`, separately from Maven packages.
 Every run reads the current server's plugin and scanner-engine indexes to key

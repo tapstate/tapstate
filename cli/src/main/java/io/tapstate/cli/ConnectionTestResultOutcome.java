@@ -1,5 +1,7 @@
 package io.tapstate.cli;
 
+import java.util.Map;
+
 /**
  * The outcome of a remote {@code GET /api/connections/{id}/test-result}. Either the connection's latest
  * stored test result was found, no result is stored for it (a 404: it has never been tested), the request
@@ -18,7 +20,11 @@ sealed interface ConnectionTestResultOutcome {
     }
 
     /** The server refused the read with a coded reason already rendered to a message. */
-    record Rejected(String code, String message) implements ConnectionTestResultOutcome {
+    record Rejected(String code, String message, Map<String, Object> params,
+            Map<String, Object> diagnostic) implements ConnectionTestResultOutcome {
+        Rejected(String code, String message) {
+            this(code, message, Map.of(), Map.of());
+        }
     }
 
     /** The server could not be reached (connection refused, timeout, or a malformed target). */

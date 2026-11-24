@@ -91,6 +91,7 @@ class NativeValidationFullJobIT {
             assertThat(report.terminal()).isEqualTo(ValidationRunState.STOPPED);
             if(cleanup==null)assertThat(report.failure()).isNull();
             else assertThat(report.failure()).isNotNull().satisfies(failure->{assertThat(failure.technical()).contains("original publication payload cleanup failed");assertThat(failure.fatal()).isEqualTo(cleanup instanceof Error);});
+            await(()->f.resources.snapshot().metadataFrames()==0);
             assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();assertThat(f.resources.snapshot().metadataFrames()).isZero();
         }finally{checkRelease.countDown();controlsRelease.forEach(java.util.concurrent.CountDownLatch::countDown);}
     }
@@ -340,7 +341,7 @@ class NativeValidationFullJobIT {
                 await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
                 var failure=access.reports().find(reference).orElseThrow().failure();assertThat(failure).isNotNull();
                 assertThat(failure.code()).isEqualTo(ValidationError.OWNER_NOT_AUTHORIZED.code());assertThat(failure.params()).containsEntry("pipeline","flow");
-                assertThat(failure.technical()).contains("validation.owner-not-authorized","last-reader-after-owner-failure");assertThat(failure.fatal()).isFalse();
+                assertThat(failure.technical()).contains("TS0300014","last-reader-after-owner-failure");assertThat(failure.fatal()).isFalse();
             }finally{state.readers.set(true);state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(new java.util.concurrent.CancellationException("Fixture cleanup"));}
         }finally{if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
     }
@@ -613,8 +614,13 @@ class NativeValidationFullJobIT {
         var entered=new java.util.concurrent.CountDownLatch(1);var returnPlan=new java.util.concurrent.CountDownLatch(1);
         var cleanupEntered=new java.util.concurrent.CountDownLatch(4);var releases=List.of(new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1));
         var closes=new AtomicInteger();
+        // Release the test barriers before fixture shutdown waits for these workers.
+        var releaseWorkers = (AutoCloseable) () -> {
+            returnPlan.countDown();
+            releases.forEach(java.util.concurrent.CountDownLatch::countDown);
+        };
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
-            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var registry=new ValidationProcessorRegistry(f.member,()->{});releaseWorkers) {
             var start=prepare(f);var reservation=f.owners.take(start);
             runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->{
                 assertThat(Thread.currentThread().getName()).startsWith("validation-check");
@@ -636,7 +642,7 @@ class NativeValidationFullJobIT {
             var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
             var failure=reservation.access().reports().find(reference).orElseThrow().failure();
             assertThat(failure).isNotNull().satisfies(value->assertThat(value.params()).containsEntry("field","fixture.firstCleanupUnknown"));
-        }finally{returnPlan.countDown();releases.forEach(java.util.concurrent.CountDownLatch::countDown);}
+        }
     }
     static void waitFor(java.util.concurrent.CountDownLatch latch){try{assertThat(latch.await(12,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}}
     static ValidationReportAdmission.Start prepare(NativeValidationOwnerReservationsIT.Fixture f){

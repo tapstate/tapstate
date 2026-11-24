@@ -63,6 +63,10 @@ public enum Domain {
     // engine, propagating a frontier; diagnosable failures such as acting on a pipeline that has no
     // running job, or a position the frontier's encoding cannot represent (runtime)
     ENGINE,
+    // the grouped step: what it may read, how its input rows are identified, and whether its group
+    // expressions and fields hold against the input's columns. Distinct from NEST, whose rollup
+    // fields share the function library but are checked with a document tree (core)
+    AGGREGATE,
     // stateful assembly of nested documents: checking a nest tree, sizing its state, and the runtime
     // limits and unresolvable references that stop or dead-letter part of it (runtime)
     NEST,

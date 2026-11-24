@@ -23,19 +23,44 @@ public record PipelinePreparationInputs(String pipelineHash,Map<String,String> s
     public static PipelinePreparationInputs of(PipelineIntentScope scope,PipelineResource pipeline,Map<String,SourceResource> sources,Map<String,Set<String>> selections) {
         if (!scope.pipelineId().equals(pipeline.id())) throw new IllegalArgumentException("Pipeline snapshot belongs to another scope");
         var hashes = new HashMap<String,String>(); var direct = new ArrayList<DirectChannelPreparation>();
-        sources.forEach((id,source) -> { if (!id.equals(source.id())) throw new IllegalArgumentException("source snapshot identity mismatch"); hashes.put(id,CanonicalHash.of(source)); });
-        if (!new HashSet<>(pipeline.sourceIds()).equals(hashes.keySet()) || !selections.keySet().equals(hashes.keySet()))
+        var physicalHashes = new HashMap<String,String>();
+        sources.forEach((id,source) -> {
+            if (!id.equals(source.id())) throw new IllegalArgumentException("source snapshot identity mismatch");
+            physicalHashes.put(id,CanonicalHash.of(source));
+        });
+        for (var ref : pipeline.sources()) {
+            String hash = physicalHashes.get(ref.id());
+            if (hash == null) throw new IllegalArgumentException("source snapshot is missing");
+            hashes.put(ref.binding(), hash);
+        }
+        if (!new HashSet<>(pipeline.sourceIds()).equals(physicalHashes.keySet()) || !selections.keySet().equals(hashes.keySet()))
             throw new IllegalArgumentException("source snapshots and selections must close the Pipeline references");
         var settings = pipeline.settings(); ReadMode mode = settings == null || settings.readMode() == null ? ReadMode.SNAPSHOT_AND_CDC : settings.readMode();
         String start = DirectChannelPreparation.checkedStart(scope,settings == null ? null : settings.startFrom());
         for (var reference : pipeline.sources()) {
             if (!(reference instanceof SourceRef.Spec spec)) throw new IllegalStateException("a prepared Pipeline requires materialized source switches");
-            var tables = selections.get(reference.id());
+            var tables = selections.get(reference.binding());
             if (!spec.srs() && mode != ReadMode.SNAPSHOT_ONLY && !tables.isEmpty())
-                direct.add(DirectChannelPreparation.of(scope,sources.get(reference.id()),mode,start,tables));
+                direct.add(DirectChannelPreparation.of(scope,sources.get(reference.id()),spec,mode,start,tables));
         }
         return new PipelinePreparationInputs(CanonicalHash.of(pipeline),hashes,selections,direct);
     }
+    /** Source artifact hashes by resource ID, independent of the capture bindings that use them. */
+    public Map<String, String> sourceArtifactHashes(PipelineResource pipeline) {
+        var hashes = new HashMap<String, String>();
+        for (var ref : pipeline.sources()) {
+            String hash = sourceHashes.get(ref.binding());
+            if (hash == null) {
+                throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+            }
+            String prior = hashes.putIfAbsent(ref.id(), hash);
+            if (prior != null && !prior.equals(hash)) {
+                throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+            }
+        }
+        return Map.copyOf(hashes);
+    }
+
     public boolean sameRecovery(PipelinePreparationInputs other) { return directChannels.equals(Objects.requireNonNull(other,"other").directChannels); }
     private static boolean hash(String value) { return value != null && value.matches("[0-9a-f]{64}"); }
 }

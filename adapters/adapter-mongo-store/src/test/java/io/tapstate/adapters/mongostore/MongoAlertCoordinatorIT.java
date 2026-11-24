@@ -20,6 +20,197 @@ import static org.assertj.core.api.Assertions.*;
 
 @RequiresDocker
 class MongoAlertCoordinatorIT {
+    @Test void deliveryEmptyPollUsesTheSameHostAggregateAndSeesTheNextIntent() {
+        withStore(f -> {
+            bindForPolling(f);
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try { assertThat(f.store.deliveryIntentsEmpty()).isTrue(); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(commands).containsOnlyOnce("aggregate:cluster_identity")
+                    .doesNotContain("find:alert_delivery_intents");
+            var id = new Document("unknown", "future-intent");
+            SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).insertOne(new Document("_id", id).append("formatVersion", 999));
+            assertThat(f.store.deliveryIntentsEmpty()).isFalse();
+        });
+    }
+
+    @Test void deliveryEmptyPollRetainsTheLegacyHostAndQueueReads() {
+        withStore(f -> {
+            bindForPolling(f);
+            try (var topology = org.mockito.Mockito.mockStatic(MongoBindingReadFacts.class, org.mockito.Mockito.CALLS_REAL_METHODS)) {
+                topology.when(() -> MongoBindingReadFacts.supported(org.mockito.ArgumentMatchers.any(com.mongodb.client.MongoClient.class)))
+                        .thenReturn(false);
+                var commands = new ArrayList<String>();
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+                try { assertThat(f.store.deliveryIntentsEmpty()).isTrue(); }
+                finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                assertThat(commands).contains("find:alert_delivery_intents");
+            }
+        });
+    }
+
+    @Test void aLegacyNodeReadStillRequiresTheLivePersistentKey(){
+        withStore(f->{
+            bindForPolling(f);var nodes=f.domain.alertNodeLifecycles(SCOPE,f.host.setup(),()->{});
+            try(var topology=org.mockito.Mockito.mockStatic(MongoBindingReadFacts.class,org.mockito.Mockito.CALLS_REAL_METHODS)){
+                topology.when(()->MongoBindingReadFacts.supported(org.mockito.ArgumentMatchers.any(com.mongodb.client.MongoClient.class))).thenReturn(false);
+                assertThat(nodes.list()).isEmpty();SystemCollections.CLUSTER_KEYS.on(f.db).deleteMany(new Document());
+                assertThatThrownBy(nodes::list).isInstanceOf(TapstateException.class);
+            }
+        });
+    }
+    @Test void malformedScopedIntentIdsCannotProveDeliveryEmpty(){
+        withStore(f->{
+            bindForPolling(f);var table=SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db);
+            var canonical=MongoAlertDeliveryCodec.scope(SCOPE).append("purpose","business").append("deliveryId","a");
+            var missing=MongoAlertDeliveryCodec.scope(SCOPE).append("deliveryId","b");
+            var reordered=new Document("purpose","business").append("authorityId",SCOPE.authorityId()).append("clusterId",SCOPE.clusterId()).append("deliveryId","c");
+            var extra=MongoAlertDeliveryCodec.scope(SCOPE).append("beforePurpose","x").append("purpose","business").append("deliveryId","d");
+            for(var id:List.of(missing,reordered,extra,canonical)){
+                table.insertOne(new Document("_id",id).append("formatVersion",999));
+                assertThat(f.store.deliveryIntentsEmpty()).as("every malformed scoped ID still requires ordinary isolation checks").isFalse();
+                assertThat(f.store.dueIntents(T,null,1).isolatedRecords()).isTrue();table.deleteOne(new Document("_id",id));
+            }
+        });
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings={"large","collation"})
+    void admittedHostFactsKeepLargeMetadataAndForeignCollectionPredicates(String kind){
+        withStore(f->{
+            bindForPolling(f);var expected=f.store.planning();var nodes=f.domain.alertNodeLifecycles(SCOPE,f.host.setup(),()->{});
+            var schema=SystemCollections.SCHEMA_MIGRATIONS.on(f.db);
+            if(kind.equals("large"))schema.updateOne(new Document("_id","config"),new Document("$set",new Document("padding","x".repeat(128*1024))));
+            else{
+                var original=schema.find(new Document("_id","config")).first();String name=SystemCollections.SCHEMA_MIGRATIONS.collectionName();
+                schema.renameCollection(new com.mongodb.MongoNamespace(f.db.getName(),name+"_original"));
+                f.db.createCollection(name,new com.mongodb.client.model.CreateCollectionOptions().collation(com.mongodb.client.model.Collation.builder()
+                        .locale("en").collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                schema.insertOne(new Document(original).append("_id","CONFIG"));
+            }
+            assertThat(f.store.planningIfConfigurationChanged(expected.version().configurationRevision())).isEmpty();
+            assertThat(nodes.list()).isEmpty();
+        });
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"aggregate", "find"})
+    void snapshotPollingBoundsEachDriverCommand(String command) {
+        withStore(f -> {
+            bindForPolling(f);
+            if ("find".equals(command)) {
+                SystemCollections.SCHEMA_MIGRATIONS.on(f.db).updateOne(new Document("_id", "config"),
+                        new Document("$set", new Document("padding", "x".repeat(128 * 1024))));
+            }
+            assertThat(f.store.deliveryIntentsEmpty()).isTrue();
+            try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var admin = client.getDatabase("admin");
+                var point = new Document("configureFailPoint", "failCommand");
+                String collection = "find".equals(command) ? "schema_migrations" : "cluster_identity";
+                admin.runCommand(new Document(point).append("mode", "alwaysOn").append("data",
+                        new Document("failCommands", List.of(command)).append("namespace", f.db.getName() + "." + collection)
+                                .append("blockConnection", true).append("blockTimeMS", 7000)));
+                try {
+                    assertThatThrownBy(f.store::deliveryIntentsEmpty).isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                } finally {
+                    admin.runCommand(point.append("mode", "off"));
+                }
+            }
+        });
+    }
+
+    private static void bindForPolling(Fixture f){
+        var cache=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,"mongodb://cache.invalid/cache","cache",null);
+        f.domain.bindings().commit(f.host.setup(),StorageBinding.Mode.OP,cache,new SourceResource("views",null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null));
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings={"source","note"})
+    void admittedReadsSkipOnlyTheApprovedAuditAndWritesKeepIt(String damaged){
+        withStore(f->{
+            bindForPolling(f);var expected=f.store.planning();var nodes=f.domain.alertNodeLifecycles(SCOPE,f.host.setup(),()->{});
+            if(damaged.equals("source"))SystemCollections.SOURCES.on(f.db).deleteOne(new Document("_id","views"));
+            else SystemCollections.PDK_NOTE_SCOPES.on(f.db).deleteMany(new Document());
+            var commands=new ArrayList<String>();MongoCommandObservation.COLLECTIONS.set((command,collection)->commands.add(command+":"+collection));
+            try{
+                assertThat(f.store.planningIfConfigurationChanged(expected.version().configurationRevision())).isEmpty();
+                assertThat(f.store.deliveryIntentsEmpty()).isTrue();assertThat(nodes.list()).isEmpty();
+            }finally{MongoCommandObservation.COLLECTIONS.remove();}
+            assertThat(commands).doesNotContain("find:sources","listIndexes:sources","find:pdk_note_scopes");
+            var rule=new Rule(header(Kind.RULE,"write-after-damage",f.access.subject()),"Write", "pipeline.failed",1,
+                    new Resources(Set.of("pipeline"),true,Set.of()),Map.of(),null,true,null);
+            assertThatThrownBy(()->f.store.saveDefinition(null,rule,f.access)).isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThatThrownBy(()->f.domain.bindings().load()).isInstanceOf(TapstateException.class);
+        });
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings={"cluster","setup","mode","binding","cipher","schema","version","key"})
+    void admittedPollingStillRejectsCurrentAuthorityDamage(String changed){
+        withStore(f->{
+            bindForPolling(f);var original=f.store.planning();var nodes=f.domain.alertNodeLifecycles(SCOPE,f.host.setup(),()->{});
+            switch(changed){
+                case "cluster" -> SystemCollections.CONFIG_CLUSTER_IDENTITY.on(f.db).updateOne(new Document(),new Document("$set",new Document("clusterId","foreign")));
+                case "setup" -> SystemCollections.STORAGE_SETUP.on(f.db).updateOne(new Document(),new Document("$set",new Document("operationId","foreign")));
+                case "mode" -> SystemCollections.STORAGE_BINDING.on(f.db).updateOne(new Document(),new Document("$set",new Document("mode","CLOUD")));
+                case "binding" -> SystemCollections.STORAGE_BINDING.on(f.db).updateOne(new Document(),new Document("$inc",new Document("bindingVersion",1L)));
+                case "cipher" -> SystemCollections.STORAGE_BINDING.on(f.db).updateOne(new Document(),new Document("$set",new Document("cache","invalid")));
+                case "schema" -> SystemCollections.SCHEMA_MIGRATIONS.on(f.db).deleteOne(new Document("_id","config"));
+                case "version" -> SystemCollections.CONFIGURATION_VERSION.on(f.db).deleteMany(new Document());
+                case "key" -> SystemCollections.CLUSTER_KEYS.on(f.db).deleteMany(new Document());
+                default -> throw new AssertionError(changed);
+            }
+            assertThatThrownBy(()->f.store.planningIfConfigurationChanged(original.version().configurationRevision())).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(()->f.store.deliveryIntentsEmpty()).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(nodes::list).isInstanceOf(TapstateException.class);
+        });
+    }
+    @Test void pollingIgnoresAlertOnlyChangesButAuthoringWakesItAndEveryIntentPurposePreventsEmptyProof(){
+        withStore(f->{
+            bindForPolling(f);long original=f.store.planning().version().configurationRevision();
+            SystemCollections.CONFIGURATION_VERSION.on(f.db).updateOne(new Document(),new Document("$inc",new Document(ConfigurationVersion.ALERT_FENCE,1L)));
+            assertThat(f.store.planningIfConfigurationChanged(original)).isEmpty();
+            SystemCollections.CONFIGURATION_VERSION.on(f.db).updateOne(new Document(),new Document("$inc",new Document("revision",1L)));
+            assertThat(f.store.planningIfConfigurationChanged(original)).isPresent();
+            var table=SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db);
+            var foreign=MongoAlertDeliveryCodec.scope(new AlarmKey.Scope("foreign",SCOPE.clusterId())).append("purpose","business").append("deliveryId","foreign");
+            table.insertOne(new Document("_id",foreign));assertThat(f.store.deliveryIntentsEmpty()).as("a populated namespace conservatively keeps scoped polling").isFalse();
+            for(String purpose:List.of("business","channel-test","future-purpose")){
+                var id=MongoAlertDeliveryCodec.scope(SCOPE).append("purpose",purpose).append("deliveryId","retained-or-future");
+                table.insertOne(new Document("_id",id).append("formatVersion",999).append("nextCheckAt",Date.from(T.plusSeconds(3600))));
+                assertThat(f.store.deliveryIntentsEmpty()).isFalse();table.deleteOne(new Document("_id",id));
+            }
+        });
+    }
+    @Test void evaluationSnapshotKeepsAllRulePagesAndRetainedStateAtOneRevisionAndSignalsOverflow(){
+        withStore(f->{
+            var facts=businessFacts(f);assertThat(accept(f,facts)).isEqualTo(Outcome.STAGED);
+            var template=(Rule)f.store.definition(Kind.RULE,"rule-a",f.access).orElseThrow();
+            var seeded=new ArrayList<Document>();
+            for(int i=0;i<999;i++){
+                var rule=new Rule(header(Kind.RULE,String.format("rule-%04d",i),f.access.subject()),"Seeded",template.typeId(),1,
+                        template.resources(),template.parameters(),null,true,null).validated(BuiltinAlarmTypes.catalog()).enrolled(null);
+                seeded.add(MongoAlertConfigurationCodec.write(rule,1));
+            }
+            SystemCollections.ALERT_RULES.on(f.db).insertMany(seeded);
+            var pages=new java.util.concurrent.atomic.AtomicInteger();var changed=new java.util.concurrent.atomic.AtomicBoolean();
+            MongoCommandObservation.COLLECTIONS.set((command,collection)->{
+                if(command.equals("aggregate")&&collection.equals(SystemCollections.ALERT_RULES.collectionName())&&pages.incrementAndGet()==2){
+                    MongoCommandObservation.COLLECTIONS.remove();
+                    var disabled=new Rule(template.header().next(T,f.access.subject()),"Changed",template.typeId(),1,
+                            template.resources(),template.parameters(),null,false,null);
+                    assertThat(f.store.saveDefinition(template,disabled,f.access)).isEqualTo(Outcome.STAGED);
+                    SystemCollections.ALERT_INSTANCES.on(f.db).updateOne(new Document(),new Document("$inc",new Document("recordRevision",1L)));
+                    changed.set(true);
+                }
+            });
+            EvaluationSnapshot snapshot;
+            try{snapshot=f.store.evaluationSnapshot(null,50);}finally{MongoCommandObservation.COLLECTIONS.remove();}
+            assertThat(changed).isTrue();assertThat(snapshot.rules().rows()).hasSize(1000);assertThat(snapshot.rules().nextId()).isNull();
+            assertThat(snapshot.rules().rows().stream().filter(d->d.header().identity().id().equals("rule-a")).map(Rule.class::cast).findFirst().orElseThrow().enabled()).isTrue();
+            assertThat(snapshot.states().rows()).singleElement().satisfies(row->assertThat(row.revision()).isEqualTo(1));
+            assertThat(f.store.state(facts.head.snapshot().rule().key(),readAll()).orElseThrow().revision()).isEqualTo(2);
+            var extra=new Rule(header(Kind.RULE,"rule-overflow",f.access.subject()),"Overflow",template.typeId(),1,
+                    template.resources(),template.parameters(),null,true,null).validated(BuiltinAlarmTypes.catalog()).enrolled(null);
+            SystemCollections.ALERT_RULES.on(f.db).insertOne(MongoAlertConfigurationCodec.write(extra,1));
+            var overflow=f.store.evaluationSnapshot(null,50);assertThat(overflow.rules().rows()).hasSize(1000);assertThat(overflow.rules().nextId()).isNotNull();
+        });
+    }
     @Test void unsupportedBuiltinFormatThreeCannotBlockCompatibleDeliveryPages(){
         withStore(f->{var facts=businessFacts(f);accept(f,facts);var unknown=MongoAlertDeliveryCodec.write(facts.intent(),1);
             unknown.get("_id",Document.class).put("deliveryId","future-builtin-format-three");unknown.put("formatVersion",3);

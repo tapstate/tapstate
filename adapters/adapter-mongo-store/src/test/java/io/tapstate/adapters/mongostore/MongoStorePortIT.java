@@ -242,7 +242,7 @@ class MongoStorePortIT {
             assertThatThrownBy(() -> port.operatorStateStores().inDatabase("local"))
                     .isInstanceOf(TapstateException.class)
                     .extracting(thrown -> ((TapstateException) thrown).code().code())
-                    .isEqualTo("store.invalid-operator-state-database");
+                    .isEqualTo("TS0470005");
         }
     }
 

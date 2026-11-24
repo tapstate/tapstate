@@ -65,6 +65,28 @@ class NodeColumnsAgainstRuntimeTest {
         assertThat(produced.keySet()).containsExactly("order_id", "channel", "doubled", "qty");
     }
 
+    /**
+     * The soft-delete marker is a column the map adds, so its place has to be the same on both sides:
+     * a target built with it in one position while every row carries it in another is the drift this
+     * class exists to catch.
+     */
+    @Test
+    @DisplayName("a soft-delete map's marker sits where the derivation puts it, on live and deleted rows")
+    void aSoftDeleteMarkerIsWhereTheDerivationPutsIt() {
+        TransformBody.MapProjection body = new TransformBody.MapProjection(projection(), "is_deleted");
+        TransformPort map = StatelessTransforms.map(MapSpec.from(body));
+
+        NodeColumns derived = NodeColumns.of(body, one(upstream()), null);
+        Map<String, Object> live = map.transform(insert(row())).get(0).after();
+        Map<String, Object> deleted = map.transform(
+                new Envelope(io.tapstate.core.event.Op.DELETE, 1L, "orders", new LinkedHashMap<>(row()), null, null))
+                .get(0).after();
+
+        agree(derived, live);
+        agree(derived, deleted);
+        assertThat(live.keySet()).containsExactly("order_id", "channel", "doubled", "is_deleted", "qty");
+    }
+
     @Test
     @DisplayName("a filter's columns are the row it lets through, untouched")
     void aFiltersColumnsAreTheRowItLetsThrough() {

@@ -127,14 +127,25 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             long intentRevision = intents.completeRebuild(session, pending.request.intent(), target);
             var annex = encode(pending).append("result", new Document("phase", "COMPLETE").append("checkpointEpoch", receipt.checkpointEpoch()).append("intentRevision", intentRevision));
+            var removed = new Document("cacheRecovery", "").append("sharedRecovery", "");
+            var updated = new Document("stateGeneration", target.stateGeneration()).append("phase", "ACTIVE")
+                    .append("cachePreparation", MongoPipelinePreparationFacts.encode(result)).append("stateRebuild", annex);
+            var desired = pending.request.intent().desired();
+            if (desired.purgeState()) {
+                if (desired.targetState() == io.tapstate.core.lifecycle.PipelineState.RUNNING) {
+                    var binding = new io.tapstate.spi.store.ConnectorRunBindings(target, 0L, java.util.List.of(),
+                            new io.tapstate.spi.store.ConnectorRunBindings.Handoff(intentRevision,
+                                    io.tapstate.spi.store.ConnectorRunBindings.Phase.REQUESTED, java.util.List.of(), java.util.List.of()));
+                    updated.append("connectorBindings", MongoPipelineStateMappings.connectorBindings(binding));
+                } else removed.append("connectorBindings", "");
+            } else if (mapping.containsKey("connectorBindings")) throw fenced();
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,
                     new Document("_id", target.pipelineId()).append("stateGeneration", pending.request.originalScope().stateGeneration())
                             .append("phase", "REBUILDING").append("operationId", pending.request.operationId()).append("stateRebuild", encode(pending))
                             .append("sharedRecovery",mapping.containsKey("sharedRecovery")?mapping.get("sharedRecovery"):new Document("$exists",false))
                             .append("noteWriteFence", writeFence),
-                    new Document("$set", new Document("stateGeneration", target.stateGeneration()).append("phase", "ACTIVE")
-                            .append("cachePreparation", MongoPipelinePreparationFacts.encode(result)).append("stateRebuild", annex))
-                            .append("$unset", new Document("cacheRecovery", "").append("sharedRecovery",""))
+                    new Document("$set", updated)
+                            .append("$unset", removed)
                             .append("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1)
                 throw new IllegalStateException("original rebuild changed within one CONFIG snapshot");
             return result;
@@ -144,6 +155,25 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
     @Override public java.util.Optional<PipelinePreparation> completed(PipelineRebuildRequest original) {
         Objects.requireNonNull(original, "original");
         return transaction(session -> completedInTransaction(session, original));
+    }
+
+    void requireCompletedStopPurge(PipelineIntentSnapshot purge, String operation, WorkloadClaimFence node) {
+        transaction(session -> {
+            var id = purge.scope().pipelineId();
+            var row = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", id)).first();
+            var state = MongoPipelineStateMappings.decode(id, row);
+            if (state.phase() != PipelineStateMapping.Phase.ACTIVE || !operation.equals(state.operationId())
+                    || state.stateGeneration() != purge.scope().stateGeneration() + 1 || !row.containsKey("stateRebuild")) throw fenced();
+            var prepared = MongoPipelinePreparationFacts.decode(id, row, clusterId);
+            requireCompletedPrior(row, prepared);
+            var annex = row.get("stateRebuild", Document.class);
+            var claim = annex.get("originalClaim", Document.class);
+            if (!purge.scope().equals(MongoPipelinePreparationFacts.scope(annex.get("originalScope", Document.class)))
+                    || !Long.valueOf(purge.intentRevision()).equals(annex.get("intentRevision"))
+                    || !node.equals(prepared.issuerNode()) || claim == null
+                    || !node.owner().nodeId().equals(claim.get("nodeId")) || !node.owner().bootId().equals(claim.get("bootId"))) throw fenced();
+            return null;
+        });
     }
 
     @Override public java.util.Optional<CompletedPipelineFull> completedFull(PipelineIntentScope target,
@@ -216,22 +246,22 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         String expectedHash = completed.inputs.sourceHashes().get(sourceId);
         if (expectedHash == null) throw fenced();
         var owner = completed.owner;
-        var source = owner.artifacts.get(sourceId).filter(io.tapstate.core.model.SourceResource.class::isInstance)
-                .map(io.tapstate.core.model.SourceResource.class::cast).orElseThrow(MongoPipelineStateRebuilds::fenced);
         var pipeline = owner.artifacts.get(completed.targetScope.pipelineId()).filter(io.tapstate.core.model.PipelineResource.class::isInstance)
                 .map(io.tapstate.core.model.PipelineResource.class::cast).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        if (!pipeline.sourceBindings().contains(sourceId)) throw fenced();
+        var ref = pipeline.sourceReference(sourceId);
+        var source = owner.artifacts.get(ref.id()).filter(io.tapstate.core.model.SourceResource.class::isInstance)
+                .map(io.tapstate.core.model.SourceResource.class::cast).orElseThrow(MongoPipelineStateRebuilds::fenced);
         if (!expectedHash.equals(CanonicalHash.of(source))
                 || pipeline.settings() != null && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY
-                || pipeline.sources().stream().noneMatch(ref -> ref.id().equals(sourceId)
-                    && ref instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs())) throw fenced();
-        String actual = io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(source.connector(), source.config(),
-                source.srs() == null ? null : source.srs().key());
+                || !(ref instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs())) throw fenced();
+        String actual = io.tapstate.core.model.PipelineSourceConfig.chain(ref, source);
         var target = completed.targetScope;
         var captures = new MongoCaptureStatePreparations(owner.client, owner.database, owner.clusterId, owner.bindings, owner.artifacts, owner.requireActive);
         var prepared = captures.read(new CacheBusinessScope(target.clusterId(), target.bindingVersion(), target.cacheIncarnation()),
                 io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(actual)).orElseThrow(MongoPipelineStateRebuilds::fenced);
         if(!prepared.canonicalChainId().equals(actual) || !prepared.chainId().equals(chain))throw fenced();
-        captures.inspectSharedHistory(prepared, sourceId, expectedHash);
+        captures.inspectSharedHistory(prepared, sourceId, expectedHash, pipeline.id(), CanonicalHash.of(pipeline));
         completed.requireCurrent();
         return prepared;
     }
@@ -344,6 +374,8 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
     }
     private void verifyDependencies(ClientSession session, String pipelineId, PipelinePreparationInputs inputs, Map<String, String> dependencies) {
         var root = artifacts.getInTransaction(session, pipelineId).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        if (!(root instanceof io.tapstate.core.model.PipelineResource pipeline)) throw fenced();
+        var captureArtifacts = inputs.sourceArtifactHashes(pipeline);
         var known = new java.util.HashMap<String, io.tapstate.core.model.Resource>(); known.put(root.id(), root);
         var queue = new java.util.ArrayDeque<io.tapstate.core.model.Resource>(); queue.add(root);
         var visited = new java.util.HashSet<String>(); var confirmed = new java.util.HashSet<String>();
@@ -356,7 +388,8 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                     known.put(target.id(), target); queue.add(target);
                 }
                 if (!edge.kind().equals(target.kind())) throw fenced();
-                String actual = CanonicalHash.of(target), capture = inputs.sourceHashes().get(edge.id());
+                String actual = CanonicalHash.of(target);
+                String capture = captureArtifacts.get(edge.id());
                 String dependency = dependencies.get(edge.id());
                 if (capture == null ? !actual.equals(dependency) : !actual.equals(capture)) throw fenced();
                 if (dependency != null) {

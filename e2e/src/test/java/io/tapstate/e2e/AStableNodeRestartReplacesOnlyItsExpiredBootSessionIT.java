@@ -134,7 +134,7 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
                 assertThat(outputOf(tooSoon))
                         .describedAs("and it says which id it was turned away over, so an operator "
                                 + "reading the restart loop can tell waiting from misconfiguration")
-                        .contains("boot.node-id-in-use")
+                        .contains("TS0310028")
                         .contains(TwoMemberCluster.NODE_A);
 
                 RealProcessServer admitted = restartUntilAdmitted(cluster, survivor, restarts);
@@ -249,7 +249,7 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
                     .describedAs("every restart that was turned away was turned away over its own id. "
                             + "Without this, a build where the node could never start again would "
                             + "produce the same patient-looking loop")
-                    .contains("boot.node-id-in-use");
+                    .contains("TS0310028");
         }
         return null;
     }

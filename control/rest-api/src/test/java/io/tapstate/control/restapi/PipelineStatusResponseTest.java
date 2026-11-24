@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Locale;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -28,8 +29,54 @@ class PipelineStatusResponseTest {
     private final MessageCatalog catalog = MessageCatalog.bundled();
 
     @Test
+    void monitoringCarriesTheExactSourceAndSinkArtifactsWithoutNoteCoordinates() {
+        var source = new io.tapstate.control.core.ConnectorUsageQuery.Version("input",
+                io.tapstate.core.model.PipelineNode.Purpose.CAPTURE, "mongodb", "1.0", "a".repeat(64), "capture-old", "chain-old");
+        var sink = new io.tapstate.control.core.ConnectorUsageQuery.Version("target",
+                io.tapstate.core.model.PipelineNode.Purpose.SYNC, "mysql", "2.0", "b".repeat(64), null, null);
+        var response = PipelineStatusResponse.of(new PipelineStatus("reader", PipelineState.RUNNING), catalog)
+                .withConnectorVersions(java.util.List.of(source, sink));
+        assertThat(response.connectorVersions()).containsExactly(source, sink);
+        assertThat(response.state()).isEqualTo(PipelineState.RUNNING);
+    }
+
+    @Test
+    void runtimeAttachmentKeepsCapturedFactsAndLegacyResponsesOmitIt() throws Exception {
+        var diagnostic = java.util.Map.<String, Object>of("message", "captured message",
+                "cause", java.util.Map.of("rawMessage", "captured cause"));
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0060027",
+                java.util.Map.of("connector", "fixture", "detail", "refused"), diagnostic);
+        var status = new PipelineStatus("orders", PipelineState.FAILED, null, OBSERVED_AT).diagnosed(failure);
+        var response = PipelineStatusResponse.of(status, catalog);
+        assertThat(response.failure().diagnostic()).isEqualTo(diagnostic);
+        assertThat(response.failure().params()).containsEntry("detail", "refused");
+        var mapper = tools.jackson.databind.json.JsonMapper.builder().build();
+        assertThat(mapper.readTree(mapper.writeValueAsString(response.failure())).path("diagnostic").path("cause")
+                .path("rawMessage").asText()).isEqualTo("captured cause");
+        assertThat(mapper.readTree(mapper.writeValueAsString(new ApiError("legacy", java.util.Map.of(), "old")))
+                .has("diagnostic")).isFalse();
+    }
+
+    @Test
+    void statusFailureRendersMessageAndSolutionInTheRequestedLanguage() {
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0060027",
+                java.util.Map.of("connector", "mysql", "detail", "write refused"));
+        var status = new PipelineStatus("orders", PipelineState.FAILED, null, OBSERVED_AT).diagnosed(failure);
+
+        PipelineStatusResponse response = PipelineStatusResponse.of(status, catalog,
+                Clock.fixed(OBSERVED_AT, ZoneOffset.UTC), Locale.forLanguageTag("zh-CN"));
+
+        assertThat(response.failure().code()).isEqualTo("TS0060027");
+        assertThat(response.failure().params()).containsEntry("detail", "write refused");
+        assertThat(response.failure().message()).contains("\u8fde\u63a5\u5668", "mysql", "\u5411\u76ee\u6807\u7aef\u5199\u5165\u6570\u636e")
+                .doesNotContain("write refused");
+        assertThat(response.failure().solution()).contains("\u76ee\u6807\u7aef\u8fde\u63a5", "\u5199\u5165\u6743\u9650", "\u6280\u672f\u8be6\u60c5");
+        assertThat(response.failure().diagnostic()).isEmpty();
+    }
+
+    @Test
     void aCurrentDiagnosisKeepsTheLastStoredStateAndAgeExplicit() {
-        var failure = new io.tapstate.core.lifecycle.ObservationFailure("engine.out-of-memory", java.util.Map.of("pipeline", "orders"));
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0440009", java.util.Map.of("pipeline", "orders"));
         var status = new PipelineStatus("orders", PipelineState.RUNNING, null, OBSERVED_AT).diagnosed(failure);
         var response = PipelineStatusResponse.of(status, catalog, Clock.fixed(OBSERVED_AT.plusSeconds(90), ZoneOffset.UTC));
         assertThat(response.state()).isEqualTo(PipelineState.FAILED);

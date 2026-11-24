@@ -182,11 +182,29 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         };
     }
 
+    @Override
+    public Set<String> completedSnapshotInputs(HazelcastInstance member, Set<String> streams) {
+        SrsMetaStore meta = storeOn(member);
+        if (meta == null) return Set.of();
+        Map<String, List<ConsumerOffset>> consumers = new HashMap<>();
+        var completed = new HashSet<String>();
+        for (String stream : streams) {
+            SourceProgress source = sourceOf(progressByTable, stream);
+            if (recordedAsLanded(stream, source, consumers.computeIfAbsent(source.miningChainId(), meta::consumerOffsets))) {
+                completed.add(stream);
+            }
+        }
+        return Set.copyOf(completed);
+    }
+
+    private static boolean recordedAsLanded(String stream, SourceProgress source, List<ConsumerOffset> consumers) {
+        return consumers.stream().anyMatch(consumer -> consumer.pipelineId().equals(source.consumerId())
+                && consumer.snapshotCompletedTables().contains(source.table(stream)));
+    }
+
     private boolean landed(AwaitedLoad load, SourceProgress source, List<ConsumerOffset> consumers,
             Optional<WriterRun> run) {
-        boolean recorded = consumers.stream().anyMatch(consumer -> consumer.pipelineId().equals(source.consumerId())
-                && consumer.snapshotCompletedTables().contains(source.table(load.table())));
-        if (recorded) {
+        if (recordedAsLanded(load.table(), source, consumers)) {
             return true;
         }
         if (run.isEmpty() || !run.get().runId().equals(runId)) {

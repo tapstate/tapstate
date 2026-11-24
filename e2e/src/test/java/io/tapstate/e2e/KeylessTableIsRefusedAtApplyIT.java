@@ -37,7 +37,7 @@ class KeylessTableIsRefusedAtApplyIT {
 
     private static final String SOURCE_ID = "src_keyless";
     private static final String TARGET_ID = "tgt_keyless";
-    private static final String UPSERT_NEEDS_KEY = "dsl.upsert-needs-key";
+    private static final String UPSERT_NEEDS_KEY = "TS0010023";
 
     /** No primary key, no unique index: nothing a write could be matched to a row by. */
     private static final String KEYLESS = "events";

@@ -71,7 +71,7 @@ class DuplicateStableNodeIdsCannotBothJoinIT {
                 assertThat(outputOf(duplicate))
                         .describedAs("a process turned away has to say which id it was turned away over; "
                                 + "a bare stack trace leaves an operator guessing at a configuration fault")
-                        .contains("boot.node-id-in-use")
+                        .contains("TS0310028")
                         .contains(TwoMemberCluster.NODE_A);
             } finally {
                 duplicate.close();

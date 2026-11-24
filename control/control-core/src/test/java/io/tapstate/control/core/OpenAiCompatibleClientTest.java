@@ -66,6 +66,177 @@ class OpenAiCompatibleClientTest {
         }
     }
 
+    @Test void managedStreamCarriesConversationAndToolArgumentsWithoutUsingAWorkspaceKey() throws Exception {
+        var requests = new ArrayList<Map<?, ?>>();
+        var auth = new ArrayList<String>();
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            auth.add(exchange.getRequestHeaders().getFirst("Authorization"));
+            requests.add((Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            String arguments = JsonWriter.write(Map.of("explanation", "Map the order fields.",
+                    "candidateWizard", Map.of("root", Map.of("table", "orders"))));
+            String result = switch (requests.size()) {
+                case 1 -> chunk(Map.of("content", "Orders."), "stop") + "data: [DONE]\n\n";
+                case 2 -> chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function",
+                        Map.of("name", "propose_pipeline", "arguments", arguments)))), "tool_calls")
+                        + "data: " + JsonWriter.write(Map.of("choices", List.of(), "usage",
+                                Map.of("prompt_tokens", 80, "completion_tokens", 12))) + "\n\n"
+                        + "data: [DONE]\n\n";
+                default -> chunk(Map.of("content", "Partial"), null)
+                        + "data: {\"error\":{\"type\":\"upstream_error\"}}\n\n";
+            };
+            var bytes = result.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var out = exchange.getResponseBody()) { out.write(bytes); }
+        });
+        server.start();
+        try {
+            var endpoint = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            var client = new OpenAiCompatibleClient(ignored -> endpoint, Duration.ofSeconds(5),
+                    (request, uri, bytes) -> request.header("Authorization", "signed-test"), 3);
+            var settings = new AiProviderSettings("bedrock-managed", endpoint.toString(), "global.moonshotai.kimi-k3", null);
+            var first = Map.of("role", "user", "content", "Which table did I select?");
+            var text = new StringBuilder();
+            assertThat(client.propose(settings, List.of(first), Map.of("proposalEnabled", false), text::append)).isEmpty();
+            assertThat(text).hasToString("Orders.");
+            var history = Map.of("role", "assistant", "content", text.toString());
+            var second = Map.of("role", "user", "content", "Add a mapping to the selected table");
+            text.setLength(0);
+            assertThat(client.propose(settings, List.of(first, history, second), Map.of(), text::append))
+                    .hasValueSatisfying(value -> assertThat(value.get("root")).isEqualTo(Map.of("table", "orders")));
+            assertThat(text).hasToString("Map the order fields.");
+            assertThat(requests.get(1).get("messages").toString()).contains("Orders.", "Add a mapping");
+            assertThat(requests.get(1).get("reasoning_effort")).isEqualTo("low");
+            assertThat(requests.get(1).get("max_completion_tokens")).isEqualTo(4096L);
+            assertThat(requests.get(1).get("tools")).isNotNull();
+
+            assertThatThrownBy(() -> client.propose(settings, List.of(second), Map.of(), ignored -> { }))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(auth).containsExactly("signed-test", "signed-test", "signed-test");
+            assertThatThrownBy(() -> client.propose(settings, List.of(second), Map.of(), ignored -> { }))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_RATE_LIMITED));
+            assertThat(requests).hasSize(3);
+        } finally { server.stop(0); }
+    }
+
+    @Test void managedRetriesOnlyOneTransientHttpFailureAndKeepsAllAttemptsStreaming() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        var observedBodies = new java.util.concurrent.ConcurrentLinkedQueue<Map<?, ?>>();
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            observedBodies.add((Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            int attempt = requests.incrementAndGet();
+            if (attempt != 2) {
+                exchange.sendResponseHeaders(attempt == 1 ? 503 : 429, -1);
+                exchange.close();
+                return;
+            }
+            var response = (chunk(Map.of("content", "Recovered."), "stop") + "data: [DONE]\n\n").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            try (var output = exchange.getResponseBody()) { output.write(response); }
+        });
+        server.start();
+        try {
+            var endpoint = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            var client = new OpenAiCompatibleClient(ignored -> endpoint, Duration.ofSeconds(5), (request, uri, body) -> {}, 10);
+            var settings = new AiProviderSettings("bedrock-managed", endpoint.toString(), "test-kimi", null);
+            var text = new StringBuilder();
+            assertThat(client.propose(settings, List.of(), Map.of("proposalEnabled", false), text::append)).isEmpty();
+            assertThat(text).hasToString("Recovered.");
+            Map<String, Object> context = Map.of("proposalEnabled", false);
+            java.util.function.Consumer<String> discard = ignored -> {};
+            assertThatThrownBy(() -> client.propose(settings, List.of(), context, discard))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_RATE_LIMITED));
+            assertThat(requests).hasValue(4);
+            assertThat(observedBodies.stream().map(body -> Boolean.TRUE.equals(body.get("stream"))).toList()).containsOnly(true);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test void managedLogsEachModelAttemptAndDoesNotCarryUsageAcrossRetries() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            String transientError = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3}}\n\n"
+                    + "data: {\"error\":{\"type\":\"upstream_error\"}}\n\n";
+            String success = chunk(Map.of("content", "Recovered."), "stop") + "data: [DONE]\n\n";
+            byte[] response = (requests.incrementAndGet() == 1 ? transientError : success)
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            try (var output = exchange.getResponseBody()) { output.write(response); }
+        });
+        String model = "test-kimi-attempt-telemetry";
+        var attempts = new java.util.concurrent.CopyOnWriteArrayList<List<Object>>();
+        Logger logger = Logger.getLogger(OpenAiCompatibleClient.class.getName());
+        var handler = new java.util.logging.Handler() {
+            @Override public void publish(LogRecord record) {
+                Object[] values = record.getParameters();
+                if (record.getMessage().startsWith("Managed AI model=") && values != null && model.equals(values[0])) {
+                    attempts.add(List.of(values[1], values[3], values[4], values[5], values[6]));
+                }
+            }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        logger.addHandler(handler);
+        server.start();
+        try {
+            var endpoint = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+            var provider = new OpenAiCompatibleClient(ignored -> endpoint, Duration.ofSeconds(5),
+                    (request, uri, body) -> { }, 5);
+            var settings = new AiProviderSettings("bedrock-managed", endpoint.toString(), model, null);
+            var text = new StringBuilder();
+            assertThat(provider.propose(settings, List.of(), Map.of("proposalEnabled", false), text::append)).isEmpty();
+            assertThat(text).hasToString("Recovered.");
+            assertThat(requests).hasValue(2);
+            assertThat(attempts).containsExactly(List.of("upstream-error", 17L, 3L, 1, 200),
+                    List.of("stream-completed", -1L, -1L, 2, 200));
+        } finally {
+            logger.removeHandler(handler);
+            server.stop(0);
+        }
+    }
+
+    @Test void managedRefusesIncompleteResponsesAndRejectsOversizedRequestsBeforeSigning() throws Exception {
+        String limited = chunk(Map.of("content", "Partial"), "length") + "data: [DONE]\n\n";
+        withServer(200, limited, settings -> {
+            AtomicInteger signed = new AtomicInteger();
+            var client = new OpenAiCompatibleClient(URI::create, Duration.ofSeconds(5),
+                    (request, uri, body) -> signed.incrementAndGet(), 5);
+            Map<String, Object> context = Map.of("proposalEnabled", false);
+            java.util.function.Consumer<String> discard = ignored -> {};
+            assertThatThrownBy(() -> client.propose(settings, List.of(), context, discard))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL));
+            var tooLong = List.of(Map.of("role", "user", "content", "\u4e2d".repeat(48 * 1024)));
+            assertThatThrownBy(() -> client.propose(settings, tooLong, context, discard))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_MANAGED_PROVIDER_INPUT_LIMIT));
+            assertThat(signed).hasValue(1);
+        });
+    }
+
+    @Test void managedReportsBedrockAuthorizationFailuresAndReleasesAdmissionWhenSigningFails() throws Exception {
+        withServer(403, "AWS rejected the request", settings -> {
+            AtomicInteger signed = new AtomicInteger();
+            var client = new OpenAiCompatibleClient(URI::create, Duration.ofSeconds(5), (request, uri, body) -> {
+                if (signed.incrementAndGet() <= 4) throw AiProviderService.error(ControlError.AI_PROVIDER_AUTH_FAILED);
+            }, 5);
+            Map<String, Object> context = Map.of("proposalEnabled", false);
+            java.util.function.Consumer<String> discard = ignored -> {};
+            for (int attempt = 1; attempt <= 5; attempt++) {
+                assertThatThrownBy(() -> client.propose(settings, List.of(), context, discard))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_MANAGED_PROVIDER_AUTH_FAILED));
+            }
+            assertThat(signed).hasValue(5);
+        });
+    }
+
     @Test void streamsOnlyTheTopLevelExplanationAndDecodesSplitEscapes() throws Exception {
         String arguments = "{\"candidateWizard\":{\"description\":\"not visible\",\"explanation\":\"nested decoy\"},"
                 + "\"explanation\":\"Quote: \\\"field\\\"\\n\\uD83D\\uDE80 sk-test\"}";
@@ -148,6 +319,28 @@ class OpenAiCompatibleClientTest {
                     .hasValueSatisfying(value -> assertThat(value).containsKey("root")));
         }
     }
+    @Test void managedAcceptsACompleteToolCallWithoutFinishReason() throws Exception {
+        String arguments = JsonWriter.write(Map.of("explanation", "Preserve the root.",
+                "candidateWizard", Map.of("root", Map.of("table", "orders"))));
+        String complete = chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function",
+                Map.of("name", "propose_pipeline", "arguments", arguments)))), null);
+        withServer(200, complete + "data: [DONE]\n\n", settings -> {
+            var client = new OpenAiCompatibleClient(URI::create, Duration.ofSeconds(5),
+                    (request, uri, body) -> { }, 5);
+            var text = new StringBuilder();
+            assertThat(client.propose(settings, List.of(), Map.of(), text::append))
+                    .hasValueSatisfying(value -> assertThat(value).containsKey("root"));
+            assertThat(text).hasToString("Preserve the root.");
+        });
+        withServer(200, complete, settings -> {
+            var client = new OpenAiCompatibleClient(URI::create, Duration.ofSeconds(5),
+                    (request, uri, body) -> { }, 5);
+            assertThatThrownBy(() -> client.propose(settings, List.of(), Map.of(), ignored -> { }))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL));
+        });
+    }
+
     @Test void describesUnionAndMapRulesForBuilderProposals() throws Exception {
         String arguments = JsonWriter.write(Map.of("candidateWizard", Map.of("root", Map.of("transforms", List.of(
                 Map.of("id", "copy-name", "name", "map", "type", "map", "enabled", true,
@@ -177,7 +370,12 @@ class OpenAiCompatibleClientTest {
             Map<?, ?> tool = (Map<?, ?>) ((List<?>) submitted.get().get("tools")).getFirst();
             Map<?, ?> function = (Map<?, ?>) tool.get("function");
             Map<?, ?> parameters = (Map<?, ?>) function.get("parameters");
-            Map<?, ?> candidateSchema = (Map<?, ?>) ((Map<?, ?>) parameters.get("properties")).get("candidateWizard");
+            Map<?, ?> properties = (Map<?, ?>) parameters.get("properties");
+            Map<?, ?> explanation = (Map<?, ?>) properties.get("explanation");
+            String identifierGuidance = "Preserve the exact spelling of table names, field names and DSL identifiers when referring to them in prose.";
+            assertThat(explanation.get("description")).asString()
+                    .contains("language of the latest user request", "unless the user explicitly requests another reply language", identifierGuidance);
+            Map<?, ?> candidateSchema = (Map<?, ?>) properties.get("candidateWizard");
             assertThat(candidateSchema).as("the provider must receive the Builder candidate contract").isNotNull();
             assertThat(candidateSchema.get("properties")).as("candidateWizard must declare its Builder fields").isNotNull();
             Map<?, ?> rootSchema = (Map<?, ?>) ((Map<?, ?>) candidateSchema.get("properties")).get("root");
@@ -202,6 +400,8 @@ class OpenAiCompatibleClientTest {
                     .map(item -> (Map<?, ?>) item).filter(item -> "system".equals(item.get("role")))
                     .map(item -> (String) item.get("content")).findFirst().orElseThrow();
             assertThat(systemPrompt).contains("passthroughUnlisted", "ruleType", "$<sourceField>");
+            assertThat(systemPrompt).contains("language of the latest user request",
+                    "unless the user explicitly requests another reply language", identifierGuidance);
             assertThat(systemPrompt).contains("Bundled DSL semantics", "CEL boolean predicate",
                     "A rename consumes its source name", "ctx.emit(record)", "explicit alias map");
             assertThat(systemPrompt).contains("function process(record, ctx)", "record.after",
@@ -282,9 +482,10 @@ class OpenAiCompatibleClientTest {
                 .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
     }
 
-    @Test void connectionCheckAcceptsAChoicesEnvelopeAndRejectsAnEmptyChoicesList() throws Exception {
-        withServer(200, "{\"choices\":[{}]}", settings ->
-                assertThatCode(() -> localClient().check(settings)).doesNotThrowAnyException());
+    @Test void connectionCheckRequiresToolSupportAndRejectsAnEmptyChoicesList() throws Exception {
+        withServer(200, "{\"choices\":[{\"message\":{\"content\":\"OK\"}}]}", settings ->
+                assertThatThrownBy(() -> localClient().check(settings)).isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_REQUEST_REJECTED)));
         withServer(200, "{\"choices\":[]}", settings -> assertThatThrownBy(() -> localClient().check(settings))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));

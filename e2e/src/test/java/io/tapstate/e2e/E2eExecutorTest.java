@@ -38,10 +38,10 @@ class E2eExecutorTest {
                 name: refused
                 pipeline: p.tap.yml
                 steps:
-                  - start_refused: actuation.source-schema-not-discovered
+                  - start_refused: TS0360004
                 """);
         assertThat(binding.calls).containsExactly("apply:[p.tap.yml]",
-                "start_refused:" + PIPELINE_ID + ":actuation.source-schema-not-discovered");
+                "start_refused:" + PIPELINE_ID + ":TS0360004");
     }
 
     @Test
@@ -232,9 +232,9 @@ class E2eExecutorTest {
     void awaitsTheFailureCodeOfThePipelineResolvedFromTheEnvelope() {
         // A dead pipeline is already assertable as a state and a count; neither says what killed it, and a
         // regression that swaps the reason for another would pass both. The code is the assertable identity.
-        binding.failureCodesUnobservedThen("engine.job-failed");
+        binding.failureCodesUnobservedThen("TS0440008");
 
-        execute(minimal("steps:\n  - await: { failure_code: engine.job-failed }\n"));
+        execute(minimal("steps:\n  - await: { failure_code: TS0440008 }\n"));
 
         assertThat(binding.failureCodedPipelineIds).containsOnly(PIPELINE_ID);
     }
@@ -247,7 +247,7 @@ class E2eExecutorTest {
                 .filter(path -> path.getParent().getFileName().toString().equals(example))
                 .findFirst().orElseThrow();
         binding.states(PipelineState.FAILED);
-        binding.failureCodesUnobservedThen("actuation.source-schema-not-discovered");
+        binding.failureCodesUnobservedThen("TS0360004");
 
         execute(Examples.read(specification));
 
@@ -258,13 +258,31 @@ class E2eExecutorTest {
     }
 
     @Test
+    void publishedUnreachableViewStoreWaitsForTheDiagnosisAfterTheFailedState() {
+        var workspace = Examples.ROOT.resolve("a-view-whose-store-cannot-be-reached-fails-with-a-named-code");
+        binding.states(PipelineState.FAILED);
+        // The checkpoint exposes FAILED before the observation publishes its diagnosis.
+        binding.failureCodesUnobservedThen("TS0360023");
+        var target = new TableAlias("tgt_file", "orders");
+        binding.countsOverTime(target, 0L);
+
+        new E2eExecutor(binding, new FilePipelineLoader(workspace),
+                Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(EnvelopeParser.parse(Examples.read(workspace.resolve("spec.e2e.yml"))));
+
+        assertThat(binding.failureCodedPipelineIds).containsOnly("e2e_pipeline");
+        assertThat(binding.failureCodeReads).isGreaterThanOrEqualTo(2);
+        assertThat(binding.readTables).contains(target);
+    }
+
+    @Test
     void reportsTheFailureCodeMismatchAgainstTheResolvedPipeline() {
-        binding.failureCodes("io.store-unauthorized");
+        binding.failureCodes("TS0480003");
 
         assertThatThrownBy(() -> execute(minimal("steps:\n  - assert: { failure_code: engine.job-failed }\n")))
                 .isInstanceOf(AssertionError.class)
                 .hasMessageContaining("mongo2mongo expected failure code engine.job-failed")
-                .hasMessageContaining("io.store-unauthorized");
+                .hasMessageContaining("TS0480003");
     }
 
     @Test
