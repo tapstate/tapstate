@@ -301,7 +301,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     (PeriodicObservations) beans.getSingleton("periodicObservations"),
                     (PipelineConvergences) beans.getSingleton("pipelineConvergences"),
                     (ProcessObservationWriter) beans.getSingleton("processObservationWriter"),
-                    (HazelcastInstance) beans.getSingleton("hazelcastMember"));
+                    (HazelcastInstance) beans.getSingleton("hazelcastMember"),
+                    (NodeSessionLease) beans.getSingleton("nodeSessionLease"));
         }
         var owners = shutdownOwners;
         var pipelines = owners == null ? null : owners.pipelines();
@@ -312,20 +313,30 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var alerts = alertRuntime.get();
         var initial = initialTestCaller.get();
 
-        // A worker that fails to drain must not leave the member and its session alive.
-        var cleanup = new ArrayList<Runnable>();
-        if (pipelines != null) cleanup.add(pipelines::stopForShutdown);
-        if (convergence != null) cleanup.add(convergence::close);
-        if (periodic != null) cleanup.add(periodic::close);
+        var drain = new ArrayList<Runnable>();
+        if (pipelines != null) drain.add(pipelines::stopForShutdown);
+        if (convergence != null) drain.add(convergence::close);
+        if (periodic != null) drain.add(periodic::close);
         if (alerts != null) {
-            cleanup.add(alerts::close);
-            cleanup.add(() -> alerts.awaitStopped(deadline));
+            drain.add(alerts::close);
+            drain.add(() -> alerts.awaitStopped(deadline));
         }
-        if (pipelines != null) cleanup.add(() -> pipelines.awaitStopped(deadline));
-        if (convergence != null) cleanup.add(() -> convergence.awaitStopped(deadline));
-        if (periodic != null) cleanup.add(() -> periodic.awaitStopped(deadline));
-        if (observationWrites != null) cleanup.add(observationWrites::close);
-        if (initial != null) cleanup.add(initial::interrupt);
+        if (pipelines != null) drain.add(() -> pipelines.awaitStopped(deadline));
+        if (convergence != null) drain.add(() -> convergence.awaitStopped(deadline));
+        if (periodic != null) drain.add(() -> periodic.awaitStopped(deadline));
+        if (observationWrites != null) drain.add(observationWrites::close);
+        if (initial != null) drain.add(initial::interrupt);
+        try {
+            ShutdownAwait.all(drain);
+        } catch (RuntimeException | Error failure) {
+            // Keep worker resources open for retry, but stop the old member and end its session.
+            if (member != null) ShutdownAwait.all(List.of(
+                    () -> { throw failure; },
+                    () -> stopMember(member, owners.lease())));
+            throw failure;
+        }
+
+        var cleanup = new ArrayList<Runnable>();
         if (payloadCleanup != null) cleanup.add(() -> { payloadCleanup.close(); payloadCleanup = null; });
         if (memberStorage != null) cleanup.add(memberStorage::close);
         if (context != null) cleanup.add(context::close);
@@ -337,8 +348,15 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         shutdownOwners = null;
     }
 
+    private static void stopMember(HazelcastInstance member, NodeSessionLease lease) {
+        if (lease != null) lease.close();
+        if (member.getLifecycleService().isRunning()) member.shutdown();
+        if (member.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
+    }
+
     private record ShutdownOwners(PipelineActuationOwnership pipelines, PeriodicObservations periodic,
-            PipelineConvergences convergence, ProcessObservationWriter observationWrites, HazelcastInstance member) {}
+            PipelineConvergences convergence, ProcessObservationWriter observationWrites, HazelcastInstance member,
+            NodeSessionLease lease) {}
 
     static final class ChildOnly implements Condition {
         @Override public boolean matches(ConditionContext context, org.springframework.core.type.AnnotatedTypeMetadata metadata) {

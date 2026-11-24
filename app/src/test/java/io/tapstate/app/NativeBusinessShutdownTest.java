@@ -66,10 +66,14 @@ class NativeBusinessShutdownTest {
             child.getBeanFactory().registerSingleton("periodicObservations", periodic);
             child.refresh();
             ReflectionTestUtils.setField(owner, "context", child);
+            var storage = mock(NativeMemberStorage.class);
+            ReflectionTestUtils.setField(owner, "memberStorage", storage);
 
             var thrown = catchThrowable(() -> ShutdownAwait.within(Duration.ofMillis(250), owner::close));
             assertThat(thrown).isNotNull().isSameAs(failure.get());
             assertThat(running).isFalse();
+            assertThat(child.isActive()).isTrue();
+            verify(storage, never()).close();
             verify(claims).release(argThat(ending -> ending.key().equals(key)
                     && ending.owner().equals(claim.owner()) && ending.claimGeneration() == claim.claimGeneration()));
             assertThat(claims.read(key).orElseThrow().leased()).isFalse();
@@ -79,6 +83,8 @@ class NativeBusinessShutdownTest {
             release.countDown();
             assertThat(worker.awaitTermination(2, TimeUnit.SECONDS)).isTrue();
             owner.close();
+            verify(storage).close();
+            assertThat(child.isActive()).isFalse();
         } finally {
             release.countDown();
             worker.shutdownNow();
