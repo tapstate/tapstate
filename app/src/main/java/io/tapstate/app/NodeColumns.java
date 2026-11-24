@@ -624,13 +624,10 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         List<Set<String>> candidates = new ArrayList<>();
         for (Set<String> names : KeyProjection.candidates(
                 upstream.keyCandidates(), rules, upstream.columns()::containsKey)) {
-            if (names.isEmpty()) {
-                candidates.add(Set.of());
-                continue;
-            }
             Set<String> surviving = new LinkedHashSet<>(names);
             surviving.retainAll(out.keySet());
-            if (!surviving.isEmpty()) candidates.add(surviving);
+            // An empty set records a required key component that has lost all its aliases.
+            candidates.add(surviving);
         }
         List<String> key = candidates.stream().filter(names -> !names.isEmpty())
                 .map(names -> names.iterator().next()).toList();
