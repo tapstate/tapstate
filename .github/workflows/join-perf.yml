@@ -57,6 +57,9 @@ jobs:
           java-version: "21"
           cache: maven
 
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
+
       - name: every scenario, on every tier
         run: |
           set -o pipefail
