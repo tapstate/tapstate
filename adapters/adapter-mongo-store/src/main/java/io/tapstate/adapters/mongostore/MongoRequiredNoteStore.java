@@ -544,7 +544,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         });
     }
 
-    private record NoteSnapshot(RequiredNoteScope scope, Document metadata, Document origin) {}
+    private record NoteSnapshot(RequiredNoteScope scope, Document metadata, Document origin, Document operator) {}
 
     private NoteSnapshot readNoteSnapshot(RequiredNoteOwner owner) {
         if (retirement != null || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
@@ -568,7 +568,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         var scope = scopeOf(owner, metadata);
         // A missing or ambiguous join keeps the origin collection's own predicate in this snapshot.
         if (origin == null) origin = origins.find(session, byScope(owner)).first();
-        return new NoteSnapshot(scope, metadata, origin);
+        return new NoteSnapshot(scope, metadata, origin, operator);
     }
 
     @Override
@@ -641,8 +641,14 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     public void markLocalArtifactReady(RequiredNoteScope scope, RequiredNoteOrigin expected) {
         requireOriginScope(scope);
         transactionWithInspection(session -> {
-            if (readyMarker(session, scope, expected)) return null;
-            verifyScope(session, scope, true);
+            var read = readySnapshot(session, scope);
+            if (readyMarker(session, scope, expected, read)) return null;
+            if (read == null) {
+                verifyScope(session, scope, true);
+            } else {
+                if (read.operator() != null) fenceNoteOwner(session, scope.owner(), read.operator());
+                fencePhysicalScope(session, scope, read.metadata());
+            }
             if (origins.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
                     new Document("$set", new Document("localArtifactReady", true))).getMatchedCount() != 1)
                 throw unavailable();
@@ -651,8 +657,15 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     private boolean readyMarker(ClientSession session, RequiredNoteScope scope, RequiredNoteOrigin expected) {
-        var read = retirement == null && !MongoValidationClaimObservation.lacksSnapshotRead(client)
+        return readyMarker(session, scope, expected, readySnapshot(session, scope));
+    }
+
+    private NoteSnapshot readySnapshot(ClientSession session, RequiredNoteScope scope) {
+        return retirement == null && !MongoValidationClaimObservation.lacksSnapshotRead(client)
                 ? noteSnapshot(session, scope.owner()) : null;
+    }
+
+    private boolean readyMarker(ClientSession session, RequiredNoteScope scope, RequiredNoteOrigin expected, NoteSnapshot read) {
         if (read != null && !scope.equals(read.scope())) throw unavailable();
         var metadata = read == null ? verifyScope(session, scope, false) : read.metadata();
         var row = read == null ? origins.find(session, byScope(scope.owner())).first() : read.origin();
@@ -1433,13 +1446,15 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         if (owner.kind() == RequiredNoteOwner.Kind.PIPELINE) {
             Document operator = operators.find(session, new Document("_id", owner.ownerId())).first();
             checkPipelineOwner(operator, owner, authoringOnly);
-            if (write) {
-                Document filter = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
-                        .append("phase", "ACTIVE").append("noteWriteFence", operator.getLong("noteWriteFence"));
-                if (operators.updateOne(session, filter,
-                        new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw unavailable();
-            }
+            if (write) fenceNoteOwner(session, owner, operator);
         }
+    }
+
+    private void fenceNoteOwner(ClientSession session, RequiredNoteOwner owner, Document operator) {
+        var filter = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
+                .append("phase", "ACTIVE").append("noteWriteFence", operator.getLong("noteWriteFence"));
+        if (operators.updateOne(session, filter,
+                new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw unavailable();
     }
 
     private static void checkPipelineOwner(Document operator, RequiredNoteOwner owner, boolean authoringOnly) {

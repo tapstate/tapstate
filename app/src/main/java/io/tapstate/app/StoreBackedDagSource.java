@@ -265,7 +265,9 @@ final class StoreBackedDagSource implements DagSource {
             java.util.function.BiConsumer<Set<String>, Map<String, String>> connectorInputs) {
         PipelineResource pipeline = PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,pipelineId),snapshot);
         var sources = pipeline.sourceIds().stream().distinct().map(id -> StoredArtifacts.requireSource(snapshot,id)).toList();
-        SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId,sources,storePort.schemas());
+        var schemas = pass != null && storePort instanceof ThreeLayerStorePort nativeStore
+                ? nativeStore.startSchemas() : storePort.schemas();
+        SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId, sources, schemas);
         var inspection = pass == null
                 ? new CapturedStartGuard.Inspection(Map.of(), models)
                 : capturedStartGuard.inspect(pass, snapshot, models);

@@ -439,12 +439,14 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     @Override public synchronized Optional<SourceRecovery> recoverSource(
             String pipeline, java.util.function.BooleanSupplier currentIntent) {
-        requireId(pipeline);
+        requireRead(pipeline);
         if (original == null || !isCurrentRun() || !(captures instanceof ScopedPipelineCaptureCoordinator scoped)) {
             return Optional.empty();
         }
         var episode = scoped.directRetry(original);
         if (episode.isEmpty()) return Optional.empty();
+        // A missing local retry is only an observation. Reprove storage authority before driving a real episode.
+        if (ownership.processOwnsClaims()) require();
         var retry = episode.orElseThrow();
         var pending = retry.decision(scoped.streamRetryPolicy());
         if (pending == null) return Optional.empty();
