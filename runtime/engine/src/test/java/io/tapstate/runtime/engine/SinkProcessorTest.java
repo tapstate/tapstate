@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.jet.core.Watermark;
+import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
@@ -157,6 +158,19 @@ class SinkProcessorTest {
         SinkProcessor processor = init(new SinkProcessor(writer, 4, 1024));
         processor.close();
         processor.close();
+        assertThat(writer.closes.get()).isEqualTo(1);
+    }
+
+    @Test
+    void closes_the_target_when_the_checkpoint_close_wait_fails() throws Exception {
+        var failure = new IllegalStateException("checkpoint close wait expired");
+        var ack = new SinkAck() {
+            @Override public void advance(String chain, ChainPosition position) { }
+            @Override public void flushOnClose() { throw failure; }
+        };
+        var writer = new RecordingWriter();
+        var processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(), 1, 1));
+        assertThatThrownBy(processor::close).isSameAs(failure);
         assertThat(writer.closes.get()).isEqualTo(1);
     }
 
@@ -391,6 +405,237 @@ class SinkProcessorTest {
     }
 
     @Test
+    void snapshot_delivery_waits_for_the_last_write_before_preparing_and_acknowledging() throws Exception {
+        var calls = new ArrayList<String>();
+        var pending = new CompletableFuture<WriteResult>();
+        SinkWriter writer = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return pending;
+            }
+
+            @Override
+            public void snapshotDelivered(String stream) {
+                calls.add("prepared=" + stream);
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        SinkAck ack = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                calls.add("advance=" + chain);
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                calls.add("bounded=" + chain);
+            }
+        };
+        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1));
+        var inbox = new TestInbox();
+        inbox.add(snapshotRow("orders"));
+
+        processor.process(0, inbox);
+        processor.tryProcessWatermark(snapshotBoundOn("orders"));
+        assertThat(calls).isEmpty();
+
+        pending.complete(new WriteResult(1));
+        drain(processor);
+
+        assertThat(calls).containsExactly("prepared=orders", "advance=orders", "bounded=orders");
+    }
+
+    @Test
+    void an_empty_snapshot_prepares_the_target_before_its_bound_is_acknowledged() throws Exception {
+        var calls = new ArrayList<String>();
+        SinkWriter writer = new RecordingSnapshotWriter(calls);
+        SinkAck ack = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                throw new AssertionError("an empty snapshot has no written position");
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                assertThat(through).isEqualTo(SourceOrder.snapshotRow(1));
+                calls.add("bounded=" + chain);
+            }
+        };
+        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1));
+
+        processor.tryProcessWatermark(snapshotBoundOn("orders"));
+
+        assertThat(calls).containsExactly("prepared=orders", "bounded=orders");
+    }
+
+    @Test
+    void a_later_cdc_bound_does_not_displace_a_held_empty_snapshot_notification() throws Exception {
+        var calls = new ArrayList<String>();
+        var bounds = new ArrayList<SourceOrder>();
+        var pending = new CompletableFuture<WriteResult>();
+        var writer = new RecordingSnapshotWriter(calls) {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return pending;
+            }
+        };
+        var ack = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                calls.add("bounded=" + chain);
+                bounds.add(through);
+            }
+        };
+        var processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1));
+        var inbox = new TestInbox();
+        inbox.add(snapshotRow("lines"));
+        processor.process(0, inbox);
+
+        processor.tryProcessWatermark(snapshotBoundOn("orders"));
+        processor.tryProcessWatermark(boundAt("orders", 2));
+        assertThat(calls).isEmpty();
+
+        pending.complete(new WriteResult(1));
+        drain(processor);
+
+        assertThat(calls).containsExactly("prepared=orders", "bounded=orders", "bounded=orders");
+        assertThat(bounds).containsExactly(SourceOrder.snapshotRow(1), new SourceOrder(1, 2));
+    }
+
+    @Test
+    void an_empty_assembled_output_is_prepared_after_all_of_its_input_snapshots_and_before_final_ack()
+            throws Exception {
+        var calls = new ArrayList<String>();
+        var chains = new PipelineChains();
+        chains.source("source-orders", "orders");
+        chains.source("source-lines", "lines");
+        chains.assembled("nested", List.of("source-orders", "source-lines"));
+        chains.derived("filtered", List.of("nested"));
+        var ack = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                throw new AssertionError("the empty output has no position to advance");
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                calls.add("bounded=" + chain);
+            }
+        };
+        var processor = init(new SinkProcessor(new RecordingSnapshotWriter(calls), ack,
+                new ContiguousPrefix(AXES), 1, 1).withAssembledOutputs(chains.assembledOutputs(List.of("filtered"))));
+
+        processor.tryProcessWatermark(snapshotBoundOn("orders"));
+        assertThat(calls).containsExactly("prepared=orders", "bounded=orders");
+        processor.tryProcessWatermark(snapshotBoundOn("lines"));
+        assertThat(calls).containsExactly("prepared=orders", "bounded=orders",
+                "prepared=lines", "prepared=nested", "bounded=lines");
+    }
+
+    @Test
+    void an_assembled_output_recovers_previously_landed_inputs_on_restart() throws Exception {
+        var calls = new ArrayList<String>();
+        SinkAck ack = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                throw new AssertionError("the empty output has no position to advance");
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                calls.add("bounded=" + chain);
+            }
+        };
+        var processor = init(new SinkProcessor(new RecordingSnapshotWriter(calls), ack,
+                new ContiguousPrefix(AXES), 1, 1)
+                .withAssembledOutputs(Map.of("nested", List.of("orders", "lines")))
+                .withCompletedSnapshotInputs(java.util.Set.of("orders")));
+        assertThat(calls).isEmpty();
+
+        processor.tryProcessWatermark(snapshotBoundOn("lines"));
+
+        assertThat(calls).containsExactly("prepared=lines", "prepared=nested", "bounded=lines");
+    }
+
+    @Test
+    void an_assembled_output_with_all_inputs_recovered_is_notified_without_another_bound() throws Exception {
+        var calls = new ArrayList<String>();
+        var processor = new SinkProcessor(new RecordingSnapshotWriter(calls), new RecordingAck(),
+                new ContiguousPrefix(AXES), 1, 1)
+                .withAssembledOutputs(Map.of("nested", List.of("orders", "lines")))
+                .withCompletedSnapshotInputs(java.util.Set.of("orders", "lines"));
+
+        init(processor);
+
+        assertThat(calls).containsExactly("prepared=nested");
+    }
+
+    @Test
+    void failed_snapshot_preparation_keeps_the_empty_snapshot_unacknowledged() throws Exception {
+        var calls = new ArrayList<String>();
+        var failure = new IllegalStateException("target schema could not be prepared");
+        SinkWriter writer = new RecordingSnapshotWriter(calls) {
+            @Override
+            public void snapshotDelivered(String stream) {
+                throw failure;
+            }
+        };
+        var ack = new RecordingAck();
+        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1));
+        Watermark bound = snapshotBoundOn("orders");
+
+        assertThatThrownBy(() -> processor.tryProcessWatermark(bound)).isSameAs(failure);
+
+        assertThat(ack.positions).isEmpty();
+        assertThat(calls).isEmpty();
+    }
+
+    @Test
+    void a_snapshot_preparation_error_is_retained_with_its_original_identity() throws Exception {
+        var fixture = new EngineRunHandleTest.Fixture(null);
+        var failure = new AssertionError("target preparation invariant failed");
+        var writer = new RecordingSnapshotWriter(new ArrayList<>()) {
+            @Override
+            public void snapshotDelivered(String stream) {
+                throw failure;
+            }
+        };
+        var ack = new RecordingAck();
+        var processor = new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 1);
+        processor.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext()
+                .setHazelcastInstance(fixture.member).setJobConfig(new JobConfig().setName("p")));
+        Watermark bound = snapshotBoundOn("orders");
+
+        assertThatThrownBy(() -> processor.tryProcessWatermark(bound)).isSameAs(failure);
+
+        assertThat(JobFailureRegistry.of(fixture.member).get("p")).containsSame(failure);
+        assertThat(ack.positions).isEmpty();
+    }
+
+    @Test
+    void an_asynchronous_checkpoint_failure_is_retained_by_the_original_idle_processor() throws Exception {
+        var fixture = new EngineRunHandleTest.Fixture(null);
+        var failure = new IllegalStateException("checkpoint write refused");
+        var ack = new SinkAck() {
+            @Override public void advance(String chain, ChainPosition position) { }
+            @Override public void flush(boolean complete) { throw failure; }
+        };
+        var processor = new SinkProcessor(new RecordingWriter(), ack, new ContiguousPrefix(AXES), 1, 1);
+        processor.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext()
+                .setHazelcastInstance(fixture.member).setJobConfig(new JobConfig().setName("p")));
+
+        assertThatThrownBy(processor::tryProcess).isSameAs(failure);
+        assertThat(JobFailureRegistry.of(fixture.member).get("p")).containsSame(failure);
+    }
+
+    @Test
     void a_snapshot_row_is_acked_when_a_change_above_it_settles_in_the_same_batch() throws Exception {
         RecordingAck ack = new RecordingAck();
         // A batch wide enough to hold a table's whole load and the first change above it. That is the
@@ -410,6 +655,29 @@ class SinkProcessorTest {
         assertThat(ack.positions).extracting(ChainPosition::order)
                 .as("the snapshot position is acked in its own right, not passed over by the change above it")
                 .contains(SourceOrder.snapshotRow(1));
+    }
+
+    @Test
+    void a_mixed_batch_cannot_ack_its_snapshot_if_delivery_notification_fails() throws Exception {
+        var failure = new IllegalStateException("snapshot preparation failed");
+        var writer = new RecordingSnapshotWriter(new ArrayList<>()) {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return CompletableFuture.completedFuture(new WriteResult(records.size()));
+            }
+
+            @Override
+            public void snapshotDelivered(String stream) {
+                throw failure;
+            }
+        };
+        var ack = new RecordingAck();
+        var processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(AXES), 1, 4));
+        var inbox = new TestInbox();
+        inbox.addAll(List.of(snapshotRow("orders"), at("orders", "p1")));
+
+        assertThatThrownBy(() -> pump(processor, inbox)).isSameAs(failure);
+        assertThat(ack.positions).isEmpty();
     }
 
     @Test
@@ -721,6 +989,28 @@ class SinkProcessorTest {
         @Override
         public void close() {
             closes.incrementAndGet();
+        }
+    }
+
+    private static class RecordingSnapshotWriter implements SinkWriter {
+        private final List<String> calls;
+
+        RecordingSnapshotWriter(List<String> calls) {
+            this.calls = calls;
+        }
+
+        @Override
+        public CompletionStage<WriteResult> write(List<Envelope> records) {
+            throw new AssertionError("the snapshot has no records to write");
+        }
+
+        @Override
+        public void snapshotDelivered(String stream) {
+            calls.add("prepared=" + stream);
+        }
+
+        @Override
+        public void close() {
         }
     }
 

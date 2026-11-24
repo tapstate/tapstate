@@ -105,7 +105,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.web.client.RestClient;
 
 import org.springframework.web.method.HandlerMethod;
@@ -391,6 +394,18 @@ class AuthTest {
         }
     }
 
+    @Test
+    void apiSecurityHeadersArePresentBeforeTheHandlerCanStartStreaming() throws Exception {
+        var api = context.getBean("apiSecurityFilterChain", SecurityFilterChain.class);
+        var headers = api.getFilters().stream().filter(HeaderWriterFilter.class::isInstance).findFirst().orElseThrow();
+        var request = new MockHttpServletRequest("POST", "/api/pipelines/orders/draft:assistant");
+        var response = new MockHttpServletResponse();
+        headers.doFilter(request, response, (req, res) -> {
+            assertThat(response.getHeader("X-Content-Type-Options")).isEqualTo("nosniff");
+            assertThat(response.isCommitted()).isFalse();
+        });
+    }
+
     // ---- an unauthenticated caller cannot reach a verb ----
 
     @Test
@@ -402,7 +417,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
         // The refusal echoes nothing back, so it cannot be used to probe which credentials exist.
         assertThat(body.params()).isEmpty();
     }
@@ -414,7 +429,7 @@ class AuthTest {
                 assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                 return response.bodyTo(ApiError.class);
             });
-            assertThat(anonymous.code()).isEqualTo("control.unauthenticated");
+            assertThat(anonymous.code()).isEqualTo("TS0210003");
         }
         String reader = machineToken(Scope.READ);
         ResponseEntity<String> catalog = client().get().uri("/api/sample-sources/catalog")
@@ -428,7 +443,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(refused.code()).isEqualTo("control.forbidden");
+        assertThat(refused.code()).isEqualTo("TS0210004");
         assertThat(refused.params()).containsEntry("op", "sample-source.install");
     }
 
@@ -441,7 +456,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -453,7 +468,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
         assertThat(body.params()).isEmpty();
     }
 
@@ -472,7 +487,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.forbidden");
+        assertThat(body.code()).isEqualTo("TS0210004");
         assertThat(body.params()).containsEntry("op", "artifact.apply").containsEntry("required", "write");
     }
 
@@ -551,7 +566,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(malformed.code()).isEqualTo("control.malformed-request");
+        assertThat(malformed.code()).isEqualTo("TS0210001");
     }
 
     @Test
@@ -581,8 +596,8 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(malformed.code()).isEqualTo("control.unauthenticated");
-        assertThat(duplicate.code()).isEqualTo("control.unauthenticated");
+        assertThat(malformed.code()).isEqualTo("TS0210003");
+        assertThat(duplicate.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -596,7 +611,7 @@ class AuthTest {
                 });
 
         assertThat(unknownApi).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(unknownRoot.code()).isEqualTo("control.unauthenticated");
+        assertThat(unknownRoot.code()).isEqualTo("TS0210003");
 
         HttpStatusCode wrongMethod = client().put().uri("/api/sources")
                 .header("Authorization", "Bearer " + machineToken(Scope.ADMIN))
@@ -741,7 +756,7 @@ class AuthTest {
 
         assertThat(logout).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(logoutAgain).isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(afterLogout.code()).isEqualTo("control.unauthenticated");
+        assertThat(afterLogout.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -759,7 +774,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(bearer.code()).isEqualTo("control.unauthenticated");
+        assertThat(bearer.code()).isEqualTo("TS0210003");
 
         ApiError sessionAsApiBearer = client().get().uri("/api/artifacts")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + login.sessionToken())
@@ -767,7 +782,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(sessionAsApiBearer.code()).isEqualTo("control.unauthenticated");
+        assertThat(sessionAsApiBearer.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -792,7 +807,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(duplicate.code()).isEqualTo("control.unauthenticated");
+        assertThat(duplicate.code()).isEqualTo("TS0210003");
 
         context.getBean(FakeSessionStore.class).replaceIssuer("tok-1", "urn:other");
         assertSessionUnauthorized(AuthWire.SESSION_PATH, AuthWire.sessionAuthorization(login.sessionToken()));
@@ -806,7 +821,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(error.code()).isEqualTo("control.unauthenticated");
+        assertThat(error.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -840,14 +855,14 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.auth-failed");
+        assertThat(body.code()).isEqualTo("TS0210002");
         assertThat(body.params()).as("the login failure reveals nothing about which half was wrong").isEmpty();
     }
 
     @Test
     void loginWithABlankCredentialIsABadRequestWithACodedBody() {
         // A missing / blank credential field is a malformed request — the client omitted a required value —
-        // refused at the boundary with a coded control.malformed-request (400). This is distinct from a
+        // refused at the boundary with a coded TS0210001 (400). This is distinct from a
         // present-but-wrong credential (the auth-failed 401), and it never reaches the login service's bare
         // argument crash.
         ApiError body = client().post().uri("/auth/login")
@@ -858,7 +873,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
     }
 
@@ -893,13 +908,13 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.bootstrap-closed");
+        assertThat(body.code()).isEqualTo("TS0210018");
     }
 
     @Test
     void bootstrapWithABlankCredentialIsABadRequestWithACodedBody() {
         // The test client is on loopback and the store is empty, so the bootstrap channel is open. A blank
-        // password is still refused at the boundary with a coded control.malformed-request (400) — it would
+        // password is still refused at the boundary with a coded TS0210001 (400) — it would
         // otherwise be hashed into a non-blank hash and silently create an admin with an empty password.
         ApiError body = client().post().uri("/auth/bootstrap")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -909,7 +924,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
     }
 
@@ -975,7 +990,7 @@ class AuthTest {
                         assertThat(response.getHeaders().getAllow()).isEmpty();
                         return response.bodyTo(ApiError.class);
                     });
-            assertThat(body.code()).isEqualTo("control.unauthenticated");
+            assertThat(body.code()).isEqualTo("TS0210003");
         }
     }
 
@@ -997,7 +1012,7 @@ class AuthTest {
                     assertThat(response.getHeaders().getAllow()).isEmpty();
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(refused.code()).isEqualTo("control.forbidden");
+        assertThat(refused.code()).isEqualTo("TS0210004");
         assertThat(refused.params()).containsEntry("op", "pipeline-draft.create").containsEntry("required", "write");
 
         client().options().uri(draft).headers(headers -> headers.setBearerAuth(machineToken(Scope.WRITE)))

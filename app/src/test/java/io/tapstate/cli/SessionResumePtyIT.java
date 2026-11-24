@@ -52,7 +52,7 @@ class SessionResumePtyIT {
     private static final Duration TERMINATION_TIMEOUT = Duration.ofSeconds(5);
     private static final String SIGNED_OUT_CONNECTORS_DIAGNOSTIC = String.join(
             System.lineSeparator(),
-            "error: cli.not-authenticated",
+            "error: TS0330021",
             "  The `connectors` command needs you to sign in first.",
             "  Run `login <username>`, or start with `tapstate -c <host:port> -u <user>`.",
             "  (cli " + Cli.VERSION_NUMBER + ", server " + Cli.VERSION_NUMBER + ")",

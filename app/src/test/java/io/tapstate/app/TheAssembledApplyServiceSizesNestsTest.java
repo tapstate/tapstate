@@ -130,7 +130,7 @@ class TheAssembledApplyServiceSizesNestsTest {
 
     private static ValidationDiagnostic sizingWarning(ArtifactValidationResult result) {
         return result.warnings().stream()
-                .filter(w -> w.code().equals("nest.state-far-exceeds-memory-budget"))
+                .filter(w -> w.code().equals("TS0460001"))
                 .findFirst()
                 .orElse(null);
     }

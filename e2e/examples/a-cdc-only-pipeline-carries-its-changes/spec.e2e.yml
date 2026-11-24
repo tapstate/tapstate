@@ -17,7 +17,8 @@
 # The state is asserted after the counts, not instead of them. A pipeline whose capture dies is driven
 # to FAILED, so a run that crashes in the acknowledgement path fails the count first and the state
 # second; a run that delivers and then dies would pass the counts and fail here. Neither on its own
-# says the mode works.
+# says the mode works. The first persisted observation can follow the CDC writes, so wait for it
+# within the same bounded executor timeout used for the counts.
 #
 # The source is read directly, with the shared replay buffer off, because that is the shape the defect
 # was reported in. The buffer is not what is being tested: it is switched off so that the change
@@ -36,4 +37,4 @@ steps:
   - await: { count: { tgt_file.orders: 2 } }
   - cdc: { src_file.orders: insert 3 }
   - await: { count: { tgt_file.orders: 5 } }
-  - assert: { state: RUNNING }
+  - await: { state: RUNNING }

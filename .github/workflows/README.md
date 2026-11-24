@@ -50,7 +50,7 @@ admission.
 
 ## Nightly Test
 
-`nightly-test.yml` is scheduled for 21:00 Asia/Shanghai and can be run manually from
+`nightly-test.yml` is scheduled for 18:00 Asia/Shanghai and can be run manually from
 `main`. The full reactor regression runs in parallel with real connectors,
 the full Join performance matrix, native CLI and MCP bundles for four
 platforms, the paired Cloud and OP image smoke, release-script self-tests,
@@ -121,7 +121,9 @@ the repository's Actions secrets before using that notification:
 
 The request carries the version and source revision; `git.extra` records the
 image tag, immutable image reference, digest, release URL, and workflow URL.
-Cloud provisioning continues to select the image by its version tag. Publication
+It also records whether the checked Cloud Boot JAR contains the managed
+Bedrock runtime configuration. The Cloud control plane can use this record
+to pin managed Bedrock launches to the approved image digest. Publication
 and registration share a cross-version concurrency queue so a delayed older
 insert cannot overtake the newer version's registration. Older
 release lines and releases already overtaken when the notification checks
@@ -211,6 +213,27 @@ tag can point to different bytes after a rebuild. Release rebuilds independently
 with its own environment configuration and approval. This lane adds no automatic
 PR/main test suite; its runner cost is incurred on manual dev dispatch and once
 per release attempt after the release gates pass.
+
+## Cluster image from selected branches
+
+`build-cluster-image.yml` is the manual lane for packaging a Cloud cluster image
+from any Tapstate and tapstate-web branch pair. Fill `tapstate_branch` and
+`tapstate_web_branch` (default `main`); the run builds the Cloud Web bundle from
+the Web commit, the Boot JAR from the Tapstate commit, stages the locked
+connector seed, verifies both image platforms, and publishes
+`ghcr.io/tapstate/tapstate-cloud:<next-minor>-dev`. The version calculator counts
+up from the tagged `main` history, so a feature branch needs no release tag of
+its own. The lane runs no test suite: the Boot JAR is packaged with
+`-DskipTests`, so test sources still compile for the modules that publish
+test-jars but no test executes. The Web step only bundles its pinned checkout,
+and the image check before the push is a packaging assertion.
+
+The job summary and the `json` job output carry the branch pair, build version,
+digest reference, tag, Web commit id, and run URL. Unlike the dev lane above,
+this workflow always publishes the plain `-dev` tag for the selected branches and
+does not register the image in the dev release catalog. It uses the same
+`cloud-ghcr-dev` environment and Public `tapstate-cloud` package, so the branch
+policy of that environment must allow the selected Tapstate ref.
 
 ## Test placement
 

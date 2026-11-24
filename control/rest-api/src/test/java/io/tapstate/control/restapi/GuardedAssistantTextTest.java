@@ -98,7 +98,7 @@ class GuardedAssistantTextTest {
             else stream.accept("late text");
             assertThat(admitted.await(3, TimeUnit.SECONDS)).isTrue();
             stream.close();
-            events.failure(ControlError.AI_PROVIDER_FAILED.code());
+            events.failure(new ApiError(ControlError.AI_PROVIDER_FAILED.code(), java.util.Map.of(), "Provider failed"));
             release.countDown();
             stream.finish();
             assertThat(output.toString(java.nio.charset.StandardCharsets.UTF_8))

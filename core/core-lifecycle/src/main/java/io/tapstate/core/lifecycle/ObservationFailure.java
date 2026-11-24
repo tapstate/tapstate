@@ -20,12 +20,17 @@ import java.util.Objects;
  * <p>The failure is current-state, like the observation carrying it: a recovered pipeline publishes an
  * observation with no failure rather than keeping the one that killed its previous run.
  */
-public record ObservationFailure(String code, Map<String, String> params) {
+public record ObservationFailure(String code, Map<String, String> params, Map<String, Object> diagnostic) {
+
+    public ObservationFailure(String code, Map<String, String> params) {
+        this(code, params, Map.of());
+    }
 
     public ObservationFailure {
         Objects.requireNonNull(code, "code");
         // A code with no arguments is normal; null reads as empty, and the copy makes the stored
         // projection immutable.
         params = params == null ? Map.of() : Map.copyOf(params);
+        diagnostic = io.tapstate.core.common.RuntimeDiagnosticProjection.fit(diagnostic);
     }
 }

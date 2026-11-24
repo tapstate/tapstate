@@ -110,7 +110,8 @@ public final class ConnectionTestService {
             owner = defaultFlight == null;
             if (owner) defaultFlight = new Flight(config, new java.util.concurrent.CompletableFuture<>());
             captured = defaultFlight;
-            if (!captured.connection().equals(config)) throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of(), null);
+            if (!captured.connection().equals(config)) throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "another connection test is using different settings"), null);
         }
         if (!owner) {
             try { return captured.report().join(); }

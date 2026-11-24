@@ -91,16 +91,16 @@ final class PipelinePrivateNoteRetirement {
         for(var context:notes.guardedBy(guard).privateContexts(request.originalScope(),request.operationId())) {
             guard.run();if(context.completed() || context.origin().isEmpty())continue;
             var owner=context.scope().owner();var source=direct.get(owner.namespace());
-            if(source==null || owner.kind()!=RequiredNoteOwner.Kind.PIPELINE
+            var node=owner.pipelineNode(PipelineNode.Purpose.CAPTURE);
+            if(source==null || node.isEmpty()
                     || !owner.ownerId().equals(request.originalScope().pipelineId())
                     || owner.bindingVersion()!=request.originalScope().bindingVersion()
                     || owner.stateGeneration()!=request.originalScope().stateGeneration()
-                    || !owner.namespace().equals(RequiredNoteOwner.namespace(new PipelineNode(owner.ownerId(),source.id()),PipelineNode.Purpose.CAPTURE))
-                    || !owner.hasPurpose(PipelineNode.Purpose.CAPTURE) || !source.connector().equals("postgres"))continue;
+                    || !source.connector().equals("postgres"))continue;
             if(!context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))throw unavailable();
             var retirement=notes.guardedBy(guard).retirement(context.scope(),request.operationId());
             if(retirement.completed())continue;
-            var config=new CaptureConfig("postgres",source.config(),List.of(),new PipelineNode(owner.ownerId(),source.id()));
+            var config=new CaptureConfig("postgres",source.config(),List.of(),node.orElseThrow());
             if(release.privatePostgres(retirement,config,request.originalScope().clusterId(),guard)) {
                 guard.run();operations.requirePending(original);retirement.completeAfterVerifiedRelease();guard.run();
             }
@@ -135,7 +135,7 @@ final class PipelinePrivateNoteRetirement {
         Objects.requireNonNull(original);Objects.requireNonNull(lifecycle);Objects.requireNonNull(guard);Objects.requireNonNull(local);
         guard.run();lifecycle.requirePending(original);var request=original.request();
         for(var retirement:notes.guardedBy(local).retirements(request.scope(),request.operationId())) {
-            guard.run();lifecycle.requirePending(original);releaseOne(request.scope().clusterId(),retirement,guard,local);
+            lifecycle.requirePending(original);releaseOne(request.scope().clusterId(),retirement,guard,local);
         }
         lifecycle.requirePending(original);guard.run();
     }

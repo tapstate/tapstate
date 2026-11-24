@@ -144,7 +144,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         requireActive.run();
         // Cross-domain validation is deliberately outside the CACHE transaction and its retry callback.
         requireIssued.run();
-        transaction(original.scope(), false, () -> {}, session -> {
+        checkpointTransaction(original.scope(), false, () -> {}, session -> {
             Document row = requireOriginal(session, original.scope(), original.preparationId());
             var inputs = admitted ? MongoPipelineSourcePreparations.retained(row, original.scope())
                     : MongoPipelineSourcePreparations.retained(session,database,original.scope());
@@ -167,12 +167,10 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
             var initial=new Document("_id",original.scope().pipelineId()).append("scope",MongoPipelinePreparationFacts.scope(original.scope()))
                     .append("stateJson",StateJson.of(PipelineState.NEW)).append("epoch",prior.map(value -> value.epoch()+1).orElse(0L))
                     .append("touchMillis",touchTime.toEpochMilli()).append("runtimeWriteFence",prior.map(value -> value.writeFence()+1).orElse(1L));
-            if(prior.isEmpty())states.insertOne(session,initial);
-            else {
-                var old=prior.orElseThrow();
-                if(states.replaceOne(session,new Document("_id",original.scope().pipelineId()).append("scope",MongoPipelinePreparationFacts.scope(old.scope()))
-                        .append("epoch",old.epoch()).append("runtimeWriteFence",old.writeFence()),initial).getMatchedCount()!=1)throw rebuild(original.scope());
-            }
+            var retired = prior.map(old -> new Document("_id", original.scope().pipelineId())
+                    .append("scope", MongoPipelinePreparationFacts.scope(old.scope()))
+                    .append("epoch", old.epoch()).append("runtimeWriteFence", old.writeFence())).orElse(null);
+            if (!MongoCachePipelineStateStore.seed(database, session, initial, retired)) throw rebuild(original.scope());
             if (admitted) MongoOperatorInventory.insertInitial(session, database, original.scope(), original.preparationId());
             else MongoOperatorInventory.prepareInitial(session, database, original.scope(), original.preparationId());
             MongoPipelineSourcePreparations.seedInitial(session,database,original.scope(),inputs);
@@ -345,6 +343,11 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
     }
     static TapstateException rebuild(PipelineIntentScope scope) { return new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED, Map.of("pipeline", scope.pipelineId()), null); }
     private static TapstateException claimFenced() { return MongoCachePipelineAccess.claimFenced(); }
+
+    private <T> T checkpointTransaction(PipelineIntentScope scope, boolean admission, Runnable originalActive,
+            Function<ClientSession, T> action) {
+        return MongoCachePipelineStateStore.writeTransaction(client, scope.pipelineId(), () -> transaction(scope, admission, originalActive, action));
+    }
 
     private <T> T transaction(PipelineIntentScope scope, boolean admission, Runnable originalActive, Function<ClientSession, T> action) {
         return StoreIo.call(() -> {

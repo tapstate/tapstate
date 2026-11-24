@@ -107,7 +107,7 @@ class AliasCmdTest {
         Run run = runWithHome(home, "alias", "install");
 
         assertThat(run.code()).isNotZero();
-        assertThat(run.all()).contains("cli.alias-install-dir-unknown");
+        assertThat(run.all()).contains("TS0330007");
     }
 
     @Test

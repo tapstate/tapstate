@@ -195,6 +195,8 @@ has   "Cloud notification checkout selects only its helper" cloud-ghcr 'sparse-c
 has   "Cloud registration excludes older release lines" cloud-ghcr "if: needs.version.outputs.is_latest == 'true'"
 has   "Cloud registration sends the publisher's immutable image" cloud-ghcr 'CLOUD_IMAGE:.*steps[.]image[.]outputs[.]image'
 has   "Cloud registration sends the checked image digest" cloud-ghcr 'CLOUD_IMAGE_DIGEST:.*needs[.]release-images[.]outputs[.]cloud_digest'
+has   "Cloud determines Bedrock support from the checked Boot JAR" cloud-image 'BOOT-INF/classes/io/tapstate/app/ManagedAiConfiguration[.]class'
+has   "Cloud registration sends the checked runtime capability" cloud-ghcr 'CLOUD_MANAGED_BEDROCK:.*needs[.]release-images[.]outputs[.]cloud_managed_bedrock'
 has   "Cloud publication and registration serialize across versions" cloud-ghcr '^      group: tapstate-cloud-release-publication$'
 has   "queued Cloud publications do not replace one another" cloud-ghcr '^      queue: max$'
 cloud_publish_at="$(job cloud-ghcr | grep -n 'ghcr-publish[.]sh publish' | head -1 | cut -d: -f1)"
@@ -436,10 +438,10 @@ triggers() {
        inside && /^  [a-z_]+:/ { sub(/:.*/, ""); sub(/^  /, ""); print }' "$1" | sort
 }
 if [ "$(triggers "$nightly")" = $'schedule\nworkflow_dispatch' ] &&
-   grep -qF -- '- cron: "0 13 * * *"' "$nightly"; then
-  ok "Nightly is scheduled for 21:00 Shanghai time or manually dispatched"
+   grep -qF -- '- cron: "0 10 * * *"' "$nightly"; then
+  ok "Nightly is scheduled for 18:00 Shanghai time or manually dispatched"
 else
-  bad "Nightly is scheduled for 21:00 Shanghai time or manually dispatched" "unexpected Nightly triggers"
+  bad "Nightly is scheduled for 18:00 Shanghai time or manually dispatched" "unexpected Nightly triggers"
 fi
 for helper in release-images real-connectors; do
   if [ "$(triggers "$here/../workflows/$helper.yml")" = workflow_call ]; then

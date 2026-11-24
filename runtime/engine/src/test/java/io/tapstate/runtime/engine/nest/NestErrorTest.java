@@ -17,7 +17,7 @@ class NestErrorTest {
     void everyCodeBelongsToTheRegisteredNestDomain() {
         assertThat(Domain.isRegistered("nest")).isTrue();
         for (NestError error : NestError.values()) {
-            assertThat(error.code()).matches("nest\\.[a-z0-9]+(-[a-z0-9]+)*");
+            assertThat(error.code()).matches("TS049(?!0000)[0-9]{4}");
         }
     }
 

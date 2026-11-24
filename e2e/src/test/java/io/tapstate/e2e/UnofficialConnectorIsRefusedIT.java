@@ -57,7 +57,7 @@ class UnofficialConnectorIsRefusedIT {
 
             ControlPlane.Refusal refusal = control.registerConnectorExpectingRefusal(artifact);
 
-            assertThat(refusal.code()).isEqualTo("connector.not-official");
+            assertThat(refusal.code()).isEqualTo("TS0060008");
             assertThat(refusal.status()).isEqualTo(400);
             assertThat(control.connectorIds()).doesNotContain(UNOFFICIAL_ID);
         }
@@ -102,7 +102,7 @@ class UnofficialConnectorIsRefusedIT {
             // The code, not the message: a refusal that reads right and codes wrong is the failure this
             // discriminates against, and the id is carried as a parameter so the code alone is not
             // asked to say which connector was refused.
-            assertThat(refusal.code()).isEqualTo("connector.not-official");
+            assertThat(refusal.code()).isEqualTo("TS0060008");
             assertThat(refusal.status()).isEqualTo(400);
             assertThat(refusal.params()).containsEntry("connector", connectorId);
         }

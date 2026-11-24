@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.core.alerting.*;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.spi.store.*;
 import java.time.*;
@@ -38,8 +40,11 @@ class PipelineAlertRuntimeTest {
         }).when(fixture.store).commit(any());
     }
     PipelineConvergencePass pass(String id) {
+        return pass(id, 1);
+    }
+    PipelineConvergencePass pass(String id, long intentRevision) {
         var scope = new PipelineIntentScope("cluster", 1, "cache", id, 1);
-        var intent = new PipelineIntentSnapshot(scope, 1, new DesiredState(id, PipelineState.RUNNING, "revision"));
+        var intent = new PipelineIntentSnapshot(scope, intentRevision, new DesiredState(id, PipelineState.RUNNING, "revision"));
         intents.put(id, intent);
         var claim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, id),
                 new WorkloadOwner("node", "boot"), 1, 1, 1);
@@ -51,6 +56,37 @@ class PipelineAlertRuntimeTest {
         return new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, fixture.host), intentStore,
                 (scope, claim) -> Optional.of(()->{}), () -> { }, fixture.clock);
     }
+
+    @Test void cloudAlertPreparationRetriesWithoutRestartingTheAlertRuntime() {
+        var properties = new CloudProperties();
+        properties.setBaseUrl("https://cloud.example");
+        properties.setToken("local-test-token");
+        properties.setClusterId("cluster");
+        properties.setAtlasUri("mongodb://fixture/config");
+        var cloud = CloudRuntimeSettings.resolve(properties);
+        var setup = new StorageSetupScope("cluster", "cloud-cluster", "original-operation", 1);
+        var configuration = mock(MongoConfigurationDomain.class);
+        var databaseAvailable = new AtomicBoolean();
+        doAnswer(call -> {
+            if (!databaseAvailable.get()) throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of(), null);
+            return null;
+        }).when(configuration).resumeInitialAlertStorage(setup.operationId());
+
+        try (var runtime = new PipelineAlertRuntime(() -> {
+            CloudConfigurationInitialization.resumeAlertStorage(configuration, setup, cloud);
+            return new PipelineAlertRuntime.Services(fixture.store, fixture.host);
+        }, intentStore, (scope, claim) -> Optional.empty(), () -> {}, fixture.clock)) {
+            runtime.start();
+            await().atMost(Duration.ofSeconds(5)).until(() -> runtime.health().degraded());
+            assertThat(runtime.health().code()).isEqualTo(IoError.STORE_UNAVAILABLE.code());
+
+            databaseAvailable.set(true);
+            await().atMost(Duration.ofSeconds(5)).until(() -> !runtime.health().degraded());
+            assertThat(runtime.managementServices().store()).isSameAs(fixture.store);
+            verify(configuration, atLeast(2)).resumeInitialAlertStorage(setup.operationId());
+        }
+    }
+
     @Test void anAuthoritativeFailureSummaryIsCapturedWhenTheThrowableIsNoLongerAvailable() {
         var redactor=new io.tapstate.core.logging.SecretRedactor();redactor.replace("source",List.of("original-source-secret"));
         try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host),intentStore,
@@ -365,6 +401,63 @@ class PipelineAlertRuntimeTest {
             await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
         } finally { release.countDown(); }
     }
+    @Test void aDelayedPeriodicReadingCannotReinstallThePriorAlertProducer() {
+        var rule = AlertEvaluationHostTest.definition("pipeline.failed");
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+        try (var runtime = runtime()) {
+            runtime.tick();
+            await().atMost(Duration.ofSeconds(3)).until(() -> !runtime.health().degraded());
+            var original = pass("orders");
+            runtime.expecting(original);
+            var scope = original.scope();
+            var claim = original.claim();
+            var nextIntent = new PipelineIntentSnapshot(scope, original.intent().intentRevision() + 1,
+                    new DesiredState("orders", PipelineState.RUNNING, "replacement"));
+            var successor = mock(PipelineConvergencePass.class);
+            when(successor.scope()).thenReturn(scope);
+            when(successor.claim()).thenReturn(claim);
+            when(successor.intent()).thenReturn(nextIntent);
+            intents.put("orders", nextIntent);
+            runtime.expecting(successor);
+            runtime.publishedPeriodic(original, observation("orders", T, PipelineState.RUNNING), () -> true);
+            drained(runtime);
+            assertThat(runtime.health().rejected()).isZero();
+            runtime.publishedPeriodic(successor, observation("orders", T, PipelineState.FAILED), () -> true);
+            await().atMost(Duration.ofSeconds(3)).until(() -> rows.values().stream().anyMatch(
+                    row -> row.value().snapshot().status() == AlertSnapshot.Status.FIRING));
+        }
+    }
+
+    @Test void aPeriodicInputSupersededDuringItsProofDoesNotDegradeCollection() throws Exception {
+        var original = pass("orders");
+        try (var runtime = runtime()) {
+            runtime.expecting(original);
+            var checking = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var checks = new java.util.concurrent.atomic.AtomicInteger();
+            try {
+                runtime.publishedPeriodic(original, observation("orders", T, PipelineState.RUNNING), () -> {
+                    if (checks.incrementAndGet() != 2) return true;
+                    checking.countDown();
+                    try { return release.await(5, TimeUnit.SECONDS); }
+                    catch (InterruptedException stopped) { Thread.currentThread().interrupt(); return false; }
+                });
+                assertThat(checking.await(5, TimeUnit.SECONDS)).isTrue();
+                var nextIntent = new PipelineIntentSnapshot(original.scope(), original.intent().intentRevision() + 1,
+                        new DesiredState("orders", PipelineState.RUNNING, "replacement"));
+                var successor = mock(PipelineConvergencePass.class);
+                var scope = original.scope(); var claim = original.claim();
+                when(successor.scope()).thenReturn(scope);
+                when(successor.claim()).thenReturn(claim);
+                when(successor.intent()).thenReturn(nextIntent);
+                intents.put("orders", nextIntent);
+                runtime.expecting(successor);
+            } finally { release.countDown(); }
+            drained(runtime);
+            assertThat(runtime.health().rejected()).isZero();
+        }
+    }
+
     @Test void freshnessRunsWithoutPublicationsAndStopDoesNotInventRecovery() {
         var rule=AlertEvaluationHostTest.definition("pipeline.observation-stale");
         when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
@@ -385,6 +478,66 @@ class PipelineAlertRuntimeTest {
             assertThat(after.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
         }
     }
+
+    @Test void aLatePublicationCannotDisplaceNewerIntentFreshness() {
+        var rule = AlertEvaluationHostTest.definition("pipeline.observation-stale");
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+        try (var runtime = runtime()) {
+            runtime.tick();
+            drained(runtime);
+            var original = pass("orders", 20);
+            runtime.expecting(original);
+            var current = pass("orders", 21);
+            runtime.expecting(current);
+
+            runtime.publishedIfExpected(current, observation("orders", T, PipelineState.RUNNING), null);
+            drained(runtime);
+            runtime.publishedIfExpected(original, observation("orders", T, PipelineState.FAILED), null);
+            drained(runtime);
+
+            fixture.now.set(T.plusSeconds(121));
+            runtime.tick();
+            drained(runtime);
+
+            assertThat(rows.values()).singleElement()
+                    .satisfies(row -> assertThat(row.value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING));
+            verify(fixture.store, atLeastOnce()).commit(argThat(commit -> commit.state().proof() != null
+                    && commit.state().proof().pipeline().equals(current.intent())));
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void onlyTheCurrentIntentRefusalInterruptsPendingAlertEvaluation(boolean currentRefusal) {
+        var originalRule = AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule = new AlertConfiguration.Rule(originalRule.header(), originalRule.name(), originalRule.typeId(), 1,
+                originalRule.resources(), Map.of("trigger-for", java.math.BigDecimal.valueOf(4)), null, true, null)
+                .validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+        try (var runtime = runtime()) {
+            runtime.tick();
+            drained(runtime);
+            var original = pass("orders", 20);
+            runtime.expecting(original);
+            var current = pass("orders", 21);
+            runtime.expecting(current);
+
+            runtime.published(current, observation("orders", T, PipelineState.FAILED), null);
+            drained(runtime);
+            assertThat(resourceHead("orders").snapshot().pendingSince()).isEqualTo(T);
+
+            fixture.now.set(T.plusSeconds(2));
+            runtime.unavailableIfExpected(currentRefusal ? current : original);
+            fixture.now.set(T.plusSeconds(4));
+            runtime.published(current, observation("orders", fixture.now.get(), PipelineState.FAILED), null);
+            drained(runtime);
+
+            var state = resourceHead("orders").snapshot();
+            assertThat(state.status()).isEqualTo(currentRefusal ? AlertSnapshot.Status.PENDING : AlertSnapshot.Status.FIRING);
+            assertThat(state.pendingSince()).isEqualTo(currentRefusal ? T.plusSeconds(4) : null);
+        }
+    }
+
     @Test void aQueueRefusalCannotBridgeThePreviousPendingWindow() {
         var original=AlertEvaluationHostTest.definition("pipeline.failed");
         var rule=new AlertConfiguration.Rule(original.header(),original.name(),original.typeId(),1,original.resources(),

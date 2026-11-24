@@ -41,6 +41,6 @@ class EnvironmentExpanderTest {
     void missingEnvironmentReferenceIsAStableCodedFailure() {
         assertThatThrownBy(() -> EnvironmentExpander.expand("${MISSING}", Map.of()))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("mcp.environment-missing");
+                .hasMessageContaining("TS0260002");
     }
 }

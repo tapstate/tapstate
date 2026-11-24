@@ -1248,6 +1248,23 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.StaticThrows", src);
     }
 
+    static Path refusedInitSource(Path dir, String channel) {
+        String code = source("RefusedInitSource", "",
+                "functions.supportBatchRead((a,b,c,d,e) -> {});functions.supportStreamRead((a,b,c,d,e) -> {});")
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) { throw (RuntimeException) System.getProperties().get(\""
+                                + channel + "\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.RefusedInitSource", code);
+    }
+
+    static Path fatalInitSource(Path dir, String channel) {
+        String code = source("FatalInitSource", "", "functions.supportBatchRead((a,b,c,d,e) -> {});")
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) { throw (Error) System.getProperties().get(\""
+                                + channel + "\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.FatalInitSource", code);
+    }
+
     /**
      * A source that registers batch read but throws from every lifecycle method (init / stop /
      * discover / connectionTest / tableCount). A capability derive reads only the registered ids, so a
@@ -1540,6 +1557,16 @@ final class Synthetic {
     }
 
     /** A connector whose discoverSchema throws — discovery could not complete, a coded drive failure. */
+    static Path declaredAuthenticationRejectedDiscoverSource(Path dir) {
+        String body = "throw new RuntimeException(new io.tapdata.exception.TapPdkUserPwdInvalidEx(\"demo\", \"fixture\", new java.sql.SQLException(\"password rejected marker\", \"72000\")));";
+        return SyntheticJar.compileToJar(dir, "synthetic.DeclaredAuthenticationDiscover", discoverSource("DeclaredAuthenticationDiscover", body));
+    }
+
+    static Path authenticationRejectedDiscoverSource(Path dir, String sqlState) {
+        String body = "throw new RuntimeException(new java.sql.SQLException(\"password rejected marker\", \"" + sqlState + "\"));";
+        return SyntheticJar.compileToJar(dir, "synthetic.AuthenticationDiscover", discoverSource("AuthenticationDiscover", body));
+    }
+
     static Path throwingDiscoverSource(Path dir) {
         String body = "throw new RuntimeException(\"discover boom\");";
         return SyntheticJar.compileToJar(dir, "synthetic.ThrowingDiscover", discoverSource("ThrowingDiscover", body));

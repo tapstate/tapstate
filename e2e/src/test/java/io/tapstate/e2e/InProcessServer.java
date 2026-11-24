@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import io.tapstate.app.Bootstrap;
 import io.tapstate.app.IsolatedConnectionDiagnostics;
+import io.tapstate.app.ObservationWorkerFixture;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -211,6 +212,14 @@ final class InProcessServer implements ServerHandle {
                 }
             }
         }
+        return cancelled;
+    }
+
+    /** Stops future dispatch and waits for in-flight writes before a test plants its own observation. */
+    int stopPublishingObservationsAndAwaitWorkers() {
+        int cancelled = stopPublishingObservations();
+        ObservationWorkerFixture.stopAndAwait(refreshedContexts.stream()
+                .filter(owner -> owner.isActive() && belongsToThisServer(owner)).toList());
         return cancelled;
     }
 

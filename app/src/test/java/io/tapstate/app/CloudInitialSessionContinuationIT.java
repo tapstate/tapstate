@@ -124,7 +124,7 @@ class CloudInitialSessionContinuationIT {
                     });
             var loggedOut = request(client, oldCookie, "/api/storage/status", Map.of(), "original-cookie-after-logout", repetition);
             assertThat(loggedOut.status()).isEqualTo(401);
-            assertThat(loggedOut.body().get("code")).isEqualTo("control.unauthenticated");
+            assertThat(loggedOut.body().get("code")).isEqualTo("TS0210003");
         } finally {
             inputs.activate.countDown(); inputs.ready.countDown();
             try (var raw = MongoClients.create(uri("admin", false))) {

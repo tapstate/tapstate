@@ -148,7 +148,7 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
                         + "left cannot be found - and carrying on would grow the record for the life of "
                         + "the job while every document stayed correct, which is the one failure nothing "
                         + "downstream can notice")
-                .hasMessageContaining("nest.reference-tracking-requires-before-image");
+                .hasMessageContaining("TS0490027");
     }
 
     @Test
@@ -162,7 +162,7 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
                         + "used to point at nothing, so the entry taken out is one nobody ever wrote and "
                         + "the real one stays - the leak this refuses, arrived at through the branch that "
                         + "looked like it was handling it")
-                .hasMessageContaining("nest.reference-tracking-requires-before-image");
+                .hasMessageContaining("TS0490027");
     }
 
     /** Every identity recorded as pointing at {@code customer}, across all of its buckets. */

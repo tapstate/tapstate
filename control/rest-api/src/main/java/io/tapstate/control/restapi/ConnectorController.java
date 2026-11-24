@@ -60,7 +60,9 @@ class ConnectorController {
             // with the coded body. The same code raised on the resolve path (connection test / discovery) is
             // a server-side condition and keeps its 500 — so the status is decided here, where the context is
             // known, not globally by code. A non-connector coded error (e.g. a blocked audit) keeps its status.
-            if (e.code().code().startsWith("connector.")) {
+            if (e.code().code().startsWith("connector.")
+                    || io.tapstate.core.common.ConnectorErrorDefinitions.registered().stream()
+                            .anyMatch(definition -> definition.code().equals(e.code().code()))) {
                 throw new BadRequestCodedException(e);
             }
             throw e;

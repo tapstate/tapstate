@@ -102,7 +102,7 @@ class TheLimitOnADocumentReachesTheJobThatEnforcesItTest {
         DAG dag = customersWithPoliciesAndClaims(LIMIT + 1);
 
         assertThatThrownBy(() -> member.getJet().newJob(dag).join())
-                .hasStackTraceContaining("nest.root-fanout-limit-exceeded")
+                .hasStackTraceContaining("TS0490019")
                 .hasStackTraceContaining("elements=" + (LIMIT + 1))
                 .hasStackTraceContaining("limit=" + LIMIT);
     }

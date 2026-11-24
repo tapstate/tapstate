@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.engine.OperatorMapCapacity;
@@ -115,7 +116,18 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         require(); var bound = Objects.requireNonNull(captures.forRun(pass.scope(),command,fixed),"fixed capture view"); require(); return bound;
     }
 
+    private io.tapstate.core.common.FailureFact openingFailure;
+
+    @Override public synchronized io.tapstate.core.common.FailureFact actuationFailureFact(String pipeline, Throwable failure) {
+        // Reading a captured fact does not authorize another actuation after an uncertain submission.
+        if (!id().equals(pipeline)) throw fenced();
+        var fact = openingFailure;
+        openingFailure = null;
+        return fact != null && fact.cause() == failure ? fact : new io.tapstate.core.common.FailureFact(failure);
+    }
+
     @Override public synchronized void start(String pipeline) {
+        openingFailure = null;
         checkingStart = true;
         try {
             startOwned(pipeline);
@@ -162,6 +174,9 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             run = engine.submitRun(id(),built.dag(),prepared.capacity().mapDatabases(),prepared.capacity().settings(),manifest);
             submissions.returned(manifest); require();
         } catch (RuntimeException | Error failed) {
+            if (!(failed instanceof VirtualMachineError) && capture != null) {
+                openingFailure = capture.openingFailureFact(pipeline, failed);
+            }
             if (submissionAttempted && run == null) {
                 // The original writer may exist. A later pass must observe this exact manifest before proceeding.
                 invalidated = true;
@@ -182,35 +197,100 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         if (original != null) ports.plans().apply(original, command).forget(id());
     }
 
-    private void stopOriginal() {
+    private void stopOriginal() { stopOriginal(false); }
+
+    private void stopOriginal(boolean trackOnStopWorker) {
         require();
         if (run != null) {
-            run.cancel(); require();
-            if (!run.awaitTerminal(STOP_BUDGET)) throw new TapstateException(EngineError.JOB_STILL_ENDING,
-                    Map.of("pipeline",id(),"seconds",STOP_BUDGET.toSeconds()),null);
+            stopStep(trackOnStopWorker, "Engine.RunHandle.cancel", run::cancel);
+            require();
+            stopStep(trackOnStopWorker, "Engine.RunHandle.awaitTerminal", () -> {
+                boolean ended = trackOnStopWorker ? run.awaitTerminal() : run.awaitTerminal(STOP_BUDGET);
+                if (!ended) throw new TapstateException(EngineError.JOB_STILL_ENDING,
+                        Map.of("pipeline",id(),"seconds",STOP_BUDGET.toSeconds()),null);
+            });
             require();
         }
         if (run == null && pass.displacedExecution() > 0 && captures instanceof ScopedPipelineCaptureCoordinator scoped) {
             // An absent Jet handle cannot supply the old capture fence. The successor may retire only
             // local sessions in the original scope at or below its admitted fence.
-            scoped.retireScope(pass.scope(), command);
+            stopStep(trackOnStopWorker, "ScopedPipelineCaptureCoordinator.retireScope",
+                    () -> scoped.retireScope(pass.scope(), command));
             require();
         } else if (capture != null) {
-            capture.stopCapture(id(), false);
+            stopStep(trackOnStopWorker, "PipelineCaptureCoordinator.stopCapture", () -> {
+                if (trackOnStopWorker) awaitCaptureClose();
+                else capture.stopCapture(id(), false);
+            });
             require();
         }
-        if (manifest != null && !engine.isLost()) { ports.releaseHot().accept(manifest); require(); }
+        if (manifest != null && !engine.isLost()) {
+            stopStep(trackOnStopWorker, "releaseHot", () -> ports.releaseHot().accept(manifest));
+            require();
+        }
         if (original != null) { ports.plans().apply(original, command).forget(id()); require(); }
     }
 
-    @Override public synchronized void stop(String pipeline,boolean purge) {
-        requireId(pipeline);
-        try { stopOriginal(); } finally { if (purge) invalidated = true; }
-        if (purge) {
-            ports.rebuild().accept(pass,Optional.ofNullable(manifest));
-            // A changed physical generation must be loaded by a new pass, never adopted by this command.
-            throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+    private void awaitCaptureClose() {
+        for (;;) {
+            require();
+            try {
+                capture.stopCapture(id(), false);
+                return;
+            } catch (io.tapstate.spi.capture.SnapshotSession.PendingClose pending) {
+                awaitOriginalClose(pending);
+            } catch (TapstateException pending) {
+                boolean captureStillEnding = pending.code() == io.tapstate.runtime.srs.CaptureError.STILL_ENDING;
+                boolean connectorStillEnding = pending.code() == io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED
+                        && pending.getCause() instanceof java.util.concurrent.TimeoutException;
+                if (Thread.currentThread().isInterrupted() || (!captureStillEnding && !connectorStillEnding)) throw pending;
+                try { Thread.sleep(100); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw pending;
+                }
+            }
         }
+    }
+
+    private static void awaitOriginalClose(io.tapstate.spi.capture.SnapshotSession.PendingClose pending) {
+        try {
+            pending.completion().toCompletableFuture().get();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw pending;
+        } catch (java.util.concurrent.ExecutionException failure) {
+            if (failure.getCause() instanceof RuntimeException runtime) throw runtime;
+            if (failure.getCause() instanceof Error error) throw error;
+            throw pending;
+        }
+    }
+
+    private void stopStep(boolean track, String operation, Runnable step) {
+        if (!track) { step.run(); return; }
+        String node = operation.equals("Engine.RunHandle.awaitTerminal") ? "unknown" : command.owner().nodeId();
+        var site = new io.tapstate.runtime.engine.StopWaitLog.Site(id(),
+                run == null ? Long.toString(command.executionGeneration()) : Long.toString(run.jobId()), node, operation);
+        io.tapstate.runtime.engine.StopWaitLog.around(site, step);
+    }
+
+    @Override public void stop(String pipeline,boolean purge) {
+        requireId(pipeline);
+        boolean requestedStop = pass.intent().desired().targetState() == PipelineState.STOPPED;
+        try { stopOriginal(requestedStop); } finally { if (purge) invalidated = true; }
+        if (purge) rebuildStopped();
+    }
+
+    @Override public void clearStopped(String pipeline) {
+        requireId(pipeline);
+        invalidated = true;
+        rebuildStopped();
+    }
+
+    private void rebuildStopped() {
+        ports.rebuild().accept(pass, Optional.ofNullable(manifest));
+        // A changed physical generation must be loaded by a new pass, never adopted by this command.
+        throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
     }
     @Override public synchronized void pause(String pipeline) {
         requireId(pipeline); if (run == null || !isCurrentRun()) throw fenced(); run.suspend(); require();
@@ -259,12 +339,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override public synchronized Optional<Throwable> failure(String pipeline) {
+        return failureFact(pipeline).map(io.tapstate.core.common.FailureFact::cause);
+    }
+    @Override public synchronized Optional<io.tapstate.core.common.FailureFact> failureFact(String pipeline) {
         requireId(pipeline);
-        if (engine.isLost()) { var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost; }
-        Optional<Throwable> failure = run != null && isCurrentRun() ? run.failure() : Optional.empty(); require();
+        if (engine.isLost()) { var lost = engine.lost(id()).map(io.tapstate.core.common.FailureFact::new); require(); return lost; }
+        Optional<io.tapstate.core.common.FailureFact> failure = run != null && isCurrentRun() ? run.failureFact() : Optional.empty(); require();
         // An earlier capture stays bound for cleanup, not for the current run's failure diagnosis.
         if (failure.isPresent() || capture == null || !isCurrentRun()) return failure;
-        var captured = capture.captureFailure(id()); require(); return captured;
+        var captured = capture.captureFailureFact(id()); require(); return captured;
     }
     @Override public synchronized Optional<Throwable> lost(String pipeline) {
         requireId(pipeline); var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost;

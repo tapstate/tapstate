@@ -63,8 +63,8 @@ final class McpOperationExecutor {
                 case "connection.schema" -> get(
                         "/api/connections/" + segment(required(args, "id")) + "/schema");
                 case "artifact.validate" -> post(
-                        "/api/artifacts:validate", args, RequestBudget.HEAVY);
-                case "artifact.apply" -> post("/api/artifacts:apply", args, RequestBudget.HEAVY);
+                        "/api/artifacts:validate", args, RequestBudget.HEAVY).withWarningText();
+                case "artifact.apply" -> post("/api/artifacts:apply", args, RequestBudget.HEAVY).withWarningText();
                 case "artifact.get" -> get("/api/artifacts/" + segment(required(args, "id")));
                 case "artifact.delete" -> artifactDelete(args);
                 case "pipeline.list" -> get(listPath("/api/pipelines:artifacts", args));

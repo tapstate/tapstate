@@ -46,7 +46,8 @@ final class MongoPipelineObservationRead {
         for (int i = 0; i < chains.size(); i++) {
             query.add(lookup(SRS_CHAINS, "chain" + i, chainQuery(business, chains.get(i))));
         }
-        List<String> ids = sources.keySet().stream().map(SrsConsumerRun::sourceId).toList();
+        List<String> ids = sources.values().stream().map(MongoCacheDomain.ObservationSource::sourceId)
+                .distinct().toList();
         for (int i = 0; i < ids.size(); i++) {
             String id = ids.get(i);
             var tables = lookup(CACHE_SOURCE_SCHEMAS, "tables", List.of(
@@ -180,7 +181,8 @@ final class MongoPipelineObservationRead {
             var context = contexts.decode(row);
             if (controls.put(context.id(), context) != null) return false;
         }
-        if (controls.size() != needed.size()) return false;
+        var contextIds = needed.stream().map(MongoSrsModelContexts::contextId).collect(java.util.stream.Collectors.toSet());
+        if (!controls.keySet().equals(contextIds)) return false;
         var bounds = new HashMap<String, SrsLogBounds>();
         for (var row : rows(root, "bounds")) bounds.put(row.getString("_id"), MongoSrsLogStore.decodeSplitBounds(row));
 
@@ -191,7 +193,7 @@ final class MongoPipelineObservationRead {
             if (!needed.contains(model.key()) || loaded.put(model.key(), model) != null) return false;
             var control = controls.get(MongoSrsModelContexts.contextId(model.key()));
             var head = contexts.head(original, model.key().table());
-            if (control == null || control.nextId() != null || control.publishedVersion() != model.key().modelVersion()
+            if (control == null || control.nextId() != null
                     || head == null || !control.id().equals(head.get("contextId"))
                     || !bounds.containsKey(MongoSrsLogStore.boundsId(model.ringName()))) return false;
             contexts.requireAnchor(original, control, control);
@@ -203,6 +205,9 @@ final class MongoPipelineObservationRead {
             for (var row : rows(root, "events")) events.put(row.get("_id", Document.class), row);
             for (var table : checkpoint.tables().values()) {
                 var model = loaded.get(table.model());
+                // Historical pins retain their schema, while checkpoint ranges need the current model head.
+                var control = controls.get(MongoSrsModelContexts.contextId(model.key()));
+                if (control.publishedVersion() != model.key().modelVersion()) return false;
                 var bound = bounds.get(MongoSrsLogStore.boundsId(model.ringName()));
                 long sequence = table.sequence();
                 if (sequence < model.ddlSequence() - 1 || sequence > bound.largestSequence()) return false;
@@ -211,7 +216,6 @@ final class MongoPipelineObservationRead {
                     // A checkpoint just before the model boundary may refer to an older model.
                     if (row == null || sequence < model.ddlSequence()) return false;
                     var event = MongoSrsLogStore.splitRecord(row);
-                    var control = controls.get(MongoSrsModelContexts.contextId(model.key()));
                     if (event.epoch() != model.key().captureEpoch() || event.schemaVer() != model.key().modelVersion()
                             || !control.fence().equals(event.captureFence())) return false;
                 }

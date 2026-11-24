@@ -6,6 +6,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 
 /**
  * Where the facts a convergence pass measured are offered for export. The second projection of the
@@ -25,6 +26,14 @@ public interface MetricsExport extends AutoCloseable {
      * state on the metrics side: as a gauge per state, never encoded into the facts themselves.
      */
     void offer(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts);
+
+    /** Periodic facts are installed only while their local admission is current. The guard never blocks. */
+    default void offerIfCurrent(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts,
+            BooleanSupplier current) {
+        if (current.getAsBoolean()) {
+            offer(pipelineId, state, observedAt, facts);
+        }
+    }
 
     /** Bounded process facts, independent of Pipeline identities and never an alarm input. */
     default void offerRuntime(Instant observedAt, List<MetricFact> facts) { }

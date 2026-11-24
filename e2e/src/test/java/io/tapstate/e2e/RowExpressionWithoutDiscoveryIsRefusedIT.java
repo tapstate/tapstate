@@ -44,7 +44,7 @@ class RowExpressionWithoutDiscoveryIsRefusedIT {
     private static final String SOURCE_ID = "src_file";
     private static final String TARGET_ID = "tgt_file";
     private static final String PIPELINE_ID = "row_expression_pipeline";
-    private static final String NEEDS_DISCOVERY = "dsl.row-expression-needs-discovery";
+    private static final String NEEDS_DISCOVERY = "TS0010020";
 
     @BeforeAll
     static void requireDocker() {

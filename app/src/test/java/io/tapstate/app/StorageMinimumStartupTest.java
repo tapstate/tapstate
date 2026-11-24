@@ -48,7 +48,7 @@ class StorageMinimumStartupTest {
         var response = client.send(HttpRequest.newBuilder(base.resolve("/auth/login")).header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString("{\"username\":\"admin\",\"password\":\"sentinel-password\"}")).build(), HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).isEqualTo(503);
-        assertThat(((Map<?,?>)JsonReader.parse(response.body())).get("code")).isEqualTo("control.storage-unavailable");
+        assertThat(((Map<?,?>)JsonReader.parse(response.body())).get("code")).isEqualTo("TS0210030");
         assertThat(response.body()).doesNotContain("sentinel-password");
         assertThat(context.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_REQUIRED);
     }
@@ -57,7 +57,7 @@ class StorageMinimumStartupTest {
         var response = client.send(HttpRequest.newBuilder(base.resolve("/api/storage/status")).header("Authorization", "Bearer old-jwt")
                 .header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString("{}")).build(), HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).isEqualTo(503);
-        assertThat(response.body()).contains("control.storage-unavailable");
+        assertThat(response.body()).contains("TS0210030");
         var bootstrap = client.send(HttpRequest.newBuilder(base.resolve("/auth/bootstrap")).header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString("{\"username\":\"admin\",\"password\":\"sentinel-password\"}")).build(), HttpResponse.BodyHandlers.ofString());
         assertThat(bootstrap.statusCode()).isEqualTo(403);

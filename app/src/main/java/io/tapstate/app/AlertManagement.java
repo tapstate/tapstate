@@ -20,14 +20,17 @@ final class AlertManagement implements AlertControlDispatcher {
         this.services=services;this.access=access;this.health=health;this.scope=scope;this.deployment=deployment;this.clock=clock;this.audit=audit;
     }
     @Override public Map<String,Object> dispatch(String operation,CredentialAuthentication caller,Map<String,Object> input){
+        return dispatch(operation,caller,input,Locale.ENGLISH);
+    }
+    @Override public Map<String,Object> dispatch(String operation,CredentialAuthentication caller,Map<String,Object> input,Locale locale){
         var op=ControlOperations.registry().resolve(operation);
         if(!operation.startsWith("alert.")||!caller.token().scope().permits(op.scope())
                 ||deployment==AlertChannelPolicy.Deployment.ON_PREM&&op.scope()==Scope.WRITE&&!caller.token().scope().permits(Scope.ADMIN))throw stale("permission");
         caller.requireActive().run();var resolved=services.get();var a=access.apply(caller);
-        var result=audit.dispatch(op,new AuditContext(caller.token().subject(),"alerts",optional(input,"etag")),()->invoke(operation,input,resolved,a,caller));
+        var result=audit.dispatch(op,new AuditContext(caller.token().subject(),"alerts",optional(input,"etag")),()->invoke(operation,input,resolved,a,caller,locale));
         caller.requireActive().run();a.locallyActive().run();return result;
     }
-    private Map<String,Object> invoke(String op,Map<String,Object> input,PipelineAlertRuntime.Services resolved,AlertStore.Access access,CredentialAuthentication caller){
+    private Map<String,Object> invoke(String op,Map<String,Object> input,PipelineAlertRuntime.Services resolved,AlertStore.Access access,CredentialAuthentication caller,Locale locale){
         var store=resolved.store();var reads=new AlertStore.ReadAccess(true,Set.of(),access.locallyActive());
         var capabilityTypes=new DeliveryTypes(store,reads);
         var author=new AlertAuthoring(store,scope,deployment,resolved.catalog(),clock,resolved.channels());var commands=new AlertDeliveryCommands(store,scope,deployment,clock,resolved.evaluator().retentionPolicy());
@@ -37,7 +40,7 @@ final class AlertManagement implements AlertControlDispatcher {
                 fields(input);return map("deployment",deployment.name(),"clusterId",scope.clusterId(),"refreshedAt",instant(clock.instant()),
                         "channelPolicies",deployment==AlertChannelPolicy.Deployment.ON_PREM?channelPolicies(resolved.channels()):Map.of(),
                         "channels",deployment==AlertChannelPolicy.Deployment.ON_PREM?resolved.channels().descriptors().stream().map(AlertManagement::channelDescriptor).toList():List.of(),
-                        "types",resolved.catalog().types().stream().map(t->type(t,resolved.providers(),resolved.descriptions())).toList());
+                        "types",resolved.catalog().types().stream().map(t->type(t,resolved.providers(),resolved.descriptions(),locale)).toList());
             }
             case "alert.resources": {
                 fields(input,"kind","cursor","limit");var p=store.resources(text(input,"kind"),optional(input,"cursor"),limit,access);return map("rows",p.rows().stream().map(AlertHttpModel::resource).toList(),"nextCursor",p.nextId());
@@ -62,7 +65,7 @@ final class AlertManagement implements AlertControlDispatcher {
                 var rule=current?h.value().snapshot().rule():e.originalBinding();
                 var observed=current?h.value().snapshot().lastObservedAt():e.diagnostics().latest()==null?null:e.diagnostics().latest().observedAt();
                 var descriptor=resolved.catalog().types().stream().filter(t->t.id().equals(key.typeId())).findFirst();
-                descriptor.ifPresent(t->{var description=resolved.descriptions().describe(t);m.put("condition",description.condition());m.put("recovery",description.recovery());m.put("guidance",description.guidance());});
+                descriptor.ifPresent(t->{var description=resolved.descriptions().describe(t,locale);m.put("condition",description.condition());m.put("recovery",description.recovery());m.put("guidance",description.guidance());});
                 m.put("thresholds",store.originalRule(rule,reads).map(AlertConfiguration.Rule::parameters).orElse(null));
                 m.put("durationSeconds",Duration.between(e.value().firedAt(),e.value().endedAt()==null?clock.instant():e.value().endedAt()).toSeconds());
                 m.put("basis",map("typeId",key.typeId(),"quality",current?h.value().snapshot().quality().name():"HISTORICAL", "observedAt",instant(observed),"triggerForSeconds",rule.triggerFor().toSeconds(),"recoverForSeconds",rule.resolveFor().toSeconds()));return m;
@@ -133,7 +136,7 @@ final class AlertManagement implements AlertControlDispatcher {
     private static Map<String,Object> channelPolicies(AlertChannelCatalog catalog){var policies=new LinkedHashMap<String,Object>();for(var descriptor:catalog.descriptors())policies.put(descriptor.capability().typeId(),policy(descriptor.transportFamily()==AlertChannelCatalog.TransportFamily.EMAIL?ChannelRetryPolicy.emailDefaults():ChannelRetryPolicy.webhookDefaults()));return policies;}
     private static Map<String,Object> channelDescriptor(AlertChannelCatalog.Descriptor d){return map("id",d.capability().typeId(),"version",d.capability().version(),"label",d.label(),"transportFamily",d.transportFamily().name(),"transportVersion",d.transportVersion(),"fields",d.fields().stream().map(f->map("key",f.key(),"label",f.label(),"maximumBytes",f.maximumBytes(),"required",f.required(),"defaultValue",f.defaultValue())).toList());}
     private static Map<String,Object> policy(ChannelRetryPolicy p){return map("timeoutSeconds",p.attemptTimeout().toSeconds(),"attempts",p.attemptsPerCycle(),"maximumAgeSeconds",p.maximumAge().toSeconds(),"retryDelaysSeconds",p.retryDelays().stream().map(Duration::toSeconds).toList());}
-    private static Map<String,Object> type(AlarmTypeCatalog.Type t,Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions){var d=descriptions.describe(t);
+    private static Map<String,Object> type(AlarmTypeCatalog.Type t,Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions,Locale locale){var d=descriptions.describe(t,locale);
         return map("id",t.id(),"version",t.version(),"kind",t.kind().name(),"resourceKinds",t.resourceKinds().stream().sorted().toList(),"severity",t.defaultSeverity().name(),"enabledByDefault",t.enabledByDefault(),"condition",d.condition(),"recovery",d.recovery(),"guidance",d.guidance(),"inputAvailable",providers.contains(t.providerId()),"parameters",t.parameters().stream().map(p->map("name",p.name(),"kind",p.kind().name(),"unit",p.unit(),"minimum",p.minimum(),"maximum",p.maximum(),"defaultValue",p.defaultValue())).toList());
     }
     private String cursorToken(String view,Map<String,Object> payload){payload.put("view",view);payload.put("authorityId",scope.authorityId());payload.put("clusterId",scope.clusterId());return encode(payload);}

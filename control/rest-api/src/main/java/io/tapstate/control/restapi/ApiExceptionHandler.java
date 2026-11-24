@@ -1,11 +1,23 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.ArtifactError;
+import io.tapstate.control.core.ClusterError;
+import io.tapstate.control.core.ConnectorCatalogError;
+import io.tapstate.control.core.DataBrowserError;
+import io.tapstate.control.core.MonitorError;
+import io.tapstate.control.core.PipelineDraftError;
+import io.tapstate.control.core.PipelineError;
+import io.tapstate.control.core.PositionError;
+import io.tapstate.control.core.SourceError;
 import io.tapstate.control.core.StorageQuota;
 import io.tapstate.control.core.StartRefusal;
 import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.alerting.AlertError;
+import io.tapstate.core.dsl.DslError;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.messages.MessageCatalog;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.CacheControl;
@@ -18,14 +30,16 @@ import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 
 import java.util.Map;
+import java.util.HashMap;
 import java.util.TreeMap;
+import java.util.Locale;
 
 /**
  * Projects a coded first-party error onto a structured HTTP response. A {@link TapstateException} — a
  * user-facing, diagnosable failure — becomes a {@code {code, params, message}} body: the canonical code
  * string, the named arguments, and the message rendered from them through the shared catalog. The status
  * is chosen from the code: a client input error (a {@code dsl.*} validation failure or a
- * {@code control.malformed-request} refused at the boundary) is a 400; the authentication codes map to
+ * {@link ControlError#MALFORMED_REQUEST} refused at the boundary) is a 400; the authentication codes map to
  * 401 / 403 / 409; a lifecycle verb on an unknown pipeline is a 404 and a forbidden transition or stale
  * revision is a 409; a metrics, snapshot, or explanation read that requires an observation is a 404 when
  * none has been published; a member that cannot read the cluster right now is a 503, because it is neither the
@@ -51,10 +65,8 @@ class ApiExceptionHandler {
         if (StorageQuota.isQuotaCode(e.code()))
             e = new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
         markCloudError(e.code());
-        MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
-        var diagnostic = e instanceof io.tapstate.control.core.ConnectionTestRefusal refusal ? refusal.diagnostic() : Map.<String, Object>of();
-        ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message(), diagnostic);
+        ApiError body = ApiError.from(e, catalog, requestLocale());
         HttpStatus status=statusFor(e.code());
         if(e.code()==io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED
                 &&java.util.Set.of("validation.metadataFrames","validation.processEnvelope","validation.cooperativeHeadroom").contains(e.args().get("limit")))status=HttpStatus.TOO_MANY_REQUESTS;
@@ -63,9 +75,8 @@ class ApiExceptionHandler {
 
     @ExceptionHandler(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition.class)
     ResponseEntity<ApiError> handleValidationConflict(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition failure){
-        MessageCatalog.Rendered rendered=catalog.render(failure.code(),failure.args());
         return ResponseEntity.status(HttpStatus.CONFLICT).cacheControl(CacheControl.noStore())
-                .body(new ApiError(failure.code().code(),new TreeMap<>(failure.args()),rendered.message()));
+                .body(ApiError.render(failure.code(), failure.args(), Map.of(), catalog, requestLocale()));
     }
 
     @ExceptionHandler(UnavailableCodedException.class)
@@ -80,9 +91,7 @@ class ApiExceptionHandler {
      */
     @ExceptionHandler(StartRefusal.class)
     ResponseEntity<StartRefusalError> handle(StartRefusal e) {
-        MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
-        StartRefusalError body = new StartRefusalError(e.code().code(), new TreeMap<>(e.args()),
-                rendered.message(), e.report(), e.decisionsApplied().isEmpty() ? null : e.decisionsApplied());
+        StartRefusalError body = new StartRefusalError(ApiError.render(e.code(), e.args(), Map.of(), catalog, requestLocale()), e.report(), e.decisionsApplied().isEmpty() ? null : e.decisionsApplied());
         return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
     }
 
@@ -103,8 +112,7 @@ class ApiExceptionHandler {
     @ExceptionHandler(BadRequestCodedException.class)
     ResponseEntity<ApiError> handle(BadRequestCodedException e) {
         markCloudError(e.code());
-        MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
-        ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
+        ApiError body = ApiError.render(e.code(), e.args(), Map.of(), catalog, requestLocale());
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).cacheControl(CacheControl.noStore()).body(body);
     }
 
@@ -120,11 +128,33 @@ class ApiExceptionHandler {
         }
     }
 
+    static Locale localeFor(HttpServletRequest request) {
+        if (request == null) return Locale.ENGLISH;
+        String accepted = request.getHeader("Accept-Language");
+        if (accepted == null || accepted.isBlank()) return Locale.ENGLISH;
+        try {
+            for (Locale.LanguageRange range : Locale.LanguageRange.parse(accepted)) {
+                Locale locale = Locale.forLanguageTag(range.getRange());
+                if ("en".equals(locale.getLanguage())) return Locale.ENGLISH;
+                if ("zh".equals(locale.getLanguage())) return locale;
+            }
+        } catch (IllegalArgumentException malformed) {
+            return Locale.ENGLISH;
+        }
+        return Locale.ENGLISH;
+    }
+
+    static Locale requestLocale() {
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes)
+            return localeFor(attributes.getRequest());
+        return Locale.ENGLISH;
+    }
+
     /**
      * The HTTP status for a coded error. The authentication codes are client-attributable and map to the
      * usual auth statuses: no / invalid credential and a rejected login are 401, an under-scoped or
      * non-loopback caller is 403, and a bootstrap channel that has already closed is a 409 state conflict.
-     * A client input error — a {@code dsl.*} validation failure or a {@code control.malformed-request} refused
+     * A client input error — a {@code dsl.*} validation failure or a {@link ControlError#MALFORMED_REQUEST} refused
      * at the boundary — is a 400. A lifecycle verb on a pipeline that was never applied is a 404; a transition
      * the state machine forbids, or a start/resume at a stale revision, is a 409 state conflict. A metrics,
      * snapshot, or explanation read that requires a published observation is likewise a 404 when none exists.
@@ -138,98 +168,121 @@ class ApiExceptionHandler {
 
     // Status depends on the error contract, including when a code is shared by several endpoints.
     // A successful artifact removal whose cleanup fails remains a server error, not a retryable refusal.
-    private static final Map<String, HttpStatus> HTTP_STATUSES = Map.ofEntries(
-            Map.entry("alert.invalid-configuration", HttpStatus.BAD_REQUEST),
-            Map.entry("alert.stale-action", HttpStatus.CONFLICT),
-            Map.entry("alert.command-conflict", HttpStatus.CONFLICT),
-            Map.entry("alert.command-expired", HttpStatus.CONFLICT),
-            Map.entry("alert.command-not-yet-valid", HttpStatus.CONFLICT),
-            Map.entry("alert.channel-unavailable", HttpStatus.SERVICE_UNAVAILABLE),
+    private static final Map<String, HttpStatus> HTTP_STATUSES = httpStatuses();
+
+    private static Map<String, HttpStatus> httpStatuses() {
+        Map<String, HttpStatus> statuses = new HashMap<>(Map.ofEntries(
+            Map.entry(AlertError.INVALID_CONFIGURATION.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(AlertError.STALE_ACTION.code(), HttpStatus.CONFLICT),
+            Map.entry(AlertError.COMMAND_CONFLICT.code(), HttpStatus.CONFLICT),
+            Map.entry(AlertError.COMMAND_EXPIRED.code(), HttpStatus.CONFLICT),
+            Map.entry(AlertError.COMMAND_NOT_YET_VALID.code(), HttpStatus.CONFLICT),
+            Map.entry(AlertError.CHANNEL_UNAVAILABLE.code(), HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("actuation.source-schema-not-discovered", HttpStatus.CONFLICT),
-            Map.entry("control.storage-cache-database-occupied", HttpStatus.BAD_REQUEST),
-            Map.entry("control.storage-cache-database-occupied-suggested", HttpStatus.BAD_REQUEST),
-            Map.entry("control.storage-databases-overlap", HttpStatus.BAD_REQUEST),
-            Map.entry("control.storage-scope-conflict", HttpStatus.CONFLICT),
-            Map.entry("control.storage-test-failed", HttpStatus.BAD_REQUEST),
-            Map.entry("control.storage-test-required", HttpStatus.CONFLICT),
-            Map.entry("control.storage-unavailable", HttpStatus.SERVICE_UNAVAILABLE),
-            Map.entry("control.storage-quota-exceeded", HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(io.tapstate.core.common.ActuationErrorDefinitions.SOURCE_SCHEMA_NOT_DISCOVERED.code(), HttpStatus.CONFLICT),
+            Map.entry(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(ControlError.STORAGE_DATABASES_OVERLAP.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(ControlError.STORAGE_SCOPE_CONFLICT.code(), HttpStatus.CONFLICT),
+            Map.entry(ControlError.STORAGE_TEST_FAILED.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(ControlError.STORAGE_TEST_REQUIRED.code(), HttpStatus.CONFLICT),
+            Map.entry(ControlError.STORAGE_UNAVAILABLE.code(), HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(ControlError.STORAGE_QUOTA_EXCEEDED.code(), HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("io.store-quota-exceeded", HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(io.tapstate.core.common.IoErrorDefinitions.STORE_QUOTA_EXCEEDED.code(), HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("dsl", HttpStatus.BAD_REQUEST),
             Map.entry("io.configuration-import-refused", HttpStatus.CONFLICT),
+            Map.entry(io.tapstate.core.common.IoErrorDefinitions.CONFIGURATION_IMPORT_REFUSED.code(), HttpStatus.CONFLICT),
             Map.entry("io.pipeline-state-rebuild-required", HttpStatus.CONFLICT),
+            Map.entry(io.tapstate.core.common.IoErrorDefinitions.PIPELINE_STATE_REBUILD_REQUIRED.code(), HttpStatus.CONFLICT),
             Map.entry("io.pipeline-table-selection-rebuild-required", HttpStatus.CONFLICT),
+            Map.entry(io.tapstate.core.common.IoErrorDefinitions.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED.code(), HttpStatus.CONFLICT),
             Map.entry("store.initialization-refused", HttpStatus.CONFLICT),
+            Map.entry(io.tapstate.core.common.StoreErrorDefinitions.INITIALIZATION_REFUSED.code(), HttpStatus.CONFLICT),
             Map.entry("store.ai-provider-schema-unsupported", HttpStatus.CONFLICT),
+            Map.entry(io.tapstate.core.common.StoreErrorDefinitions.AI_PROVIDER_SCHEMA_UNSUPPORTED.code(), HttpStatus.CONFLICT),
             Map.entry("store.invalid-uri", HttpStatus.BAD_REQUEST),
+            Map.entry(io.tapstate.core.common.StoreErrorDefinitions.INVALID_URI.code(), HttpStatus.BAD_REQUEST),
             Map.entry("store.storage-connection-unsupported", HttpStatus.BAD_REQUEST),
+            Map.entry(io.tapstate.core.common.StoreErrorDefinitions.STORAGE_CONNECTION_UNSUPPORTED.code(), HttpStatus.BAD_REQUEST),
             Map.entry("store.tls-trust-invalid", HttpStatus.BAD_REQUEST),
-            Map.entry("control.ai-not-configured", HttpStatus.CONFLICT),
-            Map.entry("control.ai-provider-auth-failed", HttpStatus.UNPROCESSABLE_CONTENT),
-            Map.entry("control.ai-provider-request-rejected", HttpStatus.BAD_GATEWAY),
-            Map.entry("control.ai-provider-rate-limited", HttpStatus.TOO_MANY_REQUESTS),
-            Map.entry("control.ai-provider-failed", HttpStatus.BAD_GATEWAY),
-            Map.entry("control.ai-provider-output-limit", HttpStatus.BAD_GATEWAY),
-            Map.entry("control.ai-invalid-proposal", HttpStatus.UNPROCESSABLE_CONTENT),
-            Map.entry("control.ai-overloaded", HttpStatus.TOO_MANY_REQUESTS),
-            Map.entry("control.auth-failed", HttpStatus.UNAUTHORIZED),
-            Map.entry("control.unauthenticated", HttpStatus.UNAUTHORIZED),
-            Map.entry("control.cloud-auth-unavailable", HttpStatus.SERVICE_UNAVAILABLE),
-            Map.entry("control.auth-mode-unavailable", HttpStatus.FORBIDDEN),
-            Map.entry("control.forbidden", HttpStatus.FORBIDDEN),
-            Map.entry("control.bootstrap-forbidden", HttpStatus.FORBIDDEN),
-            Map.entry("control.bootstrap-closed", HttpStatus.CONFLICT),
-            Map.entry("source.id-mismatch", HttpStatus.BAD_REQUEST),
-            Map.entry("source.not-found", HttpStatus.NOT_FOUND),
-            Map.entry("source.already-exists", HttpStatus.CONFLICT),
-            Map.entry("source.in-use", HttpStatus.CONFLICT),
-            Map.entry("source.srs-change-while-running", HttpStatus.CONFLICT),
-            Map.entry("source.version-conflict", HttpStatus.PRECONDITION_FAILED),
-            Map.entry("source.precondition-required", HttpStatus.PRECONDITION_REQUIRED),
-            Map.entry("artifact.not-found", HttpStatus.NOT_FOUND),
-            Map.entry("artifact.precondition-required", HttpStatus.PRECONDITION_REQUIRED),
-            Map.entry("artifact.version-conflict", HttpStatus.PRECONDITION_FAILED),
-            Map.entry("artifact.in-use", HttpStatus.CONFLICT),
-            Map.entry("artifact.pipeline-not-stopped", HttpStatus.CONFLICT),
-            Map.entry("artifact.reclaim-incomplete", HttpStatus.INTERNAL_SERVER_ERROR),
-            Map.entry("connector.not-found", HttpStatus.NOT_FOUND),
+            Map.entry(io.tapstate.core.common.StoreErrorDefinitions.TLS_TRUST_INVALID.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(ControlError.AI_NOT_CONFIGURED.code(), HttpStatus.CONFLICT),
+            Map.entry(ControlError.AI_PROVIDER_AUTH_FAILED.code(), HttpStatus.UNPROCESSABLE_CONTENT),
+            Map.entry(ControlError.AI_MANAGED_PROVIDER_AUTH_FAILED.code(), HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry("control.ai-managed-provider-auth-failed", HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(ControlError.AI_MANAGED_PROVIDER_INPUT_LIMIT.code(), HttpStatus.CONTENT_TOO_LARGE),
+            Map.entry("control.ai-managed-provider-input-limit", HttpStatus.CONTENT_TOO_LARGE),
+            Map.entry(ControlError.AI_PROVIDER_REQUEST_REJECTED.code(), HttpStatus.BAD_GATEWAY),
+            Map.entry(ControlError.AI_PROVIDER_RATE_LIMITED.code(), HttpStatus.TOO_MANY_REQUESTS),
+            Map.entry(ControlError.AI_PROVIDER_FAILED.code(), HttpStatus.BAD_GATEWAY),
+            Map.entry(ControlError.AI_PROVIDER_OUTPUT_LIMIT.code(), HttpStatus.BAD_GATEWAY),
+            Map.entry(ControlError.AI_INVALID_PROPOSAL.code(), HttpStatus.UNPROCESSABLE_CONTENT),
+            Map.entry(ControlError.AI_OVERLOADED.code(), HttpStatus.TOO_MANY_REQUESTS),
+            Map.entry(ControlError.AUTH_FAILED.code(), HttpStatus.UNAUTHORIZED),
+            Map.entry(ControlError.UNAUTHENTICATED.code(), HttpStatus.UNAUTHORIZED),
+            Map.entry(ControlError.CLOUD_AUTH_UNAVAILABLE.code(), HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(ControlError.AUTH_MODE_UNAVAILABLE.code(), HttpStatus.FORBIDDEN),
+            Map.entry(ControlError.FORBIDDEN.code(), HttpStatus.FORBIDDEN),
+            Map.entry(ControlError.BOOTSTRAP_FORBIDDEN.code(), HttpStatus.FORBIDDEN),
+            Map.entry(ControlError.BOOTSTRAP_CLOSED.code(), HttpStatus.CONFLICT),
+            Map.entry(SourceError.ID_MISMATCH.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(SourceError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),
+            Map.entry(SourceError.ALREADY_EXISTS.code(), HttpStatus.CONFLICT),
+            Map.entry(SourceError.IN_USE.code(), HttpStatus.CONFLICT),
+            Map.entry(SourceError.SRS_CHANGE_WHILE_RUNNING.code(), HttpStatus.CONFLICT),
+            Map.entry(SourceError.VERSION_CONFLICT.code(), HttpStatus.PRECONDITION_FAILED),
+            Map.entry(SourceError.PRECONDITION_REQUIRED.code(), HttpStatus.PRECONDITION_REQUIRED),
+            Map.entry(ArtifactError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),
+            Map.entry(ArtifactError.PRECONDITION_REQUIRED.code(), HttpStatus.PRECONDITION_REQUIRED),
+            Map.entry(ArtifactError.VERSION_CONFLICT.code(), HttpStatus.PRECONDITION_FAILED),
+            Map.entry(ArtifactError.IN_USE.code(), HttpStatus.CONFLICT),
+            Map.entry(ArtifactError.PIPELINE_NOT_STOPPED.code(), HttpStatus.CONFLICT),
+            Map.entry(ArtifactError.RECLAIM_INCOMPLETE.code(), HttpStatus.INTERNAL_SERVER_ERROR),
+            Map.entry(ConnectorCatalogError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),
             Map.entry("connector.test-timeout", HttpStatus.GATEWAY_TIMEOUT),
-            Map.entry("pipeline.not-found", HttpStatus.NOT_FOUND),
-            Map.entry("pipeline.already-exists", HttpStatus.CONFLICT),
-            Map.entry("pipeline.id-mismatch", HttpStatus.BAD_REQUEST),
-            Map.entry("pipeline.precondition-required", HttpStatus.PRECONDITION_REQUIRED),
-            Map.entry("pipeline.version-conflict", HttpStatus.PRECONDITION_FAILED),
-            Map.entry("pipeline.definition-change-unavailable", HttpStatus.SERVICE_UNAVAILABLE),
-            Map.entry("pipeline-draft.not-found", HttpStatus.NOT_FOUND),
-            Map.entry("pipeline-draft.already-exists", HttpStatus.CONFLICT),
-            Map.entry("pipeline-draft.mode-conflict", HttpStatus.CONFLICT),
-            Map.entry("pipeline-draft.artifact-conflict", HttpStatus.CONFLICT),
-            Map.entry("pipeline-draft.revision-conflict", HttpStatus.PRECONDITION_FAILED),
-            Map.entry("pipeline-draft.precondition-required", HttpStatus.PRECONDITION_REQUIRED),
-            Map.entry("pipeline-draft.invalid", HttpStatus.BAD_REQUEST),
-            Map.entry("control.malformed-request", HttpStatus.BAD_REQUEST),
-            Map.entry("control.preview-overloaded", HttpStatus.SERVICE_UNAVAILABLE),
-            Map.entry("lifecycle.unknown-pipeline", HttpStatus.NOT_FOUND),
-            Map.entry("lifecycle.illegal-transition", HttpStatus.CONFLICT),
-            Map.entry("lifecycle.incompatible-revision", HttpStatus.CONFLICT),
-            Map.entry("lifecycle.start-needs-confirmation", HttpStatus.CONFLICT),
-            Map.entry("lifecycle.start-blocked", HttpStatus.CONFLICT),
-            Map.entry("lifecycle.invalid-start-decision", HttpStatus.BAD_REQUEST),
-            Map.entry("lifecycle.pipeline-not-runnable", HttpStatus.CONFLICT),
-            Map.entry("lifecycle.purge-state-not-stated", HttpStatus.BAD_REQUEST),
-            Map.entry("monitor.no-observation", HttpStatus.NOT_FOUND),
-            Map.entry("monitor.invalid-cursor", HttpStatus.BAD_REQUEST),
-            Map.entry("monitor.query-budget-exceeded", HttpStatus.BAD_REQUEST),
-            Map.entry("monitor.cursor-expired", HttpStatus.GONE),
-            Map.entry("data-browser.unknown-collection", HttpStatus.NOT_FOUND),
-            Map.entry("data-browser.invalid-limit", HttpStatus.BAD_REQUEST),
-            Map.entry("data-browser.connector-not-browsable", HttpStatus.BAD_REQUEST),
-            Map.entry("data-browser.unorderable-field", HttpStatus.BAD_REQUEST),
-            Map.entry("position.write-back-while-live", HttpStatus.CONFLICT),
-            Map.entry("position.chain-not-read", HttpStatus.BAD_REQUEST),
-            Map.entry("position.field-not-editable", HttpStatus.BAD_REQUEST),
-            Map.entry("position.nothing-to-write", HttpStatus.BAD_REQUEST),
-            Map.entry("cluster.membership-unreadable", HttpStatus.SERVICE_UNAVAILABLE));
+            Map.entry(io.tapstate.core.common.ConnectorErrorDefinitions.TEST_TIMEOUT.code(), HttpStatus.GATEWAY_TIMEOUT),
+            Map.entry(PipelineError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),
+            Map.entry(PipelineError.ALREADY_EXISTS.code(), HttpStatus.CONFLICT),
+            Map.entry(PipelineError.ID_MISMATCH.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(PipelineError.PRECONDITION_REQUIRED.code(), HttpStatus.PRECONDITION_REQUIRED),
+            Map.entry(PipelineError.VERSION_CONFLICT.code(), HttpStatus.PRECONDITION_FAILED),
+            Map.entry(PipelineError.DEFINITION_CHANGE_UNAVAILABLE.code(), HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(PipelineDraftError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),
+            Map.entry(PipelineDraftError.ALREADY_EXISTS.code(), HttpStatus.CONFLICT),
+            Map.entry(PipelineDraftError.MODE_CONFLICT.code(), HttpStatus.CONFLICT),
+            Map.entry(PipelineDraftError.ARTIFACT_CONFLICT.code(), HttpStatus.CONFLICT),
+            Map.entry(PipelineDraftError.REVISION_CONFLICT.code(), HttpStatus.PRECONDITION_FAILED),
+            Map.entry(PipelineDraftError.PRECONDITION_REQUIRED.code(), HttpStatus.PRECONDITION_REQUIRED),
+            Map.entry(PipelineDraftError.INVALID.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(ControlError.MALFORMED_REQUEST.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(ControlError.PREVIEW_OVERLOADED.code(), HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(LifecycleError.UNKNOWN_PIPELINE.code(), HttpStatus.NOT_FOUND),
+            Map.entry(LifecycleError.ILLEGAL_TRANSITION.code(), HttpStatus.CONFLICT),
+            Map.entry(LifecycleError.INCOMPATIBLE_REVISION.code(), HttpStatus.CONFLICT),
+            Map.entry(LifecycleError.START_NEEDS_CONFIRMATION.code(), HttpStatus.CONFLICT),
+            Map.entry(LifecycleError.START_BLOCKED.code(), HttpStatus.CONFLICT),
+            Map.entry(LifecycleError.INVALID_START_DECISION.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(LifecycleError.PIPELINE_NOT_RUNNABLE.code(), HttpStatus.CONFLICT),
+            Map.entry(LifecycleError.PURGE_STATE_NOT_STATED.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(MonitorError.NO_OBSERVATION.code(), HttpStatus.NOT_FOUND),
+            Map.entry(MonitorError.INVALID_CURSOR.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(MonitorError.QUERY_BUDGET_EXCEEDED.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(MonitorError.CURSOR_EXPIRED.code(), HttpStatus.GONE),
+            Map.entry(DataBrowserError.UNKNOWN_COLLECTION.code(), HttpStatus.NOT_FOUND),
+            Map.entry(DataBrowserError.INVALID_LIMIT.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(DataBrowserError.CONNECTOR_NOT_BROWSABLE.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(DataBrowserError.UNORDERABLE_FIELD.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(PositionError.WRITE_BACK_WHILE_LIVE.code(), HttpStatus.CONFLICT),
+            Map.entry(PositionError.CHAIN_NOT_READ.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(PositionError.FIELD_NOT_EDITABLE.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(PositionError.NOTHING_TO_WRITE.code(), HttpStatus.BAD_REQUEST),
+            Map.entry(ClusterError.MEMBERSHIP_UNREADABLE.code(), HttpStatus.SERVICE_UNAVAILABLE)));
+        // First-party DSL errors use registered product codes. The REST boundary also keeps
+        // external DSL validation failures client-attributable without registering their codes.
+        for (DslError code : DslError.values()) statuses.put(code.code(), HttpStatus.BAD_REQUEST);
+        return Map.copyOf(statuses);
+    }
 
     /** The {@code <domain>} segment of a canonical {@code <domain>.<symbol>} code. */
     private static String domainOf(String code) {

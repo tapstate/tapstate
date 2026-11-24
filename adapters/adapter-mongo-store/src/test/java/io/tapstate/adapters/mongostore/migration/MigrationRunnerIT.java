@@ -163,7 +163,7 @@ class MigrationRunnerIT {
                 TapstateException.class);
 
         assertThat(failure).isNotNull();
-        assertThat(failure.code().code()).isEqualTo("migration.changeset-failed");
+        assertThat(failure.code().code()).isEqualTo("TS0420003");
         assertThat(failure.args()).containsEntry("cause", "disk is full");
         assertThat(installedVersion(database))
                 .as("the step that succeeded is recorded; the one that threw is not")
@@ -228,7 +228,7 @@ class MigrationRunnerIT {
                 TapstateException.class);
 
         assertThat(failure).isNotNull();
-        assertThat(failure.code().code()).isEqualTo("migration.changeset-failed");
+        assertThat(failure.code().code()).isEqualTo("TS0420003");
         assertThat(failure.args().get("cause").toString()).contains("taken over");
         assertThat(installedVersion(database)).isZero();
     }
@@ -247,7 +247,7 @@ class MigrationRunnerIT {
                 TapstateException.class);
 
         assertThat(refusal).isNotNull();
-        assertThat(refusal.code().code()).isEqualTo("migration.lock-timeout");
+        assertThat(refusal.code().code()).isEqualTo("TS0420002");
         // Naming the holder is the point of the diagnostic: the answer is on that member, not this one.
         assertThat(refusal.args()).containsEntry("holder", "member-a@host");
         assertThat(refusal.args()).containsEntry("since", heldSince.toString());
@@ -314,7 +314,7 @@ class MigrationRunnerIT {
         assertThat(failure).as("it started against a store seven versions past what it can read").isNotNull();
         assertThat(failure.getCause()).isInstanceOf(TapstateException.class);
         TapstateException refusal = (TapstateException) failure.getCause();
-        assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
+        assertThat(refusal.code().code()).isEqualTo("TS0420001");
         assertThat(refusal.args()).containsEntry("installed", "7").containsEntry("supported", "1");
     }
 

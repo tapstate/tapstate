@@ -21,11 +21,10 @@ class ConnectorCodeRegistryTest {
     void namespacedConnectorCodesCannotCollideWithFirstPartyConnectorCodes() {
         Set<String> firstParty = Arrays.stream(ConnectorError.values())
                 .map(ConnectorError::code).collect(Collectors.toSet());
-        // A first-party code is two segments (connector.<symbol>); a namespaced connector code is three
-        // (connector.<id>.<symbol>). Even a connector that reuses a first-party symbol cannot mint the
-        // first-party code, because its code always carries the connector-id segment.
+        // A product code uses the allocated numeric module; connector-authored codes retain their
+        // connector-id namespace. Reusing a product symbol cannot mint a product identity.
         for (ConnectorError e : ConnectorError.values()) {
-            String symbol = e.code().substring("connector.".length());
+            String symbol = e.name().toLowerCase(java.util.Locale.ROOT).replace('_', '-');
             String namespaced = ConnectorCodeRegistry.namespaced("mysql", symbol);
             assertThat(namespaced).isEqualTo("connector.mysql." + symbol);
             assertThat(firstParty).doesNotContain(namespaced);

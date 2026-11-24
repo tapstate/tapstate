@@ -5,6 +5,7 @@ import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelineSnapshot;
 import io.tapstate.messages.MessageCatalog;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
@@ -31,15 +32,18 @@ class PipelineObservationController {
 
     @Verb("pipeline.status")
     @GetMapping("/pipelines/{id}/status")
-    PipelineStatusResponse status(@PathVariable("id") String id) {
+    PipelineStatusResponse status(@PathVariable("id") String id, HttpServletRequest request) {
+        java.util.Locale locale = ApiExceptionHandler.localeFor(request);
         Optional<PipelineCatalogItem> item = pipelines.find(id);
         if (item.isPresent()) {
             PipelineCatalogItem pipeline = item.orElseThrow();
             return observations.findStatusWithPlan(pipeline)
-                    .map(status -> PipelineStatusResponse.of(pipeline, catalog, status))
-                    .orElseGet(() -> PipelineStatusResponse.of(pipeline, catalog));
+                    .map(status -> PipelineStatusResponse.of(pipeline, catalog, status, locale))
+                    .orElseGet(() -> PipelineStatusResponse.of(pipeline, catalog,
+                            java.time.Clock.systemUTC(), locale));
         }
-        return PipelineStatusResponse.of(observations.status(id), catalog);
+        return PipelineStatusResponse.of(observations.status(id), catalog,
+                java.time.Clock.systemUTC(), locale);
     }
 
     @Verb("pipeline.metrics")

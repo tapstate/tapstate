@@ -30,7 +30,7 @@ Flat supports both relationship directions that still produce one row per parent
 A one-to-many relationship is not flat. Tapstate does not try to infer this from a model, because a
 source model can be missing or stale and uniqueness is ultimately a property of the rows that arrive.
 When a second live row matches the same parent, the run stops with
-`nest.flat-cardinality-violation`; it never chooses an arbitrary row. Use `as: array` for one-to-many.
+`TS0490014`; it never chooses an arbitrary row. Use `as: array` for one-to-many.
 
 ## Field collisions
 
@@ -44,7 +44,7 @@ No declaration order wins a flat field collision. A flat field may not overlap:
 When discovered models are available, job construction checks their field names and refuses a known
 collision before starting. Some MongoDB collections and dynamic transform outputs have no complete model;
 the renderer repeats the check against every actual row. A collision found there stops the run with
-`nest.flat-field-conflict`, naming the flat embed, the fields, and what already owns them.
+`TS0490005`, naming the flat embed, the fields, and what already owns them.
 
 Rename or drop fields in an upstream `map` step. Join and identity fields still have to reach Nest, so a
 common pattern is to rename them before Nest and drop the internal names afterwards.

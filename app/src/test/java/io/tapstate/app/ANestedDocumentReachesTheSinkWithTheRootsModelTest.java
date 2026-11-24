@@ -242,7 +242,7 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
         assertThatThrownBy(() -> dag.dagFor(PIPELINE))
                 .as("the root's key would otherwise be the column every row now holds 0 in")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.root-key-required");
+                .hasMessageContaining("TS0490006");
     }
 
     /**

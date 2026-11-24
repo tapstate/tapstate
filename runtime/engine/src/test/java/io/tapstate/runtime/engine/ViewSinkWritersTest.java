@@ -32,7 +32,7 @@ class ViewSinkWritersTest {
                 .satisfies(failure -> {
                     TapstateException coded = (TapstateException) failure;
                     assertThat(coded.code().code())
-                            .isEqualTo("engine.view-key-missing-from-before-image");
+                            .isEqualTo("TS0440007");
                     assertThat(coded.args()).containsEntry("view", "order_state")
                             .containsEntry("key", "id")
                             .containsEntry("operation", "delete");
@@ -85,14 +85,32 @@ class ViewSinkWritersTest {
         assertThat(delegate.closed).isTrue();
     }
 
+    @Test
+    void the_guard_forwards_empty_snapshot_completion_to_the_target_writer() {
+        RecordingWriter delegate = new RecordingWriter();
+        SinkWriter writer = ViewSinkWriters.requireAlternateKeyInBeforeImage(
+                delegate, "order_state", "id");
+
+        writer.snapshotDelivered("orders");
+
+        assertThat(delegate.deliveredSnapshots).containsExactly("orders");
+        assertThat(delegate.batches).isEmpty();
+    }
+
     private static final class RecordingWriter implements SinkWriter {
         private final List<List<Envelope>> batches = new ArrayList<>();
+        private final List<String> deliveredSnapshots = new ArrayList<>();
         private boolean closed;
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             batches.add(records);
             return CompletableFuture.completedFuture(new WriteResult(records.size()));
+        }
+
+        @Override
+        public void snapshotDelivered(String stream) {
+            deliveredSnapshots.add(stream);
         }
 
         @Override

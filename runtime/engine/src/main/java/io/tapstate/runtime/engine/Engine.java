@@ -69,7 +69,7 @@ public final class Engine {
     private static final Duration PREVIOUS_RUN_BUDGET = Duration.ofSeconds(30);
 
     /** Reserved job metadata carrying the submitting caller's immutable complete execution identity. */
-    public static final String RUN_IDENTITY_ARGUMENT = "tapstate.execution-identity";
+    public static final String RUN_IDENTITY_ARGUMENT = io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT;
     public static final String OPERATOR_MANIFEST_ARGUMENT = "tapstate.operator-manifest";
 
     private final HazelcastInstance member;
@@ -93,6 +93,17 @@ public final class Engine {
     public Engine(HazelcastInstance member, OperatorStateStores operatorStateStores) {
         this.member = Objects.requireNonNull(member, "member");
         this.operatorStateStores = operatorStateStores;
+        member.getUserContext().putIfAbsent(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY,
+                new io.tapstate.core.lifecycle.ExecutionFailureRecorder() {
+                    @Override public java.util.function.Consumer<Throwable> forExecution(
+                            String pipelineId, long jobId, java.io.Serializable identity) {
+                        return JobFailureRegistry.of(member).forExecution(pipelineId, jobId, identity)::record;
+                    }
+                    @Override public java.util.function.Consumer<Throwable> forProcessor(
+                            String pipelineId, long jobId, long executionId, java.io.Serializable identity) {
+                        return JobFailureRegistry.of(member).forProcessor(pipelineId, jobId, executionId, identity)::record;
+                    }
+                });
     }
 
     /**
@@ -171,14 +182,15 @@ public final class Engine {
         }
         configureNestState(stateDatabases, settings);
         Job submitted = submitJob(pipelineId, dag, originalIdentity, manifest);
+        JobConfig config;
         try {
-            JobConfig config = submitted.getConfig();
+            config = submitted.getConfig();
             if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))
                     || !Objects.equals(manifest, config.getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
         } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
             throw runRefused(pipelineId);
         }
-        JobFailureRegistry.of(member).attach(pipelineId, submitted.getId(), originalIdentity);
+        JobFailureRegistry.of(member).forJob(submitted.getId(), config);
         return new Run(pipelineId, originalIdentity, submitted, manifest);
     }
 
@@ -258,20 +270,35 @@ public final class Engine {
             if (!isLost() && !job.getStatus().isTerminal()) job.cancel();
             JobFailureRegistry.of(member).retireRun(pipelineId, job.getId(), identity);
         }
-        public Optional<Throwable> failure() {
+        public Optional<Throwable> failure() { return failureFact().map(io.tapstate.core.common.FailureFact::cause); }
+        public Optional<io.tapstate.core.common.FailureFact> failureFact() {
             var lost = Engine.this.lost(pipelineId);
-            if (lost.isPresent()) return failures().get().filter(cause -> !ranOutOfMemory(cause)).or(() -> lost.map(Throwable.class::cast));
+            if (lost.isPresent()) return failures().fact().filter(fact -> !ranOutOfMemory(fact.cause())).or(() -> lost.map(io.tapstate.core.common.FailureFact::new));
             if (job.getStatus() != JobStatus.FAILED) return Optional.empty();
-            var recorded = failures().get();
+            var recorded = failures().fact();
             if (recorded.isPresent()) return recorded;
             try { job.getFuture().join(); return Optional.empty(); }
             catch (CancellationException cancelled) { return Optional.empty(); }
             catch (CompletionException failed) {
                 Throwable cause = failed.getCause() == null ? failed : failed.getCause();
-                return cause instanceof CancellationException ? Optional.empty() : Optional.of(cause);
+                return cause instanceof CancellationException ? Optional.empty() : Optional.of(new io.tapstate.core.common.FailureFact(cause));
             }
         }
         public boolean awaitTerminal(Duration budget) { return !isLost() && awaitJob(job, budget); }
+
+        /** Waits for this exact job once cancellation has been submitted by the stop worker. */
+        public boolean awaitTerminal() {
+            if (isLost()) return false;
+            try {
+                job.getFuture().toCompletableFuture().get();
+                return true;
+            } catch (CancellationException | ExecutionException over) {
+                return true;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
         private JobFailureRegistry.Recorder failures() {
             // A processor may attach after this handle was obtained. This is a read of the original pair only.
             return JobFailureRegistry.of(member).existing(pipelineId, job.getId(), identity);
@@ -488,18 +515,20 @@ public final class Engine {
      * the cause that names what an operator has to change. A recorded cause that is itself the heap running out,
      * anywhere down its chain, is the loss as a processor caught it, and is answered as the loss.
      */
-    public Optional<Throwable> failureOf(String pipelineId) {
+    public Optional<Throwable> failureOf(String pipelineId) { return failureFactOf(pipelineId).map(io.tapstate.core.common.FailureFact::cause); }
+
+    public Optional<io.tapstate.core.common.FailureFact> failureFactOf(String pipelineId) {
         Optional<TapstateException> lost = lost(pipelineId);
         if (lost.isPresent()) {
-            Optional<Throwable> recorded = JobFailureRegistry.of(member).get(pipelineId)
-                    .filter(cause -> !ranOutOfMemory(cause));
-            return recorded.isPresent() ? recorded : lost.map(Throwable.class::cast);
+            Optional<io.tapstate.core.common.FailureFact> recorded = JobFailureRegistry.of(member).fact(pipelineId)
+                    .filter(fact -> !ranOutOfMemory(fact.cause()));
+            return recorded.isPresent() ? recorded : lost.map(io.tapstate.core.common.FailureFact::new);
         }
         Job job = jobNamed(pipelineId);
         if (job == null || job.getStatus() != JobStatus.FAILED) {
             return Optional.empty();
         }
-        Optional<Throwable> recorded = JobFailureRegistry.of(member).get(pipelineId);
+        Optional<io.tapstate.core.common.FailureFact> recorded = JobFailureRegistry.of(member).fact(pipelineId);
         if (recorded.isPresent()) {
             return recorded;
         }
@@ -510,7 +539,7 @@ public final class Engine {
             return Optional.empty();
         } catch (CompletionException failed) {
             Throwable cause = failed.getCause() != null ? failed.getCause() : failed;
-            return cause instanceof CancellationException ? Optional.empty() : Optional.of(cause);
+            return cause instanceof CancellationException ? Optional.empty() : Optional.of(new io.tapstate.core.common.FailureFact(cause));
         }
     }
 
@@ -967,8 +996,7 @@ public final class Engine {
                         .merge(reading.kind(), measurement.value(), Math::max);
             }
         }
-        OperatorMapBindings bindings = member.getUserContext() == null ? null
-                : OperatorMapBindings.resolve(member, false);
+        OperatorMapBindings bindings = OperatorMapBindings.resolve(member, false);
         Map<String, NestStateReading> readings = new HashMap<>();
         var dataMembers = member.getCluster().getMembers().stream().filter(value -> !value.isLiteMember())
                 .map(value -> value.getUuid().toString()).collect(java.util.stream.Collectors.toSet());

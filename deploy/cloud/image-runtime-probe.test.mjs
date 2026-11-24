@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash, createPublicKey, verify } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import test from 'node:test';
 import { CLUSTER, CODE, FORMAL_CODE, TOKEN, createWireFixture, verify as verifyPhase, web } from './image-runtime-probe.mjs';
@@ -192,10 +197,50 @@ test('a seed refusal requires the unavailable business code while retaining the 
   const probe = () => verifyPhase('seed-refused', base, undefined,
     new URL('./connectors.lock.json', import.meta.url), undefined);
   await probe();
+  code = 'TS0210030';
+  await probe();
+  code = 'TS0210021';
+  await assert.rejects(probe);
   code = 'control.cloud-auth-unavailable';
   await assert.rejects(probe);
   code = 'control.storage-unavailable'; status = 200;
   await assert.rejects(probe);
   status = 503; entry = 'UNAVAILABLE';
   await assert.rejects(probe);
+});
+
+
+test('the executable probe preserves safe current and historical refusal codes without leaking payload text', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'runtime-probe-code-'));
+  t.after(() => rmSync(root, {recursive: true, force: true}));
+  const html = '<html><script src="/assets/runtime.js"></script></html>', asset = 'export const runtime = true;';
+  const sha = value => createHash('sha256').update(value).digest('hex');
+  const metadata = join(root, 'metadata.json');
+  writeFileSync(metadata, JSON.stringify({webFiles: {'index.html': sha(html), 'assets/runtime.js': sha(asset)}}));
+  let code;
+  const server = createServer((req, res) => {
+    if (req.url.startsWith('/auth/exchange?')) {
+      res.writeHead(302, {Location: '/', 'Cache-Control': 'no-store',
+        'Set-Cookie': '__Host-tapstate-cloud-session=private-cookie-sentinel; Path=/; Secure; HttpOnly; SameSite=Lax'});
+      return res.end();
+    }
+    if (req.url === '/auth/storage-entry') {res.setHeader('Content-Type', 'application/json');return res.end(JSON.stringify({mode: 'CLOUD', entry: 'SETUP_REQUIRED'}));}
+    if (req.url === '/api/storage/status') {res.writeHead(503, {'Content-Type': 'application/json'});return res.end(JSON.stringify({code, message: 'private-message-sentinel', params: {uri: 'private-uri-sentinel'}}));}
+    if (req.url.startsWith('/api/')) {res.writeHead(404, {'Content-Type': 'application/json'});return res.end('{}');}
+    res.end(req.url === '/assets/runtime.js' ? asset : html);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  for (const [input, expected] of [['TS0210015', 'TS0210015'], ['TS0210021', 'TS0210021'],
+    ['control.audit-blocked', 'control.audit-blocked'], ['TS0000001', 'unavailable'],
+    ['TS0210000', 'unavailable'], ['TS0210021-secret', 'unavailable'], ['private uri value', 'unavailable']]) {
+    code = input;
+    const failure = await promisify(execFile)(process.execPath, [fileURLToPath(new URL('./image-runtime-probe.mjs', import.meta.url)),
+      'verify', 'cloud', base, base, metadata, join(root, 'state.json')], {timeout: 10000}).catch(error => error);
+    assert.equal(failure.code, 1);
+    assert.match(failure.stderr, new RegExp(`HTTP 503, code ${expected}\\)`));
+    for (const secret of ['private-message-sentinel', 'private-uri-sentinel', 'private-cookie-sentinel'])
+      assert(!failure.stderr.includes(secret));
+  }
 });

@@ -8,6 +8,7 @@ import io.tapstate.testsupport.DockerGate;
 import java.nio.file.*;
 import java.time.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import org.bson.Document;
 import org.junit.jupiter.api.*;
 import static org.assertj.core.api.Assertions.*;
@@ -56,28 +57,74 @@ class AlertSourceFailureIT {
                 Await.until("actual CDC before the source fault",Duration.ofSeconds(60),()->landed.countDocuments(new Document("name","streaming"))==1,control::viewsJson);
                 var unavailable=masterFailure?master:source;
                 String failureType=masterFailure?"cluster.storage-unavailable":"source.connection-failed";
-                unavailable.freeze();Map<String,Object> during;
-                if(masterFailure)collection.updateOne(new Document("_id",1),new Document("$set",new Document("name","target-unavailable")));
+                String resourceKind = masterFailure ? "cluster-storage" : "source";
+                String resourceId = masterFailure ? "views" : "src_alarm";
+                var healthBefore = control.alert("health", Map.of());
+                unavailable.freeze();
+                var observedCenter = new AtomicReference<Map<String, Object>>();
                 try {
-                    Await.until("actual Source and Pipeline failures in the authoritative alert center",Duration.ofSeconds(45),()->{
-                        String center=JsonWriter.write(control.alert("center",Map.of()));return center.contains(failureType) && center.contains("pipeline.failed");
-                    },()->JsonWriter.write(control.alert("center",Map.of())));
-                    during=control.alert("center",Map.of());
-                }finally{unavailable.thaw();}
-                collection.updateOne(new Document("_id",1),new Document("$set",new Document("name","after")));
-                control.stop("source_alarm",false);
-                Await.until("the explicit retained-state stop",Duration.ofSeconds(30),()->control.state("source_alarm").filter(io.tapstate.core.lifecycle.PipelineState.STOPPED::equals).isPresent(),control::viewsJson);
-                assertThat(JsonWriter.write(control.alert("center",Map.of()))).contains(failureType);
-                control.lifecycle("source_alarm",LifecycleVerb.START);
-                Await.until("the original source to resume actual CDC",Duration.ofSeconds(90),()->landed.countDocuments(new Document("name","after"))==1,control::viewsJson);
-                collection.insertOne(new Document("_id",2).append("name","new-after-retry"));
-                Await.until("a new event on the recovered original stream",Duration.ofSeconds(60),()->landed.countDocuments(new Document("_id",2))==1,control::viewsJson);
-                Await.until("Source original-capability recovery in the alert center",Duration.ofSeconds(30),()->!
-                        JsonWriter.write(control.alert("center",Map.of())).contains(failureType),()->JsonWriter.write(control.alert("center",Map.of())));
-                var history=control.alert("center",Map.of("view","history"));assertThat(history.toString()).contains(failureType,"RECOVERED");
+                    if (masterFailure) {
+                        collection.updateOne(new Document("_id", 1), new Document("$set", new Document("name", "target-unavailable")));
+                    }
+                    Await.until(failureType + " for " + resourceId + " and pipeline.failed for source_alarm",
+                            Duration.ofSeconds(45), () -> {
+                                var center = control.alert("center", Map.of());
+                                observedCenter.set(center);
+                                return activeAlert(center, failureType, resourceKind, resourceId).isPresent()
+                                        && activeAlert(center, "pipeline.failed", "pipeline", "source_alarm").isPresent();
+                            }, () -> "center=" + JsonWriter.write(observedCenter.get())
+                                    + "; health before fault=" + JsonWriter.write(healthBefore)
+                                    + "; current health=" + JsonWriter.write(control.alert("health", Map.of())));
+                } finally {
+                    unavailable.thaw();
+                }
+                var during = observedCenter.get();
+                var original = activeAlert(during, failureType, resourceKind, resourceId).orElseThrow();
+                collection.updateOne(new Document("_id", 1), new Document("$set", new Document("name", "after")));
+                control.stop("source_alarm", false);
+                Await.until("the explicit retained-state stop", Duration.ofSeconds(30),
+                        () -> control.state("source_alarm").filter(io.tapstate.core.lifecycle.PipelineState.STOPPED::equals).isPresent(),
+                        control::viewsJson);
+                assertThat(activeAlert(control.alert("center", Map.of()), failureType, resourceKind, resourceId)
+                        .filter(row -> sameEpisode(original, row))).isPresent();
+                control.lifecycle("source_alarm", LifecycleVerb.START);
+                Await.until("the original source to resume actual CDC", Duration.ofSeconds(90),
+                        () -> landed.countDocuments(new Document("name", "after")) == 1, control::viewsJson);
+                collection.insertOne(new Document("_id", 2).append("name", "new-after-retry"));
+                Await.until("a new event on the recovered original stream", Duration.ofSeconds(60),
+                        () -> landed.countDocuments(new Document("_id", 2)) == 1, control::viewsJson);
+                var history = Await.answered("the original " + failureType + " episode to be recovered",
+                        Duration.ofSeconds(30), () -> {
+                            var reading = control.alert("center", Map.of("view", "history"));
+                            return alertRows(reading).stream()
+                                    .anyMatch(row -> sameEpisode(original, row) && "RECOVERED".equals(row.get("status")))
+                                    ? Optional.of(reading) : Optional.empty();
+                        });
+                assertThat(activeAlert(control.alert("center", Map.of()), failureType, resourceKind, resourceId)).isEmpty();
                 var evidence=Map.of("during",during,"after",control.alert("center",Map.of()),"history",history,"targetCount",landed.countDocuments(),"sameSourceUri",true,"storageRole",masterFailure?"MASTER":"BUSINESS_SOURCE");
                 Files.writeString(Path.of(System.getProperty("tapstate.t8.source-receipt",masterFailure?"/tmp/w4-t8-master-receipt.json":"/tmp/w4-t8-source-receipt.json")),JsonWriter.write(evidence));
             }finally{try(var cleanup=MongoClients.create(targetUri)){cleanup.getDatabase(targetDb).drop();}}
         }
     }
+
+    private static Optional<Map<?, ?>> activeAlert(Map<String, Object> center, String type, String kind, String id) {
+        return alertRows(center).stream().filter(row -> type.equals(row.get("typeId"))
+                && "ACTIVE".equals(row.get("status"))
+                && row.get("resource") instanceof Map<?, ?> resource
+                && kind.equals(resource.get("kind"))
+                && id.equals(resource.get("id"))).findFirst();
+    }
+
+    private static List<Map<?, ?>> alertRows(Map<String, Object> center) {
+        var rows = new ArrayList<Map<?, ?>>();
+        for (Object row : (List<?>) center.get("rows")) {
+            rows.add((Map<?, ?>) row);
+        }
+        return rows;
+    }
+
+    private static boolean sameEpisode(Map<?, ?> original, Map<?, ?> row) {
+        return original.get("key").equals(row.get("key")) && original.get("episode").equals(row.get("episode"));
+    }
+
 }

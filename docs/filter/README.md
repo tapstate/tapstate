@@ -57,7 +57,7 @@ ALTER TABLE shipments REPLICA IDENTITY FULL;
 ```
 
 If predicate evaluation reads a missing before-image field, it reports the
-existing `transform.expression-failed` diagnostic. The filter does not fetch
+existing `TS0450001` diagnostic. The filter does not fetch
 old rows from the source or reconstruct missing values.
 
 ## Ignoring an update that carries an older timestamp
@@ -79,7 +79,7 @@ update produces no row event. An update that changes nothing is dropped too.
 
 Mixed operands, such as a DATETIME against a DATE, a string or a number, are
 refused at validation, and so is arithmetic on these types. A null operand
-fails evaluation with `transform.expression-failed`; guard a nullable column
+fails evaluation with `TS0450001`; guard a nullable column
 with `has()` or a null check. The filter judges each update against the row it
 replaces, so a stale value that a partial update has already merged into the
 source row travels on with the next newer update.
@@ -109,7 +109,7 @@ expr: "after.IssuedAt.toDate('America/Los_Angeles') > today('America/Los_Angeles
 
 A literal zone that names no zone is refused when the pipeline is applied. A
 zone read from the row is judged when the row is processed, and one that names
-no zone fails with `transform.expression-failed`.
+no zone fails with `TS0450001`.
 
 ### The answer is fixed when the row is processed
 

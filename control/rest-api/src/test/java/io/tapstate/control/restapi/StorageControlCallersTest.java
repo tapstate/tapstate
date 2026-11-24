@@ -69,7 +69,7 @@ class StorageControlCallersTest {
                 new org.springframework.mock.web.MockHttpServletRequest(), response,
                 (org.springframework.security.core.AuthenticationException) failure);
         assertThat(response.getStatus()).isEqualTo(503);
-        assertThat(response.getContentAsString()).contains("control.storage-quota-exceeded", "\"params\":{}")
+        assertThat(response.getContentAsString()).contains("TS0210031", "\"params\":{}")
                 .doesNotContain("private-credential-sentinel", "private-cause-sentinel", "clusterId", "operationId");
     }
 
@@ -88,7 +88,7 @@ class StorageControlCallersTest {
                 new org.springframework.mock.web.MockHttpServletRequest(), response,
                 (org.springframework.security.core.AuthenticationException)failure);
         assertThat(response.getStatus()).isEqualTo(503);
-        assertThat(response.getContentAsString()).contains("control.storage-unavailable").doesNotContain("secret-driver-detail");
+        assertThat(response.getContentAsString()).contains("TS0210030").doesNotContain("secret-driver-detail");
         assertThat(response.getHeader("Cache-Control")).isEqualTo("no-store");
     }
 

@@ -190,7 +190,7 @@ class UnwindParentKeyTest {
         assertThatThrownBy(() -> port.transform(new Envelope(Op.DELETE, 1L, "orders",
                 Map.of("region", "east", "items", List.of(Map.of("sku", "a"))), null, null)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+                .hasMessageContaining("TS0450007");
     }
 
     /**
@@ -292,7 +292,7 @@ class UnwindParentKeyTest {
         assertThatThrownBy(() -> StoreBackedDagSource.parentKeysReaching(merged, chain(left, right, merged),
                 ORDERS_KEYED_ON_O_ID))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+                .hasMessageContaining("TS0360008");
     }
 
     @Test
@@ -301,7 +301,7 @@ class UnwindParentKeyTest {
         assertThatThrownBy(() -> StoreBackedDagSource.transformPortByStream(
                 expand, Map.of("orders", List.of()), null))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+                .hasMessageContaining("TS0360008");
     }
 
     @Test

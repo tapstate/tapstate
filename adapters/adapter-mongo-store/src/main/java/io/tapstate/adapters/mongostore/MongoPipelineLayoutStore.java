@@ -154,6 +154,6 @@ public final class MongoPipelineLayoutStore implements PipelineLayoutStore {
     }
 
     private static TapstateException corrupt(String pipelineId) {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId), null);
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", "layout"), null);
     }
 }

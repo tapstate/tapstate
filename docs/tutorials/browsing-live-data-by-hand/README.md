@@ -210,7 +210,7 @@ A follow that shows nothing for ten minutes is ended by the server, which says s
 quiet:
 
 ```
-error: data-browser.follow-idle
+error: TS0390007
   Following stopped after 10 minutes with no changes; the connector instance it held was given back.
 ```
 

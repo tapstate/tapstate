@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.DataBrowserErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 
 import java.util.Set;
@@ -9,7 +11,7 @@ import java.util.Set;
 public enum DataBrowserError implements TapstateErrorCode {
 
     /** The collection asked for is not one the source's own database holds. */
-    UNKNOWN_COLLECTION("data-browser.unknown-collection", Set.of("source", "collection")),
+    UNKNOWN_COLLECTION(DataBrowserErrorDefinitions.UNKNOWN_COLLECTION),
 
     /**
      * The read asked for a number of rows this face will not serve — more than the cap, or none at
@@ -19,7 +21,7 @@ public enum DataBrowserError implements TapstateErrorCode {
      * no read to serve either — the answer would be no rows and "there is more", which reads as an
      * empty collection with a contradiction attached.
      */
-    INVALID_LIMIT("data-browser.invalid-limit", Set.of("limit", "max")),
+    INVALID_LIMIT(DataBrowserErrorDefinitions.INVALID_LIMIT),
 
     /**
      * The order asked for names a field whose own name holds a dot, which no order can reach.
@@ -28,7 +30,7 @@ public enum DataBrowserError implements TapstateErrorCode {
      * a path and has no second form. Served anyway it would order by a path resolving nowhere — every
      * row equal, rows back in no particular order, nothing reported.
      */
-    UNORDERABLE_FIELD("data-browser.unorderable-field", Set.of("field")),
+    UNORDERABLE_FIELD(DataBrowserErrorDefinitions.UNORDERABLE_FIELD),
 
     /**
      * The source's connector cannot be asked for rows in the shape this face asks in. {@code connector}
@@ -45,21 +47,21 @@ public enum DataBrowserError implements TapstateErrorCode {
      * connector's own table names and table info, and they answer correctly for every connector here.
      * Refusing them too would hide a source a reader can perfectly well look at the outline of.
      */
-    CONNECTOR_NOT_BROWSABLE("data-browser.connector-not-browsable", Set.of("connector", "browsable")),
+    CONNECTOR_NOT_BROWSABLE(DataBrowserErrorDefinitions.CONNECTOR_NOT_BROWSABLE),
 
     /**
      * The source being followed was deleted, so the follow was stopped and its connection closed. The
      * close is the whole point: a stopped stream on an open connection is a collection nothing is
      * happening to, and a reader cannot tell those apart.
      */
-    SOURCE_DELETED("data-browser.source-deleted", Set.of()),
+    SOURCE_DELETED(DataBrowserErrorDefinitions.SOURCE_DELETED),
 
     /**
      * The follow's stream failed, so it was stopped and its connection closed. Carries no detail of the
      * failure on purpose - it reaches a reader who asked to watch a collection, not the operator of the
      * connector that broke; the failure itself is logged where the connector's own words survive.
      */
-    FOLLOW_STOPPED("data-browser.follow-stopped", Set.of()),
+    FOLLOW_STOPPED(DataBrowserErrorDefinitions.FOLLOW_STOPPED),
 
     /**
      * The follow was reclaimed after a long stretch with nothing to show. A follow holds a connector
@@ -67,28 +69,13 @@ public enum DataBrowserError implements TapstateErrorCode {
      * somebody who walked away is a place nobody else can have. A reader who is still there asks
      * again; nothing is lost but the connection.
      */
-    FOLLOW_IDLE("data-browser.follow-idle", Set.of());
+    FOLLOW_IDLE(DataBrowserErrorDefinitions.FOLLOW_IDLE);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    DataBrowserError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    DataBrowserError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

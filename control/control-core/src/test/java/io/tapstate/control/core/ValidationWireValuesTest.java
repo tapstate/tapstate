@@ -43,6 +43,6 @@ class ValidationWireValuesTest {
         assertThatThrownBy(()->new ValidationWireValues.Encoder().value(cycle)).isInstanceOf(TapstateException.class).hasMessageContaining("wire.valueCycle");
         assertThatThrownBy(()->new ValidationWireValues.Encoder().value(Collections.nCopies(65536,null))).isInstanceOf(TapstateException.class).hasMessageContaining("reportWire");
         assertThatThrownBy(()->new ValidationWireValues.Encoder().value("x".repeat(6*1024*1024))).isInstanceOf(TapstateException.class).hasMessageContaining("reportWire");
-        assertThatThrownBy(()->new ValidationWireValues.Encoder().value(new Object())).isInstanceOf(TapstateException.class).hasMessageContaining("value-type-unsupported");
+        assertThatThrownBy(()->new ValidationWireValues.Encoder().value(new Object())).isInstanceOf(TapstateException.class).hasMessageContaining("TS0300013");
     }
 }
