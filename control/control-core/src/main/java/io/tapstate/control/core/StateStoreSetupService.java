@@ -8,6 +8,7 @@ import java.util.Objects;
 
 /** Creates the Cloud destination under a server-owned marker and stable identity. */
 public final class StateStoreSetupService {
+    private static final String ATLAS_CONNECTOR = "mongodb-atlas";
     private static final String ID = "atlas-store";
     private final ApplyService apply;
     private final ArtifactQueryService artifacts;
@@ -42,7 +43,7 @@ public final class StateStoreSetupService {
             var uri = inventory.resources().stream().map(StoredResource::resource)
                     .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)
                     .filter(source -> id.equals(source.id())
-                            && ("mongodb".equals(source.connector()) || "mongodb-atlas".equals(source.connector())))
+                            && ("mongodb".equals(source.connector()) || ATLAS_CONNECTOR.equals(source.connector())))
                     .map(source -> source.config().get("uri")).filter(String.class::isInstance).map(String.class::cast)
                     .filter(value -> value.startsWith("mongodb://") || value.startsWith("mongodb+srv://"))
                     .findFirst().orElseThrow(() -> unavailable(id));
@@ -71,14 +72,14 @@ public final class StateStoreSetupService {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
                     Map.of("reason", "a state store is already configured"), null);
         }
-        ConnectionTestReport tested = connections.test(ID, "mongodb-atlas", config, principal);
+        ConnectionTestReport tested = connections.test(ID, ATLAS_CONNECTOR, config, principal);
         if (tested.outcome() != ConnectionTestReport.Outcome.PASSED) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
                     Map.of("reason", "MongoDB Atlas connection test failed"), null);
         }
         SourceInput input = new SourceInput(ID,
                 new Metadata(Map.of("store", "true"), "MongoDB Atlas state store"),
-                "mongodb-atlas", config, null, null, null, null, null, null);
+                ATLAS_CONNECTOR, config, null, null, null, null, null, null);
         SourceResource source = representation.toModel(input, null);
         ArtifactWriteResult result = apply.create(principal, source, ControlOperations.STATE_STORE_CONNECT);
         SourceProjectionService.throwForWriteRefusal(source.id(), result.write());
