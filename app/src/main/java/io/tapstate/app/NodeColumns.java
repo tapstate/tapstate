@@ -27,7 +27,6 @@ import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -370,11 +369,23 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
     private static <T> Map<String, T> commonDescriptors(Collection<NodeColumns> inputs, Set<String> columns,
             java.util.function.Function<NodeColumns, Map<String, T>> descriptors) {
         Map<String, T> result = new LinkedHashMap<>();
-        Map<String, T> first = descriptors.apply(inputs.iterator().next());
         for (String column : columns) {
-            T candidate = first.get(column);
-            if (candidate != null && inputs.stream().allMatch(input ->
-                    Objects.equals(candidate, descriptors.apply(input).get(column)))) result.put(column, candidate);
+            T candidate = null;
+            for (NodeColumns input : inputs) {
+                // An absent column only affects nullability. Every input carrying it must agree.
+                if (!input.columns().containsKey(column)) {
+                    continue;
+                }
+                T descriptor = descriptors.apply(input).get(column);
+                if (descriptor == null || (candidate != null && !candidate.equals(descriptor))) {
+                    candidate = null;
+                    break;
+                }
+                candidate = descriptor;
+            }
+            if (candidate != null) {
+                result.put(column, candidate);
+            }
         }
         return result;
     }

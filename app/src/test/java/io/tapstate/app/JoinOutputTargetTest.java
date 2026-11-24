@@ -92,20 +92,35 @@ class JoinOutputTargetTest {
                   from: project
                 """.formatted(output, rule));
         for (String pipeline : List.of(join, projected)) {
-            InMemoryStorePort store = validated(ORDERS_SRC, CUSTOMERS_SRC, TARGET, pipeline);
-            discovered(store, "orders_src", "orders", List.of("id"),
-                    new SourceField("id", "bigint", TapstateType.INT64), field("customer_ref", "bigint"),
-                    new SourceField("price", "decimal(10,2)", TapstateType.DECIMAL));
-            discovered(store, "customers_src", "customers", List.of("id"),
-                    field("id", "bigint"), field("cust_ref", "bigint"), field("name", "varchar"));
-            Map<String, Map<String, TargetTable>> captured = new LinkedHashMap<>();
-
-            new StoreBackedDagSource(store, capturing(captured)).dagFor("wide");
-
             String column = pipeline.equals(join) ? "amount" : output;
-            assertThat(captured.get("mongodb").get("widen").fields())
+            assertThat(bindJoinedDecimal(pipeline).fields())
                     .contains(new TargetField(column, "decimal(10,2)", false, TapstateType.DECIMAL));
         }
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "[widen, project] | false | decimal(10,2)",
+            "[project, widen] | false | decimal(10,2)",
+            "[widen, project] | $amount | decimal(10,2)",
+            "[widen, project] | $other_amount |",
+            "[widen, project] | $undeclared_amount |"
+    })
+    void aServedJoinedDecimalKeepsItsDeclarationWhenAllCarryingBranchesAgree(
+            String branches, String rule, String declaration) {
+        String pipeline = pipeline("SELECT o.id AS order_id, o.price AS amount, "
+                + "o.other_price AS other_amount, o.undeclared_price AS undeclared_amount")
+                .replace("serve:\n  from: widen\n", """
+                          - id: project
+                            type: map
+                            from: widen
+                            fields: { amount: %s }
+                        serve:
+                          from: %s
+                        """.formatted(rule, branches));
+
+        assertThat(bindJoinedDecimal(pipeline).fields())
+                .contains(new TargetField("amount", declaration, false, TapstateType.DECIMAL));
     }
 
     @Test
@@ -436,6 +451,22 @@ class JoinOutputTargetTest {
         Map<String, Map<String, TargetTable>> captured = new LinkedHashMap<>();
         new StoreBackedDagSource(store, capturing(captured)).dagFor("wide");
         return captured.getOrDefault("mongodb", Map.of());
+    }
+
+    private static TargetTable bindJoinedDecimal(String pipeline) {
+        InMemoryStorePort store = validated(ORDERS_SRC, CUSTOMERS_SRC, TARGET, pipeline);
+        discovered(store, "orders_src", "orders", List.of("id"),
+                new SourceField("id", "bigint", TapstateType.INT64), field("customer_ref", "bigint"),
+                new SourceField("price", "decimal(10,2)", TapstateType.DECIMAL),
+                new SourceField("other_price", "decimal(12,3)", TapstateType.DECIMAL),
+                new SourceField("undeclared_price", null, TapstateType.DECIMAL));
+        discovered(store, "customers_src", "customers", List.of("id"),
+                field("id", "bigint"), field("cust_ref", "bigint"), field("name", "varchar"));
+        Map<String, Map<String, TargetTable>> captured = new LinkedHashMap<>();
+
+        new StoreBackedDagSource(store, capturing(captured)).dagFor("wide");
+
+        return captured.get("mongodb").get("widen");
     }
 
     private static StoreBackedDagSource.SinkWriterBinder capturing(
