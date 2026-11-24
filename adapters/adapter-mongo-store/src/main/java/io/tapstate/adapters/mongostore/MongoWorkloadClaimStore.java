@@ -154,12 +154,16 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return updated == null ? WorkloadClaimAttempt.refused(existing.claim()) : WorkloadClaimAttempt.acquired(read(updated));
     }
 
-    WorkloadClaimAttempt acquireNodeBacked(WorkloadClaimKey key, WorkloadClaimFence node, long topologyRevision) {
+    WorkloadClaimAttempt acquireNodeBacked(WorkloadClaimKey key, WorkloadClaim verifiedParent, long topologyRevision) {
+        var node = WorkloadClaimFence.from(verifiedParent);
         if (session == null || !strict || (key.type() != WorkloadClaimType.PIPELINE_ACTUATION && key.type() != WorkloadClaimType.CAPTURE)
                 || !key.clusterId().equals(node.owner().nodeId())) throw MongoCacheWorkloadClaimStore.claimFenced();
-        var row = stored(key);
+        var captured = claimWithParent(key);
+        var row = captured == null ? stored(key) : new Document(captured.claim());
         var original = decodeStrict(row);
-        var current = readPipelineForAdmission(key).orElseThrow(MongoCacheWorkloadClaimStore::claimFenced);
+        var current = captured == null ? read(key).orElseThrow(MongoCacheWorkloadClaimStore::claimFenced)
+                : observedPipelineReading(captured.claim(), captured.node());
+        if (captured != null) row.remove(LEASE_REMAINING);
         boolean sameSession = nodeBacked(row) && original.owner().equals(node.owner())
                 && Long.valueOf(node.claimGeneration()).equals(row.get(NODE_LEASE_GENERATION));
         if (current.leased() && sameSession) return WorkloadClaimAttempt.acquired(current.claim());
@@ -170,6 +174,12 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 .append(NODE_LEASE_GENERATION, node.claimGeneration());
         if (collection.replaceOne(session, row, replacement).getMatchedCount() != 1)
             throw MongoCacheWorkloadClaimStore.claimFenced();
+        if (ProcessNodeSession.isProcessIdentity(verifiedParent)) {
+            // The parent was fenced in this callback and the exact replacement just won its CAS.
+            var parent = new WorkloadClaimReading(verifiedParent, ProcessNodeSession.proofWindow(verifiedParent));
+            if (!parent.leased()) throw MongoCacheWorkloadClaimStore.claimFenced();
+            return WorkloadClaimAttempt.acquired(withLease(decodeStrict(replacement), parent));
+        }
         var effective = readPipelineForAdmission(key).filter(WorkloadClaimReading::leased).orElseThrow(MongoCacheWorkloadClaimStore::claimFenced);
         return WorkloadClaimAttempt.acquired(effective.claim());
     }
@@ -326,6 +336,23 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         if (topologyRevision < 0) throw new IllegalArgumentException("topologyRevision must not be negative");
         if (session == null || !strict || expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
             throw new IllegalStateException("execution-first requires a strict Pipeline transaction");
+        var fence = WorkloadClaimFence.from(expected);
+        if (canUseNodeLease(fence) && expected.topologyRevision() == topologyRevision) {
+            var captured = claimWithParent(expected.key());
+            if (captured != null && nodeBacked(captured.claim()) && captured.node() != null) {
+                var parent = observedReading(captured.node());
+                var before = captured.claim();
+                if (ProcessNodeSession.isProcessIdentity(parent.claim()) && parent.leased()
+                        && fence.equals(WorkloadClaimFence.from(decodeStrict(before)))
+                        && expected.owner().equals(parent.claim().owner())
+                        && Long.valueOf(parent.claim().claimGeneration()).equals(before.get(NODE_LEASE_GENERATION))) {
+                    var after = collection.findOneAndUpdate(session, exactNodeBackedFilter(fence, before),
+                            List.of(executionAdvanceUpdate(executionNodeIds)),
+                            new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+                    if (after != null) return Optional.of(new ExecutionAdvance(withLease(decodeStrict(after), parent), before, after));
+                }
+            }
+        }
         var before = collection.findOneAndUpdate(session, liveExpected(expected, topologyRevision),
                 List.of(executionAdvanceUpdate(executionNodeIds)),
                 new FindOneAndUpdateOptions().returnDocument(ReturnDocument.BEFORE));
@@ -500,10 +527,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                         .filter(value -> fence.owner().equals(value.claim().owner())
                                 && Long.valueOf(value.claim().claimGeneration()).equals(row.get(NODE_LEASE_GENERATION)));
         if (parent.isEmpty()) return Optional.empty();
-        var filter = new Document("_id", id(fence.key())).append("ownerNodeId", fence.owner().nodeId())
-                .append("ownerBootId", fence.owner().bootId()).append("claimGeneration", fence.claimGeneration())
-                .append("executionGeneration", fence.executionGeneration()).append("topologyRevision", fence.topologyRevision())
-                .append("leaseUntil", row.get("leaseUntil")).append(NODE_LEASE_GENERATION, row.get(NODE_LEASE_GENERATION));
+        var filter = exactNodeBackedFilter(fence, row);
         if (fence.key().type() == WorkloadClaimType.CAPTURE) {
             if (!(row.get("capturePreparation") instanceof Document marker)) throw MongoCapturePreparationFacts.unreadable();
             var prepared = MongoCapturePreparationFacts.annex(marker);
@@ -514,6 +538,13 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 filter.append("$expr", new Document("$gt", List.of(Date.from(parent.orElseThrow().claim().leaseUntil()), "$$NOW")));
         }
         return Optional.of(filter);
+    }
+
+    private static Document exactNodeBackedFilter(WorkloadClaimFence fence, Document row) {
+        return new Document("_id", id(fence.key())).append("ownerNodeId", fence.owner().nodeId())
+                .append("ownerBootId", fence.owner().bootId()).append("claimGeneration", fence.claimGeneration())
+                .append("executionGeneration", fence.executionGeneration()).append("topologyRevision", fence.topologyRevision())
+                .append("leaseUntil", row.get("leaseUntil")).append(NODE_LEASE_GENERATION, row.get(NODE_LEASE_GENERATION));
     }
 
     private Document liveOrNodeBacked(WorkloadClaim expected, long topologyRevision) {

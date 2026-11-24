@@ -68,15 +68,15 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private final java.util.function.LongSupplier reportClock;
     private static final long REPORT_DRAIN_NANOS=Duration.ofSeconds(15).toNanos();
     private Function<String,Optional<SourceBindingSnapshot>> sourceIdentities=id->Optional.empty();
-    private Function<String,Optional<SourceBindingSnapshot>> retainedSourceIdentities = id -> sourceIdentities.apply(id);
+    private Function<String,Optional<SourceBindingSnapshot>> sharedStartupSourceIdentities = id -> sourceIdentities.apply(id);
     @FunctionalInterface interface Operations {SourceOperationObserver open(SourceBindingSnapshot identity,String domain,Runnable guard,Runnable local);}
     private Operations operations=(identity,domain,guard,local)->SourceOperationObserver.NONE;
     ScopedPipelineCaptureCoordinator withSourceOperations(Function<String,Optional<SourceBindingSnapshot>> identities,
             Operations observers){
         this.sourceIdentities=Objects.requireNonNull(identities);this.operations=Objects.requireNonNull(observers);return this;
     }
-    ScopedPipelineCaptureCoordinator withRetainedSourceIdentities(Function<String,Optional<SourceBindingSnapshot>> identities) {
-        retainedSourceIdentities = Objects.requireNonNull(identities);
+    ScopedPipelineCaptureCoordinator withSharedStartupSourceIdentities(Function<String,Optional<SourceBindingSnapshot>> identities) {
+        sharedStartupSourceIdentities = Objects.requireNonNull(identities);
         return this;
     }
 
@@ -635,7 +635,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             throw refused();
         session.sources.put(source.id, source);
         boolean retained = issued instanceof CaptureCreationResult.AlreadyIssued;
-        var identities = shared && retained ? retainedSourceIdentities : sourceIdentities;
+        var identities = shared ? sharedStartupSourceIdentities : sourceIdentities;
         source.identity = identities.apply(definition.id())
                 .filter(identity -> identity.contentHash().equals(session.inputs.sourceHashes().get(source.id))).orElse(null);
         source.prepared = prepared.preparation();
@@ -678,24 +678,24 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             source.owner.handoff = new PendingCaptureHandoff(source.handoff, context, claim(session.original));
             return;
         }
-        if (newHistory) {
-            var first = source.srs.consumers().attach(context, 0, Set.copyOf(source.selected.tables()), claim(session.original));
+        var tables = Set.copyOf(source.selected.tables());
+        var fence = claim(session.original);
+        var consumers = source.srs.consumers();
+        Optional<SrsConsumerMembership> attached;
+        source.admittedStartup = (retained || newHistory) && source.owner != null && !source.positionEditsRestricted
+                && stores.sources().supportsAdmittedCaptureStartup();
+        if (newHistory && !source.admittedStartup) {
+            var first = consumers.attach(context, 0, tables, fence);
             if (first.isPresent()) {
                 source.consumer = SrsConsumerRun.of(session.original.scope(), first.orElseThrow());
                 return;
             }
         }
-        var tables = Set.copyOf(source.selected.tables());
-        var fence = claim(session.original);
-        var consumers = source.srs.consumers();
-        Optional<SrsConsumerMembership> attached;
-        source.retainedStartup = retained && source.owner != null && !source.positionEditsRestricted
-                && stores.sources().supportsAdmittedCaptureStartup();
-        if (source.retainedStartup && source.owner.physical == null && session.inputs.sourceHashes().size() == 1) {
+        if (source.admittedStartup && source.owner.physical == null && session.inputs.sourceHashes().size() == 1) {
             var prepared = consumers.attachAndPrepareForStartup(context, tables, fence);
             source.startupPreparation = prepared.flatMap(SrsConsumerStore.StartupAttachment::preparation).orElse(null);
             attached = prepared.map(SrsConsumerStore.StartupAttachment::member);
-        } else if (source.retainedStartup) {
+        } else if (source.admittedStartup) {
             attached = consumers.attachForStartup(context, tables, fence);
         } else {
             var held = consumers.find(key);
@@ -712,7 +712,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private SnapshotBindings snapshotBindings(Session session, SnapshotStateStore state) {
         var snapshots = new LinkedHashMap<String, PipelineCaptureBindings.SnapshotOnlySource>();
-        boolean retained = !session.sources.isEmpty() && session.sources.values().stream().allMatch(source -> source.retainedStartup);
+        boolean retained = !session.sources.isEmpty() && session.sources.values().stream().allMatch(source -> source.admittedStartup);
         long prior = state == null ? 0 : retained ? state.startupOrder() : state.order();
         long epoch = 0;
         if (session.bounded && !session.sources.isEmpty()) {
@@ -855,7 +855,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         SrsChainState before;
         SrsConsumerProgress retained;
         SrsConsumerStore.AttachedChain startupTail = null;
-        if (admitted && source.retainedStartup && source.owner != null && source.owner.physical == null) {
+        if (admitted && source.admittedStartup && source.owner != null && source.owner.physical == null) {
             var preparation = source.startupPreparation;
             source.startupPreparation = null;
             if (preparation == null)
@@ -1504,7 +1504,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         boolean reportTimeRemaining(){long elapsed=reportClock.getAsLong()-reportDrainStarted;return elapsed>=0&&elapsed<REPORT_DRAIN_NANOS;}
     }
     private static final class Source {
-        boolean retainedStartup;
+        boolean admittedStartup;
         Runnable guard;boolean sampled;SourceBindingSnapshot identity;
         final String id;
         final String sourceId;

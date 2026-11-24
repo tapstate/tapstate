@@ -1826,7 +1826,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     String alertReadKeyId(ClientSession session){requireOpen();return configurationKey.readCurrent(session).activeKeyId();}
 
     /** One persistent key, with no node-session ACK, rotation state or cache access. */
-    private static final class PersistentKey implements SourceConfigCipherProvider {
+    private static final class PersistentKey implements SourceConfigCipherProvider.Snapshot {
         private final MongoCollection<Document> keys;
         private final String clusterId;
         private final SourceConfigCipher cipher;
@@ -1846,7 +1846,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             return requireCurrent(keys.find(session,new Document("_id","cluster")).first());
         }
 
-        SourceConfigCipher requireCurrent(Document row) {
+        @Override public SourceConfigCipher requireCurrent(Document row) {
             SourceConfigCipher observed = decode(row);
             if (!cipher.activeKeyId().equals(observed.activeKeyId())) throw invalidKey();
             return observed;

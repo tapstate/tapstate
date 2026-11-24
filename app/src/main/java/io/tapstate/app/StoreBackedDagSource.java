@@ -315,8 +315,11 @@ final class StoreBackedDagSource implements DagSource {
         return List.copyOf(nodes);
     }
 
-    StoreBackedDagSource withConnectorExecutions(PipelineConnectorExecutions executions) {
-        if (sinkWriterBinder instanceof PdkSinkWriterBinder binder) binder.connectorExecutions = executions;
+    StoreBackedDagSource withRuntimeBindings(PipelineConnectorExecutions executions, String defaultSourceId) {
+        if (sinkWriterBinder instanceof PdkSinkWriterBinder binder) {
+            binder.connectorExecutions = executions;
+            binder.defaultSourceId = Objects.requireNonNull(defaultSourceId);
+        }
         return this;
     }
 
@@ -5256,6 +5259,11 @@ final class StoreBackedDagSource implements DagSource {
         private final java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned;
         private final ArtifactStore artifacts;
         private PipelineConnectorExecutions connectorExecutions;
+        private String defaultSourceId;
+        private Optional<io.tapstate.spi.store.SourceBindingSnapshot> defaultSourceBinding() {
+            return defaultSourceId == null ? artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBindingForSinkStartup)
+                    : artifacts.sourceBindingForSinkStartup(defaultSourceId);
+        }
         PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;this.recoveryPinned=ignored -> false;this.artifacts=null;}
         PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner){this(notes,provisioner,ignored -> false);}
         PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned){this(notes,provisioner,recoveryPinned,null);}
@@ -5269,7 +5277,7 @@ final class StoreBackedDagSource implements DagSource {
                     connectorExecutions == null ? null : connectorExecutions.selection(original.scope(), requireActive)
                             .binding(sink.config().node().nodeId(), sink.purpose()));
             if(artifacts!=null) {
-                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBindingForSinkStartup)
+                var identity=defaultSourceBinding()
                         .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));
                 if(identity.isPresent())run=run.withSource(identity.orElseThrow());
             }
@@ -5297,7 +5305,7 @@ final class StoreBackedDagSource implements DagSource {
                     connectorExecutions == null ? null : connectorExecutions.selection(original.scope(), requireActive)
                             .binding(sink.config().node().nodeId(), sink.purpose()));
             if(artifacts!=null) {
-                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBindingForSinkStartup)
+                var identity=defaultSourceBinding()
                         .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));
                 if(identity.isPresent())run=run.withSource(identity.orElseThrow());
             }

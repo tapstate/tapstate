@@ -276,8 +276,8 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             var row = new MongoCacheBusinessIdentity(database, scope).admitRetainedCapture(session, key);
             if (row == null) throw MongoCapturePreparationFacts.history(key.resourceId());
             MongoCaptureCachePreparations.requirePreparation(row, key, scope);
-            MongoCachePipelinePreparations.proveNodeForClaim(session, database, scope, node);
-            return raw.inStrictSession(session).acquireNodeBacked(key, node, revision);
+            var parent = MongoCachePipelinePreparations.proveNodeForClaim(session, database, scope, node);
+            return raw.inStrictSession(session).acquireNodeBacked(key, parent, revision);
         }, null);
     }
 
@@ -286,8 +286,8 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireScope(original);
         if (topologyRevision != 1 || !node.owner().nodeId().equals(scope.clusterId())) throw claimFenced();
         return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> {
-            MongoCachePipelinePreparations.proveNodeForClaim(session, database, scope, node);
-            return store.acquireNodeBacked(pipelineKey(original), node, topologyRevision);
+            var parent = MongoCachePipelinePreparations.proveNodeForClaim(session, database, scope, node);
+            return store.acquireNodeBacked(pipelineKey(original), parent, topologyRevision);
         }));
     }
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
@@ -470,8 +470,10 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 var advanced = first.orElseThrow();
                 var retained = decodeScope(advanced.before(), expected.key());
                 if (!retained.equals(decodeScope(advanced.row(), expected.key()))) throw claimFenced();
-                validateState(session, retained);
-                fenceProgress(session, retained);
+                var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
+                var state = access.stateRow(session);
+                access.requirePreparedClaim(advanced.row());
+                access.updateState(session, state, new Document(), false);
                 return Optional.of(advanced.claim());
             }, true));
         }

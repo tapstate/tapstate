@@ -171,12 +171,34 @@ final class MongoCachePipelineAccess {
         return result;
     }
 
+    private record PreparedRows(Document state, Document claim) {}
+
+    /** Read all three admission checks at one transaction snapshot. Its caller still performs the original write CAS. */
+    private <T> T withPreparedRows(java.util.function.BiFunction<ClientSession, PreparedRows, T> action) {
+        return transaction(TRANSACTION, false, session -> {
+            var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+            var facts = MongoBindingReadFacts.supported(client) ? MongoPipelineProofFacts.readAuthority(session, database, scope, key) : null;
+            if (facts != null) {
+                validateAuthority(facts);
+                return action.apply(session, new PreparedRows(facts.checkpoint(), facts.claim()));
+            }
+            new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(),
+                    scope.cacheIncarnation())).requireAdmissionState(session);
+            var state = stateRow(session);
+            return action.apply(session, new PreparedRows(state, requirePreparedClaim(session, true)));
+        });
+    }
+
+    <T> T checkpointWithPreparedState(java.util.function.BiFunction<ClientSession, Document, T> action) {
+        return MongoCachePipelineStateStore.writeTransaction(client, scope.pipelineId(),
+                () -> withPreparedRows((session, rows) -> action.apply(session, rows.state())));
+    }
+
     <T> T stateTransaction(boolean mutation, Function<ClientSession, T> action) {
-        java.util.function.Supplier<T> change = () -> transaction(session -> {
-            var current = state(session, true);
+        java.util.function.Supplier<T> change = () -> withPreparedRows((session, rows) -> {
             if (mutation) {
                 proveClaim(session, true);
-                updateState(session, current, new Document(), false);
+                updateState(session, rows.state(), new Document(), false);
             }
             return action.apply(session);
         });
@@ -318,10 +340,7 @@ final class MongoCachePipelineAccess {
 
     /** Returns the full prepared claim only to this retained startup snapshot. */
     <T> T retainedStartRead(java.util.function.BiFunction<ClientSession, Document, T> action) {
-        T result = transaction(session -> {
-            stateRow(session);
-            return action.apply(session, requirePreparedClaim(session, true));
-        });
+        T result = withPreparedRows((session, rows) -> action.apply(session, rows.claim()));
         requireActive.run();
         return result;
     }

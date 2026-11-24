@@ -82,6 +82,7 @@ final class ConvergenceDriver implements AutoCloseable {
         }
     }
     private final Map<String, TerminalPass> terminalPasses = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, PipelineIntentStore.ScanCandidate> waitingStarts = new ConcurrentHashMap<>();
     private final Map<String, Long> attemptedStarts = new java.util.concurrent.ConcurrentHashMap<>();
 
     private final PeriodicObservations periodicObservations;
@@ -447,6 +448,7 @@ final class ConvergenceDriver implements AutoCloseable {
         // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
         attemptedStarts.keySet().retainAll(pipelineIds);
+        waitingStarts.keySet().retainAll(pipelineIds);
         terminalPasses.keySet().retainAll(pipelineIds);
         unavailableObservations.keySet().retainAll(pipelineIds);
         // Same for the claims: a pipeline that is gone still has this member named as its driver until the
@@ -482,6 +484,8 @@ final class ConvergenceDriver implements AutoCloseable {
         var previousTerminal = terminalPasses.remove(pipelineId);
         boolean refreshTerminal = previousTerminal != null && previousTerminal.stopped() != null;
         if (scoped != null && scoped.stoppedRecheck() != null && !actuation.finishStoppedRelease(pipelineId)) return;
+        if (initialStart && candidate.equals(waitingStarts.get(pipelineId)) && actuation.awaitingNextAcquisition(candidate.scope())) return;
+        waitingStarts.remove(pipelineId);
         // Attribute every line logged while reconciling this pipeline to it, so the logs read face can
         // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
@@ -516,14 +520,17 @@ final class ConvergenceDriver implements AutoCloseable {
                         try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PREPARATION)) {
                             if (!prepareStart(pending)) return;
                         }
-                        snapshot = PipelineDiagnostics.measure(pipelineId, Phase.PIPELINE_INTENT,
-                                () -> scoped.intents().loadForActuation(pipelineId).filter(pending.intent()::equals));
-                        if (snapshot.isEmpty()) return;
-                        if (scoped.observations() != null) {
-                            var reading = scoped.intents().readForActuation(pipelineId).filter(value -> pending.intent().equals(value.intent()));
-                            if (reading.isEmpty()) return;
-                            observationOrigin = reading.orElseThrow();
+                        if (scoped.observations() == null) {
+                            snapshot = PipelineDiagnostics.measure(pipelineId, Phase.PIPELINE_INTENT,
+                                    () -> scoped.intents().loadForActuation(pipelineId).filter(pending.intent()::equals));
+                        } else {
+                            var reading = PipelineDiagnostics.measure(pipelineId, Phase.PIPELINE_INTENT,
+                                    () -> scoped.intents().readForActuation(pipelineId)
+                                            .filter(value -> pending.intent().equals(value.intent())));
+                            observationOrigin = reading.orElse(null);
+                            snapshot = reading.map(PipelineIntentStore.ActuationReading::intent);
                         }
+                        if (snapshot.isEmpty()) return;
                     } else {
                         if (scoped.resumeRebuild() != null) scoped.resumeRebuild().accept(pipelineId);
                         return;
@@ -546,6 +553,8 @@ final class ConvergenceDriver implements AutoCloseable {
                     var intent = snapshot.orElseThrow();
                     boolean priority = initialStart && isNewStart(candidate) && initialClaimMatches(candidate, intent);
                     permit = priority ? actuation.permit(intent.scope(), true) : actuation.permit(intent.scope());
+                    if (priority && !permit.granted() && actuation.awaitingNextAcquisition(intent.scope()))
+                        waitingStarts.put(pipelineId, candidate);
                 }
                 if (permit.granted()) {
                     if (candidate.startRevision() != 0 && snapshot.get().intentRevision() == candidate.startRevision()

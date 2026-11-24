@@ -327,9 +327,6 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 .filter(value -> value.targetScope().equals(scope)).isPresent();
     }
 
-    private boolean recoveryPinned(PipelineIntentScope scope) {
-        original.requireBusiness();return configuration.cacheRecoveries().read(scope.pipelineId()).filter(value -> value.targetScope().equals(scope)).isPresent();
-    }
     @Override public HandlerExecutionChain handlerFor(HttpServletRequest request) throws Exception {
         if (!active.get()) return null;
         for (var mapping : handlers) {
@@ -589,7 +586,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean PipelineConnectorExecutions pipelineConnectorExecutions(NativeBusinessContext owner,
                 ConnectorProvisioner connectors) {
             return new PipelineConnectorExecutions(owner.configuration.intents(), owner.configuration.capturePreparations(),
-                    owner.configuration.requiredNotes(), owner.memberStorage.sourceViews(), connectors, owner::recoveryPinned);
+                    owner.configuration.requiredNotes(), owner.memberStorage.sourceViews(), connectors, owner::captureRecoveryPinned);
         }
         @Bean(destroyMethod = "close") PipelineCaptureCoordinator pipelineCaptureCoordinator(NativeBusinessContext owner,
                 NodeSessionLease node, ExecutionAuthorization authorization, CaptureOwnership ownership, ClusterProperties cluster,
@@ -602,7 +599,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
                             cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding, signals::source)
-                    .withRetainedSourceIdentities(owner.configuration::retainedCaptureSourceBinding)
+                    .withSharedStartupSourceIdentities(owner.configuration::retainedCaptureSourceBinding)
                     .withConnectorExecutions(connectorExecutions)
                     .withReadRetries(new RetryPolicies(owner.configuration.retrySettings())::policy);
         }
@@ -634,7 +631,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts, SnapshotLoadReceipts boundedLoads,NativePipelineRecovery recovery, ValidationPipelineInitials initialLoads, PipelineConnectorExecutions connectorExecutions) {
             return StoreBackedDagSource.scopedRoot(owner.port, nests, StoreReachability.probing(tester, Duration.ofSeconds(10)),
                     SourcePlacement.on(member.getCluster().getLocalMember().getAddress()), cloud.cloud(),
-                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::recoveryPinned,boundedLoads::forRun,recovery.capturedStartGuard()).observedInitialLoads(initialLoads::decorate).withConnectorExecutions(connectorExecutions);
+                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::captureRecoveryPinned,boundedLoads::forRun,recovery.capturedStartGuard()).observedInitialLoads(initialLoads::decorate).withRuntimeBindings(connectorExecutions, owner.original.binding().defaultSourceId());
         }
         @Bean(destroyMethod = "close") BoundedPipelinePreviewExecutor boundedPipelinePreviewExecutor(StorePort store, ConnectorProvisioner connectors,
                 HazelcastInstance member, NestSettings nests, Clock clock) {

@@ -621,6 +621,13 @@ final class PipelineActuationOwnership {
         }
     }
 
+    /** Mirrors the existing retry deadline for this physical scope. A negative answer never grants a claim. */
+    synchronized boolean awaitingNextAcquisition(PipelineIntentScope scope) {
+        var state = held.get(scope.pipelineId());
+        return processOwnsClaims() && state != null && scope.equals(state.scope) && state.claim == null
+                && state.contacted && nanoTime.getAsLong() - state.nextContactNanos < 0;
+    }
+
     private ScopedAcquisition reserveAcquisition(PipelineIntentScope scope, Held state, long now) {
         if (scope.equals(state.scope)) {
             if (state.contacted && now - state.nextContactNanos < 0) return null;

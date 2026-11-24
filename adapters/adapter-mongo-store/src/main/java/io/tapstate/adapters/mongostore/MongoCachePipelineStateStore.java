@@ -170,8 +170,7 @@ final class MongoCachePipelineStateStore implements StateStore {
     @Override public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime) {
         access.requirePipeline(pipelineId); Objects.requireNonNull(nextStateJson, "stateJson"); Objects.requireNonNull(touchTime, "touchTime");
         if (expectedEpoch < 0) throw new IllegalArgumentException("expected epoch must be nonnegative");
-        return access.checkpointTransaction(session -> {
-            Document current = access.state(session, true);
+        return access.checkpointWithPreparedState((session, current) -> {
             access.proveClaim(session, true);
             long epoch = current.getLong("epoch");
             if (epoch != expectedEpoch) return new CasOutcome.Fenced(epoch);

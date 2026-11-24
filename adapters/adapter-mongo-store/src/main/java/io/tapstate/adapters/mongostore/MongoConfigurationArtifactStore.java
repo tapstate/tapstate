@@ -609,6 +609,8 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             stages.add(MongoValidationClaimObservation.lookup(SystemCollections.SCHEMA_MIGRATIONS, "schema", "config",
                     new Document("value", bounded)));
             MongoStartConfigRead.addArtifacts(stages, List.of(id));
+            if (ciphers instanceof SourceConfigCipherProvider.Snapshot)
+                stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.CLUSTER_KEYS, "sourceKey", "cluster"));
             var selected = budget.database(database).withReadConcern(ReadConcern.SNAPSHOT);
             var captured = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(selected).aggregate(stages).first();
             var identity = captured != null && captured.get("identity") instanceof Document value ? value : null;
@@ -623,7 +625,9 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             var stored = resources.orElseThrow().getFirst();
             if (!"source".equals(stored.get("kind"))) return Optional.empty();
             MongoSourceIdentity.read(stored);
-            var cipher = ciphers.refresh(budget);
+            var key = MongoStartConfigRead.boundedRow(captured, "sourceKey", "cluster");
+            var cipher = key != null && ciphers instanceof SourceConfigCipherProvider.Snapshot verifier
+                    ? verifier.requireCurrent(key) : ciphers.refresh(budget);
             var source = (SourceResource) new EncryptedArtifactCodec(cipher).decode(stored);
             budget.requireRemaining();
             return Optional.of(new io.tapstate.spi.store.SourceBindingSnapshot(source, stored.getString("contentHash"),

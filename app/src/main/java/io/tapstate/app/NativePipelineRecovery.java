@@ -83,7 +83,7 @@ final class NativePipelineRecovery {
         var inputs = models.preparationInputs(scope, authored, pipeline, sources);
         Optional<PipelineCacheRecovery> summary;
         try {
-            summary = configuration.cacheRecoveries().read(id);
+            summary = configuration.cacheRecoveries().readForCaptureStartup(id);
         } catch (RuntimeException failure) {
             // Report the source refusal first, even when CONFIG cannot choose the startup branch.
             preparer.verifyRetainedSources(scope, inputs);

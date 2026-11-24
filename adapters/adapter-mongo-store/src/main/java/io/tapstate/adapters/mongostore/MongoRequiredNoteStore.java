@@ -548,12 +548,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     private NoteSnapshot readNoteSnapshot(RequiredNoteOwner owner) {
         if (retirement != null || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
-        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
-            requireActive.run();
-            var result = noteSnapshot(null, owner);
-            requireActive.run();
-            return result;
-        }));
+        return MongoCaptureStartupRows.readSnapshot(client, requireActive, session -> noteSnapshot(session, owner));
     }
 
     private NoteSnapshot noteSnapshot(ClientSession session, RequiredNoteOwner owner) {
@@ -563,14 +558,17 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         var id = scopeId(owner);
         stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_SCOPES, "primary", id));
         stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_ORIGINS, "origin", id));
-        var row = session == null ? MongoStartConfigRead.snapshot(database, stages) : MongoStartConfigRead.snapshot(database, session, stages);
+        var row = MongoStartConfigRead.snapshot(database, session, stages);
         var metadata = noteScopeRow(row, "primary", id);
         var operator = pipeline ? noteScopeRow(row, "operator", owner.ownerId()) : null;
         var origin = noteScopeRow(row, "origin", id);
-        if (metadata == null || pipeline && operator == null || origin == null) return null;
+        if (metadata == null || pipeline && operator == null) return null;
         checkBinding(row, owner);
         if (pipeline) checkPipelineOwner(operator, owner, false);
-        return new NoteSnapshot(scopeOf(owner, metadata), metadata, origin);
+        var scope = scopeOf(owner, metadata);
+        // A missing or ambiguous join keeps the origin collection's own predicate in this snapshot.
+        if (origin == null) origin = origins.find(session, byScope(owner)).first();
+        return new NoteSnapshot(scope, metadata, origin);
     }
 
     @Override

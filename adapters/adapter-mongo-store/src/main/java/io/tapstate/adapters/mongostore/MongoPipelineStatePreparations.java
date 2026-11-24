@@ -284,13 +284,16 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     private void requireIssued(PipelineIntentScope scope, String preparationId,
             io.tapstate.spi.store.PipelineIntentStore.PendingStart pending) {
         Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(preparationId, "preparationId");
-        transaction(session -> {
+        Function<ClientSession, Void> check = session -> {
             var current = MongoPipelinePreparationFacts.decode(scope.pipelineId(),
                     requireCurrent(session, scope, pending != null, true, pending), clusterId);
             if (current.phase() != PipelinePreparation.Phase.ISSUED || !scope.equals(current.scope())
                     || !preparationId.equals(current.preparationId())) throw fenced();
             return null;
-        });
+        };
+        if (pending != null && MongoReadBudget.supportsSnapshotReads(client))
+            MongoCaptureStartupRows.readSnapshot(client, requireActive, check);
+        else transaction(check);
     }
 
     @Override public PipelinePreparation complete(PipelinePreparationReceipt receipt) {
