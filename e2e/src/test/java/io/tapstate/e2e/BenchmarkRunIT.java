@@ -272,7 +272,21 @@ class BenchmarkRunIT {
         String sourceName = namespace + "_src";
         String targetName = namespace + "_tgt";
         Path seeds = Files.createDirectory(folder.resolve("runtime-input"));
-        Files.copy(artifact, seeds.resolve("mongodb-connector.jar"));
+        boolean latencyProbe = evidence.request.getBoolean("endpoint_latency_probe", org.bson.BsonBoolean.FALSE).getValue()
+                && text(definition, "mode").equals("live-latency")
+                && text(definition, "spec").equals("specs/copy-basic.json") && operators == null;
+        Path connector = seeds.resolve("mongodb-connector.jar");
+        Path witness = folder.resolve("source-latency.tsv");
+        if (latencyProbe) {
+            Path delegate = folder.resolve("verified-latency-delegate").resolve("mongodb.jar");
+            Files.createDirectory(delegate.getParent());
+            Files.write(connector, ObservedMongoConnectorJar.buildLatencyProbe(Files.readAllBytes(artifact), witness, delegate));
+            evidence.result.put("latency_probe", Map.of("protocol", BenchmarkLatencyProbe.PROTOCOL,
+                    "original_connector_sha256", digest(artifact), "probe_connector_sha256", digest(connector),
+                    "source_file", witness.getFileName().toString(), "ack_file", witness.getFileName() + ".ack"));
+        } else {
+            Files.copy(artifact, connector);
+        }
         boolean requiresTestCommands = slowTarget || text(definition, "id").equals(HANDOFF);
         try (var owned = requiresTestCommands ? BenchmarkTargetLimit.newReplicaSet() : null) {
             if (owned != null) {
@@ -285,8 +299,10 @@ class BenchmarkRunIT {
             try (var client = MongoClients.create(sourceUri)) {
                 var sourceDb = client.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY);
                 var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
-                runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
-                        sourceDb, targetDb, client.getDatabase("admin"), limited);
+                try (var probe = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb) : null) {
+                    runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
+                            sourceDb, targetDb, client.getDatabase("admin"), limited, probe);
+                }
             }
         }
     }
@@ -294,7 +310,7 @@ class BenchmarkRunIT {
     private static void runMongo(BsonDocument entry, BsonDocument definition, Evidence evidence, Path folder,
             BenchmarkOperators operators, MongoWorkloadGenerator.HotKeys hot, Map<String, Integer> baseLengths,
             Path seeds, String sourceUri, String targetUri, MongoDatabase sourceDb, MongoDatabase targetDb,
-            MongoDatabase admin, boolean limited) throws Exception {
+            MongoDatabase admin, boolean limited, BenchmarkLatencyProbe latencyProbe) throws Exception {
         var memoryProfile = definition.getDocument("workload_spec").getDocument("memory_profile", null);
         boolean memory = memoryProfile != null;
         boolean steady = operators != null && operators.scenario.equals("join-steady-state");
@@ -379,7 +395,7 @@ class BenchmarkRunIT {
                                             target.getNamespace().getFullName(), delay) : null;
                                             var window = slowTarget ? new BenchmarkTargetLimit.TargetWindow(targetDb, target) : null) {
                                         mongoCdc(entry, prepared, control, source, target, evidence, text(definition, "mode"),
-                                                limit, delay, window, handoff);
+                                                limit, delay, window, handoff, latencyProbe);
                                     }
                                 }
                                 evidence.stage = "readback";
@@ -475,7 +491,7 @@ class BenchmarkRunIT {
     private static void mongoCdc(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, Evidence evidence, String mode,
             BenchmarkTargetLimit limit, int delay, BenchmarkTargetLimit.TargetWindow targetWindow,
-            BenchmarkTargetLimit handoffLimit) {
+            BenchmarkTargetLimit handoffLimit, BenchmarkLatencyProbe latencyProbe) {
         evidence.stage = "initial-state";
         evidence.window("load");
         int initial = number(entry, "rows");
@@ -568,10 +584,15 @@ class BenchmarkRunIT {
             int warmup = number(entry, "warmup_seconds");
             int measure = number(entry, "measurement_seconds");
             evidence.window("warmup");
+            if (latencyProbe != null) {
+                evidence.result.put("latency_probe_error", "Probe window or drain did not complete");
+                latencyProbe.start();
+            }
             var result = prepared.inject(new MongoWorkloadGenerator.LiveWindow(rate, Duration.ofSeconds(warmup),
                     Duration.ofSeconds(measure)), mix, null, () -> {
                         settleExpected(entry, control, baseline + (long) rate * warmup);
                         observedWarm[0] = settled(control);
+                        if (latencyProbe != null) latencyProbe.awaitScoringBoundary();
                         if (targetWindow != null) {
                             targetWindow.begin();
                         }
@@ -616,16 +637,40 @@ class BenchmarkRunIT {
             evidence.result.put("target_settled_before_drain", acknowledged);
             settleExpected(entry, control, observedWarm[0] + measured);
             evidence.phase("ack_wait", drain);
-            var threshold = entry.getDocument("case").getDocument("workload_spec").getDocument("measurements")
-                    .getDocument("live-latency").getDocument("trial").getDocument("p99");
-            evidence.result.put("live_latency", LiveLatencyEligibility.assess(Math.toIntExact(measured), List.of(), false,
-                    number(threshold, "minimum_valid_samples"),
-                    threshold.getNumber("minimum_confirmation_coverage_percent").doubleValue() / 100));
-            evidence.result.put("measurement_status", "insufficient-event-correlation");
+            var trial = entry.getDocument("case").getDocument("workload_spec").getDocument("measurements")
+                    .getDocument("live-latency").getDocument("trial");
+            var threshold = trial.getDocument("p99");
+            int minimumP99 = number(threshold, "minimum_valid_samples");
+            var smoke = trial.getDocument("smoke");
+            int minimumP95 = Math.multiplyExact(number(smoke, "events_per_second"), number(smoke, "measurement_seconds"));
+            double coverage = threshold.getNumber("minimum_confirmation_coverage_percent").doubleValue() / 100;
+            var latency = latencyProbe == null
+                    ? LiveLatencyEligibility.assess(Math.toIntExact(measured), List.of(), false, minimumP95, minimumP99, coverage)
+                    : latencyReading(latencyProbe, result, minimumP95, minimumP99, coverage,
+                            Duration.ofSeconds(number(trial.getDocument("candidate"), "max_drain_seconds")), evidence);
+            evidence.result.put("live_latency", latency);
+            evidence.result.put("measurement_status", latency.status().equals("eligible")
+                    ? "endpoint-latency-observed" : "insufficient-event-correlation");
             evidence.result.put("diagnostic_delivery", "The aggregate histogram includes events outside the measured window.");
             evidence.result.put("window_source_events", measured);
             evidence.result.put("window_settled_delta", settled(control) - observedWarm[0]);
         }
+    }
+
+    private static LiveLatencyEligibility.Reading latencyReading(BenchmarkLatencyProbe probe,
+            MongoWorkloadGenerator.Live run, int minimumP95, int minimumP99, double coverage, Duration drain, Evidence evidence) {
+        var measured = probe.finish(run, RECORDS, minimumP95, minimumP99, coverage, drain);
+        evidence.result.put("latency_source_clock_resolution_ms", 1000);
+        evidence.result.put("latency_minimum_p95_samples", minimumP95);
+        evidence.result.put("latency_minimum_p99_samples", minimumP99);
+        evidence.result.put("latency_required_confirmation_coverage", coverage);
+        if (measured.startEpochMillis() != null) {
+            evidence.result.put("latency_source_window_start_epoch_ms", measured.startEpochMillis());
+            evidence.result.put("latency_source_window_end_exclusive_epoch_ms", measured.endExclusiveEpochMillis());
+        }
+        evidence.result.remove("latency_probe_error");
+        if (measured.reason() != null) evidence.result.put("latency_probe_error", measured.reason());
+        return measured.reading();
     }
 
     private static void changeAtSnapshotHandoff(BsonDocument entry,
@@ -1147,6 +1192,7 @@ class BenchmarkRunIT {
             reading.put("last", token(stream.last()));
             reading.put("history_boundary", token(stream.historyBoundary()));
             reading.put("sequence_sha256", stream.sourceSequenceSha256());
+            reading.put("clock_sequence_sha256", stream.sourceClockSequenceSha256());
             reading.put("hot_key_selections", stream.hotKeySelections());
             reading.put("error", stream.error());
             result.put(name, reading);
