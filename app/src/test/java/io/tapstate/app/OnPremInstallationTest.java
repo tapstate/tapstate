@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.control.core.StorageInitializationProgress;
 import io.tapstate.control.core.StorageSetupService;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.StorageBinding;
@@ -105,6 +106,42 @@ class OnPremInstallationTest {
             assertThat(installation.firstAdministratorReady()).isFalse();
             when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY); when(runtime.businessStarted()).thenReturn(false);
             assertThat(installation.firstAdministratorReady()).isFalse();
+        }
+    }
+
+    @Test void restoredProgressDoesNotHideAnAlreadyConfiguredAndReadyInstallation() {
+        var files = InstallationFiles.initialize(directory.resolve("restored-readiness"));
+        files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CONFIGURED, "a".repeat(64)));
+        var scope = files.stage().scope();
+        var progress = new StorageInitializationProgress(Clock.systemUTC());
+        progress.begin(scope, 2, true);
+        progress.completed(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+        progress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+
+        var root = mock(StorageRoot.class);
+        var runtime = mock(StorageRuntime.class);
+        var configuration = mock(MongoConfigurationDomain.class);
+        var states = mock(StorageSetupStateStore.class);
+        when(root.mode()).thenReturn(StorageBinding.Mode.OP);
+        when(root.runtime()).thenReturn(runtime);
+        when(root.initializationProgress()).thenReturn(progress);
+        when(runtime.configuration()).thenReturn(Optional.of(configuration));
+        when(configuration.setupStates()).thenReturn(states);
+        when(states.guardedBy(any())).thenReturn(states);
+        when(states.load()).thenReturn(new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.COMPLETE, 1));
+        when(root.phase()).thenReturn(StorageRoot.Phase.AUTH_READY);
+        try (var installation = new OnPremInstallation(root, files, new MongoProperties(),
+                mock(StorageSetupService.DefaultTarget.class), Clock.systemUTC())) {
+            assertThat(installation.initializationProgress()).containsEntry("state", "RUNNING");
+            when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY);
+            assertThat(installation.initializationProgress()).containsEntry("state", "RUNNING");
+            when(runtime.businessStarted()).thenReturn(true);
+            files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CREATE_STARTED, "a".repeat(64)));
+            assertThat(installation.initializationProgress()).containsEntry("state", "RUNNING");
+            files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CONFIGURED, "a".repeat(64)));
+            assertThat(installation.initializationProgress()).isEmpty();
+            progress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+            assertThat(installation.initializationProgress()).containsEntry("state", "COMPLETE");
         }
     }
 

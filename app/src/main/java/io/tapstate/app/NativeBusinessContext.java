@@ -508,9 +508,19 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 HazelcastInstance member, ValidationCaptureObservations observations) {
             return new NativeSrsCaptureRunUnit(owner.original.preparation().businessScope(), sources, member, observations);
         }
+        @Bean io.tapstate.control.core.ConnectorUsageQuery pipelineConnectorUsage(NativeBusinessContext owner) {
+            return new PipelineConnectorUsage(owner.configuration.intents(), owner.configuration.drafts(), owner.original::requireBusiness);
+        }
+
+        @Bean PipelineConnectorExecutions pipelineConnectorExecutions(NativeBusinessContext owner,
+                ConnectorProvisioner connectors) {
+            return new PipelineConnectorExecutions(owner.configuration.intents(), owner.configuration.capturePreparations(),
+                    owner.configuration.requiredNotes(), owner.memberStorage.sourceViews(), connectors, owner::recoveryPinned);
+        }
         @Bean(destroyMethod = "close") PipelineCaptureCoordinator pipelineCaptureCoordinator(NativeBusinessContext owner,
                 NodeSessionLease node, ExecutionAuthorization authorization, CaptureOwnership ownership, ClusterProperties cluster,
-                NativeSrsCaptureRunUnit runtime, SnapshotBuffer buffer, ConnectorProvisioner connectors, Clock clock, SnapshotLoadReceipts boundedLoads,BuiltinResourceSignals signals) {
+                NativeSrsCaptureRunUnit runtime, SnapshotBuffer buffer, ConnectorProvisioner connectors, Clock clock, SnapshotLoadReceipts boundedLoads,BuiltinResourceSignals signals,
+                PipelineConnectorExecutions connectorExecutions) {
             var scope = owner.original.preparation().businessScope();
             return new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(scope, owner.original.cache(),
                     owner.memberStorage.sourceViews(), owner.configuration.capturePreparations(),
@@ -518,6 +528,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
                             cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding, signals::source)
+                    .withConnectorExecutions(connectorExecutions)
                     .withReadRetries(new RetryPolicies(owner.configuration.retrySettings())::policy);
         }
         @Bean(destroyMethod="close") NativeValidationCaptureRoutes nativeValidationCaptureRoutes(NativeBusinessContext owner,
@@ -545,10 +556,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     environment.getProperty("tapstate.execution.max-blocking-processors-per-member", Integer.class, 128));
         }
         @Bean DagSource dagSource(NativeBusinessContext owner, NestSettings nests, ConnectionTester tester, HazelcastInstance member,
-                CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts, SnapshotLoadReceipts boundedLoads,NativePipelineRecovery recovery, ValidationPipelineInitials initialLoads) {
+                CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts, SnapshotLoadReceipts boundedLoads,NativePipelineRecovery recovery, ValidationPipelineInitials initialLoads, PipelineConnectorExecutions connectorExecutions) {
             return StoreBackedDagSource.scopedRoot(owner.port, nests, StoreReachability.probing(tester, Duration.ofSeconds(10)),
                     SourcePlacement.on(member.getCluster().getLocalMember().getAddress()), cloud.cloud(),
-                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::recoveryPinned,boundedLoads::forRun,recovery.capturedStartGuard()).observedInitialLoads(initialLoads::decorate);
+                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::recoveryPinned,boundedLoads::forRun,recovery.capturedStartGuard()).observedInitialLoads(initialLoads::decorate).withConnectorExecutions(connectorExecutions);
         }
         @Bean(destroyMethod = "close") BoundedPipelinePreviewExecutor boundedPipelinePreviewExecutor(StorePort store, ConnectorProvisioner connectors,
                 HazelcastInstance member, NestSettings nests, Clock clock) {
@@ -734,7 +745,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
                 ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,
                 ClusterNodeAlertSource resourceAlerts, ProcessObservationWriter observationWrites, PeriodicObservations periodicObservations,
-                PipelineConvergences pipelineConvergences) {
+                PipelineConvergences pipelineConvergences, PipelineConnectorExecutions connectorExecutions) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
@@ -755,7 +766,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var ports = new ScopedEngineLifecycleActuator.Ports(operators::prepare, operators::releaseHot,
                     rebuilds::rebuild, (original, command) -> plans.forRun(original, () -> {
                         owner.memberStorage.requireNode(); if (!ownership.proveClaim(original.scope(), command)) throw ThreeLayerStorePort.refused();
-                    }));
+                    }), connectorExecutions);
             var observationSampling = new NativeObservationSampling(owner.configuration, owner.original.cache(), scopedCaptures,
                     pipeline -> engine.captureRun(pipeline).map(run -> {
                         if (!(run.operatorManifest().executionIdentity() instanceof ExecutionFence original)) throw ThreeLayerStorePort.refused();

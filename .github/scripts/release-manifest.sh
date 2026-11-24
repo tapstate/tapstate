@@ -26,11 +26,6 @@
 # Both directions are checked. An asset with no platform offering it is as wrong as a platform with no
 # asset: one of the two is a mistake, and which one it is needs a person.
 #
-# Known boundary, not a gap: connector jars are not part of a versioned release. They are carried by a
-# floating prerelease that is republished on its own schedule, so they are neither expected here nor
-# counted as missing. That is a temporary arrangement, and while it holds this check would otherwise
-# have to choose between reporting them missing every time and not looking at connectors at all.
-#
 # Reports everything wrong before exiting, rather than stopping at the first. A release is assembled
 # once and looked at by a person once; handing back one problem at a time wastes both.
 

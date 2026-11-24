@@ -25,7 +25,9 @@ class ConfiguredCaptureRunTest {
     void recoveredPrivateAndSharedCapturesUseThePreviouslyConfirmedArtifact(boolean shared) {
         var notes=notes();var config=config(shared);var origin=ConnectorNoteOrigin.capture("demo",HASH,config.settings());
         when(notes.origin(any())).thenReturn(origin);var provisioner=mock(ConnectorProvisioner.class);
+        when(provisioner.withArtifactRetention(any())).thenCallRealMethod();
         when(provisioner.resolve("demo",HASH)).thenReturn(ARTIFACT);
+        when(provisioner.resolveRetained(eq(notes),any(),eq(origin))).thenCallRealMethod();
         var run=ConfiguredCaptureRun.prepare(ORIGINAL,config,notes,provisioner,() -> {},true);
         assertThat(run.artifactHash()).isEqualTo(HASH);verify(provisioner).resolve("demo",HASH);verify(provisioner,never()).resolve("demo");
     }
@@ -33,6 +35,7 @@ class ConfiguredCaptureRunTest {
     @ParameterizedTest @ValueSource(booleans={false,true})
     void pluginOpenUsesTheOriginalTokensAndExactArtifactWithoutOpeningCurrentScopes(boolean shared) {
         var notes=notes(); var provisioner=mock(ConnectorProvisioner.class);
+        when(provisioner.withArtifactRetention(any())).thenCallRealMethod();
         when(provisioner.resolve("demo")).thenReturn(ARTIFACT); when(provisioner.resolve("demo",HASH)).thenReturn(ARTIFACT);
         var config=config(shared); var run=ConfiguredCaptureRun.prepare(ORIGINAL,config,notes,provisioner,() -> {});
         var refusal=new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);

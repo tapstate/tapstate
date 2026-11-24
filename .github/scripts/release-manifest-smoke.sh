@@ -87,7 +87,9 @@ make_oci() {   # architectures, space separated
 }
 
 root="$(make_root 9.9.9)"; staging="$(make_staging)"; oci="$(make_oci "amd64 arm64")"
-pass_case "a complete release passes" "$root" "$staging" "$oci"
+mkdir -p "$root/deploy/op"
+touch "$root/deploy/op/package.py"
+pass_case "the product release is complete without the standalone OP tarball" "$root" "$staging" "$oci"
 
 # Named outright because nothing consumes them. No automated path fetches either file, so their going
 # missing is invisible everywhere else -- which is the whole reason they are listed by name.

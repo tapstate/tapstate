@@ -12,6 +12,9 @@ on:
       release-version:
         required: true
         type: string
+      onprem-only:
+        type: boolean
+        default: false
     secrets:
       RELEASE_SATELLITE_TOKEN:
         required: true
@@ -133,6 +136,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ -f deploy/cloud/stage-published-connectors.py ]]; then
+            PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-published-connectors.py \
+              --boot-jar app/target/app-*-boot.jar --profile onprem \
+              --stage-dir "$RUNNER_TEMP/onprem-stage"
+          else
           mkdir -p "$RUNNER_TEMP/onprem-jars"
           assets="$(jq -r '.connectors[].id + "-connector.jar", .licenseFiles[].name' deploy/docker/connectors.lock.json)"
           patterns=()
@@ -144,6 +152,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py \
             --profile onprem --lock deploy/docker/connectors.lock.json \
             --jar-dir "$RUNNER_TEMP/onprem-jars" --stage-dir "$RUNNER_TEMP/onprem-stage"
+          fi
           echo "build-context=onprem_connectors=$RUNNER_TEMP/onprem-stage" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -174,7 +183,7 @@ jobs:
           mkdir "$RUNNER_TEMP/onprem-built-layout"
           tar -xf "$RUNNER_TEMP/server-image.tar" -C "$RUNNER_TEMP/onprem-built-layout"
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/verify-image.py \
-            --oci-layout "$RUNNER_TEMP/onprem-built-layout" --lock deploy/docker/connectors.lock.json \
+            --oci-layout "$RUNNER_TEMP/onprem-built-layout" --lock "$RUNNER_TEMP/onprem-stage/release/connectors.lock.json" \
             --boot-jar app/target/app-*-boot.jar --web-profile onprem
       - uses: actions/upload-artifact@v4
         with:
@@ -183,6 +192,7 @@ jobs:
           if-no-files-found: error
 
   cloud-server-jar:
+    if: ${{ !inputs.onprem-only }}
     # Cloud and on-prem share the same server revision but not the same Web bundle. The Cloud Web
     # profile consumes the Cluster cookie session and compiles its Console return URL into static
     # assets, so reusing the ordinary Boot JAR would silently ship on-prem login behavior.
@@ -332,12 +342,21 @@ jobs:
             --input "$RUNNER_TEMP/cloud-boot-jar/cloud-server-boot-jar.enc" \
             --output "app/target/app-${{ inputs.release-version }}-boot.jar" \
             --context "$ARTIFACT_CONTEXT"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21.0.13+9.0.LTS"
       - name: stage the exact published connector and license bytes
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          if [[ -f deploy/cloud/stage-published-connectors.py ]]; then
+            PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-published-connectors.py \
+              --boot-jar app/target/app-*-boot.jar --profile cloud \
+              --stage-dir "$RUNNER_TEMP/cloud-stage"
+          else
           mkdir -p "$RUNNER_TEMP/cloud-jars"
           assets="$(jq -r '.connectors[].id + "-connector.jar", .licenseFiles[].name' deploy/cloud/connectors.lock.json)"
           patterns=()
@@ -350,6 +369,7 @@ jobs:
             --lock deploy/cloud/connectors.lock.json \
             --jar-dir "$RUNNER_TEMP/cloud-jars" \
             --stage-dir "$RUNNER_TEMP/cloud-stage"
+          fi
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: build the Cloud OCI archive from the verified server Boot JAR
@@ -385,7 +405,7 @@ jobs:
           tar -xf "$RUNNER_TEMP/cloud-image.tar" -C "$RUNNER_TEMP/cloud-layout"
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/verify-image.py \
             --oci-layout "$RUNNER_TEMP/cloud-layout" \
-            --lock deploy/cloud/connectors.lock.json \
+            --lock "$RUNNER_TEMP/cloud-stage/release/connectors.lock.json" \
             --boot-jar "${boot_jars[0]}" \
             --web-profile cloud --cloud-console-url "$CLOUD_CONSOLE_URL"
           PYTHONDONTWRITEBYTECODE=1 python3 .github/scripts/web-provenance.py create \

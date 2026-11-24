@@ -45,6 +45,13 @@ public final class CaptureHealth {
 
     private final AtomicReference<io.tapstate.core.common.FailureFact> failure = new AtomicReference<>();
 
+    private final java.util.concurrent.atomic.AtomicBoolean tokenedBatch = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** A CDC callback has delivered a source position through the original recipient. */
+    public boolean receivedSourcePosition() {
+        return tokenedBatch.get();
+    }
+
     /**
      * Rows received, by source table and then by the op's wire symbol. Concurrent on both levels because it
      * is written on whichever thread the connector calls back on -- one per subscription, and a snapshot
@@ -210,6 +217,7 @@ public final class CaptureHealth {
             public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                 events.forEach(CaptureHealth.this::received);
                 onBatch.onBatch(events, position);
+                if (position.isPresent()) tokenedBatch.set(true);
             }
 
             @Override

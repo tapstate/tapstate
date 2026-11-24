@@ -28,7 +28,13 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     record Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
             BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
-            BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans) {
+            BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans,
+            PipelineConnectorExecutions connectorExecutions) {
+        Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
+                BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
+                BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans) {
+            this(operators,releaseHot,rebuild,plans,null);
+        }
         Ports {
             Objects.requireNonNull(operators,"operators"); Objects.requireNonNull(releaseHot,"releaseHot");
             Objects.requireNonNull(rebuild,"rebuild"); Objects.requireNonNull(plans,"plans");
@@ -155,8 +161,14 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         try {
             prepared = dags.prepareStart(pass,defaultDatabase); require();
             if (prepared.operatorPlan().isEmpty() || prepared.artifactSnapshot().isEmpty() || prepared.sourceModels().isEmpty()) throw fenced();
-            shared = Set.copyOf(prepared.connectorHashes().isEmpty()?connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values())):
-                    connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values()),prepared.connectorHashes())); require();
+            var hashes = prepared.connectorHashes();
+            if (hashes.isEmpty() && original != null && ports.connectorExecutions() != null) {
+                hashes = ports.connectorExecutions().retainedSinkHashes(pass.intent(), prepared.connectorNodes(), this::require);
+            }
+            var sinks = Set.copyOf(prepared.sinkConnectors().values());
+            shared = Set.copyOf(hashes.isEmpty() ? connectors.requireEveryMemberCanLoad(id(), sinks)
+                    : connectors.requireEveryMemberCanLoad(id(), sinks, hashes));
+            require();
         } catch (TapstateException refused) {
             ownership.startRefusedBeforeItsRun(pass.scope(),command); throw refused;
         }
@@ -173,6 +185,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         run = null; capture = boundCapture(original);
         boolean submissionAttempted = false;
         try {
+            if (ports.connectorExecutions() != null)
+                ports.connectorExecutions().prepare(pass.intent(), prepared.connectorNodes(), command, this::require);
             pass.prepareOperatorDatabases(command,
                     prepared.operatorPlan().orElseThrow().nestDatabases().values(), this::require); require();
             var planned = prepared.plan(); require();
@@ -187,6 +201,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             require(); pass.bindCapture(command,capture.captureBindings()); require();
             var built = planned.build(original); require();
             if (!members.equals(built.planned().members())) throw new IllegalStateException("topology changed its prepared members");
+            if (ports.connectorExecutions() != null)
+                ports.connectorExecutions().publish(pass.intent(), prepared.connectorNodes(), command, this::require);
             var recorder = Objects.requireNonNull(ports.plans().apply(original,command),"fixed plan recorder"); require();
             var previous = recorder.last(id()); require();
             recorder.record(EngineLifecycleActuator.planOf(id(),execution,built.planned(),clock.instant(),prepared.sinkConnectors(),shared).replacing(previous)); require();
@@ -202,7 +218,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                 // The original writer may exist. A later pass must observe this exact manifest before proceeding.
                 invalidated = true;
             } else {
-                try { cleanupFailedStart(); } catch (RuntimeException | Error cleanup) { if (cleanup != failed) failed.addSuppressed(cleanup); }
+                try {
+                    cleanupFailedStart();
+                    if (ports.connectorExecutions() != null)
+                        ports.connectorExecutions().abandon(pass.intent(), command, this::require);
+                } catch (RuntimeException | Error cleanup) { if (cleanup != failed) failed.addSuppressed(cleanup); }
             }
             throw failed;
         }
@@ -299,7 +319,10 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         requireId(pipeline);
         if (captures instanceof ScopedPipelineCaptureCoordinator scoped) scoped.clearDirectRetries(pass.scope());
         boolean requestedStop = pass.intent().desired().targetState() == PipelineState.STOPPED;
-        try { stopOriginal(requestedStop); } finally { if (purge) invalidated = true; }
+        try {
+            stopOriginal(requestedStop);
+            if (ports.connectorExecutions() != null) ports.connectorExecutions().stopped(pass.intent(), command, this::require);
+        } finally { if (purge) invalidated = true; }
         if (purge) rebuildStopped();
     }
 

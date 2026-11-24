@@ -1,0 +1,262 @@
+name: Build OP archive
+run-name: >-
+  OP archive · ${{ inputs.source_ref || github.ref_name }} ·
+  ${{ inputs.platform == 'linux-amd64' && 'Linux x86-64' || inputs.platform == 'darwin-arm64' && 'macOS Apple Silicon' || 'Linux + macOS' }} ·
+  @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Tapstate branch or tag (blank uses the selected workflow ref)"
+        type: string
+        required: false
+      web_ref:
+        description: "Tapstate Web ref"
+        type: string
+        default: main
+        required: false
+      platform:
+        description: "Controller platforms"
+        type: choice
+        options:
+          - both
+          - linux-amd64
+          - darwin-arm64
+        default: both
+      selection_mode:
+        description: "Connector selection (check boxes are used by Custom)"
+        type: choice
+        options:
+          - All
+          - GA
+          - Beta
+          - Alpha
+          - Custom
+        default: Custom
+      # Keep the optional selections aligned with deploy/connectors/supported-connectors.json.
+      connector_mysql:
+        description: "MySQL"
+        type: boolean
+        default: false
+      connector_aliyun-rds-mysql:
+        description: "ApsaraDB RDS for MySQL"
+        type: boolean
+        default: false
+      connector_aws-rds-mysql:
+        description: "Amazon RDS for MySQL"
+        type: boolean
+        default: false
+      connector_polar-db-mysql:
+        description: "ApsaraDB PolarDB for MySQL"
+        type: boolean
+        default: false
+      connector_mysql-pxc:
+        description: "MySQL Percona XtraDB Cluster"
+        type: boolean
+        default: false
+      connector_postgres:
+        description: "PostgreSQL"
+        type: boolean
+        default: false
+      connector_aliyun-rds-postgres:
+        description: "ApsaraDB RDS for PostgreSQL"
+        type: boolean
+        default: false
+      connector_aliyun-adb-postgres:
+        description: "ApsaraDB AnalyticDB for PostgreSQL"
+        type: boolean
+        default: false
+      connector_polar-db-postgres:
+        description: "ApsaraDB PolarDB for PostgreSQL"
+        type: boolean
+        default: false
+      connector_tencent-db-postgres:
+        description: "TencentDB for PostgreSQL"
+        type: boolean
+        default: false
+      connector_aliyun-db-mongodb:
+        description: "ApsaraDB for MongoDB"
+        type: boolean
+        default: false
+      connector_tencent-db-mongodb:
+        description: "TencentDB for MongoDB"
+        type: boolean
+        default: false
+      connector_oracle:
+        description: "Oracle"
+        type: boolean
+        default: false
+      connector_sqlserver:
+        description: "SQL Server"
+        type: boolean
+        default: false
+      connector_db2:
+        description: "Db2"
+        type: boolean
+        default: false
+      connector_db2i:
+        description: "Db2 for i"
+        type: boolean
+        default: false
+      connector_dummy:
+        description: "Dummy"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          persist-credentials: false
+      - name: Resolve the source and archive name
+        id: source
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref || github.ref }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE_REF" in
+            refs/heads/*|refs/tags/*) ref="$SOURCE_REF" ;;
+            refs/*) echo "::error::Select a branch or tag." ; exit 1 ;;
+            *)
+              if git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF"; then
+                ref="refs/heads/$SOURCE_REF"
+              elif git show-ref --verify --quiet "refs/tags/$SOURCE_REF"; then
+                ref="refs/tags/$SOURCE_REF"
+              else
+                echo "::error::Select a branch or tag." ; exit 1
+              fi ;;
+          esac
+          if [[ ! -f deploy/op/package.py || ! -f deploy/op/controller/go.mod ]]; then
+            echo "::error::The selected Tapstate source predates OP archive support."
+            exit 1
+          fi
+
+          revision_pattern='[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*'
+          version="$(python3 -c 'import xml.etree.ElementTree as E; print(E.parse("pom.xml").findtext("{*}properties/{*}revision", "").strip())')"
+          name="${ref#refs/*/}"
+          if [[ "$ref" == refs/tags/* && "$name" =~ ^v?($revision_pattern)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            name="$version"
+          fi
+          if [[ ! "$version" =~ ^$revision_pattern$ ]]; then
+            echo "::error::The selected source has no usable Tapstate version in pom.xml."
+            exit 1
+          fi
+          label="$(printf '%s' "$name" | LC_ALL=C sed 's/[^a-zA-Z0-9._-]/-/g')"
+          sha="$(git rev-parse HEAD)"
+          if (( ${#label} > 180 )); then
+            label="${label:0:160}-${sha:0:12}"
+          fi
+          {
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "archive=tapstate-op-$label.tar.gz"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: op-packaging
+          sparse-checkout: |
+            /LICENSE
+            /NOTICE
+            /deploy/op
+            /deploy/cloud/stage-connectors.py
+            /deploy/cloud/stage-published-connectors.py
+            /deploy/connectors/licenses
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: tapstate/tapstate-web
+          ref: ${{ inputs.web_ref || 'main' }}
+          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          path: tapstate-web
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Enable the pinned package manager
+        run: corepack enable
+      - name: Build and stage the OP Web bundle
+        id: web
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          web_sha="$(git -C tapstate-web rev-parse HEAD)"
+          (cd tapstate-web && pnpm install --frozen-lockfile)
+          bash scripts/build-web-assets.sh --web-root tapstate-web --web-revision "$web_sha" --web-profile onprem
+          bash scripts/prepare-web-assets.sh --web-root tapstate-web --web-revision "$web_sha" \
+            --web-profile onprem --tapstate-revision "$SOURCE_SHA" --release-version "$VERSION" \
+            --output app/target/generated-resources/tapstate-web
+          echo "sha=$web_sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
+      - name: Build the Tapstate server assembly
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: mvn -B -pl app -am -Drevision="$VERSION" -DskipTests package
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: deploy/op/controller/go.mod
+          cache: false
+      - name: Package and verify the OP archive
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.source.outputs.archive }}
+          VERSION: ${{ steps.source.outputs.version }}
+          PLATFORM: ${{ inputs.platform }}
+          CONNECTOR_MODE: ${{ inputs.selection_mode }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          WEB_SHA: ${{ steps.web.outputs.sha }}
+          WORKFLOW_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          set -euo pipefail
+          connectors="$(jq -er '.selection_mode as $mode |
+            [to_entries[] | select(.key | startswith("connector_")) |
+            select($mode != "Custom" or .value == true) | .key | ltrimstr("connector_")] |
+            join(",")' <<< "$WORKFLOW_INPUTS")"
+          stage=()
+          case "$CONNECTOR_MODE" in
+            GA) stage=(--release-stage ga) ;;
+            Beta) stage=(--release-stage beta) ;;
+            Alpha) stage=(--release-stage alpha) ;;
+          esac
+          platform=()
+          if [[ "$PLATFORM" != both ]]; then platform=(--platform "$PLATFORM"); fi
+          bash deploy/op/build-controllers.sh "$RUNNER_TEMP/op-controllers"
+          boot_sha="$(sha256sum "app/target/app-$VERSION-boot.jar" | cut -d ' ' -f 1)"
+          packager=op-packaging/deploy/op/package.py
+          python3 "$packager" official --version "$VERSION" \
+            --assembly "app/target/app-$VERSION-dist.tar.gz" --boot-sha256 "$boot_sha" \
+            --controllers "$RUNNER_TEMP/op-controllers" "${platform[@]}" --connectors "$connectors" "${stage[@]}" \
+            --output "$RUNNER_TEMP/op/$ARCHIVE"
+          jars="$(python3 "$packager" verify --version "$VERSION" --boot-sha256 "$boot_sha" \
+            "${platform[@]}" --archive "$RUNNER_TEMP/op/$ARCHIVE" --checksum "$RUNNER_TEMP/op/$ARCHIVE.sha256" \
+            --list-connectors)"
+          {
+            printf '### OP archive\n\n- Archive: `%s`\n- Tapstate commit: `%s`\n- Web commit: `%s`\n' \
+              "$ARCHIVE" "$SOURCE_SHA" "$WEB_SHA"
+            printf '\n| PDK ID | Version | JAR in archive |\n| --- | --- | --- |\n'
+            while IFS=$'\t' read -r id version jar; do
+              printf '| `%s` | `%s` | `%s` |\n' "$id" "$version" "$jar"
+            done <<< "$jars"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.archive }}
+          path: ${{ runner.temp }}/op/
+          if-no-files-found: error

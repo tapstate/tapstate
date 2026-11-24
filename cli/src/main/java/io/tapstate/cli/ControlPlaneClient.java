@@ -165,6 +165,11 @@ interface ControlPlaneClient extends AutoCloseable {
      */
     ConnectorRegisterOutcome register(URI baseUrl, String credential, byte[] artifact);
 
+    /** A missing endpoint identifies a server that still uses the legacy connector distribution. */
+    default java.util.Optional<ConnectorRegisterOutcome> downloadConnector(URI baseUrl, String credential, String connectorId) {
+        return java.util.Optional.empty();
+    }
+
     /**
      * Lists the connectors the online catalog exposes via {@code GET {baseUrl}/api/connectors},
      * authenticated by the bearer {@code credential}: the bundled snapshot union the rows derived for
