@@ -79,11 +79,15 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -115,17 +119,33 @@ import static org.assertj.core.api.Assertions.assertThat;
 class PipelineObservationApiTest {
 
     private static final Instant NOW = Instant.parse("2026-07-12T12:00:00Z");
+    private static final String MYSQL_POSITION = serializedPosition("mysql-bin.000003:1544");
+    private static final String POSTGRES_POSITION = serializedPosition("0/16B6C50");
 
     /** One running pipeline with a couple of metrics and one in-progress snapshot table. */
     private static final Observation PL1 = new Observation("pl1", PipelineState.RUNNING,
             Map.of("recordCount", 42L, "errorCount", 0L),
             Map.of("orders", new TableSnapshot(10, 100L, 10)));
 
+    // A connector token that shares the Java magic and uses a different version byte.
+    private static final String HEADER_LIKE_POSITION = "rO0ABA==";
+
     /** One running pipeline whose target-acked source positions have advanced, to exercise that field. */
     private static final Observation PL_POS = new Observation("pl2", PipelineState.RUNNING,
             Map.of("recordCount", 6L, "errorCount", 0L),
             Map.of(),
-            Map.of("orders", "w7"));
+            Map.of("orders", "w7", "shipments", MYSQL_POSITION, "events", POSTGRES_POSITION,
+                    "ledger", "binlog.000017:567", "archive", HEADER_LIKE_POSITION));
+
+    private static String serializedPosition(String position) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(position);
+        } catch (IOException ex) {
+            throw new AssertionError(ex);
+        }
+        return Base64.getEncoder().encodeToString(bytes.toByteArray());
+    }
 
     /** One pipeline whose job died, to exercise the coded reason the status face carries. */
     private static final Observation PL_DEAD = new Observation("pl3", PipelineState.FAILED,
@@ -383,7 +403,13 @@ class PipelineObservationApiTest {
         // A source position is a string, and the metrics map is numeric run statistics. Carrying the
         // position as a sibling rather than nested inside that map keeps every metrics cell a number,
         // so a reader never has to type-test a cell before using it.
-        assertThat(body.get("targetAckedPosition")).isEqualTo(Map.of("orders", "w7"));
+        Map<String, String> positions = (Map<String, String>) body.get("targetAckedPosition");
+        assertThat(positions).containsOnlyKeys("orders", "shipments", "events", "ledger", "archive")
+                .containsEntry("orders", "w7")
+                .containsEntry("ledger", "binlog.000017:567")
+                .containsEntry("archive", HEADER_LIKE_POSITION);
+        assertThat(positions.get("shipments")).matches("opaque-v1:[0-9a-f]{64}");
+        assertThat(positions.get("events")).matches("opaque-v1:[0-9a-f]{64}").isNotEqualTo(positions.get("shipments"));
         Map<String, Object> metrics = (Map<String, Object>) body.get("metrics");
         assertThat(metrics).doesNotContainKey("targetAckedPosition");
         assertThat(metrics.get("recordCount")).isNotNull();

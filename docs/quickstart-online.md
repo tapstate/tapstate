@@ -781,8 +781,11 @@ pagination, REST and MCP forms, and the difference between an empty retained win
 - **The position it reports is `targetAckedPosition`: how far the target has confirmed writes.**
   When a connector supplies a Java-serialized token, `metrics` summarizes how many tables have
   an acknowledged position and how many distinct positions they share; it cannot infer a source
-  coordinate or lag from those opaque bytes. The REST metrics response retains the raw token for
-  machine use. This is not how far the source could be read to or how far the pipeline has processed.
+  coordinate or lag from those opaque bytes. The REST metrics response returns an
+  `opaque-v1:<sha256>` fingerprint for equality comparisons. The updated CLI shows a short
+  fingerprint with either server version. An older CLI may print the full fingerprint verbatim.
+  To read or write a resume point, use `/api/pipelines/{id}/position`.
+  This is not how far the source could be read to or how far the pipeline has processed.
   Those two are printed by name as `not collected`, because a position that is simply missing reads
   the same as one this product has no concept of — and only one of those is an answer. A target that
   has stopped accepting writes freezes this position while the other two would still be moving, so
