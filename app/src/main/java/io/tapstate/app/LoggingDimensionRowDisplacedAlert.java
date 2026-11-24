@@ -37,23 +37,30 @@ final class LoggingDimensionRowDisplacedAlert implements DimensionRowDisplacedAl
 
     private final String pipelineId;
     private final String stepId;
+    private final long stateGeneration;
     private final AtomicLong count = new AtomicLong();
 
     /** An unbound template, carried with the graph until a member starts one join vertex. */
     LoggingDimensionRowDisplacedAlert() {
-        this.pipelineId = null;
-        this.stepId = null;
+        this(0);
     }
 
-    private LoggingDimensionRowDisplacedAlert(String pipelineId, String stepId) {
+    LoggingDimensionRowDisplacedAlert(long stateGeneration) {
+        this.pipelineId = null;
+        this.stepId = null;
+        this.stateGeneration = stateGeneration;
+    }
+
+    private LoggingDimensionRowDisplacedAlert(String pipelineId, String stepId, long stateGeneration) {
         this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
         this.stepId = Objects.requireNonNull(stepId, "stepId");
+        this.stateGeneration = stateGeneration;
     }
 
     /** Gives each member-side vertex its own attribution and widening counter. */
     @Override
     public DimensionRowDisplacedAlert bind(String pipelineId, String stepId) {
-        return new LoggingDimensionRowDisplacedAlert(pipelineId, stepId);
+        return new LoggingDimensionRowDisplacedAlert(pipelineId, stepId, stateGeneration);
     }
 
     @Override
@@ -77,6 +84,13 @@ final class LoggingDimensionRowDisplacedAlert implements DimensionRowDisplacedAl
                 new TapstateException(EngineError.JOIN_DIMENSION_ROW_DISPLACED, args, null);
         String previousPipeline = MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+        String generationKey = io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY;
+        String previousGeneration = MDC.get(generationKey);
+        if (stateGeneration > 0) {
+            MDC.put(generationKey, Long.toString(stateGeneration));
+        } else {
+            MDC.remove(generationKey);
+        }
         try {
             LOG.warn("{} (pipeline {}, step {}, {} displaced so far on this member)",
                     coded.getMessage(), pipelineId, stepId, seen);
@@ -85,6 +99,11 @@ final class LoggingDimensionRowDisplacedAlert implements DimensionRowDisplacedAl
                 MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
             } else {
                 MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, previousPipeline);
+            }
+            if (previousGeneration == null) {
+                MDC.remove(generationKey);
+            } else {
+                MDC.put(generationKey, previousGeneration);
             }
         }
     }

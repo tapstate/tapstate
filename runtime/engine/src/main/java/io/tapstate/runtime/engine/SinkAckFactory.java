@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.LinkedHashMap;
 import java.util.Collections;
+import java.util.Set;
 
 /**
  * Resolves, on the member it runs on, the {@link SinkAck} a sink advances its durable watermark through. It
@@ -88,5 +89,13 @@ public interface SinkAckFactory extends Serializable {
      */
     default LoadLandings loadLandings(HazelcastInstance member) {
         return awaited -> List.of();
+    }
+
+    /**
+     * Source streams whose snapshot landing was durably confirmed for every writer, including in an
+     * earlier execution of this pipeline intent. Such sources can resume without another snapshot bound.
+     */
+    default Set<String> completedSnapshotInputs(HazelcastInstance member, Set<String> streams) {
+        return Set.of();
     }
 }

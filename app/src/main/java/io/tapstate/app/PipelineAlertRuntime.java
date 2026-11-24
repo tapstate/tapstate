@@ -8,6 +8,7 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import java.util.function.BooleanSupplier;
 import java.util.function.*;
 
 /** Bounded production feed. The two evaluation workers own no transport and never run convergence. */
@@ -154,7 +155,31 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void published(PipelineConvergencePass pass, Observation observation, Throwable cause) {
         if (pass == null || closed.get()) return;
         Slot slot = slot(pass); if (slot == null) return;
-        long sequence = slot.sequence.getAndIncrement();
+        publish(slot, slot.sequence.getAndIncrement(), observation, cause, () -> true);
+    }
+    @Override public void publishedIfExpected(PipelineConvergencePass pass, Observation observation, Throwable cause) {
+        publishIfExpected(pass, observation, cause, () -> true);
+    }
+
+    @Override public void publishedPeriodic(PipelineConvergencePass pass, Observation observation, BooleanSupplier current) {
+        publishIfExpected(pass, observation, null, current);
+    }
+
+    private void publishIfExpected(PipelineConvergencePass pass, Observation observation, Throwable cause, BooleanSupplier current) {
+        if (closed.get() || !current.getAsBoolean()) return;
+        Slot slot;
+        long sequence;
+        synchronized (objectAdmission) {
+            slot = expectedSlot(pass);
+            if (slot == null) return;
+            // Consecutive intents for one incarnation share the sequence counter.
+            sequence = slot.sequence.getAndIncrement();
+        }
+        publish(slot, sequence, observation, cause, () -> current.getAsBoolean()
+                && slots.get(slot.producer.scope().pipelineId()) == slot);
+    }
+
+    private void publish(Slot slot, long sequence, Observation observation, Throwable cause, BooleanSupplier current) {
         int bytes = inputBytes(observation);
         if (bytes < 0 || observation.observedAt() == null || observation.observedAt().isAfter(clock.instant())) {
             reject(slot, "input-budget-or-clock"); return;
@@ -165,28 +190,51 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 ? Optional.of(coded.code().code()) : Optional.empty()) : diagnostics.pipeline(cause,observation.failure())).orElse(null);
         var capturedRules = rules.get();
         submit(slot, bytes + 16 * 1024, () -> {
-            var proved=currentProof(slot);
-            long interruption = slot.interruptions.get();
-            slot.actual = original.state();
-            if (slot.publication == null || original.observedAt().isAfter(slot.publication)) slot.publication = original.observedAt();
-            for (var rule : matching(slot, capturedRules)) {
-                var binding = binding(slot, rule,proved);
-                if (rule.typeId().equals("pipeline.observation-stale")) continue;
-                if (slot.discontinuous()) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
-                AlertInput input = rule.metric() != null ? new AlertInput.Metric(original)
-                        : new AlertInput.Conditions(original.observedAt(), slot.producer.intent().desired().targetState() != PipelineState.RUNNING
-                                ? AlertSignal.Condition.UNKNOWN : original.state() == PipelineState.FAILED
-                                ? AlertSignal.Condition.BAD : original.state() == PipelineState.RUNNING
-                                && slot.producer.intent().desired().targetState() == PipelineState.RUNNING
-                                ? AlertSignal.Condition.GOOD : AlertSignal.Condition.UNKNOWN, trace);
-                accept(binding, sequence, input);
+            if (!current.getAsBoolean()) return;
+            try {
+                publishCurrent(slot, original, trace, capturedRules, current, sequence);
+            } catch (TapstateException refused) {
+                if (current.getAsBoolean()) throw refused;
             }
-            requireCurrent(slot,proved);
-            slot.recoveredInterruption = interruption;
         });
+    }
+
+    private void publishCurrent(Slot slot, Observation original, AlarmDiagnostics.SafeTrace trace,
+            List<AlertConfiguration.Rule> capturedRules, BooleanSupplier current, long sequence) {
+        var proved = currentProof(slot);
+        if (!current.getAsBoolean()) return;
+        long interruption = slot.interruptions.get();
+        slot.actual = original.state();
+        if (slot.publication == null || original.observedAt().isAfter(slot.publication)) slot.publication = original.observedAt();
+        for (var rule : matching(slot, capturedRules)) {
+            var binding = binding(slot, rule,proved);
+            if (rule.typeId().equals("pipeline.observation-stale")) continue;
+            if (slot.discontinuous()) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
+            AlertInput input = rule.metric() != null ? new AlertInput.Metric(original)
+                    : new AlertInput.Conditions(original.observedAt(), slot.producer.intent().desired().targetState() != PipelineState.RUNNING
+                            ? AlertSignal.Condition.UNKNOWN : original.state() == PipelineState.FAILED
+                            ? AlertSignal.Condition.BAD : original.state() == PipelineState.RUNNING
+                            && slot.producer.intent().desired().targetState() == PipelineState.RUNNING
+                            ? AlertSignal.Condition.GOOD : AlertSignal.Condition.UNKNOWN, trace);
+            accept(binding, sequence, input);
+        }
+        requireCurrent(slot,proved);
+        slot.recoveredInterruption = interruption;
     }
     @Override public void unavailable(PipelineConvergencePass pass) {
         if (pass != null) reject(slots.get(pass.scope().pipelineId()), "publication-unavailable");
+    }
+    @Override public void unavailableIfExpected(PipelineConvergencePass pass) {
+        synchronized (objectAdmission) {
+            var slot = expectedSlot(pass);
+            if (slot != null) reject(slot, "publication-unavailable");
+        }
+    }
+    private Slot expectedSlot(PipelineConvergencePass pass) {
+        if (pass == null || closed.get()) return null;
+        var producer = new Producer(pass.scope(), pass.claim(), pass.intent());
+        var current = slots.get(producer.scope().pipelineId());
+        return current != null && current.producer.equals(producer) ? current : null;
     }
     @Override public void retain(Collection<String> ids) {
         slots.keySet().retainAll(Set.copyOf(ids));

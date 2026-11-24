@@ -56,6 +56,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         this.configuration = root.runtime().requireConfiguration();
     }
 
+    java.util.Optional<PipelineStateMappings.LogWindow> pipelineLogWindow(String id) {
+        original.requireActive();
+        return configuration.pipelineStates().logWindow(id);
+    }
+
     @Override public synchronized void start() {
         original.requireBusiness();
         if (context != null) throw ThreeLayerStorePort.refused();
@@ -287,9 +292,18 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         active.set(false); handlers = List.of();
         Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
+        var beans = context == null ? null : context.getBeanFactory();
+        var periodic = beans == null ? null : (PeriodicObservations) beans.getSingleton("periodicObservations");
+        var convergence = beans == null ? null : (PipelineConvergences) beans.getSingleton("pipelineConvergences");
+        var observationWrites = beans == null ? null : (ProcessObservationWriter) beans.getSingleton("processObservationWriter");
+        if (convergence != null) convergence.close();
+        if (periodic != null) periodic.close();
         var alerts = alertRuntime.get();
         if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
+        if (convergence != null) convergence.awaitStopped(deadline);
+        if (periodic != null) periodic.awaitStopped(deadline);
+        if (observationWrites != null) observationWrites.close();
         var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
         Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
         Throwable failure = null;
@@ -695,11 +709,26 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 }
             };
         }
+        @Bean(destroyMethod = "close") ProcessObservationWriter processObservationWriter(NativeBusinessContext owner,
+                @org.springframework.beans.factory.annotation.Value("${tapstate.converge.interval-ms:1000}") String interval) {
+            return new ProcessObservationWriter(owner.original.cache(),
+                    org.springframework.boot.convert.DurationStyle.detectAndParse(interval, java.time.temporal.ChronoUnit.MILLIS));
+        }
+        @Bean(destroyMethod = "close") PeriodicObservations periodicObservations() {
+            return new PeriodicObservations();
+        }
+
+        @Bean(destroyMethod = "close") PipelineConvergences pipelineConvergences() {
+            return new PipelineConvergences();
+        }
+
         @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
-                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,ClusterNodeAlertSource resourceAlerts) {
+                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,
+                ClusterNodeAlertSource resourceAlerts, ProcessObservationWriter observationWrites, PeriodicObservations periodicObservations,
+                PipelineConvergences pipelineConvergences) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
@@ -729,17 +758,24 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return ConvergenceDriver.scoped(converger, observations, samples, export,
                     () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
-                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain,
+                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> {
+                                if (admission instanceof ClusterRebuildAdmission rebuildAdmission) {
+                                    rebuildAdmission.observeScope(pass.scope(), () -> owner.pipelineLogWindow(pass.scope().pipelineId()));
+                                }
+                                return admission;
+                            }, admission::retain,
                             alerts, owner.context.getBean(PipelineFirstStatePreparer.class)::prepareDeferred,
                             pipelineId -> owner.configuration.intents().load(pipelineId)
                                     .filter(intent -> !intent.deleted() && PipelineRebuildCoordinator.clearsPrivateCapture(intent.desired()))
                                     .ifPresent(intent -> {
+                                        org.slf4j.MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
+                                                Long.toString(intent.scope().stateGeneration()));
                                         // The rebuild store verifies the frozen claim and checkpoint.
                                         // Taking a fresh actuation claim here could invalidate them after restart.
                                         try (var ignored = ownership.enterPass(intent.scope())) {
                                             rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
                                         }
-                                    }), observationSampling));
+                                    }), observationSampling, observationWrites), periodicObservations, pipelineConvergences);
         }
         @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {

@@ -525,17 +525,72 @@ class ScopedPipelineCaptureCoordinatorTest {
                     new SrsConsumerStore.RetentionConsumer(peer, Map.of()));
             var oldSnapshot = new SrsConsumerStore.RetentionSnapshot(old, members);
             var newSnapshot = new SrsConsumerStore.RetentionSnapshot(opened, members);
-            when(stores.consumers().retentionSnapshot(held.chain()))
-                    .thenAnswer(call -> Optional.of(chain.get() == old ? oldSnapshot : newSnapshot));
             var refreshed = new CountDownLatch(1);
             doAnswer(call -> {
                 if (chain.get() == opened) refreshed.countDown();
                 return null;
             }).when(f.runtime).retain(eq(BUSINESS), eq(held.chain()), eq(fence), any());
+            when(stores.consumers().retentionSnapshot(held.chain()))
+                    .thenAnswer(call -> Optional.of(chain.get() == old ? oldSnapshot : newSnapshot));
 
             assertThat(refreshed.await(5, TimeUnit.SECONDS)).isTrue();
             verify(f.runtime).startTail(eq(BUSINESS), eq(opened), eq(fence), any(), any(), any(), any(), anyBoolean());
             verify(f.runtime, never()).retain(eq(BUSINESS), eq(held.chain()), eq(fence), any(), same(oldSnapshot));
+        }
+    }
+
+    @Test void unavailableRetentionSnapshotKeepsTheHealthyTailAndRetriesCleanup() throws InterruptedException {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var failures = new AtomicInteger();
+            var retained = new CountDownLatch(2);
+            doAnswer(call -> {
+                if (failures.get() > 0) retained.countDown();
+                return null;
+            }).when(f.runtime).retain(eq(BUSINESS), eq(held.chain()),
+                    eq(WorkloadClaimFence.from(held.claim())), any());
+            when(stores.consumers().retentionSnapshot(held.chain())).thenAnswer(call -> {
+                failures.incrementAndGet();
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "snapshot unavailable"), null);
+            });
+
+            assertThat(retained.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(failures).hasValueGreaterThanOrEqualTo(2);
+            assertThat(held.run().captureFailure("flow")).isEmpty();
+            verify(f.ownership, never()).release(held.claim());
+            verify(held.tail(), never()).close();
+            verify(f.runtime, times(1)).startTail(any(), any(), any(), any(), any(), any(), any(), anyBoolean());
+        }
+    }
+
+    @Test void unavailableRetentionSnapshotStillRejectsALostCaptureOwner() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var fenced = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            when(stores.consumers().retentionSnapshot(held.chain())).thenAnswer(call -> {
+                when(f.authorization.requireCapture(any(), any())).thenThrow(fenced);
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "snapshot unavailable"), null);
+            });
+
+            verify(f.ownership, timeout(3000)).release(held.claim());
+            assertThat(held.run().captureFailure("flow")).contains(fenced);
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = IoError.class,
+            names = {"WORKLOAD_CLAIM_FENCED", "CACHE_BUSINESS_FENCED", "DOCUMENT_UNREADABLE"})
+    void retentionSnapshotFencesAndDamagedFactsStillEndTheCapture(IoError code) {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var failure = new TapstateException(code, Map.of(), null);
+            when(stores.consumers().retentionSnapshot(held.chain())).thenThrow(failure);
+
+            verify(f.ownership, timeout(3000)).release(held.claim());
+            assertThat(held.run().captureFailure("flow")).contains(failure);
         }
     }
 
@@ -712,6 +767,182 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void aMaintenanceCloseDoesNotBlockAccessToAnIndependentPipeline() throws Exception {
+        var allowClose = new CountDownLatch(1);
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100));
+                var calls = Executors.newSingleThreadExecutor()) {
+            try {
+                pendingTailFailure(f, allowClose);
+                var other = new PipelineIntentScope("cluster", BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "independent", 1);
+                var checked = calls.submit(() -> f.coordinator.hasScope(other));
+                assertThat(checked.get(1, TimeUnit.SECONDS)).isFalse();
+            } finally { allowClose.countDown(); }
+        }
+    }
+
+    @Test void failedStartCleanupLeavesTheSharedCaptureRegistryAvailable() throws Exception {
+        var closeEntered = new CountDownLatch(1);
+        var allowClose = new CountDownLatch(1);
+        var refused = new IllegalStateException("original second source refused its opening");
+        var captured = healthyCaptureRun();
+        try (var f = new Fixture(List.of("left", "right"), 2); var calls = Executors.newFixedThreadPool(2)) {
+            doReturn(captured).doThrow(refused).when(f.runtime).beginSnapshotOnly(any(), anyLong(), any(), any(), any());
+            doAnswer(call -> {
+                closeEntered.countDown();
+                assertThat(allowClose.await(5, TimeUnit.SECONDS)).isTrue();
+                return null;
+            }).when(f.runtime).stopSnapshot(same(captured));
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            var original = calls.submit(() -> run.startCapture("flow", f.snapshot(), f.models()));
+            try {
+                assertThat(closeEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                var other = new PipelineIntentScope("cluster", BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "independent", 1);
+                assertThat(calls.submit(() -> f.coordinator.hasScope(other)).get(1, TimeUnit.SECONDS)).isFalse();
+                assertThat(original).isNotDone();
+            } finally { allowClose.countDown(); }
+            assertThatThrownBy(() -> original.get(5, TimeUnit.SECONDS)).hasCause(refused);
+            assertThat(run.isCapturing("flow")).isFalse();
+        }
+    }
+
+    @Test void aRetryCannotReportAnOriginalSessionWhileFailedStartCleanupIsStillRunning() throws Exception {
+        var closeEntered = new CountDownLatch(1);
+        var allowClose = new CountDownLatch(1);
+        var refused = new IllegalStateException("original second source refused its opening");
+        var captured = healthyCaptureRun();
+        try (var f = new Fixture(List.of("left", "right"), 2);
+                var calls = Executors.newFixedThreadPool(2)) {
+            doReturn(captured).doThrow(refused).when(f.runtime).beginSnapshotOnly(any(), anyLong(), any(), any(), any());
+            doAnswer(call -> {
+                closeEntered.countDown();
+                assertThat(allowClose.await(10, TimeUnit.SECONDS)).isTrue();
+                return null;
+            }).when(f.runtime).stopSnapshot(same(captured));
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            var artifacts = f.snapshot();
+            var models = f.models();
+            var original = calls.submit(() -> run.startCapture("flow", artifacts, models));
+            try {
+                assertThat(closeEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(run.isCapturing("flow")).as("the original session is still registered for cleanup").isTrue();
+                var retry = calls.submit(() -> run.startCapture("flow", artifacts, models));
+                assertThatThrownBy(() -> retry.get(1, TimeUnit.SECONDS))
+                        .as("the same-fence start cannot report an already ended session as ready")
+                        .hasCauseInstanceOf(TapstateException.class);
+            } finally { allowClose.countDown(); }
+            assertThatThrownBy(() -> original.get(5, TimeUnit.SECONDS)).hasCause(refused);
+            assertThat(run.isCapturing("flow")).isFalse();
+        }
+    }
+
+    @Test void baselineMismatchCleanupLeavesTheSharedCaptureRegistryAvailable() throws Exception {
+        var closeEntered = new CountDownLatch(1);
+        var allowClose = new CountDownLatch(1);
+        var nativeStores = new SrsStores(mock(SrsChainStore.class, RETURNS_SELF),
+                mock(SrsModelStore.class, RETURNS_SELF), mock(SrsLogStore.class),
+                mock(SrsConsumerStore.class, RETURNS_SELF));
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.CDC_ONLY, Duration.ofSeconds(10), "fixture", nativeStores);
+                var calls = Executors.newFixedThreadPool(2)) {
+            OwnedShared held = ownedShared(f, false, ignored -> {}, () -> {}, true);
+            var constructor = SrsBaselineModelMismatch.class.getDeclaredConstructor(String.class, String.class);
+            constructor.setAccessible(true);
+            var mismatch = constructor.newInstance(held.chain(), "orders");
+            class MismatchedPort implements CapturePort, AutoCloseable {
+                @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                    throw mismatch;
+                }
+                @Override public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError("unexpected snapshot"); }
+                @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new AssertionError("unexpected discovery"); }
+                @Override public ConnectionReport testConnection(CaptureConfig config) { throw new AssertionError("unexpected probe"); }
+                @Override public void close() {
+                    closeEntered.countDown();
+                    try { assertThat(allowClose.await(10, TimeUnit.SECONDS)).isTrue(); }
+                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                }
+            }
+            f.portOverride.set(new MismatchedPort());
+            var starting = calls.submit(() -> held.run().startCapture("flow", f.snapshot(), f.models()));
+            try {
+                assertThat(closeEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                var other = new PipelineIntentScope("cluster", BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "independent", 1);
+                var checked = calls.submit(() -> f.coordinator.hasScope(other));
+                assertThat(checked.get(1, TimeUnit.SECONDS)).isFalse();
+            } finally { allowClose.countDown(); }
+            assertThatThrownBy(() -> starting.get(5, TimeUnit.SECONDS)).hasCause(mismatch);
+        }
+    }
+
+    @Test void maintenanceRetriesOriginalRetirementAfterBothReleaseAttemptsFail() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report = pendingTailFailure(f);
+            WorkloadClaim original = report.held().claim();
+            report.held().run().stopCapture("flow", false);
+            var attempted = new CountDownLatch(2);
+            var released = new CountDownLatch(1);
+            var calls = new AtomicInteger();
+            var unavailable = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "temporary release failure"), null);
+            doAnswer(call -> {
+                if (calls.incrementAndGet() <= 2) {
+                    attempted.countDown();
+                    throw unavailable;
+                }
+                released.countDown();
+                return null;
+            }).when(f.ownership).release(original);
+            report.settled().run();
+            assertThat(attempted.await(5, TimeUnit.SECONDS)).as("both initial release attempts failed").isTrue();
+            assertThat(released.await(3, TimeUnit.SECONDS))
+                    .as("subsequent maintenance retries the retained original owner after storage recovers")
+                    .isTrue();
+            verify(f.ownership, times(3)).release(original);
+        }
+    }
+
+    @Test void shutdownWaitsForExplicitRetirementStartedAfterItsOwnerSnapshot() throws Exception {
+        var ownerWorkerEntered = new CountDownLatch(1);
+        var releaseOwnerWorker = new CountDownLatch(1);
+        var endingTenure = new CountDownLatch(1);
+        var releaseTenure = new CountDownLatch(1);
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC); var calls = Executors.newFixedThreadPool(2)) {
+            var report = pendingTailFailure(f);
+            var held = report.held();
+            held.run().stopCapture("flow", false);
+            WorkloadClaimFence fence = WorkloadClaimFence.from(held.claim());
+            doAnswer(call -> {
+                endingTenure.countDown();
+                assertThat(releaseTenure.await(10, TimeUnit.SECONDS)).isTrue();
+                return null;
+            }).when(f.ownership).endTenure(fence);
+            var field = ScopedPipelineCaptureCoordinator.class.getDeclaredField("ownerOperations");
+            field.setAccessible(true);
+            var worker = (ExecutorService) field.get(f.coordinator);
+            worker.submit(() -> {
+                ownerWorkerEntered.countDown();
+                return releaseOwnerWorker.await(10, TimeUnit.SECONDS);
+            });
+            assertThat(ownerWorkerEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            var shutdown = calls.submit(f.coordinator::close);
+            try {
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(worker::isShutdown);
+                var retirement = calls.submit(() -> f.coordinator.retireShared(held.preparation(), fence));
+                assertThat(endingTenure.await(5, TimeUnit.SECONDS)).isTrue();
+                releaseOwnerWorker.countDown();
+                assertThatThrownBy(() -> shutdown.get(1, TimeUnit.SECONDS))
+                        .as("the original explicit retirement must finish before host close returns")
+                        .isInstanceOf(TimeoutException.class);
+                releaseTenure.countDown();
+                retirement.get(5, TimeUnit.SECONDS);
+                shutdown.get(5, TimeUnit.SECONDS);
+                verify(f.ownership).release(held.claim());
+                verify(f.ownership).endTenure(fence);
+            } finally {
+                releaseOwnerWorker.countDown();
+                releaseTenure.countDown();
+                report.settled().run();
+            }
+        }
+    }
+
     @Test void anExpiredLocalProofFallsBackWhileFullAuthorityStillStands() {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
@@ -742,7 +973,9 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(f.authorization.requireLocal(ORIGINAL)).thenThrow(new TapstateException(
                     io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "flow"), null));
             assertThat(f.authorization.require(ORIGINAL)).isEqualTo(PIPELINE);
+            clearInvocations(f.authorization);
             assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            verify(f.authorization).requireLocal(ORIGINAL);
             verify(publisher, times(2)).publishScoped(SCOPE, state, observations, null);
             verifyNoInteractions(cache);
             assertThat(f.coordinator.observationSelection(ORIGINAL)).isEmpty();
@@ -761,6 +994,10 @@ class ScopedPipelineCaptureCoordinatorTest {
     }
     private static OwnedShared ownedShared(Fixture f, boolean openPort,
             java.util.function.Consumer<PipelineCaptureCoordinator> start, Runnable afterPort) {
+        return ownedShared(f, openPort, start, afterPort, false);
+    }
+    private static OwnedShared ownedShared(Fixture f, boolean openPort,
+            java.util.function.Consumer<PipelineCaptureCoordinator> start, Runnable afterPort, boolean realTail) {
         String canonical="mck-key",physical="srs-recovery-"+"b".repeat(64),operation=UUID.randomUUID().toString();
         String captureId=SourceCaptureIdentity.sharedCapture(canonical);
         var prepared=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SHARED_SRS,physical,captureId,
@@ -796,7 +1033,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         doReturn(-1L).when(f.runtime).initialReadAfter(any(),anyString(),anyString(),any(),anyString(),any());
         doNothing().when(f.runtime).retain(any(),anyString(),any(),any());
         var tail=mock(NativeSrsCaptureRunUnit.Tail.class);when(tail.health()).thenReturn(new CaptureHealth());
-        doAnswer(call->{
+        if (!realTail) doAnswer(call->{
             if(openPort){f.tailGuard.set(call.getArgument(6));java.util.function.Function<SrsCaptureWriter,CapturePort> factory=call.getArgument(5);factory.apply(mock(SrsCaptureWriter.class));afterPort.run();}
             return tail;
         }).when(f.runtime).startTail(any(),any(),any(),any(),any(),any(),any(),anyBoolean());
@@ -1084,6 +1321,10 @@ class ScopedPipelineCaptureCoordinatorTest {
             this(ids,capacity,mode,renewal,"fixture");
         }
         Fixture(List<String> ids,int capacity,ReadMode mode,Duration renewal,String connector) {
+            this(ids, capacity, mode, renewal, connector, new SrsStores(mock(SrsChainStore.class),
+                    mock(SrsModelStore.class), mock(SrsLogStore.class), mock(SrsConsumerStore.class)));
+        }
+        Fixture(List<String> ids,int capacity,ReadMode mode,Duration renewal,String connector,SrsStores nativeStores) {
             buffer=new SnapshotBuffer(capacity);
             for(String id:ids) {
                 var definition=new SourceResource(id,null,connector,Map.of("database","x"),SourceMode.CDC,List.of(TableRef.literal("orders")),new Srs("key",null,null,null,true),null);
@@ -1125,7 +1366,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                     ?"io.tapdata.mongodb.MongodbConnector":"not.loaded","2.0.8",null,null,"a".repeat(64),false);
             when(connectors.resolve(connector)).thenReturn(artifact);
             when(connectors.resolve(connector,"a".repeat(64))).thenReturn(artifact);
-            runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),mock(SrsConsumerStore.class)),mock(HazelcastInstance.class)));
+            runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,nativeStores,mock(HazelcastInstance.class)));
             var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),OWNER,1,0,1);
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes,ignored -> false,
                             boundedLoads,completedFull),

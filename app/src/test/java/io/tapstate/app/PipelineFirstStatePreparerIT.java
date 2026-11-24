@@ -231,6 +231,53 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @Test void deferredStartDiagnosticsSurviveReopenAndDoNotCarryOverToRetry() {
+        withFixture(f -> {
+            var intents = f.configuration.intents();
+            var original = intents.load("flow").orElseThrow();
+            var inputs = new PipelinePreparationInputs(original.desired().revision(), Map.of(), Map.of(), List.of());
+            assertThat(intents.compareAndSetStart(f.scope, original.intentRevision(), original.desired(), inputs)).isTrue();
+            var pending = intents.pendingStart("flow").orElseThrow();
+            var fields = Map.<String, Object>of("id", "doc-42", "field", "revision");
+            var driver = ConvergenceDriver.scoped(null,
+                    org.mockito.Mockito.mock(io.tapstate.runtime.scheduler.ObservationPublisher.class),
+                    null, null, () -> true, PipelineActuationOwnership.single(),
+                    new ConvergenceDriver.ScopedPorts(intents, f.cache, ACTIVE, pass -> null, pass -> null,
+                            ignored -> {}, PipelineAlertFeed.none(), start -> {
+                                throw new TapstateException(IoError.DOCUMENT_UNREADABLE, fields, null);
+                            }, null));
+            driver.reconcile();
+            var rows = f.configDatabase.getCollection("pipeline_intents");
+            var filter = new Document("_id", "flow");
+            assertThat(rows.find(filter).first()).containsEntry("startFailureParams", new Document(fields));
+
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster-a")) {
+                var bound = org.mockito.Mockito.mock(StorageRuntime.Bound.class);
+                org.mockito.Mockito.when(bound.preparation()).thenReturn(reopened.bindings().cachePreparation().orElseThrow());
+                var port = new ThreeLayerStorePort(reopened, bound, ignored -> {}, (scope, captured) -> {}, true);
+                var failure = port.observations().read("flow").orElseThrow().failure();
+                assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+                assertThat(failure.params()).isEqualTo(fields);
+                assertThat(port.pipelineCatalogStates(List.of("flow")).get("flow").observation().orElseThrow().failure())
+                        .isEqualTo(failure);
+
+                var retry = reopened.intents();
+                var failed = retry.load("flow").orElseThrow();
+                assertThat(retry.compareAndSetStart(f.scope, failed.intentRevision(), failed.desired(), inputs)).isTrue();
+                assertThat(rows.find(filter).first()).doesNotContainKeys("startFailure", "startFailureParams");
+                assertThat(port.observations().read("flow")).isEmpty();
+                intents.failStart(pending, IoError.DOCUMENT_UNREADABLE, fields);
+                assertThat(retry.pendingStart("flow")).isPresent();
+                retry.failStart(retry.pendingStart("flow").orElseThrow(), IoError.DOCUMENT_UNREADABLE);
+                assertThat(rows.find(filter).first()).containsEntry("startFailure", "DOCUMENT_UNREADABLE")
+                        .doesNotContainKey("startFailureParams");
+                var historical = port.observations().read("flow").orElseThrow().failure();
+                assertThat(historical.code()).isEqualTo(failure.code());
+                assertThat(historical.params()).isEmpty();
+            }
+        });
+    }
+
     @Test void reopeningClientsCannotReissueAnAuthorityWhoseCacheHistoryIsAbsent() {
         withFixture(f -> {
             var issued = f.configuration.preparations().issueFirstCreate(f.scope, f.node);
@@ -618,6 +665,72 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void deletionAdmissionFencesTheExactStoppedIntentInsideConfig(boolean newerPurge) {
+        withFixture(f -> {
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var initial=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(f.scope,initial.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,initial.desired().revision()))).isTrue();
+            var expected=f.configuration.intents().load("flow").orElseThrow();
+            var request=new io.tapstate.spi.store.PipelineRetirementRequest("exact-stop-delete",f.scope,CanonicalHash.of(pipeline),Optional.empty());
+            if (newerPurge) {
+                assertThat(f.configuration.intents().compareAndSet(f.scope,expected.intentRevision(),
+                        new DesiredState("flow",PipelineState.STOPPED,expected.desired().revision(),true))).isTrue();
+                var accepted=f.configuration.intents().load("flow").orElseThrow();
+                assertCode(() -> f.configuration.retirements().begin(request,expected),IoError.PIPELINE_INTENT_FENCED);
+                assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);
+                assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase())
+                        .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE);
+                assertThat(f.configuration.intents().load("flow")).contains(accepted);
+            } else {
+                assertThat(f.configuration.retirements().begin(request,expected).request()).isEqualTo(request);
+                assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase())
+                        .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
+            }
+        });
+    }
+
+    @Test void anExpiredNodeRejectsTheActualCacheReceiptBeforeConnectorRelease() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);
+            var run=f.cache.workloadClaims(f.business()).readPipeline(f.scope).orElseThrow().claim();
+            var store=f.configuration.requiredNotes();
+            var token=store.initialize(io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                    new io.tapstate.core.model.PipelineNode("flow","source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1));
+            store.prepareOrigin(token,io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture("fixture","c".repeat(64),Map.of()));
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new io.tapstate.spi.store.PipelineRetirementRequest("expired-receipt",f.scope,CanonicalHash.of(pipeline),
+                    Optional.of(new io.tapstate.spi.store.PipelineRetirementRequest.CacheOriginal(WorkloadClaimFence.from(run),0)));
+            var actual=f.cache.pipelineRetirements(f.business(),ACTIVE);
+            var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.PipelineCacheRetirements.class,
+                    org.mockito.AdditionalAnswers.delegatesTo(actual));
+            org.mockito.Mockito.doAnswer(call -> {
+                var receipt=actual.retire(call.getArgument(0),call.getArgument(1),call.getArgument(2));
+                f.cacheDatabase.getCollection("workload_claims").updateOne(
+                        new Document("_id",new Document("clusterId","cluster-a").append("resourceType","NODE_SESSION").append("resourceId",OWNER.nodeId())),
+                        new Document("$set",new Document("leaseUntil",new java.util.Date(0))));
+                return receipt;
+            }).when(boundary).retire(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+            var releases=new java.util.concurrent.atomic.AtomicInteger();
+            var notes=new PipelinePrivateNoteRetirement(store,f.configuration.rebuilds(),(retirement,config,purpose,cluster,guard) -> {
+                releases.incrementAndGet(); return Optional.empty();
+            });
+            var coordinator=new PipelineDeletionCoordinator(f.configuration.retirements(),boundary,f.cache.srs(f.business(),ACTIVE).consumers(),notes,
+                    () -> f.node,ACTIVE,(original,manifest) -> new PipelineDeletionCoordinator.Isolated(original.cache(),ACTIVE,ACTIVE,
+                            receipt -> f.cache.requireCurrentPipelineRetirement(receipt,f.node)));
+
+            assertCode(() -> coordinator.delete(request,Optional.empty()),IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(releases).hasValue(0);
+            assertThat(f.claim()).containsKey("pipelineRetirement");
+            assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);
+            assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase())
+                    .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
+            assertThat(store.retirement(token,request.operationId()).completed()).isFalse();
+        });
+    }
+
     @Test void deletionKeepsOriginalIdentityAndBlocksReuseUntilReleaseIsConfirmed() {
         withFixture(f -> {
             f.preparer(f.configuration,f.cache).prepare(f.scope);var claims=f.cache.workloadClaims(f.business());
@@ -638,7 +751,8 @@ class PipelineFirstStatePreparerIT {
                 return failed.get()?Optional.of(new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null)):Optional.empty();
             });
             var coordinator=new PipelineDeletionCoordinator(f.configuration.retirements(),f.cache.pipelineRetirements(f.business(),ACTIVE),f.cache.srs(f.business(),ACTIVE).consumers(),notes,
-                    () -> f.node,ACTIVE,(original,manifest) -> new PipelineDeletionCoordinator.Isolated(original.cache(),ACTIVE,ACTIVE));
+                    () -> f.node,ACTIVE,(original,manifest) -> new PipelineDeletionCoordinator.Isolated(original.cache(),ACTIVE,ACTIVE,
+                            receipt -> f.cache.requireCurrentPipelineRetirement(receipt,f.node)));
             assertThatThrownBy(() -> coordinator.delete(request,Optional.empty())).isInstanceOf(TapstateException.class);
             assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase()).isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
             var beforeLateRelease=f.claim();

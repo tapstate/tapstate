@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -47,6 +48,12 @@ public final class RateSampler {
     private final Duration interval;
     private record Cadence(Object scope, Instant at) {}
     private final Map<String, Cadence> lastSampledAt = new ConcurrentHashMap<>();
+    private record Pending(Object scope, RateSample sample, RateHistoryStore destination, long epoch) {}
+    private static final class Flight {
+        private Pending pending;
+        private long epoch;
+    }
+    private final Map<String, Flight> appending = new java.util.HashMap<>();
 
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
@@ -67,35 +74,99 @@ public final class RateSampler {
     /** The original Pipeline scope owns both the cadence and this invocation's destination. */
     public void offer(Observation observation, io.tapstate.spi.store.PipelineIntentScope scope, RateHistoryStore destination) {
         Objects.requireNonNull(observation, "observation"); Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(destination, "destination");
-        if (!scope.pipelineId().equals(observation.pipelineId())) throw new io.tapstate.core.common.TapstateException(
-                io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        requirePipeline(observation.pipelineId(), scope);
         offer(scope, observation, destination);
     }
 
-    private void offer(Object key, Observation observation, RateHistoryStore destination) {
-        if (observation.observedAt() == null) {
-            return;
-        }
-        RateSample sample = sampleOf(observation);
-        if (sample == null) {
-            return;
-        }
-        Cadence last = lastSampledAt.get(observation.pipelineId());
-        if (last != null && key.equals(last.scope()) && observation.observedAt().isBefore(last.at().plus(interval))) {
-            return;
-        }
-        destination.append(sample);
-        lastSampledAt.put(observation.pipelineId(), new Cadence(key, observation.observedAt()));
+    /** Offers a sample prepared from an already published observation. */
+    public void offerPrepared(RateSample sample, io.tapstate.spi.store.PipelineIntentScope scope, RateHistoryStore destination) {
+        requirePipeline(sample.pipelineId(), scope);
+        enqueue(scope, sample, destination);
     }
 
-    /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */
+    private static void requirePipeline(String pipeline, io.tapstate.spi.store.PipelineIntentScope scope) {
+        if (!scope.pipelineId().equals(pipeline)) throw new io.tapstate.core.common.TapstateException(
+                io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
+    private void offer(Object key, Observation observation, RateHistoryStore destination) {
+        RateSample sample = sampleOf(observation);
+        if (sample != null) enqueue(key, sample, destination);
+    }
+
+    private void enqueue(Object key, RateSample sample, RateHistoryStore destination) {
+        String pipelineId = sample.pipelineId();
+        Flight flight;
+        Pending next;
+        synchronized (appending) {
+            flight = appending.get(pipelineId);
+            if (flight != null) {
+                var pending = flight.pending;
+                if (pending == null || !sample.observedAt().isBefore(pending.sample().observedAt()))
+                    flight.pending = new Pending(key, sample, destination, flight.epoch);
+                return;
+            }
+            flight = new Flight();
+            appending.put(pipelineId, flight);
+            next = new Pending(key, sample, destination, flight.epoch);
+        }
+        drain(next, flight);
+    }
+
+    private void drain(Pending next, Flight flight) {
+        String pipelineId = next.sample().pipelineId();
+        Throwable failure = null;
+        while (next != null) {
+            try { append(next, flight); }
+            catch (RuntimeException | Error problem) {
+                if (failure == null) failure = problem;
+                else if (problem instanceof Error && !(failure instanceof Error)) {
+                    problem.addSuppressed(failure);
+                    failure = problem;
+                } else if (failure != problem) failure.addSuppressed(problem);
+            }
+            synchronized (appending) {
+                next = flight.pending;
+                flight.pending = null;
+                if (next == null) appending.remove(pipelineId, flight);
+            }
+        }
+        if (failure instanceof Error fatal) throw fatal;
+        if (failure instanceof RuntimeException refused) throw refused;
+    }
+
+    private void append(Pending offer, Flight flight) {
+        var sample = offer.sample();
+        var pipelineId = sample.pipelineId();
+        synchronized (appending) {
+            if (flight.epoch != offer.epoch()) return;
+            var last = lastSampledAt.get(pipelineId);
+            if (last != null && offer.scope().equals(last.scope()) && sample.observedAt().isBefore(last.at().plus(interval)))
+                return;
+        }
+        offer.destination().append(sample);
+        synchronized (appending) {
+            if (flight.epoch == offer.epoch()) lastSampledAt.put(pipelineId, new Cadence(offer.scope(), sample.observedAt()));
+        }
+    }
+
+    /** Drops cadence and pending work for deleted Pipelines without waiting for their active append. */
     public void forgetPipelinesOutside(Collection<String> live) {
-        lastSampledAt.keySet().retainAll(live);
+        var kept = Set.copyOf(live);
+        synchronized (appending) {
+            lastSampledAt.keySet().retainAll(kept);
+            appending.forEach((id, flight) -> {
+                if (!kept.contains(id)) {
+                    flight.pending = null;
+                    flight.epoch++;
+                }
+            });
+        }
     }
 
     /** The sample {@code observation} yields, or {@code null} when it carries nothing to draw a line from. */
-    static RateSample sampleOf(Observation observation) {
-        if (observation.state() == PipelineState.COMPLETED) {
+    public static RateSample sampleOf(Observation observation) {
+        if (observation.observedAt() == null || observation.state() == PipelineState.COMPLETED) {
             return null;
         }
         Map<String, Long> counters = new LinkedHashMap<>();

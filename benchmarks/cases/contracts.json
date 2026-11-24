@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "profiles": {
+    "small": {"version": 1, "fields": 10, "logical_row_bytes": 256, "snapshot_rows_trial_target": 5000000},
+    "standard": {"version": 1, "fields": 20, "logical_row_bytes": 1024, "snapshot_rows_trial_target": 2000000},
+    "wide": {"version": 1, "fields": 50, "logical_row_bytes": 4096, "snapshot_rows_trial_target": 500000},
+    "large": {"version": 1, "fields": 100, "logical_row_bytes": 16384, "snapshot_rows_trial_target": 200000}
+  },
+  "generation": {
+    "version": 1,
+    "seed": 42,
+    "logical_row_size_tolerance_percent": 5,
+    "logical_encoding": {
+      "format": "compact UTF-8 JSON",
+      "field_order": "recipe field order",
+      "integer": "base 10",
+      "decimal": "fixed two decimal places",
+      "datetime": "UTC with milliseconds",
+      "binary": "standard Base64 without line breaks",
+      "arrays": "encode constituents recursively",
+      "exclude": ["event envelope", "network overhead", "JVM object overhead"],
+      "report_separately": ["BSON bytes", "observed network bytes", "CDC before bytes", "CDC after bytes", "CDC event bytes"]
+    },
+    "scalar_fields_percent": {"string": 50, "integer": 20, "decimal": 10, "boolean": 10, "datetime": 10},
+    "keys": "Use distinct consecutive integer primary keys; count keys among integer fields. Generate relationship keys from each scenario's relationship.",
+    "nullable_field_values_percent": 5,
+    "non_nullable_fields": ["primary keys", "relationship keys", "scenario-required fields"],
+    "strings": {"alphabet": "ASCII letters and digits", "base_length_status": "pending-calibration", "uniform_length_percent": [50, 150], "rounding": "lower bound ceiling; upper bound floor"},
+    "integers": {"uniform_inclusive": [-1000000, 1000000]},
+    "decimals": {"uniform_inclusive_cents": [-100000000, 100000000], "scale": 2},
+    "boolean_true_percent": 50,
+    "datetime_utc": {"start_inclusive": "2025-01-01T00:00:00.000Z", "end_exclusive": "2026-01-01T00:00:00.000Z"},
+    "size_statistics": ["sample count", "minimum", "mean", "p95", "maximum"]
+  },
+  "repetition": {
+    "count": 3,
+    "order": "sequential within the batch runner",
+    "reset": "Regenerate equivalent input and history; reset target to the case initial state and initialize independent CDC positions and operator state.",
+    "database_process": "Reuse within the batch by default; record cache and warm-up conditions.",
+    "aggregation": "Keep each raw result and completion status; report medians and variation for eligible repeats."
+  },
+  "environments": {
+    "single-node-op": {"runtime": "single-node on-prem", "mongodb": "shared test replica set with isolated source and target databases"},
+    "single-node-op-dedicated-target": {"runtime": "single-node on-prem", "mongodb": "independent target instance for both paired arms when target-write isolation requires it"}
+  },
+  "incremental": {
+    "initial_mutable_keys_trial_target": 300000,
+    "mix_percent": {"insert": 80, "update": 15, "delete": 5},
+    "default_groups_per_hundred": {"insert_only": 65, "insert_then_update": 15, "independent_delete": 5},
+    "rounding": "Floor each operation quota and allocate the remaining units by descending fractional remainder, with insert, update, delete as the tie order.",
+    "selection": {
+      "insert": "Take unique keys from a range disjoint from the initial keys.",
+      "update": "Pair with inserts first, after the insert on the same stream. Pick excess update keys uniformly without replacement from eligible initial keys.",
+      "delete": "Pick uniformly without replacement from initial keys, excluding keys selected for an independent update.",
+      "order": "Seed the interleaving, preserve each insert-update dependency, keep warm-up keys separate, and preserve per-stream boundaries."
+    },
+    "update_mutable_fields_percent": 10,
+    "update_rounding": "Round to nearest with ties up and a minimum of one field.",
+    "update": "Keep primary and relationship keys and required filter fields unchanged. Make actual value changes, including an observable output field when propagation is expected.",
+    "allow_manual_mix_override": true,
+    "mongo_source": {"pre_images": true, "write_concern": "majority"}
+  },
+  "measurement": {
+    "snapshot": {
+      "start": "Start the isolated snapshot after input and environment preparation.",
+      "finish": "Both all inputs are consumed and all expected target writes or consumptions are acknowledged. Take the later boundary.",
+      "unit": "source rows and case-defined target units",
+      "metrics": ["elapsed time", "input rows and logical bytes", "output units and logical bytes", "throughput"],
+      "trial": {"connectivity_rows": 10000, "intermediate_rows": 100000},
+      "separate": ["preparation", "warm-up", "status publication delay", "target readback"]
+    },
+    "live-latency": {
+      "start": "Attribute each eligible unit to the source connector event time in the half-open scoring window.",
+      "finish": "Use the actual acknowledgements for all expected target writes of that unit, including in-window units completed during bounded drain.",
+      "unit": "case-defined source event or acknowledged group",
+      "metrics": ["p50", "p95", "p99", "valid sample count", "confirmation coverage", "actual injection and acknowledgement rates", "queue and backlog"],
+      "trial": {
+        "smoke": {"events_per_second": 10, "warmup_seconds": 30, "measurement_seconds": 60, "max_drain_seconds": 30},
+        "candidate": {"events_per_second": 100, "warmup_seconds": 30, "measurement_seconds": 300, "max_drain_seconds": 60, "target_events": 30000},
+        "p99": {"minimum_valid_samples": 10000, "minimum_confirmation_coverage_percent": 99.9}
+      },
+      "separate": ["intended no-output events", "unconfirmed or uncorrelated units", "out-of-window events", "warm-up", "readback"]
+    },
+    "backlog-throughput": {
+      "start": "Start isolated catch-up after prewriting the fixed batch and recording each input boundary.",
+      "finish": "Take the later time of all streams reaching their final positions and all expected writes obtaining target acknowledgement.",
+      "unit": "actual source events and case-defined target units",
+      "metrics": ["elapsed time", "input events and bytes per second", "output units and bytes per second"],
+      "trial": {"staged_events": [30000, 300000], "batch_events_trial_target": 300000},
+      "separate": ["initial state preparation", "prewriting", "target readback", "historical event age"]
+    }
+  },
+  "memory": {
+    "phases": ["load", "warm-up", "measurement", "drain", "idle"],
+    "scopes": ["Tapstate JVM or container", "generator", "MongoDB instance"],
+    "metrics": ["RSS", "heap", "GC", "quota headroom", "queue high water", "exit and OOM evidence"],
+    "sampling_interval_and_budgets": "pending-calibration"
+  },
+  "memory_profile": {
+    "version": 1,
+    "op_rss_sample_interval_ms": 500,
+    "mongo_sample_interval_seconds": 2,
+    "minimum_samples_per_window": 2,
+    "minimum_coverage_fraction": 0.5,
+    "idle_seconds": 2,
+    "steady_windows": 3,
+    "op_heap_limit_mib": 768,
+    "formal_limits_status": "pending-calibration"
+  },
+  "eligibility": {
+    "calibration_status": "pending",
+    "unfrozen": ["formal scale", "concurrency", "hard timeout", "cache and warm-up conditions", "resource quotas", "applicable memory windows"],
+    "timeout_or_missing_boundary": "Keep partial evidence and mark the sample incomplete. Check target contents independently of measurement eligibility.",
+    "comparison": "Bind runtime, code, connector lock, machine, configuration, case version and effective recipe. Keep unsupported byte, resource and timing readings missing."
+  }
+}

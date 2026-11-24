@@ -38,8 +38,22 @@ final class PipelineLogAppender extends AppenderBase<ILoggingEvent> {
         if (pipelineId == null || pipelineId.isBlank()) {
             return;
         }
-        sink.append(pipelineId,
-                new LogLine(event.getTimeStamp(), event.getLevel().toString(), redactor.redactLog(render(event)), diagnostic(event, redactor)));
+        var line = new LogLine(event.getTimeStamp(), event.getLevel().toString(),
+                redactor.redactLog(render(event)), diagnostic(event, redactor));
+        String generation = event.getMDCPropertyMap().get(PipelineAttribution.STATE_GENERATION_MDC_KEY);
+        if (generation == null) {
+            sink.append(pipelineId, line);
+            return;
+        }
+        long original;
+        try {
+            original = Long.parseLong(generation);
+        } catch (NumberFormatException invalid) {
+            return;
+        }
+        if (original > 0) {
+            sink.append(pipelineId, original, line);
+        }
     }
 
     static java.util.Map<String, Object> diagnostic(ILoggingEvent event, SecretRedactor redactor) {

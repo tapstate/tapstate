@@ -163,6 +163,13 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
     }
     private final Set<PendingPreflight> pendingPreflights;
+    private java.util.function.Predicate<Throwable> deferredPreflightClose = failure -> false;
+
+    /** The original host can take responsibility for closing a specifically identified failed opening. */
+    public PdkCapturePort withDeferredPreflightClose(java.util.function.Predicate<Throwable> deferred) {
+        deferredPreflightClose = Objects.requireNonNull(deferred, "deferred");
+        return this;
+    }
 
     private java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure = ignored -> {};
 
@@ -229,7 +236,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     public PdkCapturePort withSnapshotPreparation(SnapshotPreparer prepare) {
         var configured = new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
                 nanoClock, releaseTimeout, noteScopes, Objects.requireNonNull(prepare, "prepare"), streamPreparer, pendingPreflights);
-        configured.withOperationObserver(operationObserver).withOpeningFailure(openingFailure);
+        configured.withOperationObserver(operationObserver).withOpeningFailure(openingFailure)
+                .withDeferredPreflightClose(deferredPreflightClose);
         return configured;
     }
 
@@ -238,7 +246,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     public PdkCapturePort withStreamPreparation(StreamPreparer prepare) {
         var configured = new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
                 nanoClock, releaseTimeout, noteScopes, snapshotPreparer, Objects.requireNonNull(prepare, "prepare"), pendingPreflights);
-        configured.withOperationObserver(operationObserver).withOpeningFailure(openingFailure);
+        configured.withOperationObserver(operationObserver).withOpeningFailure(openingFailure)
+                .withDeferredPreflightClose(deferredPreflightClose);
         return configured;
     }
 
@@ -621,7 +630,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         } catch (ExecutionException failure) {
             delivery.cancel();
             Throwable cause = failure.getCause();
-            abortPreflightAfter(cause, connector, thread, delivery);
+            if (deferredPreflightClose.test(cause)) pendingPreflights.add(new PendingPreflight(connector, thread, delivery));
+            else abortPreflightAfter(cause, connector, thread, delivery);
             if (cause instanceof RuntimeException runtime) {
                 throw runtime;
             }

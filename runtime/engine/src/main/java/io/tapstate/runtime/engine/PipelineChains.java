@@ -24,6 +24,7 @@ final class PipelineChains {
     private final Map<String, Map<String, Integer>> pathsByVertex = new LinkedHashMap<>();
     // Per vertex: the chains whose own rows reach it, rather than rows a nest or a join assembled from them.
     private final Map<String, Set<String>> unassembledByVertex = new LinkedHashMap<>();
+    private final Map<String, Map<String, List<String>>> assembledOutputsByVertex = new LinkedHashMap<>();
 
     /** Records that the vertex keyed {@code vertexKey} reads {@code chain} and nothing else. */
     void source(String vertexKey, String chain) {
@@ -37,6 +38,7 @@ final class PipelineChains {
         byVertex.put(vertexKey, union(upstreamKeys));
         pathsByVertex.put(vertexKey, paths(upstreamKeys));
         unassembledByVertex.put(vertexKey, unassembled(upstreamKeys));
+        assembledOutputsByVertex.put(vertexKey, assembledOutputs(upstreamKeys));
     }
 
     /**
@@ -45,9 +47,20 @@ final class PipelineChains {
      * the chains' sources read.
      */
     void assembled(String vertexKey, List<String> upstreamKeys) {
-        byVertex.put(vertexKey, union(upstreamKeys));
+        List<String> inputs = union(upstreamKeys);
+        byVertex.put(vertexKey, inputs);
         pathsByVertex.put(vertexKey, paths(upstreamKeys));
         unassembledByVertex.put(vertexKey, Set.of());
+        assembledOutputsByVertex.put(vertexKey, Map.of(vertexKey, inputs));
+    }
+
+    /** Which source snapshots must land before each assembled output can be declared delivered. */
+    Map<String, List<String>> assembledOutputs(List<String> upstreamKeys) {
+        Map<String, List<String>> outputs = new LinkedHashMap<>();
+        for (String key : upstreamKeys) {
+            outputs.putAll(assembledOutputsByVertex.getOrDefault(key, Map.of()));
+        }
+        return Map.copyOf(outputs);
     }
 
     /**

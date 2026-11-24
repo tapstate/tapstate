@@ -6,6 +6,7 @@ import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.IoError;
 import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
@@ -105,6 +106,53 @@ class ControlPlaneTest {
                     .isInstanceOf(AssertionError.class).hasMessageContaining("503");
             assertThat(fixture.control.storageStatusDuringStartup().orElseThrow().get("businessPhase"))
                     .isEqualTo("READY");
+        }
+    }
+
+    @Test
+    void logLifetimeDeletionRetriesTheCurrentClaimFenceForTheSameArtifact() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            var deletes = new AtomicInteger();
+            var reads = new AtomicInteger();
+            String hash = "original-hash";
+            fixture.server.createContext("/api/artifacts/" + PIPELINE, exchange -> {
+                boolean deleting = exchange.getRequestMethod().equals("DELETE");
+                if (deleting && deletes.incrementAndGet() > 1) {
+                    exchange.sendResponseHeaders(204, -1);
+                    exchange.close();
+                    return;
+                }
+                if (!deleting) reads.incrementAndGet();
+                String body = deleting ? JsonWriter.write(Map.of("code", IoError.WORKLOAD_CLAIM_FENCED.code(),
+                        "params", Map.of(), "message", "rendered"))
+                        : JsonWriter.write(Map.of("id", PIPELINE, "kind", "pipeline",
+                                "canonicalForm", "fixture", "contentHash", hash));
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(deleting ? 500 : 200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+
+            PipelineLogLifetimeIT.deleteAtRest(fixture.control, PIPELINE, hash);
+            assertThat(deletes).hasValue(2);
+            assertThat(reads).hasValue(2);
+        }
+    }
+
+    @Test
+    void logLifetimeDeletionDoesNotRetryAnUnrelatedErrorMentioningTheClaimFence() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            var calls = new AtomicInteger();
+            fixture.server.createContext("/api/artifacts/" + PIPELINE, exchange -> {
+                calls.incrementAndGet();
+                byte[] bytes = JsonWriter.write(Map.of("code", IoError.STORE_UNAVAILABLE.code(),
+                        "message", "Earlier refusal: io.workload-claim-fenced / " + IoError.WORKLOAD_CLAIM_FENCED.code()))
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(500, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            assertThatThrownBy(() -> PipelineLogLifetimeIT.deleteAtRest(fixture.control, PIPELINE, "original-hash"))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining(IoError.STORE_UNAVAILABLE.code());
+            assertThat(calls).hasValue(1);
         }
     }
 

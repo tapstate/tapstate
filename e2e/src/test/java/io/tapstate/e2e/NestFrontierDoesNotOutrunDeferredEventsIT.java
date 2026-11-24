@@ -16,6 +16,7 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -203,6 +204,7 @@ class NestFrontierDoesNotOutrunDeferredEventsIT {
 
                 // The restart. What comes back has never seen this pipeline and reads the same store; the
                 // source resumes above the deferred change, so nothing will replay it.
+                Instant restartStartedAt = Instant.now();
                 try (ServerHandle restarted = tier.launch(storage)) {
                     ControlPlane control = new ControlPlane(restarted.baseUrl());
                     // The restarted server reopens the same prepared installation.
@@ -250,9 +252,14 @@ class NestFrontierDoesNotOutrunDeferredEventsIT {
                     assertThat(element.get("sku"))
                             .as("the payload the held change carried, not a shell rebuilt from its key")
                             .isEqualTo(DEFERRED_SKU);
-                    assertThat(control.errorCount(pipelineId))
+                    long errors = Await.answered(
+                            "an error count for pipeline " + pipelineId + " observed after restart at " + restartStartedAt,
+                            () -> control.observedAt(pipelineId)
+                                    .filter(observedAt -> observedAt.isAfter(restartStartedAt))
+                                    .flatMap(observedAt -> control.errorCount(pipelineId)));
+                    assertThat(errors)
                             .as("nothing here is an error: the run held a change, restarted, and placed it")
-                            .contains(0L);
+                            .isZero();
                 }
             }
         }

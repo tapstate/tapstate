@@ -6,6 +6,7 @@ import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.SinkPreparationStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.core.common.TapstateException;
 import java.util.Map;
 import java.util.Objects;
@@ -23,21 +24,38 @@ public final class PdkSinkPreparations {
         private SharedSinkConnectors.NoteIdentity notes;
     }
     private final OpeningFacts opening;
+    private final WorkloadClaimFence execution;
     public PdkSinkPreparations(SinkPreparationStore store,PipelineIntentScope scope,PipelineNode node,
             PipelineNode.Purpose purpose,OnFullLoad policy,boolean fullLoad) {
         this(store, scope, node, purpose, policy, fullLoad, new OpeningFacts());
     }
     public PdkSinkPreparations(SinkPreparationStore store,PipelineIntentScope scope,PipelineNode node,
             PipelineNode.Purpose purpose,OnFullLoad policy,boolean fullLoad,OpeningFacts opening) {
+        this(store, scope, node, purpose, policy, fullLoad, opening, null);
+    }
+
+    private PdkSinkPreparations(SinkPreparationStore store, PipelineIntentScope scope, PipelineNode node,
+            PipelineNode.Purpose purpose, OnFullLoad policy, boolean fullLoad, OpeningFacts opening,
+            WorkloadClaimFence execution) {
         this.store=Objects.requireNonNull(store,"store");this.scope=Objects.requireNonNull(scope,"scope");
         this.node=Objects.requireNonNull(node,"node");this.purpose=Objects.requireNonNull(purpose,"purpose");
         this.policy=Objects.requireNonNull(policy,"policy");this.fullLoad=fullLoad;
         this.opening=Objects.requireNonNull(opening,"opening");
+        this.execution = execution;
         if (!scope.pipelineId().equals(node.pipelineId())) throw new IllegalArgumentException("sink node belongs to another Pipeline");
     }
-    void requireClaim(io.tapstate.spi.store.WorkloadClaimFence original) {
+    PdkSinkPreparations forExecution(WorkloadClaimFence original) {
         if(original.key().type()!=io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION || original.executionGeneration()<1
                 || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId()))throw fenced();
+        if (execution != null) {
+            if (!execution.equals(original)) throw fenced();
+            return this;
+        }
+        return new PdkSinkPreparations(store, scope, node, purpose, policy, fullLoad, opening, original);
+    }
+
+    boolean canAwait(SinkPreparationStore.Snapshot pending) {
+        return execution != null && execution.equals(pending.originalClaim());
     }
     void requireInputs(PipelineNode actualNode,PipelineNode.Purpose actualPurpose,OnFullLoad actualPolicy,boolean actualFullLoad) {
         if(!node.equals(actualNode) || purpose!=actualPurpose || policy!=actualPolicy || fullLoad!=actualFullLoad)throw fenced();

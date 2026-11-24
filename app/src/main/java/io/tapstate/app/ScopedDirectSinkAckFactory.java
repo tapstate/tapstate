@@ -43,7 +43,7 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
         });
     }
     @Override public SinkAck resolve(HazelcastInstance member) {
-        var bound = bindings(member); return new Writer(bound,null);
+        var bound = bindings(member); return new Writer(bound,null,CheckpointProgressWrites.of(member));
     }
     @Override public LoadLandings loadLandings(HazelcastInstance member) {
         var bound = bindings(member);
@@ -59,6 +59,18 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
                         .filter(landed -> WriterFrontier.passedLoad(landed,snapshot)).isEmpty();
             }).toList();
         };
+    }
+
+    @Override
+    public Set<String> completedSnapshotInputs(HazelcastInstance member, Set<String> streams) {
+        var read = new HashMap<DirectSourceRun, DirectChannelProgress>();
+        var completed = new LinkedHashSet<String>();
+        for (String stream : streams) {
+            var source = source(stream);
+            var progress = read.computeIfAbsent(source.run(), run -> bind(member, run).progress());
+            if (progress.cursor().snapshotCompletedTables().contains(source.table())) completed.add(stream);
+        }
+        return Set.copyOf(completed);
     }
     private Map<DirectSourceRun,Bound> bindings(HazelcastInstance member) {
         var bound = new HashMap<DirectSourceRun,Bound>();
@@ -82,9 +94,13 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
         private static final long serialVersionUID = 1L;
         private final transient Map<DirectSourceRun,Bound> bound;
         private final String writer;
-        Writer(Map<DirectSourceRun,Bound> bound,String writer) { this.bound = bound; this.writer = writer; }
+        private final transient CheckpointProgressWrites progressWrites;
+        private final transient CheckpointWriteAcks receipts = new CheckpointWriteAcks();
+        Writer(Map<DirectSourceRun,Bound> bound,String writer,CheckpointProgressWrites progressWrites) {
+            this.bound = bound; this.writer = writer; this.progressWrites = progressWrites;
+        }
         @Override public SinkAck forWriter(String writer) {
-            if (writer == null || writer.isBlank()) throw new IllegalArgumentException("blank private writer"); return new Writer(bound,writer);
+            if (writer == null || writer.isBlank()) throw new IllegalArgumentException("blank private writer"); return new Writer(bound,writer,progressWrites);
         }
         @Override public void advance(String stream,ChainPosition point) { advance(stream,point,null); }
         @Override public void advance(String stream,ChainPosition point,WorkloadClaimFence claim) {
@@ -94,8 +110,25 @@ final class ScopedDirectSinkAckFactory implements SinkAckFactory {
         @Override public void bounded(String stream,SourceOrder through,WorkloadClaimFence claim) { report(stream,new WriterProgress(through,null),claim); }
         private void report(String stream,WriterProgress progress,WorkloadClaimFence claim) {
             if (writer == null) throw new IllegalStateException("a private acknowledgement must name its original writer");
-            var source = source(stream); var run = source.run(); var handle = bound.get(run); handle.requireClaim(claim);
-            if (!handle.store().advanceWriter(run.context(),run.epoch(),runId,source.table(),writer,progress,run.pipelineClaim())) throw run.refused();
+            var source = source(stream); var run = source.run(); var handle = bound.get(run);
+            if (progressWrites == null) {
+                handle.requireClaim(claim);
+                if (!handle.store().advanceWriter(run.context(),run.epoch(),runId,source.table(),writer,progress,run.pipelineClaim())) throw run.refused();
+                return;
+            }
+            receipts.check();
+            if (claim != null && !run.pipelineClaim().equals(claim)) throw run.refused();
+            if (progress.durableThrough().seq() == SourceOrder.SNAPSHOT_SEQ) {
+                receipts.await();
+                if (!progressWrites.writer(handle, claim, runId, source.table(), writer, progress)) throw run.refused();
+            } else {
+                receipts.track(progressWrites.offerWriter(handle, claim, runId, source.table(), writer, progress), run::refused);
+            }
         }
+        @Override public void flush(boolean complete) {
+            if (complete) receipts.await();
+            else receipts.check();
+        }
+        @Override public void flushOnClose() { CheckpointWriteAcks.close(() -> flush(true)); }
     }
 }
