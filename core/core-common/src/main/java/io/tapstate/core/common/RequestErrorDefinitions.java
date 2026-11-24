@@ -77,6 +77,9 @@ public final class RequestErrorDefinitions {
     public static final ProductErrorDefinition AI_MANAGED_PROVIDER_INPUT_LIMIT =
             DEFINITIONS.define(33, Severity.ERROR, Set.of());
 
+    public static final ProductErrorDefinition RETRY_SETTINGS_REVISION_CONFLICT =
+            DEFINITIONS.define(34, Severity.ERROR, Set.of());
+
     private RequestErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

@@ -468,7 +468,13 @@ public final class ControlOperations {
     public static final Operation ALERT_TEST_RESULT = new Operation("alert.test-result", Scope.ADMIN, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
     public static final Operation ALERT_RETRY = new Operation("alert.retry", Scope.ADMIN, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
 
+    public static final Operation RETRY_SETTINGS_GET = new Operation("retry-settings.get", Scope.ADMIN, false, null,
+            "Read the cluster retry settings and revision.", REST_ONLY);
+    public static final Operation RETRY_SETTINGS_REPLACE = new Operation("retry-settings.replace", Scope.ADMIN, true, null,
+            "Replace the cluster retry settings at the supplied revision.", REST_ONLY);
+
     private static final List<Operation> ALL = List.of(
+            RETRY_SETTINGS_GET, RETRY_SETTINGS_REPLACE,
             VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP, VALIDATION_HISTORY, VALIDATION_REPORT, VALIDATION_ROOTS, VALIDATION_ROOT, VALIDATION_SCHEDULE_DISABLE,
             ALERT_RULE_PREVIEW, ALERT_ROUTE_PREVIEW, ALERT_RESOURCES, ALERT_CATALOG, ALERT_CENTER, ALERT_DETAIL, ALERT_DELIVERIES, ALERT_HEALTH, ALERT_CONFIGURATION_LIST, ALERT_CONFIGURATION_SAVE, ALERT_CONFIGURATION_RETIRE, ALERT_PREVIEW, ALERT_TEST, ALERT_TEST_RESULT, ALERT_RETRY,
             AI_PROVIDER_GET,

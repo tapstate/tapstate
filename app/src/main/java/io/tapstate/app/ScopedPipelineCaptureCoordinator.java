@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.core.common.FailureFact;
+import io.tapstate.core.common.RetryPolicy;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
@@ -77,11 +79,21 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure){
         CapturePort port=ports.open(notes,config,guard,snapshot,stream);
         if (port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk) {
-            pdk.withOpeningFailure(openingFailure);
+            pdk.withOpeningFailure(openingFailure).withReadRetries(retryPolicies);
             if (identity != null) pdk.withOperationObserver(operations.open(identity,domain,guard,local));
         }
         return port;
     }
+    private Function<String, RetryPolicy> retryPolicies = operation -> RetrySettingsStore.DEFAULT.disabled();
+    private record DirectRetryKey(PipelineIntentScope scope, String source) {}
+    private record DirectRetry(ExecutionFence execution, CaptureReadRetry retry) {}
+    private final Map<DirectRetryKey, DirectRetry> directRetries = new ConcurrentHashMap<>();
+
+    ScopedPipelineCaptureCoordinator withReadRetries(Function<String, RetryPolicy> policies) {
+        retryPolicies = Objects.requireNonNull(policies);
+        return this;
+    }
+
     private final Map<ExecutionFence,Session> sessions=new LinkedHashMap<>();
     // Retiring a run can check its capture while holding a CACHE transaction, without waiting on maintenance.
     private final Set<ExecutionFence> startingOrActiveCaptures = ConcurrentHashMap.newKeySet();
@@ -502,6 +514,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                         ? ReadMode.SNAPSHOT_AND_CDC
                         : pipeline.settings().readMode();
         var session = new Session(run.original, inputs, execution.clock().instant(), mode, run.openingFailure);
+        session.replaysKeyedCopies = replayableKeyedCopy(pipeline);
         if (connectorExecutions != null)
             session.selection = connectorExecutions.selection(run.original.scope(), () -> requirePipeline(run.original));
         sessions.put(run.original, session);
@@ -1114,6 +1127,74 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         health.failure().ifPresent(ScopedPipelineCaptureCoordinator::throwFailure);
     }
 
+    private static boolean replayableKeyedCopy(PipelineResource pipeline) {
+        return (pipeline.transforms() == null || pipeline.transforms().isEmpty())
+                && pipeline.view() == null
+                && pipeline.serve() instanceof ServeBlock.Inline serve
+                && (serve.push() == null || serve.push().isEmpty())
+                && serve.sync() != null && !serve.sync().isEmpty()
+                && serve.sync().stream().allMatch(sink -> sink.rename() == null
+                        && sink.writeMode() != io.tapstate.core.model.WriteMode.APPEND);
+    }
+
+    private static CapturePort snapshotReplay(Session session, Source source, CapturePort port) {
+        if (session.replaysKeyedCopies && source.expectedModels != null
+                && port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk) {
+            pdk.withReplayableSnapshotTables(table -> {
+                var model = source.expectedModels.get(table);
+                return model != null && !model.primaryKey().isEmpty();
+            });
+        }
+        return port;
+    }
+
+    private CapturePort directPort(Session session, Source source, CapturePort port) {
+        snapshotReplay(session, source, port);
+        if (session.bounded || !(port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk)) return port;
+        var key = new DirectRetryKey(session.original.scope(), source.id);
+        pdk.withStreamRecovery(failure -> {
+            if (!session.ended.get()) directRetries.compute(key, (ignored, existing) -> {
+                if (session.ended.get() || existing != null
+                        && existing.execution().executionGeneration() > session.original.executionGeneration()) return existing;
+                var episode = existing != null && existing.execution().equals(session.original)
+                        ? existing : new DirectRetry(session.original, new CaptureReadRetry());
+                episode.retry().interrupted(failure);
+                return episode;
+            });
+        }, () -> directRetries.computeIfPresent(key, (ignored, episode) ->
+                    episode.execution().equals(session.original) ? null : episode),
+                () -> {
+                    var episode = directRetries.get(key);
+                    return episode != null && episode.execution().equals(session.original) && episode.retry().inProgress();
+                });
+        return pdk;
+    }
+
+    Optional<CaptureReadRetry> directRetry(ExecutionFence original) {
+        return directRetries.entrySet().stream()
+                .filter(entry -> entry.getValue().execution().equals(original) && entry.getValue().retry().waiting())
+                .sorted(Map.Entry.comparingByKey(java.util.Comparator.comparing(DirectRetryKey::source)))
+                .map(entry -> entry.getValue().retry()).findFirst();
+    }
+
+    boolean hasDirectRetryFor(ExecutionFence original, Throwable failure) {
+        return directRetries.values().stream().anyMatch(episode ->
+                episode.execution().equals(original) && episode.retry().waitingFor(failure));
+    }
+
+    RetryPolicy streamRetryPolicy() {
+        return retryPolicies.apply(RetrySettingsStore.STREAM_READ);
+    }
+
+    void carryDirectRetries(ExecutionFence previous, ExecutionFence replacement) {
+        directRetries.replaceAll((key, value) -> value.execution().equals(previous)
+                ? new DirectRetry(replacement, value.retry()) : value);
+    }
+
+    void clearDirectRetries(PipelineIntentScope scope) {
+        directRetries.keySet().removeIf(key -> key.scope().equals(scope));
+    }
+
     private void startPrivateSource(
             Session session,
             Source source,
@@ -1133,7 +1214,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                             preparation -> {
                                 source.snapshotEpoch = preparation.request().snapshotEpoch();
                                 source.readTables = Set.copyOf(preparation.stillOwed());
-                                return observedPort(source.identity,notes,fixedConfig,source.prepared.captureId()+":snapshot:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),preparation::prepare,null,session.openingFailure::set);
+                                return directPort(session, source, observedPort(source.identity,notes,fixedConfig,
+                                        source.prepared.captureId()+":snapshot:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),
+                                        guard,()->requireSessionLocal(session),preparation::prepare,null,session.openingFailure::set));
                             },
                             output,
                             buffer.capacity(),
@@ -1141,7 +1224,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             source.direct = source.channels.load(source.direct.context());
             direct.put(source.id, DirectSourceRun.of(session.original, source.direct));
         } else {
-            var port = observedPort(source.identity,notes,config,source.prepared.captureId()+":direct:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),null,null,session.openingFailure::set);
+            var port = directPort(session, source, observedPort(source.identity,notes,config,
+                    source.prepared.captureId()+":direct:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),
+                    guard,()->requireSessionLocal(session),null,null,session.openingFailure::set));
             source.run =
                     session.bounded
                             ? runtime.beginSnapshotOnly(config, epoch, port, output, guard)
@@ -1221,7 +1306,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 preparation -> {
                     source.snapshotEpoch = preparation.request().snapshotEpoch();
                     source.readTables = Set.copyOf(preparation.stillOwed());
-                    return observedPort(
+                    return snapshotReplay(session, source, observedPort(
                             source.identity,notes,
                             fixedConfig,
                             source.prepared.captureId()+":snapshot:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),
@@ -1233,7 +1318,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                 requireSnapshotModels(source, actual, comparison);
                                 preparation.prepare(request, seam, actual, comparison);
                             },
-                            null, session.openingFailure::set);
+                            null, session.openingFailure::set));
                 };
         if (source.freshFull == null)
             source.run =
@@ -1299,6 +1384,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private final class Owner {
         final CapturePreparation prepared; final WorkloadClaimFence fence; final WorkloadClaim initial;
+        final CaptureReadRetry retry = new CaptureReadRetry();
         final Set<ExecutionFence> sessions=ConcurrentHashMap.newKeySet(); final AtomicBoolean ended=new AtomicBoolean();
         SourceBindingSnapshot identity;CaptureClaimLease lease;ExecutionFence origin;CaptureConfig config;ConfiguredCaptureRun configured;boolean positionEditsRestricted;
         // The owner operation alone replaces the physical handle; observers may read it during maintenance.
@@ -1387,6 +1473,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         boolean starting = true;
         boolean stopping;
         PipelineConnectorExecutions.Selection selection = PipelineConnectorExecutions.Selection.EMPTY;
+        boolean replaysKeyedCopies;
         final AtomicReference<io.tapstate.core.common.FailureFact> openingFailure;
         Session(ExecutionFence original,PipelinePreparationInputs inputs,Instant began,ReadMode mode,AtomicReference<io.tapstate.core.common.FailureFact> openingFailure) { this.openingFailure=openingFailure; this.original=original;this.inputs=inputs;this.began=began;this.mode=mode;this.bounded=mode==ReadMode.SNAPSHOT_ONLY;this.snapshot=mode!=ReadMode.CDC_ONLY; }
         String label(String source,String table) {
@@ -1594,6 +1681,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     private ConfiguredCaptureRun ensureTail(Owner owner, boolean admitted,
             java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
+        if (owner.retry.waiting()) throw new RingNotOpenYet(new CaptureId(owner.prepared.captureId()));
         return ensureTail(owner, tailStores(owner), admitted, null, openingFailure, true);
     }
 
@@ -1678,7 +1766,12 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         java.util.function.Function<io.tapstate.runtime.srs.SrsCaptureWriter, CapturePort> open = writer -> {
             CapturePort port=ports.open(opening,config,physical.guard,null,actual -> writer.prepare(actual,notes.modelComparison(config,stores.notes(),connectors,physical.guard)));
             if(port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk){
-                pdk.withOpeningFailure(captured::set);
+                pdk.withOpeningFailure(captured::set).withReadRetries(retryPolicies)
+                        .withStreamRecovery(failure -> {
+                            if (owner.physical == physical && physical.live.get()) owner.retry.interrupted(failure);
+                        }, () -> {
+                            if (owner.physical == physical && physical.live.get()) owner.retry.recovered();
+                        }, owner.retry::inProgress);
                 if (lockedStartup) pdk.withDeferredPreflightClose(SrsBaselineModelMismatch.class::isInstance);
                 if (owner.identity != null) {
                     physical.reports=operations.open(owner.identity,owner.prepared.captureId()+":stream",physical::requireReport,physical::requireReportLocal);
@@ -1847,7 +1940,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             var physical = owner.physical;
             var failure = physical == null ? Optional.<io.tapstate.core.common.FailureFact>empty() : physical.failureFact();
             if (failure.isEmpty()) {
-                maintainTail(owner, openingFailure::set);
+                if (owner.retry.waiting()) recoverSharedRead(owner, physical, openingFailure);
+                else maintainTail(owner, openingFailure::set);
                 return;
             }
             var fact = failure.orElseThrow();
@@ -1867,6 +1961,33 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 if (ending != failure) failure.addSuppressed(ending);
                 LOG.warn("Could not retire capture {} after maintenance", owner.prepared.captureId(), failure);
             }
+        }
+    }
+
+    private void recoverSharedRead(Owner owner, Physical physical, AtomicReference<FailureFact> openingFailure) {
+        if (physical != null) {
+            owner.finishCheckpointingForRetirement();
+            physical.close();
+            owner.physical = null;
+        }
+        if (!owner.demand.get() && !needed(owner)) {
+            retireMaintainedOwner(owner);
+            return;
+        }
+        var pending = owner.retry.decision(streamRetryPolicy());
+        if (pending == null) return;
+        if (pending.delay() == null) {
+            markOwnerFailure(owner, pending.failure());
+            retireMaintainedOwner(owner);
+            return;
+        }
+        if (!pending.delay().isZero()) return;
+        owner.retry.attempting();
+        LOG.info("Reopening shared capture {} from its durable checkpoint", owner.prepared.captureId());
+        try {
+            maintainTail(owner, openingFailure::set);
+        } catch (RuntimeException opening) {
+            if (!owner.retry.waiting() || owner.physical != null) throw opening;
         }
     }
 

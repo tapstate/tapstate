@@ -44,5 +44,7 @@
   {"module": "e2e", "class": "io.tapstate.e2e.AHundredTablesShareTheSinksWritersIT"},
   {"module": "e2e", "class": "io.tapstate.e2e.PublishedExamplesIT", "example": "examples/the-snapshot-half-reaches-the-target/spec.e2e.yml"},
   {"module": "e2e", "class": "io.tapstate.e2e.PublishedExamplesIT", "example": "examples/a-cdc-only-pipeline-carries-its-changes/spec.e2e.yml"},
-  {"module": "e2e", "class": "io.tapstate.e2e.RealDummyPipelineIT", "method": "publishedDummyRunsThroughTheCli"}
+  {"module": "e2e", "class": "io.tapstate.e2e.RealDummyPipelineIT", "method": "publishedDummyRunsThroughTheCli"},
+  {"module": "app", "class": "io.tapstate.app.NativeReadReconnectIT"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStoreIT", "method": "clusterRetrySettingsKeepAnAtomicRevisionAndInheritIndividualOverrides"}
 ]

@@ -72,6 +72,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     private ExecutionFence original;
     private PipelineCaptureCoordinator capture;
     private boolean checkingStart;
+    private boolean recoveringSource;
 
     ScopedEngineLifecycleActuator(PipelineConvergencePass pass,Engine engine,DagSource dags,
             PipelineCaptureCoordinator captures,PipelineActuationOwnership ownership,String defaultDatabase,
@@ -89,6 +90,17 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             requireEarlier(fixed); original = fixed;
         } else if (command.executionGeneration() > 0) original = new ExecutionFence(pass.scope(),command);
         submissions.observed(id(),manifest); require();
+        if (run != null && !isCurrentRun() && original.scope().equals(pass.scope())
+                && command.executionGeneration() > 0 && captures instanceof ScopedPipelineCaptureCoordinator scoped) {
+            var attempted = new ExecutionFence(pass.scope(), command);
+            if (scoped.directRetry(attempted).isPresent() && run.status().isTerminal()) {
+                // A failed replacement can leave its cancelled predecessor discoverable by name.
+                // Its pending retry and partial capture belong to the attempted execution.
+                run = null;
+                manifest = null;
+                original = attempted;
+            }
+        }
         if (original != null && !engine.isLost()) capture = boundCapture(original);
         require();
     }
@@ -160,11 +172,16 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         } catch (TapstateException refused) {
             ownership.startRefusedBeforeItsRun(pass.scope(),command); throw refused;
         }
+        var originalBeforeStart = original;
         stopOriginal(); require();
         var execution = ownership.beginExecution(pass.scope(),command);
         if (!execution.allowed()) throw fenced();
         pass.advancedSubmission(execution); command = execution.claimFence(); require();
         original = execution.fence(); manifest = prepared.operatorPlan().orElseThrow().bind(original);
+        if (captures instanceof ScopedPipelineCaptureCoordinator scoped) {
+            if (recoveringSource) scoped.carryDirectRetries(originalBeforeStart, original);
+            else scoped.clearDirectRetries(pass.scope());
+        }
         run = null; capture = boundCapture(original);
         boolean submissionAttempted = false;
         try {
@@ -176,7 +193,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             var members = planned.members();
             ports.operators().prepare(manifest,prepared.operatorPlan().orElseThrow().capacities(),members,this::require); require();
             try { capture.startCapture(id(),prepared.artifactSnapshot().orElseThrow(),prepared.sourceModels().orElseThrow()); }
-            catch (RingNotOpenYet waiting) { return; }
+            catch (RingNotOpenYet waiting) {
+                ports.releaseHot().accept(manifest);
+                manifest = null;
+                return;
+            }
             require(); pass.bindCapture(command,capture.captureBindings()); require();
             var built = planned.build(original); require();
             if (!members.equals(built.planned().members())) throw new IllegalStateException("topology changed its prepared members");
@@ -296,6 +317,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
 
     @Override public void stop(String pipeline,boolean purge) {
         requireId(pipeline);
+        if (captures instanceof ScopedPipelineCaptureCoordinator scoped) scoped.clearDirectRetries(pass.scope());
         boolean requestedStop = pass.intent().desired().targetState() == PipelineState.STOPPED;
         try {
             stopOriginal(requestedStop);
@@ -325,6 +347,39 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         }
         require(); run.resume(); require();
     }
+    @Override public synchronized Optional<SourceRecovery> recoverSource(
+            String pipeline, java.util.function.BooleanSupplier currentIntent) {
+        requireId(pipeline);
+        if (original == null || !isCurrentRun() || !(captures instanceof ScopedPipelineCaptureCoordinator scoped)) {
+            return Optional.empty();
+        }
+        var episode = scoped.directRetry(original);
+        if (episode.isEmpty()) return Optional.empty();
+        var retry = episode.orElseThrow();
+        var pending = retry.decision(scoped.streamRetryPolicy());
+        if (pending == null) return Optional.empty();
+        if (pending.delay() == null) {
+            scoped.clearDirectRetries(pass.scope());
+            return Optional.of(new SourceRecovery(pending.failure()));
+        }
+        if (!pending.delay().isZero() || !currentIntent.getAsBoolean()) return Optional.of(new SourceRecovery(null));
+        retry.attempting();
+        recoveringSource = true;
+        try {
+            start(pipeline);
+            // A shared source can defer submission before the replacement Direct reader is created.
+            if (run == null) retry.interrupted(pending.failure());
+            return Optional.of(new SourceRecovery(null));
+        } catch (TapstateException failure) {
+            if (invalidated) throw failure;
+            if (original != null && scoped.hasDirectRetryFor(original, failure)) return Optional.of(new SourceRecovery(null));
+            scoped.clearDirectRetries(pass.scope());
+            return Optional.of(new SourceRecovery(actuationFailureFact(pipeline, failure)));
+        } finally {
+            recoveringSource = false;
+        }
+    }
+
     @Override public synchronized Optional<Throwable> terminalLeaseFailure(String pipeline) {
         requireId(pipeline);
         return pass.renewalFailure().map(Throwable.class::cast);

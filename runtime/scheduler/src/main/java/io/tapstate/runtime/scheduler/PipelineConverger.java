@@ -213,6 +213,13 @@ public final class PipelineConverger {
                     .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
                     .orElse(driven);
         }
+        var sourceRecovery = actuator.recoverSource(pipelineId, stillOriginalIntent);
+        if (sourceRecovery.isPresent()) {
+            var failed = sourceRecovery.orElseThrow().failure();
+            if (failed == null) return ConvergeResult.recovering(current);
+            ConvergeResult driven = driveTo(pipelineId, PipelineState.FAILED, false, current, false);
+            return driven.checkpoint().map(checkpoint -> ConvergeResult.failed(checkpoint, failed)).orElse(driven);
+        }
         Optional<LifecycleActuator.Completion> completion = actuator.completion(pipelineId);
         if (completion.isPresent()) {
             // Success belongs to this execution, not to an intent that can be retried on a new epoch.

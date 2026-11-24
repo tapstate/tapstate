@@ -130,5 +130,9 @@
   "TS0210033": {
     "message": "The request exceeds the input limit for the managed AI service.",
     "solution": "Start a new conversation or select fewer tables, then try again."
+  },
+  "TS0210034": {
+    "message": "Retry settings changed after they were read.",
+    "solution": "Reload the retry settings and reapply the desired changes."
   }
 }
