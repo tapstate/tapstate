@@ -108,11 +108,18 @@ def workflow_contract(text):
         for step in re.split(r'(?m)(?=^      - )', block.split('    steps:\n', 1)[1]):
             if not step.strip():
                 continue
-            if any(marker in step for marker in ('actions/checkout@v4', 'id: scope', 'CI change-scope controls', 'Validate CI routing', 'Documentation-only CI')):
+            if any(marker in step for marker in ('actions/checkout@v4', 'id: scope', 'CI change-scope controls', 'Documentation-only CI')):
                 continue
             assert f"{selector} != 'true'" in step, (role, step.splitlines()[0])
-    assert 'test "$PLAN_RESULT" = success' in jobs['build']
-    assert 'test "$SHARD_RESULT" = success' in jobs['build']
+    # A failed full shard must still reach checkout and the aggregate evidence steps.
+    pre_checkout = jobs['build'].split('- uses: actions/checkout@v4', 1)[0]
+    for step in pre_checkout.split('      - ')[1:]:
+        if 'test "$SHARD_RESULT" = success' in step:
+            assert "if: needs.shard-plan.outputs.docs-only == 'true'" in step, 'full shard failure skips diagnostic collection'
+    assert 'test "$PLAN_RESULT" = success' in pre_checkout
+    assert 'test "$SHARD_RESULT" = success' in pre_checkout
+    after_evidence = jobs['build'].split('- name: Admit the complete report and coverage set', 1)[1]
+    assert 'test "$SHARD_RESULT" = success' in after_evidence
     assert "if [ \"$DOCS_ONLY\" = true ]; then" in jobs['sonarqube']
     assert 'not evaluated for documentation-only changes' in jobs['sonarqube']
 

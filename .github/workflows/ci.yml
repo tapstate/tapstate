@@ -378,16 +378,14 @@ jobs:
     # Match test-shards so toolchain and ABI evidence remain comparable.
     runs-on: ubuntu-22.04
     steps:
-      - name: Validate CI routing
+      - name: Documentation-only CI
+        if: needs.shard-plan.outputs.docs-only == 'true'
         env:
           PLAN_RESULT: ${{ needs.shard-plan.result }}
           SHARD_RESULT: ${{ needs.test-shards.result }}
         run: |
           test "$PLAN_RESULT" = success
           test "$SHARD_RESULT" = success
-      - name: Documentation-only CI
-        if: needs.shard-plan.outputs.docs-only == 'true'
-        run: |
           echo 'Only prose documentation changed. Compilation, integration tests, images and Sonar analysis were not run.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v4
         with:
