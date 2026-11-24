@@ -17,21 +17,7 @@ class ClusterProperties {
     private String id;
     private String nodeId;
     private Profile profile = Profile.SINGLE;
-    private boolean profileConfigured;
-    private boolean workloadLeasesEnabled = true;
-
-    public boolean isWorkloadLeasesEnabled() { return workloadLeasesEnabled; }
-
-    public void setWorkloadLeasesEnabled(boolean enabled) { workloadLeasesEnabled = enabled; }
-
-    boolean nodeBackedPipeline() { return explicitSingle() || !workloadLeasesEnabled; }
-
-    void validateWorkloadLeases(boolean cloud, boolean op, HazelcastProperties.DiscoveryMode discovery) {
-        if (!workloadLeasesEnabled && (cloud || !op || profile != Profile.SINGLE
-                || discovery != HazelcastProperties.DiscoveryMode.NONE)) {
-            throw new IllegalArgumentException("tapstate.cluster.workload-leases-enabled=false requires single-node OP with discovery NONE");
-        }
-    }
+    private Boolean workloadLeasesEnabled;
     private int bootstrapMinMembers = 3;
     private Duration nodeSessionTtl = Duration.ofSeconds(30);
     private Duration nodeSessionRenewInterval = Duration.ofSeconds(10);
@@ -62,10 +48,20 @@ class ClusterProperties {
 
     void setProfile(Profile profile) {
         this.profile = profile;
-        profileConfigured = true;
     }
 
-    boolean explicitSingle() { return profileConfigured && profile == Profile.SINGLE; }
+    public Boolean getWorkloadLeasesEnabled() { return workloadLeasesEnabled; }
+
+    public void setWorkloadLeasesEnabled(Boolean enabled) { workloadLeasesEnabled = enabled; }
+
+    enum WorkloadLeases { INDEPENDENT, NODE_BACKED }
+
+    WorkloadLeases workloadLeases(boolean cloud, boolean op, HazelcastProperties.DiscoveryMode discovery) {
+        boolean singleOp = !cloud && op && profile == Profile.SINGLE && discovery == HazelcastProperties.DiscoveryMode.NONE;
+        if (!singleOp && Boolean.FALSE.equals(workloadLeasesEnabled))
+            throw new IllegalArgumentException("tapstate.cluster.workload-leases-enabled=false requires single-node OP with discovery NONE");
+        return singleOp && !Boolean.TRUE.equals(workloadLeasesEnabled) ? WorkloadLeases.NODE_BACKED : WorkloadLeases.INDEPENDENT;
+    }
 
     int getBootstrapMinMembers() {
         return bootstrapMinMembers;

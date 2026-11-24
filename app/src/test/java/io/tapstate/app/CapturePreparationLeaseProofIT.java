@@ -54,7 +54,6 @@ class CapturePreparationLeaseProofIT {
                 var nodeKey = new WorkloadClaimKey(storage.clusterId(), WorkloadClaimType.NODE_SESSION, memberOwner.nodeId());
                 var node = store.acquire(nodeKey, memberOwner, 0, Duration.ofSeconds(30)).claim();
                 var properties = new ClusterProperties();
-                assertThat(properties.explicitSingle()).isFalse();
                 var membership = new ClusterMembershipGate(properties); membership.bindSingle(node); membership.observeNodeSession(() -> true);
                 var local = mock(Member.class); when(local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE)).thenReturn(memberOwner.nodeId());
                 when(local.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE)).thenReturn(memberOwner.bootId()); when(local.localMember()).thenReturn(true);

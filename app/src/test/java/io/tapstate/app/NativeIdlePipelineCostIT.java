@@ -75,8 +75,9 @@ class NativeIdlePipelineCostIT {
             mongo.start();
             var storage=NativeAppStorage.createOnPremWithAdmin(mongo,"idle1022","admin","isolated-idle-password");
             try(var raw=MongoClients.create(storage.configurationUri());
-                    var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
-                        "--tapstate.cluster.workload-leases-enabled="+workloadLeasesEnabled,
+                    var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                        .properties(workloadLeasesEnabled ? Map.<String,Object>of("tapstate.cluster.workload-leases-enabled", true,
+                                "tapstate.cluster.profile", "SINGLE") : Map.<String,Object>of()).run(
                         "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR",
                         "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.hz.member-port=0",
                         "--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.connectors.seed-dir="+connectorDirectory(),
@@ -134,12 +135,15 @@ class NativeIdlePipelineCostIT {
                         var landed=data.getCollection("idle_order_views").find(new Document("_id",6L)).first();
                         assertThat(landed).isNotNull();assertThat(landed.getList("lines",Document.class)).hasSize(1);
                     });
+                    var claims = raw.getDatabase(storage.cacheDatabase()).getCollection("workload_claims");
+                    for (String kind : List.of("CAPTURE", "PIPELINE_ACTUATION")) {
+                        var filter = new Document("_id.resourceType", kind);
+                        if (workloadLeasesEnabled)
+                            filter.append("leaseUntil", new Document("$gt", new java.util.Date(0))).append("nodeLeaseGeneration", new Document("$exists", false));
+                        else filter.append("leaseUntil", new java.util.Date(-1)).append("nodeLeaseGeneration", new Document("$gt", 0L));
+                        assertThat(claims.countDocuments(filter)).as("active %s lease mode", kind).isPositive();
+                    }
                     if (!workloadLeasesEnabled) {
-                        var claims = raw.getDatabase(storage.cacheDatabase()).getCollection("workload_claims");
-                        for (String kind : List.of("CAPTURE", "PIPELINE_ACTUATION")) {
-                            assertThat(claims.countDocuments(new Document("_id.resourceType", kind)
-                                    .append("leaseUntil", new java.util.Date(-1)).append("nodeLeaseGeneration", new Document("$gt", 0L)))).isPositive();
-                        }
                         var views = data.getCollection("idle_order_views");
                         data.getCollection("lines").updateOne(new Document("_id", 6L), new Document("$set", new Document("parent_id", 1L)));
                         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->

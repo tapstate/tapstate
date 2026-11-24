@@ -420,11 +420,14 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 if(observer instanceof BuiltinResourceSignals signals)signals.cacheOperation(write,failure);
             });
         }
-        @Bean MemberStorage memberStorage(NativeBusinessContext owner, ClusterProperties cluster, WorkloadClaimStore claims, SrsStores sources,
+        @Bean ClusterProperties.WorkloadLeases workloadLeases(NativeBusinessContext owner, ClusterProperties cluster,
                 CloudRuntimeSettings cloud, HazelcastProperties hazelcast) {
-            cluster.validateWorkloadLeases(cloud.cloud(), owner.original.binding().mode() == StorageBinding.Mode.OP,
+            return cluster.workloadLeases(cloud.cloud(), owner.original.binding().mode() == StorageBinding.Mode.OP,
                     hazelcast.getDiscovery().getMode());
-            owner.memberStorage = new NativeMemberStorage(owner.original, owner.configuration, cluster, claims, sources);
+        }
+        @Bean MemberStorage memberStorage(NativeBusinessContext owner, ClusterProperties cluster, WorkloadClaimStore claims,
+                SrsStores sources, ClusterProperties.WorkloadLeases leases) {
+            owner.memberStorage = new NativeMemberStorage(owner.original, owner.configuration, cluster, claims, sources, leases);
             return owner.memberStorage;
         }
         @Bean ClusterMembershipStore clusterMembershipStore(NativeBusinessContext owner) {
@@ -533,10 +536,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean PipelineActuationOwnership pipelineActuationOwnership(HazelcastInstance member,
                 NativeBusinessContext owner, ClusterProperties cluster, ClusterMembershipGate membership, ClusterWorkloadClaims claims,
-                CloudRuntimeSettings cloud) {
+                CloudRuntimeSettings cloud, ClusterProperties.WorkloadLeases leases) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
             if (!(held instanceof WorkloadClaim node)) throw ThreeLayerStorePort.refused();
-            if (cluster.nodeBackedPipeline()) {
+            if (leases == ClusterProperties.WorkloadLeases.NODE_BACKED) {
                 return PipelineActuationOwnership.nodeBacked(owner.original.preparation().businessScope(),
                         WorkloadClaimFence.from(node), membership, claims, cluster.pipelineClaimTtl(cloud.cloud()),
                         cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
@@ -549,16 +552,16 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return ownership;
         }
         @Bean(destroyMethod = "close") ActuationClaimRenewer actuationClaimRenewer(PipelineActuationOwnership ownership, ClusterProperties cluster,
-                CloudRuntimeSettings cloud) {
-            return cluster.nodeBackedPipeline() ? ActuationClaimRenewer.inactive()
+                CloudRuntimeSettings cloud, ClusterProperties.WorkloadLeases leases) {
+            return leases == ClusterProperties.WorkloadLeases.NODE_BACKED ? ActuationClaimRenewer.inactive()
                     : new ActuationClaimRenewer(ownership, cluster.pipelineClaimRenewInterval(cloud.cloud()));
         }
         @Bean CaptureOwnership captureOwnership(HazelcastInstance member, ClusterProperties cluster,
-                ClusterMembershipGate membership, ClusterWorkloadClaims claims) {
+                ClusterMembershipGate membership, ClusterWorkloadClaims claims, ClusterProperties.WorkloadLeases leases) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
             if (!(held instanceof WorkloadClaim node)) throw ThreeLayerStorePort.refused();
             return new CaptureOwnership(node.key().clusterId(), node.owner(), membership, claims, cluster.getWorkloadClaimTtl(),
-                    cluster.isWorkloadLeasesEnabled() ? null : WorkloadClaimFence.from(node));
+                    leases == ClusterProperties.WorkloadLeases.NODE_BACKED ? WorkloadClaimFence.from(node) : null);
         }
         @Bean PipelineFirstStatePreparer pipelineFirstStatePreparer(NativeBusinessContext owner, NodeSessionLease node,
                 ClusterProperties cluster, Clock clock) {

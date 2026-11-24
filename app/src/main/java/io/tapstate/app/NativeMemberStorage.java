@@ -16,6 +16,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
     private final ClusterProperties properties;
     private final WorkloadClaimStore claims;
     private final SrsStores sources;
+    private final ClusterProperties.WorkloadLeases leases;
     // Publishes the startup lease handle; NodeSessionLease owns its atomic lease state.
     @SuppressWarnings("java:S3077")
     private volatile NodeSessionLease startupLease;
@@ -30,10 +31,11 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
     private final CheckpointProgressWrites progressWrites = new CheckpointProgressWrites();
 
     NativeMemberStorage(StorageRuntime.Bound bound, MongoConfigurationDomain configuration, ClusterProperties properties,
-            WorkloadClaimStore claims, SrsStores sources) {
+            WorkloadClaimStore claims, SrsStores sources, ClusterProperties.WorkloadLeases leases) {
         this.bound = Objects.requireNonNull(bound); this.configuration = Objects.requireNonNull(configuration);
         this.properties = Objects.requireNonNull(properties); this.claims = Objects.requireNonNull(claims);
         this.sources = Objects.requireNonNull(sources);
+        this.leases = Objects.requireNonNull(leases);
     }
     @Override public synchronized void prepare(Config config, WorkloadClaim originalNode, long askedAt) {
         bound.requireBusiness();
@@ -44,7 +46,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
         config.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         config.getUserContext().put(SrsStoreViews.USER_CONTEXT_KEY, sourceViews());
         config.getUserContext().put(CheckpointProgressWrites.USER_CONTEXT_KEY, progressWrites);
-        maps = OperatorMapBindings.prepare(config, new ScopedOperatorStateProvider(bound.cache(), authorization, !properties.isWorkloadLeasesEnabled()));
+        maps = OperatorMapBindings.prepare(config, new ScopedOperatorStateProvider(bound.cache(), authorization, leases == ClusterProperties.WorkloadLeases.NODE_BACKED));
         ScopedSinkStateProvider.bind(config, bound.cache(), configuration.requiredNotes());
         RequiredNestDeadLetter.bindTo(config, new ScopedRequiredDeadLetterProvider(configuration.requiredDeadLetters(), authorization));
     }
