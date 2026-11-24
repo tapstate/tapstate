@@ -29,6 +29,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.function.Supplier;
 
 /**
@@ -49,6 +50,10 @@ import java.util.function.Supplier;
  * the backpressure that bounds them belong to the runtime, not this writer.
  */
 final class PdkSinkWriter implements SinkWriter {
+
+    // PDK alternatives and target transactions can be keyed by thread name on a shared connector.
+    private static final ThreadFactory WRITER_THREADS =
+            Thread.ofPlatform().daemon().name("tapstate-sink-write-", 1).factory();
 
     private final PdkConnector connector;
     private final WriteRecordFunction write;
@@ -71,8 +76,7 @@ final class PdkSinkWriter implements SinkWriter {
     private volatile Thread writeThread;
     private boolean delivering;
     private final ExecutorService writes = Executors.newSingleThreadExecutor(task -> {
-        Thread thread = new Thread(task, "tapstate-sink-write");
-        thread.setDaemon(true);
+        Thread thread = WRITER_THREADS.newThread(task);
         writeThread = thread;
         return thread;
     });
