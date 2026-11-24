@@ -23,11 +23,15 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -272,6 +276,33 @@ class PdkCapturePortTest {
         } finally {
             System.getProperties().remove(key);
             System.getProperties().remove(key + ".prepare");
+        }
+    }
+
+    @Test
+    void snapshotRetriesFromTheAcceptedOffsetWhenThePdkPreparationHookThrows(@TempDir Path dir) throws Exception {
+        String key = "tapstate.snapshot.retry.hook." + System.nanoTime();
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var preparations = new java.util.concurrent.atomic.AtomicInteger();
+        System.getProperties().put(key, calls);
+        System.getProperties().put(key + ".prepare", preparations);
+        System.getProperties().put(key + ".prepareFailure", true);
+        var ids = new ArrayList<>();
+        try {
+            var jar = Synthetic.retryingSnapshotSource(dir, key, true);
+            try (var port = new PdkCapturePort(provisioner(jar, "synthetic.RetryingSnapshotSource", null))
+                    .withReadRetries(ignored -> new io.tapstate.core.common.RetryPolicy(true,
+                            Duration.ofMillis(1), Duration.ofSeconds(30)));
+                    var batch = port.snapshotOnly(config("t1"))) {
+                while (batch.hasNext()) ids.add(batch.next().after().get("id"));
+            }
+            assertThat(ids).containsExactly(1L, 2L);
+            assertThat(calls).hasValue(2);
+            assertThat(preparations).hasValue(1);
+        } finally {
+            System.getProperties().remove(key);
+            System.getProperties().remove(key + ".prepare");
+            System.getProperties().remove(key + ".prepareFailure");
         }
     }
 
@@ -973,7 +1004,7 @@ class PdkCapturePortTest {
     }
 
     @Test
-    void aDeliveryAdmittedBeforeTheNextInterruptionCannotClearIt(@TempDir Path dir) throws Exception {
+    void aStartedReaderReportsTheLaterInterruptionWithoutRepeatingRecovery(@TempDir Path dir) throws Exception {
         String channel = "stream-retry-" + java.util.UUID.randomUUID();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -1002,7 +1033,7 @@ class PdkCapturePortTest {
                 release.countDown();
             }
             assertThat(delivered.await(5, TimeUnit.SECONDS)).isTrue();
-            assertThat(recovered).hasValue(0);
+            assertThat(recovered).hasValue(1);
         } finally {
             System.getProperties().remove(channel + ".entered");
             System.getProperties().remove(channel + ".delivered");
@@ -1047,6 +1078,180 @@ class PdkCapturePortTest {
         } finally {
             System.getProperties().remove(channel + ".entered");
             System.getProperties().remove(channel + ".delivered");
+        }
+    }
+
+    @Test
+    void aConnectorStartedSignalEndsQuietRecoveryWithoutAChangeOrPosition(@TempDir Path dir) throws Exception {
+        try (var probe = RecoveryProbe.open(dir, "started-heartbeat", Duration.ofSeconds(5));
+             var sub = probe.start()) {
+            assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.started.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.heartbeat.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.recovered).hasValue(1);
+            assertThat(probe.adapterStarts).hasValue(0);
+            assertThat(probe.batches).hasValue(1);
+            assertThat(probe.emptyBatches).hasValue(1);
+            assertThat(probe.positionlessBatches).hasValue(1);
+            assertThat(probe.terminalFailures).hasValue(0);
+
+            probe.commands.add("return");
+            assertThat(probe.ended.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void aQuietInvocationWithoutStartedConfirmsAfterTheConfiguredObservationWindow(@TempDir Path dir) throws Exception {
+        try (var probe = RecoveryProbe.open(dir, "quiet", Duration.ofMillis(120));
+             var sub = probe.start()) {
+            assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.recoveredSignal.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.started.getCount()).isOne();
+            assertThat(probe.adapterStarts).hasValue(0);
+            assertThat(probe.batches).hasValue(0);
+            assertThat(probe.terminalFailures).hasValue(0);
+
+            probe.commands.add("return");
+            assertThat(probe.ended.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void recoveryObservationStartsAtTheStreamInvocationAfterPreflight(@TempDir Path dir) throws Exception {
+        var prepareEntered = new CountDownLatch(1);
+        var prepareRelease = new CountDownLatch(1);
+        try (var probe = RecoveryProbe.open(dir, "quiet", Duration.ofMillis(120), actual -> {
+            prepareEntered.countDown();
+            try {
+                if (!prepareRelease.await(5, TimeUnit.SECONDS)) throw new AssertionError("preflight never released");
+            } catch (InterruptedException cancelled) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(cancelled);
+            }
+        }); var caller = Executors.newSingleThreadExecutor()) {
+            var opening = caller.submit(probe::start);
+            try {
+                assertThat(prepareEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(probe.recoveredSignal.await(400, TimeUnit.MILLISECONDS)).isFalse();
+            } finally {
+                prepareRelease.countDown();
+            }
+            try (var sub = opening.get(5, TimeUnit.SECONDS)) {
+                assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(probe.recoveredSignal.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(probe.batches).hasValue(0);
+                assertThat(probe.terminalFailures).hasValue(0);
+                probe.commands.add("return");
+                assertThat(probe.ended.await(5, TimeUnit.SECONDS)).isTrue();
+            }
+        } finally {
+            prepareRelease.countDown();
+        }
+    }
+
+    @Test
+    void anEarlySourceFailureDisarmsTheQuietObservationTimer(@TempDir Path dir) throws Exception {
+        try (var probe = RecoveryProbe.open(dir, "quiet", Duration.ofMillis(400));
+             var sub = probe.start()) {
+            assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            probe.commands.add("fail");
+            assertThat(probe.interrupted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.recoveredSignal.await(700, TimeUnit.MILLISECONDS)).isFalse();
+            assertThat(probe.terminalFailures).hasValue(0);
+        }
+    }
+
+    @Test
+    void aNormalReturnBeforeTheQuietWindowDisarmsItsTimer(@TempDir Path dir) throws Exception {
+        try (var probe = RecoveryProbe.open(dir, "return", Duration.ofMillis(120));
+             var sub = probe.start()) {
+            assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.ended.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.recoveredSignal.await(400, TimeUnit.MILLISECONDS)).isFalse();
+            assertThat(probe.terminalFailures).hasValue(0);
+        }
+    }
+
+    @Test
+    void closingAQuietSubscriptionCancelsItsRecoveryTimer(@TempDir Path dir) throws Exception {
+        var probe = RecoveryProbe.open(dir, "quiet", Duration.ofMillis(120));
+        var sub = probe.start();
+        try {
+            assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            sub.close();
+            assertThat(probe.recoveredSignal.await(400, TimeUnit.MILLISECONDS)).isFalse();
+            assertThat(probe.terminalFailures).hasValue(0);
+        } finally {
+            sub.close();
+            probe.close();
+        }
+    }
+
+    private static final class RecoveryProbe implements AutoCloseable {
+        private final String channel = "stream-recovery-window-" + java.util.UUID.randomUUID();
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch started = new CountDownLatch(1);
+        private final CountDownLatch heartbeat = new CountDownLatch(1);
+        private final CountDownLatch ended = new CountDownLatch(1);
+        private final CountDownLatch interrupted = new CountDownLatch(1);
+        private final CountDownLatch recoveredSignal = new CountDownLatch(1);
+        private final BlockingQueue<String> commands = new LinkedBlockingQueue<>();
+        private final AtomicInteger recovered = new AtomicInteger();
+        private final AtomicInteger adapterStarts = new AtomicInteger();
+        private final AtomicInteger batches = new AtomicInteger();
+        private final AtomicInteger emptyBatches = new AtomicInteger();
+        private final AtomicInteger positionlessBatches = new AtomicInteger();
+        private final AtomicInteger terminalFailures = new AtomicInteger();
+        private final PdkCapturePort port;
+
+        private RecoveryProbe(Path dir, String mode, Duration timeout,
+                PdkCapturePort.StreamPreparer streamPreparer) throws Exception {
+            System.getProperties().put(channel + ".mode", mode);
+            System.getProperties().put(channel + ".entered", entered);
+            System.getProperties().put(channel + ".started", started);
+            System.getProperties().put(channel + ".heartbeat", heartbeat);
+            System.getProperties().put(channel + ".ended", ended);
+            System.getProperties().put(channel + ".commands", commands);
+            var jar = Synthetic.recoverySignalStreamSource(dir, channel);
+            var configured = new PdkCapturePort(provisioner(jar, "synthetic.RecoverySignalStreamSource", null))
+                    .withReadRetries(operation -> new io.tapstate.core.common.RetryPolicy(true,
+                            Duration.ofSeconds(1), Duration.ofHours(8)))
+                    .withStreamRecovery(failure -> interrupted.countDown(), () -> {
+                        recovered.incrementAndGet();
+                        recoveredSignal.countDown();
+                    }, () -> true)
+                    .withStreamRecoveryConfirmationTimeout(timeout);
+            if (streamPreparer != null) configured = configured.withStreamPreparation(streamPreparer);
+            port = configured;
+        }
+
+        static RecoveryProbe open(Path dir, String mode, Duration timeout) throws Exception {
+            return open(dir, mode, timeout, null);
+        }
+
+        static RecoveryProbe open(Path dir, String mode, Duration timeout,
+                PdkCapturePort.StreamPreparer streamPreparer) throws Exception {
+            return new RecoveryProbe(dir, mode, timeout, streamPreparer);
+        }
+
+        Subscription start() {
+            return port.cdc(config("t1"), CaptureStart.present(), new io.tapstate.spi.capture.CaptureStartedListener() {
+                @Override public void onStart(SourcePosition position) { adapterStarts.incrementAndGet(); }
+                @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                    batches.incrementAndGet();
+                    if (events.isEmpty()) emptyBatches.incrementAndGet();
+                    if (position.isEmpty()) positionlessBatches.incrementAndGet();
+                }
+                @Override public void onFailure(io.tapstate.core.common.FailureFact failure) {
+                    terminalFailures.incrementAndGet();
+                }
+            });
+        }
+
+        @Override public void close() {
+            port.close();
+            for (String suffix : List.of(".mode", ".entered", ".started", ".heartbeat", ".ended", ".commands"))
+                System.getProperties().remove(channel + suffix);
         }
     }
 

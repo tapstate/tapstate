@@ -44,30 +44,46 @@ public final class TcpResetProxy implements AutoCloseable {
 
     private void accept() {
         while (!listener.isClosed()) {
+            java.net.Socket front;
             try {
-                var front = listener.accept();
-                if (!available) {
-                    front.setSoLinger(true, 0);
-                    front.close();
-                    continue;
-                }
-                var back = new java.net.Socket(host, port);
-                var hop = new Hop(front, back);
-                boolean admitted;
-                synchronized (admission) {
-                    admitted = available;
-                    if (admitted) hops.add(hop);
-                }
-                if (!admitted) {
-                    hop.reset();
-                    continue;
-                }
-                Thread.ofVirtual().start(() -> pump(hop, front, back));
-                Thread.ofVirtual().start(() -> pump(hop, back, front));
-            } catch (java.io.IOException closedOrUnavailable) {
-                if (!listener.isClosed()) throw new java.io.UncheckedIOException(closedOrUnavailable);
+                front = listener.accept();
+            } catch (java.io.IOException failed) {
+                if (!listener.isClosed()) throw new java.io.UncheckedIOException(failed);
+                return;
             }
+            if (!available) {
+                resetFront(front);
+                continue;
+            }
+            connect(front);
         }
+    }
+
+    private void connect(java.net.Socket front) {
+        var back = new java.net.Socket();
+        var hop = new Hop(front, back);
+        try {
+            back.connect(new java.net.InetSocketAddress(host, port));
+        } catch (java.io.IOException refused) {
+            hop.reset();
+            return;
+        }
+        boolean admitted;
+        synchronized (admission) {
+            admitted = available && !listener.isClosed();
+            if (admitted) hops.add(hop);
+        }
+        if (!admitted) {
+            hop.reset();
+            return;
+        }
+        Thread.ofVirtual().start(() -> pump(hop, front, back));
+        Thread.ofVirtual().start(() -> pump(hop, back, front));
+    }
+
+    private static void resetFront(java.net.Socket front) {
+        try { front.setSoLinger(true, 0); } catch (java.io.IOException alreadyClosed) {}
+        try { front.close(); } catch (java.io.IOException alreadyClosed) {}
     }
 
     private void pump(Hop hop, java.net.Socket input, java.net.Socket output) {
@@ -88,8 +104,8 @@ public final class TcpResetProxy implements AutoCloseable {
 
     private record Hop(java.net.Socket front, java.net.Socket back) {
         void reset() {
-            try { front.setSoLinger(true, 0); } catch (java.io.IOException alreadyClosed) {}
-            close();
+            resetFront(front);
+            try { back.close(); } catch (java.io.IOException alreadyClosed) {}
         }
 
         void close() {

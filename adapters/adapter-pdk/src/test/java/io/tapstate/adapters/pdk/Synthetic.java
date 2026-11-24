@@ -376,7 +376,9 @@ final class Synthetic {
         String register = "functions.supportErrorHandleFunction((context, method, failure) -> {"
                 + "  if (method != io.tapdata.pdk.apis.functions.PDKMethod.SOURCE_BATCH_READ) throw new AssertionError(method);"
                 + "  return io.tapdata.pdk.apis.functions.connection.RetryOptions.create().needRetry(false).beforeRetryMethod(() -> "
-                + "     ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + ".prepare\")).incrementAndGet());"
+                + "{ ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + ".prepare\")).incrementAndGet();"
+                + "  if (System.getProperties().containsKey(\"" + counter + ".prepareFailure\")) throw new java.io.UncheckedIOException(new java.io.IOException(\"re-open temporarily failed\"));"
+                + "});"
                 + "});"
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
                 + "  int call = ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + "\")).incrementAndGet();"
@@ -411,6 +413,29 @@ final class Synthetic {
                 + "});";
         return SyntheticJar.compileToJar(dir, "synthetic.AsyncFailingStreamSource",
                 source("AsyncFailingStreamSource", "", register));
+    }
+
+    static Path recoverySignalStreamSource(Path dir, String channel) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  String mode = (String) System.getProperties().get(\"" + channel + ".mode\");"
+                + "  ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".entered\")).countDown();"
+                + "  if (mode.equals(\"started\") || mode.equals(\"started-heartbeat\")) {"
+                + "    consumer.streamReadStarted();"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".started\")).countDown();"
+                + "  }"
+                + "  if (mode.equals(\"started-heartbeat\")) {"
+                + "    consumer.accept(List.of(new io.tapdata.entity.event.control.HeartbeatEvent().init()), null);"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".heartbeat\")).countDown();"
+                + "  }"
+                + "  if (mode.equals(\"return\")) { consumer.streamReadEnded();"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".ended\")).countDown(); return; }"
+                + "  String command = ((java.util.concurrent.BlockingQueue<String>) System.getProperties().get(\"" + channel + ".commands\")).take();"
+                + "  if (command.equals(\"fail\")) throw new java.io.IOException(\"controlled source interruption\");"
+                + "  if (command.equals(\"return\")) { consumer.streamReadEnded();"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".ended\")).countDown(); }"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.RecoverySignalStreamSource",
+                source("RecoverySignalStreamSource", "", register));
     }
 
     static Path emittingSource(Path dir) {

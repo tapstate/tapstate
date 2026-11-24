@@ -36,7 +36,18 @@ final class PdkReadRetry {
                 ? code.isRecoverable() : options != null && options.isNeedRetry();
         if (!requested && !defaultRetry(failure)) return Optional.empty();
         var beforeRetry = options == null ? null : options.getBeforeRetryMethod();
-        return Optional.of(beforeRetry == null ? () -> {} : beforeRetry);
+        return Optional.of(beforeRetry == null ? () -> {} : () -> prepareBestEffort(beforeRetry, failure));
+    }
+
+    /** The PDK preparation hook is advisory. The read still owns the retry decision and its failure. */
+    private static void prepareBestEffort(Runnable beforeRetry, Throwable failure) {
+        try {
+            beforeRetry.run();
+        } catch (CancellationException cancelled) {
+            throw cancelled;
+        } catch (RuntimeException rejected) {
+            if (rejected != failure) failure.addSuppressed(rejected);
+        }
     }
 
     private static boolean defaultRetry(Throwable failure) {

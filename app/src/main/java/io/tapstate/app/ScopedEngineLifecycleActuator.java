@@ -84,6 +84,17 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             requireEarlier(fixed); original = fixed;
         } else if (command.executionGeneration() > 0) original = new ExecutionFence(pass.scope(),command);
         submissions.observed(id(),manifest); require();
+        if (run != null && !isCurrentRun() && original.scope().equals(pass.scope())
+                && command.executionGeneration() > 0 && captures instanceof ScopedPipelineCaptureCoordinator scoped) {
+            var attempted = new ExecutionFence(pass.scope(), command);
+            if (scoped.directRetry(attempted).isPresent() && run.status().isTerminal()) {
+                // A failed replacement can leave its cancelled predecessor discoverable by name.
+                // Its pending retry and partial capture belong to the attempted execution.
+                run = null;
+                manifest = null;
+                original = attempted;
+            }
+        }
         if (original != null && !engine.isLost()) capture = boundCapture(original);
         require();
     }

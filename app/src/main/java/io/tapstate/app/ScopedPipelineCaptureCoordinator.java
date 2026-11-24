@@ -1844,7 +1844,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private void recoverSharedRead(Owner owner, Physical physical, AtomicReference<FailureFact> openingFailure) {
         if (physical != null) {
-            if (physical.live.get()) physical.finishCheckpointing();
+            owner.finishCheckpointingForRetirement();
             physical.close();
             owner.physical = null;
         }
