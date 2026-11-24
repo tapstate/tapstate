@@ -223,7 +223,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
             throw new IllegalArgumentException("definition change hash must match the captured Pipeline");
         }
         try {
-            return transaction(session -> {
+            return publicationTransaction(change.pipelineId(), session -> {
                 var observed = artifacts.getInTransaction(session, change.pipelineId());
                 if (observed.isEmpty() || !(observed.orElseThrow() instanceof PipelineResource)
                         || !change.expectedArtifactHash().equals(CanonicalHash.of(observed.orElseThrow()))) {
