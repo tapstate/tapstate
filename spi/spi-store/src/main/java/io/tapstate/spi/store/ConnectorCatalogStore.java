@@ -39,6 +39,16 @@ public interface ConnectorCatalogStore {
         return Optional.empty();
     }
 
+    /** Publishes exact artifact metadata after the content-addressed spec is available. */
+    default void upsertArtifact(ConnectorArtifactMetadata artifact) {
+        throw new UnsupportedOperationException("Versioned connectors require a CACHE catalog");
+    }
+
+    /** Reads the metadata for an existing binding without selecting a different artifact. */
+    default Optional<ConnectorArtifactMetadata> artifact(String connectorId, String sha256) {
+        return Optional.empty();
+    }
+
     /** Returns the stored derived row for a connector id, or empty if none has been derived. */
     Optional<ConnectorCatalogEntry> get(String connectorId);
 

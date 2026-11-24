@@ -1,5 +1,6 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.common.ConnectorCatalogErrorDefinitions;
 import io.tapstate.core.common.DiagnosticProjection;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.control.client.ControlResponse;
@@ -804,6 +805,58 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         } catch (IOException | RuntimeException e) {
             return new ConnectorRegisterOutcome.Unreachable();
         }
+    }
+
+    @Override
+    public java.util.Optional<ConnectorRegisterOutcome> downloadConnector(URI baseUrl, String credential, String id) {
+        if (!id.matches("[A-Za-z0-9][A-Za-z0-9_.-]*")) return java.util.Optional.empty();
+        try {
+            var request = authed(baseUrl, "/api/connector-center/" + id + ":download", credential)
+                    .POST(HttpRequest.BodyPublishers.noBody()).build();
+            var response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() != 200 && response.statusCode() != 202) {
+                var rejected = rejection(response.body(), "The server refused the connector download.");
+                if (response.statusCode() == 404
+                        && !ConnectorCatalogErrorDefinitions.NOT_FOUND.code().equals(rejected.code())
+                        && !"connector.not-found".equals(rejected.code()))
+                    return java.util.Optional.empty();
+                return java.util.Optional.of(new ConnectorRegisterOutcome.Rejected(rejected.code(), rejected.message()));
+            }
+            if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> accepted)
+                    || !(accepted.get("operationId") instanceof String operation)
+                    || !operation.matches("[a-f0-9-]{36}")) {
+                return java.util.Optional.of(new ConnectorRegisterOutcome.Unreachable());
+            }
+            return java.util.Optional.of(awaitConnectorDownload(baseUrl, credential, operation));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return java.util.Optional.of(new ConnectorRegisterOutcome.Unreachable());
+        } catch (HttpTimeoutException timeout) {
+            return java.util.Optional.of(new ConnectorRegisterOutcome.TimedOut());
+        } catch (IOException | IllegalArgumentException unavailable) {
+            return java.util.Optional.of(new ConnectorRegisterOutcome.Unreachable());
+        }
+    }
+
+    private ConnectorRegisterOutcome awaitConnectorDownload(URI baseUrl, String credential, String operation)
+            throws IOException, InterruptedException {
+        String path = "/api/connector-center/operations/" + operation;
+        long limit = System.nanoTime() + java.time.Duration.ofMinutes(5).toNanos();
+        while (System.nanoTime() < limit) {
+            var response = send(authed(baseUrl, path, credential).GET().build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() != 200 || !(JsonReader.parse(response.body()) instanceof Map<?, ?> value))
+                return new ConnectorRegisterOutcome.Unreachable();
+            if ("INSTALLED".equals(value.get("state")) && value.get("connectorId") instanceof String connector
+                    && value.get("sha256") instanceof String hash) {
+                return new ConnectorRegisterOutcome.Registered(new RegisteredConnector(connector, hash,
+                        stringOrNull(value.get("pdkApiVersion")), Boolean.TRUE.equals(value.get("newlyRegistered"))));
+            }
+            if ("FAILED".equals(value.get("state")) && value.get("errorCode") instanceof String error)
+                return new ConnectorRegisterOutcome.Rejected(error, "The connector download or installation failed.");
+            Thread.sleep(500);
+        }
+        return new ConnectorRegisterOutcome.TimedOut();
     }
 
     @Override

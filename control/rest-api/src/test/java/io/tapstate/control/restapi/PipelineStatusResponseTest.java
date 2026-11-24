@@ -29,6 +29,18 @@ class PipelineStatusResponseTest {
     private final MessageCatalog catalog = MessageCatalog.bundled();
 
     @Test
+    void monitoringCarriesTheExactSourceAndSinkArtifactsWithoutNoteCoordinates() {
+        var source = new io.tapstate.control.core.ConnectorUsageQuery.Version("input",
+                io.tapstate.core.model.PipelineNode.Purpose.CAPTURE, "mongodb", "1.0", "a".repeat(64), "capture-old", "chain-old");
+        var sink = new io.tapstate.control.core.ConnectorUsageQuery.Version("target",
+                io.tapstate.core.model.PipelineNode.Purpose.SYNC, "mysql", "2.0", "b".repeat(64), null, null);
+        var response = PipelineStatusResponse.of(new PipelineStatus("reader", PipelineState.RUNNING), catalog)
+                .withConnectorVersions(java.util.List.of(source, sink));
+        assertThat(response.connectorVersions()).containsExactly(source, sink);
+        assertThat(response.state()).isEqualTo(PipelineState.RUNNING);
+    }
+
+    @Test
     void runtimeAttachmentKeepsCapturedFactsAndLegacyResponsesOmitIt() throws Exception {
         var diagnostic = java.util.Map.<String, Object>of("message", "captured message",
                 "cause", java.util.Map.of("rawMessage", "captured cause"));

@@ -29,7 +29,7 @@
   },
   "TS0060008": {
     "message": "Runtime registration supports these connectors today: {official}. '{connector}' is not among them yet.",
-    "solution": "Register one of the connectors listed above. The supported set grows as connectors complete certification, so an artifact refused here is not necessarily faulty."
+    "solution": "Register one of the listed connectors, refresh the support catalog, or update Tapstate before retrying offline."
   },
   "TS0060009": {
     "message": "Connector '{connector}' could not be loaded.",
@@ -168,5 +168,9 @@
   "TS0060042": {
     "message": "Schema discovery for {connector} was rejected by the database's authentication checks.",
     "solution": "Check the data source username, password and authentication settings, then refresh its schema. If the credentials are correct, ask the database administrator to check the account."
+  },
+  "TS0060043": {
+    "message": "Connector '{connector}' requires local artifact {hash}, which is missing or unreadable.",
+    "solution": "Restore the original connector JAR under that hash, then retry from the retained position."
   }
 }

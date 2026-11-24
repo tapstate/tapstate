@@ -21,8 +21,9 @@ class ControlOperationsTest {
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.select", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
+                        "retry-settings.get", "retry-settings.replace",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
-                        "system.version",
+                        "system.version", "system.pdk-version",
                         "artifact.apply",
                         "artifact.validate",
                         "artifact.get",
@@ -47,6 +48,8 @@ class ControlOperationsTest {
                         "connector.list",
                         "connector.get",
                         "connector.icon",
+                        "connector-center.list", "connector-center.refresh", "connector-center.download",
+                        "connector-center.operation", "connector-center.upload",
                         "data-browser.collections",
                         "data-browser.find",
                         "data-browser.stats",
@@ -132,6 +135,26 @@ class ControlOperationsTest {
         assertThat(registry.resolve("connector.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.get").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.icon").scope()).isEqualTo(Scope.READ);
+        for (String id : List.of("connector-center.list", "connector-center.operation")) {
+            assertThat(registry.resolve(id).scope()).isEqualTo(Scope.READ);
+            assertThat(registry.resolve(id).audited()).isFalse();
+        }
+        for (String id : List.of("connector-center.refresh", "connector-center.download", "connector-center.upload")) {
+            assertThat(registry.resolve(id).scope()).isEqualTo(Scope.ADMIN);
+            assertThat(registry.resolve(id).audited()).isTrue();
+        }
+        for (Operation operation : registry.all()) {
+            Scope cloudScope = switch (operation.id()) {
+                case "connector-center.refresh", "connector-center.download" -> Scope.WRITE;
+                default -> operation.scope();
+            };
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.CLOUD_SESSION))
+                    .as(operation.id()).isEqualTo(cloudScope);
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.HUMAN_JWT))
+                    .as(operation.id()).isEqualTo(operation.scope());
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.MACHINE_TOKEN))
+                    .as(operation.id()).isEqualTo(operation.scope());
+        }
         // the three data-browser verbs look at what a declared source's own database holds. They read
         // through to the connector and persist nothing at all — not even the result, unlike the two
         // connection probes — so they are read-scoped.
@@ -231,9 +254,11 @@ class ControlOperationsTest {
         // reservation stays unpublished until its dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(88);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
+                && !"system.pdk-version".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())
-                && !"ai-provider.select".equals(op.id())
-                && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")).allSatisfy(op ->
+                && !"ai-provider.select".equals(op.id()) && !op.id().startsWith("retry-settings.")
+                && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")
+                && !op.id().startsWith("connector-center.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
                 assertThat(op.exposure()).containsOnlyKeys(Frontend.REST));
@@ -242,6 +267,9 @@ class ControlOperationsTest {
                 .containsEntry(Frontend.REST, Maturity.CURRENT).doesNotContainKey(Frontend.CLI);
         assertThat(registry.resolve("ai-provider.select").exposure())
                 .containsEntry(Frontend.REST, Maturity.CURRENT).containsOnlyKeys(Frontend.REST);
+        assertThat(registry.resolve("retry-settings.get").scope()).isEqualTo(Scope.ADMIN);
+        assertThat(registry.resolve("retry-settings.replace").scope()).isEqualTo(Scope.ADMIN);
+        assertThat(registry.resolve("retry-settings.replace").audited()).isTrue();
     }
 
     @Test
@@ -285,11 +313,15 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "system.pdk-version",
+                        "connector-center.list", "connector-center.refresh", "connector-center.download",
+                        "connector-center.operation", "connector-center.upload",
                         "validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
                         "validation.start", "validation.progress", "validation.stop", "validation.history",
                         "validation.report", "validation.roots", "validation.root", "validation.schedule-disable",
                         "alert.rule-preview", "alert.route-preview", "alert.catalog", "alert.resources", "alert.center", "alert.detail", "alert.deliveries", "alert.health", "alert.configuration.list", "alert.configuration.save", "alert.configuration.retire", "alert.preview", "alert.test", "alert.test-result", "alert.retry",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.select", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
+                        "retry-settings.get", "retry-settings.replace",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "sample-source.list", "sample-source.install", "state-store.connect",
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",

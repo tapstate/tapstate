@@ -78,6 +78,7 @@ pipeline_observation | cache | MongoCachePipelineObservationStore | migrated | 1
 source_schemas | cache | MongoCacheSchemaStore | migrated | 1 | -
 connector_catalog | cache | MongoCacheConnectorCatalogStore | migrated | 1 | -
 connector_specs | cache | MongoCacheConnectorSpecStore | migrated | 1 | -
+connector_artifact_holdings | cache | MongoCacheConnectorArtifactHoldings | owned-elsewhere | 0 | -
 connection_test_results | cache | MongoCacheConnectionTestResultStore | migrated | 1 | -
 connector_artifacts (gridfs) | cache | MongoCacheConnectorRegistry | immutable | 1 | metadata.connectorId
 derived_schemas | cache | MongoCacheDerivedSchemaStore | migrated | 1 | -
@@ -108,3 +109,4 @@ alert_target_limits | config | MongoAlertNotificationStore | migrated | 2 | _id.
 alert_test_quotas | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
 alert_node_lifecycles | config | MongoAlertNodeLifecycleStore | migrated | 1 | authorityId+clusterId+phase+nodeId+bootId
 ai_provider_settings | config | MongoConfigurationAiProviderSettingsStore | migrated | 2 | -
+retry_settings | config | MongoRetrySettingsStore | migrated | 1 | -

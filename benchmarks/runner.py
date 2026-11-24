@@ -11,8 +11,10 @@ import threading
 import time
 import uuid
 
+import baseline
 import catalog as definitions
 import report
+import workloads
 
 
 ROOT = definitions.BENCHMARKS.parent
@@ -112,6 +114,14 @@ def make_entries(cases, args):
     return [{"case": case, "scale": "qualification", **load} for case in cases]
 
 
+def resolve_entries(cases, args):
+    if not args.formal_workloads:
+        return make_entries(cases, args), []
+    if any(hasattr(args, name) for name in LOAD_DEFAULTS):
+        raise ValueError("Formal workloads do not allow command-line load overrides")
+    return workloads.resolve(cases, definitions.read_json(args.formal_workloads), LOAD_DEFAULTS.keys())
+
+
 def allocate(entries, estimates, slots, limit, deadline, reserve):
     if slots < 1 or limit < 1 or deadline < 1 or not 0 <= reserve < deadline:
         raise ValueError("Specify positive capacity, with a reserve shorter than the total deadline")
@@ -191,6 +201,9 @@ def require_clean_manifest_checkout(catalog):
 
 def run_entries(entries, binding, args, manifest=None):
     checked_entries(entries)
+    deadline = getattr(args, "stop_at_epoch_seconds", None)
+    if deadline is not None and deadline <= time.time():
+        raise ValueError("The batch measurement deadline has already expired")
     if not args.boot_jar.is_file() or not args.connectors.is_dir():
         raise ValueError("Supply the candidate OP boot jar and pinned connector directory")
     output = args.output.resolve()
@@ -203,6 +216,7 @@ def run_entries(entries, binding, args, manifest=None):
         "entries": entries,
         "connector_dir": str(args.connectors.resolve()),
         "output": str(output),
+        "endpoint_latency_probe": getattr(args, "endpoint_latency_probe", False),
     }
     request_file = output / "request.json"
     write_json(request_file, request)
@@ -237,7 +251,8 @@ def run_entries(entries, binding, args, manifest=None):
         sampler.start()
         code = 1
         try:
-            code = wait_for_fixture(process, output, upper_bound, manifest, started, started_wall_ns)
+            code = wait_for_fixture(process, output, upper_bound, manifest, started, started_wall_ns,
+                                    stop_at_epoch_seconds=deadline)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             code = 124
         finally:
@@ -262,6 +277,8 @@ def run_entries(entries, binding, args, manifest=None):
                     status, reason = "measurement-incomplete", "Could not read the raw result file"
             else:
                 status, reason = "not-run", f"Runner exited with {code} before the raw repeat was recorded"
+                if (output / relative.parent).is_dir() and code == 124:
+                    status, reason = "timed-out", "Batch deadline expired during this repeat"
             results.append({
                 "run_id": run_id, "case_id": case["id"], "case_version": case["case_version"],
                 "repeat": repeat, "status": status, "reason": reason,
@@ -271,20 +288,30 @@ def run_entries(entries, binding, args, manifest=None):
                "mongo_resource_file": "mongo-resource.jsonl" if (output / "mongo-resource.jsonl").is_file() else None}
     if manifest:
         summary.update(batch=args.batch, manifest_sha256=manifest["manifest_sha256"])
+        if "github_attempt" in manifest and os.environ.get("GITHUB_ACTIONS") == "true":
+            summary["github_attempt"] = github_attempt()
     write_json(output / "summary.json", summary)
     print(json.dumps({"run_id": run_id, "results": str(output / "summary.json"),
                       "statuses": [result["status"] for result in results]}))
     return 1 if code or any(result["status"] != "completed" for result in results) else 0
 
 
-def wait_for_fixture(process, output, fixture_limit, manifest, started, started_wall_ns):
+def wait_for_fixture(process, output, fixture_limit, manifest, started, started_wall_ns,
+                     *, stop_at_epoch_seconds=None):
     reserve = manifest.get("reserve_seconds", 0) if manifest else 0
     if type(reserve) is not int or reserve < 0:
         raise ValueError("Manifest reserve must be a nonnegative integer")
-    if not reserve:
+    if not reserve and stop_at_epoch_seconds is None:
         return process.wait(timeout=fixture_limit)
-    build_deadline = started + reserve
-    total_deadline = build_deadline + fixture_limit
+    wall_limit = (float("inf") if stop_at_epoch_seconds is None else
+                  stop_at_epoch_seconds - started_wall_ns / 1_000_000_000)
+    if not reserve:
+        remaining = started + min(wall_limit, fixture_limit) - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, fixture_limit)
+        return process.wait(timeout=remaining)
+    build_deadline = started + min(wall_limit, reserve)
+    total_deadline = started + min(wall_limit, reserve + fixture_limit)
     marker = output / "fixture-started"
     while True:
         observed_at = time.monotonic()
@@ -365,6 +392,14 @@ def write_json(path, result):
     path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def github_attempt():
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+    if run_id < 1 or attempt < 1:
+        raise ValueError("Expected a positive GitHub run ID and attempt")
+    return {"run_id": run_id, "attempt": attempt}
+
+
 def positive(value):
     parsed = int(value)
     if parsed < 1:
@@ -395,6 +430,8 @@ def add_load(parser):
         parser.add_argument("--" + name.replace("_", "-"), type=positive, default=argparse.SUPPRESS)
     parser.add_argument("--mix", type=mix, default=argparse.SUPPRESS,
                         help="Override the allowed CDC mix, e.g. 100/0/0.")
+    parser.add_argument("--formal-workloads", type=Path,
+                        help="Resolve each selected case from a versioned formal workload registry.")
 
 
 def main():
@@ -418,6 +455,7 @@ def main():
     allocator.add_argument("--environment", required=True)
     allocator.add_argument("--estimates", type=Path, required=True)
     allocator.add_argument("--output", type=Path, required=True)
+    allocator.add_argument("--bind-github-attempt", action="store_true")
     execute = sub.add_parser("run")
     add_selection(execute)
     add_load(execute)
@@ -427,6 +465,10 @@ def main():
     execute.add_argument("--boot-jar", type=Path, default=ROOT / "app/target/app-0.8.0-boot.jar")
     execute.add_argument("--output", type=Path, required=True)
     execute.add_argument("--offline", action="store_true")
+    execute.add_argument("--endpoint-latency-probe", action="store_true",
+                         help="Observe source events and target confirmations on supported Copy live cases.")
+    execute.add_argument("--stop-at-epoch-seconds", type=positive,
+                         help="Stop the benchmark process at this absolute time, leaving time for evidence collection.")
     reporter = sub.add_parser("report")
     reporter.add_argument("--manifest", type=Path, required=True)
     reporter.add_argument("--summary", type=Path, action="append", default=[])
@@ -436,9 +478,10 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "report":
+            reference, reference_status = baseline.load(args.baseline)
             result = report.reconcile(definitions.read_json(args.manifest),
                                       [definitions.read_json(path) for path in args.summary],
-                                      definitions.read_json(args.baseline) if args.baseline else None)
+                                      reference, baseline_status=reference_status)
             write_json(args.output, result)
             if args.markdown:
                 args.markdown.write_text(report.markdown(result), encoding="utf-8")
@@ -451,10 +494,13 @@ def main():
                   if args.format == "json" else definitions.render_markdown(catalog, selected))
             return 0
         if args.command == "run" and args.manifest:
-            if args.id or args.where or args.suite != "all":
-                raise ValueError("Select in the manifest or on the command line")
+            if args.id or args.where or args.suite != "all" or args.formal_workloads:
+                raise ValueError("Select the cases and workloads in the manifest or on the command line")
             manifest = definitions.read_json(args.manifest)
             entries = replay(catalog, manifest, args.batch)
+            if ("github_attempt" in manifest and os.environ.get("GITHUB_ACTIONS") == "true"
+                    and manifest["github_attempt"] != github_attempt()):
+                raise ValueError("Manifest belongs to another GitHub run attempt")
             for name in LOAD_DEFAULTS:
                 if hasattr(args, name) and any(entry[name] != getattr(args, name) for entry in entries):
                     raise ValueError(f"--{name.replace('_', '-')} conflicts with the manifest batch")
@@ -468,21 +514,39 @@ def main():
                       "cases": [case_listing(case) for case in page]}
             print(json.dumps(result, indent=2) if args.format == "json" else format_page(catalog, page, result))
             return 0
-        entries = make_entries(cases, args)
+        entries, missing_workloads = resolve_entries(cases, args)
         if args.command == "run":
+            if missing_workloads:
+                raise ValueError("; ".join(item["reason"] for item in missing_workloads))
             return run_entries(entries, binding, args)
         require_clean_manifest_checkout(catalog)
-        checked_entries(entries)
+        if entries:
+            checked_entries(entries)
         estimates = definitions.read_json(args.estimates)
         if estimates["environment"] != args.environment:
             raise ValueError("Timing estimates were recorded for a different environment")
-        allocation = allocate(entries, estimates["durations_seconds"], args.slots,
+        durations = (workloads.formal_estimates(entries, estimates) if args.formal_workloads
+                     else estimates["durations_seconds"])
+        allocation = allocate(entries, durations, args.slots,
                               args.batch_seconds, args.deadline_seconds, args.reserve_seconds)
+        allocation["unallocated"].extend(missing_workloads)
         manifest = {
             "identity": binding, "environment": args.environment,
             "execution_limit_seconds": min(args.batch_seconds, args.deadline_seconds - args.reserve_seconds),
             "selected_ids": [case["id"] for case in cases], **allocation,
         }
+        if args.formal_workloads:
+            manifest["scale"] = "formal"
+            manifest["whole_case_estimates_seconds"] = durations
+            manifest["selected_cases"] = [
+                {"id": case["id"], "version": case["case_version"], "scenario": case["description"],
+                 "mode": case["mode"], "phase": case["phase"], "profile": case["profile"],
+                 "repeats": case["workload_spec"]["repetition"]["count"],
+                 "paired_control": "paired-control" in case["tags"]}
+                for case in cases
+            ]
+        if args.bind_github_attempt:
+            manifest["github_attempt"] = github_attempt()
         manifest["manifest_sha256"] = definitions.digest(manifest)
         write_json(args.output, manifest)
         print(json.dumps({key: value for key, value in allocation.items() if key != "batches"}))

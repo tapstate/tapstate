@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "repositories": {
+    "oss": {
+      "baseUrl": "https://nexus.tapdata.net/repository/maven-releases/",
+      "bom": {
+        "groupId": "io.tapdata",
+        "artifactId": "connectors-bom",
+        "version": "2.0.11.20261024.3"
+      }
+    },
+    "enterprise": {
+      "baseUrl": "https://nexus.tapdata.net/repository/maven-releases/",
+      "bom": {
+        "groupId": "io.tapdata",
+        "artifactId": "connectors-enterprise-bom",
+        "version": "2.0.11.20261031.3"
+      }
+    }
+  }
+}
