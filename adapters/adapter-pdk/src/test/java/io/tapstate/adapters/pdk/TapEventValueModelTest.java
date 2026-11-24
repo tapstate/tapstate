@@ -1026,7 +1026,7 @@ class TapEventValueModelTest {
 
     @Test
     void aDecimal128TypeWithoutTheRequiredAccessorsCrashesAsAProgrammerError() throws Exception {
-        var decimal = TapEventCodec.class.getDeclaredMethod("decimal128Value", Object.class);
+        var decimal = PdkBsonDecimal.class.getDeclaredMethod("decimal128Value", Object.class);
         decimal.setAccessible(true);
 
         assertThatThrownBy(() -> decimal.invoke(null, new Object()))

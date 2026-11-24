@@ -249,7 +249,7 @@ jobs:
           fi
           if [[ "$SHARD" == app-* ]]; then
             test -n "${TAPSTATE_TEST_CLOUD_RELEASE_DIR:-}"
-            for connector in mongodb mysql postgres; do
+            for connector in mongodb mongodb-atlas mysql postgres; do
               connector_jar="$TAPSTATE_TEST_CLOUD_RELEASE_DIR/connectors/$connector-connector.jar"
               test -f "$connector_jar"
               export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.pdk.it.$connector-jar=$connector_jar"

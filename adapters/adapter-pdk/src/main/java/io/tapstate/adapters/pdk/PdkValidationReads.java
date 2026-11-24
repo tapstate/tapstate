@@ -139,7 +139,7 @@ public final class PdkValidationReads {
         var result=new AtomicReference<Metadata>();
         var reader=deferred(table,query,decode,submit->PdkValidationSession.inspect(connection.connectorId(),artifact,connection.settings(),table,projection,model->{
             String version=scope.version(model,artifact);
-            var structural=PdkSchemaDiscoverer.structuralModel(List.of(model)).tables().getFirst();
+            var structural=PdkSchemaDiscoverer.validationModel(List.of(model),artifact.className()).tables().getFirst();
             if(!table.equals(structural.name()))throw invalid("metadata.tableScope");
             var described=new Metadata(structural,new Binding(version,
                     PdkValidationModelVersion.codecBinding(artifact,configurationHash,version)));

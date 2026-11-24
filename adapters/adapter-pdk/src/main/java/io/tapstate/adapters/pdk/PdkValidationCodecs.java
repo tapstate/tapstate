@@ -8,6 +8,7 @@ import io.tapdata.entity.schema.type.TapNumber;
 import io.tapdata.entity.schema.type.TapJson;
 import io.tapdata.entity.schema.type.TapBinary;
 import io.tapdata.entity.schema.value.ByteData;
+import io.tapdata.entity.schema.value.TapNumberValue;
 import io.tapdata.entity.schema.value.TapRawValue;
 import io.tapdata.entity.schema.value.TapValue;
 import io.tapstate.core.common.TapstateException;
@@ -40,11 +41,17 @@ final class PdkValidationCodecs {
     private final String connectorId;
     private final String binding;
     private final TapCodecsRegistry registry;
+    private final boolean bsonDecimals;
 
     PdkValidationCodecs(String connectorId, String binding, TapCodecsRegistry registry) {
+        this(connectorId, binding, registry, false);
+    }
+
+    PdkValidationCodecs(String connectorId, String binding, TapCodecsRegistry registry, boolean bsonDecimals) {
         this.connectorId = Objects.requireNonNull(connectorId, "connectorId");
         this.binding = Objects.requireNonNull(binding, "binding");
         this.registry = Objects.requireNonNull(registry, "registry");
+        this.bsonDecimals = bsonDecimals;
         if (connectorId.isBlank() || binding.isBlank()) throw new IllegalArgumentException("codec identity is required");
     }
 
@@ -213,6 +220,11 @@ final class PdkValidationCodecs {
         // The pinned SPI has no explicit not-applicable sentinel for a custom null result. Do not
         // invent a fallback convention. A non-null wrapper with a null payload is a distinct result.
         if (converted == null || converted instanceof TapRawValue) throw unavailable(field);
+        if (bsonDecimals && origin == Origin.CUSTOM && converted.getClass() == TapNumberValue.class
+                && PdkBsonDecimal.isNative(value)) {
+            var exact = PdkBsonDecimal.fromNarrowed(value, converted.getValue());
+            if (exact != null) return new Selected(exact, origin, binding);
+        }
         return new Selected(converted, origin, binding);
     }
 

@@ -159,7 +159,7 @@ def check(workflows, contexts, inputs):
     assert 'prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"' in shards
     assert 'TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release' in shards
     assert 'if [[ "$SHARD" == app-* ]]; then' in execute[1], 'App PDK inputs must stay in their selected Maven verify step'
-    assert 'for connector in mongodb mysql postgres; do' in execute[1], 'all direct-validation connector inputs are required'
+    assert 'for connector in mongodb mongodb-atlas mysql postgres; do' in execute[1], 'all direct-validation connector inputs are required'
     assert 'test -f "$connector_jar"' in execute[1], 'missing real connector inputs must fail before tests'
     assert '-Dtapstate.pdk.it.$connector-jar=$connector_jar' in execute[1], 'real PDK paths must reach the original Maven forks'
     namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
@@ -278,7 +278,7 @@ for original, replacement in [
     (MAVEN_ARGS, MAVEN_ARGS.replace('${{ runner.temp }}/test-tmp', '/tmp')),
     ('mkdir -p "$RUNNER_TEMP/test-tmp"', 'echo missing-test-tmp'),
     ('if [[ "$SHARD" == app-* ]]; then', 'if false; then'),
-    ('for connector in mongodb mysql postgres; do', 'for connector in mongodb mysql; do'),
+    ('for connector in mongodb mongodb-atlas mysql postgres; do', 'for connector in mongodb mysql postgres; do'),
     ('test -f "$connector_jar"', 'true'),
     ('-Dtapstate.pdk.it.$connector-jar=$connector_jar', '-Dtapstate.pdk.it.unrelated-jar=$connector_jar'),
     ('permissions:\n', 'env:\n  MAVEN_ARGS: "-Dapi.version=1.44"\npermissions:\n'),
