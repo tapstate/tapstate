@@ -3912,7 +3912,8 @@ final class StoreBackedDagSource implements DagSource {
             if (direct) {
                 var source = captureBindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
                 return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.loadEpoch(),
-                        order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
+                        order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
+                        readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.artifactId())));
             }
             var source = captureBindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
             return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
@@ -3929,7 +3930,8 @@ final class StoreBackedDagSource implements DagSource {
             return SrsSourceProcessor.directMetaSupplier(vertex.pipelineId(),
                     vertex.resolution().ringName(vertex.table()), vertex.stream(),
                     sourceEpoch,
-                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
+                    readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.artifactId())));
         }
         // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
         // after one run dies the head can sit far below what this pipeline already landed, and starting there

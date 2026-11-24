@@ -615,6 +615,75 @@ class SrsSourceProcessorTest {
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
         ProcessorMetaSupplier meta = SrsSourceProcessor.snapshotOnlyMetaSupplier(
                 PIPELINE, ringName, "orders", 1L, RECORDED_STAMP, SourcePlacement.anyMember());
+        try {
+            withOneSlotOutbox(meta, (processor, outbox) -> {
+                // The row takes the only slot, refusing its bound without relying on worker scheduling.
+                assertThat(processor.complete()).isFalse();
+                assertThat(outbox.queue(0)).hasSize(1);
+                assertThat(describe((Envelope) outbox.queue(0).peek())).isEqualTo("orders|null|100|1:" + SourceOrder.SNAPSHOT_SEQ);
+                outbox.reset();
+                assertThat(processor.complete()).isFalse();
+                assertThat(outbox.queue(0)).hasSize(1);
+
+                List<Object> emitted = new ArrayList<>();
+                outbox.drainQueueAndReset(0, emitted, false);
+                assertThat(emitted).hasSize(1);
+                assertThat(processor.complete()).isFalse();
+                assertThat(outbox.queue(0)).containsExactly(new Watermark(0L, (byte) 7));
+
+                outbox.drainQueueAndReset(0, emitted, false);
+                assertThat(emitted).hasSize(2);
+                assertThat(processor.complete()).isFalse();
+                assertThat(outbox.queue(0)).isEmpty();
+            });
+        } finally {
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+        }
+    }
+
+    @Test
+    void anInterruptedRingBatchPublishesItsBoundBeforeReadingTheNextBatch() throws Exception {
+        String ring = "srs.chain.backpressured-read-batches";
+        fill(ring, 6);
+        var meta = SrsSourceProcessor.metaSupplier(PIPELINE, ring, "orders", StartFrom.earliest(),
+                null, 1L, SrsReadCursorPublisherFactory.NONE, RECORDED_STAMP, SourcePlacement.anyMember(), 2);
+        assertTwoRowsPerBound(meta);
+    }
+
+    @Test
+    void aPrivateCaptureBatchPublishesBoundsOnlyForTheRowsAlreadyEmitted() throws Exception {
+        String ring = "direct.backpressured-read-batches";
+        var buffer = new SnapshotBuffer();
+        for (int i = 0; i < 6; i++) {
+            buffer.append(PIPELINE, ring, Envelope.insert(i, "orders", Map.of("id", i), null)
+                    .withPosition(new ChainPosition(new SourceOrder(1, i), i == 5 ? "capture-end" : null)));
+        }
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        try {
+            var meta = SrsSourceProcessor.directMetaSupplier(PIPELINE, ring, "orders", 1L, RECORDED_STAMP,
+                    SourcePlacement.anyMember(), 2);
+            assertTwoRowsPerBound(meta);
+        } finally {
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+        }
+    }
+
+    private void assertTwoRowsPerBound(ProcessorMetaSupplier meta) throws Exception {
+        withOneSlotOutbox(meta, (processor, outbox) -> {
+            List<Object> emitted = new ArrayList<>();
+            for (int pass = 0; pass < 16; pass++) {
+                processor.complete();
+                outbox.drainQueueAndReset(0, emitted, false);
+            }
+            assertThat(emitted.stream().map(item -> item instanceof Watermark bound
+                    ? "bound-" + bound.timestamp() : "row-" + ((Envelope) item).position().order().seq()))
+                    .containsExactly("row-0", "row-1", "bound-2", "row-2", "row-3",
+                            "bound-4", "row-4", "row-5", "bound-6");
+        });
+    }
+
+    private void withOneSlotOutbox(ProcessorMetaSupplier meta,
+            java.util.function.BiConsumer<Processor, TestOutbox> check) throws Exception {
         Address address = hz.getCluster().getLocalMember().getAddress();
         meta.init(new TestProcessorMetaSupplierContext()
                 .setHazelcastInstance(hz).setTotalParallelism(1).setLocalParallelism(1));
@@ -634,31 +703,13 @@ class SrsSourceProcessorTest {
         try {
             processor.init(outbox, context);
 
-            // The row takes the only slot, refusing its bound without relying on worker scheduling.
-            assertThat(processor.complete()).isFalse();
-            assertThat(outbox.queue(0)).hasSize(1);
-            assertThat(describe((Envelope) outbox.queue(0).peek())).isEqualTo("orders|null|100|1:" + SourceOrder.SNAPSHOT_SEQ);
-            outbox.reset();
-            assertThat(processor.complete()).isFalse();
-            assertThat(outbox.queue(0)).hasSize(1);
-
-            List<Object> emitted = new ArrayList<>();
-            outbox.drainQueueAndReset(0, emitted, false);
-            assertThat(emitted).hasSize(1);
-            assertThat(processor.complete()).isFalse();
-            assertThat(outbox.queue(0)).containsExactly(new Watermark(0L, (byte) 7));
-
-            outbox.drainQueueAndReset(0, emitted, false);
-            assertThat(emitted).hasSize(2);
-            assertThat(processor.complete()).isFalse();
-            assertThat(outbox.queue(0)).isEmpty();
+            check.accept(processor, outbox);
         } finally {
             try {
                 processor.close();
                 supplier.close(null);
                 meta.close(null);
             } finally {
-                hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
                 thread.setContext(previous);
             }
         }
