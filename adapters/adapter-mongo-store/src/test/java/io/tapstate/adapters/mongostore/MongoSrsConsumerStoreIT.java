@@ -11,6 +11,8 @@ import io.tapstate.spi.store.SrsConsumerMembership;
 import io.tapstate.spi.store.SrsConsumerStore;
 import io.tapstate.spi.store.SrsConsumerRun;
 import io.tapstate.spi.store.SrsSnapshotPin;
+import io.tapstate.spi.store.SrsCaptureCheckpoint;
+import io.tapstate.spi.store.SrsTableCheckpoint;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.SrsModel;
 import io.tapstate.spi.store.SrsModelKey;
@@ -114,17 +116,24 @@ class MongoSrsConsumerStoreIT {
 
     @Test void startupAttachRetryDoesNotUndoAConcurrentDetach() {
         withBusiness(f -> {
+            preparedTrimLog(f);
+            f.chains().requestTables(CHAIN, Set.of("orders"), f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.captureFence())).isTrue();
+            var key = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0);
+            var checkpoint = new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 4), "t4"),
+                    Map.of("orders", new SrsTableCheckpoint(key, 4)));
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
             var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
             var reader = new MongoSrsConsumerStore(f.client(), f.database(), SCOPE, () -> {}, () -> {});
             var beforeProof = new CountDownLatch(1);
             var afterDetach = new CountDownLatch(1);
             var paused = new java.util.concurrent.atomic.AtomicBoolean();
-            var chainReads = new java.util.concurrent.atomic.AtomicInteger();
+            var eventReads = new java.util.concurrent.atomic.AtomicInteger();
             try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
                 var start = executor.submit(() -> {
                     MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
-                        if ("aggregate".equals(command) && "srs_chains".equals(collection))
-                            chainReads.incrementAndGet();
+                        if ("find".equals(command) && "srs_events".equals(collection))
+                            eventReads.incrementAndGet();
                         if ("update".equals(command) && "workload_claims".equals(collection)
                                 && paused.compareAndSet(false, true)) {
                             beforeProof.countDown();
@@ -146,7 +155,7 @@ class MongoSrsConsumerStoreIT {
                     assertThat(f.consumers().detach(A, member.revision(), f.fenceA())).isPresent();
                 } finally { afterDetach.countDown(); }
                 var result = start.get(10, TimeUnit.SECONDS);
-                assertThat(chainReads.get()).as("the original startup transaction retried").isGreaterThanOrEqualTo(2);
+                assertThat(eventReads.get()).as("each transaction attempt must read the retained checkpoint event").isGreaterThanOrEqualTo(2);
                 assertThat(result).as("startup must preserve the newer detach").isEmpty();
                 assertThat(f.consumers().find(A.key()).orElseThrow().detached()).isTrue();
                 assertThat(f.consumers().progress(A)).isEmpty();
@@ -2523,6 +2532,7 @@ class MongoSrsConsumerStoreIT {
             finally { MongoCommandObservation.COLLECTIONS.remove(); }
             assertThat(loaded.checkpoint()).isEqualTo(checkpoint);
             System.out.println("FRESH_CHAIN_COMMANDS count=" + commands.size() + " commands=" + commands);
+            assertThat(commands).containsOnlyOnce("find:srs_events", "find:srs_models").doesNotContain("find:srs_model_contexts");
             assertThat(commands).hasSizeLessThanOrEqualTo(9);
         });
     }

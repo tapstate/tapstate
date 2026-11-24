@@ -229,7 +229,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
         Objects.requireNonNull(ring, "ring");
         if (split) return transaction(null, session -> {
             splitBounds(session, ring);
-            return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, seq))).first()).map(row -> checkedRecord(session, ring, row));
+            return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, seq))).first()).map(row -> checkedRecord(session, ring, row, null));
         });
         Document document = StoreIo.call(() -> collection.find(new Document("_id", key(ring, seq))).first());
         return document == null ? Optional.empty() : Optional.of(toRecord(document));
@@ -417,9 +417,9 @@ public final class MongoSrsLogStore implements SrsLogStore {
         return new RetainedBounds(known,rows);
     }
 
-    Optional<SrsLogRecord> loadInSession(ClientSession session, String ring, long sequence) {
+    Optional<SrsLogRecord> loadInSession(ClientSession session, String ring, long sequence, MongoSrsReadFacts facts) {
         return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, sequence))).first())
-                .map(row -> checkedRecord(session, ring, row));
+                .map(row -> checkedRecord(session, ring, row, facts));
     }
 
     private SrsLogBounds splitBounds(ClientSession session, String ring) {
@@ -467,9 +467,9 @@ public final class MongoSrsLogStore implements SrsLogStore {
     /** The model ranges the append proofs established under one lease; trusted only while that exact lease stands. */
     private record ProvenModels(WorkloadClaimFence fence, MongoSrsLease.Lease lease, Map<ProvenModel, MongoSrsModelStore.EventModelRange> ranges) {}
 
-    private SrsLogRecord checkedRecord(ClientSession session, String ring, Document stored) {
+    private SrsLogRecord checkedRecord(ClientSession session, String ring, Document stored, MongoSrsReadFacts facts) {
         SrsLogRecord event = splitRecord(stored);
-        if (models != null) models.requireEvent(session, ring, event, false).requireAt(splitSequence(stored), ring, event);
+        if (models != null) models.requireEvent(session, ring, event, false, facts).requireAt(splitSequence(stored), ring, event);
         return event;
     }
 

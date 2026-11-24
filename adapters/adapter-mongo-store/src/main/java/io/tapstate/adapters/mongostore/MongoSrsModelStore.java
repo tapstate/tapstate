@@ -349,7 +349,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
             if (originalCapture == null) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
             if (originalCapture.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(originalCapture.key().clusterId())) throw claimFenced();
             var chain = requireChain(session, expected);
-            var reference = eventReference(session, ring, expected.captureEpoch(), expected.modelVersion(), originalCapture, false, chain);
+            var reference = eventReference(session, ring, expected.captureEpoch(), expected.modelVersion(), originalCapture, false, chain, null);
             if (!expected.equals(reference.model().key())) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
             requireActive.run();
             return reference;
@@ -930,19 +930,19 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     EventModelRange requireEvent(ClientSession session, String ring, SrsLogRecord event, boolean writing) {
-        try { return eventRange(session, ring, event, writing); }
-        catch (TapstateException missing) {
+        return requireEvent(session, ring, event, writing, null);
+    }
+
+    EventModelRange requireEvent(ClientSession session, String ring, SrsLogRecord event, boolean writing, MongoSrsReadFacts facts) {
+        try {
+            return eventReference(session, ring, event.epoch(), event.schemaVer(), event.captureFence(), writing, null, facts).range();
+        } catch (TapstateException missing) {
             if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, event.epoch(), event.schemaVer());
             throw missing;
         }
     }
-    private EventModelRange eventRange(ClientSession session, String ring, SrsLogRecord event, boolean writing) {
-        return eventReference(session, ring, event.epoch(), event.schemaVer(), event.captureFence(), writing).range();
-    }
-    private ModelReference eventReference(ClientSession session, String ring, long epoch, long version, WorkloadClaimFence fence, boolean writing) {
-        return eventReference(session,ring,epoch,version,fence,writing,null);
-    }
-    private ModelReference eventReference(ClientSession session, String ring, long epoch, long version, WorkloadClaimFence fence, boolean writing,Document originalRoot) {
+    private ModelReference eventReference(ClientSession session, String ring, long epoch, long version,
+            WorkloadClaimFence fence, boolean writing, Document originalRoot, MongoSrsReadFacts facts) {
         if (version < 0 || epoch < 1 || fence == null) throw eventUnavailable(ring, epoch, version);
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())) throw claimFenced();
         var candidates = SystemCollections.SRS_MODELS.on(database).find(session, new Document("cacheIncarnation", scope.cacheIncarnation())
@@ -951,15 +951,15 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (candidates.isEmpty()) throw eventUnavailable(ring, epoch, version);
         if (candidates.size() != 1) throw unreadable();
         SrsModel model = decode(candidates.getFirst());
-        Document chain = originalRoot==null?requireChain(session, model.key()):requireChain(originalRoot,model.key());
-        var control = contexts.find(session, model.key());
+        Document chain = originalRoot == null ? requireChain(session, model.key(), facts) : requireChain(originalRoot, model.key());
+        var control = contexts.find(session, model.key(), facts);
         if (control == null) throw unavailable(model.key());
-        contexts.requireAnchor(session, chain, control);
+        contexts.requireAnchor(session, chain, control, facts);
         if (!fence.equals(control.fence())) throw claimFenced();
         if (writing && (!fence.key().resourceId().equals(chain.get("captureId"))
                 || !Long.valueOf(epoch).equals(chain.get("epoch")) || control.nextId() != null)) throw eventUnavailable(ring, epoch, version);
         requirePublished(control, model);
-        EventModelRange range = range(session, model, control);
+        EventModelRange range = range(session, model, control, facts);
         if (writing) {
             if (chain.getLong("modelWriteFence") >= Long.MAX_VALUE - 1) throw eventUnavailable(ring, epoch, version);
             // Capture replacement and context closure both write this root, including when claim IDs differ.
@@ -974,9 +974,6 @@ public final class MongoSrsModelStore implements SrsModelStore {
         return new ModelReference(model, control.fence(), range);
     }
 
-    private EventModelRange range(ClientSession session, SrsModel model, MongoSrsModelContexts.Context control) {
-        return range(session, model, control, null);
-    }
     private EventModelRange range(ClientSession session, SrsModel model, MongoSrsModelContexts.Context control, MongoSrsReadFacts facts) {
         return range(model, control, key -> requireModel(session, key, facts), id -> contexts.require(session, id, facts));
     }
