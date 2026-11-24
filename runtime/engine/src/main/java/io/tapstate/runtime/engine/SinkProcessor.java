@@ -491,27 +491,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 if (frontier != null) {
                     holdWord(settled.positions());
                 }
-                continue;
+            } else {
+                enqueue((Envelope) item);
             }
-            Envelope row = (Envelope) item;
-            if (moveWriter != null) {
-                KeyMoveHandoffs.Receipt receipt = moveWriter.receiptFor(row);
-                if (receipt != null) {
-                    queuedMove = reserveMove(row, receipt);
-                    receipt.queued();
-                    break;
-                }
-            }
-            ArrayDeque<Queued> queue = queued.get(row.src());
-            if (queue == null) {
-                queue = new ArrayDeque<>();
-                queued.put(row.src(), queue);
-                waitingSince.put(row.src(), nanoClock.getAsLong());
-            }
-            queue.add(new Queued(nextOrder++, row));
-            queuedRows++;
         }
-        if (queuedMove != null) {
+        if (queuedMove != null && moveWriter != null) {
             while (queuedRows + queuedMove.batch().size() < maxBatchSize && inbox.peek() instanceof Envelope next
                     && next.src().equals(queuedMove.row().src()) && moveWriter.receiptFor(next) == null
                     && queuedMove.admit().test(next)) {
@@ -525,11 +509,30 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
     }
 
-    private QueuedMove reserveMove(Envelope row, KeyMoveHandoffs.Receipt receipt) {
+    private void enqueue(Envelope row) {
+        if (moveWriter != null) {
+            KeyMoveHandoffs.Receipt receipt = moveWriter.receiptFor(row);
+            if (receipt != null) {
+                queuedMove = reserveMove(row, receipt, moveWriter);
+                receipt.queued();
+                return;
+            }
+        }
+        ArrayDeque<Queued> queue = queued.get(row.src());
+        if (queue == null) {
+            queue = new ArrayDeque<>();
+            queued.put(row.src(), queue);
+            waitingSince.put(row.src(), nanoClock.getAsLong());
+        }
+        queue.add(new Queued(nextOrder++, row));
+        queuedRows++;
+    }
+
+    private QueuedMove reserveMove(Envelope row, KeyMoveHandoffs.Receipt receipt, KeyMoveSinkWriter writer) {
         long firstOrder = nextOrder++;
         var batch = new ArrayList<Envelope>();
         var earlier = queued.get(row.src());
-        Predicate<Envelope> admit = moveWriter.batchAdmission(row);
+        Predicate<Envelope> admit = writer.batchAdmission(row);
         if (queued.size() == 1 && earlier != null) {
             boolean share = true;
             for (Queued item : earlier) {
@@ -545,7 +548,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 queuedRows -= earlier.size();
                 waitingSince.remove(row.src());
             } else {
-                admit = moveWriter.batchAdmission(row);
+                admit = writer.batchAdmission(row);
             }
         }
         batch.add(row);
