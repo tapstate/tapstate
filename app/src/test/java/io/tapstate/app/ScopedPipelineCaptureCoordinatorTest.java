@@ -244,6 +244,41 @@ class ScopedPipelineCaptureCoordinatorTest {
             verify(consumers, times(2)).progress(f.streamingContext);
         }
     }
+    @org.junit.jupiter.api.RepeatedTest(2)
+    void stopCanRetireItsOriginalSharedCaptureWhenHandoffStartsDuringTheFinalDemandRead() {
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofHours(1))) {
+            var node = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"), OWNER, 1, 0, 1);
+            when(f.ownership.parentNode()).thenReturn(node);
+            var held = ownedShared(f);
+            var owner = ownerOf(f, held);
+            var lease = (CaptureClaimLease) org.springframework.test.util.ReflectionTestUtils.getField(owner, "lease");
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var guarded = mock(SrsConsumerStore.class);
+            var guard = new AtomicReference<Runnable>();
+            doAnswer(call -> {
+                guard.set(call.getArgument(1));
+                return new SrsStores(stores.chains(), stores.models(), stores.log(), guarded);
+            }).when(f.sources).srs(eq(BUSINESS), any());
+            doAnswer(call -> {
+                // The checkout was already in flight when the original capture lost its proof.
+                doThrow(new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null))
+                        .when(f.authorization).requireCapture(eq(BUSINESS), eq(WorkloadClaimFence.from(held.claim())));
+                lease.renew();
+                guard.get().run();
+                throw new AssertionError("the ended capture still authorized a consumer read");
+            }).when(guarded).attached(held.chain());
+            doAnswer(call -> {
+                guard.get().run();
+                throw new AssertionError("the ended capture still authorized recovery inspection");
+            }).when(guarded).inspectSharedRecovery(held.preparation());
+
+            held.run().stopCapture("flow", false);
+            verify(guarded).attached(held.chain());
+            verify(held.tail()).close();
+            verify(f.ownership).release(held.claim());
+        }
+    }
+
     private static Object ownerOf(Fixture fixture, OwnedShared held) {
         synchronized (fixture.coordinator) {
             var owners = (Map<?, ?>) org.springframework.test.util.ReflectionTestUtils.getField(fixture.coordinator, "owners");

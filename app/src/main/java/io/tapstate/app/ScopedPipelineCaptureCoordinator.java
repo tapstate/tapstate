@@ -2048,7 +2048,12 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             else ShutdownAwait.future(preceding, shutdownDeadline);
         }
         try {
-            if (!owner.ended.get() && needed(owner)) return;
+            try {
+                if (!owner.ended.get() && needed(owner)) return;
+            } catch (TapstateException fenced) {
+                // Handoff may end this exact shared owner while Stop holds its retirement reservation.
+                if (!owner.ended.get() || !duringHandoff(owner, fenced)) throw fenced;
+            }
             owner.finishCheckpointingForRetirement();
             owner.ended.set(true);
             owner.release();
