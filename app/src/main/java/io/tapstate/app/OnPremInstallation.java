@@ -41,8 +41,19 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     void onStartupCompleted(Runnable action) { startupCompleted = Objects.requireNonNull(action); }
     @Override public Map<String,Object> initializationProgress() {
         var stage = files.stage();
-        return root.initializationProgress().snapshot().filter(value -> value.operationId().equals(stage.scope().operationId()))
+        return root.initializationProgress().snapshot()
+                .filter(value -> value.operationId().equals(stage.scope().operationId()))
+                .filter(value -> !restoredPublicationAlreadyReady(stage, value))
                 .map(StorageControlDispatcher::progress).orElse(Map.of());
+    }
+
+    private boolean restoredPublicationAlreadyReady(InstallationFiles.Stage stage, StorageInitializationProgress.View progress) {
+        return stage.handoff() == InstallationFiles.Handoff.CONFIGURED
+                && progress.restored() && progress.state() == StorageInitializationProgress.State.RUNNING
+                && progress.milestones().stream().anyMatch(milestone ->
+                        milestone.id() == StorageInitializationProgress.Stage.PUBLISH_READY
+                                && milestone.state() == StorageInitializationProgress.State.RUNNING)
+                && root.phase() == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted();
     }
 
     OnPremInstallation(StorageRoot root, InstallationFiles files, MongoProperties mongo, StorageSetupService.DefaultTarget target, Clock clock) {

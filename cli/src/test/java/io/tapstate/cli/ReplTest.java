@@ -33,6 +33,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -192,6 +193,8 @@ class ReplTest {
         ConnectionTestResultOutcome testResultOutcome = new ConnectionTestResultOutcome.Unreachable();
         ConnectionDiscoverSchemaOutcome discoverSchemaOutcome = new ConnectionDiscoverSchemaOutcome.Unreachable();
         ConnectionSchemaOutcome schemaOutcome = new ConnectionSchemaOutcome.Unreachable();
+        Optional<ConnectorRegisterOutcome> downloadOutcome = Optional.empty();
+        final List<String> downloadCalls = new ArrayList<>();
         ConnectorRegisterOutcome registerOutcome = new ConnectorRegisterOutcome.Unreachable();
         /** Per-artifact register outcomes keyed by artifact byte length (for batch/directory tests); falls back to {@link #registerOutcome}. */
         final Map<Integer, ConnectorRegisterOutcome> registerOutcomeByLength = new HashMap<>();
@@ -504,6 +507,12 @@ class ReplTest {
         public ConnectionSchemaOutcome schema(URI baseUrl, String credential, String id) {
             schemaCalls.add(credential + "@" + baseUrl + "/" + id);
             return healthy.contains(baseUrl) ? schemaOutcome : new ConnectionSchemaOutcome.Unreachable();
+        }
+
+        @Override
+        public Optional<ConnectorRegisterOutcome> downloadConnector(URI baseUrl, String credential, String id) {
+            downloadCalls.add(id);
+            return downloadOutcome;
         }
 
         @Override
@@ -3574,15 +3583,33 @@ class ReplTest {
                 .contains("newlyRegistered:");
     }
 
-    @Test
-    void registerForAMissingFileReportsCannotReadAndDoesNotCallTheServer(@TempDir Path workdir) {
+    @ParameterizedTest
+    @ValueSource(strings = {"nope.jar", "nope.JAR"})
+    void registerForAMissingFileReportsCannotReadAndDoesNotCallTheServer(String name, @TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.downloadOutcome = Optional.of(new ConnectorRegisterOutcome.Rejected("TS0380001", "Catalog refusal"));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
-        assertThat(h.repl().dispatch("register nope.jar")).isTrue();
+        assertThat(h.repl().dispatch("register " + name)).isTrue();
 
-        assertThat(h.sink().toString().substring(mark)).contains("register:").containsIgnoringCase("cannot read");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(h.sink().toString().substring(mark)).contains("register: cannot read", name);
+        assertThat(client.downloadCalls).isEmpty();
+        assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void registerWithAConnectorIdUsesTheServerCatalog(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.downloadOutcome = Optional.of(new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("mysql", "hash-mysql", "2.11.0", true)));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register mysql")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
+        assertThat(client.downloadCalls).containsExactly("mysql");
         assertThat(client.registerCalls).isEmpty();
     }
 

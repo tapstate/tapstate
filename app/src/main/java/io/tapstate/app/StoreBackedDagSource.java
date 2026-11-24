@@ -26,6 +26,7 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.PipelineSourceConfig;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -274,7 +275,39 @@ final class StoreBackedDagSource implements DagSource {
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
                 () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), captured.sinkConnectors(pipelineId),
-                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),confirmedHashes);
+                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),confirmedHashes,
+                pass == null ? List.of() : captured.connectorNodes(pipeline, models));
+    }
+
+    private List<PipelineConnectorExecutions.Node> connectorNodes(PipelineResource pipeline, SourceModelSnapshot models) {
+        var nodes = new ArrayList<PipelineConnectorExecutions.Node>();
+        boolean bounded = pipeline.settings() != null && pipeline.settings().readMode() == ReadMode.SNAPSHOT_ONLY;
+        for (var reference : pipeline.sources()) {
+            var source = StoredArtifacts.requireSource(artifacts(), reference.id());
+            var selection = SourceCaptureResolution.forPipeline(pipeline, reference, source, models.modelForBinding(reference.binding(), source));
+            if (selection.isEmpty()) continue;
+            boolean shared = !bounded && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs();
+            nodes.add(new PipelineConnectorExecutions.Node(reference.binding(), PipelineNode.Purpose.CAPTURE,
+                    source.connector(), PipelineSourceConfig.settings(reference, source),
+                    shared ? selection.orElseThrow().chainId().value() : null));
+        }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            var source = StoredArtifacts.requireSource(artifacts(), ViewTargetResolver.resolve(view, viewStoreId()).sourceId());
+            nodes.add(new PipelineConnectorExecutions.Node(view.id(), PipelineNode.Purpose.VIEW, source.connector(), source.config(), null));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            for (var element : serve.sync()) {
+                var source = StoredArtifacts.requireSource(artifacts(), element.source());
+                nodes.add(new PipelineConnectorExecutions.Node(syncNodeId(element), PipelineNode.Purpose.SYNC,
+                        source.connector(), source.config(), null));
+            }
+        }
+        return List.copyOf(nodes);
+    }
+
+    StoreBackedDagSource withConnectorExecutions(PipelineConnectorExecutions executions) {
+        if (sinkWriterBinder instanceof PdkSinkWriterBinder binder) binder.connectorExecutions = executions;
+        return this;
     }
 
     private record PreparedOperators(OperatorCoordinatePlan coordinates,Map<String,NestTable> tables,
@@ -5213,6 +5246,7 @@ final class StoreBackedDagSource implements DagSource {
         private final io.tapstate.adapters.pdk.ConnectorProvisioner provisioner;
         private final java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned;
         private final ArtifactStore artifacts;
+        private PipelineConnectorExecutions connectorExecutions;
         PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;this.recoveryPinned=ignored -> false;this.artifacts=null;}
         PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner){this(notes,provisioner,ignored -> false);}
         PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned){this(notes,provisioner,recoveryPinned,null);}
@@ -5222,7 +5256,9 @@ final class StoreBackedDagSource implements DagSource {
             if(original==null || original.scope()==null)return factory;
             if(!(factory instanceof PdkSinkWriterFactory sink))throw new IllegalStateException("the configured binder requires a concrete target factory");
             if(notes==null || provisioner==null)throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
-            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
+            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()),
+                    connectorExecutions == null ? null : connectorExecutions.selection(original.scope(), requireActive)
+                            .binding(sink.config().node().nodeId(), sink.purpose()));
             if(artifacts!=null) {
                 var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBinding)
                         .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));
@@ -5248,7 +5284,9 @@ final class StoreBackedDagSource implements DagSource {
             var eligible = eligibleStreams(sink, plan);
             if(eligible.isEmpty())return scoped(factory,original,plan.inputs,requireActive);
             if(notes==null || provisioner==null)throw new IllegalStateException("configured sampled targets require their original binder");
-            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
+            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()),
+                    connectorExecutions == null ? null : connectorExecutions.selection(original.scope(), requireActive)
+                            .binding(sink.config().node().nodeId(), sink.purpose()));
             if(artifacts!=null) {
                 var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBinding)
                         .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));

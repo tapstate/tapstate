@@ -188,7 +188,11 @@ def verify(layout: Path, lock_path: Path, boot_jar_path: Path | None = None, *,
         profile, console_url = PROVENANCE.declared_profile(web_profile, cloud_console_url)
     except PROVENANCE.ProvenanceError as exc:
         raise ImageError(str(exc)) from exc
-    required_ids = STAGING.ONPREM_IDS if profile == "onprem" else STAGING.REQUIRED_IDS
+    version = object_from_bytes(lock_path.read_bytes(), "connector lock").get("schemaVersion")
+    if version == 3:
+        required_ids = STAGING.PUBLISHED_ONPREM_IDS if profile == "onprem" else STAGING.CLOUD_IDS
+    else:
+        required_ids = STAGING.ONPREM_IDS if profile == "onprem" else STAGING.REQUIRED_IDS
     try:
         entries, license_files = STAGING.read_lock(lock_path, required_ids)
         lock_bytes = lock_path.read_bytes()

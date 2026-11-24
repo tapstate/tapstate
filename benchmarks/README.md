@@ -97,6 +97,80 @@ python3 -B benchmarks/runner.py run --manifest /tmp/perf-manifest.json --batch 0
 The manifest binds the exact checkout, definitions and effective load. A missing
 estimate or case that does not fit is recorded in the allocation and blocks replay.
 
+## Formal workloads on hosted runners
+
+Pipeline Performance provides a separate manual dispatch. Select a branch or tag
+and choose all cases, one primary group, dimension filters, or exact case IDs.
+Scheduled runs select all cases after the first scheduled Nightly Test attempt
+on the default branch completes.
+
+Formal recipes live in `cases/formal-workloads.json`. Each `ID@version` entry
+contains a recipe version, the case definition SHA-256 and every effective load
+field. Pass that file as `--formal-workloads` to `run` for a local calibration
+or to `allocate` for hosted execution. Qualification commands keep their explicit
+load options. Formal workloads use the catalog's repeat count and operation mix.
+
+`cases/hosted-runner-estimates.json` binds each estimate to a formal workload
+digest and the `ubuntu-24.04-x64-op` environment. Entries with an
+`observed_whole_case_seconds` field come from a completed same-workload run,
+including all repeats and arms. A `projection` identifies its hosted reference,
+the bounded qualification estimate and the work scheduled at the formal scale.
+Live projections budget the full warm-up and scoring windows for every repeat,
+arm and lifecycle cycle before adding the larger of the observed hosted overhead
+and the remaining qualification estimate. Snapshot and backlog projections use
+comparable hosted input volumes and the qualification estimate as a floor. The
+already observed elapsed time of a matching single repeat can raise a
+projection. The hosted planning margin is 25% plus 60 seconds per case.
+
+The preparation summary shows each selected case version, profile, repeat count,
+paired-control requirement, estimate and batch. The manifest preserves the
+individual estimates with the frozen case definitions and load. A selection with
+missing or mismatched recipes or estimates publishes an incomplete allocation
+and leaves every measurement job skipped.
+
+Initial snapshot sizes are 100,000 rows for small and standard, 25,000 for wide
+and 10,000 for large. Individual calibrated recipes can retain other input
+sizes. Formal live workloads normally use 100 events per second with a 30-second
+warm-up and a 300-second scoring window. The two-input Union live case uses a
+hosted-calibrated rate of 50 events per second across both streams. The paired
+hotspot cases use lower, versioned rates to preserve the hot-region allocation
+when mutations sample existing keys without replacement. Lifecycle repeats
+retain three cycles with shorter scoring windows and matching idle observations.
+
+The report artifact `performance-report-<attempt>` includes `report.json` and
+`report.md`. The input and batch artifact names also carry the attempt. Reproduce
+a result with its case version, tested SHA, workload, and environment profile.
+Use **Run workflow** to start a new run for a repeat measurement. **Re-run all
+jobs** can remove the first run's artifacts before the workflow rejects the new
+attempt. If the first report upload succeeded and the report is gone after a
+rerun, the health check records its removal and leaves notification state
+unchanged.
+
+The scheduled health workflow runs from the default branch. It sends through
+the `PERFORMANCE_FEISHU_WEBHOOK` repository Actions secret for the synchronization
+performance bot. The group notification shows run-wide coverage and links to
+the same Actions attempt for the full evidence.
+
+Delivery state advances after the webhook confirms acceptance. A definite
+rejection leaves the previous state available for the next scheduled check.
+If a receipt is missing or ambiguous, the workflow records the source health
+run and retains the pending intent so it does not send a possible duplicate.
+
+### Released baselines
+
+At preparation, the runner reads `baselines/releases.json` from a pinned commit
+in the public `tapstate-performance` repository. The version 1 release record
+has an `active` mapping from environment profile to version and a `versions`
+mapping whose entries specify `id`, `environment`, `code_sha`, `commit`, `path`,
+and the `sha256` of the baseline file. The file at that exact commit includes
+the same ID, version, environment and measured code SHA, declares `kind: accepted`,
+and contains the `cases` mapping. A publisher advances `active` after verifying
+the published content. Manual dispatch can select an earlier published version.
+
+The preparation artifact preserves the chosen release identity and content.
+When a baseline is unavailable or invalid, the report retains coverage and
+execution results and records why comparison was unavailable.
+
 ## Walk through a delivery candidate on local OP
 
 Allocation and manifest replay require a clean candidate checkout, including the

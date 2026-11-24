@@ -86,6 +86,7 @@ final class PipelineRecoveryInspector {
         if(inputs.selectedTables().values().stream().allMatch(Set::isEmpty))throw invalid("Full recovery requires a non-empty resolved source selection.");
         var artifacts=new TreeMap<String,String>();var modelHashes=new TreeMap<String,String>();
         var originalContexts=new LinkedHashMap<String,SourceResource>();
+        var predecessor = configuration.intents().connectorBindings().previousForRecovery(scope).orElse(null);
         var resolver=new TargetModelResolver(store,snapshot,models::model);
         for(var ref:pipeline.sources()) {
             var source=sources.get(ref.id());
@@ -113,9 +114,18 @@ final class PipelineRecoveryInspector {
             boolean shared=ref instanceof SourceRef.Spec spec && spec.srs()
                     && (pipeline.settings()==null || pipeline.settings().readMode()!=ReadMode.SNAPSHOT_ONLY);
             if(shared) {
-                var retained=configuration.capturePreparations().inspectSharedOrigin(new CacheBusinessScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation()),ref.binding(),CanonicalHash.of(source),pipeline.id(),CanonicalHash.of(authored));
-                var expected=ConnectorNoteOrigin.capture(source.connector(),artifacts.get(source.connector()),PipelineSourceConfig.settings(ref, source));
-                if(retained.isPresent() && !retained.orElseThrow().equals(expected))throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH,Map.of(),null);
+                var bound = predecessor == null ? null : predecessor.find(ref.binding(), PipelineNode.Purpose.CAPTURE).orElse(null);
+                if (bound != null && bound.chainId() != null) {
+                    var notes = configuration.requiredNotes().guardedBy(active);
+                    var origin = notes.origin(bound.notes());
+                    var expected = ConnectorNoteOrigin.capture(source.connector(), bound.sha256(), PipelineSourceConfig.settings(ref, source));
+                    if (!origin.equals(expected)) throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
+                    connectors.resolveRetained(notes, bound.notes(), origin);
+                } else {
+                    var retained=configuration.capturePreparations().inspectSharedOrigin(new CacheBusinessScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation()),ref.binding(),CanonicalHash.of(source),pipeline.id(),CanonicalHash.of(authored));
+                    var expected=ConnectorNoteOrigin.capture(source.connector(),artifacts.get(source.connector()),PipelineSourceConfig.settings(ref, source));
+                    if(retained.isPresent() && !retained.orElseThrow().equals(expected))throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH,Map.of(),null);
+                }
             }
         }
         var targets=new ArrayList<Target>();
@@ -133,8 +143,9 @@ final class PipelineRecoveryInspector {
             originalContexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,view.id()),PipelineNode.Purpose.VIEW),target);
         }
         if(targets.isEmpty())throw invalid("Full recovery requires a configured write target.");
+        var recoveryContexts = PipelinePrivateNoteRetirement.recoveryContexts(originalContexts, predecessor);
         for(var context:configuration.cacheRecoveries().inspectPrivateContexts(id)) {
-            var desired=originalContexts.get(context.scope().owner().namespace());
+            var desired=recoveryContexts.get(context.scope().owner().namespace());
             if(context.completed() || context.origin().isEmpty() || desired==null)continue;
             var origin=context.origin().orElseThrow();var expected=ConnectorNoteOrigin.capture(desired.connector(),artifacts.get(desired.connector()),desired.config());
             if(!origin.equals(expected)) {

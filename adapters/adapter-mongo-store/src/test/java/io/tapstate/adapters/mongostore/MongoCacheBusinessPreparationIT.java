@@ -64,7 +64,9 @@ class MongoCacheBusinessPreparationIT {
             Document ttl = SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(f.database).listIndexes().into(new ArrayList<>()).stream()
                     .filter(row -> row.containsKey("expireAfterSeconds")).findFirst().orElseThrow();
             assertThat(((Number) ttl.get("expireAfterSeconds")).longValue()).isEqualTo(Duration.ofDays(7).toSeconds());
-            assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("system_meta", "artifacts", "users", "pdk_notes");
+            assertThat(f.database.listCollectionNames().into(new ArrayList<>()))
+                    .doesNotContain("system_meta", "artifacts", "users", "pdk_notes",
+                            "connector_artifacts.files", "connector_artifacts.chunks");
         });
     }
 
@@ -77,6 +79,63 @@ class MongoCacheBusinessPreparationIT {
                 assertThat(reopened.loadBusinessScope(f.preparation.businessScope())).isEqualTo(f.preparation.businessScope());
             }
             assertThat(f.root()).isEqualTo(before); assertThat(f.schemas()).isEqualTo(schema);
+        });
+    }
+
+    @Test void retainedStartupPreparesOnlyTheAbsentAggregateStructure() {
+        withCache(StorageBinding.Mode.OP, Duration.ofDays(15), f -> {
+            var scope = f.domain.prepareInitialBusiness(f.preparation, ACTIVE);
+            var table = SystemCollections.CACHE_AGGREGATE_STATE.on(f.database);
+            table.drop();
+            var before = f.names();
+            var schema = f.schemas();
+
+            assertThatThrownBy(() -> f.domain.verifyBusinessReady(scope)).isInstanceOf(TapstateException.class);
+            f.domain.prepareRetainedAggregateState(scope, ACTIVE);
+            f.domain.verifyBusinessReady(scope);
+
+            assertThat(f.names()).containsAll(before).hasSize(before.size() + 1);
+            assertThat(table.countDocuments()).isZero();
+            assertThat(table.listIndexes().into(new ArrayList<>()))
+                    .extracting(index -> index.getString("name")).containsExactlyInAnyOrder("_id_", "operator_placement");
+            var ready = f.root();
+            f.domain.prepareRetainedAggregateState(scope, ACTIVE);
+            assertThat(f.root()).isEqualTo(ready);
+            assertThat(f.schemas()).isEqualTo(schema);
+        });
+    }
+
+    @Test void missingAggregateStructureWithRetainedReferencesIsNotCreated() {
+        withCache(StorageBinding.Mode.OP, Duration.ofDays(15), f -> {
+            var scope = f.domain.prepareInitialBusiness(f.preparation, ACTIVE);
+            var table = SystemCollections.CACHE_AGGREGATE_STATE;
+            table.on(f.database).drop();
+            var owner = new io.tapstate.spi.store.PipelineIntentScope(scope.clusterId(), scope.bindingVersion(),
+                    scope.cacheIncarnation(), "retained", 1);
+            SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database).insertOne(
+                    new Document("_id", MongoPipelinePreparationFacts.scope(owner))
+                            .append("placements", List.of(new Document("resource", "AGGREGATE_STATE"))));
+            var root = f.root();
+
+            assertThatThrownBy(() -> f.domain.prepareRetainedAggregateState(scope, ACTIVE))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.names()).doesNotContain(table.collectionName());
+            assertThat(f.root()).isEqualTo(root);
+        });
+    }
+
+    @Test void retainedStartupDoesNotRepairAnIncompleteBusinessCache() {
+        withCache(StorageBinding.Mode.OP, Duration.ofDays(15), f -> {
+            var scope = f.domain.prepareInitialBusiness(f.preparation, ACTIVE);
+            SystemCollections.CACHE_AGGREGATE_STATE.on(f.database).drop();
+            SystemCollections.CACHE_CONNECTOR_SPECS.on(f.database).drop();
+            var before = f.names();
+            var root = f.root();
+
+            assertThatThrownBy(() -> f.domain.prepareRetainedAggregateState(scope, ACTIVE))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.names()).containsExactlyInAnyOrderElementsOf(before);
+            assertThat(f.root()).isEqualTo(root);
         });
     }
 
@@ -189,11 +248,10 @@ class MongoCacheBusinessPreparationIT {
     }
 
     @Test void missingReadyStructuresIndexesOrGenesisRefuseWithoutRecreation() {
-        for (String fault : List.of("claims", "chunks", "model-index", "genesis", "counter")) withCache(StorageBinding.Mode.OP, Duration.ofDays(15), f -> {
+        for (String fault : List.of("claims", "model-index", "genesis", "counter")) withCache(StorageBinding.Mode.OP, Duration.ofDays(15), f -> {
             f.domain.prepareInitialBusiness(f.preparation, ACTIVE);
             switch (fault) {
                 case "claims" -> SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database).drop();
-                case "chunks" -> SystemCollections.CACHE_CONNECTOR_ARTIFACTS.chunksOn(f.database).drop();
                 case "model-index" -> SystemCollections.SRS_MODELS.on(f.database).dropIndex("srs_models_ring_version");
                 case "genesis" -> SystemCollections.CACHE_CLUSTER_MEMBERSHIP.on(f.database).deleteMany(new Document());
                 case "counter" -> SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document(), new Document("$unset", new Document("claimAdmissionFence", "")));

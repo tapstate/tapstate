@@ -95,6 +95,7 @@ class RealDummyPipelineIT {
             System.out.printf("Raw Dummy CDC records.out: %d -> %d%n", first, recordsOut(control, cdc));
             cli(server, storage, "metrics " + cdc + "\nexit\n");
 
+            disableSnapshotRetry(control);
             String failing = "dummy_op_failure";
             Files.writeString(work.resolve("src_failure.tap.yml"),
                     source("src_failure", 32, true, "[1]") + "  batch_timeouts: bad-interval\n");
@@ -772,6 +773,14 @@ class RealDummyPipelineIT {
                 exit
                 """.formatted(id));
         assertThat(applied).contains("dummy_orders", "primaryKey", "serial", "created  pipeline  " + id);
+    }
+
+    private static void disableSnapshotRetry(ControlPlane control) {
+        // The published Dummy requests retry for batch failures. This case exercises terminal reporting.
+        var defaults = Map.<String, Object>of("enabled", true, "intervalMillis", 60_000L,
+                "maxDurationMillis", Duration.ofHours(8).toMillis());
+        assertThat(control.replaceRetrySettings(0, defaults, Map.of("snapshot-read", Map.of("enabled", false)))
+                .statusCode()).isEqualTo(200);
     }
 
     private static void awaitState(ControlPlane control, String id, PipelineState state) {

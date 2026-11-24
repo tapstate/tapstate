@@ -63,6 +63,12 @@ final class PipelineFailures {
     static ObservationFailure of(String pipelineId, Throwable failure, Map<String, Object> diagnostic,
             io.tapstate.core.common.FailureFact.PublicFailure publicFailure) {
         var firstCoded = codedCause(failure);
+        if (firstCoded != null && firstCoded.code() == ConnectorError.LOCAL_ARTIFACT_UNAVAILABLE
+                && firstCoded.args().get("connector") instanceof String connector
+                && connector.length() <= MAX_DESCRIPTION_LENGTH && connector.matches("[A-Za-z0-9][A-Za-z0-9_.-]*")
+                && firstCoded.args().get("hash") instanceof String hash && hash.matches("[0-9a-f]{64}")) {
+            return new ObservationFailure(firstCoded.code().code(), Map.of("connector", connector, "hash", hash), diagnostic);
+        }
         if (publicFailure == null && firstCoded != null && firstCoded.code() instanceof ConnectorError) {
             var unavailable = io.tapstate.core.common.FailureFact.unavailable(failure);
             return of(pipelineId, failure, diagnostic.isEmpty() ? unavailable.diagnostic() : diagnostic,

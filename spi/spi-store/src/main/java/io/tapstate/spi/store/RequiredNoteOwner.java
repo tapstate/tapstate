@@ -20,6 +20,14 @@ public record RequiredNoteOwner(long bindingVersion, String namespace, Kind kind
                 node.pipelineId(), stateGeneration);
     }
 
+    public static RequiredNoteOwner forArtifact(long bindingVersion, PipelineNode node,
+            PipelineNode.Purpose purpose, long stateGeneration, String sha256, long intentRevision) {
+        Objects.requireNonNull(node, "node");
+        if (sha256 == null || !sha256.matches("[a-f0-9]{64}")) throw new IllegalArgumentException("invalid note artifact hash");
+        return new RequiredNoteOwner(bindingVersion, namespace(node, purpose) + ".artifact-" + sha256 + "-" + intentRevision,
+                Kind.PIPELINE, node.pipelineId(), stateGeneration);
+    }
+
     /** Whether this private identity belongs to the fixed connector purpose. */
     public boolean hasPurpose(PipelineNode.Purpose purpose) {
         return kind == Kind.PIPELINE && namespace.startsWith(pipelinePrefix(ownerId, purpose));

@@ -2698,7 +2698,13 @@ final class Repl {
             return registerDirectory(artifactPath, parsed.format());
         }
         PrintWriter err = commandLine.getErr();
-        boolean publishedId = !Files.exists(artifactPath) && PublishedConnectorArtifacts.contains(parsed.path());
+        boolean catalogCandidate = !Files.exists(artifactPath)
+                && !parsed.path().toLowerCase(Locale.ROOT).endsWith(".jar");
+        if (catalogCandidate) {
+            var installed = controlPlane.downloadConnector(session.landingNode(), session.credential(), parsed.path());
+            if (installed.isPresent()) return renderRegistrationOutcome(installed.get(), parsed.format());
+        }
+        boolean publishedId = catalogCandidate && PublishedConnectorArtifacts.contains(parsed.path());
         byte[] artifact;
         String artifactName;
         if (publishedId) {
@@ -2725,13 +2731,17 @@ final class Repl {
         ConnectorRegisterOutcome outcome = withFailover(() -> controlPlane.register(
                 session.landingNode(), session.credential(), artifact),
                 o -> o instanceof ConnectorRegisterOutcome.Unreachable);
+        return renderRegistrationOutcome(outcome, parsed.format());
+    }
+
+    private int renderRegistrationOutcome(ConnectorRegisterOutcome outcome, OutputFormat format) {
         return switch (outcome) {
             case ConnectorRegisterOutcome.Registered registered -> {
-                renderRegistered(registered.connector(), parsed.format());
+                renderRegistered(registered.connector(), format);
                 yield Cli.EXIT_OK;
             }
             case ConnectorRegisterOutcome.Rejected rejected -> {
-                renderRegisterRejection(rejected.code(), rejected.message(), parsed.format());
+                renderRegisterRejection(rejected.code(), rejected.message(), format);
                 yield Cli.EXIT_DIAGNOSTIC;
             }
             case ConnectorRegisterOutcome.TimedOut ignored -> reportRequestTimedOut();

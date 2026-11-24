@@ -6,10 +6,12 @@ import io.tapstate.core.catalog.CatalogEntryReader;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.BundledConnectorIcon;
+import io.tapstate.spi.store.ConnectorArtifactMetadata;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.RegistrationSource;
 import org.bson.BsonBinarySubType;
+import org.bson.BsonType;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.bson.types.Binary;
@@ -23,6 +25,7 @@ import static com.mongodb.client.model.Filters.exists;
 
 /** Derived catalog rows retain the shared catalog codec and one original CACHE scope. */
 final class MongoCacheConnectorCatalogStore implements ConnectorCatalogStore {
+    private static final Bson EARLIER_ROWS = com.mongodb.client.model.Filters.type("_id", BsonType.STRING);
     private static final String BUNDLED = "bundledArtifact";
     private static final String ICON = "icon";
     private static final String HASH = "contentHash";
@@ -49,14 +52,50 @@ final class MongoCacheConnectorCatalogStore implements ConnectorCatalogStore {
         }
         Document bundled = new Document(HASH, registration.contentHash())
                 .append(VERSION, registration.pdkApiVersion()).append(SOURCE, registration.source().name());
-        icon.ifPresent(value -> {
-            byte[] bytes = value.bytes();
-            if (value.mediaType().isBlank() || bytes.length > BundledConnectorIcon.MAX_BYTES) {
-                throw new IllegalArgumentException("Invalid bundled connector icon");
-            }
-            bundled.append(ICON, new Document("mediaType", value.mediaType()).append("bytes", new Binary(bytes)));
-        });
+        icon.ifPresent(value -> appendIcon(bundled, value));
         replace(id, normalized(entry).append(BUNDLED, bundled));
+    }
+
+    @Override public void upsertArtifact(ConnectorArtifactMetadata artifact) {
+        String id = artifact.catalog().id();
+        Document key = artifactKey(id, artifact.sha256());
+        var row = access.stamp(new Document("_id", key)
+                .append("entry", normalized(artifact.catalog()))
+                .append("version", artifact.version()).append(VERSION, artifact.pdkApiVersion())
+                .append("origin", artifact.origin().name()).append("sizeBytes", artifact.sizeBytes()));
+        artifact.icon().ifPresent(value -> appendIcon(row, value));
+        access.write(session -> {
+            access.collection.replaceOne(session, new Document("_id", key), row, new ReplaceOptions().upsert(true));
+            return null;
+        });
+    }
+
+    @Override public Optional<ConnectorArtifactMetadata> artifact(String connectorId, String sha256) {
+        Document key = artifactKey(connectorId, sha256);
+        return access.read(session -> {
+            Document row = access.collection.find(session, new Document("_id", key)).first();
+            if (row == null || !access.inScope(row, connectorId)) return Optional.empty();
+            try {
+                var entry = decode(row.get("entry", Document.class), connectorId);
+                return Optional.of(new ConnectorArtifactMetadata(entry, sha256, row.getString("version"),
+                        row.getString(VERSION), ConnectorArtifactMetadata.Origin.valueOf(row.getString("origin")),
+                        row.getLong("sizeBytes"), icon(row, connectorId)));
+            } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
+                throw MongoCacheMetadataAccess.unreadable(connectorId, "connector-artifact");
+            }
+        });
+    }
+
+    private Document artifactKey(String connectorId, String sha256) {
+        return access.stamp(new Document("connectorId", connectorId).append("sha256", sha256));
+    }
+
+    private static void appendIcon(Document row, BundledConnectorIcon value) {
+        byte[] bytes = value.bytes();
+        if (value.mediaType().isBlank() || bytes.length > BundledConnectorIcon.MAX_BYTES) {
+            throw new IllegalArgumentException("Invalid connector icon");
+        }
+        row.append(ICON, new Document("mediaType", value.mediaType()).append("bytes", new Binary(bytes)));
     }
 
     private static Document normalized(ConnectorCatalogEntry entry) {
@@ -79,7 +118,7 @@ final class MongoCacheConnectorCatalogStore implements ConnectorCatalogStore {
     @Override public List<ConnectorCatalogEntry> list() {
         return access.read(session -> {
             var entries = new ArrayList<ConnectorCatalogEntry>();
-            try (var cursor = access.collection.find(session).projection(CATALOG).iterator()) {
+            try (var cursor = access.collection.find(session, EARLIER_ROWS).projection(CATALOG).iterator()) {
                 while (cursor.hasNext()) {
                     Document row = cursor.next();
                     String id = id(row);
