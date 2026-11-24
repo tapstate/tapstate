@@ -24,6 +24,37 @@ public final class StateStoreSetupService {
         this.connections = Objects.requireNonNull(connections, "connections");
     }
 
+    /** Reads only the deployment-managed destination. A caller-supplied Source label grants no access. */
+    public String connectionUri(TapstatePrincipal caller, String id, Runnable active, AuditGate audit) {
+        var operation = ControlOperations.STATE_STORE_CONNECTION_URI;
+        boolean cloud = profile == DeploymentProfile.CLOUD;
+        var required = cloud ? Scope.WRITE : Scope.ADMIN;
+        var credential = cloud ? CredentialType.CLOUD_SESSION : CredentialType.HUMAN_JWT;
+        if (caller.credentialType() != credential || !caller.permits(required)) {
+            throw new TapstateException(ControlError.FORBIDDEN,
+                    Map.of("op", operation.id(), "required", required.name().toLowerCase(java.util.Locale.ROOT)), null);
+        }
+        active.run();
+        return audit.dispatch(operation, new AuditContext(caller.subject(), id), () -> {
+            if (artifacts.managedDefaultSourceId().filter(id::equals).isEmpty()) throw unavailable(id);
+            var inventory = artifacts.resourceInventory("source", id);
+            if (inventory.managedDefaultSourceId().filter(id::equals).isEmpty()) throw unavailable(id);
+            var uri = inventory.resources().stream().map(StoredResource::resource)
+                    .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)
+                    .filter(source -> id.equals(source.id())
+                            && ("mongodb".equals(source.connector()) || "mongodb-atlas".equals(source.connector())))
+                    .map(source -> source.config().get("uri")).filter(String.class::isInstance).map(String.class::cast)
+                    .filter(value -> value.startsWith("mongodb://") || value.startsWith("mongodb+srv://"))
+                    .findFirst().orElseThrow(() -> unavailable(id));
+            active.run();
+            return uri;
+        });
+    }
+
+    private static TapstateException unavailable(String id) {
+        return new TapstateException(SourceError.NOT_FOUND, Map.of("id", id), null);
+    }
+
     public SourceView connect(String principal, Map<String, Object> config) {
         if (profile != DeploymentProfile.CLOUD) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,

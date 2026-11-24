@@ -39,7 +39,7 @@ class ControlOperationsTest {
                         "source.delete",
                         "sample-source.list",
                         "sample-source.install",
-                        "state-store.connect",
+                        "state-store.connect", "state-store.connection-uri",
                         "connection.test",
                         "connection.test-result",
                         "connection.discover-schema",
@@ -254,6 +254,7 @@ class ControlOperationsTest {
         // reservation stays unpublished until its dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(88);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
+                && !"state-store.connection-uri".equals(op.id())
                 && !"system.pdk-version".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())
                 && !"ai-provider.select".equals(op.id()) && !op.id().startsWith("retry-settings.")
@@ -323,7 +324,7 @@ class ControlOperationsTest {
                         "ai-provider.get", "ai-provider.replace", "ai-provider.select", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
                         "retry-settings.get", "retry-settings.replace",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
-                        "sample-source.list", "sample-source.install", "state-store.connect",
+                        "sample-source.list", "sample-source.install", "state-store.connect", "state-store.connection-uri",
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "cluster.context", "view.list",
