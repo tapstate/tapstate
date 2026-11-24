@@ -269,6 +269,29 @@ class ASinkBatchesByCountOrByTimeTest {
         assertThat(writer.batches).containsExactly(List.of(2, 3), List.of(2));
     }
 
+    @Test
+    void consecutiveMovesOnDifferentKeysEachReceiveTheirOwnAcknowledgement() throws Exception {
+        var writer = new IndependentWriter() {
+            @Override
+            public KeyMoveHandoffs.Receipt receiptFor(Envelope row) {
+                Object id = row.after().get("id");
+                return new KeyMoveHandoffs.Receipt() {
+                    public void queued() { notices.add("queued " + id); }
+                    public void written() { notices.add("written " + id); }
+                };
+            }
+        };
+        var sink = sink(writer, null, null, 32, 0);
+        sink.process(0, inbox(row("orders", 3), row("orders", 4)));
+        assertThat(writer.notices).containsExactly("queued 3", "queued 4");
+        writer.completeAll();
+        sink.tryProcess();
+        assertThat(writer.notices).containsExactly("queued 3", "queued 4", "written 3");
+        writer.completeAll();
+        sink.tryProcess();
+        assertThat(writer.notices).containsExactly("queued 3", "queued 4", "written 3", "written 4");
+    }
+
     private static class IndependentWriter extends MoveWriter {
         @Override
         public Predicate<Envelope> batchAdmission(Envelope reserved) {

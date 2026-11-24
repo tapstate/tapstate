@@ -513,7 +513,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
         if (queuedMove != null) {
             while (queuedRows + queuedMove.batch().size() < maxBatchSize && inbox.peek() instanceof Envelope next
-                    && next.src().equals(queuedMove.row().src()) && queuedMove.admit().test(next)) {
+                    && next.src().equals(queuedMove.row().src()) && moveWriter.receiptFor(next) == null
+                    && queuedMove.admit().test(next)) {
                 queuedMove.batch().add((Envelope) inbox.poll());
                 nextOrder++;
             }

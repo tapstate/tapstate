@@ -10,7 +10,10 @@ import java.util.function.Predicate;
  * fan-out accounting and execution identity. Plain sink writers need no per-row lookup.
  */
 public interface KeyMoveSinkWriter extends SinkWriter {
-    /** The receipt for this effect, or null if it may join an ordinary target batch. */
+    /**
+     * Looks up the receipt without consuming it. The sink may inspect a row before removing it
+     * from the inbox. An ordinary row has no receipt.
+     */
     KeyMoveHandoffs.Receipt receiptFor(Envelope row);
 
     /**
