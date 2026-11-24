@@ -12,6 +12,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
+import com.hazelcast.jet.core.processor.SinkProcessors;
 import com.hazelcast.jet.core.processor.SourceProcessors;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.event.ChainPosition;
@@ -1130,6 +1131,117 @@ class JoinDriverTest {
     @Test
     void aRemoteDimensionOwnerKeepsTheReplacementAtTheOldKey() throws Exception {
         checkTheVacatedDimensionKey(new NodeWidth(STREAM, 1, 2, null), true);
+    }
+
+    @Test
+    void aLaterFactCanReuseTheVacatedIdentityOnItsOwnProcessor() throws Exception {
+        String pipeline = "native-fact-reuse-" + UUID.randomUUID();
+        var member = joinMember(pipeline, List.of());
+        var reused = new CountDownLatch(1);
+        FACT_REUSES.put(pipeline, reused);
+        try {
+            var partitions = member.getPartitionService();
+            String a = JoinKey.of(List.of(1L)).name();
+            int owner = partitions.getPartition(a).getPartitionId() % 2;
+            long nextId = LongStream.range(2, 100).filter(id ->
+                    partitions.getPartition(JoinKey.of(List.of(id)).name()).getPartitionId() % 2 != owner)
+                    .findFirst().orElseThrow();
+            var original = Map.<String, Object>of("id", 1L, "cust_id", 11L);
+            var arriving = Map.<String, Object>of("id", nextId, "cust_id", 11L);
+            var replacement = Map.<String, Object>of("id", 1L, "cust_id", 22L);
+            var move = new ChainPosition(new SourceOrder(1, 2), "move");
+            var reuse = new ChainPosition(new SourceOrder(1, 3), "reuse");
+            var stores = new ImapJoinStores(member, pipeline, STREAM);
+            stores.putFact(a, original);
+            stores.indexAdd("c", JoinKey.of(List.of(11L)).name(), a);
+            stores.putDimensionRow("c", JoinKey.of(List.of(11L)).name(), Map.of("id", 11L, "name", "Ada"));
+            stores.putDimensionRow("c", JoinKey.of(List.of(22L)).name(), Map.of("id", 22L, "name", "Grace"));
+            member.<Envelope>getList("facts").addAll(List.of(
+                    update(Map.of("id", 1L), arriving).withPosition(move),
+                    insert(replacement).withPosition(reuse)));
+            var dag = new DAG();
+            var facts = dag.newVertex("facts", SourceProcessors.readListP("facts"));
+            var customers = dag.newVertex("customers", SourceProcessors.readListP("empty"));
+            var output = JoinDag.attach(dag, planOf(JoinKind.LEFT), pipeline, STREAM,
+                    List.of("id"), Map.of("c", List.of("id")), source -> List.of(source.equals("o") ? facts : customers),
+                    vertex -> 0, delayedFactRemoval(), DimensionRowDisplacedAlert.NONE, new NodeWidth(STREAM, 2, 1, null));
+            dag.edge(Edge.from(output).to(dag.newVertex("result",
+                    SinkProcessors.writeListP("projected"))));
+            member.getJet().newJob(dag).getFuture().get(25, TimeUnit.SECONDS);
+            assertThat(stores.fact(a)).as("the new owner of the reused identity").containsEntry("cust_id", 22L);
+            String b = JoinKey.of(List.of(nextId)).name();
+            assertThat(stores.fact(b)).containsEntry("cust_id", 11L);
+            assertThat(stores.indexPage("c", JoinKey.of(List.of(11L)).name(), 0)).containsExactly(b);
+            assertThat(stores.indexPage("c", JoinKey.of(List.of(22L)).name(), 0)).containsExactly(a);
+            var projected = member.getList("projected").stream().filter(Envelope.class::isInstance)
+                    .map(Envelope.class::cast).toList();
+            assertThat(projected).anySatisfy(row -> {
+                assertThat(row.positions()).containsValue(reuse);
+                assertThat(row.after()).containsEntry("order_id", 1L).containsEntry("customer_name", "Grace");
+            }).anySatisfy(row -> {
+                assertThat(row.positions()).containsValue(move);
+                assertThat(row.after()).containsEntry("order_id", nextId).containsEntry("customer_name", "Ada");
+            });
+        } finally {
+            reused.countDown();
+            member.shutdown();
+            FACT_REUSES.remove(pipeline);
+        }
+    }
+
+    @Test
+    void aCompleteBeforeImageCanWithdrawTheOldFactWithoutAnotherMirrorRead() {
+        var fixture = new Fixture(JoinKind.LEFT);
+        var oldRow = Map.<String, Object>of("id", 1L, "cust_id", 11L, "note", "same");
+        var newRow = Map.<String, Object>of("id", 2L, "cust_id", 11L, "note", "same");
+        fixture.apply(fact(insert(oldRow)));
+        fixture.stores.forgetCounts();
+        var departure = new SourceChange("o", update(oldRow, newRow), fixture.factKeyOf(1L));
+        fixture.absorbOnly(departure);
+        assertThat(fixture.stores.singleReads).isZero();
+        assertThat(fixture.stores.batchReads).isZero();
+    }
+
+    @Test
+    void replayAtTheArrivingFactOwnerRepairsItsIndexWithoutTouchingTheReusedKey() {
+        var kept = new MapJoinStores(2);
+        var restarted = new Fixture(JoinKind.LEFT, kept);
+        String a = restarted.factKeyOf(1L);
+        String b = restarted.factKeyOf(2L);
+        var oldRow = Map.<String, Object>of("id", 1L, "cust_id", 11L, "note", "original");
+        var newRow = Map.<String, Object>of("id", 2L, "cust_id", 11L, "note", "original");
+        var replacement = Map.<String, Object>of("id", 1L, "cust_id", 22L, "note", "new");
+        kept.putFact(a, replacement);
+        // An unstamped mirror from an earlier version carries no proof of a completed index write.
+        kept.putFact(b, newRow);
+        var arrival = new SourceChange("o", update(oldRow, newRow), b);
+        restarted.applyBatch(List.of(arrival, arrival));
+        assertThat(kept.fact(a)).isEqualTo(replacement);
+        assertThat(kept.indexPage("c", JoinKey.of(List.of(11L)).name(), 0)).containsExactly(b);
+    }
+
+    private static final Map<String, CountDownLatch> FACT_REUSES = new ConcurrentHashMap<>();
+
+    private static JoinStoresBinding delayedFactRemoval() {
+        return (member, pipeline, node) -> new ForwardingJoinStores(new ImapJoinStores(member, pipeline, node)) {
+            @Override
+            public void removeFact(String key) {
+                try {
+                    // A later insert can reach the mirror while a removal on another processor is paused.
+                    FACT_REUSES.get(pipeline).await(3, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(e);
+                }
+                super.removeFact(key);
+            }
+
+            @Override
+            public void putFact(String key, Map<String, Object> row) {
+                super.putFact(key, row);
+                if (Long.valueOf(22).equals(row.get("cust_id"))) FACT_REUSES.get(pipeline).countDown();
+            }
+        };
     }
 
     private static HazelcastInstance joinMember(String pipeline, List<String> seeds) {

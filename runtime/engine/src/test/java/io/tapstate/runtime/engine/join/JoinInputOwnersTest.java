@@ -17,7 +17,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class DimensionOwnersTest {
+class JoinInputOwnersTest {
     @Test
     void aRefusedArrivalKeepsItsPositionAheadOfTheFollowingMarker() throws Exception {
         var position = new ChainPosition(new SourceOrder(1, 9), "p9");
@@ -42,12 +42,21 @@ class DimensionOwnersTest {
                         arriving);
     }
 
+    @Test
+    void anInvalidNewFactIdentityReachesValidationBeforeDetachingTheOldFact() throws Exception {
+        var invalid = Envelope.update(1, "orders", Map.of("id", 10L), Map.of("description", "missing id"), null);
+        assertThat(throughOneSlot(new JoinInputOwners(List.of("id"), true), invalid)).containsExactly(invalid);
+    }
+
     private static List<Object> throughOneSlot(Object... items) throws Exception {
         return throughOneSlot(List.of("id"), items);
     }
 
     private static List<Object> throughOneSlot(List<String> columns, Object... items) throws Exception {
-        var processor = new DimensionOwners(columns);
+        return throughOneSlot(new JoinInputOwners(columns, false), items);
+    }
+
+    private static List<Object> throughOneSlot(JoinInputOwners processor, Object... items) throws Exception {
         var outbox = new TestOutbox(new int[] {1}, 1);
         processor.init(outbox, new TestProcessorContext());
         var inbox = new TestInbox(List.of(items));

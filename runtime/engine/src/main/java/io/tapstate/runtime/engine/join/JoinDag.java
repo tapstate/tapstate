@@ -112,12 +112,14 @@ public final class JoinDag {
             }
             Vertex producer = producers.size() == 1 ? producers.get(0)
                     : merged(dag, vertex, source, producers, nextOutbound);
-            if (width.isNative() && !source.equals(factSource)) {
+            if (width.isNative()) {
                 // Preserve each producer FIFO through expansion, including preferred widths capped by Jet.
                 List<String> columns = keyColumns.get(source);
-                Vertex owners = dag.newVertex(nodeId + ":dimension-owners:" + edge,
+                boolean fact = source.equals(factSource);
+                String ownerStage = fact ? ":fact-owners:" : ":dimension-owners:";
+                Vertex owners = dag.newVertex(nodeId + ownerStage + edge,
                         ProcessorMetaSupplier.of(producer.getMetaSupplier().preferredLocalParallelism(),
-                                () -> new DimensionOwners(columns)))
+                                () -> new JoinInputOwners(columns, fact)))
                         .localParallelism(producer.getLocalParallelism());
                 dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(owners).isolated());
                 producer = owners;

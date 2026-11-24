@@ -14,15 +14,17 @@ import io.tapstate.runtime.engine.StageTimer;
 import java.util.List;
 import java.util.Objects;
 
-/** Addresses a dimension update to each bucket it mutates before the distributed partition edge. */
-final class DimensionOwners extends AbstractProcessor implements Staged {
+/** Addresses a join input to each state owner it mutates before the distributed partition edge. */
+final class JoinInputOwners extends AbstractProcessor implements Staged {
     private StageTimer timer = StageTimer.none(Stage.JOIN);
     private final List<String> columns;
+    private final boolean fact;
     private Tuple2<String, Envelope> departure;
     private Tuple2<String, Envelope> arrival;
 
-    DimensionOwners(List<String> columns) {
+    JoinInputOwners(List<String> columns, boolean fact) {
         this.columns = columns;
+        this.fact = fact;
     }
 
     @Override
@@ -55,6 +57,9 @@ final class DimensionOwners extends AbstractProcessor implements Staged {
             JoinKey oldKey = JoinKey.of(JoinKeys.valuesOf(event.before(), columns));
             if (!oldKey.matchable()) return tryEmit(item);
             JoinKey newKey = JoinKey.of(JoinKeys.valuesOf(event.after(), columns));
+            // A null dimension key can leave a match. A fact must have a valid new identity:
+            // pass the intact input to the normal validation before any removal can take place.
+            if (!newKey.matchable() && fact) return tryEmit(item);
             if (newKey.matchable() && oldKey.name().equals(newKey.name())) return tryEmit(item);
             departure = Tuple2.tuple2(oldKey.name(), event);
             if (newKey.matchable()) arrival = Tuple2.tuple2(newKey.name(), event);

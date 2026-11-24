@@ -14,9 +14,9 @@ import java.util.Objects;
  *
  * @param source the name the plan calls the source by
  * @param event  the change itself
- * @param dimensionOwner the dimension bucket to mutate when a change spans owners
+ * @param ownerKey the state bucket this processor may mutate for an addressed input
  */
-public record SourceChange(String source, Envelope event, String dimensionOwner) {
+public record SourceChange(String source, Envelope event, String ownerKey) {
 
     public SourceChange(String source, Envelope event) {
         this(source, event, null);
