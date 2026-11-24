@@ -265,6 +265,75 @@ class ScopedEngineLifecycleActuatorTest {
         verify(root).forRun(SCOPE, claim(1), new ExecutionFence(SCOPE, claim(1)));
     }
 
+    @Test void aSharedCaptureWaitReleasesItsUnsubmittedHotBindingsAcrossPasses() {
+        var placement = new OperatorPlacement(SCOPE, "cache", OperatorPlacement.Resource.NEST_STATE,
+                "nest", "[]", "state");
+        var capacity = new io.tapstate.runtime.engine.OperatorMapCapacity(placement, 512);
+        var coordinates = mock(OperatorCoordinatePlan.class);
+        when(coordinates.bind(any())).thenAnswer(call -> {
+            ExecutionFence fence = call.getArgument(0);
+            return new OperatorRunManifest("p", fence, List.of(new io.tapstate.runtime.engine.OperatorMapBinding(
+                    placement, fence, fence.operatorExecutionKey())));
+        });
+        when(coordinates.capacities()).thenReturn(List.of(capacity));
+        when(coordinates.nestDatabases()).thenReturn(Map.of());
+        preparation = new DagSource.StartPreparation(preparation.capacity(), preparation.stateLocations(),
+                preparation.artifactSnapshot(), preparation.planner(), preparation.sinkConnectors(), preparation.sourceModels(),
+                Optional.of(coordinates));
+        var member = mock(com.hazelcast.core.HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
+        when(member.getDistributedObjects()).thenReturn(List.of());
+        when(member.getConfig()).thenReturn(new com.hazelcast.config.Config());
+        var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,
+                (binding, active) -> mock(KeyedStateStore.class));
+        var installed = new ArrayList<OperatorRunManifest>();
+        var releasedHot = new ArrayList<OperatorRunManifest>();
+        var originalPorts = ports();
+        var recording = new ScopedEngineLifecycleActuator.Ports((original, capacities, members, guard) -> {
+            guard.run();
+            io.tapstate.runtime.engine.OperatorMapConfigurations.install(member, original, capacities);
+            installed.add(original);
+        }, original -> {
+            original.bindings().forEach(registry::release);
+            releasedHot.add(original);
+        }, originalPorts.rebuild(), originalPorts.plans());
+        doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("shared-owner-retrying")))
+                .when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), recording, submissions).start("p");
+        assertThat(registry.originals(SCOPE)).isEmpty();
+        assertThat(releasedHot).contains(installed.getFirst());
+        assertThat(installed.getFirst().executionIdentity()).isEqualTo(new ExecutionFence(SCOPE, claim(2)));
+
+        when(engine.captureRun("p")).thenReturn(Optional.empty());
+        var restartPass = new PipelineConvergencePass(pass.intent(), held.get(), views, () -> {});
+        when(dags.prepareStart(eq(restartPass), eq("cache"))).thenReturn(preparation);
+        new ScopedEngineLifecycleActuator(restartPass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), recording, submissions).start("p");
+        var stopIntent = new PipelineIntentSnapshot(SCOPE, 2,
+                new DesiredState("p", PipelineState.STOPPED, "hash", false));
+        var stopPass = new PipelineConvergencePass(stopIntent, held.get(), views, () -> {});
+        new ScopedEngineLifecycleActuator(stopPass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), recording, submissions).stop("p", false);
+        assertThat(registry.originals(SCOPE)).isEmpty();
+        assertThat(releasedHot).containsAll(installed);
+        assertThat(installed).hasSize(2);
+        verify(engine, never()).submitRun(anyString(), any(DAG.class), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
+    @Test void anUnreleasedWaitingManifestRemainsAvailableToFailedStartCleanup() {
+        doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("shared-owner-retrying")))
+                .when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        var attempts = new java.util.concurrent.atomic.AtomicInteger();
+        var unavailable = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "hot release interrupted"), null);
+        onRelease = () -> {
+            if (!prepared.isEmpty() && attempts.incrementAndGet() == 1) throw unavailable;
+        };
+        assertThatThrownBy(() -> actuator().start("p")).isSameAs(unavailable);
+        assertThat(attempts).hasValue(2);
+        assertThat(released).containsExactly(manifest(1), manifest(2));
+    }
+
     @Test void aRefusedRecoveryBeforeReplacementSurfacesTheStartFailure() {
         var time = new java.util.concurrent.atomic.AtomicLong();
         var retry = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));

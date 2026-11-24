@@ -207,7 +207,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     private Consumer<FailureFact> streamInterrupted;
     private Runnable streamRecovered = () -> {};
     private java.util.function.BooleanSupplier streamReopening = () -> false;
-    private Duration streamRecoveryConfirmationTimeout = Duration.ofMinutes(30);
+    private static final Duration STREAM_RECOVERY_CONFIRMATION_DELAY = Duration.ofMinutes(30);
+    private StreamRecoveryScheduler streamRecoveryScheduler = PdkCapturePort::scheduleStreamRecovery;
 
     public PdkCapturePort withReadRetries(Function<String, RetryPolicy> policies) {
         readRetries = Objects.requireNonNull(policies);
@@ -229,10 +230,16 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         return this;
     }
 
-    PdkCapturePort withStreamRecoveryConfirmationTimeout(Duration timeout) {
-        Objects.requireNonNull(timeout, "stream recovery confirmation timeout");
-        if (timeout.isZero() || timeout.isNegative()) throw new IllegalArgumentException("timeout must be positive");
-        streamRecoveryConfirmationTimeout = timeout;
+    @FunctionalInterface
+    interface StreamRecoveryScheduler {
+        default long nanoTime() { return System.nanoTime(); }
+
+        /** Schedule a future confirmation and return its cancellation action. */
+        Runnable scheduleAt(long cutoffNanos, Runnable confirm);
+    }
+
+    PdkCapturePort withStreamRecoveryScheduler(StreamRecoveryScheduler scheduler) {
+        streamRecoveryScheduler = Objects.requireNonNull(scheduler);
         return this;
     }
 
@@ -293,7 +300,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         configured.streamInterrupted = streamInterrupted;
         configured.streamRecovered = streamRecovered;
         configured.streamReopening = streamReopening;
-        configured.streamRecoveryConfirmationTimeout = streamRecoveryConfirmationTimeout;
+        configured.streamRecoveryScheduler = streamRecoveryScheduler;
         return configured.withOperationObserver(operationObserver).withOpeningFailure(openingFailure)
                 .withDeferredPreflightClose(deferredPreflightClose).withReadRetries(readRetries)
                 .withReplayableSnapshotTables(replayableSnapshot);
@@ -1410,7 +1417,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                         throw downstreamFailure;
                     }
                 }).stateListener((oldState, newState) -> {
-                    if (newState == StreamReadConsumer.STATE_STREAM_READ_STARTED) recovery.started();
+                    if (newState == StreamReadConsumer.STATE_STREAM_READ_STARTED) recovery.confirm();
                     else if (newState == StreamReadConsumer.STATE_STREAM_READ_ENDED) recovery.finishInvocation();
                 });
                 Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
@@ -1465,28 +1472,39 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
     }
 
+    private static Runnable scheduleStreamRecovery(long cutoffNanos, Runnable confirm) {
+        var timer = Thread.ofVirtual().name("tapstate-cdc-recovery-confirm").start(() -> {
+            long remaining = cutoffNanos - System.nanoTime();
+            if (remaining > 0) {
+                try { TimeUnit.NANOSECONDS.sleep(remaining); }
+                catch (InterruptedException cancelled) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            confirm.run();
+        });
+        return () -> {
+            if (timer != Thread.currentThread()) timer.interrupt();
+        };
+    }
+
     /** Serializes recovery signals and owns the no-callback observation timer for one invocation. */
     private final class StreamRecovery {
         private boolean closed;
         private boolean invocationActive;
         private boolean reportingRecovery;
-        private Thread timer;
+        private Runnable cancelConfirmation;
 
         synchronized boolean beginInvocation() {
             if (closed) return false;
             invocationActive = true;
             reportingRecovery = streamReopening.getAsBoolean();
             if (reportingRecovery) {
-                long cutoff = System.nanoTime() + streamRecoveryConfirmationTimeout.toNanos();
-                timer = Thread.ofVirtual().name("tapstate-cdc-recovery-confirm")
-                        .unstarted(() -> confirmAfterQuietWindow(cutoff));
-                timer.start();
+                long cutoff = streamRecoveryScheduler.nanoTime() + STREAM_RECOVERY_CONFIRMATION_DELAY.toNanos();
+                cancelConfirmation = streamRecoveryScheduler.scheduleAt(cutoff, this::confirm);
             }
             return true;
-        }
-
-        synchronized void started() {
-            confirm();
         }
 
         synchronized void interrupted(FailureFact failure) {
@@ -1506,21 +1524,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             finishInvocation();
         }
 
-        private void confirmAfterQuietWindow(long cutoff) {
-            long remaining = cutoff - System.nanoTime();
-            if (remaining > 0) {
-                try { TimeUnit.NANOSECONDS.sleep(remaining); }
-                catch (InterruptedException cancelled) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-            synchronized (this) {
-                confirm();
-            }
-        }
-
-        private void confirm() {
+        synchronized void confirm() {
             if (closed || !invocationActive || !reportingRecovery) return;
             reportingRecovery = false;
             cancelTimer();
@@ -1528,9 +1532,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
 
         private void cancelTimer() {
-            Thread previous = timer;
-            timer = null;
-            if (previous != null && previous != Thread.currentThread()) previous.interrupt();
+            var cancel = cancelConfirmation;
+            cancelConfirmation = null;
+            if (cancel != null) cancel.run();
         }
     }
 

@@ -179,7 +179,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             var members = planned.members();
             ports.operators().prepare(manifest,prepared.operatorPlan().orElseThrow().capacities(),members,this::require); require();
             try { capture.startCapture(id(),prepared.artifactSnapshot().orElseThrow(),prepared.sourceModels().orElseThrow()); }
-            catch (RingNotOpenYet waiting) { return; }
+            catch (RingNotOpenYet waiting) {
+                ports.releaseHot().accept(manifest);
+                manifest = null;
+                return;
+            }
             require(); pass.bindCapture(command,capture.captureBindings()); require();
             var built = planned.build(original); require();
             if (!members.equals(built.planned().members())) throw new IllegalStateException("topology changed its prepared members");

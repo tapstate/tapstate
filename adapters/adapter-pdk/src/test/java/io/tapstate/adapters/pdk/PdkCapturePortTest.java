@@ -1083,7 +1083,7 @@ class PdkCapturePortTest {
 
     @Test
     void aConnectorStartedSignalEndsQuietRecoveryWithoutAChangeOrPosition(@TempDir Path dir) throws Exception {
-        try (var probe = RecoveryProbe.open(dir, "started-heartbeat", Duration.ofSeconds(5));
+        try (var probe = RecoveryProbe.open(dir, "started-heartbeat");
              var sub = probe.start()) {
             assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(probe.started.await(5, TimeUnit.SECONDS)).isTrue();
@@ -1101,11 +1101,15 @@ class PdkCapturePortTest {
     }
 
     @Test
-    void aQuietInvocationWithoutStartedConfirmsAfterTheConfiguredObservationWindow(@TempDir Path dir) throws Exception {
-        try (var probe = RecoveryProbe.open(dir, "quiet", Duration.ofMillis(120));
+    void aQuietInvocationWithoutStartedConfirmsAtThirtyMinutes(@TempDir Path dir) throws Exception {
+        try (var probe = RecoveryProbe.open(dir, "quiet");
              var sub = probe.start()) {
             assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
-            assertThat(probe.recoveredSignal.await(5, TimeUnit.SECONDS)).isTrue();
+            probe.timer.advance(Duration.ofMinutes(30).minusNanos(1));
+            assertThat(probe.recovered).hasValue(0);
+            probe.timer.advance(Duration.ofNanos(1));
+            probe.timer.fire();
+            assertThat(probe.recovered).hasValue(1);
             assertThat(probe.started.getCount()).isOne();
             assertThat(probe.adapterStarts).hasValue(0);
             assertThat(probe.batches).hasValue(0);
@@ -1120,7 +1124,7 @@ class PdkCapturePortTest {
     void recoveryObservationStartsAtTheStreamInvocationAfterPreflight(@TempDir Path dir) throws Exception {
         var prepareEntered = new CountDownLatch(1);
         var prepareRelease = new CountDownLatch(1);
-        try (var probe = RecoveryProbe.open(dir, "quiet", Duration.ofMillis(120), actual -> {
+        try (var probe = RecoveryProbe.open(dir, "quiet", actual -> {
             prepareEntered.countDown();
             try {
                 if (!prepareRelease.await(5, TimeUnit.SECONDS)) throw new AssertionError("preflight never released");
@@ -1132,13 +1136,18 @@ class PdkCapturePortTest {
             var opening = caller.submit(probe::start);
             try {
                 assertThat(prepareEntered.await(5, TimeUnit.SECONDS)).isTrue();
-                assertThat(probe.recoveredSignal.await(400, TimeUnit.MILLISECONDS)).isFalse();
+                probe.timer.advance(Duration.ofMinutes(30));
+                assertThat(probe.timer.scheduled.get()).isNull();
+                assertThat(probe.recovered).hasValue(0);
             } finally {
                 prepareRelease.countDown();
             }
             try (var sub = opening.get(5, TimeUnit.SECONDS)) {
                 assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
-                assertThat(probe.recoveredSignal.await(5, TimeUnit.SECONDS)).isTrue();
+                probe.timer.advance(Duration.ofMinutes(30).minusNanos(1));
+                assertThat(probe.recovered).hasValue(0);
+                probe.timer.advance(Duration.ofNanos(1));
+                assertThat(probe.recovered).hasValue(1);
                 assertThat(probe.batches).hasValue(0);
                 assertThat(probe.terminalFailures).hasValue(0);
                 probe.commands.add("return");
@@ -1151,39 +1160,67 @@ class PdkCapturePortTest {
 
     @Test
     void anEarlySourceFailureDisarmsTheQuietObservationTimer(@TempDir Path dir) throws Exception {
-        try (var probe = RecoveryProbe.open(dir, "quiet", Duration.ofMillis(400));
+        try (var probe = RecoveryProbe.open(dir, "quiet");
              var sub = probe.start()) {
             assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
             probe.commands.add("fail");
             assertThat(probe.interrupted.await(5, TimeUnit.SECONDS)).isTrue();
-            assertThat(probe.recoveredSignal.await(700, TimeUnit.MILLISECONDS)).isFalse();
+            probe.assertDisarmed();
             assertThat(probe.terminalFailures).hasValue(0);
         }
     }
 
     @Test
     void aNormalReturnBeforeTheQuietWindowDisarmsItsTimer(@TempDir Path dir) throws Exception {
-        try (var probe = RecoveryProbe.open(dir, "return", Duration.ofMillis(120));
+        try (var probe = RecoveryProbe.open(dir, "return");
              var sub = probe.start()) {
             assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(probe.ended.await(5, TimeUnit.SECONDS)).isTrue();
-            assertThat(probe.recoveredSignal.await(400, TimeUnit.MILLISECONDS)).isFalse();
+            probe.assertDisarmed();
             assertThat(probe.terminalFailures).hasValue(0);
         }
     }
 
     @Test
     void closingAQuietSubscriptionCancelsItsRecoveryTimer(@TempDir Path dir) throws Exception {
-        var probe = RecoveryProbe.open(dir, "quiet", Duration.ofMillis(120));
+        var probe = RecoveryProbe.open(dir, "quiet");
         var sub = probe.start();
         try {
             assertThat(probe.entered.await(5, TimeUnit.SECONDS)).isTrue();
             sub.close();
-            assertThat(probe.recoveredSignal.await(400, TimeUnit.MILLISECONDS)).isFalse();
+            probe.assertDisarmed();
             assertThat(probe.terminalFailures).hasValue(0);
         } finally {
             sub.close();
             probe.close();
+        }
+    }
+
+    private static final class ManualRecoveryScheduler implements PdkCapturePort.StreamRecoveryScheduler {
+        private record Confirmation(long deadline, Runnable action) {}
+
+        private final AtomicLong now = new AtomicLong();
+        private final AtomicReference<Confirmation> scheduled = new AtomicReference<>();
+        private final CountDownLatch cancelled = new CountDownLatch(1);
+
+        @Override public long nanoTime() { return now.get(); }
+
+        @Override public Runnable scheduleAt(long deadline, Runnable confirm) {
+            assertThat(scheduled.compareAndSet(null, new Confirmation(deadline, confirm))).isTrue();
+            return cancelled::countDown;
+        }
+
+        void advance(Duration elapsed) {
+            long time = now.addAndGet(elapsed.toNanos());
+            var confirmation = scheduled.get();
+            if (confirmation != null && cancelled.getCount() != 0 && time >= confirmation.deadline()) {
+                confirmation.action().run();
+            }
+        }
+
+        // A timer may already be dispatching while the reader is being closed.
+        void fire() {
+            scheduled.get().action().run();
         }
     }
 
@@ -1194,7 +1231,7 @@ class PdkCapturePortTest {
         private final CountDownLatch heartbeat = new CountDownLatch(1);
         private final CountDownLatch ended = new CountDownLatch(1);
         private final CountDownLatch interrupted = new CountDownLatch(1);
-        private final CountDownLatch recoveredSignal = new CountDownLatch(1);
+        private final ManualRecoveryScheduler timer = new ManualRecoveryScheduler();
         private final BlockingQueue<String> commands = new LinkedBlockingQueue<>();
         private final AtomicInteger recovered = new AtomicInteger();
         private final AtomicInteger adapterStarts = new AtomicInteger();
@@ -1204,8 +1241,7 @@ class PdkCapturePortTest {
         private final AtomicInteger terminalFailures = new AtomicInteger();
         private final PdkCapturePort port;
 
-        private RecoveryProbe(Path dir, String mode, Duration timeout,
-                PdkCapturePort.StreamPreparer streamPreparer) throws Exception {
+        private RecoveryProbe(Path dir, String mode, PdkCapturePort.StreamPreparer streamPreparer) throws Exception {
             System.getProperties().put(channel + ".mode", mode);
             System.getProperties().put(channel + ".entered", entered);
             System.getProperties().put(channel + ".started", started);
@@ -1216,22 +1252,25 @@ class PdkCapturePortTest {
             var configured = new PdkCapturePort(provisioner(jar, "synthetic.RecoverySignalStreamSource", null))
                     .withReadRetries(operation -> new io.tapstate.core.common.RetryPolicy(true,
                             Duration.ofSeconds(1), Duration.ofHours(8)))
-                    .withStreamRecovery(failure -> interrupted.countDown(), () -> {
-                        recovered.incrementAndGet();
-                        recoveredSignal.countDown();
-                    }, () -> true)
-                    .withStreamRecoveryConfirmationTimeout(timeout);
+                    .withStreamRecovery(failure -> interrupted.countDown(), recovered::incrementAndGet, () -> true)
+                    .withStreamRecoveryScheduler(timer);
             if (streamPreparer != null) configured = configured.withStreamPreparation(streamPreparer);
             port = configured;
         }
 
-        static RecoveryProbe open(Path dir, String mode, Duration timeout) throws Exception {
-            return open(dir, mode, timeout, null);
+        static RecoveryProbe open(Path dir, String mode) throws Exception {
+            return open(dir, mode, null);
         }
 
-        static RecoveryProbe open(Path dir, String mode, Duration timeout,
-                PdkCapturePort.StreamPreparer streamPreparer) throws Exception {
-            return new RecoveryProbe(dir, mode, timeout, streamPreparer);
+        static RecoveryProbe open(Path dir, String mode, PdkCapturePort.StreamPreparer streamPreparer) throws Exception {
+            return new RecoveryProbe(dir, mode, streamPreparer);
+        }
+
+        void assertDisarmed() throws InterruptedException {
+            assertThat(timer.cancelled.await(5, TimeUnit.SECONDS)).isTrue();
+            timer.advance(Duration.ofMinutes(30));
+            timer.fire();
+            assertThat(recovered).hasValue(0);
         }
 
         Subscription start() {

@@ -427,7 +427,7 @@ final class Synthetic {
                 + "    consumer.accept(List.of(new io.tapdata.entity.event.control.HeartbeatEvent().init()), null);"
                 + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".heartbeat\")).countDown();"
                 + "  }"
-                + "  if (mode.equals(\"return\")) { consumer.streamReadEnded();"
+                + "  if (mode.equals(\"return\")) {"
                 + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".ended\")).countDown(); return; }"
                 + "  String command = ((java.util.concurrent.BlockingQueue<String>) System.getProperties().get(\"" + channel + ".commands\")).take();"
                 + "  if (command.equals(\"fail\")) throw new java.io.IOException(\"controlled source interruption\");"
