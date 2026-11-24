@@ -162,14 +162,14 @@ branch to build both repositories at the selected ref (the branch must exist in
 both repositories). Select `minor`, `patch`, or `major`; the version calculator
 uses the tagged `main` history so an unmerged feature branch does not need a
 release tag ancestor. The selected ref still supplies the Tapstate and Web source.
-Dev runs create no Git tags or releases. Main may replace the shared candidate
-version's `-dev` tag; each feature build publishes a tag with the Tapstate source
-SHA suffix for manual validation without changing main's image or the dev catalog.
+Dev runs create no Git tags or releases. Each run of this workflow publishes
+the shared candidate tag and registers the image in the dev catalog. For a
+temporary test on one Cluster, use the branch-pair workflow below.
 
 | Lane | Image | Version tag policy |
 | --- | --- | --- |
-| Cloud dev from main | `ghcr.io/tapstate/tapstate-cloud:<version>-dev` | Replaced by another main dev build of that version |
-| Cloud dev from a branch | `ghcr.io/tapstate/tapstate-cloud:<version>-dev-<tapstate-sha>` | Source-specific tag; cannot replace main's candidate |
+| Cloud dev publication | `ghcr.io/tapstate/tapstate-cloud:<version>-dev` | Replaced by another dev publication of that version |
+| Temporary branch pair | `ghcr.io/tapstate/tapstate-cloud:<version>-dev-<manifest-hash>` | Identifies the verified OCI index for one build |
 | Cloud release | `ghcr.io/tapstate/tapstate-cloud:<version>` | Independently rebuilt by release; different bytes cannot overwrite an existing tag |
 
 Configure the `cloud-ghcr-dev` environment with the dev `VITE_CLOUD_CONSOLE_URL`
@@ -225,7 +225,7 @@ from any Tapstate and tapstate-web branch pair. Fill `tapstate_branch` and
 `tapstate_web_branch` (default `main`); the run builds the Cloud Web bundle from
 the Web commit, the Boot JAR from the Tapstate commit, stages the locked
 connector seed, verifies both image platforms, and publishes
-`ghcr.io/tapstate/tapstate-cloud:<next-minor>-dev`. The version calculator counts
+`ghcr.io/tapstate/tapstate-cloud:<next-minor>-dev-<manifest-hash>`. The version calculator counts
 up from the tagged `main` history, so a feature branch needs no release tag of
 its own. The lane runs no test suite: the Boot JAR is packaged with
 `-DskipTests`, so test sources still compile for the modules that publish
@@ -234,8 +234,9 @@ and the image check before the push is a packaging assertion.
 
 The job summary and the `json` job output carry the branch pair, build version,
 digest reference, tag, Web commit id, and run URL. Unlike the dev lane above,
-this workflow always publishes the plain `-dev` tag for the selected branches and
-does not register the image in the dev release catalog. It uses the same
+this workflow uses the full SHA-256 of the verified OCI index as the tag suffix,
+including for a main/main build. It skips dev catalog registration. Use the
+digest reference to update the selected Cluster. It uses the same
 `cloud-ghcr-dev` environment and Public `tapstate-cloud` package, so the branch
 policy of that environment must allow the selected Tapstate ref.
 

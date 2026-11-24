@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Next version from main's release history. Branch images receive a source-specific dev tag."
+        description: "Next version from main's release history. Publishes the shared dev tag and registers it in Cloud."
         type: choice
         options: [minor, patch, major]
         required: true
