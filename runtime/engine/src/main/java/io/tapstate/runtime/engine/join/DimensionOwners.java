@@ -1,22 +1,48 @@
 package io.tapstate.runtime.engine.join;
 
 import com.hazelcast.jet.core.AbstractProcessor;
+import com.hazelcast.jet.core.Inbox;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.datamodel.Tuple2;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.sql.JoinKey;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.StageTimer;
 
 import java.util.List;
 import java.util.Objects;
 
 /** Addresses a dimension update to each bucket it mutates before the distributed partition edge. */
-final class DimensionOwners extends AbstractProcessor {
+final class DimensionOwners extends AbstractProcessor implements Staged {
+    private StageTimer timer = StageTimer.none(Stage.JOIN);
     private final List<String> columns;
     private Tuple2<String, Envelope> departure;
     private Tuple2<String, Envelope> arrival;
 
     DimensionOwners(List<String> columns) {
         this.columns = columns;
+    }
+
+    @Override
+    public Stage stage() {
+        return Stage.JOIN;
+    }
+
+    @Override
+    protected void init(Processor.Context context) {
+        timer = StageTimer.of(stage(), context);
+    }
+
+    @Override
+    public void process(int ordinal, Inbox inbox) {
+        long started = timer.begin();
+        try {
+            super.process(ordinal, inbox);
+        } finally {
+            timer.end(started);
+        }
     }
 
     @Override
