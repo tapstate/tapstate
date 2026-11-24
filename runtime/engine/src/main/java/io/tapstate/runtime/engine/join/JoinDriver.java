@@ -578,7 +578,7 @@ public final class JoinDriver {
         if (dimension == null) {
             throw new IllegalArgumentException("this join reads no source called " + change.source());
         }
-        absorbDimension(dimension, change.event());
+        absorbDimension(dimension, change.event(), change.dimensionOwner());
     }
 
     /**
@@ -778,18 +778,18 @@ public final class JoinDriver {
      * those rows are supposed to become matches, and they can only be found again because they were
      * written into the bucket when they missed.
      */
-    private void absorbDimension(Dimension dimension, Envelope event) {
+    private void absorbDimension(Dimension dimension, Envelope event, String owner) {
         Map<String, Object> after = event.after();
         Map<String, Object> before = event.before();
         String was = before == null ? null : keyOfDimensionRow(before, dimension);
         String now = after == null ? null : keyOfDimensionRow(after, dimension);
         boolean keyMoved = !Objects.equals(was, now);
 
-        if (was != null && keyMoved) {
+        if (was != null && keyMoved && (owner == null || owner.equals(was))) {
             stores.removeDimensionRow(dimension.source(), was);
             queueRecompute(dimension, was, event.ts(), event.positions());
         }
-        if (after == null || now == null) {
+        if (after == null || now == null || (owner != null && !owner.equals(now))) {
             // A dimension row whose join key holds a null matches nothing, by the same rule that makes
             // a null key on the other side match nothing. Keeping it would give it a bucket no fact row
             // can ever name.

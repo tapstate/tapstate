@@ -5,6 +5,8 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorSupplier;
+import com.hazelcast.jet.core.ProcessorMetaSupplier;
+import com.hazelcast.jet.datamodel.Tuple2;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.metrics.Metric;
 import com.hazelcast.jet.core.metrics.Metrics;
@@ -110,6 +112,16 @@ public final class JoinDag {
             }
             Vertex producer = producers.size() == 1 ? producers.get(0)
                     : merged(dag, vertex, source, producers, nextOutbound);
+            if (width.isNative() && !source.equals(factSource)) {
+                // Preserve each producer FIFO through expansion, including preferred widths capped by Jet.
+                List<String> columns = keyColumns.get(source);
+                Vertex owners = dag.newVertex(nodeId + ":dimension-owners:" + edge,
+                        ProcessorMetaSupplier.of(producer.getMetaSupplier().preferredLocalParallelism(),
+                                () -> new DimensionOwners(columns)))
+                        .localParallelism(producer.getLocalParallelism());
+                dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(owners).isolated());
+                producer = owners;
+            }
             dag.edge(width.into(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(vertex, edge),
                     nodeId, keyOf(keyColumns.get(source))));
         });
@@ -179,6 +191,9 @@ public final class JoinDag {
         return item -> {
             if (item instanceof SettledPositions) {
                 return SETTLED_POSITIONS_LANE;
+            }
+            if (item instanceof Tuple2<?, ?> change) {
+                return change.f0();
             }
             Envelope event = (Envelope) item;
             Map<String, Object> row = event.after() != null ? event.after() : event.before();
