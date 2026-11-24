@@ -106,6 +106,8 @@ class ProcessObservationWriterTest {
             var first = stage(writer, "first", 1);
             first.wrap(mock(ObservationStore.class)).afterSave(() -> {
                 assertThat(org.slf4j.MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY)).isEqualTo("first");
+                assertThat(org.slf4j.MDC.get(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY))
+                        .isEqualTo("1");
                 callbacks.add("first-watch");
             });
             writer.submit(first, () -> callbacks.add("first-history"), () -> callbacks.add("first-failed"));
