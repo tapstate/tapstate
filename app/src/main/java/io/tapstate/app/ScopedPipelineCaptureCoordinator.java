@@ -1147,7 +1147,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             boolean recovery = stores.recoveryPinned().test(session.original.scope());
             notes = source.artifact != null
                     ? ConfiguredCaptureRun.prepareBound(session.original, config, stores.notes(), connectors,
-                            guard, source.artifact, source.previousArtifact)
+                            guard, source.artifact, source.previousArtifact,
+                            source.shared && session.snapshot && stores.sources().supportsAdmittedCaptureStartup() && !recovery)
                     : source.shared && session.snapshot && stores.sources().supportsAdmittedCaptureStartup() && !recovery
                         ? ConfiguredCaptureRun.prepareStartup(session.original, config, stores.notes(), connectors, guard)
                         : ConfiguredCaptureRun.prepare(session.original, config, stores.notes(), connectors, guard, recovery);
@@ -1825,7 +1826,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             boolean recoveryPinned = stores.recoveryPinned().test(owner.opener.original().scope());
             configured = owner.artifact != null
                     ? ConfiguredCaptureRun.prepareBound(owner.opener.original(), owner.opener.config(), stores.notes(), connectors, owner::require,
-                            owner.artifact, owner.previousArtifact)
+                            owner.artifact, owner.previousArtifact, admitted && !recoveryPinned)
                     : admitted && !recoveryPinned
                         ? ConfiguredCaptureRun.prepareStartup(owner.opener.original(), owner.opener.config(), stores.notes(), connectors, owner::require)
                         : ConfiguredCaptureRun.prepare(owner.opener.original(), owner.opener.config(), stores.notes(), connectors, owner::require, recoveryPinned);

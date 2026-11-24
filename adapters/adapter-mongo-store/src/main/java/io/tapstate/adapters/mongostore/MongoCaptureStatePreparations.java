@@ -116,13 +116,31 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
                 .orElseGet(() -> issueFirstCreate(request));
     }
 
+    private record CreationScope(StorageBinding binding, Document mapping) {}
+
+    private CreationScope creationScope(ClientSession session, PipelineIntentScope pipeline, CacheBusinessScope scope) {
+        if (!cluster.equals(scope.clusterId())) throw fenced();
+        if (MongoReadBudget.supportsSnapshotReads(client)) {
+            var stages = MongoStartConfigRead.root();
+            MongoStartConfigRead.addBinding(stages);
+            stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", pipeline.pipelineId()));
+            var captured = MongoStartConfigRead.snapshot(database, session, stages);
+            var mapping = MongoStartConfigRead.boundedRow(captured, "mapping", pipeline.pipelineId());
+            var binding = MongoStartConfigRead.binding(captured, bindings, scope);
+            if (mapping != null && binding.isPresent()) return new CreationScope(binding.orElseThrow(), mapping);
+        }
+        var loaded = bindings.readForTransaction(session).loaded().orElseThrow(MongoCaptureStatePreparations::fenced);
+        if (!scope.equals(loaded.cachePreparation().businessScope())) throw fenced();
+        var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", pipeline.pipelineId())).first();
+        return new CreationScope(loaded.binding(), mapping);
+    }
+
     @Override public CaptureCreationResult issueFirstCreate(CapturePreparationRequest request) {
         Objects.requireNonNull(request,"request");String operation=UUID.randomUUID().toString();
         var issued=transaction(session -> {
             var scope=scopeOf(request.pipeline());
-            var binding=bindings.readForTransaction(session).loaded().orElseThrow(MongoCaptureStatePreparations::fenced);
-            if (!cluster.equals(scope.clusterId()) || !scope.equals(binding.cachePreparation().businessScope())) throw fenced();
-            var mapping=SystemCollections.OPERATOR_GENERATIONS.on(database).find(session,new Document("_id",request.pipeline().pipelineId())).first();
+            var creation = creationScope(session, request.pipeline(), scope);
+            var mapping = creation.mapping();
             var state=MongoPipelineStateMappings.decode(request.pipeline().pipelineId(),mapping);
             if(state.phase()!=PipelineStateMapping.Phase.ACTIVE || state.stateGeneration()!=request.pipeline().stateGeneration())throw fenced();
             var verified = new MongoPipelineStatePreparations(client,database,cluster,bindings,artifacts,active)
@@ -144,7 +162,7 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
             if (sharedArtifact != null && mode != CapturePreparation.Mode.SHARED_SRS) throw fenced();
             if (sharedArtifact != null && sharedArtifact.handoffIntentRevision() != null) {
                 var intent = new MongoPipelineIntentStore(client, database, cluster, bindings)
-                        .loadInTransaction(session, request.pipeline().pipelineId()).orElseThrow(MongoCaptureStatePreparations::fenced);
+                        .loadRetainedInTransaction(session, request.pipeline().pipelineId()).orElseThrow(MongoCaptureStatePreparations::fenced);
                 if (intent.deleted() || intent.intentRevision() != sharedArtifact.handoffIntentRevision()
                         || !intent.scope().equals(request.pipeline())) throw fenced();
             }
@@ -167,7 +185,7 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
                         || !retained.sourceIdentityHash().equals(preparation.sourceIdentityHash()))
                     throw MongoPipelineSourcePreparations.identityUnproven(request.pipeline());
                 if (handoffCandidate(mapping, request, retained)) {
-                    return new Issuance(retained,true,MongoStorageBindingStore.targetFingerprint(binding.binding().cache()),
+                    return new Issuance(retained,true,MongoStorageBindingStore.targetFingerprint(creation.binding().cache()),
                             source.srs()==null?null:source.srs().retention(),true);
                 }
                 return new Issuance(retained,false,null,null,false);
@@ -192,7 +210,7 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
             if (sharedArtifact != null && sharedArtifact.handoffIntentRevision() != null
                     && !handoffCandidate(mapping, request, preparation)) throw fenced();
             table.insertOne(session,MongoCapturePreparationFacts.withArtifact(MongoCapturePreparationFacts.row(preparation), artifactHash));
-            return new Issuance(preparation,true,MongoStorageBindingStore.targetFingerprint(binding.binding().cache()),source.srs()==null?null:source.srs().retention(),newSharedHistory);
+            return new Issuance(preparation,true,MongoStorageBindingStore.targetFingerprint(creation.binding().cache()),source.srs()==null?null:source.srs().retention(),newSharedHistory);
         });
         active.run();return issued.won()?new CaptureCreationResult.Issued(new Creation(issued.preparation(),request,issued.targetFingerprint(),issued.retention(),issued.newSharedHistory(),active)):new CaptureCreationResult.AlreadyIssued(issued.preparation());
     }
@@ -344,7 +362,7 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
         if (!CanonicalHash.of(pipeline).equals(pipelineHash) || !pipeline.sourceBindings().contains(sourceId)) throw fenced();
         return pipeline.sourceReference(sourceId);
     }
-    private void requireScope(ClientSession session,CacheBusinessScope expected){var current=bindings.cachePreparationForTransaction(session).orElseThrow(MongoCaptureStatePreparations::fenced).businessScope();if(!cluster.equals(expected.clusterId()) || !expected.equals(current))throw fenced();}
+    private void requireScope(ClientSession session,CacheBusinessScope expected){var current=bindings.admittedCachePreparation(session).orElseThrow(MongoCaptureStatePreparations::fenced).businessScope();if(!cluster.equals(expected.clusterId()) || !expected.equals(current))throw fenced();}
     MongoCapturePreparationFacts.Recovery reserveSharedRecovery(ClientSession session,StorageRecoveryCommands.Plan plan) {
         var previous=plan.manifest().sharedSrs().previous();requireScope(session,previous.scope());
         var table=SystemCollections.CAPTURE_PREPARATIONS.on(database);

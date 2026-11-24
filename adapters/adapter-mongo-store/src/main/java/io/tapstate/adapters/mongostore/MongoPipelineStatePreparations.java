@@ -226,7 +226,8 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         var ids = new java.util.LinkedHashSet<String>();
         ids.add(scope.pipelineId());
         if (requested != null) ids.addAll(requested.sourceHashes().keySet());
-        var captured = artifacts.preparationInputsInTransaction(session, ids);
+        var captured = artifacts.startupDefinitions(session, scope.pipelineId());
+        if (captured.isEmpty()) captured = artifacts.preparationInputsInTransaction(session, ids);
         return verifiedInputs(scope, requested, captured,
                 id -> artifacts.getInTransaction(session, id).orElseThrow(MongoPipelineStatePreparations::fenced));
     }

@@ -94,7 +94,21 @@ final class MongoCachePipelineAccess {
     }
 
     CheckpointDoc readCheckpoint(MongoStructureProof structures) {
-        try { return transaction(session -> MongoStateStore.toCheckpoint(state(session, true))); }
+        try {
+            if (!unpreparedModels && authoringModels == null && StoreIo.call(() -> MongoReadBudget.supportsSnapshotReads(client))) {
+                var facts = MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+                    requireActive.run();
+                    var snapshot = database.withReadPreference(com.mongodb.ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
+                    var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+                    var captured = MongoPipelineProofFacts.readAuthority(snapshot, scope, key);
+                    if (captured != null) validateAuthority(captured);
+                    requireActive.run();
+                    return captured;
+                }));
+                if (facts != null) return MongoStateStore.toCheckpoint(facts.checkpoint());
+            }
+            return transaction(session -> MongoStateStore.toCheckpoint(state(session, true)));
+        }
         catch (RuntimeException failure) {
             if (structures != null) structures.clear();
             throw failure;
@@ -710,10 +724,11 @@ final class MongoCachePipelineAccess {
         var update = new Document("$inc", new Document(counter, 1L));
         var physical = MongoPipelinePreparationFacts.scope(scope);
         var live = WorkloadClaimDocuments.live(original).append("pipelineScope", physical).append("pipelinePreparation.phase", "PREPARED");
-        if (table.updateOne(session, live, update).getMatchedCount() == 1) return;
-        var node = new MongoWorkloadClaimStore(table).inStrictSession(session).nodeBackedFilter(original);
-        if (node.isEmpty() || table.updateOne(session, node.orElseThrow().append("pipelineScope", physical)
-                .append("pipelinePreparation.phase", "PREPARED"), update).getMatchedCount() != 1) throw claimFenced();
+        var filter = MongoWorkloadClaimStore.canUseNodeLease(original)
+                ? new MongoWorkloadClaimStore(table).inStrictSession(session).nodeBackedFilter(original)
+                        .map(node -> node.append("pipelineScope", physical).append("pipelinePreparation.phase", "PREPARED")).orElse(live)
+                : live;
+        if (table.updateOne(session, filter, update).getMatchedCount() != 1) throw claimFenced();
     }
 
     /** This real write also serializes an observation with replacement of the current state scope. */

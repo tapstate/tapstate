@@ -1367,7 +1367,22 @@ final class PipelineActuationOwnership {
     /** Retries only the start's proof read, under the same admission deadline. */
     boolean proveStartClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
         return PipelineDiagnostics.measure(scope == null ? null : scope.pipelineId(), Phase.PIPELINE_CLAIM_PROOF,
-                () -> admittedRead(() -> proveClaimOwned(scope, expected, true, true), () -> false));
+                () -> admittedRead(() -> !processOwnsClaims()
+                        ? proveClaimOwned(scope, expected, true, true)
+                        : ownsSingleStart(scope, expected), () -> false));
+    }
+
+    boolean processOwnsClaims() {
+        return nodeSession != null && io.tapstate.spi.store.ProcessNodeSession.owns(nodeSession);
+    }
+
+    /** The single OP already adopted this exact fence. Submission and store mutations keep their own fences. */
+    private synchronized boolean ownsSingleStart(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        if (closing || scope == null || !accepts(scope) || !processOwnsClaims()
+                || !membership.businessEligible()) return false;
+        var local = held.get(scope.pipelineId());
+        return local != null && scope.equals(local.scope) && !local.executionAdvancing && local.claim != null
+                && expected.equals(WorkloadClaimFence.from(local.claim)) && membership.singleControlEligible(local.claim);
     }
 
     /** Captures a conservative original lease outside CONFIG; the returned guard performs no IO. */

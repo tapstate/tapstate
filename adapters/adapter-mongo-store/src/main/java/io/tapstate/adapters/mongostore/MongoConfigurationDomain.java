@@ -1880,7 +1880,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
         @Override
         public boolean fenceWrite(SourceConfigWriteScope scope, String keyId) {
-            return fenceWrite(scope,keyId,keys.find(scope.session(), new Document("_id", "cluster")).first());
+            if (!scope.session().hasActiveTransaction())
+                return fenceWrite(scope, keyId, keys.find(scope.session(), new Document("_id", "cluster")).first());
+            if (!cipher.activeKeyId().equals(keyId)) throw invalidKey();
+            // Validate the exact key that this write fenced. An invalid pre-image aborts the transaction.
+            var original = keys.findOneAndUpdate(scope.session(), new Document("_id", "cluster").append("keyId", keyId),
+                    new Document("$inc", new Document("sourceWriteFence", 1L)));
+            if (!keyId.equals(decode(original).activeKeyId())) throw invalidKey();
+            return true;
         }
 
         private boolean fenceWrite(SourceConfigWriteScope scope,String keyId,Document checkedKey) {

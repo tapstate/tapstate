@@ -42,6 +42,16 @@ public interface PipelineIntentStore {
         throw new UnsupportedOperationException("connector bindings are not supported");
     }
 
+    record ExecutionBindings(ConnectorRunBindings bindings, long intentRevision) {}
+
+    default Optional<ExecutionBindings> executionBindings(PipelineIntentScope scope) {
+        return connectorBindings().load(scope).map(bindings -> {
+            var intent = load(scope.pipelineId()).filter(value -> scope.equals(value.scope()))
+                    .orElseThrow(() -> new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null));
+            return new ExecutionBindings(bindings, intent.intentRevision());
+        });
+    }
+
     /** A durable request to prepare exactly the definition and intent that HTTP accepted. */
     record PendingStart(PipelineIntentSnapshot intent, PipelinePreparationInputs inputs) {}
 

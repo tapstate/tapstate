@@ -595,8 +595,13 @@ class MongoCapturePreparationsIT {
             var applied=new AtomicBoolean();var failure=new AtomicReference<Throwable>();var pending=ConcurrentHashMap.<Integer>newKeySet();
             var witness=new CommandListener(){
                 public void commandStarted(CommandStartedEvent event){
-                    if(event.getDatabaseName().equals(f.config.getName()) && event.getCommandName().equals("find")
-                            && event.getCommand().getString("find").getValue().equals("sources"))pending.add(event.getRequestId());
+                    if (!event.getDatabaseName().equals(f.config.getName())) return;
+                    var command = event.getCommand();
+                    boolean sourceRead = event.getCommandName().equals("find") && command.getString("find").getValue().equals("sources");
+                    boolean joinedSourceRead = event.getCommandName().equals("aggregate") && command.getArray("pipeline").stream()
+                            .map(org.bson.BsonValue::asDocument).filter(stage -> stage.containsKey("$lookup"))
+                            .anyMatch(stage -> stage.getDocument("$lookup").getString("as").getValue().equals("sources"));
+                    if (sourceRead || joinedSourceRead) pending.add(event.getRequestId());
                 }
                 public void commandSucceeded(CommandSucceededEvent event){
                     if(!pending.remove(event.getRequestId()) || event.getResponse().getDocument("cursor").getArray("firstBatch").isEmpty() || !applied.compareAndSet(false,true))return;
@@ -681,7 +686,7 @@ class MongoCapturePreparationsIT {
                 var preparation = new MongoCaptureCachePreparations(client, client.getDatabase(f.cache.getName()),
                         f.scope, MongoStorageBindingStore.targetFingerprint(f.connection), ACTIVE, f.domain.rateRetention());
                 var created = preparation.createFirst(grant);
-                assertThat(commands).hasSize(22).doesNotContain("listCollections", "listIndexes", "abortTransaction");
+                assertThat(commands).hasSize(11).doesNotContain("listCollections", "listIndexes", "abortTransaction");
                 assertThat(commands.getLast()).isEqualTo("commitTransaction");
                 commands.clear();
                 assertThat(preparation.load(created.preparation())).isEqualTo(created);

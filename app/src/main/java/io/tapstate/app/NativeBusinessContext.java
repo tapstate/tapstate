@@ -707,12 +707,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean(destroyMethod="close") ClusterNodeAlertSource clusterNodeAlertSource(NativeBusinessContext owner,HazelcastInstance member,
                 ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock,
                 NodeSessionLease node,CloudRuntimeSettings cloud){
-            ScopedSinkStateProvider.of(member).observeOperations((run,config,slot,guard,local)->{
+            ScopedSinkStateProvider.of(member).observeOperations((run,config,slot,guard,local,startup)->{
+                if (run.source() == null) return io.tapstate.spi.capture.SourceOperationObserver.NONE;
                 var dependency = runtime.pipelineGuard(run.original(), guard);
                 boolean transferred = false;
                 try {
                     String sourceId = owner.original.binding().defaultSourceId();
-                    var source = owner.configuration.sourceBindingForSinkStartup(sourceId);
+                    var source = startup.monitoredSource(() -> owner.configuration.sourceBindingForSinkStartup(sourceId));
                     org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).debug("Target monitoring identity [source={},captured={},connector={},settings={},binding={}]",source.isPresent(),run.source()!=null,
                             source.map(value->value.source().connector().equals(config.connectorId())).orElse(false),
                             source.map(value->value.source().config().equals(config.settings())).orElse(false),

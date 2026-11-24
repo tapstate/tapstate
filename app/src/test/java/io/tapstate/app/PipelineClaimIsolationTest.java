@@ -244,6 +244,31 @@ class PipelineClaimIsolationTest {
         }
     }
 
+    @Test
+    void singleStartReadsOnlyItsOwnAdoptedFenceAndStillChecksStorageBeforeSubmission() {
+        var operator = nodeBackedOwner();
+        var node = new WorkloadClaim(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),
+                new WorkloadOwner("node", "boot"), 1, 0, 7, io.tapstate.spi.store.ProcessNodeSession.PROCESS_OWNED);
+        io.tapstate.spi.store.ProcessNodeSession.open(node, Duration.ofSeconds(10));
+        try {
+            when(membership.singleControlEligible(any())).thenReturn(true);
+            when(boundary.acquireNodeBackedPipeline(any(), any(), anyLong())).thenAnswer(call ->
+                    claims.acquire(key(call.getArgument(0)), node.owner(), 7, Duration.ofMinutes(1)));
+            var held = WorkloadClaimFence.from(operator.permit(A).claim());
+            org.mockito.Mockito.clearInvocations(boundary);
+            assertThat(operator.proveStartClaim(A, held)).isTrue();
+            assertThat(operator.proveStartClaim(B, held)).isFalse();
+            when(membership.businessEligible()).thenReturn(false);
+            assertThat(operator.proveStartClaim(A, held)).isFalse();
+            org.mockito.Mockito.verifyNoInteractions(boundary);
+            when(membership.businessEligible()).thenReturn(true);
+            assertThat(operator.proveClaim(A, held)).isTrue();
+            org.mockito.Mockito.verify(boundary).readPipeline(A);
+        } finally {
+            io.tapstate.spi.store.ProcessNodeSession.close(node);
+        }
+    }
+
     private PipelineActuationOwnership nodeBackedOwner() {
         owner();
         var node = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),

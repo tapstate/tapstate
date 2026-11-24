@@ -231,6 +231,30 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return Optional.ofNullable(find(session, id)).map(this::decode);
     }
 
+    /** Materialize Pipeline and physical Source definitions under their published identities in one transaction. */
+    Map<String, Resource> startupDefinitions(ClientSession session, String pipelineId) {
+        if (!MongoReadBudget.supportsSnapshotReads(client)) return Map.of();
+        var pipelineRow = collections.get("pipeline").find(session, new Document("_id", pipelineId)).first();
+        if (pipelineRow == null || !pipelineId.equals(pipelineRow.get("_id"))) return Map.of();
+        var decoded = decode(pipelineRow);
+        if (!(decoded instanceof PipelineResource pipeline)) return Map.of();
+        var ids = new java.util.LinkedHashSet<>(pipeline.sourceIds());
+        ids.add(pipelineId);
+        // Check all resource kinds together, including aliases and collisions, before reusing the bodies.
+        if (ids.size() > 16) return Map.of();
+        var keys = List.copyOf(ids);
+        var stages = MongoStartConfigRead.root();
+        MongoStartConfigRead.addArtifacts(stages, keys);
+        var rows = MongoStartConfigRead.artifacts(MongoStartConfigRead.snapshot(database, session, stages), keys);
+        if (rows.isEmpty() || rows.orElseThrow().size() != keys.size()) return Map.of();
+        var result = new LinkedHashMap<String, Resource>();
+        for (var row : rows.orElseThrow()) {
+            var resource = pipelineId.equals(row.get("_id")) ? pipeline : decode(row);
+            result.put(resource.id(), resource);
+        }
+        return result;
+    }
+
     Map<String, Resource> preparationInputsInTransaction(ClientSession session, Set<String> ids) {
         var rows = ids.size() <= 128 ? publicationRows(session, ids, false, null) : Optional.<Map<String, Document>>empty();
         var result = new LinkedHashMap<String, Resource>();

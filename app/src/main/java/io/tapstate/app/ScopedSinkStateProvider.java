@@ -17,9 +17,9 @@ final class ScopedSinkStateProvider {
     ScopedSinkStateProvider(PipelineStoreViews cache,RequiredNoteStore notes){this.cache=Objects.requireNonNull(cache,"cache");this.notes=Objects.requireNonNull(notes,"notes");}
     static void bind(Config config,PipelineStoreViews cache,RequiredNoteStore notes){if(config.getUserContext().putIfAbsent(KEY,new ScopedSinkStateProvider(cache,notes))!=null)throw fenced();}
     static ScopedSinkStateProvider of(HazelcastInstance member){if(member.getUserContext().get(KEY)instanceof ScopedSinkStateProvider provider)return provider;throw fenced();}
-    @FunctionalInterface interface Operations {io.tapstate.spi.capture.SourceOperationObserver open(ConfiguredSinkRun run,SinkConfig config,String slot,Runnable guard,Runnable local);}
+    @FunctionalInterface interface Operations {io.tapstate.spi.capture.SourceOperationObserver open(ConfiguredSinkRun run,SinkConfig config,String slot,Runnable guard,Runnable local,WriterStartup startup);}
     private final java.util.concurrent.atomic.AtomicReference<Operations> operations=new java.util.concurrent.atomic.AtomicReference<>(
-            (run,config,slot,guard,local)->io.tapstate.spi.capture.SourceOperationObserver.NONE);
+            (run,config,slot,guard,local,startup)->io.tapstate.spi.capture.SourceOperationObserver.NONE);
     void observeOperations(Operations observer){operations.set(Objects.requireNonNull(observer));}
     PdkSinkPort open(HazelcastInstance member,ConfiguredSinkRun run,SinkConfig config,ConnectorProvisioner provisioner,SharedSinkConnectors sharing) {
         return open(member,run,config,provisioner,sharing,"writer:0:0");
@@ -29,6 +29,12 @@ final class ScopedSinkStateProvider {
     }
     static final class WriterStartup {
         private ConnectorRef artifact;
+        private java.util.Optional<SourceBindingSnapshot> monitoredSource;
+        synchronized java.util.Optional<SourceBindingSnapshot> monitoredSource(
+                java.util.function.Supplier<java.util.Optional<SourceBindingSnapshot>> read) {
+            if (monitoredSource == null) monitoredSource = read.get();
+            return monitoredSource;
+        }
         boolean independentArtifact() { return artifact != null && !artifact.shareSafe(); }
         private final PdkSinkPreparations.OpeningFacts ready = new PdkSinkPreparations.OpeningFacts();
     }
@@ -49,11 +55,11 @@ final class ScopedSinkStateProvider {
         var receipts=new PdkSinkPreparations(cache.sinkPreparations(run.original().scope(),original,active),run.original().scope(),run.node(),run.purpose(),config.onFullLoad(),config.fullLoad(),startup.ready);
         Runnable local=()->{if(!original.equals(authorization.requireLocal(run.original())))throw fenced();};
         return PdkSinkPort.withScopedState(exact,sharing,run.purpose(),scopes,original,receipts)
-                .withOperationObserver(operations.get().open(run,config,slot,active,local))
-                .withSharedInitialization(()->operations.get().open(run,config,"shared-init:"+(slot.startsWith("writer:")?slot.substring(7,slot.lastIndexOf(':')):slot),active,local));
+                .withOperationObserver(operations.get().open(run,config,slot,active,local,startup))
+                .withSharedInitialization(()->operations.get().open(run,config,"shared-init:"+(slot.startsWith("writer:")?slot.substring(7,slot.lastIndexOf(':')):slot),active,local,startup));
     }
     io.tapstate.spi.capture.SourceOperationObserver observeOriginal(ConfiguredSinkRun run,SinkConfig config,String slot,Runnable guard,Runnable local) {
-        return operations.get().open(run,config,slot,guard,local);
+        return operations.get().open(run,config,slot,guard,local,new WriterStartup());
     }
     static ScopedSinkStateProvider local() {
         var members=com.hazelcast.core.Hazelcast.getAllHazelcastInstances();

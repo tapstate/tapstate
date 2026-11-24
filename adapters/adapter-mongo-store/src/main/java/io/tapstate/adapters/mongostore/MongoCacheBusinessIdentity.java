@@ -123,7 +123,7 @@ final class MongoCacheBusinessIdentity {
         return claim;
     }
 
-    private void admitClaim(ClientSession session, Document row) {
+    void admitClaim(ClientSession session, Document row) {
         long revision = admissionRevision(row);
         if (revision == Long.MAX_VALUE - 1) throw businessFenced();
         if (SystemCollections.CACHE_IDENTITY.on(database).updateOne(session,

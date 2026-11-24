@@ -324,10 +324,49 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         });
     }
 
+    private record BindingRows(Document mapping, PipelineIntentSnapshot intent) {}
+
+    /** The mapping, intent and CACHE incarnation belong to the same CONFIG snapshot. */
+    private BindingRows bindingRows(ClientSession session, PipelineIntentScope scope, boolean readIntent) {
+        if (bindings.supportsActuationBatch()) {
+            var stages = MongoStartConfigRead.root();
+            stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
+            MongoStorageBindingStore.appendAdmittedPreparation(stages);
+            stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", scope.pipelineId()));
+            if (readIntent) stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.PIPELINE_INTENTS, "intent", scope.pipelineId()));
+            var row = identity.aggregate(session, stages).first();
+            var mapping = MongoStartConfigRead.boundedRow(row, "mapping", scope.pipelineId());
+            var intent = MongoStartConfigRead.boundedRow(row, "intent", scope.pipelineId());
+            var cluster = row == null ? null : row.get("root", Document.class);
+            var setup = MongoStartConfigRead.boundedRow(row, "setup", "cluster");
+            var binding = MongoStartConfigRead.boundedRow(row, "binding", "cluster");
+            var recovery = MongoStartConfigRead.boundedRow(row, "recovery", "cluster");
+            if (cluster != null && "cluster".equals(cluster.get("_id")) && setup != null && binding != null
+                    && recovery != null && mapping != null && (!readIntent || intent != null)) {
+                var current = bindings.admittedObservationFacts(cluster, setup, binding, null, recovery).preparation();
+                if (current.filter(value -> sameCache(value, scope)).isEmpty()) throw fenced();
+                requireGeneration(scope, mapping);
+                return new BindingRows(mapping, readIntent ? decode(intent) : null);
+            }
+        }
+        var mapping = requireAdmittedScope(session, scope);
+        return new BindingRows(mapping, readIntent ? loadRetainedInTransaction(session, scope.pipelineId()).orElse(null) : null);
+    }
+
+    @Override public Optional<ExecutionBindings> executionBindings(PipelineIntentScope scope) {
+        return readSnapshot(session -> {
+            var rows = bindingRows(session, scope, true);
+            return currentConnectorBindings(rows.mapping(), scope).map(value -> {
+                if (rows.intent() == null || !scope.equals(rows.intent().scope())) throw fenced();
+                return new ExecutionBindings(value, rows.intent().intentRevision());
+            });
+        });
+    }
+
     @Override public ConnectorBindingStore connectorBindings() {
         return new ConnectorBindingStore() {
             @Override public Optional<ConnectorRunBindings> load(PipelineIntentScope scope) {
-                return transaction(session -> currentConnectorBindings(requireScope(session, scope, false), scope));
+                return readSnapshot(session -> currentConnectorBindings(bindingRows(session, scope, false).mapping(), scope));
             }
             @Override public Optional<ConnectorRunBindings> previousForRecovery(PipelineIntentScope target) {
                 return transaction(session -> {
@@ -414,8 +453,10 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             java.util.function.BiFunction<ClientSession, ConnectorRunBindings, ConnectorRunBindings> change) {
         Objects.requireNonNull(original, "original");
         return transaction(session -> {
-            if (original.deleted() || !loadInTransaction(session, original.scope().pipelineId()).filter(original::equals).isPresent()) throw fenced();
-            var mapping = requireScope(session, original.scope(), false);
+            if (original.deleted()) throw fenced();
+            var rows = bindingRows(session, original.scope(), true);
+            if (!original.equals(rows.intent())) throw fenced();
+            var mapping = rows.mapping();
             var held = MongoPipelineStateMappings.connectorBindings(mapping)
                     .orElse(new ConnectorRunBindings(original.scope(), 0, List.of(), null));
             if (!held.scope().equals(original.scope())) throw fenced();
@@ -430,7 +471,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
 
     private void finishBindings(PipelineIntentScope scope, long startIntentRevision, boolean published) {
         transaction(session -> {
-            var mapping = requireScope(session, scope, false);
+            var mapping = requireAdmittedScope(session, scope);
             var held = MongoPipelineStateMappings.connectorBindings(mapping).orElseThrow(MongoPipelineIntentStore::fenced);
             if (!held.scope().equals(scope)) throw fenced();
             if (held.handoff() == null) {
@@ -529,7 +570,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
 
     @Override public Optional<PendingStart> pendingStart(String pipelineId) {
         requireId(pipelineId);
-        return transaction(session -> {
+        return readSnapshot(session -> {
             var row = intents.find(session, new Document("_id", pipelineId)
                     .append(PREPARATION, new Document("$exists", true))
                     .append(FAILURE, new Document("$exists", false))).first();
@@ -742,15 +783,17 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (!clusterId.equals(scope.clusterId()) || !clusterId.equals(stored.get("clusterId")) || binding != scope.bindingVersion()) throw fenced();
         if (!cacheAlreadyMatched && !matchesCurrentCache(session, scope)) throw fenced();
         Document row = mappings.find(session, new Document("_id", scope.pipelineId())).first();
-        var state = MongoPipelineStateMappings.decode(scope.pipelineId(), row);
-        if (state.phase() != PipelineStateMapping.Phase.ACTIVE || state.stateGeneration() != scope.stateGeneration()) throw fenced();
-        return row;
+        return requireGeneration(scope, row);
     }
     private Document requireAdmittedScope(ClientSession session, PipelineIntentScope scope) {
         var cache = bindings.admittedCachePreparation(session).orElseThrow(MongoPipelineIntentStore::fenced).businessScope();
         if (!clusterId.equals(scope.clusterId()) || !cache.clusterId().equals(scope.clusterId())
                 || cache.bindingVersion() != scope.bindingVersion() || !cache.cacheIncarnation().equals(scope.cacheIncarnation())) throw fenced();
         Document row = mappings.find(session, new Document("_id", scope.pipelineId())).first();
+        return requireGeneration(scope, row);
+    }
+
+    private static Document requireGeneration(PipelineIntentScope scope, Document row) {
         var state = MongoPipelineStateMappings.decode(scope.pipelineId(), row);
         if (state.phase() != PipelineStateMapping.Phase.ACTIVE || state.stateGeneration() != scope.stateGeneration()) throw fenced();
         return row;

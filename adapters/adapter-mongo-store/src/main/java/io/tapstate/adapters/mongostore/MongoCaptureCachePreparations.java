@@ -227,16 +227,37 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         requireCancelledSharedAuthority(receipt);
         var retained=(SharedReceipt)receipt;return retained.owner.cancelledSnapshot(retained);
     }
+    private static final List<SystemCollections> SHARED_HISTORY = List.of(SystemCollections.SRS_CHAINS,
+            SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS,
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS, SystemCollections.SRS_EVENTS);
+
     @Override public CaptureCacheState createFirst(FirstCaptureCreation invocation) {
         var original=MongoCaptureStatePreparations.consumeFirst(invocation,targetFingerprint);
         var preparation=original.preparation();var request=original.request();String ringRetention=original.retention();requireScope(preparation);
         if(preparation.replacement())throw history(preparation);
         return checkpointTransaction(request.pipeline(), original::requireActive,session -> {
             var pipeline=new MongoCachePipelineAccess(client,database,request.pipeline(),request.originalPipeline(),() -> {active.run();original.requireActive();});
-            var state=pipeline.state(session,true);pipeline.proveClaim(session,true);pipeline.updateState(session,state,new Document(),false);
-            var retained=MongoPipelineSourcePreparations.retained(session,database,request.pipeline());
+            var shared = preparation.mode() == CapturePreparation.Mode.SHARED_SRS;
+            var birth = MongoBindingReadFacts.supported(client) ? MongoPipelineProofFacts.captureBirth(session, database,
+                    request.pipeline(), request.originalPipeline().key(), shared ? SHARED_HISTORY : List.of()) : null;
+            var captured = birth == null ? null : birth.authority();
+            var identity = new MongoCacheBusinessIdentity(database, scope);
+            Document state;
+            if (captured == null) {
+                identity.requireAdmissionState(session);
+                state = pipeline.state(session, true);
+            } else {
+                MongoCacheBusinessIdentity.requireObservedAdmission(captured.identity(), captured.schema(), scope);
+                state = captured.checkpoint();
+                pipeline.validateState(state);
+                pipeline.requirePreparedClaim(captured.claim());
+            }
+            pipeline.proveClaim(session,true);
+            pipeline.updateState(session,state,new Document(),false);
+            var retained = captured == null ? MongoPipelineSourcePreparations.retained(session, database, request.pipeline())
+                    : MongoPipelineSourcePreparations.retained(captured.claim(), request.pipeline());
             if(!retained.equals(request.inputs()))throw MongoPipelineSourcePreparations.identityUnproven(request.pipeline());
-            var identity=new MongoCacheBusinessIdentity(database,scope);identity.admitClaim(session);
+            if (captured == null) identity.admitClaim(session); else identity.admitClaim(session, captured.identity());
             Date now=MongoCachePipelinePreparations.proveNode(session,database,scope,request.originalNode());
             var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,preparation.captureId());
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first()!=null) {
@@ -245,7 +266,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
                     return loadInSession(session, preparation);
                 throw history(preparation);
             }
-            requireNoPriorFacts(session,preparation);
+            requireNoPriorFacts(session, preparation, birth == null || !shared ? Set.copyOf(SHARED_HISTORY) : birth.populated());
             var initial=new WorkloadClaimFence(key,request.originalNode().owner(),1,0,request.originalNode().topologyRevision());
             var row=new Document("_id",MongoWorkloadClaimStore.id(key)).append("clusterId",key.clusterId()).append("resourceType",key.type().name()).append("resourceId",key.resourceId())
                     .append("ownerNodeId",initial.owner().nodeId()).append("ownerBootId",initial.owner().bootId()).append("claimGeneration",1L).append("executionGeneration",0L)
@@ -342,14 +363,21 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         var preparation=MongoCapturePreparationFacts.annex(marker);
         if(!preparation.scope().equals(scope) || !preparation.captureId().equals(key.resourceId()) || !key.clusterId().equals(scope.clusterId()) || key.type()!=WorkloadClaimType.CAPTURE)throw MongoCapturePreparationFacts.fenced();return preparation;
     }
-    private void requireNoPriorFacts(ClientSession session,CapturePreparation original) {
-        var byCapture=new Document("captureId",original.captureId());
-        if(SystemCollections.SRS_CHAINS.on(database).find(session,byCapture).first()!=null)throw history(original);
-        if(original.mode()==CapturePreparation.Mode.SHARED_SRS) {
-            if(SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",original.chainId())).first()!=null)throw history(original);
-            for(var table:List.of(SystemCollections.SRS_MODELS,SystemCollections.SRS_MODEL_CONTEXTS,SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS))
-                if(table.on(database).find(session,new Document("_id.chain",original.chainId())).first()!=null)throw history(original);
-            if(SystemCollections.SRS_EVENTS.on(database).find(session,new Document("captureFence.resourceId",original.captureId())).first()!=null)throw history(original);
+    private void requireNoPriorFacts(ClientSession session, CapturePreparation original, Set<SystemCollections> populated) {
+        var byCapture = new Document("captureId", original.captureId());
+        boolean shared = original.mode() == CapturePreparation.Mode.SHARED_SRS;
+        if (populated.contains(SystemCollections.SRS_CHAINS)) {
+            var filter = shared ? new Document("$or", List.of(byCapture, new Document("_id", original.chainId()))) : byCapture;
+            if (SystemCollections.SRS_CHAINS.on(database).find(session, filter).projection(new Document("_id", 1)).first() != null)
+                throw history(original);
+        }
+        if (shared) {
+            for (var table : populated) {
+                if (table == SystemCollections.SRS_CHAINS) continue;
+                var filter = table == SystemCollections.SRS_EVENTS ? new Document("captureFence.resourceId", original.captureId())
+                        : new Document("_id.chain", original.chainId());
+                if (table.on(database).find(session, filter).projection(new Document("_id", 1)).first() != null) throw history(original);
+            }
         }
         if(original.mode()==CapturePreparation.Mode.DIRECT) {
             try(var rows=SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).find(session,new Document("_id.captureId",original.captureId())).iterator()) {
@@ -366,7 +394,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
     }
 
     private <T> T checkpointTransaction(io.tapstate.spi.store.PipelineIntentScope pipeline, Runnable originalActive, Function<ClientSession, T> body) {
-        return MongoCachePipelineStateStore.writeTransaction(client, pipeline.pipelineId(), () -> transaction(originalActive, body));
+        return MongoCachePipelineStateStore.writeTransaction(client, pipeline.pipelineId(), () -> transaction(originalActive, false, body));
     }
     private <T>T transaction(Runnable originalActive,Function<ClientSession,T> body) {
         return transaction(originalActive, true, body);

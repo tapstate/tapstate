@@ -81,7 +81,9 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         requireActive.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),ref.contentHash(),config.settings());
         if (pinned == null) provisioner.retain(ref);
-        if(!expected.equals(fixed.prepareOrigin(primary,expected)))throw unavailable();
+        // The prepared binding already committed this exact origin and generation. Recheck any other path in storage.
+        boolean preparedBinding = binding != null && binding.notes().equals(primary) && expected.equals(pinned);
+        if (!preparedBinding && !expected.equals(fixed.prepareOrigin(primary, expected))) throw unavailable();
         if (pinned == null) provisioner.markBound(fixed, primary, expected);
         requireActive.run();return new ConfiguredSinkRun(original,config.node(),purpose,new Note(primary),new Note(global),ref.contentHash());
     }

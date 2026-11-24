@@ -397,11 +397,23 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     void requireBinding(ClientSession session, io.tapstate.spi.store.ConnectorRunBindings.Binding binding) {
         var scope = binding.notes();
-        checkOwner(session, scope.owner(), false);
-        var origin = retainedOrigin(session, scope, verifyPhysicalScope(session, scope, true));
+        var proof = retirement == null && !MongoValidationClaimObservation.lacksSnapshotRead(client)
+                ? noteSnapshot(session, scope.owner()) : null;
+        Document metadata;
+        Document row;
+        if (proof == null) {
+            checkOwner(session, scope.owner(), false);
+            metadata = verifyPhysicalScope(session, scope, true);
+            row = origins.find(session, byScope(scope.owner())).first();
+        } else {
+            if (!scope.equals(proof.scope())) throw unavailable();
+            metadata = proof.metadata();
+            fencePhysicalScope(session, scope, metadata);
+            row = proof.origin();
+        }
+        var origin = retainedOrigin(scope, metadata, row);
         if (origin == null || !origin.connectorId().equals(binding.connectorId())
-                || !origin.artifactHash().equals(binding.sha256()) || !readyMarker(session, scope, origin))
-            throw unavailable();
+                || !origin.artifactHash().equals(binding.sha256()) || !localReady(row)) throw unavailable();
     }
 
     @Override
@@ -518,33 +530,47 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     @Override
     public RequiredNoteOrigin origin(RequiredNoteScope scope) {
         requireOriginScope(scope);
-        var owner = scope.owner();
-        if (retirement == null && owner.kind() == RequiredNoteOwner.Kind.PIPELINE
-                && !MongoValidationClaimObservation.lacksSnapshotRead(client)) {
-            var captured = MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
-                requireActive.run();
-                var stages = pipelineNoteStages(owner);
-                stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_ORIGINS, "origin", scopeId(owner)));
-                var snapshot = MongoStartConfigRead.snapshot(database, stages);
-                var operator = noteScopeRow(snapshot, "operator", owner.ownerId());
-                var metadata = noteScopeRow(snapshot, "primary", scopeId(owner));
-                var stored = noteScopeRow(snapshot, "origin", scopeId(owner));
-                if (operator == null || metadata == null || stored == null) return null;
-                checkBinding(snapshot, owner);
-                checkPipelineOwner(operator, owner, false);
-                if (!scopeOf(owner, metadata).equals(scope)) throw unavailable();
-                var value = retainedOrigin(scope, metadata, stored);
-                if (value == null) throw unavailable();
-                requireActive.run();
-                return value;
-            }));
-            if (captured != null) return captured;
+        var captured = readNoteSnapshot(scope.owner());
+        if (captured != null) {
+            if (!scope.equals(captured.scope())) throw unavailable();
+            var origin = retainedOrigin(scope, captured.metadata(), captured.origin());
+            if (origin == null) throw unavailable();
+            return origin;
         }
         return transactionWithInspection(session -> {
             RequiredNoteOrigin retained = retainedOrigin(session, scope, verifyScope(session, scope, false));
             if (retained == null) throw unavailable();
             return retained;
         });
+    }
+
+    private record NoteSnapshot(RequiredNoteScope scope, Document metadata, Document origin) {}
+
+    private NoteSnapshot readNoteSnapshot(RequiredNoteOwner owner) {
+        if (retirement != null || MongoValidationClaimObservation.lacksSnapshotRead(client)) return null;
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            requireActive.run();
+            var result = noteSnapshot(null, owner);
+            requireActive.run();
+            return result;
+        }));
+    }
+
+    private NoteSnapshot noteSnapshot(ClientSession session, RequiredNoteOwner owner) {
+        var stages = MongoStartConfigRead.root();
+        boolean pipeline = owner.kind() == RequiredNoteOwner.Kind.PIPELINE;
+        if (pipeline) stages.add(noteScopeLookup(SystemCollections.OPERATOR_GENERATIONS, "operator", owner.ownerId()));
+        var id = scopeId(owner);
+        stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_SCOPES, "primary", id));
+        stages.add(noteScopeLookup(SystemCollections.PDK_NOTE_ORIGINS, "origin", id));
+        var row = session == null ? MongoStartConfigRead.snapshot(database, stages) : MongoStartConfigRead.snapshot(database, session, stages);
+        var metadata = noteScopeRow(row, "primary", id);
+        var operator = pipeline ? noteScopeRow(row, "operator", owner.ownerId()) : null;
+        var origin = noteScopeRow(row, "origin", id);
+        if (metadata == null || pipeline && operator == null || origin == null) return null;
+        checkBinding(row, owner);
+        if (pipeline) checkPipelineOwner(operator, owner, false);
+        return new NoteSnapshot(scopeOf(owner, metadata), metadata, origin);
     }
 
     @Override
@@ -598,6 +624,11 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     @Override
     public java.util.Optional<RequiredNoteOrigin> originIfPresent(RequiredNoteScope scope) {
         requireOriginScope(scope);
+        var read = readNoteSnapshot(scope.owner());
+        if (read != null) {
+            if (!scope.equals(read.scope())) throw unavailable();
+            return java.util.Optional.ofNullable(retainedOrigin(scope, read.metadata(), read.origin()));
+        }
         return transactionWithInspection(session -> java.util.Optional.ofNullable(
                 retainedOrigin(session, scope, verifyScope(session, scope, false))));
     }
@@ -622,10 +653,16 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     private boolean readyMarker(ClientSession session, RequiredNoteScope scope, RequiredNoteOrigin expected) {
-        var existing = retainedOrigin(session, scope, verifyScope(session, scope, false));
-        if (!expected.equals(existing)) throw originMismatch();
-        Document row = origins.find(session, byScope(scope.owner()).append("generation", scope.generation())).first();
-        if (row == null) throw unavailable();
+        var read = retirement == null && !MongoValidationClaimObservation.lacksSnapshotRead(client)
+                ? noteSnapshot(session, scope.owner()) : null;
+        if (read != null && !scope.equals(read.scope())) throw unavailable();
+        var metadata = read == null ? verifyScope(session, scope, false) : read.metadata();
+        var row = read == null ? origins.find(session, byScope(scope.owner())).first() : read.origin();
+        if (!expected.equals(retainedOrigin(scope, metadata, row))) throw originMismatch();
+        return localReady(row);
+    }
+
+    private static boolean localReady(Document row) {
         if (!row.containsKey("localArtifactReady")) return false;
         if (!Boolean.TRUE.equals(row.get("localArtifactReady"))) throw unreadable("localArtifactReady");
         return true;
@@ -1361,12 +1398,14 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         Document document = scopes.find(session, byScope(scope.owner())).first();
         RequiredNoteScope observed = scopeOf(scope.owner(), document);
         if (observed.generation() != scope.generation()) throw unavailable();
-        if (write) {
-            if (document.getLong("writeFence") >= Long.MAX_VALUE - 1) throw unreadable("writeFence");
-            if (scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
-                    new Document("$inc", new Document("writeFence", 1L))).getMatchedCount() != 1) throw unavailable();
-        }
+        if (write) fencePhysicalScope(session, scope, document);
         return document;
+    }
+
+    private void fencePhysicalScope(ClientSession session, RequiredNoteScope scope, Document document) {
+        if (document.getLong("writeFence") >= Long.MAX_VALUE - 1) throw unreadable("writeFence");
+        if (scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
+                new Document("$inc", new Document("writeFence", 1L))).getMatchedCount() != 1) throw unavailable();
     }
 
     private void checkBinding(ClientSession session, RequiredNoteOwner owner) {

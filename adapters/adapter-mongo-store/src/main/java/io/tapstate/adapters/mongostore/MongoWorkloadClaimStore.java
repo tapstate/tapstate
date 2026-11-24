@@ -176,6 +176,14 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
 
     private Optional<WorkloadClaimReading> readPipelineForAdmission(WorkloadClaimKey key) {
         if (session == null || !strict) return read(key);
+        var captured = claimWithParent(key);
+        if (captured == null) return read(key);
+        return Optional.of(observedPipelineReading(captured.claim(), captured.node()));
+    }
+
+    private record ClaimWithParent(Document claim, Document node) {}
+
+    private ClaimWithParent claimWithParent(WorkloadClaimKey key) {
         var limit = new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), 64 * 1024));
         var inline = new Document("$project", new Document("_id", 0).append("row", new Document("$cond",
                 java.util.Arrays.asList(limit, "$$ROOT", null))));
@@ -187,16 +195,16 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                         .append("pipeline", List.of(new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", nodeId)))),
                                 new Document("$limit", 1), leaseRemaining(true), inline)).append("as", "node")));
         var captured = collection.aggregate(session, stages).first();
-        if (captured == null) return Optional.empty();
-        if (!(captured.get("row") instanceof Document original)) return read(key);
+        if (captured == null) return null;
+        if (!(captured.get("row") instanceof Document original)) return null;
         var nodes = captured.getList("node", Document.class);
         Document node = nodes.isEmpty() ? null : nodes.getFirst().get("row", Document.class);
-        if (!nodes.isEmpty() && node == null) return read(key);
+        if (!nodes.isEmpty() && node == null) return null;
         if (nodeBacked(original)) {
             var canonical = id(new WorkloadClaimKey(key.clusterId(), WorkloadClaimType.NODE_SESSION, original.getString("ownerNodeId")));
-            if (node == null || !canonical.equals(node.get("_id"))) return read(key);
+            if (node == null || !canonical.equals(node.get("_id"))) return null;
         }
-        return Optional.of(observedPipelineReading(original, node));
+        return new ClaimWithParent(original, node);
     }
 
     Optional<WorkloadClaim> acquireNewValidationExecution(WorkloadClaim previous, WorkloadOwner owner,
@@ -483,10 +491,14 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
 
     Optional<Document> nodeBackedFilter(WorkloadClaimFence fence) {
         if (!canUseNodeLease(fence)) return Optional.empty();
-        var row = stored(fence.key());
+        var captured = session != null && strict ? claimWithParent(fence.key()) : null;
+        var row = captured == null ? stored(fence.key()) : captured.claim();
         if (!nodeBacked(row) || !fence.equals(WorkloadClaimFence.from(decodeStrict(row))))
             return Optional.empty();
-        var parent = nodeLease(row);
+        var parent = captured == null ? nodeLease(row)
+                : Optional.of(observedReading(captured.node())).filter(WorkloadClaimReading::leased)
+                        .filter(value -> fence.owner().equals(value.claim().owner())
+                                && Long.valueOf(value.claim().claimGeneration()).equals(row.get(NODE_LEASE_GENERATION)));
         if (parent.isEmpty()) return Optional.empty();
         var filter = new Document("_id", id(fence.key())).append("ownerNodeId", fence.owner().nodeId())
                 .append("ownerBootId", fence.owner().bootId()).append("claimGeneration", fence.claimGeneration())

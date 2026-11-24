@@ -42,6 +42,14 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
 
     static PinProof readPin(ClientSession session, MongoDatabase database, PipelineIntentScope scope, WorkloadClaimFence original) {
         long sampledAt = System.nanoTime();
+        if (MongoWorkloadClaimStore.canUseNodeLease(original)) {
+            var authority = readPipelineAuthority(session, database, scope, original.key());
+            if (authority == null) return null;
+            var facts = authority.facts();
+            var live = MongoWorkloadClaimStore.observedPipelineReading(facts.claim(), authority.node());
+            if (!live.leased() || !original.equals(WorkloadClaimFence.from(live.claim()))) return null;
+            return new PinProof(new RenewalProof(facts.identity(), facts.schema(), facts.checkpoint()), facts.claim(), sampledAt);
+        }
         var id = MongoWorkloadClaimStore.id(original.key());
         var live = WorkloadClaimDocuments.live(original).append("pipelineScope", MongoPipelinePreparationFacts.scope(scope))
                 .append("pipelinePreparation.phase", "PREPARED");
@@ -85,6 +93,11 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
 
     /** A node-backed tenure and its original live node are sampled by the same server command. */
     static PipelineAuthority readPipelineAuthority(MongoDatabase snapshot, PipelineIntentScope scope, WorkloadClaimKey key) {
+        return readPipelineAuthority(null, snapshot, scope, key);
+    }
+
+    private static PipelineAuthority readPipelineAuthority(ClientSession session, MongoDatabase snapshot,
+            PipelineIntentScope scope, WorkloadClaimKey key) {
         var stages = authorityStages(scope, key);
         var nodeId = new Document("clusterId", scope.clusterId())
                 .append("resourceType", io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION.name()).append("resourceId", "$$owner");
@@ -93,7 +106,9 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
                 .append("pipeline", List.of(new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", nodeId)))),
                         new Document("$limit", 1), MongoWorkloadClaimStore.leaseRemaining(true), inline()))
                 .append("as", "node")));
-        var captured = SystemCollections.CACHE_IDENTITY.on(snapshot).aggregate(stages).collation(SIMPLE).first();
+        var table = SystemCollections.CACHE_IDENTITY.on(snapshot);
+        var query = session == null ? table.aggregate(stages) : table.aggregate(session, stages);
+        var captured = query.collation(SIMPLE).first();
         var facts = authority(captured);
         if (facts == null) return null;
         var rows = captured.getList("node", Document.class);
@@ -106,6 +121,25 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
     static Authority readAuthority(ClientSession session, MongoDatabase database, PipelineIntentScope scope, WorkloadClaimKey key) {
         var stages = authorityStages(scope, key);
         return authority(SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, stages).collation(SIMPLE).first());
+    }
+
+    record CaptureBirth(Authority authority, java.util.Set<SystemCollections> populated) {}
+
+    /** Any row in a namespace retains that collection's own collation for the subsequent history check. */
+    static CaptureBirth captureBirth(ClientSession session, MongoDatabase database, PipelineIntentScope scope,
+            WorkloadClaimKey key, List<SystemCollections> historyTables) {
+        var stages = authorityStages(scope, key);
+        for (var table : historyTables) {
+            stages.add(new Document("$lookup", new Document("from", table.collectionName()).append("as", table.collectionName())
+                    .append("pipeline", List.of(new Document("$limit", 1), new Document("$project",
+                            new Document("_id", 0).append("present", new Document("$literal", true)))))));
+        }
+        var row = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, stages).collation(SIMPLE).first();
+        var facts = authority(row);
+        if (facts == null) return null;
+        var populated = java.util.EnumSet.noneOf(SystemCollections.class);
+        for (var table : historyTables) if (!row.getList(table.collectionName(), Document.class).isEmpty()) populated.add(table);
+        return new CaptureBirth(facts, populated);
     }
 
     record SinkReceipt(Authority authority, Document row) {}

@@ -91,7 +91,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         this.ownership = Objects.requireNonNull(ownership,"ownership"); this.defaultDatabase = Objects.requireNonNull(defaultDatabase,"defaultDatabase");
         this.connectors = Objects.requireNonNull(connectors,"connectors"); this.clock = Objects.requireNonNull(clock,"clock");
         this.ports = Objects.requireNonNull(ports,"ports"); this.submissions = Objects.requireNonNull(submissions,"submissions");
-        this.command = pass.claim(); require();
+        this.command = pass.claim(); requireRead(id());
         run = engine.captureRun(id()).orElse(null); requireLocal();
         if (run != null) {
             manifest = run.operatorManifest();
@@ -127,6 +127,17 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         boolean proved = checkingStart ? ownership.proveStartClaim(pass.scope(), command)
                 : ownership.proveClaim(pass.scope(), command);
         if (!proved) throw fenced();
+        requireLocal();
+    }
+    /** Inspecting the existing Jet handle does not grant a new engine action or a storage write. */
+    private void requireRead(String pipeline) {
+        if (!id().equals(pipeline)) throw fenced();
+        if (!ownership.processOwnsClaims()) {
+            require();
+            return;
+        }
+        requireLocal();
+        if (!ownership.proveStartClaim(pass.scope(), command)) throw fenced();
         requireLocal();
     }
     /** Preparation may use this process's confirmed lease; later reads and durable writes retain their fences. */
@@ -460,7 +471,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override public synchronized Optional<Throwable> terminalLeaseFailure(String pipeline) {
-        requireId(pipeline);
+        requireRead(pipeline);
         return pass.renewalFailure().map(Throwable.class::cast);
     }
 
@@ -468,14 +479,14 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         long displaced = pass.displacedExecution();
         if (displaced > 0 && displaced == command.executionGeneration()
                 && (run == null || original != null && pass.scope().equals(original.scope()) && !run.completed())) {
-            requireId(pipeline);
+            requireRead(pipeline);
             return Optional.of(new LeaseLoss(displaced,
                     new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipeline), null)));
         }
         if (run == null || original == null || !pass.scope().equals(original.scope())) return Optional.empty();
         if (run.isCarryingAJob()) {
             if (original.claimGeneration() >= command.claimGeneration()) return Optional.empty();
-            requireId(pipeline);
+            requireRead(pipeline);
             // The successor can fence this old execution even before its Jet tasks notice the loss.
             return Optional.of(new LeaseLoss(original.executionGeneration(),
                     new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipeline), null)));
@@ -483,7 +494,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         var failure = run.failure();
         for (Throwable cause = failure.orElse(null); cause != null; cause = cause.getCause()) {
             if (cause instanceof TapstateException coded && coded.code() == EngineError.EXECUTION_NOT_AUTHORIZED) {
-                requireId(pipeline);
+                requireRead(pipeline);
                 return Optional.of(new LeaseLoss(original.executionGeneration(), coded));
             }
         }
@@ -491,7 +502,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override public synchronized boolean recoveredJobRunning(String pipeline) {
-        requireId(pipeline);
+        requireRead(pipeline);
         return run != null && isCurrentRun() && run.status() == com.hazelcast.jet.core.JobStatus.RUNNING;
     }
 
@@ -499,33 +510,33 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         return failureFact(pipeline).map(io.tapstate.core.common.FailureFact::cause);
     }
     @Override public synchronized Optional<io.tapstate.core.common.FailureFact> failureFact(String pipeline) {
-        requireId(pipeline);
-        if (engine.isLost()) { var lost = engine.lost(id()).map(io.tapstate.core.common.FailureFact::new); require(); return lost; }
-        Optional<io.tapstate.core.common.FailureFact> failure = run != null && isCurrentRun() ? run.failureFact() : Optional.empty(); require();
+        requireRead(pipeline);
+        if (engine.isLost()) { var lost = engine.lost(id()).map(io.tapstate.core.common.FailureFact::new); requireRead(pipeline); return lost; }
+        Optional<io.tapstate.core.common.FailureFact> failure = run != null && isCurrentRun() ? run.failureFact() : Optional.empty(); requireRead(pipeline);
         // An earlier capture stays bound for cleanup, not for the current run's failure diagnosis.
         if (failure.isPresent() || capture == null || !isCurrentRun()) return failure;
-        var captured = capture.captureFailureFact(id()); require(); return captured;
+        var captured = capture.captureFailureFact(id()); requireRead(pipeline); return captured;
     }
     @Override public synchronized Optional<Throwable> lost(String pipeline) {
-        requireId(pipeline); var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost;
+        requireRead(pipeline); var lost = engine.lost(id()).map(Throwable.class::cast); requireRead(pipeline); return lost;
     }
     @Override public synchronized boolean isCarryingAJob(String pipeline) {
-        requireId(pipeline);
+        requireRead(pipeline);
         // A successful bounded job still owns completion while its target receipts arrive.
         boolean carrying = (run != null && isCurrentRun() && run.isCarryingAJob()) || successfulBoundedJob(pipeline);
-        require();
+        requireRead(pipeline);
         return carrying;
     }
     @Override public synchronized void settleCompleted(String pipeline) { retryCompletion(pipeline); }
     @Override public synchronized boolean completed(String pipeline) {
-        requireId(pipeline);
+        requireRead(pipeline);
         if (!successfulBoundedJob(pipeline)) {
             return false;
         }
         boolean complete;
         try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_TARGET_CONFIRM)) {
             complete = capture.loadDelivered(pipeline) && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();
-            require();
+            requireRead(pipeline);
         }
         if (complete) PipelineDiagnostics.event("bounded_confirmation_observed");
         return complete;
@@ -537,7 +548,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     @Override public synchronized Optional<Completion> completion(String pipeline) {
         if (!completed(pipeline)) return Optional.empty();
-        var proof = new Completion(Long.toString(run.jobId()),command); require(); return Optional.of(proof);
+        var proof = new Completion(Long.toString(run.jobId()),command); requireRead(pipeline); return Optional.of(proof);
     }
     @Override public synchronized void complete(String pipeline) {
         complete(pipeline,completion(pipeline).orElseThrow(ScopedEngineLifecycleActuator::fenced));
