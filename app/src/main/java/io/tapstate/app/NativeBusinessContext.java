@@ -98,6 +98,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         overrides.put("connectionTestResultStore", resultStore);
         overrides.put("tokenStore", configuration.tokens());
         overrides.put("aiProviderSettingsStore", configuration.aiProviderSettings());
+        overrides.put("retrySettingsStore", configuration.retrySettings());
         var providerClient = parent.getBeanProvider(AiProviderClient.class).getIfAvailable();
         if (providerClient != null) overrides.put("aiProviderClient", providerClient);
         overrides.put("auditStore", configuration.audit());
@@ -346,6 +347,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 }
             });
         }
+        @Bean io.tapstate.control.core.RetrySettingsService retrySettingsService(RetrySettingsStore store, AuditGate audit) {
+            return new io.tapstate.control.core.RetrySettingsService(store, audit);
+        }
+
         @Bean SrsStores nativeSrsStores(NativeBusinessContext owner) {
             return owner.original.cache().runtimeSrs(owner.original.preparation().businessScope(), owner.original::requireBusiness);
         }
@@ -512,7 +517,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::recoveryPinned,boundedLoads,
                     owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
-                            cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding,signals::source);
+                            cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding, signals::source)
+                    .withReadRetries(new RetryPolicies(owner.configuration.retrySettings())::policy);
         }
         @Bean(destroyMethod="close") NativeValidationCaptureRoutes nativeValidationCaptureRoutes(NativeBusinessContext owner,
                 HazelcastInstance member,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization,ValidationMemberResources.Member resources){

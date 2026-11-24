@@ -1,6 +1,11 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.core.common.FailureFact;
+import io.tapstate.core.common.RetryPolicy;
+import io.tapstate.core.common.RetryWindow;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.RetrySettingsStore;
+import io.tapdata.pdk.apis.functions.PDKMethod;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.core.model.PipelineNode;
@@ -52,7 +57,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 
 /**
@@ -194,6 +202,47 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         catch (RuntimeException | Error failure) { openingFailed(null, failure); throw failure; }
     }
 
+    private Function<String, RetryPolicy> readRetries = operation -> RetrySettingsStore.DEFAULT.disabled();
+    private java.util.function.Predicate<String> replayableSnapshot = table -> false;
+    private Consumer<FailureFact> streamInterrupted;
+    private Runnable streamRecovered = () -> {};
+    private java.util.function.BooleanSupplier streamReopening = () -> false;
+    private static final Duration STREAM_RECOVERY_CONFIRMATION_DELAY = Duration.ofMinutes(30);
+    private StreamRecoveryScheduler streamRecoveryScheduler = PdkCapturePort::scheduleStreamRecovery;
+
+    public PdkCapturePort withReadRetries(Function<String, RetryPolicy> policies) {
+        readRetries = Objects.requireNonNull(policies);
+        return this;
+    }
+
+    /** Only callers with proven replay-safe downstream effects may restart a partially read table. */
+    public PdkCapturePort withReplayableSnapshotTables(java.util.function.Predicate<String> replayable) {
+        replayableSnapshot = Objects.requireNonNull(replayable);
+        return this;
+    }
+
+    /** The capture owner can replace the reader using its durable recovery boundary. */
+    public PdkCapturePort withStreamRecovery(Consumer<FailureFact> interrupted, Runnable recovered,
+            java.util.function.BooleanSupplier reopening) {
+        streamInterrupted = Objects.requireNonNull(interrupted);
+        streamRecovered = Objects.requireNonNull(recovered);
+        streamReopening = Objects.requireNonNull(reopening);
+        return this;
+    }
+
+    @FunctionalInterface
+    interface StreamRecoveryScheduler {
+        default long nanoTime() { return System.nanoTime(); }
+
+        /** Schedule a future confirmation and return its cancellation action. */
+        Runnable scheduleAt(long cutoffNanos, Runnable confirm);
+    }
+
+    PdkCapturePort withStreamRecoveryScheduler(StreamRecoveryScheduler scheduler) {
+        streamRecoveryScheduler = Objects.requireNonNull(scheduler);
+        return this;
+    }
+
     private SourceOperationObserver operationObserver = SourceOperationObserver.NONE;
 
     /** Installed only by an original running-source assembly, never by a manual connection test. */
@@ -236,9 +285,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     public PdkCapturePort withSnapshotPreparation(SnapshotPreparer prepare) {
         var configured = new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
                 nanoClock, releaseTimeout, noteScopes, Objects.requireNonNull(prepare, "prepare"), streamPreparer, pendingPreflights);
-        configured.withOperationObserver(operationObserver).withOpeningFailure(openingFailure)
-                .withDeferredPreflightClose(deferredPreflightClose);
-        return configured;
+        return withPortSettings(configured);
     }
 
 
@@ -246,9 +293,17 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     public PdkCapturePort withStreamPreparation(StreamPreparer prepare) {
         var configured = new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
                 nanoClock, releaseTimeout, noteScopes, snapshotPreparer, Objects.requireNonNull(prepare, "prepare"), pendingPreflights);
-        configured.withOperationObserver(operationObserver).withOpeningFailure(openingFailure)
-                .withDeferredPreflightClose(deferredPreflightClose);
-        return configured;
+        return withPortSettings(configured);
+    }
+
+    private PdkCapturePort withPortSettings(PdkCapturePort configured) {
+        configured.streamInterrupted = streamInterrupted;
+        configured.streamRecovered = streamRecovered;
+        configured.streamReopening = streamReopening;
+        configured.streamRecoveryScheduler = streamRecoveryScheduler;
+        return configured.withOperationObserver(operationObserver).withOpeningFailure(openingFailure)
+                .withDeferredPreflightClose(deferredPreflightClose).withReadRetries(readRetries)
+                .withReplayableSnapshotTables(replayableSnapshot);
     }
 
     /** Configured capture notes use the configuration domain, independently of generic operator state. */
@@ -523,6 +578,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         OracleLogMinerIdentifiers.validateConfigured(config);
         PdkConnector connector = observed(openRuntime(config),"stream");
         StreamReadFunction stream;
+        SourcePosition resumePosition = start instanceof CaptureStart.Resume resume ? resume.position() : null;
         Object resumeAt;
         try {
             stream = requireFunction(connector.functions().getStreamReadFunction());
@@ -542,8 +598,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             // loop: the loop's catch-all delivers everything it catches as a coded connector read failure,
             // which would report "the source failed" for what is really a position this build cannot read.
             // It needs the connector's loader, not an inited connector, so this is the earliest point.
-            resumeAt = start instanceof CaptureStart.Resume resume
-                    ? ConnectorOffsetCodec.fromToken(connector.connectorId(), resume.position().token(),
+            resumeAt = resumePosition != null
+                    ? ConnectorOffsetCodec.fromToken(connector.connectorId(), resumePosition.token(),
                             connector.connector().getClass().getClassLoader())
                     : null;
         } catch (RuntimeException e) {
@@ -558,16 +614,17 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config) || streamPreparer != null
                 ? new CompletableFuture<>() : null;
         CdcDelivery delivery = new CdcDelivery();
+        var recovery = new StreamRecovery();
         Acknowledgements acknowledgements = new Acknowledgements(connector, listener,
                 connector.functions().getFlushOffsetFunction(), acknowledgeIntervalNanos, nanoClock);
         Thread thread = new Thread(
-                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight,
-                        acknowledgements, delivery),
+                () -> streamLoop(connector, config, resumeAt, resumePosition, startAt, listener, stream, preflight,
+                        acknowledgements, delivery, recovery),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
         try{awaitPreflight(preflight,connector,thread,delivery);}
-        catch(RuntimeException | Error failure){openingFailed(connector,failure);closeObserver(connector);throw failure;}
+        catch(RuntimeException | Error failure){recovery.close();openingFailed(connector,failure);closeObserver(connector);throw failure;}
         return new Subscription() {
             private final CompletableFuture<Void> ended = new CompletableFuture<>();
             @Override
@@ -577,7 +634,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
             @Override
             public void close() {
-                closeObserver(connector);acknowledgements.close();
+                recovery.close();closeObserver(connector);acknowledgements.close();
                 if (delivery.cancel()) {
                     Thread cleanup = new Thread(() -> finishCdc(connector, thread, delivery, ended),
                             "tapstate-cdc-ending-" + connector.connectorId());
@@ -1150,15 +1207,37 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
         LOG.info("Snapshot read started for table {}", stream);
         java.util.concurrent.atomic.LongAdder eventsRead = new java.util.concurrent.atomic.LongAdder();
-        operation(connector,stream,SourceOperationObserver.Capability.SNAPSHOT_READ, () -> { batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
-            if (events.isEmpty()) {
-                return;
-            }
-            // A copy: the list is the connector's, and is decoded only once somebody takes it.
-            List<TapEvent> handed = new ArrayList<>(events);
-            reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
-            eventsRead.add(handed.size());
-        }); return null; });
+        var acceptedOffset = new AtomicReference<Object>();
+        var acceptedRows = new AtomicBoolean();
+        var handoffFailed = new AtomicBoolean();
+        RetryWindow.execute(() -> readRetries.apply(RetrySettingsStore.SNAPSHOT_READ),
+                failure -> {
+                    boolean replay = acceptedRows.get() && acceptedOffset.get() == null;
+                    if (handoffFailed.get() || (replay && !replayableSnapshot.test(stream))) return Optional.empty();
+                    return PdkReadRetry.prepare(connector, PDKMethod.SOURCE_BATCH_READ, failure);
+                },
+                () -> {
+                    if (reading.isClosed() || Thread.currentThread().isInterrupted()) {
+                        throw new CancellationException("the snapshot table was closed");
+                    }
+                    connector.requireActive();
+                }, () -> operation(connector, stream, SourceOperationObserver.Capability.SNAPSHOT_READ, () -> {
+                    batch.batchRead(connector.context(), table, acceptedOffset.get(), BATCH_SIZE, (events, offset) -> {
+                        if (events.isEmpty()) return;
+                        // Keep the complete accepted batch in the read-ahead queue across attempts.
+                        List<TapEvent> handed = new ArrayList<>(events);
+                        try {
+                            reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+                        } catch (RuntimeException | Error stopped) {
+                            handoffFailed.set(true);
+                            throw stopped;
+                        }
+                        acceptedRows.set(true);
+                        acceptedOffset.set(offset);
+                        eventsRead.add(handed.size());
+                    });
+                    return null;
+                }));
         LOG.info("Snapshot read finished for table {} ({} events read; awaiting target confirmation)",
                 stream, eventsRead.sum());
     }
@@ -1262,11 +1341,22 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         return tables;
     }
 
-    private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
+    private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt,
+            SourcePosition resumePosition, Long startAt,
             CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
-            Acknowledgements acknowledgements, CdcDelivery delivery) {
+            Acknowledgements acknowledgements, CdcDelivery delivery, StreamRecovery recovery) {
+        var interrupted = new AtomicReference<Throwable>();
         try {
-            Map<String, TapTable> tables = connector.underLoader(() -> prepareStream(connector, config));
+            Map<String, TapTable> tables = connector.underLoader(() -> {
+                try {
+                    return prepareStream(connector, config);
+                } catch (Throwable opening) {
+                    if (!delivery.closed && streamReopening.getAsBoolean() && retryableStream(connector, opening)) {
+                        interrupted.set(opening);
+                    }
+                    throw opening;
+                }
+            });
             if (delivery.closed) return;
             if (streamPreparer != null) {
                 try {
@@ -1302,10 +1392,11 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, startAt);
                 if (delivery.closed) return null;
                 if (listener instanceof CaptureStartedListener started) {
-                    position(connector, startOffset).ifPresent(started::onStart);
+                    if (resumePosition != null) started.onStart(resumePosition);
+                    else position(connector, startOffset).ifPresent(started::onStart);
                 }
                 Map<String, PdkRowSchema> declared = declaredTypes(tables);
-                var callbackFailed = new java.util.concurrent.atomic.AtomicBoolean();
+                var callbackFailed = new AtomicBoolean();
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     // Every delivery is the moment to hand the connector what its source may release: this
                     // is the connector's own delivery thread, the one thread any connector can safely be
@@ -1321,20 +1412,30 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                         acknowledgements.applyIfDue();
                         delivery.accept(() -> handOver(connector, declared, listener, events, offset));
                     } catch (RuntimeException | Error downstreamFailure) {
+                        recovery.finishInvocation();
                         callbackFailed.set(true);
                         throw downstreamFailure;
                     }
+                }).stateListener((oldState, newState) -> {
+                    if (newState == StreamReadConsumer.STATE_STREAM_READ_STARTED) recovery.confirm();
+                    else if (newState == StreamReadConsumer.STATE_STREAM_READ_ENDED) recovery.finishInvocation();
                 });
                 Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
                 if (delivery.closed) return null;
+                if (!recovery.beginInvocation()) return null;
                 try { stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer); }
                 catch (Throwable failure) {
+                    // Stop the observation timer before operation reporting or PDK retry classification can block.
+                    recovery.finishInvocation();
                     if (!delivery.closed && !callbackFailed.get()) {
                         for(String table:config.streams().isEmpty()?tables.keySet():config.streams())
                             reportOperation(connector,table,SourceOperationObserver.Capability.STREAM_READ,failure);
+                        if (retryableStream(connector, failure)) {
+                            interrupted.set(failure);
+                        }
                     }
                     throw failure;
-                }
+                } finally { recovery.finishInvocation(); }
                 return null;
             });
         } catch (Throwable t) {
@@ -1360,15 +1461,86 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     ? coded
                     : new TapstateException(ConnectorError.CAPTURE_FAILED,
                             Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
-            if (preflight != null && preflight.completeExceptionally(reported)) {
-                return;
-            }
             var fact = connector.failureFact(reported);
+            boolean retry = interrupted.get() == t;
+            if (retry) recovery.interrupted(fact);
+            if (preflight != null && preflight.completeExceptionally(reported) || retry) return;
             LOG.atWarn().addKeyValue("diagnostic", io.tapstate.core.logging.FailureLogSnapshot.of(fact))
                     .log("cdc stream for connector {} stopped on a failure [{}]: {}", connector.connectorId(),
                             reported.code().code(), fact.publicFailure().params());
             listener.onFailure(fact);
         }
+    }
+
+    private static Runnable scheduleStreamRecovery(long cutoffNanos, Runnable confirm) {
+        var timer = Thread.ofVirtual().name("tapstate-cdc-recovery-confirm").start(() -> {
+            long remaining = cutoffNanos - System.nanoTime();
+            if (remaining > 0) {
+                try { TimeUnit.NANOSECONDS.sleep(remaining); }
+                catch (InterruptedException cancelled) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            confirm.run();
+        });
+        return () -> {
+            if (timer != Thread.currentThread()) timer.interrupt();
+        };
+    }
+
+    /** Serializes recovery signals and owns the no-callback observation timer for one invocation. */
+    private final class StreamRecovery {
+        private boolean closed;
+        private boolean invocationActive;
+        private boolean reportingRecovery;
+        private Runnable cancelConfirmation;
+
+        synchronized boolean beginInvocation() {
+            if (closed) return false;
+            invocationActive = true;
+            reportingRecovery = streamReopening.getAsBoolean();
+            if (reportingRecovery) {
+                long cutoff = streamRecoveryScheduler.nanoTime() + STREAM_RECOVERY_CONFIRMATION_DELAY.toNanos();
+                cancelConfirmation = streamRecoveryScheduler.scheduleAt(cutoff, this::confirm);
+            }
+            return true;
+        }
+
+        synchronized void interrupted(FailureFact failure) {
+            if (closed) return;
+            finishInvocation();
+            streamInterrupted.accept(failure);
+        }
+
+        synchronized void finishInvocation() {
+            invocationActive = false;
+            reportingRecovery = false;
+            cancelTimer();
+        }
+
+        synchronized void close() {
+            closed = true;
+            finishInvocation();
+        }
+
+        synchronized void confirm() {
+            if (closed || !invocationActive || !reportingRecovery) return;
+            reportingRecovery = false;
+            cancelTimer();
+            streamRecovered.run();
+        }
+
+        private void cancelTimer() {
+            var cancel = cancelConfirmation;
+            cancelConfirmation = null;
+            if (cancel != null) cancel.run();
+        }
+    }
+
+    private boolean retryableStream(PdkConnector connector, Throwable failure) {
+        return streamInterrupted != null && readRetries.apply(RetrySettingsStore.STREAM_READ).enabled()
+                && PdkReadRetry.prepare(connector, PDKMethod.SOURCE_STREAM_READ, failure).isPresent();
     }
 
     private static Object readerOffset(PdkConnector connector, Object startOffset, boolean resumed) {

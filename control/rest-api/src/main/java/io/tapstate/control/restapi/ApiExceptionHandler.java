@@ -187,6 +187,7 @@ class ApiExceptionHandler {
             Map.entry(ControlError.STORAGE_TEST_FAILED.code(), HttpStatus.BAD_REQUEST),
             Map.entry(ControlError.STORAGE_TEST_REQUIRED.code(), HttpStatus.CONFLICT),
             Map.entry(ControlError.STORAGE_UNAVAILABLE.code(), HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(ControlError.RETRY_SETTINGS_REVISION_CONFLICT.code(), HttpStatus.CONFLICT),
             Map.entry(ControlError.STORAGE_QUOTA_EXCEEDED.code(), HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("io.store-quota-exceeded", HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry(io.tapstate.core.common.IoErrorDefinitions.STORE_QUOTA_EXCEEDED.code(), HttpStatus.SERVICE_UNAVAILABLE),
