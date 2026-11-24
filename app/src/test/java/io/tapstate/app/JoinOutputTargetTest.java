@@ -26,6 +26,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * What key a join's output is written under.
@@ -70,6 +72,40 @@ class JoinOutputTargetTest {
         assertThat(targets).containsOnlyKeys("widen");
         assertThat(targets.get("widen").fields()).extracting(TargetField::name, TargetField::primaryKey)
                 .containsExactlyInAnyOrder(tuple("order_key", true), tuple("tag", false));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "amount, =after.amount",
+            "total, =after.amount",
+            "total, =before.amount",
+            "total, $amount"
+    })
+    void aMapCopyOfAJoinedDecimalKeepsItsLegacyDeclaration(String output, String rule) {
+        String join = pipeline("SELECT o.id AS order_id, o.price AS amount, c.name AS customer_name");
+        String projected = join.replace("serve:\n  from: widen\n", """
+                  - id: project
+                    type: map
+                    from: widen
+                    fields: { %s: '%s' }
+                serve:
+                  from: project
+                """.formatted(output, rule));
+        for (String pipeline : List.of(join, projected)) {
+            InMemoryStorePort store = validated(ORDERS_SRC, CUSTOMERS_SRC, TARGET, pipeline);
+            discovered(store, "orders_src", "orders", List.of("id"),
+                    new SourceField("id", "bigint", TapstateType.INT64), field("customer_ref", "bigint"),
+                    new SourceField("price", "decimal(10,2)", TapstateType.DECIMAL));
+            discovered(store, "customers_src", "customers", List.of("id"),
+                    field("id", "bigint"), field("cust_ref", "bigint"), field("name", "varchar"));
+            Map<String, Map<String, TargetTable>> captured = new LinkedHashMap<>();
+
+            new StoreBackedDagSource(store, capturing(captured)).dagFor("wide");
+
+            String column = pipeline.equals(join) ? "amount" : output;
+            assertThat(captured.get("mongodb").get("widen").fields())
+                    .contains(new TargetField(column, "decimal(10,2)", false, TapstateType.DECIMAL));
+        }
     }
 
     @Test

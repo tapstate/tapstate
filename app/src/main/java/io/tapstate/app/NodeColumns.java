@@ -101,17 +101,18 @@ import java.util.Set;
  *                      values have no origin even if their output name matches a source column
  * @param expanded      whether rows passed through an expansion, repeating parent values and
  *                      invalidating source uniqueness
+ * @param legacyDecimalDeclarations the original type tokens carried by decimal values without numeric metadata
  */
 record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
         Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
         Set<String> unchangedFields, Map<String, StringType> stringTypes, List<String> unwindSourceIdFields,
-        List<Set<String>> keyCandidates) {
+        List<Set<String>> keyCandidates, Map<String, String> legacyDecimalDeclarations) {
 
     NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
             Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
             Set<String> unchangedFields, Map<String, StringType> stringTypes, List<String> unwindSourceIdFields) {
         this(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, stringTypes,
-                unwindSourceIdFields, key.stream().map(Set::of).toList());
+                unwindSourceIdFields, key.stream().map(Set::of).toList(), Map.of());
     }
 
     NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
@@ -140,15 +141,23 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
     }
 
     NodeColumns withStringTypes(Map<String, StringType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types, unwindSourceIdFields, keyCandidates);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields,
+                types, unwindSourceIdFields, keyCandidates, legacyDecimalDeclarations);
     }
 
     NodeColumns withUnchangedFields(Set<String> fields) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes, unwindSourceIdFields, keyCandidates);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields,
+                stringTypes, unwindSourceIdFields, keyCandidates, legacyDecimalDeclarations);
     }
 
     NodeColumns withNumericTypes(Map<String, NumericType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes, unwindSourceIdFields, keyCandidates);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields,
+                stringTypes, unwindSourceIdFields, keyCandidates, legacyDecimalDeclarations);
+    }
+
+    NodeColumns withLegacyDecimalDeclarations(Map<String, String> declarations) {
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields,
+                stringTypes, unwindSourceIdFields, keyCandidates, declarations);
     }
 
     NodeColumns {
@@ -161,6 +170,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         origins = Collections.unmodifiableMap(new LinkedHashMap<>(origins));
         numericTypes = Collections.unmodifiableMap(new LinkedHashMap<>(numericTypes));
         stringTypes = Collections.unmodifiableMap(new LinkedHashMap<>(stringTypes));
+        legacyDecimalDeclarations = Map.copyOf(legacyDecimalDeclarations);
         unchangedFields = Collections.unmodifiableSet(new LinkedHashSet<>(unchangedFields));
     }
 
@@ -333,13 +343,14 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         }
         Map<String, NumericType> numbers = commonDescriptors(inputs, out.keySet(), NodeColumns::numericTypes);
         Map<String, StringType> strings = commonDescriptors(inputs, out.keySet(), NodeColumns::stringTypes);
+        Map<String, String> decimals = commonDescriptors(inputs, out.keySet(), NodeColumns::legacyDecimalDeclarations);
         Set<String> unchanged = new LinkedHashSet<>(out.keySet());
         inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
         List<Set<String>> mergedCandidates = mergedKeyCandidates(inputs);
         List<String> mergedKey = mergedCandidates.stream().filter(names -> !names.isEmpty())
                 .map(names -> names.iterator().next()).toList();
         return new NodeColumns(out, mergedKey, null,
-                origins, expanded, numbers, unchanged, strings, mergedSourceIdentityFields(inputs), mergedCandidates);
+                origins, expanded, numbers, unchanged, strings, mergedSourceIdentityFields(inputs), mergedCandidates, decimals);
     }
 
     /** An added key component needs a common alias on every input. */
@@ -458,16 +469,18 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         origins.remove(unwind.elementKey());
         Map<String, NumericType> numbers = new LinkedHashMap<>(upstream.numericTypes());
         Map<String, StringType> strings = new LinkedHashMap<>(upstream.stringTypes());
+        Map<String, String> decimals = new LinkedHashMap<>(upstream.legacyDecimalDeclarations());
         Set<String> unchanged = new LinkedHashSet<>(upstream.unchangedFields());
         // The element and its generated locators are new values, not the parent's declaration.
         for (String replaced : new String[] {unwind.path(), unwind.includeArrayIndex(), unwind.elementKey()}) {
             numbers.remove(replaced);
             strings.remove(replaced);
+            decimals.remove(replaced);
             unchanged.remove(replaced);
         }
         return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings,
                 unwind.sourceIdField() != null || upstream.unwindSourceIdFields().isEmpty()
-                        ? List.of(unwind.resolvedSourceIdField()) : upstream.unwindSourceIdFields(), candidates);
+                        ? List.of(unwind.resolvedSourceIdField()) : upstream.unwindSourceIdFields(), candidates, decimals);
     }
 
     /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
@@ -520,7 +533,8 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             }
         }
         root.columns().forEach(out::putIfAbsent);
-        return known(out).withNumericTypes(root.numericTypes()).withStringTypes(root.stringTypes()).withUnchangedFields(root.unchangedFields());
+        return known(out).withNumericTypes(root.numericTypes()).withStringTypes(root.stringTypes())
+                .withUnchangedFields(root.unchangedFields()).withLegacyDecimalDeclarations(root.legacyDecimalDeclarations());
     }
 
     /**
@@ -613,12 +627,13 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         Map<String, String> out = new LinkedHashMap<>();
         Map<String, NumericType> numbers = new LinkedHashMap<>();
         Map<String, StringType> strings = new LinkedHashMap<>();
+        Map<String, String> decimals = new LinkedHashMap<>();
         Set<String> unchanged = new LinkedHashSet<>();
         Set<String> consumed = new LinkedHashSet<>();
         Set<String> dropped = new LinkedHashSet<>();
 
-        applyRules(rules, upstream, upstreamTypes, out, numbers, strings, unchanged, consumed, dropped);
-        passThrough(upstream, out, numbers, strings, unchanged, consumed, dropped);
+        applyRules(rules, upstream, upstreamTypes, out, numbers, strings, decimals, unchanged, consumed, dropped);
+        passThrough(upstream, out, numbers, strings, decimals, unchanged, consumed, dropped);
         Map<String, String> origins = projectedOrigins(rules, upstream, out.keySet());
 
         List<Set<String>> candidates = new ArrayList<>();
@@ -635,17 +650,17 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         List<String> key = candidates.stream().filter(names -> !names.isEmpty())
                 .map(names -> names.iterator().next()).toList();
         return new NodeColumns(out, key, null,
-                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields(), candidates);
+                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields(), candidates, decimals);
     }
 
     private static void applyRules(
             Map<String, FieldRule> rules, NodeColumns upstream, Map<String, TapstateType> upstreamTypes,
             Map<String, String> out, Map<String, NumericType> numbers, Map<String, StringType> strings,
-            Set<String> unchanged, Set<String> consumed, Set<String> dropped) {
+            Map<String, String> decimals, Set<String> unchanged, Set<String> consumed, Set<String> dropped) {
         rules.forEach((output, rule) -> {
             switch (rule) {
                 case FieldRule.Rename rename ->
-                        applyRename(rename, output, upstream, out, numbers, strings, unchanged, consumed);
+                        applyRename(rename, output, upstream, out, numbers, strings, decimals, unchanged, consumed);
                 case FieldRule.Drop ignored -> dropped.add(output);
                 // A literal is the one column here that is known not to be absent: it is the same
                 // written-down value on every row.
@@ -656,7 +671,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                 case FieldRule.Computed computed -> {
                     out.put(output, JoinSchemaDrift.declaredType(
                             RowExpressions.typedValueType(computed.celExpr(), upstreamTypes), true));
-                    keepMovedDescriptors(output, computed.celExpr(), upstream, numbers, strings);
+                    keepMovedDescriptors(output, computed.celExpr(), upstream, numbers, strings, decimals);
                 }
             }
         });
@@ -665,7 +680,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
     private static void applyRename(
             FieldRule.Rename rename, String output, NodeColumns upstream,
             Map<String, String> out, Map<String, NumericType> numbers, Map<String, StringType> strings,
-            Set<String> unchanged, Set<String> consumed) {
+            Map<String, String> decimals, Set<String> unchanged, Set<String> consumed) {
         consumed.add(rename.sourceField());
         String renamed = upstream.columns().get(rename.sourceField());
         if (renamed != null) {
@@ -673,33 +688,36 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             if (output.equals(rename.sourceField()) && upstream.unchangedFields().contains(output)) {
                 unchanged.add(output);
             }
-            copyTypeDescriptors(output, rename.sourceField(), upstream, numbers, strings);
+            copyTypeDescriptors(output, rename.sourceField(), upstream, numbers, strings, decimals);
         }
     }
 
     private static void passThrough(
             NodeColumns upstream, Map<String, String> out,
             Map<String, NumericType> numbers, Map<String, StringType> strings,
-            Set<String> unchanged, Set<String> consumed, Set<String> dropped) {
+            Map<String, String> decimals, Set<String> unchanged, Set<String> consumed, Set<String> dropped) {
         upstream.columns().forEach((name, type) -> {
             if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
                 out.put(name, type);
                 if (upstream.unchangedFields().contains(name)) {
                     unchanged.add(name);
                 }
-                copyTypeDescriptors(name, name, upstream, numbers, strings);
+                copyTypeDescriptors(name, name, upstream, numbers, strings, decimals);
             }
         });
     }
 
     private static void copyTypeDescriptors(
             String target, String source, NodeColumns upstream,
-            Map<String, NumericType> numbers, Map<String, StringType> strings) {
+            Map<String, NumericType> numbers, Map<String, StringType> strings, Map<String, String> decimals) {
         if (upstream.stringTypes().containsKey(source)) {
             strings.put(target, upstream.stringTypes().get(source));
         }
         if (upstream.numericTypes().containsKey(source)) {
             numbers.put(target, upstream.numericTypes().get(source));
+        }
+        if (upstream.legacyDecimalDeclarations().containsKey(source)) {
+            decimals.put(target, upstream.legacyDecimalDeclarations().get(source));
         }
     }
 
@@ -743,17 +761,12 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
      * expression produces a value nothing was declared about, and hands on nothing.
      */
     private static void keepMovedDescriptors(String output, String expr, NodeColumns upstream,
-            Map<String, NumericType> numbers, Map<String, StringType> strings) {
+            Map<String, NumericType> numbers, Map<String, StringType> strings, Map<String, String> decimals) {
         String moved = RowExpressions.movedColumn(expr);
         if (moved == null || !upstream.columns().containsKey(moved)) {
             return;
         }
-        if (upstream.stringTypes().containsKey(moved)) {
-            strings.put(output, upstream.stringTypes().get(moved));
-        }
-        if (upstream.numericTypes().containsKey(moved)) {
-            numbers.put(output, upstream.numericTypes().get(moved));
-        }
+        copyTypeDescriptors(output, moved, upstream, numbers, strings, decimals);
     }
 
     /**

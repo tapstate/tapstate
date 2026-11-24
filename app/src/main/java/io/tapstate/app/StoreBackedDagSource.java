@@ -1565,11 +1565,16 @@ final class StoreBackedDagSource implements DagSource {
         if (original == null) return null;
         Map<String, io.tapstate.core.common.NumericType> numbers = new LinkedHashMap<>();
         Map<String, io.tapstate.core.common.StringType> strings = new LinkedHashMap<>();
+        Map<String, String> legacyDecimals = new LinkedHashMap<>();
         for (TargetField field : base.fields()) {
             if (field.numericType() != null) numbers.put(field.name(), field.numericType());
+            else if (field.inferredType() == TapstateType.DECIMAL && field.type() != null) {
+                legacyDecimals.put(field.name(), field.type());
+            }
             if (field.stringType() != null) strings.put(field.name(), field.stringType());
         }
-        var origin = original.withNumericTypes(numbers).withStringTypes(strings);
+        var origin = original.withNumericTypes(numbers).withStringTypes(strings)
+                .withLegacyDecimalDeclarations(legacyDecimals);
         var inputs = streamInputs(graph, from, stream, origin, new HashSet<>());
         if (inputs.isEmpty()) return null;
         NodeColumns produced = inputs.size() == 1 ? inputs.values().iterator().next()
@@ -2066,15 +2071,17 @@ final class StoreBackedDagSource implements DagSource {
     private static TargetField publishedField(String column, TargetField carried,
             NodeColumns produced, NodeColumns atTheSource) {
         var inferred = JoinSchemaDrift.typeOf(produced.columns().get(column));
+        var number = produced.numericTypes().get(column);
+        boolean needsDecimalDeclaration = inferred == TapstateType.DECIMAL && number == null;
         // A decimal without a descriptor can reuse an older source spelling only while the value
         // is unchanged. A computed value with the same name has no declared source range.
         boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource)
-                && (inferred != io.tapstate.core.common.TapstateType.DECIMAL
-                || produced.numericTypes().containsKey(column)
-                || produced.unchangedFields().contains(column));
-        return new TargetField(column, spellingStillHolds ? carried.type() : null, false,
-                inferred,
-                produced.numericTypes().get(column), produced.stringTypes().get(column));
+                && (!needsDecimalDeclaration || produced.unchangedFields().contains(column));
+        String spelling = spellingStillHolds ? carried.type() : null;
+        if (needsDecimalDeclaration) {
+            spelling = produced.legacyDecimalDeclarations().getOrDefault(column, spelling);
+        }
+        return new TargetField(column, spelling, false, inferred, number, produced.stringTypes().get(column));
     }
 
     /**
