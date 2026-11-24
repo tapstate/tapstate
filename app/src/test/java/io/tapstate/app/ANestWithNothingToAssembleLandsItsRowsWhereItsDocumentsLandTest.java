@@ -102,6 +102,22 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
         assertThat(planned.shape().sinkTargetsOf(SINK)).containsEntry(TABLE, new SinkTarget(TABLE, List.of("id")));
     }
 
+    @Test
+    void aProjectionAfterNestPreservesTheDeclaredCompositeKeyOrder() {
+        List<String> key = List.of("id", "cust_no");
+        Step project = Step.inline("project", FromClause.list(FromRef.literal(STEP)),
+                new TransformBody.MapProjection(Map.of("cust_no", FieldRule.computed("after.cust_no"))), null);
+        InMemoryStorePort store = seedStore(List.of(rootOnly(STEP, "id", "cust_no"), project),
+                FromClause.list(FromRef.literal(TABLE), FromRef.literal("project")), key);
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+
+        DagSource.PlannedDag planned = new StoreBackedDagSource(store, capturing(bound)).plannedDagFor(PIPELINE, null);
+
+        assertThat(bound.get().get(STEP).fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactlyElementsOf(key);
+        assertThat(planned.shape().sinkTargetsOf(SINK)).containsEntry(TABLE, new SinkTarget(TABLE, key));
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void targetInspectionUsesTheSameQualifiedRootLandingAndRenamesAsTheSink(boolean serveLeft) {
@@ -175,12 +191,16 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
     }
 
     /** A nest over the table with nothing to assemble, keyed on {@code key}. */
-    private static Step rootOnly(String id, String key) {
+    private static Step rootOnly(String id, String... key) {
         return Step.inline(id, FromClause.aliases(Map.of("c", FromRef.literal(TABLE))),
                 new TransformBody.Nest(null, null, new NestRoot("c", List.of(key), null, null, List.of())), null);
     }
 
     private static InMemoryStorePort seedStore(List<Step> steps, FromClause served) {
+        return seedStore(steps, served, List.of("id"));
+    }
+
+    private static InMemoryStorePort seedStore(List<Step> steps, FromClause served, List<String> key) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(TABLE)), null, null));
@@ -194,7 +214,7 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel(SOURCE, "fake", 0L, new SourceModel(List.of(
                 new SourceTable(TABLE, List.of(new SourceField("id", "int"), new SourceField("cust_no", "string"),
-                        new SourceField("name", "string")), List.of("id"), List.of())))));
+                        new SourceField("name", "string")), key, List.of())))));
         return store;
     }
 }

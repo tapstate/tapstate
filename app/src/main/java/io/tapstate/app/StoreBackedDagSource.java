@@ -2007,10 +2007,11 @@ final class StoreBackedDagSource implements DagSource {
      * inherit its old spelling as a fallback when no element type is known.
      *
      *
-     * <p>The key starts as the table's complete key, key columns leading, because that is the order
-     * the sink matches an upsert in. If a projection drops or replaces any component, output identity
-     * is unresolved: a surviving subset cannot uniquely identify rows from a composite-key source,
-     * so the target table is published without a key. Keyed writes can then refuse it.
+     * <p>The key starts as the table's complete key in its declared order, with key columns leading
+     * because that is the order the sink matches an upsert in. If a projection drops or replaces any
+     * component, output identity is unresolved: a surviving subset cannot uniquely identify rows from
+     * a composite-key source, so the target table is published without a key. Keyed writes can then
+     * refuse it.
      *
      * <p><b>The table's own key is the default and no longer the whole rule</b>, because a node that
      * expands a list emits several rows carrying one parent's key, and what tells them apart is a
@@ -2033,10 +2034,10 @@ final class StoreBackedDagSource implements DagSource {
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
             fields.add(publishedField(column, carried, produced, atTheSource));
-            TargetField identity = declared.get(produced.origins().get(column));
-            if (identity != null && identity.primaryKey()
-                    && column.equals(parentNames.get(identity.name()))) {
-                key.add(column);
+        }
+        for (TargetField field : base.fields()) {
+            if (field.primaryKey() && parentNames.containsKey(field.name())) {
+                key.add(parentNames.get(field.name()));
             }
         }
         for (String added : produced.key()) {
