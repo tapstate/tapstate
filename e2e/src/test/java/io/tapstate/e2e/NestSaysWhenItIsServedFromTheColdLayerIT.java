@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -16,6 +17,7 @@ import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -109,16 +111,9 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
                 Await.until("every root to reach the view", TIMEOUT,
                         () -> mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE).size() == ROOTS,
                         () -> control.metrics(pipelineId));
-                Await.until("the cold-layer warning to be published", TIMEOUT,
-                        () -> control.logs(pipelineId).contains(EXPECTED_CODE),
-                        () -> control.metrics(pipelineId));
-
-                assertThat(control.logs(pipelineId))
-                        .as("the pipeline's own logs face, where an operator would look. A run under this "
-                                + "much pressure has to say it is being served from behind its memory - "
-                                + "nothing else moves when that happens.%n  metrics: %s",
-                                control.metrics(pipelineId))
-                        .contains(EXPECTED_CODE);
+                Await.until("the pipeline logs to contain the cold-layer warning", TIMEOUT,
+                        () -> hasColdLayerWarning(control.logs(pipelineId)),
+                        () -> control.logs(pipelineId));
 
                 // The other half: said without dying. An implementation that only reports at the point of
                 // failure satisfies the assertion above only by failing, which these two forbid.
@@ -130,6 +125,17 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
                         .contains(0L);
             }
         }
+    }
+
+    private boolean hasColdLayerWarning(String response) {
+        if (!response.startsWith("200 ")) return false;
+        if (!(JsonReader.parse(response.substring(4)) instanceof Map<?, ?> logs)
+                || !pipelineId.equals(logs.get("pipelineId"))
+                || !(logs.get("lines") instanceof List<?> lines)) return false;
+        return lines.stream().anyMatch(entry -> entry instanceof Map<?, ?> line
+                && "WARN".equals(line.get("level"))
+                && line.get("message") instanceof String message
+                && message.startsWith(EXPECTED_CODE + " "));
     }
 
     /** Each root is a first touch. Child arrivals would revisit hot roots and dilute the cold share. */

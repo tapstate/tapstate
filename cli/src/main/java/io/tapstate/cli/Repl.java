@@ -8,6 +8,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.lifecycle.LegacyPositionEncoding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.schema.SchemaNavigator;
@@ -26,15 +27,11 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -3881,8 +3878,8 @@ final class Repl {
     /**
      * {@code metrics <pipeline-id>} — reads the pipeline's open map of run statistics and the one source
      * position it records, and prints one {@code <name>  <value>} line each in name order. Readable
-     * positions appear under {@code targetAckedPosition.<table>}; Java-serialized positions get a stable
-     * fingerprint because their connector-private bytes cannot be presented as source coordinates. A benign
+     * positions appear under {@code targetAckedPosition.<table>}; opaque positions get a stable
+     * fingerprint when no source coordinate is available. A benign
      * {@code no metrics} line appears when nothing is wired yet (unavailable, never faked). A coded
      * refusal renders its code and message.
      *
@@ -3912,20 +3909,21 @@ final class Repl {
             case MetricsOutcome.Found found -> {
                 Map<String, String> lines = new TreeMap<>();
                 found.metrics().forEach((name, value) -> lines.put(name, String.valueOf(value)));
-                List<String> serializedPositions = new ArrayList<>();
+                List<String> opaquePositions = new ArrayList<>();
                 found.targetAckedPosition().forEach((table, position) -> {
-                    if (isSerializedJavaPosition(position)) {
-                        serializedPositions.add(position);
+                    String fingerprint = metricsPositionFingerprint(position);
+                    if (fingerprint != null) {
+                        opaquePositions.add(fingerprint);
                         lines.put(TARGET_ACKED_POSITION + "." + table,
-                                "opaque position fingerprint " + opaquePositionFingerprint(position)
+                                "opaque position fingerprint " + fingerprint.substring(0, 16)
                                         + " (source coordinate unavailable)");
                     } else {
                         lines.put(TARGET_ACKED_POSITION + "." + table, position);
                     }
                 });
-                if (!serializedPositions.isEmpty()) {
-                    long distinct = serializedPositions.stream().distinct().count();
-                    int tables = serializedPositions.size();
+                if (!opaquePositions.isEmpty()) {
+                    long distinct = opaquePositions.stream().distinct().count();
+                    int tables = opaquePositions.size();
                     lines.put(TARGET_ACKED_POSITION, "recorded on " + tables
                             + (tables == 1 ? " table; " : " tables; ") + distinct
                             + (distinct == 1 ? " distinct opaque position" : " distinct opaque positions")
@@ -3955,24 +3953,16 @@ final class Repl {
         };
     }
 
-    private static boolean isSerializedJavaPosition(String position) {
-        // AC ED 00 05 is the Java serialization header (rO0AB in base64). The CLI has no connector
-        // class or safe source-coordinate decoder for these opaque tokens.
-        return position != null && position.startsWith("rO0AB");
-    }
-
-    private static String opaquePositionFingerprint(String position) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(position.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest, 0, 8);
-        } catch (NoSuchAlgorithmException impossible) {
-            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+    private static String metricsPositionFingerprint(String position) {
+        if (position.matches("opaque-v1:[0-9a-f]{64}")) {
+            return position.substring("opaque-v1:".length());
         }
+        // Older servers sent the serialized token itself. Keep the same displayed fingerprint.
+        return LegacyPositionEncoding.hasJavaStreamHeader(position) ? CanonicalHash.ofText(position) : null;
     }
 
     private static String positionForText(String position) {
-        return isSerializedJavaPosition(position) ? OPAQUE_POSITION : position;
+        return LegacyPositionEncoding.hasJavaStreamHeader(position) ? OPAQUE_POSITION : position;
     }
 
     private int historyOnline(String id, List<String> options) {
