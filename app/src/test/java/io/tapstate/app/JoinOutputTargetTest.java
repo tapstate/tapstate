@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.common.TapstateException;
@@ -51,6 +52,72 @@ class JoinOutputTargetTest {
         assertThat(targets).containsOnlyKeys("widen");
         assertThat(keyOf(targets.get("widen"))).containsExactly("order_id");
         assertThat(namesOf(targets.get("widen"))).containsExactly("order_id", "customer_name");
+    }
+
+    @Test
+    void aMapAfterJoinPublishesItsProjectedFieldsAndKeyToTheSyncTarget() {
+        String pipeline = JOIN_PIPELINE.replace("serve:\n  from: widen\n", """
+                  - id: project
+                    type: map
+                    from: widen
+                    fields: { order_key: $order_id, customer_name: false, tag: x }
+                serve:
+                  from: project
+                """);
+
+        Map<String, TargetTable> targets = bind(pipeline);
+
+        assertThat(targets).containsOnlyKeys("widen");
+        assertThat(targets.get("widen").fields()).extracting(TargetField::name, TargetField::primaryKey)
+                .containsExactlyInAnyOrder(tuple("order_key", true), tuple("tag", false));
+    }
+
+    @Test
+    void aComputedFieldAfterJoinReplacesTheJoinedColumnsType() {
+        String pipeline = JOIN_PIPELINE.replace("serve:\n  from: widen\n", """
+                  - id: project
+                    type: map
+                    from: widen
+                    fields: { customer_name: "=size(after.customer_name)" }
+                serve:
+                  from: project
+                """);
+        InMemoryStorePort store = validated(ORDERS_SRC, CUSTOMERS_SRC, TARGET, pipeline);
+        discovered(store, "orders_src", "orders", List.of("id"),
+                new SourceField("id", "bigint", TapstateType.INT64), field("customer_ref", "bigint"));
+        discovered(store, "customers_src", "customers", List.of("id"),
+                field("id", "bigint"), field("cust_ref", "bigint"),
+                new SourceField("name", "varchar", TapstateType.STRING));
+        Map<String, Map<String, TargetTable>> captured = new LinkedHashMap<>();
+
+        new StoreBackedDagSource(store, capturing(captured)).dagFor("wide");
+
+        assertThat(captured.get("mongodb").get("widen").fields()).containsExactly(
+                new TargetField("order_id", "bigint", true, TapstateType.INT64),
+                new TargetField("customer_name", null, false, TapstateType.INT64));
+    }
+
+    @Test
+    void aMapAfterJoinCannotPublishAnIncompleteOrReplacedFactKey() {
+        for (String rule : List.of("false", "'=after.region + \"-copy\"'")) {
+            String pipeline = COMPOSITE_KEY_PIPELINE.replace("serve:\n  from: widen\n", """
+                      - id: project
+                        type: map
+                        from: widen
+                        fields: { order_key: $order_id, region: %s }
+                    serve:
+                      from: project
+                    """.formatted(rule));
+            assertThatThrownBy(() -> bind(pipeline, List.of("id", "region")))
+                    .isInstanceOfSatisfying(TapstateException.class, failure ->
+                            assertThat(failure.code()).isEqualTo(ActuationError.SYNC_OUTPUT_IDENTITY_UNRESOLVED));
+
+            TargetTable appended = bind(pipeline.replace("source: orders_dest }", "source: orders_dest, write_mode: append }"),
+                    List.of("id", "region")).get("widen");
+            assertThat(namesOf(appended)).contains("order_key");
+            assertThat(appended.fields()).noneMatch(TargetField::primaryKey);
+            assertThat(appended.indexes()).noneMatch(TargetIndex::unique);
+        }
     }
 
     @Test
