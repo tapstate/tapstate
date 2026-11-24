@@ -145,7 +145,9 @@ public enum EngineError implements TapstateErrorCode {
      * verdicts converge, and this is the one that never cleared. {@code state} names the state, {@code seconds}
      * how long the run waited.
      */
-    CLUSTER_REFUSED_THE_STATE(EngineErrorDefinitions.CLUSTER_REFUSED_THE_STATE);
+    CLUSTER_REFUSED_THE_STATE(EngineErrorDefinitions.CLUSTER_REFUSED_THE_STATE),
+
+    KEY_MOVE_WRITE_UNCONFIRMED(EngineErrorDefinitions.KEY_MOVE_WRITE_UNCONFIRMED);
 
     private final ProductErrorDefinition definition;
 

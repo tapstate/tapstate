@@ -9,6 +9,7 @@ import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.common.FailureFact;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
@@ -29,6 +30,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
@@ -163,6 +165,12 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // When each queued stream's oldest row was taken in, by the clock the wait is measured against.
     private final Map<String, Long> waitingSince = new LinkedHashMap<>();
     private int queuedRows;
+    private final KeyMoveSinkWriter moveWriter;
+    private QueuedMove queuedMove;
+
+    private record QueuedMove(long order, Envelope row, KeyMoveHandoffs.Receipt receipt, List<Envelope> batch,
+            Predicate<Envelope> admit) {}
+
     // The number the next row taken in gets. A word or a bound taken in waits for every row numbered below it.
     private long nextOrder;
     // How long a stream's oldest queued row waits for more before its rows go, and the clock it is measured
@@ -257,6 +265,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         this.writerOf = writerOf;
         this.totalOne = totalOne;
         this.writer = Objects.requireNonNull(writer, "writer");
+        this.moveWriter = writer instanceof KeyMoveSinkWriter ordered ? ordered : null;
+        if (moveWriter != null && maxInFlight != 1)
+            throw new IllegalArgumentException("key moves require an ordered writer");
         this.suppliedGauge = Objects.requireNonNull(gauge, "gauge");
         this.gauge = this.suppliedGauge;
         this.supplied = Objects.requireNonNull(delivery, "delivery");
@@ -474,7 +485,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * writer. It waits for every row taken in before it to land, and is handed over then.
      */
     private void takeIn(Inbox inbox) {
-        while (!inbox.isEmpty() && queuedRows < maxBatchSize) {
+        while (queuedMove == null && !inbox.isEmpty() && queuedRows < maxBatchSize) {
             Object item = inbox.poll();
             if (item instanceof SettledPositions settled) {
                 if (frontier != null) {
@@ -483,6 +494,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 continue;
             }
             Envelope row = (Envelope) item;
+            if (moveWriter != null) {
+                KeyMoveHandoffs.Receipt receipt = moveWriter.receiptFor(row);
+                if (receipt != null) {
+                    queuedMove = reserveMove(row, receipt);
+                    receipt.queued();
+                    break;
+                }
+            }
             ArrayDeque<Queued> queue = queued.get(row.src());
             if (queue == null) {
                 queue = new ArrayDeque<>();
@@ -492,10 +511,44 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             queue.add(new Queued(nextOrder++, row));
             queuedRows++;
         }
+        if (queuedMove != null) {
+            while (queuedRows + queuedMove.batch().size() < maxBatchSize && inbox.peek() instanceof Envelope next
+                    && next.src().equals(queuedMove.row().src()) && queuedMove.admit().test(next)) {
+                queuedMove.batch().add((Envelope) inbox.poll());
+                nextOrder++;
+            }
+        }
         if (frontier != null) {
             // A word taken in behind rows that have all landed already has nothing to wait for.
             releaseHeld();
         }
+    }
+
+    private QueuedMove reserveMove(Envelope row, KeyMoveHandoffs.Receipt receipt) {
+        long firstOrder = nextOrder++;
+        var batch = new ArrayList<Envelope>();
+        var earlier = queued.get(row.src());
+        Predicate<Envelope> admit = moveWriter.batchAdmission(row);
+        if (queued.size() == 1 && earlier != null) {
+            boolean share = true;
+            for (Queued item : earlier) {
+                if (!admit.test(item.row())) {
+                    share = false;
+                    break;
+                }
+            }
+            if (share) {
+                firstOrder = earlier.getFirst().order();
+                for (Queued item : earlier) batch.add(item.row());
+                queued.remove(row.src());
+                queuedRows -= earlier.size();
+                waitingSince.remove(row.src());
+            } else {
+                admit = moveWriter.batchAdmission(row);
+            }
+        }
+        batch.add(row);
+        return new QueuedMove(firstOrder, row, receipt, batch, admit);
     }
 
     /** Holds {@code positions} until every row taken in before them has landed. */
@@ -519,6 +572,13 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         long now = nanoClock.getAsLong();
         boolean wrote = false;
         while (inFlight.size() < maxInFlight) {
+            if (queuedMove != null && queued.isEmpty()) {
+                var batch = queuedMove.batch();
+                inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
+                        queuedMove.order(), queuedMove.receipt(), batch.size()));
+                queuedMove = null;
+                return true;
+            }
             String stream = nextDue(now);
             if (stream == null) {
                 return wrote;
@@ -536,7 +596,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // envelopes themselves until then would keep a batch's worth of rows alive for the length of a
             // write; this keeps one number per table and operation in it instead.
             inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
-                    firstOrder));
+                    firstOrder, null, 0));
         }
         // A saturated in-flight set leaves the queues as they are, and once they are full the inbox too; Jet
         // backpressures upstream until reapSettled frees a slot on a later call.
@@ -548,7 +608,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * as a batch waits - no time at all, by default - or no room left to take in more, or the input over.
      */
     private String nextDue(long now) {
-        boolean full = queuedRows >= maxBatchSize;
+        boolean full = queuedRows >= maxBatchSize || queuedMove != null;
         for (Map.Entry<String, ArrayDeque<Queued>> stream : queued.entrySet()) {
             if (full || draining || maxWaitNanos == 0
                     || now - waitingSince.get(stream.getKey()) >= maxWaitNanos) {
@@ -569,7 +629,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             reapSettled();
         } while (writeWhatIsDue());
         reportWaiting();
-        boolean done = inFlight.isEmpty() && queued.isEmpty();
+        boolean done = inFlight.isEmpty() && queued.isEmpty() && queuedMove == null;
         if (done) flushCheckpoint(true);
         return done;
     }
@@ -604,6 +664,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             batch.delivered().rows().forEach((table, byOp) -> inFlightByTable.merge(
                     table, byOp.values().stream().mapToLong(Long::longValue).sum(), Long::sum));
         }
+        if (queuedMove != null) queuedByStream.merge(queuedMove.row().src(), (long) queuedMove.batch().size(), Long::sum);
         delivery.waiting(queuedByStream, inFlightByTable);
     }
 
@@ -732,7 +793,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     /** The number of the oldest row not yet landed - queued or being written - or the next number if none is. */
     private long firstUnlanded() {
-        long first = nextOrder;
+        long first = queuedMove == null ? nextOrder : queuedMove.order();
         for (ArrayDeque<Queued> queue : queued.values()) {
             first = Math.min(first, queue.peek().order());
         }
@@ -783,7 +844,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 return false;
             }
             try {
-                settle(batch.future()); // throws on a failed write, before any position advances
+                WriteResult result = settle(batch.future());
+                if (batch.receipt() != null) {
+                    if (result.written() != batch.expectedWrites()) {
+                        throw new TapstateException(EngineError.KEY_MOVE_WRITE_UNCONFIRMED,
+                                Map.of("expected", batch.expectedWrites(), "accepted", result.written()), null);
+                    }
+                    batch.receipt().written();
+                }
             } catch (RuntimeException | Error failure) {
                 // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
                 // machinery: once the job's terminal result is durable Jet can no longer hand back this
@@ -896,9 +964,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * already raised (coded, for a real connector); the cause is rethrown as-is so it fails the job
      * unwrapped rather than buried in a {@link CompletionException}.
      */
-    private static void settle(CompletableFuture<WriteResult> future) {
+    private static WriteResult settle(CompletableFuture<WriteResult> future) {
         try {
-            future.join();
+            return future.join();
         } catch (CompletionException wrapper) {
             Throwable cause = wrapper.getCause();
             if (cause instanceof RuntimeException runtime) {
@@ -916,7 +984,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * first row - the lowest in it, since a stream's rows go in the order they were taken in.
      */
     private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
-            DeliveredRows delivered, long firstOrder) {
+            DeliveredRows delivered, long firstOrder, KeyMoveHandoffs.Receipt receipt, int expectedWrites) {
     }
 
     /** A row taken in and not yet handed to the writer, with the number it was taken in under. */

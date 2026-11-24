@@ -1,23 +1,28 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -197,6 +202,118 @@ class ASinkBatchesByCountOrByTimeTest {
                 .containsExactly("orders=o1");
     }
 
+    @Test
+    void aMoveReservesItsPlaceWhileThePreviousBatchIsStillWriting() throws Exception {
+        var writer = new MoveWriter();
+        SinkProcessor sink = sink(writer, null, null, 32, WAIT_MILLIS);
+        var input = inbox(row("orders", 1), row("orders", 2), row("orders", 3),
+                row("orders", 4), row("orders", 5));
+        sink.process(0, input);
+        assertThat(writer.notices).containsExactly("queued");
+        assertThat(writer.batches).containsExactly(List.of(1, 2));
+
+        writer.completeAll();
+        sink.tryProcess();
+        sink.process(0, input);
+        assertThat(writer.batches).containsExactly(List.of(1, 2), List.of(3));
+        assertThat(writer.notices).containsExactly("queued");
+
+        writer.completeAll();
+        elapse(WAIT_MILLIS);
+        sink.tryProcess();
+        assertThat(writer.notices).containsExactly("queued", "written");
+        assertThat(writer.batches).containsExactly(List.of(1, 2), List.of(3), List.of(4, 5));
+    }
+
+    @Test
+    void aReservedEffectSharesItsBatchOnlyWithProvenIndependentRows() throws Exception {
+        var writer = new IndependentWriter();
+        SinkProcessor sink = sink(writer, null, null, 32, WAIT_MILLIS);
+        var input = inbox(row("orders", 1), row("orders", 3), row("orders", 2),
+                row("orders", 3), row("orders", 4));
+        sink.process(0, input);
+        assertThat(writer.batches).containsExactly(List.of(1, 3, 2));
+        assertThat(writer.notices).containsExactly("queued", "queued");
+        writer.pending.getFirst().complete(new WriteResult(3));
+        sink.tryProcess();
+        assertThat(writer.batches).containsExactly(List.of(1, 3, 2), List.of(3, 4));
+        assertThat(writer.notices).containsExactly("queued", "queued", "written");
+        writer.pending.getLast().complete(new WriteResult(1));
+        assertThatThrownBy(sink::tryProcess).isInstanceOf(RuntimeException.class);
+        assertThat(writer.notices).containsExactly("queued", "queued", "written");
+    }
+
+    @Test
+    void twoOrdinaryWritesAcrossAReservationCannotBeReorderedInOneBulk() throws Exception {
+        var revisions = new HashMap<Object, Object>();
+        var writer = new IndependentWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> rows) {
+                return super.write(rows).thenApply(result -> {
+                    for (Envelope row : rows.reversed()) {
+                        revisions.put(row.after().get("id"), row.after().get("revision"));
+                    }
+                    return result;
+                });
+            }
+        };
+        SinkProcessor sink = sink(writer, null, null, 32, 0);
+        var before = Envelope.insert(1, "orders", Map.of("id", 2, "revision", 1), null);
+        var after = Envelope.insert(3, "orders", Map.of("id", 2, "revision", 2), null);
+        sink.process(0, inbox(before, row("orders", 3), after));
+        writer.pending.getFirst().complete(new WriteResult(writer.batches.getFirst().size()));
+        sink.tryProcess();
+        writer.completeAll();
+        sink.tryProcess();
+        assertThat(revisions.get(2)).isEqualTo(2);
+        assertThat(writer.batches).containsExactly(List.of(2, 3), List.of(2));
+    }
+
+    private static class IndependentWriter extends MoveWriter {
+        @Override
+        public Predicate<Envelope> batchAdmission(Envelope reserved) {
+            var keys = new HashSet<Object>();
+            keys.add(reserved.after().get("id"));
+            return other -> keys.add(other.after().get("id"));
+        }
+    }
+
+    @Test
+    void aFailedOrUnconfirmedEffectDoesNotReleaseAWriteReceipt() throws Exception {
+        for (boolean failed : List.of(true, false)) {
+            var writer = new MoveWriter();
+            SinkProcessor sink = sink(writer, null, null, 32, 0);
+            sink.process(0, inbox(row("orders", 3), row("orders", 4)));
+            if (failed) {
+                writer.pending.getFirst().completeExceptionally(new IllegalStateException("disconnected"));
+            } else {
+                writer.pending.getFirst().complete(new WriteResult(0));
+            }
+            if (failed) {
+                assertThatThrownBy(sink::tryProcess).hasMessage("disconnected");
+            } else {
+                assertThatThrownBy(sink::tryProcess).isInstanceOfSatisfying(
+                        TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
+            }
+            assertThat(writer.notices).containsExactly("queued");
+            assertThat(writer.batches).containsExactly(List.of(3));
+        }
+    }
+
+    private static class MoveWriter extends ManualWriter implements KeyMoveSinkWriter {
+        final List<String> notices = new ArrayList<>();
+
+        @Override
+        public KeyMoveHandoffs.Receipt receiptFor(Envelope row) {
+            if (!Integer.valueOf(3).equals(row.after().get("id"))) return null;
+            return new KeyMoveHandoffs.Receipt() {
+                public void queued() { notices.add("queued"); }
+                public void written() { notices.add("written"); }
+            };
+        }
+    }
+
     private SinkProcessor sink(SinkWriter writer, SinkAck ack, SinkFrontier frontier, int maxRecords,
             long maxWaitMillis) throws Exception {
         SinkProcessor sink = new SinkProcessor(writer, ack, frontier, 1, maxRecords, FrontierGauge.none(),
@@ -245,10 +362,10 @@ class ASinkBatchesByCountOrByTimeTest {
     }
 
     /** Records each batch's ids and stream, and settles only when the test says so. */
-    private static final class ManualWriter implements SinkWriter {
-        private final List<List<Object>> batches = new ArrayList<>();
+    private static class ManualWriter implements SinkWriter {
+        final List<List<Object>> batches = new ArrayList<>();
         private final List<String> streams = new ArrayList<>();
-        private final List<CompletableFuture<WriteResult>> pending = new ArrayList<>();
+        final List<CompletableFuture<WriteResult>> pending = new ArrayList<>();
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {

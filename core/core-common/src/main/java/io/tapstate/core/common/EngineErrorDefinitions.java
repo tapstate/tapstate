@@ -38,6 +38,9 @@ public final class EngineErrorDefinitions {
     public static final ProductErrorDefinition CLUSTER_REFUSED_THE_STATE =
             DEFINITIONS.define(15, Severity.ERROR, Set.of("state", "seconds"));
 
+    public static final ProductErrorDefinition KEY_MOVE_WRITE_UNCONFIRMED =
+            DEFINITIONS.define(16, Severity.ERROR, Set.of("expected", "accepted"));
+
     private EngineErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {
