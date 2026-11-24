@@ -733,6 +733,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: deploy/op/controller/go.mod
+          cache: false
+      - name: OP controller unit tests
+        working-directory: deploy/op/controller
+        run: go test -v ./...
       - name: shellcheck the shell scripts
         run: |
           shellcheck -s sh install/install.sh
