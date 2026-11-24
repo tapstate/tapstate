@@ -189,9 +189,12 @@ class NodeSessionStartupTest {
         claims.holdRelease.set(true);
         NodeSessionStartup startup = startup(claims);
         CountDownLatch returned = new CountDownLatch(1);
+        startup.stateChanged(new LifecycleEvent(LifecycleEvent.LifecycleState.SHUTTING_DOWN));
+        assertThat(startup.isCurrent()).isTrue();
+        assertThat(claims.releases).hasValue(0);
         Thread callback = Thread.ofPlatform().daemon().name("owned-node-session-lifecycle-control").unstarted(() -> {
             try {
-                startup.stateChanged(new LifecycleEvent(LifecycleEvent.LifecycleState.SHUTTING_DOWN));
+                startup.stateChanged(new LifecycleEvent(LifecycleEvent.LifecycleState.SHUTDOWN));
             } finally {
                 returned.countDown();
             }
@@ -209,6 +212,20 @@ class NodeSessionStartupTest {
             startup.abort();
         }
         assertThat(claims.releases).hasValue(1);
+    }
+
+    @Test
+    void aFailedMemberStopLeavesTheReservationToExpire() {
+        var claims = new RecordingClaims();
+        var startup = startup(claims);
+        var failure = new IllegalStateException("owned member stop failed");
+        var member = org.mockito.Mockito.mock(HazelcastInstance.class);
+        org.mockito.Mockito.doThrow(failure).when(member).shutdown();
+        startup.handOff(member);
+
+        assertThatThrownBy(startup.lease()::close).isSameAs(failure);
+        assertThat(startup.isCurrent()).isFalse();
+        assertThat(claims.releases).hasValue(0);
     }
 
     private static NodeSessionStartup startup(RecordingClaims claims) {

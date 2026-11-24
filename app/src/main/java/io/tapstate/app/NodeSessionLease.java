@@ -47,6 +47,7 @@ final class NodeSessionLease implements AutoCloseable {
 
     /** When the lease the last accepted renewal bought runs out, on the monotonic clock. */
     private volatile long provenUntil;
+    private volatile Runnable stopMember = () -> { };
 
     private NodeSessionLease() {
         this.nanoTime = System::nanoTime;
@@ -214,9 +215,13 @@ final class NodeSessionLease implements AutoCloseable {
         }
     }
 
+    void stopMemberOnClose(Runnable stop) {
+        stopMember = Objects.requireNonNull(stop);
+    }
+
     @Override
     public void close() {
-        stopAndClose(() -> { });
+        stopAndClose(stopMember);
     }
 
     /** Fence locally before stopping, and never put coordination I/O ahead of the member stop. */
@@ -225,11 +230,9 @@ final class NodeSessionLease implements AutoCloseable {
         try {
             stop.run();
         } finally {
-            if (release) {
-                renewer.shutdownNow();
-                releaseCurrent();
-            }
+            if (release) renewer.shutdownNow();
         }
+        if (release) releaseCurrent();
     }
 
     /** A library lifecycle listener cannot wait for coordination-store I/O. */

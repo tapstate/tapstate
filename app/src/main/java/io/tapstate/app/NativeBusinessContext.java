@@ -47,6 +47,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private RetiredPipelinePayloadCleanup payloadCleanup;
     private final java.util.concurrent.atomic.AtomicReference<PipelineAlertRuntime> alertRuntime = new java.util.concurrent.atomic.AtomicReference<>();
     private final ShutdownAwait shutdown = new ShutdownAwait();
+    private ShutdownOwners shutdownOwners;
     private List<HandlerMapping> handlers = List.of();
     private final AtomicBoolean initialTestSubmitted = new AtomicBoolean();
     private final java.util.concurrent.atomic.AtomicReference<Thread> initialTestCaller = new java.util.concurrent.atomic.AtomicReference<>();
@@ -291,39 +292,53 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     }
     private void closeOwned(long deadline) {
         active.set(false); handlers = List.of();
-        Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
-        if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
-        var beans = context == null ? null : context.getBeanFactory();
-        var periodic = beans == null ? null : (PeriodicObservations) beans.getSingleton("periodicObservations");
-        var convergence = beans == null ? null : (PipelineConvergences) beans.getSingleton("pipelineConvergences");
-        var observationWrites = beans == null ? null : (ProcessObservationWriter) beans.getSingleton("processObservationWriter");
-        if (convergence != null) convergence.close();
-        if (periodic != null) periodic.close();
+        // Spring removes its singletons on close. A retry must still check the actual workers.
+        boolean retrying = shutdownOwners != null;
+        if (!retrying && context != null) {
+            var beans = context.getBeanFactory();
+            shutdownOwners = new ShutdownOwners(
+                    (PipelineActuationOwnership) beans.getSingleton("pipelineActuationOwnership"),
+                    (PeriodicObservations) beans.getSingleton("periodicObservations"),
+                    (PipelineConvergences) beans.getSingleton("pipelineConvergences"),
+                    (ProcessObservationWriter) beans.getSingleton("processObservationWriter"),
+                    (HazelcastInstance) beans.getSingleton("hazelcastMember"));
+        }
+        var owners = shutdownOwners;
+        var pipelines = owners == null ? null : owners.pipelines();
+        var periodic = owners == null ? null : owners.periodic();
+        var convergence = owners == null ? null : owners.convergence();
+        var observationWrites = owners == null ? null : owners.observationWrites();
+        var member = owners == null ? null : owners.member();
         var alerts = alertRuntime.get();
-        if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
-        if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
-        if (convergence != null) convergence.awaitStopped(deadline);
-        if (periodic != null) periodic.awaitStopped(deadline);
-        if (observationWrites != null) observationWrites.close();
-        var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
-        Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
-        Throwable failure = null;
-        try { if (payloadCleanup != null) { payloadCleanup.close(); payloadCleanup = null; } }
-        catch (RuntimeException | Error cleanup) { failure = cleanup; }
-        try { if (memberStorage != null) memberStorage.close(); } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+        var initial = initialTestCaller.get();
+
+        // A worker that fails to drain must not leave the member and its session alive.
+        var cleanup = new ArrayList<Runnable>();
+        if (pipelines != null) cleanup.add(pipelines::stopForShutdown);
+        if (convergence != null) cleanup.add(convergence::close);
+        if (periodic != null) cleanup.add(periodic::close);
+        if (alerts != null) {
+            cleanup.add(alerts::close);
+            cleanup.add(() -> alerts.awaitStopped(deadline));
         }
-        try { if (context != null) context.close(); } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
-        }
-        try {
-            if (member instanceof HazelcastInstance actual && actual.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
-        } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
-        }
-        if (failure instanceof Error error) throw error;
-        if (failure instanceof RuntimeException error) throw error;
+        if (pipelines != null) cleanup.add(() -> pipelines.awaitStopped(deadline));
+        if (convergence != null) cleanup.add(() -> convergence.awaitStopped(deadline));
+        if (periodic != null) cleanup.add(() -> periodic.awaitStopped(deadline));
+        if (observationWrites != null) cleanup.add(observationWrites::close);
+        if (initial != null) cleanup.add(initial::interrupt);
+        if (payloadCleanup != null) cleanup.add(() -> { payloadCleanup.close(); payloadCleanup = null; });
+        if (memberStorage != null) cleanup.add(memberStorage::close);
+        if (context != null) cleanup.add(context::close);
+        if (member != null) cleanup.add(() -> {
+            if (retrying && member.getLifecycleService().isRunning()) member.shutdown();
+            if (member.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
+        });
+        ShutdownAwait.all(cleanup);
+        shutdownOwners = null;
     }
+
+    private record ShutdownOwners(PipelineActuationOwnership pipelines, PeriodicObservations periodic,
+            PipelineConvergences convergence, ProcessObservationWriter observationWrites, HazelcastInstance member) {}
 
     static final class ChildOnly implements Condition {
         @Override public boolean matches(ConditionContext context, org.springframework.core.type.AnnotatedTypeMetadata metadata) {
