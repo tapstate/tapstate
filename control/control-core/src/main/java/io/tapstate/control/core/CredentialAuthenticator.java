@@ -17,9 +17,10 @@ import java.util.Optional;
  */
 public final class CredentialAuthenticator {
 
-    private final java.util.function.Function<String, Optional<CredentialAuthentication>> startContexts;
+    public enum Request { ORDINARY, PIPELINE_START, PIPELINE_STOP }
+
+    private final java.util.function.BiFunction<String, Request, Optional<CredentialAuthentication>> contexts;
     private final CredentialVerifier verifier;
-    private final java.util.function.Function<String, Optional<CredentialAuthentication>> contexts;
 
     public CredentialAuthenticator(TokenService tokenService, TokenSigner tokenSigner) {
         Objects.requireNonNull(tokenService, "tokenService");
@@ -28,42 +29,48 @@ public final class CredentialAuthenticator {
                 ? tokenService.authenticate(presented)
                 : tokenSigner.verify(presented);
         this.contexts = null;
-        this.startContexts = null;
     }
 
     /** Uses the selected deployment's verifier, such as the Cluster-local managed-session verifier. */
     public CredentialAuthenticator(CredentialVerifier verifier) {
         this.verifier = Objects.requireNonNull(verifier, "verifier");
         this.contexts = null;
-        this.startContexts = null;
     }
 
-    private CredentialAuthenticator(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts,
-            java.util.function.Function<String, Optional<CredentialAuthentication>> startContexts) {
+    private CredentialAuthenticator(java.util.function.BiFunction<String, Request, Optional<CredentialAuthentication>> contexts) {
         this.contexts = Objects.requireNonNull(contexts, "contexts");
-        this.startContexts = Objects.requireNonNull(startContexts, "startContexts");
-        this.verifier = credential -> contexts.apply(credential).map(CredentialAuthentication::token);
+        this.verifier = credential -> contexts.apply(credential, Request.ORDINARY).map(CredentialAuthentication::token);
+    }
+
+    public static CredentialAuthenticator scopedRequests(java.util.function.BiFunction<String, Request, Optional<CredentialAuthentication>> contexts) {
+        return new CredentialAuthenticator(contexts);
     }
 
     /** The selected provider supplies a fixed scope and an original-credential guard, never a latest-scope lookup. */
     public static CredentialAuthenticator scoped(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts) {
-        return new CredentialAuthenticator(contexts, contexts);
+        Objects.requireNonNull(contexts, "contexts");
+        return scopedRequests((value, request) -> contexts.apply(value));
     }
 
     /** Keeps the selected request admission separate from later credential revalidation. */
     public static CredentialAuthenticator scoped(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts,
             java.util.function.Function<String, Optional<CredentialAuthentication>> startContexts) {
-        return new CredentialAuthenticator(contexts, startContexts);
+        Objects.requireNonNull(contexts, "contexts");
+        Objects.requireNonNull(startContexts, "startContexts");
+        return scopedRequests((value, request) -> (request == Request.PIPELINE_START ? startContexts : contexts).apply(value));
     }
 
     public Optional<CredentialAuthentication> authenticateStartContext(String presented) {
-        if (presented == null || presented.isBlank()) return Optional.empty();
-        return startContexts == null ? authenticateContext(presented) : startContexts.apply(presented);
+        return authenticateContext(presented, Request.PIPELINE_START);
     }
 
     public Optional<CredentialAuthentication> authenticateContext(String presented) {
+        return authenticateContext(presented, Request.ORDINARY);
+    }
+
+    public Optional<CredentialAuthentication> authenticateContext(String presented, Request request) {
         if (presented == null || presented.isBlank()) return Optional.empty();
-        if (contexts != null) return contexts.apply(presented);
+        if (contexts != null) return contexts.apply(presented, request);
         return verifier.verify(presented).map(original -> new CredentialAuthentication(original,
                 Optional.empty(), Optional.empty(), () -> {
                     if (!verifier.verify(presented).filter(original::equals).isPresent())

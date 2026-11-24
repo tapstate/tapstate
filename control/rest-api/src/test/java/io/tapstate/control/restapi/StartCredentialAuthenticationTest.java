@@ -22,7 +22,7 @@ class StartCredentialAuthenticationTest {
         });
         var provider = new TapstateCredentialAuthenticationProvider(credentials);
         var start = new TapstateCredentialAuthenticationToken("human-jwt");
-        start.setDetails(true);
+        start.setDetails(CredentialAuthenticator.Request.PIPELINE_START);
         var accepted = provider.authenticate(start);
         assertThat(accepted.isAuthenticated()).isTrue();
         assertThat(starts).hasValue(1);

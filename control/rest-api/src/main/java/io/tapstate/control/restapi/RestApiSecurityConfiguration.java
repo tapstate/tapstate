@@ -189,7 +189,10 @@ class RestApiSecurityConfiguration {
             var converted = converter.convert(request);
             if (converted instanceof TapstateCredentialAuthenticationToken token) {
                 String path = request.getRequestURI().substring(request.getContextPath().length());
-                token.setDetails("POST".equals(request.getMethod()) && path.matches("/api/pipelines/[^/]+:start"));
+                if ("POST".equals(request.getMethod())) {
+                    if (path.matches("/api/pipelines/[^/]+:start")) token.setDetails(CredentialAuthenticator.Request.PIPELINE_START);
+                    else if (path.matches("/api/pipelines/[^/]+:stop")) token.setDetails(CredentialAuthenticator.Request.PIPELINE_STOP);
+                }
             }
             return converted;
         });

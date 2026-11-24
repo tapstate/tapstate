@@ -15,6 +15,24 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class StorageAuthenticationTest {
+    @Test void stopChecksTheSamePublicationAndCacheScopeBeforeAndAfterJwtAndAtRevalidation() {
+        withOpAuthentication(f -> {
+            String jwt = new HmacTokenSigner(new byte[32], HmacTokenSigner.DEFAULT_TTL, f.clock, f.scope).issue("admin", Scope.ADMIN);
+            clearInvocations(f.configuration, f.cache);
+            var proof = f.authentication.credentials().authenticateContext(jwt, CredentialAuthenticator.Request.PIPELINE_STOP).orElseThrow();
+            verify(f.configuration, times(2)).requireRequestAuthenticationPublished(eq(f.bound.preparation()), any(MongoReadBudget.class));
+            verify(f.cache, times(2)).loadRequestAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            clearInvocations(f.configuration, f.cache);
+            proof.requireActive().run();
+            verify(f.configuration, times(2)).requireRequestAuthenticationPublished(eq(f.bound.preparation()), any(MongoReadBudget.class));
+            verify(f.cache, times(2)).loadRequestAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            doThrow(new TapstateException(IoError.CACHE_AUTH_FENCED, Map.of(), null))
+                    .when(f.cache).loadRequestAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            assertThatThrownBy(proof.requireActive()::run).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+        });
+    }
+
     @Test void startAdmissionUsesOneAuthoritySnapshotAndRetainsExplicitRevalidation() {
         withOpAuthentication(f -> {
             String jwt = new HmacTokenSigner(new byte[32], HmacTokenSigner.DEFAULT_TTL, f.clock, f.scope)

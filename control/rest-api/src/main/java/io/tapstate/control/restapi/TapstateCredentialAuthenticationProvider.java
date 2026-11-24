@@ -40,9 +40,9 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
 
     private Authentication verify(Authentication authentication) {
         TapstateCredentialAuthenticationToken credential = (TapstateCredentialAuthenticationToken) authentication;
-        var original = (Boolean.TRUE.equals(credential.getDetails())
-                ? credentials.authenticateStartContext(credential.credential())
-                : credentials.authenticateContext(credential.credential()))
+        var admission = credential.getDetails() instanceof CredentialAuthenticator.Request request
+                ? request : CredentialAuthenticator.Request.ORDINARY;
+        var original = credentials.authenticateContext(credential.credential(), admission)
                 .orElseThrow(() -> new BadCredentialsException("invalid bearer credential"));
         VerifiedToken verified = original.token();
         TapstatePrincipal principal = TokenService.isMachineToken(credential.credential())
