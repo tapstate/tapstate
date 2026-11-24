@@ -75,7 +75,7 @@ class NativeBusinessCandidateLifecycleIT {
                                 var intents=org.mockito.Mockito.spy(ports.intents());
                                 org.mockito.Mockito.doAnswer(read -> {
                                     reads.incrementAndGet();if(!starting.get())prematureReads.incrementAndGet();return read.callRealMethod();
-                                }).when(intents).pipelineIds();
+                                }).when(intents).dispatchSnapshot();
                                 ReflectionTestUtils.setField(driver,"scoped",new ConvergenceDriver.ScopedPorts(intents,ports.stores(),ports.requireActive(),
                                         ports.actuators(),ports.rebuilds(),ports.retainRebuilds()));
                                 var cache=observer.getDatabase(storage.cacheDatabase());
