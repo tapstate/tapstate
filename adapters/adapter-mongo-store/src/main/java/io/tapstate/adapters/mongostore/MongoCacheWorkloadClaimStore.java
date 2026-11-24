@@ -261,13 +261,26 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl)));
     }
 
+    @Override public WorkloadClaimAttempt acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long revision) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.CAPTURE || revision != 1 || !scope.clusterId().equals(node.owner().nodeId()))
+            throw claimFenced();
+        return transaction((session, budget) -> {
+            var row = new MongoCacheBusinessIdentity(database, scope).admitRetainedCapture(session, key);
+            if (row == null) throw MongoCapturePreparationFacts.history(key.resourceId());
+            MongoCaptureCachePreparations.requirePreparation(row, key, scope);
+            MongoCachePipelinePreparations.proveNodeForClaim(session, database, scope, node);
+            return raw.inStrictSession(session).acquireNodeBacked(key, node, revision);
+        }, null);
+    }
+
     @Override public WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope original, WorkloadClaimFence node,
             long topologyRevision) {
         requireScope(original);
         if (topologyRevision != 1 || !node.owner().nodeId().equals(scope.clusterId())) throw claimFenced();
         return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> {
             MongoCachePipelinePreparations.proveNodeForClaim(session, database, scope, node);
-            return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
+            return store.acquireNodeBacked(pipelineKey(original), node, topologyRevision);
         }));
     }
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {

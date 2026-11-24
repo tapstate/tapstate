@@ -109,6 +109,12 @@ final class ClusterWorkloadClaims {
         return acquire(key, true, () -> Optional.of(store.acquire(key, owner, topologyRevision, ttl)));
     }
 
+    Optional<WorkloadClaimAttempt> acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long revision, boolean initial) {
+        return membership.businessEligible()
+                ? acquire(key, true, () -> Optional.of(store.acquireNodeBackedCapture(key, node, revision)), initial)
+                : Optional.empty();
+    }
+
     Optional<WorkloadClaimAttempt> acquireInitialCapture(WorkloadClaimKey key,WorkloadOwner owner,long topologyRevision,Duration ttl) {
         if(key.type()!=WorkloadClaimType.CAPTURE)throw new IllegalArgumentException("initial Capture acquisition requires a Capture key");
         if(!membership.businessEligible())return Optional.empty();

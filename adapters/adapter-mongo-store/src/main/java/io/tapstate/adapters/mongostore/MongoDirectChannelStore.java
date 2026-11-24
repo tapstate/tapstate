@@ -291,7 +291,7 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
         if (row == null) throw fenced();
         var original = new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
         if (!capture.equals(WorkloadClaimFence.from(original))) throw fenced();
-        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(capture),
+        if (WorkloadClaimDocuments.proveCapture(session, SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), capture,
                 new Document("$inc",new Document("fencedDirectWrites",1L))).getMatchedCount() != 1) throw fenced();
     }
     private static void requireCapture(DirectChannelContext context,WorkloadClaimFence capture) {

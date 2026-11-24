@@ -9,6 +9,12 @@ target: https://tapstate.dev/docs/guides/cluster
 Cluster mode is opt-in. An installation that does not set a discovery mode remains a single member,
 binds the member protocol to `127.0.0.1`, and cannot discover another Tapstate process.
 
+Single-node OP with discovery disabled can set `tapstate.cluster.workload-leases-enabled=false`
+at startup. Pipeline and Capture keep their own claim generations and follow the member's timed
+Node Session. NEST reuses its placement validation for the current execution. State writes still
+check the original claim and inventory in the transaction. Stop and restart OP to change modes.
+The default is `true`. Cloud and multi-member deployments require the default.
+
 Every cluster member needs:
 
 - one shared `tapstate.cluster.id`;

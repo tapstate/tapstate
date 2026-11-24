@@ -36,6 +36,25 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void executionBoundNestReusesProofAcrossTheTimedWindowAndFencesStaleWrites() {
+        withFixture(f -> {
+            var placement = f.at(OperatorPlacement.Resource.NEST_STATE);
+            var namespace = placement.mapName();
+            var writer = (MongoCacheOperatorStateStore) f.domain.executionBoundNestState(placement, WorkloadClaimFence.from(f.claim), ACTIVE);
+            writer.save(namespace, "order", new byte[]{1});
+            long opens = MongoCacheOperatorStateStore.LEASE_OPENS.get();
+            Thread.sleep(MongoCacheOperatorStateStore.DEFAULT_LEASE_MILLIS + 100);
+            writer.save(namespace, "order", new byte[]{2});
+            assertThat(writer.load(namespace, "order")).hasValue(new byte[]{2});
+            assertThat(MongoCacheOperatorStateStore.LEASE_OPENS.get()).isEqualTo(opens);
+            writer.dropLease();
+            writer.save(namespace, "order", new byte[]{3});
+            assertThat(MongoCacheOperatorStateStore.LEASE_OPENS.get()).isEqualTo(opens + 1);
+            assertThat(f.domain.workloadClaims(BUSINESS).release(f.claim)).isTrue();
+            code(() -> writer.delete(namespace, "order"), IoError.WORKLOAD_CLAIM_FENCED);
+        });
+    }
+
     private static boolean readingPipelineState(CommandStartedEvent event) {
         return event.getCommandName().equals("find")
                 && event.getCommand().getString("find").getValue().equals(SystemCollections.CACHE_PIPELINE_STATE.collectionName());

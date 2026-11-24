@@ -77,7 +77,7 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
                 var actual = table.find(session,new Document("_id",MongoWorkloadClaimStore.id(capture.key()))).first();
                 if (actual==null || !preparation.equals(MongoCaptureCachePreparations.requirePreparation(actual,capture.key(),business()))) throw fenced();
                 new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(actual);
-                if (table.updateOne(session,WorkloadClaimDocuments.live(capture),new Document("$inc",new Document("fencedSnapshotWrites",1L))).getMatchedCount()!=1) throw fenced();
+                if (WorkloadClaimDocuments.proveCapture(session, table, capture,new Document("$inc",new Document("fencedSnapshotWrites",1L))).getMatchedCount()!=1) throw fenced();
                 held.add(new Document("source",source).append("capture",WorkloadClaimDocuments.stored(capture)));
             }
             var command = WorkloadClaimDocuments.stored(access.originalClaim());

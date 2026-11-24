@@ -524,7 +524,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                                     else models.beforeAttempt(session);
                                 }
                                 if (fence != null) {
-                                    if (workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM).getMatchedCount() != 1) {
+                                    if (WorkloadClaimDocuments.proveCapture(session, workloadClaims, fence, PROVE_THE_CLAIM).getMatchedCount() != 1) {
                                         throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
                                     }
                                 }
@@ -669,8 +669,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
         StoreIo.run(() -> {
             try (ClientSession session = client.startSession()) {
                 session.withTransaction(() -> {
-                    UpdateResult proved = workloadClaims.updateOne(
-                            session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM);
+                    UpdateResult proved = WorkloadClaimDocuments.proveCapture(session, workloadClaims, fence, PROVE_THE_CLAIM);
                     if (proved.getMatchedCount() != 1) {
                         throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
                     }

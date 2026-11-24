@@ -125,7 +125,9 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         validate(key, owner, topologyRevision, ttl);
         if (session == null || !strict || key.type() != WorkloadClaimType.CAPTURE)
             throw new IllegalStateException("retained capture admission requires its original transaction");
-        return acquireExisting(key, owner, topologyRevision, ttl, reading(observed));
+        var current = reading(observed);
+        if (nodeBacked(observed) && current.leased()) return WorkloadClaimAttempt.refused(current.claim());
+        return acquireExisting(key, owner, topologyRevision, ttl, current);
     }
 
     private WorkloadClaimAttempt acquireExisting(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision,
@@ -136,8 +138,8 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return updated == null ? WorkloadClaimAttempt.refused(existing.claim()) : WorkloadClaimAttempt.acquired(read(updated));
     }
 
-    WorkloadClaimAttempt acquireNodeBackedPipeline(WorkloadClaimKey key, WorkloadClaimFence node, long topologyRevision) {
-        if (session == null || !strict || key.type() != WorkloadClaimType.PIPELINE_ACTUATION
+    WorkloadClaimAttempt acquireNodeBacked(WorkloadClaimKey key, WorkloadClaimFence node, long topologyRevision) {
+        if (session == null || !strict || (key.type() != WorkloadClaimType.PIPELINE_ACTUATION && key.type() != WorkloadClaimType.CAPTURE)
                 || !key.clusterId().equals(node.owner().nodeId())) throw MongoCacheWorkloadClaimStore.claimFenced();
         var row = stored(key);
         var original = decodeStrict(row);
@@ -459,19 +461,30 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     static boolean canUseNodeLease(WorkloadClaimFence expected) {
-        return expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+        return (expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION || expected.key().type() == WorkloadClaimType.CAPTURE)
                 && expected.key().clusterId().equals(expected.owner().nodeId());
     }
 
     Optional<Document> nodeBackedFilter(WorkloadClaimFence fence) {
         if (!canUseNodeLease(fence)) return Optional.empty();
         var row = stored(fence.key());
-        if (!nodeBacked(row) || !fence.equals(WorkloadClaimFence.from(decodeStrict(row))) || nodeLease(row).isEmpty())
+        if (!nodeBacked(row) || !fence.equals(WorkloadClaimFence.from(decodeStrict(row))))
             return Optional.empty();
-        return Optional.of(new Document("_id", id(fence.key())).append("ownerNodeId", fence.owner().nodeId())
+        var parent = nodeLease(row);
+        if (parent.isEmpty()) return Optional.empty();
+        var filter = new Document("_id", id(fence.key())).append("ownerNodeId", fence.owner().nodeId())
                 .append("ownerBootId", fence.owner().bootId()).append("claimGeneration", fence.claimGeneration())
                 .append("executionGeneration", fence.executionGeneration()).append("topologyRevision", fence.topologyRevision())
-                .append("leaseUntil", row.get("leaseUntil")).append(NODE_LEASE_GENERATION, row.get(NODE_LEASE_GENERATION)));
+                .append("leaseUntil", row.get("leaseUntil")).append(NODE_LEASE_GENERATION, row.get(NODE_LEASE_GENERATION));
+        if (fence.key().type() == WorkloadClaimType.CAPTURE) {
+            if (!(row.get("capturePreparation") instanceof Document marker)) throw MongoCapturePreparationFacts.unreadable();
+            var prepared = MongoCapturePreparationFacts.annex(marker);
+            if (!fence.key().resourceId().equals(prepared.captureId()) || !fence.key().clusterId().equals(prepared.scope().clusterId()))
+                throw MongoCacheWorkloadClaimStore.claimFenced();
+            filter.append("capturePreparation", marker)
+                    .append("$expr", new Document("$gt", List.of(Date.from(parent.orElseThrow().claim().leaseUntil()), "$$NOW")));
+        }
+        return Optional.of(filter);
     }
 
     private Document liveOrNodeBacked(WorkloadClaim expected, long topologyRevision) {

@@ -26,6 +26,11 @@ public interface WorkloadClaimStore {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
     }
 
+    /** Admits a prepared Capture under the exact single-member Node Session. */
+    default WorkloadClaimAttempt acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long topologyRevision) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
     /** Admits a Pipeline in an explicit single-member deployment under its original node session. */
     default WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node,
             long topologyRevision) {

@@ -34,7 +34,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             requireEmptySharedNamespace(session,admitted.replacement());
             new MongoCacheBusinessIdentity(database,scope).admitMetadataWrite(session);
             Date now=MongoCachePipelinePreparations.proveNode(session,database,scope,currentNode);
-            for(var row:observed.claims())requireEnded(row,now);
+            for(var row:observed.claims())requireEnded(session,row,now);
             var claims=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
             var originalCapture=observed.claims().getFirst();var before=observed.snapshot().captureFence();
             if(before.claimGeneration()>=Long.MAX_VALUE-2)throw history(previous);
@@ -140,7 +140,9 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             if(table.on(database).find(session,new Document("_id.chain",replacement.chainId())).projection(new Document("_id",1)).first()!=null)throw history(replacement);
         MongoSrsLogStore.requireEmptyPhysicalNamespace(session,database,replacement.chainId());
     }
-    private static void requireEnded(Document row,Date now) {
+    private void requireEnded(ClientSession session, Document row, Date now) {
+        if (MongoWorkloadClaimStore.nodeBacked(row) && new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database))
+                .inStrictSession(session).nodeLease(row).isPresent()) throw MongoCapturePreparationFacts.fenced();
         if(!(row.get("leaseUntil") instanceof Date lease) || lease.after(now))throw MongoCapturePreparationFacts.fenced();
     }
     private void verifyApplied(ClientSession session,MongoStorageRecoveryCommands.SharedOriginal original,MongoSrsConsumerStore consumers) {

@@ -1241,7 +1241,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(permit.fence()==null)throw refused();
         var owner=new Owner(prepared.preparation(),permit.claim()); owners.put(id,owner); owner.sessions.add(session.original); source.owner=owner;
         owner.identity=source.identity;
-        owner.lease=new CaptureClaimLease(execution.ownership(),permit.claim(),execution.renewal(),() -> lost(owner));
+        var parent = execution.ownership().parentNode();
+        owner.lease = parent == null ? new CaptureClaimLease(execution.ownership(), permit.claim(), execution.renewal())
+                : CaptureClaimLease.followingParent(execution.ownership(), permit.claim(), execution.renewal(), parent,
+                        execution.node(), () -> execution.authorization().requireCapture(stores.scope(), owner.fence));
+        owner.lease.onLost(() -> lost(owner));
         owner.lease.whileNeeded(owner.demand::get);
         owner.require(); return owner;
     }

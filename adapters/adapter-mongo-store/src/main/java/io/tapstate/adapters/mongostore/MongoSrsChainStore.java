@@ -392,7 +392,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
     void prove(ClientSession session, WorkloadClaimFence fence) {
         Objects.requireNonNull(fence, "originalCaptureFence");
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())
-                || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(fence),
+                || WorkloadClaimDocuments.proveCapture(session, SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), fence,
                 new Document("$inc", new Document("fencedChainWrites", 1L))).getMatchedCount() != 1) throw fenced();
     }
     void requireCapture(Document row, WorkloadClaimFence fence) {

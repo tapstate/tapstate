@@ -18,6 +18,20 @@ class ClusterProperties {
     private String nodeId;
     private Profile profile = Profile.SINGLE;
     private boolean profileConfigured;
+    private boolean workloadLeasesEnabled = true;
+
+    public boolean isWorkloadLeasesEnabled() { return workloadLeasesEnabled; }
+
+    public void setWorkloadLeasesEnabled(boolean enabled) { workloadLeasesEnabled = enabled; }
+
+    boolean nodeBackedPipeline() { return explicitSingle() || !workloadLeasesEnabled; }
+
+    void validateWorkloadLeases(boolean cloud, boolean op, HazelcastProperties.DiscoveryMode discovery) {
+        if (!workloadLeasesEnabled && (cloud || !op || profile != Profile.SINGLE
+                || discovery != HazelcastProperties.DiscoveryMode.NONE)) {
+            throw new IllegalArgumentException("tapstate.cluster.workload-leases-enabled=false requires single-node OP with discovery NONE");
+        }
+    }
     private int bootstrapMinMembers = 3;
     private Duration nodeSessionTtl = Duration.ofSeconds(30);
     private Duration nodeSessionRenewInterval = Duration.ofSeconds(10);

@@ -696,6 +696,13 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheOperatorStateStore(pipelineAccess(placement.scope(), original, requireActive), placement);
     }
 
+    @Override public io.tapstate.spi.store.KeyedStateStore executionBoundNestState(io.tapstate.spi.store.OperatorPlacement placement,
+            io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
+        if (placement.resource() != io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE
+                || Objects.requireNonNull(original, ORIGINAL_ARGUMENT).executionGeneration() < 1) throw MongoCachePipelineAccess.claimFenced();
+        return new MongoCacheOperatorStateStore(pipelineAccess(placement.scope(), original, requireActive), placement, true);
+    }
+
     @Override public io.tapstate.spi.store.RateHistoryStore pipelineRateHistory(io.tapstate.spi.store.PipelineIntentScope scope) {
         return new MongoCacheRateHistoryStore(pipelineAccess(scope, null, () -> {}));
     }

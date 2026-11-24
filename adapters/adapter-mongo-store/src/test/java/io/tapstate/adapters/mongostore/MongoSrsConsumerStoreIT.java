@@ -4403,4 +4403,86 @@ class MongoSrsConsumerStoreIT {
             }
         });
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"node-expired", "node-boot", "node-generation", "released-reacquired", "wrong-capture", "retired", "late-node-expiry"})
+    void nodeBackedCaptureKeepsOriginalFenceThroughModelChainAndLogWrites(String scenario) {
+        withBusiness(f -> {
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var node = claims.acquire(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, SCOPE.clusterId()),
+                    new WorkloadOwner(SCOPE.clusterId(), "local-boot"), 1, Duration.ofSeconds(30)).claim();
+            var parent = WorkloadClaimFence.from(node);
+            assertThat(claims.release(f.capture())).isTrue();
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {});
+            var capture = authority.acquireNodeBackedCapture(f.capture().key(), parent, 1).claim();
+            var old = WorkloadClaimFence.from(capture);
+            assertThat(authority.read(capture.key()).orElseThrow().leased()).isTrue();
+            assertThat(authority.acquire(capture.key(), node.owner(), 1, Duration.ofSeconds(30)).acquired()).isFalse();
+            var chains = f.chains();
+            assertThat(chains.openEpoch(CHAIN, 0, old)).hasValue(1);
+            var modelStore = models(f);
+            var key = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0);
+            var table = new SourceTable("orders", List.of(new SourceField("id", "int")), List.of(), List.of());
+            modelStore.publishInitial(key, ring("orders"), table, old);
+            var log = new MongoSrsLogStore(f.client(), SystemCollections.SRS_EVENTS.on(f.database()), SystemCollections.SRS_LOG_BOUNDS.on(f.database()),
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()), modelStore);
+            log.storeAll(ring("orders"), 0, List.of(new io.tapstate.spi.store.SrsLogRecord("initial", io.tapstate.core.event.Op.INSERT, 1, null, Map.of("id", 0), 0, old, 1)));
+            var candidate = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 1), ring("orders"), table, 1);
+            switch (scenario) {
+                case "node-expired" -> SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(node.key())),
+                        new Document("$set", new Document("leaseUntil", new java.util.Date(0))));
+                case "node-boot", "node-generation" -> {
+                    assertThat(claims.release(node)).isTrue();
+                    var nextOwner = scenario.equals("node-boot") ? new WorkloadOwner(SCOPE.clusterId(), "node-boot-b") : node.owner();
+                    var next = claims.acquire(node.key(), nextOwner, 1, Duration.ofSeconds(30)).claim();
+                    assertThat(next.claimGeneration()).isGreaterThan(node.claimGeneration());
+                }
+                case "released-reacquired" -> {
+                    assertThat(authority.release(capture)).isTrue();
+                    assertThat(authority.read(capture.key()).orElseThrow().leased()).isFalse();
+                    var next = authority.acquireNodeBackedCapture(capture.key(), parent, 1).claim();
+                    assertThat(next.claimGeneration()).isGreaterThan(old.claimGeneration());
+                    assertThat(authority.release(capture)).isFalse();
+                    var current = WorkloadClaimFence.from(next);
+                    assertThat(chains.openEpoch(CHAIN, 1, current)).hasValue(2);
+                    var nextKey = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 2, 0);
+                    modelStore.publishInitial(nextKey, ring("orders"), table, current);
+                    log.storeAll(ring("orders"), 1, List.of(new io.tapstate.spi.store.SrsLogRecord("reacquired", io.tapstate.core.event.Op.INSERT, 1, null, Map.of("id", 1), 0, current, 2)));
+                    assertThat(log.load(ring("orders"), 1)).isPresent();
+                    assertThat(claims.read(node.key()).orElseThrow().claim().claimGeneration()).isEqualTo(node.claimGeneration());
+                }
+                case "retired" -> {
+                    SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("claimAdmissionFence", 0L)));
+                    try (var session = f.client().startSession()) { session.withTransaction(() -> { new MongoCacheBusinessIdentity(f.database(), SCOPE).retire(session, "retire-node-capture"); return null; }); }
+                }
+                case "late-node-expiry" -> {
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(node.key())),
+                            new Document("$set", new Document("leaseUntil", new java.util.Date(System.currentTimeMillis() + 400))));
+                    var atWrite = new CountDownLatch(1); var resume = new CountDownLatch(1);
+                    try (var caller = Executors.newSingleThreadExecutor()) {
+                        var result = caller.submit(() -> {
+                            MongoCommandObservation.COLLECTIONS.set((op, collection) -> {
+                                if (op.equals("update") && collection.equals("workload_claims")) { atWrite.countDown(); awaitReclaimBarrier(resume); }
+                            });
+                            try { return modelStore.publish(candidate, old); } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                        });
+                        try {
+                            assertThat(atWrite.await(2, TimeUnit.SECONDS)).isTrue(); TimeUnit.MILLISECONDS.sleep(650); resume.countDown();
+                            assertThatThrownBy(() -> result.get(3, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+                        } finally { resume.countDown(); }
+                    }
+                }
+                case "wrong-capture" -> { }
+                default -> throw new AssertionError(scenario);
+            }
+            var refused = scenario.equals("wrong-capture") ? new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "other"), old.owner(), old.claimGeneration(), old.executionGeneration(), old.topologyRevision()) : old;
+            var before = SystemCollections.SRS_EVENTS.on(f.database()).countDocuments();
+            assertThatThrownBy(() -> modelStore.publish(candidate, refused)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> chains.requestTables(CHAIN, Set.of("orders"), refused)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> log.storeAll(ring("orders"), 2, List.of(new io.tapstate.spi.store.SrsLogRecord("stale", io.tapstate.core.event.Op.INSERT, 1, null, Map.of("id", 2), 0, refused, 1)))).isInstanceOf(TapstateException.class);
+            assertThat(SystemCollections.SRS_EVENTS.on(f.database()).countDocuments()).isEqualTo(before);
+            assertThat(SystemCollections.SRS_MODELS.on(f.database()).find(new Document("_id", MongoSrsModelStore.key(candidate.key()))).first()).isNull();
+        });
+    }
+
 }

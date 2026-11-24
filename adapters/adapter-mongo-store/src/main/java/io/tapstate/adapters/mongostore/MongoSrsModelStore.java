@@ -101,7 +101,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
             else
                 requireBusiness(session);
             // Checkpoints take the same claim before the chain; retain that write order during cleanup.
-            if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
+            if(WorkloadClaimDocuments.proveCapture(session, SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), fence,PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
             var consumers=new MongoSrsConsumerStore(client,database,scope,requireActive,requireStructure);
             var facts = new MongoSrsReadFacts(session, database, scope, true);
             Document chain;
@@ -289,7 +289,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
         Document chain = requireChain(session, model.key());
         if (!Long.valueOf(model.key().captureEpoch()).equals(chain.get("epoch"))
                 || !fence.key().resourceId().equals(chain.get("captureId"))) throw unavailable(model.key());
-        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_CAPTURE)
+        if (WorkloadClaimDocuments.proveCapture(session, SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), fence, PROVE_CAPTURE)
                 .getMatchedCount() != 1) throw claimFenced();
         Document anchor = contexts.head(chain, model.key().table());
         var control = contexts.find(session, model.key());

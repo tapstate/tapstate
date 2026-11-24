@@ -44,7 +44,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
         config.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         config.getUserContext().put(SrsStoreViews.USER_CONTEXT_KEY, sourceViews());
         config.getUserContext().put(CheckpointProgressWrites.USER_CONTEXT_KEY, progressWrites);
-        maps = OperatorMapBindings.prepare(config, new ScopedOperatorStateProvider(bound.cache(), authorization));
+        maps = OperatorMapBindings.prepare(config, new ScopedOperatorStateProvider(bound.cache(), authorization, !properties.isWorkloadLeasesEnabled()));
         ScopedSinkStateProvider.bind(config, bound.cache(), configuration.requiredNotes());
         RequiredNestDeadLetter.bindTo(config, new ScopedRequiredDeadLetterProvider(configuration.requiredDeadLetters(), authorization));
     }

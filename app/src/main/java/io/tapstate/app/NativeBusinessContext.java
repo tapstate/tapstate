@@ -420,7 +420,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 if(observer instanceof BuiltinResourceSignals signals)signals.cacheOperation(write,failure);
             });
         }
-        @Bean MemberStorage memberStorage(NativeBusinessContext owner, ClusterProperties cluster, WorkloadClaimStore claims, SrsStores sources) {
+        @Bean MemberStorage memberStorage(NativeBusinessContext owner, ClusterProperties cluster, WorkloadClaimStore claims, SrsStores sources,
+                CloudRuntimeSettings cloud, HazelcastProperties hazelcast) {
+            cluster.validateWorkloadLeases(cloud.cloud(), owner.original.binding().mode() == StorageBinding.Mode.OP,
+                    hazelcast.getDiscovery().getMode());
             owner.memberStorage = new NativeMemberStorage(owner.original, owner.configuration, cluster, claims, sources);
             return owner.memberStorage;
         }
@@ -533,7 +536,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 CloudRuntimeSettings cloud) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
             if (!(held instanceof WorkloadClaim node)) throw ThreeLayerStorePort.refused();
-            if (cluster.explicitSingle()) {
+            if (cluster.nodeBackedPipeline()) {
                 return PipelineActuationOwnership.nodeBacked(owner.original.preparation().businessScope(),
                         WorkloadClaimFence.from(node), membership, claims, cluster.pipelineClaimTtl(cloud.cloud()),
                         cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
@@ -547,14 +550,15 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean(destroyMethod = "close") ActuationClaimRenewer actuationClaimRenewer(PipelineActuationOwnership ownership, ClusterProperties cluster,
                 CloudRuntimeSettings cloud) {
-            return cluster.explicitSingle() ? ActuationClaimRenewer.inactive()
+            return cluster.nodeBackedPipeline() ? ActuationClaimRenewer.inactive()
                     : new ActuationClaimRenewer(ownership, cluster.pipelineClaimRenewInterval(cloud.cloud()));
         }
         @Bean CaptureOwnership captureOwnership(HazelcastInstance member, ClusterProperties cluster,
                 ClusterMembershipGate membership, ClusterWorkloadClaims claims) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
             if (!(held instanceof WorkloadClaim node)) throw ThreeLayerStorePort.refused();
-            return new CaptureOwnership(node.key().clusterId(), node.owner(), membership, claims, cluster.getWorkloadClaimTtl());
+            return new CaptureOwnership(node.key().clusterId(), node.owner(), membership, claims, cluster.getWorkloadClaimTtl(),
+                    cluster.isWorkloadLeasesEnabled() ? null : WorkloadClaimFence.from(node));
         }
         @Bean PipelineFirstStatePreparer pipelineFirstStatePreparer(NativeBusinessContext owner, NodeSessionLease node,
                 ClusterProperties cluster, Clock clock) {

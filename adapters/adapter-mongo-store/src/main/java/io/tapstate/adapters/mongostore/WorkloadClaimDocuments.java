@@ -43,6 +43,14 @@ final class WorkloadClaimDocuments {
                 .orElseGet(() -> live(fence));
     }
 
+    static com.mongodb.client.result.UpdateResult proveCapture(ClientSession session, MongoCollection<Document> claims,
+            WorkloadClaimFence fence, Document update) {
+        var timed = claims.updateOne(session, live(fence), update);
+        if (timed.getMatchedCount() == 1 || !MongoWorkloadClaimStore.canUseNodeLease(fence)) return timed;
+        return new MongoWorkloadClaimStore(claims).inStrictSession(session).nodeBackedFilter(fence)
+                .map(filter -> claims.updateOne(session, filter, update)).orElse(timed);
+    }
+
     static WorkloadClaimFence readNode(Document stored) {
         var node = read(stored, WorkloadClaimType.NODE_SESSION);
         if (!node.key().resourceId().equals(node.owner().nodeId())) throw unreadable();

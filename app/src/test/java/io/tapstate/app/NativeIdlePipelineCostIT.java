@@ -45,6 +45,10 @@ class NativeIdlePipelineCostIT {
         verifyNativeFixture(false);
     }
 
+    @Test void singleNodeWorkloadSwitchDeliversFullAndCdcNestState() throws Exception {
+        verifyNativeFixture(false, false);
+    }
+
     public static class Application {
         public static void main(String[] args)throws Exception{
             // Keep the fixture runnable against the baseline before this startup default existed.
@@ -61,6 +65,9 @@ class NativeIdlePipelineCostIT {
         return seeds;
     }
     private void verifyNativeFixture(boolean measure) throws Exception {
+        verifyNativeFixture(measure, true);
+    }
+    private void verifyNativeFixture(boolean measure, boolean workloadLeasesEnabled) throws Exception {
         try(var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
                 .withTmpFs(Map.of("/data/db","rw","/data/configdb","rw"))
                 .withCreateContainerCmdModifier(cmd->cmd.getHostConfig().withMemory(768L*1024*1024).withNanoCPUs(1_000_000_000L))
@@ -69,6 +76,7 @@ class NativeIdlePipelineCostIT {
             var storage=NativeAppStorage.createOnPremWithAdmin(mongo,"idle1022","admin","isolated-idle-password");
             try(var raw=MongoClients.create(storage.configurationUri());
                     var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                        "--tapstate.cluster.workload-leases-enabled="+workloadLeasesEnabled,
                         "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR",
                         "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.hz.member-port=0",
                         "--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.connectors.seed-dir="+connectorDirectory(),
@@ -82,8 +90,13 @@ class NativeIdlePipelineCostIT {
                         data.getCollection("orders").insertOne(new Document("_id",(long)i).append("parent_id",(long)i));
                         data.getCollection("lines").insertOne(new Document("_id",(long)i).append("parent_id",(long)i));
                     }
+                    if (!workloadLeasesEnabled) {
+                        for (String table : List.of("orders", "lines"))
+                            data.runCommand(new Document("collMod", table)
+                                    .append("changeStreamPreAndPostImages", new Document("enabled", true)));
+                    }
                     var port=NativeAppStorage.business(app).getBean(StorePort.class);
-                    port.artifacts().save(new SourceResource("idle-input",null,"mongodb",Map.of("isUri",true,"uri",storage.masterUri()),
+                    port.artifacts().save(new SourceResource("idle-input",null,"mongodb",Map.of("isUri",true,"uri",storage.masterUri(),"preImage",!workloadLeasesEnabled),
                             SourceMode.CDC,List.of(TableRef.literal("orders"),TableRef.literal("lines")),null,null));
                     var fields=List.of(new SourceField("_id","int",TapstateType.INT64),new SourceField("parent_id","int",TapstateType.INT64));
                     port.schemas().save(new DiscoveredSourceModel("idle-input","mongodb",System.currentTimeMillis(),new SourceModel(List.of(
@@ -121,6 +134,21 @@ class NativeIdlePipelineCostIT {
                         var landed=data.getCollection("idle_order_views").find(new Document("_id",6L)).first();
                         assertThat(landed).isNotNull();assertThat(landed.getList("lines",Document.class)).hasSize(1);
                     });
+                    if (!workloadLeasesEnabled) {
+                        var claims = raw.getDatabase(storage.cacheDatabase()).getCollection("workload_claims");
+                        for (String kind : List.of("CAPTURE", "PIPELINE_ACTUATION")) {
+                            assertThat(claims.countDocuments(new Document("_id.resourceType", kind)
+                                    .append("leaseUntil", new java.util.Date(-1)).append("nodeLeaseGeneration", new Document("$gt", 0L)))).isPositive();
+                        }
+                        var views = data.getCollection("idle_order_views");
+                        data.getCollection("lines").updateOne(new Document("_id", 6L), new Document("$set", new Document("parent_id", 1L)));
+                        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                                assertThat(views.find(new Document("_id", 1L)).first().getList("lines", Document.class)).hasSize(2));
+                        data.getCollection("lines").deleteOne(new Document("_id", 6L));
+                        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                                assertThat(views.find(new Document("_id", 1L)).first().getList("lines", Document.class))
+                                        .extracting(child -> child.get("_id")).containsExactly(1L));
+                    }
                     System.out.println("IDLE_CDC_AFTER_WINDOW_PASSED");
                     for(var result:results) {
                         @SuppressWarnings("unchecked") var ops=(Map<String,Long>)result.get("opcounters");
