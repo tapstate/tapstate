@@ -114,6 +114,10 @@ final class MongoSrsReadFacts {
                     new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring), true);
             addQuery(requested, SystemCollections.SRS_LOG_BOUNDS,
                     new Document("_id", MongoSrsLogStore.boundsId(ring)), false);
+            if (at.sequence() >= 0) {
+                addQuery(requested, SystemCollections.SRS_EVENTS,
+                        new Document("_id", MongoSrsLogStore.key(ring, at.sequence())), false);
+            }
         }
         addSnapshotReferences(root, pin, requested);
         prefetchStartupProofs(root, requested);
@@ -226,6 +230,12 @@ final class MongoSrsReadFacts {
             SystemCollections table, Document filter, boolean idOnly) {
         var selected = table.on(database).find(session, filter);
         return (idOnly ? selected.projection(new Document("_id", 1)) : selected).first();
+    }
+
+    Optional<Document> prefetchedEvent(ClientSession original, MongoCollection<Document> events, Document filter) {
+        requireSession(original, database);
+        if (!events.getNamespace().equals(SystemCollections.SRS_EVENTS.on(database).getNamespace())) return Optional.empty();
+        return rows.getOrDefault(lookup(SystemCollections.SRS_EVENTS, filter, false), Optional.empty());
     }
 
     Document bounds(ClientSession original, MongoCollection<Document> selected, Document filter) {

@@ -418,7 +418,9 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     Optional<SrsLogRecord> loadInSession(ClientSession session, String ring, long sequence, MongoSrsReadFacts facts) {
-        return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, sequence))).first())
+        var filter = new Document("_id", key(ring, sequence));
+        var event = facts == null ? Optional.<Document>empty() : facts.prefetchedEvent(session, collection, filter);
+        return event.or(() -> Optional.ofNullable(collection.find(session, filter).first()))
                 .map(row -> checkedRecord(session, ring, row, facts));
     }
 

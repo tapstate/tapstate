@@ -114,7 +114,8 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
-    @Test void startupAttachRetryDoesNotUndoAConcurrentDetach() {
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void startupAttachRetryDoesNotUndoAConcurrentDetach(boolean loseEvent) {
         withBusiness(f -> {
             preparedTrimLog(f);
             f.chains().requestTables(CHAIN, Set.of("orders"), f.captureFence());
@@ -128,12 +129,12 @@ class MongoSrsConsumerStoreIT {
             var beforeProof = new CountDownLatch(1);
             var afterDetach = new CountDownLatch(1);
             var paused = new java.util.concurrent.atomic.AtomicBoolean();
-            var eventReads = new java.util.concurrent.atomic.AtomicInteger();
+            var proofReads = new java.util.concurrent.atomic.AtomicInteger();
             try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
                 var start = executor.submit(() -> {
                     MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
-                        if ("find".equals(command) && "srs_events".equals(collection))
-                            eventReads.incrementAndGet();
+                        if ("aggregate".equals(command) && "srs_chains".equals(collection))
+                            proofReads.incrementAndGet();
                         if ("update".equals(command) && "workload_claims".equals(collection)
                                 && paused.compareAndSet(false, true)) {
                             beforeProof.countDown();
@@ -150,13 +151,22 @@ class MongoSrsConsumerStoreIT {
                         return reader.attachForStartup(A, Set.of("orders", "lines"), f.fenceA());
                     } finally { MongoCommandObservation.COLLECTIONS.remove(); }
                 });
+                var events = SystemCollections.SRS_EVENTS.on(f.database());
+                Document removed = null;
                 try {
                     assertThat(beforeProof.await(10, TimeUnit.SECONDS)).isTrue();
                     assertThat(f.consumers().detach(A, member.revision(), f.fenceA())).isPresent();
+                    if (loseEvent) removed = events.findOneAndDelete(new Document("_id", MongoSrsLogStore.key(ring("orders"), 4)));
                 } finally { afterDetach.countDown(); }
-                var result = start.get(10, TimeUnit.SECONDS);
-                assertThat(eventReads.get()).as("each transaction attempt must read the retained checkpoint event").isGreaterThanOrEqualTo(2);
-                assertThat(result).as("startup must preserve the newer detach").isEmpty();
+                if (loseEvent) {
+                    assertThat(removed).isNotNull();
+                    assertThatThrownBy(() -> start.get(10, TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.ExecutionException.class)
+                            .satisfies(failure -> code(failure.getCause(), IoError.SRS_CHECKPOINT_UNPROVEN));
+                    events.insertOne(removed);
+                } else {
+                    assertThat(start.get(10, TimeUnit.SECONDS)).as("startup must preserve the newer detach").isEmpty();
+                }
+                assertThat(proofReads.get()).as("checkpoint proofs are read again on retry").isGreaterThanOrEqualTo(2);
                 assertThat(f.consumers().find(A.key()).orElseThrow().detached()).isTrue();
                 assertThat(f.consumers().progress(A)).isEmpty();
             }
@@ -2516,7 +2526,8 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
-    @Test void aFreshChainReadBatchesItsOwnRetainedCheckpointDependencies() {
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aFreshChainReadBatchesItsOwnRetainedCheckpointDependencies(boolean oversized) {
         withBusiness(f -> {
             preparedTrimLog(f);
             f.chains().requestTables(CHAIN, Set.of("orders"), f.captureFence());
@@ -2525,6 +2536,10 @@ class MongoSrsConsumerStoreIT {
             var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 4), "t4"),
                     Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(key, 4)));
             f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            if (oversized) {
+                SystemCollections.SRS_EVENTS.on(f.database()).updateOne(new Document("_id", MongoSrsLogStore.key(ring("orders"), 4)),
+                        new Document("$set", new Document("after.large", "x".repeat(70 * 1024))));
+            }
             var commands = new ArrayList<String>();
             io.tapstate.spi.store.SrsChainState loaded;
             MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
@@ -2532,7 +2547,8 @@ class MongoSrsConsumerStoreIT {
             finally { MongoCommandObservation.COLLECTIONS.remove(); }
             assertThat(loaded.checkpoint()).isEqualTo(checkpoint);
             System.out.println("FRESH_CHAIN_COMMANDS count=" + commands.size() + " commands=" + commands);
-            assertThat(commands).containsOnlyOnce("find:srs_events", "find:srs_models").doesNotContain("find:srs_model_contexts");
+            assertThat(commands).containsOnlyOnce("find:srs_models").doesNotContain("find:srs_model_contexts");
+            assertThat(java.util.Collections.frequency(commands, "find:srs_events")).isEqualTo(oversized ? 1 : 0);
             assertThat(commands).hasSizeLessThanOrEqualTo(9);
         });
     }
