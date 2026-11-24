@@ -151,7 +151,7 @@ class ValidationRootHintOutboxTest {
     }
 
     @Test
-    void lockContentionDoesNotWaitOrSilentlyDropAnOfferedBatch() throws Exception {
+    void competingCaptureOffersFailWithoutWaitingOrSilentlyDroppingABatch() throws Exception {
         var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
         try (var executor = Executors.newVirtualThreadPerTaskExecutor();
              var outbox = new ValidationRootHintOutbox(run(), sender(), LIMITS, () -> {
@@ -179,8 +179,12 @@ class ValidationRootHintOutboxTest {
             outbox.tryOffer(move(1, 2));
             var polling = executor.submit(outbox::poll);
             assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
-            try { assertThat(outbox.tryOffer(move(2, 3))).isEqualTo(Offer.FAILED); }
-            finally { release.countDown(); }
+            try {
+                assertThat(outbox.tryOffer(move(2, 3))).isEqualTo(Offer.ACCEPTED);
+                var sourceFailure = new IllegalStateException("source failed during poll");
+                outbox.reportFailure(sourceFailure);
+                assertThat(outbox.failure()).contains(sourceFailure);
+            } finally { release.countDown(); }
             assertThat(polling.get(2, TimeUnit.SECONDS)).isEmpty();
             assertThat(outbox.snapshot().inFlight()).isFalse();
             assertThat(outbox.snapshot().bytes()).isZero();
@@ -213,10 +217,9 @@ class ValidationRootHintOutboxTest {
             outbox.tryOffer(move(1, 2));
             var polling = executor.submit(outbox::poll);
             assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
-            Throwable ordinary;
+            var ordinary = new IllegalStateException("source failed before the fatal poll error");
             try {
-                assertThat(outbox.tryOffer(move(2, 3))).isEqualTo(Offer.FAILED);
-                ordinary = outbox.failure().orElseThrow();
+                outbox.reportFailure(ordinary);
             } finally { release.countDown(); }
             assertThatThrownBy(() -> polling.get(2, TimeUnit.SECONDS)).hasCause(fatal);
             assertThat(outbox.failure().orElseThrow()).isSameAs(fatal);
