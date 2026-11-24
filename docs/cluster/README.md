@@ -20,6 +20,12 @@ Multi-member profiles and Cloud use Mongo leases. The earlier draft setting
 membership at startup and listens for subsequent joins. On seeing a peer, the OP process reports
 the cluster name and member addresses, stops serving work and exits with a nonzero status.
 
+If the network closes idle Mongo connections, the JVM option
+`-Dtapstate.store.mongo.max-idle-time-ms=45000` makes CONFIG and CACHE clients discard
+connections after 45 seconds of inactivity. Place it before `-jar` when starting OP.
+An explicit `maxIdleTimeMS` in a connection URI takes precedence. Omitting the JVM option
+keeps the driver's existing idle policy.
+
 Every cluster member needs:
 
 - one shared `tapstate.cluster.id`;

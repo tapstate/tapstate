@@ -69,6 +69,7 @@ public final class MongoConnection implements AutoCloseable {
     private final MongoConnectionSettings settings;
     private final String explicitDatabase;
     private final String caPem;
+    static final String MAX_IDLE_TIME_PROPERTY = "tapstate.store.mongo.max-idle-time-ms";
     private final boolean strictStorage;
     private final boolean userAtlas;
     private MongoClient client;
@@ -448,6 +449,19 @@ public final class MongoConnection implements AutoCloseable {
                 })
                 .applyToClusterSettings(b ->
                         b.serverSelectionTimeout(settings.serverSelectionTimeout().toMillis(), TimeUnit.MILLISECONDS));
+        if (strictStorage && connectionString.getMaxConnectionIdleTime() == null) {
+            String configured = System.getProperty(MAX_IDLE_TIME_PROPERTY);
+            if (configured != null) {
+                long millis;
+                try {
+                    millis = Long.parseLong(configured);
+                } catch (NumberFormatException invalid) {
+                    throw new IllegalArgumentException(MAX_IDLE_TIME_PROPERTY + " must be a non-negative number of milliseconds");
+                }
+                if (millis < 0) throw new IllegalArgumentException(MAX_IDLE_TIME_PROPERTY + " must be non-negative");
+                builder.applyToConnectionPoolSettings(pool -> pool.maxConnectionIdleTime(millis, TimeUnit.MILLISECONDS));
+            }
+        }
         // TLS follows the URI (applyConnectionString already applied it). A CA file is meaningful only
         // when TLS is on, so it is applied then and ignored otherwise: it trusts the self-signed chain
         // without touching the JVM-wide trust store.
