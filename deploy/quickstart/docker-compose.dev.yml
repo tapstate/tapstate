@@ -21,6 +21,9 @@
 # The build reads app/target/app-<version>-boot.jar, so package that first:
 #
 #   ( cd ../.. && mvn -pl app -am -DskipTests package )
+#   python3 ../cloud/stage-published-connectors.py --boot-jar ../../app/target/app-*-boot.jar \
+#     --profile onprem --stage-dir "$PWD/.onprem-seeds"
+#   export TAPSTATE_ONPREM_CONNECTORS_CONTEXT="$PWD/.onprem-seeds"
 #
 # Overriding image: as well as adding build: keeps the locally built server under its own tag, so it can
 # never be confused with -- or silently overwrite the cache of -- the published one.
@@ -30,3 +33,6 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+      target: onprem-release
+      additional_contexts:
+        onprem_connectors: ${TAPSTATE_ONPREM_CONNECTORS_CONTEXT:?stage the verified OP connectors first}

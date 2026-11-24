@@ -29,6 +29,7 @@ public enum ControlError implements TapstateErrorCode {
     AI_OVERLOADED(RequestErrorDefinitions.AI_OVERLOADED),
     /** Structurally invalid client input; programmer invariant violations remain bare failures. */
     MALFORMED_REQUEST(RequestErrorDefinitions.MALFORMED_REQUEST),
+    RETRY_SETTINGS_REVISION_CONFLICT(RequestErrorDefinitions.RETRY_SETTINGS_REVISION_CONFLICT),
 
     /** A valid preview request could not enter the bounded candidate-compilation pool. */
     PREVIEW_OVERLOADED(RequestErrorDefinitions.PREVIEW_OVERLOADED),

@@ -33,6 +33,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -192,6 +193,8 @@ class ReplTest {
         ConnectionTestResultOutcome testResultOutcome = new ConnectionTestResultOutcome.Unreachable();
         ConnectionDiscoverSchemaOutcome discoverSchemaOutcome = new ConnectionDiscoverSchemaOutcome.Unreachable();
         ConnectionSchemaOutcome schemaOutcome = new ConnectionSchemaOutcome.Unreachable();
+        Optional<ConnectorRegisterOutcome> downloadOutcome = Optional.empty();
+        final List<String> downloadCalls = new ArrayList<>();
         ConnectorRegisterOutcome registerOutcome = new ConnectorRegisterOutcome.Unreachable();
         /** Per-artifact register outcomes keyed by artifact byte length (for batch/directory tests); falls back to {@link #registerOutcome}. */
         final Map<Integer, ConnectorRegisterOutcome> registerOutcomeByLength = new HashMap<>();
@@ -504,6 +507,12 @@ class ReplTest {
         public ConnectionSchemaOutcome schema(URI baseUrl, String credential, String id) {
             schemaCalls.add(credential + "@" + baseUrl + "/" + id);
             return healthy.contains(baseUrl) ? schemaOutcome : new ConnectionSchemaOutcome.Unreachable();
+        }
+
+        @Override
+        public Optional<ConnectorRegisterOutcome> downloadConnector(URI baseUrl, String credential, String id) {
+            downloadCalls.add(id);
+            return downloadOutcome;
         }
 
         @Override
@@ -3574,15 +3583,33 @@ class ReplTest {
                 .contains("newlyRegistered:");
     }
 
-    @Test
-    void registerForAMissingFileReportsCannotReadAndDoesNotCallTheServer(@TempDir Path workdir) {
+    @ParameterizedTest
+    @ValueSource(strings = {"nope.jar", "nope.JAR"})
+    void registerForAMissingFileReportsCannotReadAndDoesNotCallTheServer(String name, @TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.downloadOutcome = Optional.of(new ConnectorRegisterOutcome.Rejected("TS0380001", "Catalog refusal"));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
-        assertThat(h.repl().dispatch("register nope.jar")).isTrue();
+        assertThat(h.repl().dispatch("register " + name)).isTrue();
 
-        assertThat(h.sink().toString().substring(mark)).contains("register:").containsIgnoringCase("cannot read");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(h.sink().toString().substring(mark)).contains("register: cannot read", name);
+        assertThat(client.downloadCalls).isEmpty();
+        assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void registerWithAConnectorIdUsesTheServerCatalog(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.downloadOutcome = Optional.of(new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("mysql", "hash-mysql", "2.11.0", true)));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register mysql")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
+        assertThat(client.downloadCalls).containsExactly("mysql");
         assertThat(client.registerCalls).isEmpty();
     }
 
@@ -6014,7 +6041,7 @@ class ReplTest {
                 + "AApzb3J0U3RyaW5ndAASTGphdmEvbGFuZy9TdHJpbmc7TAAMc291cmNlT2Zmc2V0cQB+AAJ4cHBwcA==";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
-                Map.of("orders", serializedPosition, "accounts", serializedPosition),
+                Map.of("orders", serializedPosition, "accounts", serializedPosition, "archive", "rO0ABA=="),
                 List.of("sourceHeadPosition"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -6022,7 +6049,8 @@ class ReplTest {
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected");
+        assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected",
+                "targetAckedPosition.archive  rO0ABA==");
         assertThat(out).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
                 .containsPattern("targetAckedPosition.accounts  opaque position fingerprint [0-9a-f]{16}");
         assertThat(out).as("text metrics must not expose an opaque serialized connector object")
@@ -6040,6 +6068,12 @@ class ReplTest {
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
         String first = h.sink().toString().substring(mark);
+
+        String projectedPosition = "opaque-v1:" + CanonicalHash.ofText(firstPosition);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", projectedPosition));
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+        assertThat(h.sink().toString().substring(mark)).isEqualTo(first);
 
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", nextPosition));
         mark = h.sink().toString().length();

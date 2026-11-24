@@ -1,11 +1,16 @@
 package io.tapstate.app;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.util.Enumeration;
+import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
@@ -32,6 +37,39 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class PdkRuntimeInBootJarIT {
 
     private static final String BOOT_JAR_PROPERTY = "tapstate.app.boot-jar";
+
+    @Test
+    void manifestDescribesThePackagedHostJars() throws Exception {
+        try (var jar = new JarFile(System.getProperty(BOOT_JAR_PROPERTY))) {
+            var resource = jar.getJarEntry("META-INF/tapstate/pdk-version.json");
+            assertThat(resource).isNotNull();
+            var manifest = new ObjectMapper().readTree(jar.getInputStream(resource));
+            var modules = new HashSet<String>();
+            for (var dependency : manifest.required("dependencies")) {
+                String id = dependency.required("artifactId").asText();
+                String base = dependency.required("version").asText();
+                String resolved = dependency.required("resolvedVersion").asText();
+                assertThat(modules.add(id)).as("unique host artifact %s", id).isTrue();
+                assertThat(dependency.required("groupId").asText()).isEqualTo("io.tapdata");
+                var matching = jar.stream().filter(entry -> entry.getName().equals("BOOT-INF/lib/" + id + "-" + base + ".jar")
+                        || entry.getName().equals("BOOT-INF/lib/" + id + "-" + resolved + ".jar")).toList();
+                assertThat(matching).as(id).hasSize(1);
+                try (var bytes = jar.getInputStream(matching.getFirst())) {
+                    var hash = MessageDigest.getInstance("SHA-256").digest(bytes.readAllBytes());
+                    assertThat(dependency.required("sha256").asText()).isEqualTo(HexFormat.of().formatHex(hash));
+                }
+                if (base.endsWith("-SNAPSHOT")) {
+                    assertThat(resolved).contains(dependency.required("snapshotTimestamp").asText())
+                            .doesNotEndWith("-SNAPSHOT");
+                }
+                if (id.equals("tapdata-pdk-api")) {
+                    assertThat(manifest.required("pdkApiVersion").asText()).isEqualTo(base);
+                }
+            }
+            assertThat(modules).contains("tapdata-pdk-api", "tapdata-api", "tapdata-pdk-runner", "tapdata-common",
+                    "pdk-error-code", "error-code-scanner", "error-code-core");
+        }
+    }
 
     @ParameterizedTest(name = "{0}")
     @CsvSource({

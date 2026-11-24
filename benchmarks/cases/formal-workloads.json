@@ -1,0 +1,901 @@
+{
+  "cases": {
+    "aggregate.backlog.basic.standard@1": {
+      "definition_sha256": "4ec3b4af3d25ea4bbe7feb22ffa42dca6293a6462071f025cf23377f86701ffc",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "aggregate.live.basic.standard@1": {
+      "definition_sha256": "9b49135e7c315009e050e860a3f98d8e23f8d28d8f15b2c0a11036165813048e",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "aggregate.snapshot.basic.large@1": {
+      "definition_sha256": "360ad2dc561ec2a57469042786c2a0dfdbcc674b5c0a222279344a4bed3a01f5",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "aggregate.snapshot.basic.small@1": {
+      "definition_sha256": "a6558502d33906e0f06c13b40e27694e906c8539d37309625cb9193fc9cf8191",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 40000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "aggregate.snapshot.basic.standard@1": {
+      "definition_sha256": "cddc6add285c1a612759027161522422f47922c6d6c338d3bc085d3b3e32cffd",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "aggregate.snapshot.basic.wide@1": {
+      "definition_sha256": "835be3bdadcdeaa9b44308cd6e66bf25b056ef33d2572a8390b97f6bb304c294",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.backlog.fixed-iud.standard@1": {
+      "definition_sha256": "7f023c567c7121ce554491b3ac180aa095207d26a11f1ab970c1b2e93567fd04",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.live.basic.standard@1": {
+      "definition_sha256": "eb7e1dbc0773c01a1d925659b14e79ab82466c59d4c3a0ee9bef4ef374ab4681",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.live.handoff.standard@1": {
+      "definition_sha256": "84462327127fa7009ad808f3067e6e2319716310408689f885033f015618c9a9",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.live.slow-target.large@2": {
+      "definition_sha256": "e1447fd5bf019186ee3519e643bf28b024fdb880c9c18a2dd56e3d97feb5107a",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.snapshot.basic.large@2": {
+      "definition_sha256": "6f16dde8e9835c0e58a793d78ce1ccedc1ebdcd98083b305ffc6212f998660e1",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.snapshot.basic.small@1": {
+      "definition_sha256": "cb5f389cb127f1b750b9ed2c8e9a9b72cf3e0c3af2894698d60d130fa3949415",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.snapshot.basic.standard@1": {
+      "definition_sha256": "cbc33ae22b4b35f89ea7636ddb66f4e4d9595bbe23082b2b928e674ce972f158",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.snapshot.basic.wide@2": {
+      "definition_sha256": "e08a8d1429b514eab6ce7d01d8c35ea77e3841744c2ae632e3fbf9a6b75f1590",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "copy.snapshot.dummy-baseline.standard@1": {
+      "definition_sha256": "f81989e2b1bbc6ab9710c28e2ed321fb3b89699fd7a4c45af350bdb289ce661f",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "filter.backlog.basic.standard@1": {
+      "definition_sha256": "8b459ba0a04c592fe9c30910bdb9c4f148f786e40c320d6c2674f72ae9e0aeff",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "filter.live.basic.standard@1": {
+      "definition_sha256": "95827e6ef77341af41b2a419365609af58625a346a1cb2dc2d749daba9e4f9b6",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "filter.snapshot.basic.large@1": {
+      "definition_sha256": "1b9f33fb8251459aaa01e8270ad22b839776950c30d5d7285c44c6a5c51ac77e",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "filter.snapshot.basic.small@1": {
+      "definition_sha256": "453d54f8b0fd5a9daf87593024c413ffea70cb61a171b6dd89e1c90f27d09aa9",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "filter.snapshot.basic.standard@1": {
+      "definition_sha256": "5beed97d49fd4c1936b92ae9c1a69085959b30b8dd3c0e9e17db8175b8a290a1",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "filter.snapshot.basic.wide@1": {
+      "definition_sha256": "2d7ce2fd6a972f2a920c2d853086fbaf7d12e0cea28dad7138f5dca3826efd31",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.backlog.basic.standard@1": {
+      "definition_sha256": "027b3b2d9b682f4adf9c37ce146e208f9ce3a88a159ce3385b3cba26811e9803",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.lifecycle.release.standard@2": {
+      "definition_sha256": "8367e8938813d6fee25b732ef07071fd04432a5f28e064b6a226dede79437752",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 60,
+        "mix": null,
+        "rate": 30,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.live.basic.standard@1": {
+      "definition_sha256": "835297f2b202faa329e5fa55b08dc49f67b7c251d00826d2ae031924dc397811",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.live.hot-update.standard@1": {
+      "definition_sha256": "054b2929b2686f2d85ee83016582b121975f6b1f9c1dcec883f4fa96186c7a93",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 5,
+        "repeats": 3,
+        "rows": 5000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 2
+    },
+    "join.live.hot-update.wide@2": {
+      "definition_sha256": "02601990ed702e5a87d5ff9cf1d044b724707c8a5318e968aea85547518b6e79",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 5,
+        "repeats": 3,
+        "rows": 5000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.live.steady-state.standard@2": {
+      "definition_sha256": "7ccee221ca4a05be9851b6f5fa9764297c0b9d8bc6f4abf90d07a998f9dd8915",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.snapshot.basic.large@1": {
+      "definition_sha256": "bba07a1468f92239708112f1ba1ce1d8b820e3c0661e67929e685bd7307e542e",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.snapshot.basic.small@1": {
+      "definition_sha256": "82c46c1c0e6b63735a93b2392df2e3a866bb5ba8e24f7a97d7a2baeda4dc8fcd",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.snapshot.basic.standard@1": {
+      "definition_sha256": "9b9031eceabad1e97b9b7746388962d2c52fa56c607bdf39f4878ed04973e771",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "join.snapshot.basic.wide@1": {
+      "definition_sha256": "7768d6f5afe61478453ef5f5d321d47561e5371984adbeeeb8c53066a8e087b1",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "js.backlog.basic.standard@1": {
+      "definition_sha256": "ee5505d527735c35284b59e7a296f3bc4dfe271f5bb56df8b7ef71e10d4fda51",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "js.live.basic.standard@1": {
+      "definition_sha256": "1431ce11d3d2f3543cc2a9ed555bc3f6194a671bb514437db754834604377122",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "js.snapshot.basic.large@1": {
+      "definition_sha256": "e3414a2540b39cff2db4dea2a3d4c5df75bbf18218c7a0272660c92eb457e63a",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "js.snapshot.basic.small@1": {
+      "definition_sha256": "5553d14f072743d8ed208c161a10754aa755fa6c54fec9f9f43f8dc2a0c44cb8",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "js.snapshot.basic.standard@1": {
+      "definition_sha256": "780618cce9c2f8ff6c8a127118c181a9c8b9aeb765d649077360cd6c607c3092",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "js.snapshot.basic.wide@1": {
+      "definition_sha256": "3866d07b163db1704a7b54badce13350cb807fee6566d9661e888ebb34e611fd",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "map.backlog.basic.standard@1": {
+      "definition_sha256": "72bbf7a0fa896ea6a03262d0828dbcd76e033e4437a7114c2a64efb476a7161b",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "map.live.basic.standard@1": {
+      "definition_sha256": "15504ab79397cf8da610cb244de141f59b8346929e9f0479e94f750d1005c63e",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "map.snapshot.basic.large@1": {
+      "definition_sha256": "ecd08e0cce9f39b0627d7b53ce6bad22664d1904cadf323142e576323cefb816",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "map.snapshot.basic.small@1": {
+      "definition_sha256": "26f9ede8ac3952644043129236e7f4087342a7a90901e48c931c7ca7b9d192c7",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "map.snapshot.basic.standard@1": {
+      "definition_sha256": "cf13e434a21b42dc942c1551ddff4479f22eb2180b833deea7e46bb81a515ab7",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "map.snapshot.basic.wide@1": {
+      "definition_sha256": "cff34b47384c717f5eb3397e0ac6173576472e3208e056188068f597d8b7e6c9",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "mixed.snapshot.double-map.standard@1": {
+      "definition_sha256": "7aeb9b0134457b84dcd73edee650fa06c2b31c86ea89d03d965c2317cd3cf953",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.backlog.basic.standard@1": {
+      "definition_sha256": "c54f1e3d7f117a4a5f14d4e38680fc3ab6f5e6e6fd408e901bfc64f31ee80cb0",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.live.basic.standard@1": {
+      "definition_sha256": "1bb6719a5fccf03fd0a5e8c0e2b0c0739d5b23ac5a01bef91eb21ad1925b9882",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.live.child-update.standard@1": {
+      "definition_sha256": "f91f34ac28ce3eb428cda7a2b8dce1b623ea91e54bffc75289edaead1f9d0a61",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 25,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.snapshot.basic.large@1": {
+      "definition_sha256": "ff77e6a023371b46124124cab866061a6f2ddb18af265e769de2f7f3283d6716",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.snapshot.basic.small@1": {
+      "definition_sha256": "b906b1e5d6d3ec4ade957877ad1b2d6841a742dc8ab34f8d4478c7c2f4e47ba6",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.snapshot.basic.standard@1": {
+      "definition_sha256": "cbf403e349b7d5d12e6cef1af77d41e65a2bc5a736c5f9032489d16577f5dd48",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.snapshot.basic.wide@1": {
+      "definition_sha256": "7b9ac9ab7c30fc1275aa09937ba710ed9d2edda549cfb9ce787d363739f426c4",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "nest.snapshot.fanout.wide@2": {
+      "definition_sha256": "d0d05f0dd61c87f519cde4c4fc0aca336116dbbd88d6396f9c5f9c02e644b9dc",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "union.backlog.basic.standard@1": {
+      "definition_sha256": "8614d6c6b1db184c309a85f4ab5f273919ba60a38df0717d01e9386b54ddcab5",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "union.live.basic.standard@1": {
+      "definition_sha256": "6f19073dcced7d2eff3c70211ddc2c6866c3355a7b39c19faa0cc9e7caf11c10",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 50,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "union.snapshot.basic.large@1": {
+      "definition_sha256": "0982e3cd94a44fa5bc2df42657e12898638e7799fc411c04a6c3ad02d6e24519",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "union.snapshot.basic.small@1": {
+      "definition_sha256": "f57d136959a78f3512653eca6ecdde029e47710c62742a7f89277dd0c4718686",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "union.snapshot.basic.standard@1": {
+      "definition_sha256": "b5a53f5b2280d6b33aec3f5087e4e35bf49dec88a05f3713f1ff27eb6e4e4966",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "union.snapshot.basic.wide@1": {
+      "definition_sha256": "c6d84cf96a543bf37351063d662066f076c132d12151f628822fc4a916e6765e",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "unwind.backlog.basic.standard@1": {
+      "definition_sha256": "631a1f864da628b378adcfaf33fa173a6aab6ec669d2d638158ebc421649c80b",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "unwind.live.basic.standard@1": {
+      "definition_sha256": "5d194250e473a77a72a4f1c2621847456793da600108e77ab21fa3cfa90027ff",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "unwind.snapshot.basic.large@1": {
+      "definition_sha256": "071035a8c9b04aef70220f5e0e4152e7c2af6de354a7203b74f7ca4bab55cc7d",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 10000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "unwind.snapshot.basic.small@1": {
+      "definition_sha256": "eaf7907b08dc8fbb0e47d4ac3f4a30c2554ac61e175a13b5770c95dae614b6ba",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "unwind.snapshot.basic.standard@1": {
+      "definition_sha256": "5826349c6af660bb18b1377cfa84c1f0f6720789b04834420725944dfcb8b560",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 100000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    },
+    "unwind.snapshot.basic.wide@1": {
+      "definition_sha256": "a25561574f41270e4a50eb79f8e3be89ae21cf0cc07666452cded0df2d2bb8de",
+      "load": {
+        "backlog_events": 30000,
+        "measurement_seconds": 300,
+        "mix": null,
+        "rate": 100,
+        "repeats": 3,
+        "rows": 25000,
+        "timeout_seconds": 600,
+        "warmup_seconds": 30
+      },
+      "version": 1
+    }
+  },
+  "schema_version": 1
+}

@@ -79,6 +79,25 @@ class PipelineFailuresTest {
     }
 
     @Test
+    void missingLocalArtifactIdentifiesTheExactVerifiedCoordinatesBeforeAConnectorOpens() {
+        String hash = "ab".repeat(32);
+        var cause = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.LOCAL_ARTIFACT_UNAVAILABLE,
+                Map.of("connector", "mongodb-atlas", "hash", hash), null);
+        var failure = PipelineFailures.of("orders", cause, Map.of(), null);
+        assertThat(failure.code()).isEqualTo("TS0060043");
+        assertThat(failure.params()).containsOnly(entry("connector", "mongodb-atlas"), entry("hash", hash));
+    }
+
+    @Test
+    void unusableLocalArtifactCoordinatesStayRedacted() {
+        var cause = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.LOCAL_ARTIFACT_UNAVAILABLE,
+                Map.of("connector", "mongodb", "hash", "unexpected detail"), null);
+        var failure = PipelineFailures.of("orders", cause, Map.of(), null);
+        assertThat(failure.params()).containsOnly(entry("connector", "[diagnostic unavailable]"),
+                entry("hash", "[diagnostic unavailable]"));
+    }
+
+    @Test
     void aCodedCauseKeepsItsOwnCodeAndArguments() {
         TapstateException coded = new TapstateException(
                 EngineError.NO_SUCH_JOB, Map.of("pipeline", "orders"), null);

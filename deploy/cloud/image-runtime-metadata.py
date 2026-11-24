@@ -61,7 +61,10 @@ def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path, seed_lo
     with zipfile.ZipFile(jar_path) as jar:
         if hashlib.sha256(jar.read(SDK)).hexdigest() != SDK_SHA:
             raise ValueError("runtime smoke requires the locked actual SDK bytes")
-        if jar.read("META-INF/tapstate/connectors.lock.json") != lock.read_bytes():
+        if json.loads(lock.read_text()).get("schemaVersion") == 3:
+            if "META-INF/tapstate/supported-connectors.json" not in jar.namelist():
+                raise ValueError("runtime Boot JAR does not carry its official connector support manifest")
+        elif jar.read("META-INF/tapstate/connectors.lock.json") != lock.read_bytes():
             raise ValueError("runtime Boot JAR does not carry the selected connector lock")
         manifest = jar.read("META-INF/tapstate-web.files.sha256").decode()
     web_files = {name.removeprefix("./"): digest for digest, name in

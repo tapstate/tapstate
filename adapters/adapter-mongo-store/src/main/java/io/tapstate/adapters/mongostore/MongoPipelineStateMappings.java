@@ -9,6 +9,12 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ConnectorRunBindings;
+import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.RequiredNoteScope;
+import io.tapstate.core.model.PipelineNode;
+import java.util.List;
+import java.util.Set;
 import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.PipelineStateMappings;
 import org.bson.Document;
@@ -118,6 +124,7 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
             replacement.put("validationPreparation", MongoValidationPreparationFacts.encode(new MongoValidationPreparationFacts.State(
                     java.util.UUID.randomUUID(), 0, MongoValidationPreparationFacts.Phase.UNASSIGNED, null, null, previous.previous())));
         }
+        replacement.remove("connectorBindings");
         replacement.remove("stateRebuild");
         replacement.remove("cacheRecovery");
         MongoPipelineSharedRecoveryFacts.removeOnVerifiedReplacement(prior,replacement,result.scope());
@@ -209,10 +216,93 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
         throw retirementRequired(pipelineId);
     }
 
+    static Optional<ConnectorRunBindings> connectorBindings(Document mapping) {
+        if (!mapping.containsKey("connectorBindings")) return Optional.empty();
+        String pipeline = mapping.getString("_id");
+        try {
+            if (!(mapping.get("connectorBindings") instanceof Document row)
+                    || !row.keySet().equals(Set.of("formatVersion", "scope", "effectiveIntentRevision", "effective", "handoff"))
+                    || !Integer.valueOf(1).equals(row.get("formatVersion"))
+                    || !(row.get("effectiveIntentRevision") instanceof Long revision)) throw unreadable(pipeline);
+            var scope = MongoPipelinePreparationFacts.scope(row.get("scope", Document.class));
+            if (!pipeline.equals(scope.pipelineId())) throw unreadable(pipeline);
+            if (!mapping.getLong("stateGeneration").equals(scope.stateGeneration())) {
+                var replacement = MongoCacheRecoveryFacts.read(mapping).orElseThrow(() -> unreadable(pipeline));
+                if (!scope.equals(replacement.previousScope())) throw unreadable(pipeline);
+            }
+            ConnectorRunBindings.Handoff handoff = null;
+            if (row.get("handoff") != null) {
+                var pending = row.get("handoff", Document.class);
+                if (!pending.keySet().equals(Set.of("intentRevision", "phase", "candidates", "previous"))
+                        || !(pending.get("intentRevision") instanceof Long intentRevision)) throw unreadable(pipeline);
+                handoff = new ConnectorRunBindings.Handoff(intentRevision,
+                        ConnectorRunBindings.Phase.valueOf(pending.getString("phase")),
+                        connectorBindings(pending, "candidates"), connectorBindings(pending, "previous"));
+            }
+            return Optional.of(new ConnectorRunBindings(scope, revision, connectorBindings(row, "effective"), handoff));
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException malformed) {
+            throw unreadable(pipeline);
+        }
+    }
+
+    private static List<ConnectorRunBindings.Binding> connectorBindings(Document row, String field) {
+        return row.getList(field, Document.class).stream().map(value -> {
+            if (!value.keySet().equals(Set.of("nodeId", "purpose", "connectorId", "version", "sha256", "notes", "captureId", "chainId")))
+                throw new IllegalArgumentException("invalid connector binding fields");
+            var notes = value.get("notes", Document.class);
+            if (!notes.keySet().equals(Set.of("bindingVersion", "namespace", "kind", "ownerId", "stateGeneration", "generation"))
+                    || !(notes.get("bindingVersion") instanceof Long binding)
+                    || !(notes.get("stateGeneration") instanceof Long state)
+                    || !(notes.get("generation") instanceof Long generation))
+                throw new IllegalArgumentException("invalid connector note coordinates");
+            var scope = new RequiredNoteScope(new RequiredNoteOwner(binding, notes.getString("namespace"),
+                    RequiredNoteOwner.Kind.valueOf(notes.getString("kind")), notes.getString("ownerId"), state), generation);
+            return new ConnectorRunBindings.Binding(value.getString("nodeId"), PipelineNode.Purpose.valueOf(value.getString("purpose")),
+                    value.getString("connectorId"), value.getString("version"), value.getString("sha256"), scope,
+                    value.getString("captureId"), value.getString("chainId"));
+        }).toList();
+    }
+
+    static Document connectorBindings(ConnectorRunBindings value) {
+        var pending = value.handoff();
+        Document handoff = pending == null ? null : new Document("intentRevision", pending.intentRevision())
+                .append("phase", pending.phase().name()).append("candidates", bindingDocuments(pending.candidates()))
+                .append("previous", bindingDocuments(pending.previous()));
+        return new Document("formatVersion", 1).append("scope", MongoPipelinePreparationFacts.scope(value.scope()))
+                .append("effectiveIntentRevision", value.effectiveIntentRevision()).append("effective", bindingDocuments(value.effective()))
+                .append("handoff", handoff);
+    }
+
+    private static List<Document> bindingDocuments(List<ConnectorRunBindings.Binding> values) {
+        return values.stream().map(value -> {
+            var token = value.notes(); var owner = token.owner();
+            var notes = new Document("bindingVersion", owner.bindingVersion()).append("namespace", owner.namespace())
+                    .append("kind", owner.kind().name()).append("ownerId", owner.ownerId())
+                    .append("stateGeneration", owner.stateGeneration()).append("generation", token.generation());
+            return new Document("nodeId", value.nodeId()).append("purpose", value.purpose().name())
+                    .append("connectorId", value.connectorId()).append("version", value.version()).append("sha256", value.sha256())
+                    .append("notes", notes).append("captureId", value.captureId()).append("chainId", value.chainId());
+        }).toList();
+    }
+
+    static void writeConnectorBindings(ClientSession session, MongoDatabase database, Document mapping, ConnectorRunBindings value) {
+        if (mapping.getLong("noteWriteFence") >= Long.MAX_VALUE - 1)
+            throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+        var before = mapping.get("connectorBindings");
+        var filter = new Document("_id", mapping.getString("_id")).append("stateGeneration", mapping.get("stateGeneration"))
+                .append("phase", "ACTIVE").append("noteWriteFence", mapping.get("noteWriteFence"));
+        filter.append("connectorBindings", before == null ? new Document("$exists", false) : before);
+        if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session, filter,
+                new Document("$set", new Document("connectorBindings", connectorBindings(value)))
+                        .append("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1)
+            throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+    }
+
     static PipelineStateMapping decode(String pipelineId, Document document) {
         try {
             if (document == null || !(document.get("stateGeneration") instanceof Long generation)
                     || !(document.get("noteWriteFence") instanceof Long fence) || fence < 0 || fence == Long.MAX_VALUE) throw unreadable(pipelineId);
+            connectorBindings(document);
             MongoCacheRecoveryFacts.read(document);
             MongoPipelineSharedRecoveryFacts.read(document);
             return new PipelineStateMapping(pipelineId, generation,
