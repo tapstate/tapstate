@@ -59,23 +59,11 @@ final class StoreIo {
 
     /** As {@link #call(Supplier)}, naming the document the operation is for, for a size failure. */
     static <T> T call(String id, Supplier<T> operation) {
-        return call(id, null, operation);
-    }
-
-    /** Runs a publication transaction and preserves an unknown commit result from the driver. */
-    static <T> T callForPipelinePublication(String pipelineId, Supplier<T> operation) {
-        return call(UNNAMED, pipelineId, operation);
-    }
-
-    private static <T> T call(String id, String publishingPipeline, Supplier<T> operation) {
         try {
             return operation.get();
         } catch (BsonMaximumSizeExceededException e) {
             throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
         } catch (MongoException e) {
-            if (publishingPipeline != null && e.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
-                throw pipelineCommitOutcomeUnknown(publishingPipeline);
-            }
             if (DOCUMENT_TOO_LARGE_CODES.contains(errorCode(e))) {
                 throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
             }

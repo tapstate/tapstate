@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoException;
 import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
@@ -34,6 +35,7 @@ import java.util.logging.Logger;
 
 /** Private draft saves keep their own CAS; publication joins the existing configuration artifact transaction. */
 final class MongoConfigurationDraftStore implements PipelineDraftStore {
+    private static final int MAX_COMMIT_ATTEMPTS = 3;
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private static final Logger LOG = Logger.getLogger(MongoConfigurationDraftStore.class.getName());
@@ -191,7 +193,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
             throw new IllegalArgumentException("publication hash must match the captured Pipeline");
         }
         try {
-            return StoreIo.callForPipelinePublication(publication.pipelineId(), () -> withTransaction(session -> {
+            return publicationTransaction(publication.pipelineId(), session -> {
                 Document row = drafts.find(session, new Document("_id", publication.pipelineId())).first();
                 if (row == null || deleted(row)) return new Published(PipelineDraftMutation.NOT_FOUND, 0);
                 PipelineDraft current = codec.decode(row);
@@ -205,7 +207,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
                 drafts.replaceOne(session, new Document("_id", current.pipelineId()).append("revision", current.revision()).append("deleted", false),
                         codec.encode(published, session));
                 return new Published(PipelineDraftMutation.PUBLISHED, generation);
-            }));
+            });
         } catch (MongoConfigurationArtifactStore.Refused conflict) {
             return new Published(PipelineDraftMutation.ARTIFACT_CONFLICT, 0);
         }
@@ -263,13 +265,28 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
         if (!Boolean.TRUE.equals(row.get("deleted"))) return false;
         codec.tombstoneRevision(row); return true;
     }
-    private <T> T transaction(Function<ClientSession, T> action) {
-        return StoreIo.call(() -> withTransaction(action));
+    private <T> T publicationTransaction(String pipelineId, Function<ClientSession, T> action) {
+        return transaction(session -> {
+            T result = action.apply(session);
+            // Commit explicitly so withTransaction still retries transient body failures but skips its own commit loop.
+            for (int attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
+                try {
+                    session.commitTransaction();
+                    return result;
+                } catch (MongoException error) {
+                    if (!error.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) throw error;
+                }
+            }
+            throw StoreIo.pipelineCommitOutcomeUnknown(pipelineId);
+        });
     }
-    private <T> T withTransaction(Function<ClientSession, T> action) {
-        try (var session = client.startSession()) {
-            return session.withTransaction(() -> action.apply(session), TRANSACTION);
-        }
+
+    private <T> T transaction(Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            try (var session = client.startSession()) {
+                return session.withTransaction(() -> action.apply(session), TRANSACTION);
+            }
+        });
     }
     private static PipelineDraft withRevision(PipelineDraft draft, long revision) {
         return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), revision, draft.mode(), draft.name(), draft.description(),
