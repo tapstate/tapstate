@@ -186,6 +186,8 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
      * Background-only, after the physical request has exited. Null means an unknown delivery outcome;
      * BUSY also retries. Only a matching accepted/duplicate receipt releases the logical packet.
      */
+    // The controller observes this latch even if the delivery thread dies. A fatal Error is always rethrown.
+    @SuppressWarnings("java:S1181")
     public Settlement settle(Lease lease, ValidationRootHintInbox.Receipt receipt) {
         Objects.requireNonNull(lease, "lease");
         if (lease.owner != this) throw invalid("hint.foreignLease");
@@ -193,8 +195,7 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
         deliveryLock.lock();
         try {
             if (lease.settled) return Settlement.ALREADY_SETTLED;
-            Entry entry = Objects.requireNonNull(lease.entry, "entry");
-            requireActiveLease(entry, lease);
+            Entry entry = activeEntry(lease);
             lease.settled = true; entry.lease = null;
             if (closed) return failure.get() == null ? Settlement.CLOSED : Settlement.FAILED;
             long now = nanoTime.getAsLong();
@@ -209,10 +210,12 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
         }
     }
 
-    private void requireActiveLease(Entry entry, Lease lease) {
-        if (buffer.get().first() != entry || entry.lease != lease) {
+    private Entry activeEntry(Lease lease) {
+        var entry = buffer.get().first();
+        if (entry == null || entry != lease.entry || entry.lease != lease) {
             throw new IllegalStateException("hint lease ownership was lost");
         }
+        return entry;
     }
 
     private Settlement settleEntry(Entry entry, ValidationRootHintInbox.Receipt receipt, long now) {

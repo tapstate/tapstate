@@ -228,6 +228,23 @@ class ValidationRootHintOutboxTest {
     }
 
     @Test
+    void fatalSettlementFaultIsLatchedBeforeItEscapesAndReleasesThePacket() {
+        var fatal = new AssertionError("settlement clock");
+        var calls = new AtomicInteger();
+        try (var outbox = new ValidationRootHintOutbox(run(), sender(), LIMITS, () -> {
+            if (calls.incrementAndGet() == 3) throw fatal;
+            return 0L;
+        })) {
+            outbox.tryOffer(move(1, 2));
+            var lease = outbox.poll().orElseThrow();
+            assertThatThrownBy(() -> outbox.settle(lease, null)).isSameAs(fatal);
+            assertThat(outbox.failure().orElseThrow()).isSameAs(fatal);
+            assertThat(outbox.snapshot().packets()).isZero();
+            assertThat(outbox.drained().toCompletableFuture()).isCompleted();
+        }
+    }
+
+    @Test
     void fatalErrorsRemainUnwrappedAndLatchedForController() {
         var fatal = new AssertionError("clock invariant");
         try (var outbox = new ValidationRootHintOutbox(run(), sender(), LIMITS, () -> { throw fatal; })) {
