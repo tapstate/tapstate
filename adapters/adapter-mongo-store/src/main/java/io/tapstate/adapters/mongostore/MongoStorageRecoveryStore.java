@@ -7,6 +7,7 @@ import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CachePreparation;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.spi.store.StorageRecoveryCommands;
 import org.bson.Document;
 
 import java.util.Map;
@@ -88,39 +89,80 @@ final class MongoStorageRecoveryStore {
     }
     private static Stored read(ClientSession session, MongoDatabase database, StorageBinding binding,
             java.util.function.Supplier<Document> setup) {
+        return read(session, database, binding.setup(), binding.mode(), binding.bindingVersion(), setup);
+    }
+
+    static Stored read(ClientSession session, MongoDatabase database, io.tapstate.spi.store.StorageSetupScope owner,
+            StorageBinding.Mode mode, long bindingVersion, Document setup) {
+        return read(session, database, owner, mode, bindingVersion, () -> setup);
+    }
+
+    private static Stored read(ClientSession session, MongoDatabase database, io.tapstate.spi.store.StorageSetupScope owner,
+            StorageBinding.Mode mode, long bindingVersion, java.util.function.Supplier<Document> setup) {
         var rows = SystemCollections.STORAGE_RECOVERY.on(database).find(session).limit(2).into(new java.util.ArrayList<>());
         if (rows.size() != 1) throw unreadable();
         Document row = rows.getFirst();
+        return read(row, owner, mode, bindingVersion, setup);
+    }
+
+    static Stored read(Document row, io.tapstate.spi.store.StorageSetupScope owner, StorageBinding.Mode mode,
+            long bindingVersion, java.util.function.Supplier<Document> setup) {
+        var preparation = readRecord(row, owner.clusterId(), owner.operationId(), mode, bindingVersion,
+                () -> requireRecoverySetup(setup.get(), mode));
+        return new Stored(row, preparation);
+    }
+
+    /** Recognizes a no-work record without granting authority to act on the plan. */
+    static boolean idleCompletionRecord(Document row, CachePreparation expected) {
+        if (AUTH_PREPARING.equals(row.get(PHASE))) return false;
+        if (row.containsKey("pendingRecovery")
+                && (!(row.get("pendingRecovery") instanceof Document plan)
+                        || !StorageRecoveryCommands.Phase.COMPLETE.name().equals(plan.get("phase")))) return false;
+        var scope = expected.authScope();
+        try {
+            // The installation is already admitted. A work-bearing result repeats the full setup and binding audit.
+            return expected.equals(readRecord(row, scope.clusterId(), expected.operationId(), scope.mode(),
+                    scope.bindingVersion(), () -> {}));
+        } catch (TapstateException invalid) {
+            return false;
+        }
+    }
+
+    private static CachePreparation readRecord(Document row, String clusterId, String initialOperation,
+            StorageBinding.Mode mode, long bindingVersion, Runnable requireSetup) {
         if (!SINGLETON_ID.equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion"))
                 || !MongoConfigurationDomain.LAYOUT.equals(row.get("layoutId"))
-                || !binding.setup().clusterId().equals(row.get("clusterId"))
-                || !Long.valueOf(binding.bindingVersion()).equals(row.get("bindingVersion"))
+                || !clusterId.equals(row.get("clusterId"))
+                || !Long.valueOf(bindingVersion).equals(row.get("bindingVersion"))
                 || !(row.get("revision") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE
                 || !(row.get("authGeneration") instanceof Long generation) || generation < 1 || generation == Long.MAX_VALUE
                 || !(row.get("recoveryId") instanceof String operation) || operation.isBlank()
                 || !(row.get("cacheIncarnation") instanceof String incarnation)) throw unreadable();
         try {
             if (!UUID.fromString(incarnation).toString().equals(incarnation)) throw unreadable();
-            requireRecoveryPhase(row, binding, setup, operation, revision, generation);
-            var scope = new CacheAuthScope(binding.setup().clusterId(), binding.bindingVersion(), binding.mode(), incarnation, generation);
+            requireRecoveryPhase(row, initialOperation, operation, revision, generation, requireSetup);
+            var scope = new CacheAuthScope(clusterId, bindingVersion, mode, incarnation, generation);
             requirePendingScope(row, scope);
-            return new Stored(row, new CachePreparation(operation, scope));
+            return new CachePreparation(operation, scope);
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) {
             throw unreadable();
         }
     }
 
-    private static void requireRecoveryPhase(Document row, StorageBinding binding,
-            java.util.function.Supplier<Document> setup, String operation, long revision, long generation) {
+    private static void requireRecoveryPhase(Document row, String initialOperation, String operation,
+            long revision, long generation, Runnable requireSetup) {
         if (INITIAL.equals(row.get(PHASE))) {
-            if (!binding.setup().operationId().equals(operation) || revision != 0 || generation != 1) throw unreadable();
+            if (!initialOperation.equals(operation) || revision != 0 || generation != 1) throw unreadable();
         } else {
             if (!java.util.Set.of(AUTH_PREPARING, AUTH_READY).contains(row.get(PHASE)) || generation < 2 || revision < 1
                     || !UUID.fromString(operation).toString().equals(operation)) throw unreadable();
-            Document stage = setup.get();
-            if (stage == null || !("COMPLETE".equals(stage.get(PHASE))
-                    || binding.mode() == StorageBinding.Mode.CLOUD && "STORAGE_BOUND".equals(stage.get(PHASE)))) throw unreadable();
+            requireSetup.run();
         }
+    }
+
+    private static void requireRecoverySetup(Document stage, StorageBinding.Mode mode) {
+        if (stage == null || !("COMPLETE".equals(stage.get(PHASE))
+                || mode == StorageBinding.Mode.CLOUD && "STORAGE_BOUND".equals(stage.get(PHASE)))) throw unreadable();
     }
 
     private static void requirePendingScope(Document row, CacheAuthScope scope) {

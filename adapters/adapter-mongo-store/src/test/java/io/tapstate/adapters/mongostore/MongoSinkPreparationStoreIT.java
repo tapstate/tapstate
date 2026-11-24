@@ -75,6 +75,18 @@ class MongoSinkPreparationStoreIT {
             }
         });
     }
+
+    @Test void batchReadsOnlyTheRequestedOriginalReceipts() {
+        withFixture(f -> {
+            var orders = f.input("orders");
+            var customers = f.input("customers");
+            var store = f.store();
+            store.prepareTargets(List.of(orders, customers));
+            var ready = store.complete(store.begin(orders), new SinkPreparationStore.Result(true));
+            assertThat(store.loadMany(List.of(customers, orders))).containsExactly(store.load(customers), ready);
+            assertCode(() -> store.loadMany(List.of(orders, f.input("absent"))), IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+        });
+    }
     @Test void issuedUnknownResultNeverBecomesANewClearPermissionAfterRestart() {
         withFixture(f -> {
             var input=f.input("orders");var original=f.store();original.prepareTargets(List.of(input));original.begin(input);

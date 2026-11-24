@@ -1,5 +1,8 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapdata.entity.codec.TapCodecsRegistry;
+import io.tapdata.entity.event.dml.TapInsertRecordEvent;
+import io.tapdata.entity.schema.value.TapStringValue;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.sink.DdlPolicy;
@@ -33,6 +36,47 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PdkSinkPortTest {
 
     @Test
+    void aWriterOpenedWithoutALogicalNodeStillFreezesItsSecretContext(@TempDir Path dir) throws Throwable {
+        Path jar = Synthetic.countingSink(dir);
+        String spec = """
+                {"properties":{"id":"demo","name":"demo"},"configOptions":{"connection":{"properties":{
+                "credential":{"type":"string","x-component":"Password"}}}}}
+                """;
+        var ref = new ConnectorRef(List.of(jar), "synthetic.CountingSink", "2.0.8", null, spec);
+        var port = new PdkSinkPort(id -> ref);
+        var config = new SinkConfig("demo", Map.of("credential", "node-less-secret"), WriteMode.UPSERT, DdlPolicy.FAIL);
+        try (var writer = port.open(config)) {
+            var failure = new TapstateException(ConnectorError.WRITE_FAILED,
+                    Map.of("connector", "demo", "detail", "node-less-secret"), null);
+            var fact = writer.failureFact(failure);
+            assertThat(fact.cause()).isSameAs(failure);
+            assertThat(fact.publicFailure()).isNotNull();
+            assertThat(fact.publicFailure().params()).containsEntry("connector", "demo");
+            assertThat(fact.publicFailure().params().toString()).doesNotContain("node-less-secret");
+        }
+    }
+
+    @Test
+    void aDeferredTargetRequiresScopedPreparationBeforeAnyConnectorIsProvisioned() {
+        var provisions = new AtomicInteger();
+        var port = new PdkSinkPort(id -> {
+            provisions.incrementAndGet();
+            throw new AssertionError("an unsupported target must be refused before provisioning");
+        });
+        var decimal = new io.tapstate.core.common.NumericType(null, true, null, null,
+                new java.math.BigDecimal("-99.99"), new java.math.BigDecimal("99.99"), 4, 2);
+        var target = new TargetTable("orders", List.of(TargetField.deferredDecimal("amount", decimal)));
+        var config = new SinkConfig("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, target);
+        var targets = Map.of("orders", target);
+
+        assertThatThrownBy(() -> port.open(config, targets)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ConnectorError.WRITE_FAILED));
+        assertThatThrownBy(() -> port.openPrepared(config, targets)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> port.prepare(config, targets)).isInstanceOf(TapstateException.class);
+        assertThat(provisions).hasValue(0);
+    }
+
+    @Test
     void targetPreparationReportsItsActualInitializationFailure(@TempDir Path dir) throws Exception {
         var jar=Synthetic.lifecycleSinkThatFailsToStart(dir,dir.resolve("lifecycle.txt"));
         var observed=new java.util.ArrayList<Throwable>();
@@ -64,6 +108,39 @@ class PdkSinkPortTest {
 
         assertThat(writtenTable).hasValue("k2");
         assertThat(recordTables).hasValue(List.of("k2", "k2", "k2"));
+    }
+
+    @Test
+    void writesPreferV2WithTheTargetFieldThenV1ThenTheDefault(@TempDir Path dir) throws Throwable {
+        Path jar = Synthetic.countingSink(dir);
+        var connector = PdkConnector.open("demo", provisioner(jar, "synthetic.CountingSink").resolve("demo"), Map.of());
+        var target = new TargetTable("renamed", List.of(new TargetField("reading", "varchar(30)", false)));
+        var loader = connector.underLoader(() -> Thread.currentThread().getContextClassLoader());
+        var codecs = connector.codecs();
+        codecs.registerFromTapValue(TapStringValue.class, value -> "v1");
+        codecs.registerFromTapValueV2(TapStringValue.class, (value, field) -> {
+            assertThat(Thread.currentThread().getContextClassLoader()).isSameAs(loader);
+            assertThat(field).isNotNull();
+            assertThat(field.getName()).isEqualTo("reading");
+            assertThat(field.getDataType()).isEqualTo("varchar(30)");
+            return "v2";
+        });
+        var written = new java.util.ArrayList<Object>();
+        var row = TapEventCodec.decodeChange(TapInsertRecordEvent.create().table("input")
+                .after(Map.of("reading", new TapStringValue("portable"))), new TapCodecsRegistry(), Map.of());
+        try (SinkWriter writer = new PdkSinkWriter(connector, (context, events, table, result) -> {
+            written.add(((TapInsertRecordEvent) events.getFirst()).getAfter().get("reading"));
+            result.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>(1L, 0L, 0L));
+        }, configWithTarget(target), Map.of("input", target), null)) {
+            assertThat(await(writer, List.of(row)).written()).isEqualTo(1);
+            codecs.registerFromTapValueV2(TapStringValue.class, (value, field) -> null);
+            assertThat(await(writer, List.of(row)).written()).isEqualTo(1);
+            codecs.unregisterFromTapValueV2(TapStringValue.class);
+            assertThat(await(writer, List.of(row)).written()).isEqualTo(1);
+            codecs.unregisterFromTapValue(TapStringValue.class);
+            assertThat(await(writer, List.of(row)).written()).isEqualTo(1);
+        }
+        assertThat(written).containsExactly("v2", "portable", "v1", "portable");
     }
 
     @Test

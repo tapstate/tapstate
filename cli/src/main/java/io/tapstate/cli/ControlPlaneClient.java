@@ -165,6 +165,11 @@ interface ControlPlaneClient extends AutoCloseable {
      */
     ConnectorRegisterOutcome register(URI baseUrl, String credential, byte[] artifact);
 
+    /** A missing endpoint identifies a server that still uses the legacy connector distribution. */
+    default java.util.Optional<ConnectorRegisterOutcome> downloadConnector(URI baseUrl, String credential, String connectorId) {
+        return java.util.Optional.empty();
+    }
+
     /**
      * Lists the connectors the online catalog exposes via {@code GET {baseUrl}/api/connectors},
      * authenticated by the bearer {@code credential}: the bundled snapshot union the rows derived for
@@ -340,6 +345,19 @@ interface ControlPlaneClient extends AutoCloseable {
      */
     default DerivedSchemaOutcome acceptDerivedSchema(URI baseUrl, String credential, String pipelineId) {
         return new DerivedSchemaOutcome.Unreachable();
+    }
+
+    /**
+     * Asks a running aggregate step to compare its groups with the rows it holds, or with
+     * {@code repair} to write them again from those rows, via
+     * {@code POST {baseUrl}/api/pipelines/{pipelineId}/aggregates/{step}:check} or {@code ...:repair},
+     * authenticated by the bearer {@code credential}. {@code group} names one group by the text of each
+     * of its key values, or is null to take a page of the step's groups starting after {@code after}, the
+     * place an earlier answer gave. Never throws.
+     */
+    default AggregateCheckOutcome aggregateCheck(URI baseUrl, String credential, String pipelineId, String step,
+            boolean repair, Map<String, String> group, String after) {
+        return new AggregateCheckOutcome.Unreachable();
     }
 
     /**

@@ -18,22 +18,27 @@ final class ConnectorAttribution {
     private ConnectorAttribution() {
     }
 
-    /**
-     * Claims the slot for {@code pipelineId}, answering what was in it. Pass that answer back to
-     * {@link #restore(String)} when the work is done; call neither for a drive naming no pipeline.
-     */
-    static String claim(String pipelineId) {
-        String previous = MDC.get(PipelineAttribution.MDC_KEY);
-        MDC.put(PipelineAttribution.MDC_KEY, pipelineId);
+    static Scope claim(String pipelineId, long stateGeneration) {
+        var previous = new Scope(MDC.get(PipelineAttribution.MDC_KEY),
+                MDC.get(PipelineAttribution.STATE_GENERATION_MDC_KEY));
+        set(PipelineAttribution.MDC_KEY, pipelineId);
+        set(PipelineAttribution.STATE_GENERATION_MDC_KEY, stateGeneration > 0 ? Long.toString(stateGeneration) : null);
         return previous;
     }
 
-    /** Puts back what {@link #claim(String)} found, leaving the slot empty when it found nothing. */
-    static void restore(String previous) {
-        if (previous == null) {
-            MDC.remove(PipelineAttribution.MDC_KEY);
+    private static void set(String key, String value) {
+        if (value == null) {
+            MDC.remove(key);
         } else {
-            MDC.put(PipelineAttribution.MDC_KEY, previous);
+            MDC.put(key, value);
+        }
+    }
+
+    record Scope(String pipelineId, String stateGeneration) implements AutoCloseable {
+        @Override
+        public void close() {
+            set(PipelineAttribution.MDC_KEY, pipelineId);
+            set(PipelineAttribution.STATE_GENERATION_MDC_KEY, stateGeneration);
         }
     }
 }

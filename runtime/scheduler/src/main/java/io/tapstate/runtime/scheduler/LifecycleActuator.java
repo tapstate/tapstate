@@ -16,6 +16,13 @@ import io.tapstate.spi.store.WorkloadClaimFence;
  * is the only verb that can also be asked to throw away what the pipeline has.
  */
 public interface LifecycleActuator {
+    record SourceRecovery(io.tapstate.core.common.FailureFact failure) {}
+
+    /** Handles a recoverable source exit while the original running intent remains current. */
+    default Optional<SourceRecovery> recoverSource(String pipeline, java.util.function.BooleanSupplier currentIntent) {
+        return Optional.empty();
+    }
+
 
     /** Begins a fresh run of the pipeline: submits its topology as the pipeline's one job. */
     void start(String pipelineId);
@@ -38,12 +45,34 @@ public interface LifecycleActuator {
      */
     void stop(String pipelineId, boolean purgeState);
 
+    /** Clears an original execution whose physical stop has already been confirmed. */
+    default void clearStopped(String pipelineId) { stop(pipelineId, true); }
+
     /**
      * The failure of the pipeline's job if it died on its own, or empty while it runs, has no job, or
      * was ended by a stop. This is how the converge loop observes a job that failed after it started:
      * a stop's own cancellation is not a failure and must not be reported as one.
      */
     Optional<Throwable> failure(String pipelineId);
+
+    /** Reads the cause and safe attachment atomically from the same run owner. */
+    default Optional<io.tapstate.core.common.FailureFact> failureFact(String pipelineId) {
+        return failure(pipelineId).map(io.tapstate.core.common.FailureFact::new);
+    }
+
+    /** Reads a synchronous refusal before driving FAILED can retire its original owner. */
+    default io.tapstate.core.common.FailureFact actuationFailureFact(String pipelineId, Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
+    }
+
+    /** A terminal Jet execution that was rejected by its original lease fence. */
+    record LeaseLoss(long executionGeneration, Throwable cause) {}
+
+    default Optional<Throwable> terminalLeaseFailure(String pipelineId) { return Optional.empty(); }
+
+    default Optional<LeaseLoss> leaseLoss(String pipelineId) { return Optional.empty(); }
+
+    default boolean recoveredJobRunning(String pipelineId) { return isCarryingAJob(pipelineId); }
 
     /**
      * Whether this exact bounded execution ended successfully, including every target write. A quiet

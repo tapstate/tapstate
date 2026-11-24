@@ -26,6 +26,14 @@ final class MongoOperatorInventory {
         if (!UUID.fromString(preparationId).toString().equals(preparationId)) throw new IllegalArgumentException("invalid preparation identity");
         var table = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database);
         if (table.find(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first() != null) throw MongoCachePipelinePreparations.rebuild(scope);
+        insertInitial(session, database, scope, preparationId);
+    }
+
+    /** The caller's current seed transaction has already checked that this exact root is absent. */
+    static void insertInitial(ClientSession session, MongoDatabase database, PipelineIntentScope scope, String preparationId) {
+        if (!session.hasActiveTransaction() || !UUID.fromString(preparationId).toString().equals(preparationId))
+            throw new IllegalArgumentException("invalid preparation identity or transaction");
+        var table = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database);
         table.insertOne(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope)).append("formatVersion", 1)
                 .append("preparationId", preparationId).append("revision", 0L).append("databases", List.of()).append("shapes", List.of()).append("placements", List.of()));
     }

@@ -32,24 +32,30 @@ pipeline. The history and explanation responses, including coded errors, carry
 | Why does the latest observation look this way? | `GET /api/pipelines/{id}/explain` | `explain <id>` or `status <id>` | `pipeline_explain` |
 | How wide does each node of the current run run, and why? | `plan` in `GET /api/pipelines/{id}/status` or `.../explain` | `explain <id>` or `status <id>` | `pipeline_status` or `pipeline_explain` |
 
-The status response keeps `state` tied to runtime observation. Before the first observation, a known
-pipeline returns `state: "NEW"` and omits `observedState`, `observedAt`, and `observedAgeMillis`;
-`desiredState` carries the requested lifecycle target and `displayState` carries the authoring-facing
-lifecycle projection. An applied artifact that has never been started reports `displayState: "NOT_STARTED"`;
-when a start or resume is in progress, it can report `STARTING` or `RESUMING`. When an observation exists,
-`state`, `observedState`, and `observedAt` come from the same observation, and `observedAgeMillis` is
-calculated from that observation time. A saved draft reports `displayState: "DRAFT"` and `hasArtifact: false`.
+The status response uses `state` for runtime lifecycle state, `desiredState` for the requested target,
+and `displayState` for the authoring-facing lifecycle projection. An applied artifact that has never been
+started reports `displayState: "NOT_STARTED"`. An accepted start can report `desiredState: "RUNNING"`
+and `displayState: "STARTING"` while the runtime checkpoint and observation are still absent. In that
+window the response omits `state`, `observedState`, `observedAt`, and `observedAgeMillis`. A saved draft
+reports `state: "NEW"`, `displayState: "DRAFT"`, and `hasArtifact: false`. The observation fields describe
+the last runtime observation, and `observedAgeMillis` is calculated from its timestamp.
 
-A failure to read the desired lifecycle document is returned separately as `intentReadFailure`, with a coded
-`code`, named `params`, and rendered `message`. Any runtime observation already read remains available in
-`state`, `observedState`, and `observedAt`. If neither desired intent nor an observation can be read, the
-response omits `displayState`; clients should keep this read failure separate from the lifecycle label and
-should not infer a fallback state. A status read for a leftover runtime observation without a current draft or
-artifact reports `hasArtifact: false` and omits `displayState`.
+A current engine job can report `state: "RUNNING"` and `displayState: "RUNNING"` before monitoring
+publishes its first observation. This read verifies the current execution identity; a requested start
+or a checkpoint written before job submission is not enough. `observedState`, `observedAt`, and
+`observedAgeMillis` remain absent in that window. Metrics freshness does not hold back the lifecycle
+label. If the current execution cannot be verified yet, the known transition remains visible instead
+of claiming that the job is running.
+
+When runtime state is available but desired intent cannot be read, the response preserves the runtime
+state and includes an `intentReadFailure` object with `code`, `params`, and `message`. If an applied
+Pipeline has no usable runtime state or known transition, the endpoint returns HTTP 500 with
+`TS0480004` and `params.field: "checkpoint"`. A status read for a leftover runtime
+observation without a current draft or artifact reports `hasArtifact: false` and omits `displayState`.
 
 The status watch sends observed state changes only. It stays open without frames while a known pipeline or
-saved draft has no observation, and closes an id that is not known with `lifecycle.unknown-pipeline`. Reads
-that need runtime data, such as metrics, snapshot, and explain, continue to return `monitor.no-observation`
+saved draft has no observation, and closes an id that is not known with `TS0280005`. Reads
+that need runtime data, such as metrics, snapshot, and explain, continue to return `TS0400001`
 until the first observation is published.
 
 The snapshot read shows progress for the pipeline's initial load. A replacement run keeps a table's
@@ -66,7 +72,7 @@ changes wait for it until then; each table crosses on its own, so one table can 
 still landing.
 
 `pipeline.explain` requires a current observation. A newly started pipeline may return
-`monitor.no-observation` until its first observation is published. History is independent of the
+`TS0400001` until its first observation is published. History is independent of the
 latest observation and can still return retained samples for a stopped pipeline.
 
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
@@ -85,9 +91,40 @@ within an operation; later visits count again. The flat view spells these instru
 deltas. Older observations without both instruments have no measured cold share. Existing callback
 timings and counters keep their units; callbacks are not physical database command counts.
 
-The cold-layer alert still requires at least 100 logical accesses and a cold share of at least 50%.
-Small samples accumulate, missing key measurements do not establish recovery, and notifications describe
-pressure and recovery transitions.
+The cold-layer alert requires a cold share of at least 50% over at least 100 accesses. It applies that
+floor in keys when split read/write instrumentation is available and in logical accesses for older
+reporters with aggregate key counters. Small samples accumulate and missing measurements do not establish
+recovery. An active alert clears after two measured windows below 40%.
+
+## Nest state metrics
+
+Read the `facts` array of `GET /api/pipelines/{id}/metrics`. Use `tapstate.nest.namespace` to
+join a measurement to `tapstate.pipeline.nest.namespace.info`, which gives its step, path and map.
+
+| Metric | Type | What it measures |
+|---|---|---|
+| `tapstate.pipeline.nest.roots.rendered` | Counter | Whole root documents handed to the downstream outbox |
+| `tapstate.pipeline.state.commit.groups` | Counter | Successful state-store write calls |
+| `tapstate.pipeline.state.commit.keys` | Histogram | Keys per successful write call |
+| `tapstate.pipeline.state.commit.round_trips` | Histogram | Synchronous backend commands per successful write call |
+| `tapstate.pipeline.state.commit.duration` | Histogram | Seconds from store call to acknowledgement |
+| `tapstate.pipeline.state.evictions` | Counter | Local state-map evictions |
+| `tapstate.pipeline.state.document.bytes` | Histogram | Bytes per written key; at a root namespace, the weight of each document as stored |
+| `tapstate.pipeline.state.document.bytes.max` | Gauge | The most bytes one key's state has taken |
+| `tapstate.pipeline.state.commit.bytes` | Histogram | Bytes per successful write call |
+| `tapstate.pipeline.nest.rollup.fold.duration` | Histogram | Seconds to fold one document's rollup fields at a level that declares them |
+
+The root counter measures output from the operator. Target acknowledgement and table loading are
+shown by the existing pipeline metrics and snapshot interfaces. Compare cumulative samples only
+within the same execution and counting lifetime. An acknowledged store call may contain multiple
+database transactions. Command counts cover the synchronous Mongo adapter; commands on other
+threads are outside the measurement.
+
+Every change to a document rewrites its whole stored state, so `state.document.bytes` at a root namespace is
+what one change costs. A document holding about a megabyte or more is past what rollup fields keep up with
+(see [rollup fields](../nest/rollup-fields.md)); `state.document.bytes.max` shows how close the heaviest has
+come to the 16 MB a stored document may hold. `nest.rollup.fold.duration` separates the time spent folding
+rollup fields from the time spent writing state.
 
 ## Current-run initial-load display
 
@@ -229,15 +266,15 @@ The server enforces independent bounds:
 - up to 25,000 scanned raw documents in one request;
 - two output-rate series plus at most 20 selected lag series.
 
-Crossing a runtime bound returns `monitor.query-budget-exceeded`; narrow the time range or select fewer
+Crossing a runtime bound returns `TS0400004`; narrow the time range or select fewer
 tables. Lowering the output limit creates more response pages but does not raise the raw scan budget.
 
 `nextCursor` is always present and is `null` on the last page. When it is non-null, repeat the pipeline
 id, `from`, `to`, `resolution`, `limit`, and every table selector unchanged, and add that cursor. A
 token is opaque, query-bound, and valid for 10 minutes. It
 does not hold a Mongo cursor, transaction, or other server-side session. Changing the query, modifying the
-token, or using a token from another pipeline returns `monitor.invalid-cursor`; an expired token returns
-`monitor.cursor-expired` with HTTP 410. Start a new first-page query in either case.
+token, or using a token from another pipeline returns `TS0400002`; an expired token returns
+`TS0400003` with HTTP 410. Start a new first-page query in either case.
 
 History declares `consistency: "EVENTUAL"`. Keyset pagination does not repeat or skip records visible in
 the ordered walk at each page boundary, but the complete walk is not a database snapshot. A late sample
@@ -364,7 +401,7 @@ No explanation rule reads it; it answers beside the diagnosis.
 | `nodes[].requested`, `nodes[].requestedOrigin` | The target total the node was given, and whether its author wrote it (`explicit`) or it is the default for the node's kind (`node-default`) |
 | `nodes[].scope` | `total-one`: one processor for the whole cluster. `native`: the same number of processors on every member |
 | `nodes[].memberCount`, `nodes[].computedLocal`, `nodes[].effective` | The member count and per-member count the width was worked out for, and the processors that makes in total. `computedLocal` is absent for `total-one` |
-| `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `rounded-up`, `rounded-down`, or `budget:<name>` |
+| `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `state-has-one-writer`, `rounded-up`, `rounded-down`, or `budget:<name>` |
 | `nodes[].batch` | `maxRecords` and `maxWaitMillis`: the batch the node takes its input in |
 | `nodes[].change` | How the node's width moved from the run before: `previousEffective`, and `causes` naming each input that moved it apart - `members-changed`, `target-changed`, `capability-changed`. Absent where the width did not move |
 | `nodes[].resources` | Sinks only: `writers`; `connectorMode` (`isolated`: a connector per writer, `shared`: one per member, used only for an artifact certified to be shared) and `connectorInstances`; `bufferedRecords`, two batches per writer; and `edgeQueueRecords`, a full queue from every processor sending into the sink to every processor it takes its input on. These are upper bounds worked out before anything opens. A connector's own connection pool is sized inside the connector and is not counted; see [Connections behind a connector instance](#connections-behind-a-connector-instance) |
@@ -398,17 +435,19 @@ given as the most any run saw: how many an instance holds at a given moment vari
 
 ## Coded errors and operator response
 
-Every coded REST error is `{code, params, message}` and carries `Cache-Control: no-store`.
+Every coded REST error contains `{code, params, message}` and carries `Cache-Control: no-store`.
+A localized `solution` is included when available; optional `diagnostic` can include technical
+details, nested causes, and a separately retained original message.
 
 | HTTP | Code | Response |
 |---|---|---|
-| 400 | `control.malformed-request` | Correct timestamps, range, resolution, limit, or selectors. |
-| 400 | `monitor.invalid-cursor` | Repeat the exact query or start a new first page. |
-| 400 | `monitor.query-budget-exceeded` | Narrow the range or select fewer table series. |
-| 401/403 | `control.unauthenticated` / `control.forbidden` | Supply a valid read-scoped credential. |
-| 404 | `lifecycle.unknown-pipeline` | Check the id and apply the pipeline first. |
-| 404 | `monitor.no-observation` | The pipeline exists; wait for its first observation before retrying reads that require runtime data. |
-| 410 | `monitor.cursor-expired` | Start a new history query; do not resume the old walk. |
+| 400 | `TS0210001` (legacy releases use `TS0210001`) | Correct timestamps, range, resolution, limit, or selectors. |
+| 400 | `TS0400002` | Repeat the exact query or start a new first page. |
+| 400 | `TS0400004` | Narrow the range or select fewer table series. |
+| 401/403 | `TS0210003` / `TS0210004` | Supply a valid read-scoped credential. |
+| 404 | `TS0280005` | Check the id and apply the pipeline first. |
+| 404 | `TS0400001` | The pipeline exists; wait for its first observation before retrying reads that require runtime data. |
+| 410 | `TS0400003` | Start a new history query; do not resume the old walk. |
 
 A 200 `NO_RETAINED_SAMPLES` history response is different from every error above. So is an absent
 metric in an otherwise valid page. Keep those states distinct in dashboards and automation.
@@ -417,3 +456,55 @@ For live displays, poll current reads and `pipeline.explain` as independent obse
 history by fetching a new first page instead of caching or extending a completed cursor walk. Respect
 `no-store`, keep gaps as gaps, and leave an absent value unknown. These rules prevent a stopped
 publisher, reset counter, expired sample, and measured zero from collapsing into the same graph.
+
+## Periodic observation pressure
+
+Regular observations of running Pipelines collect and write in bounded background
+workers. There are four workers, up to 64 queued Pipeline jobs, and at most one
+running request plus one latest pending request per Pipeline. Repeated pending
+requests coalesce; capacity exhaustion rejects work instead of running it on the
+convergence caller. These are observation requests, not data records.
+
+At normal log levels, `Periodic observation backpressure` reports entry into
+coalescing or rejection, and `Periodic observation backpressure cleared` reports
+that the backlog drained. A publication failure is logged once while it remains
+unavailable; the next successful publication logs recovery. The last stored
+`observedAt` continues to age while no new observation can be published. A successful
+HTTP read does not make those old facts fresh.
+
+Lifecycle convergence uses a separate bounded queue with four workers and 64
+queued Pipeline jobs. Each Pipeline keeps at most one running pass and one latest
+pending pass. A slow start or stop therefore leaves other workers able to converge
+and schedule observations for other Pipelines. Saturated admission rotates across
+Pipelines on later ticks; rejected work is retried rather than executed by the
+scheduler. Normal logs report `Lifecycle convergence backpressure` and its recovery.
+
+Each pass still uses the original execution identity and fences. The final
+observation, completion transition and cleanup retain their order within the same
+Pipeline. Inspect actual state, desired intent and monitoring freshness separately;
+queuing a lifecycle pass does not establish that its requested state was reached.
+
+## Stored facts and wide Pipelines
+
+Stored observation facts use the same per-instrument cardinality rules as metric
+export. For table-scoped movement instruments the budget retains 1,000 named tables
+per Pipeline; excess detail is combined into points marked
+`otel.metric.overflow=true`. Counters and histogram counts, sums, and buckets add;
+lag retains its worst value. Overflow is reduced detail, not missing work.
+
+Only the stored `facts` projection is folded. The flat `metrics`, snapshot,
+positions, initial-load information, state, failure and observation time keep
+their original values. Those other fields can still grow, so the facts budget is
+not a fixed upper bound on the complete BSON document. Fresh consumers continue
+to use the same original measured frame; retained terminal facts read back from
+storage already contain its folded projection.
+
+## Pipeline log lifetimes
+
+Pipeline log tails remain bounded, node-local, and in memory. Deleting and
+recreating a Pipeline with the same ID starts a different lifetime: logs captured
+by its predecessor, including delayed connector callbacks, are excluded from the
+successor's tail. Pause and resume retain the current lifetime, and rebuilding
+its physical state does not by itself discard its earlier valid log lines.
+Older generations cannot crowd newer log lines out of the retained buffer.
+A process restart still loses that node's in-memory log tail.

@@ -49,6 +49,24 @@ class StorageEntryStatusTest {
         assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.UNAVAILABLE);
         verifyNoInteractions(states);
     }
+    @Test void existingAdministratorCanLogInWhileBusinessIsStarting() {
+        var reader = reader();
+        var administrators = mock(FirstAdminStore.class);
+        when(configuration.firstAdmin()).thenReturn(administrators);
+        when(administrators.load()).thenReturn(Optional.of(new FirstAdminStore.Status(scope, 1,
+                FirstAdminStore.Phase.COMPLETE, "admin")));
+        when(states.load()).thenReturn(new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.COMPLETE, 1));
+
+        when(root.phase()).thenReturn(StorageRoot.Phase.AUTH_READY);
+        assertThat(reader.read()).isEqualTo(new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.LOGIN, false));
+
+        when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY);
+        assertThat(reader.read()).isEqualTo(new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.LOGIN, false));
+
+        when(runtime.businessStarted()).thenReturn(true);
+        assertThat(reader.read()).isEqualTo(new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.LOGIN, true));
+        verify(runtime, never()).loadBound();
+    }
     @Test void firstAdministratorEntryWaitsForTheActualBusinessAdmissionGate() {
         var reader = reader();
         var administrators = mock(FirstAdminStore.class);

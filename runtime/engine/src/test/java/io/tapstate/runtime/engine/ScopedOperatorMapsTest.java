@@ -51,7 +51,7 @@ class ScopedOperatorMapsTest {
     }
 
     @Test void everyTypedMapReloadsColdStateWithoutReusingAnotherExecutionOrAddingConfigurations() {
-        var first = Arrays.stream(OperatorPlacement.Resource.values()).map(kind -> binding(placement(SCOPE,kind),1)).toList();
+        var first = Arrays.stream(OperatorPlacement.Resource.values()).filter(OperatorPlacement.Resource::keptInAMap).map(kind -> binding(placement(SCOPE,kind),1)).toList();
         var next = first.stream().map(original -> binding(original.placement(),2)).toList();
         var current = new AtomicReference<Object>("attempt-1"); var scope = new AtomicReference<>(SCOPE); var cold = new Cold();
         HazelcastInstance member = Hazelcast.newHazelcastInstance(config(first));
@@ -87,7 +87,7 @@ class ScopedOperatorMapsTest {
             registry.install(List.of(original)); var oldMap = member.getMap(original.mapName()); Object key = List.of("key"); oldMap.put(key,"old");
             scope.set(nextScope); registry.install(List.of(next)); var newMap = member.getMap(next.mapName());
             assertThat(newMap.get(key)).isNull(); newMap.put(key,"new");
-            assertThatThrownBy(() -> oldMap.put(key,"late")).hasStackTraceContaining("io.workload-claim-fenced");
+            assertThatThrownBy(() -> oldMap.put(key,"late")).hasStackTraceContaining("TS0480009");
             assertThat(newMap.get(key)).isEqualTo("new"); newMap.evict(key); assertThat(newMap.get(key)).isEqualTo("new");
             oldMap.destroy(); assertThat(registry.release(original)).isTrue();
             assertThat(newMap.get(key)).isEqualTo("new");
@@ -146,13 +146,17 @@ class ScopedOperatorMapsTest {
         positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of(),OperatorMapCoordinates.NestMap.PARKING,null));
         positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of("ref"),OperatorMapCoordinates.NestMap.LOOKUP,"dimension"));
         positions.add(OperatorMapCoordinates.nest(SCOPE,"cache","nested",List.of("ref"),OperatorMapCoordinates.NestMap.REFERENCES,"dimension"));
-        for (var kind : OperatorPlacement.Resource.values()) if (kind != OperatorPlacement.Resource.NEST_STATE)
+        for (var kind : OperatorPlacement.Resource.values()) if (kind != OperatorPlacement.Resource.NEST_STATE && kind.keptInAMap())
             positions.add(OperatorMapCoordinates.join(SCOPE,"cache","joined",kind,"dimension"));
         var bindings = positions.stream().map(place -> binding(place,1)).toList(); var manifest = new OperatorRunManifest(SCOPE.pipelineId(),"attempt-1",bindings);
         var cold = new Cold(); var current = new AtomicReference<Object>("attempt-1"); var scope = new AtomicReference<>(SCOPE);
         var member = Hazelcast.newHazelcastInstance(config(bindings));
         try (var registry = OperatorMapBindings.bindTo(member,(binding,active) -> cold.guarded(binding,current,scope,active))) {
             registry.install(bindings);
+            for (var binding : bindings) {
+                assertThat(registry.isRootNestState(binding.mapName()))
+                        .isEqualTo(binding.placement().equals(positions.getFirst()));
+            }
             var traveling = io.tapstate.runtime.engine.nest.NestBinding.onMap(manifest).forStep(SCOPE.pipelineId(),"nested");
             var bytes = new java.io.ByteArrayOutputStream();
             try (var out = new java.io.ObjectOutputStream(bytes)) { out.writeObject(traveling); }

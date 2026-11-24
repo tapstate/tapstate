@@ -12,9 +12,14 @@ import java.util.Optional;
  * failure is present only for {@link ConvergeStatus#FAILED}.
  */
 public record ConvergeResult(
-        ConvergeStatus status, Optional<CheckpointDoc> checkpoint, Optional<Throwable> failure) {
+        ConvergeStatus status, Optional<CheckpointDoc> checkpoint, Optional<Throwable> failure,
+        java.util.Map<String, Object> diagnostic, io.tapstate.core.common.FailureFact.PublicFailure publicFailure) {
+    public ConvergeResult(ConvergeStatus status, Optional<CheckpointDoc> checkpoint, Optional<Throwable> failure) {
+        this(status, checkpoint, failure, java.util.Map.of(), null);
+    }
 
     public ConvergeResult {
+        diagnostic = failure.isEmpty() ? java.util.Map.of() : io.tapstate.core.common.RuntimeDiagnosticProjection.fit(diagnostic);
         Objects.requireNonNull(status, "status");
         Objects.requireNonNull(checkpoint, "checkpoint");
         Objects.requireNonNull(failure, "failure");
@@ -28,8 +33,16 @@ public record ConvergeResult(
         return new ConvergeResult(ConvergeStatus.NOTHING_TO_DO, Optional.empty(), Optional.empty());
     }
 
+    static ConvergeResult recovering(CheckpointDoc checkpoint) {
+        return new ConvergeResult(ConvergeStatus.RECOVERING, Optional.of(checkpoint), Optional.empty());
+    }
+
     static ConvergeResult superseded() {
         return new ConvergeResult(ConvergeStatus.SUPERSEDED, Optional.empty(), Optional.empty());
+    }
+
+    static ConvergeResult failed(CheckpointDoc checkpoint, io.tapstate.core.common.FailureFact fact) {
+        return new ConvergeResult(ConvergeStatus.FAILED, Optional.of(checkpoint), Optional.of(fact.cause()), fact.diagnostic(), fact.publicFailure());
     }
 
     static ConvergeResult failed(CheckpointDoc checkpoint, Throwable cause) {

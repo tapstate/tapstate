@@ -16,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.LongSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -215,6 +216,11 @@ class RestartResumesTheTailIT {
             update(source, 1, BEFORE_STOP);
             awaitName(mongo, target, 1, BEFORE_STOP, "the change the first run captured");
 
+            var firstLoad = Await.answered("the original full load", TIMEOUT,
+                    () -> control.initialLoad(pipelineId).filter(load -> "STREAMING".equals(load.get("phase"))));
+            String originalRun = (String) firstLoad.get("runKey");
+            assertThat(originalRun).isNotBlank();
+
             // The pair `restart --rerun` composes: the stop clears, so there is nothing to carry on from.
             // The new full load goes into a target holding the first run's rows, so the start asks first;
             // keeping them is the answer, because what this case reads is how much the rerun read.
@@ -223,7 +229,10 @@ class RestartResumesTheTailIT {
 
             // The count itself is the liveness here: nought would mean the run never started, and the
             // whole table is the only reading that says it really read the table again.
-            assertThat(settledRowsRead(control, pipelineId))
+            Await.answered("the completed full load of the replacement execution", TIMEOUT,
+                    () -> control.initialLoad(pipelineId).filter(load -> "STREAMING".equals(load.get("phase"))
+                            && load.get("runKey") instanceof String run && !originalRun.equals(run)));
+            assertThat(control.awaitSnapshotRowsRead(pipelineId, Set.of(TABLE)).get(TABLE))
                     .as("rows the rerun read from %s: it was told to read everything, so it reads every "
                             + "seeded row", TABLE)
                     .isEqualTo(SEEDED_ROWS);

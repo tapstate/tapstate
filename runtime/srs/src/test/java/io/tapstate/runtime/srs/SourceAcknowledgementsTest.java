@@ -96,6 +96,19 @@ class SourceAcknowledgementsTest {
         followed.close(); handOver(); assertThat(tail.told).isEmpty();
     }
 
+    @Test void awaitingTheFirstCheckpointDefersTheReadButStillAcknowledgesTheCurrentEpoch() {
+        var reads = new AtomicInteger();
+        var chains = new NativeChains(() -> {
+            reads.incrementAndGet();
+            return Optional.of(nativeState(3, "first"));
+        });
+        followed = acknowledgements.follow(chains, CHAIN, 3, tail, health, () -> {}, true);
+        assertThat(reads).hasValue(0);
+        assertThat(tail.told).isEmpty();
+        handOver();
+        assertThat(tail.told).containsExactly("first");
+    }
+
     private record NativeChains(java.util.function.Supplier<Optional<io.tapstate.spi.store.SrsChainState>> read) implements io.tapstate.spi.store.SrsChainStore {
         @Override public Optional<io.tapstate.spi.store.SrsChainState> load(String chain) { assertThat(chain).isEqualTo(CHAIN); return read.get(); }
         @Override public io.tapstate.spi.store.SrsChainStore guardedBy(Runnable guard) { throw new AssertionError(); }

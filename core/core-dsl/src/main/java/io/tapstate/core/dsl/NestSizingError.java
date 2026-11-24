@@ -1,6 +1,8 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.NestSizingErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 
 import java.util.Set;
@@ -26,44 +28,30 @@ public enum NestSizingError implements TapstateErrorCode {
      * the level at, {@code estimatedEntries} how many entries its tables would put in it,
      * {@code budget} how many it keeps in memory, and {@code multiple} the ratio that crossed the line.
      */
-    STATE_FAR_EXCEEDS_MEMORY_BUDGET(
-            "nest.state-far-exceeds-memory-budget",
-            Set.of("pipeline", "embedPath", "estimatedEntries", "budget", "multiple")),
+    STATE_FAR_EXCEEDS_MEMORY_BUDGET(NestSizingErrorDefinitions.STATE_FAR_EXCEEDS_MEMORY_BUDGET),
 
     /**
      * A level could be sized from only some of the tables that feed it, because the rest report no row
      * count. {@code counted} of {@code total} is how much of the level the estimate could see; what it
      * did see is a floor rather than an answer.
      */
-    CAPACITY_ESTIMATE_INCOMPLETE(
-            "nest.capacity-estimate-incomplete",
-            Set.of("pipeline", "embedPath", "counted", "total"));
-
-    private final String code;
-    private final Set<String> placeholders;
-
-    NestSizingError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
-
-    @Override
-    public String code() {
-        return code;
-    }
+    CAPACITY_ESTIMATE_INCOMPLETE(NestSizingErrorDefinitions.CAPACITY_ESTIMATE_INCOMPLETE),
 
     /**
-     * Sizing tells the author what a pipeline will cost to run, never that it may not run. Being over
-     * the budget is the design — what is beyond it is kept on the layer behind and read back — so a
-     * refusal here would reject deployments that are working as intended.
+     * A level carrying rollup fields is estimated to make its documents heavier than a rollup keeps up with:
+     * each change rewrites the document's state and refolds the level, so its cost grows with the level's
+     * elements times their width. {@code estimatedElements} is the level's rows over its parent's, an average a
+     * skewed level exceeds for some documents; {@code estimatedBytes} the state those elements take; {@code
+     * boundary} how many elements of this width a document should hold.
      */
-    @Override
-    public Severity severity() {
-        return Severity.WARNING;
-    }
+    ROLLUP_LEVEL_WIDE(NestSizingErrorDefinitions.ROLLUP_LEVEL_WIDE);
 
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+
+    private final ProductErrorDefinition definition;
+
+    NestSizingError(ProductErrorDefinition definition) { this.definition = definition; }
+
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

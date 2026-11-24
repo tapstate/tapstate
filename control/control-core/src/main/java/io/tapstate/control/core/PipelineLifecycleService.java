@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.LifecycleMachine;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.DesiredStore;
 
 import java.util.Map;
@@ -76,6 +77,14 @@ public final class PipelineLifecycleService {
         return apply(principal, pipelineId, LifecycleVerb.START, false, expectedContentHash, detail);
     }
 
+    DesiredState start(String principal, String pipelineId, String expectedContentHash,
+            Map<String, Object> detail, Startable checked, StartPlan plan) {
+        Objects.requireNonNull(expectedContentHash, "expectedContentHash");
+        return apply(principal, pipelineId, LifecycleVerb.START, false, expectedContentHash, detail,
+                checked.intent().scope().isPresent() && expectedContentHash.equals(checked.artifact().contentHash())
+                        ? checked : null, plan);
+    }
+
     /**
      * What every start is checked for before anything else is asked of it: the pipeline is applied, it
      * is runnable, and its state lets it start. Answers with what the start would run and what the
@@ -83,10 +92,19 @@ public final class PipelineLifecycleService {
      */
     public Startable startable(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        var captured = desired.startEntry(pipelineId);
+        if (captured.isPresent()) {
+            var entry = captured.orElseThrow();
+            var artifact = new StoredResource(entry.pipeline(), CanonicalHash.of(entry.pipeline()));
+            requireRunnable(pipelineId, entry.pipeline());
+            LifecycleMachine.transition(currentState(entry.intent().desired(), entry.checkpoint()), LifecycleVerb.START);
+            return new Startable(artifact, entry.pipeline(), entry.intent(), entry.checkpoint());
+        }
         StoredResource latestArtifact = requireRunnable(pipelineId);
-        Optional<DesiredState> prior = desired.read(pipelineId);
-        LifecycleMachine.transition(currentState(prior, actualCheckpoint.apply(pipelineId)), LifecycleVerb.START);
-        return new Startable(latestArtifact, (PipelineResource) latestArtifact.resource(), prior);
+        var intent = desired.readForStart(pipelineId);
+        var checkpoint = actualCheckpoint.apply(pipelineId);
+        LifecycleMachine.transition(currentState(intent.desired(), checkpoint), LifecycleVerb.START);
+        return new Startable(latestArtifact, (PipelineResource) latestArtifact.resource(), intent, checkpoint);
     }
 
     /**
@@ -107,7 +125,12 @@ public final class PipelineLifecycleService {
      * @param pipeline the same definition as a model
      * @param prior    the pipeline's last desired intent, empty for one never started
      */
-    public record Startable(StoredResource artifact, PipelineResource pipeline, Optional<DesiredState> prior) {
+    public record Startable(StoredResource artifact, PipelineResource pipeline, DesiredStore.StartIntent intent,
+            Optional<CheckpointDoc> checkpoint) {
+        public Startable(StoredResource artifact, PipelineResource pipeline, Optional<DesiredState> prior) {
+            this(artifact, pipeline, new DesiredStore.StartIntent(prior, Optional.empty(), 0), Optional.empty());
+        }
+        public Optional<DesiredState> prior() { return intent.desired(); }
     }
 
     /**
@@ -139,12 +162,15 @@ public final class PipelineLifecycleService {
     /** The applied pipeline, refused when it is unknown or is a draft that cannot run yet. */
     private StoredResource requireRunnable(String pipelineId) {
         StoredResource latestArtifact = requireApplied(pipelineId);
-        PipelineResource pipeline = (PipelineResource) latestArtifact.resource();
+        requireRunnable(pipelineId, (PipelineResource) latestArtifact.resource());
+        return latestArtifact;
+    }
+
+    private static void requireRunnable(String pipelineId, PipelineResource pipeline) {
         if (pipeline.sources().isEmpty() || pipeline.view() == null && pipeline.serve() == null) {
             throw new TapstateException(
                     LifecycleError.PIPELINE_NOT_RUNNABLE, Map.of("pipeline", pipelineId), null);
         }
-        return latestArtifact;
     }
 
     private StoredResource requireApplied(String pipelineId) {
@@ -160,10 +186,15 @@ public final class PipelineLifecycleService {
 
     private DesiredState apply(String principal, String pipelineId, LifecycleVerb verb, boolean purgeState,
             String expectedContentHash, Map<String, Object> detail) {
+        return apply(principal, pipelineId, verb, purgeState, expectedContentHash, detail, null, null);
+    }
+
+    private DesiredState apply(String principal, String pipelineId, LifecycleVerb verb, boolean purgeState,
+            String expectedContentHash, Map<String, Object> detail, Startable checked, StartPlan plan) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
 
-        StoredResource latestArtifact = verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME
+        StoredResource latestArtifact = checked != null ? checked.artifact() : verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME
                 ? requireRunnable(pipelineId)
                 : requireApplied(pipelineId);
         String latest = latestArtifact.contentHash();
@@ -171,22 +202,25 @@ public final class PipelineLifecycleService {
             throw new TapstateException(PipelineError.VERSION_CONFLICT, Map.of("id", pipelineId), null);
         }
 
-        Optional<DesiredState> prior = desired.read(pipelineId);
-        Optional<CheckpointDoc> checkpoint = actualCheckpoint.apply(pipelineId);
+        Optional<DesiredState> prior = checked == null ? desired.read(pipelineId) : checked.prior();
+        Optional<CheckpointDoc> checkpoint = checked == null ? actualCheckpoint.apply(pipelineId) : checked.checkpoint();
         PipelineState current = currentState(prior, checkpoint);
         // Clearing retained state is meaningful after a keeping stop. A repeated keeping stop remains
         // illegal, including while a clearing operation is pending, so it cannot withdraw that decision.
-        PipelineState target = verb == LifecycleVerb.STOP && purgeState && current == PipelineState.STOPPED
-                ? PipelineState.STOPPED : LifecycleMachine.transition(current, verb);
+        boolean clearStopped = verb == LifecycleVerb.STOP && purgeState && current == PipelineState.STOPPED;
+        PipelineState target = clearStopped ? PipelineState.STOPPED : LifecycleMachine.transition(current, verb);
 
         // What the latest artifact would be assembled from, alongside what it hashes to. Both are taken off
         // the same canonical structure, so a field that moves one moves the other and the two cannot drift
         // into disagreeing about what changed.
-        String latestAssembly = artifacts.assemblyIdentityOf(pipelineId).orElse(null);
+        boolean adoptsLatest = verb == LifecycleVerb.START || clearStopped;
+        String latestAssembly = adoptsLatest
+                ? io.tapstate.core.model.canonical.AssemblyIdentity.of(latestArtifact.resource())
+                : artifacts.assemblyIdentityOf(pipelineId).orElse(null);
 
-        // The revision the verb runs at: a fresh start adopts the latest; the other verbs carry forward the
-        // revision the pipeline is already at. A run verb (start / resume) must run at the latest applied.
-        String runRevision = verb == LifecycleVerb.START ? latest : prior.map(DesiredState::revision).orElse(latest);
+        // A clearing stop on an already stopped Pipeline prepares the latest published inputs.
+        // Other non-start verbs keep the revision of the run they are acting on.
+        String runRevision = adoptsLatest ? latest : prior.map(DesiredState::revision).orElse(latest);
 
         // A resume over an edit made while the pipeline was paused. The refusal is right whenever carrying
         // on would run the pipeline as it was against a definition that has moved; it is wrong only when
@@ -239,7 +273,7 @@ public final class PipelineLifecycleService {
         // artifact's assembly here would state that the run matches a definition nobody checked it
         // against. The next resume would then find the two equal and rebuild over a change that is not
         // safe to rebuild over. Unknown stays unknown, which costs a refusal that a start clears.
-        String runAssembly = verb == LifecycleVerb.START || reassemble
+        String runAssembly = adoptsLatest || reassemble
                 ? latestAssembly
                 : prior.map(DesiredState::assemblyRevision).orElse(null);
 
@@ -250,11 +284,15 @@ public final class PipelineLifecycleService {
                     // Asked again at the last moment for a start held to a definition: the definition could
                     // have been replaced while the intent was being worked out, and a start that went ahead
                     // over that would run a definition nobody checked.
-                    if (expectedContentHash != null && !artifacts.getResource(pipelineId)
+                    var preparation = checked == null || plan == null
+                            ? Optional.<DesiredStore.StartPreparation>empty() : plan.preparation().get();
+                    if (expectedContentHash != null && (checked == null || !desired.defersStart(next, checked.intent(), preparation))
+                            && !artifacts.getResource(pipelineId)
                             .map(StoredResource::contentHash).filter(expectedContentHash::equals).isPresent()) {
                         throw new TapstateException(PipelineError.VERSION_CONFLICT, Map.of("id", pipelineId), null);
                     }
-                    desired.save(next);
+                    if (checked == null) desired.save(next);
+                    else desired.saveStart(next, checked.intent(), preparation);
                     return next;
                 });
     }

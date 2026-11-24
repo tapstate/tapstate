@@ -13,7 +13,12 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
+import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -43,7 +48,9 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -61,6 +68,191 @@ class ExecutionAuthorizationTest {
     private final InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
     private final ClusterMembershipGate membership = eligibleGate();
     private final AtomicLong nanos = new AtomicLong();
+
+    @Test void aColdLifecycleReaderNeverWaitsForTheClaimStore() throws Exception {
+        submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var reading = claims.read(key).orElseThrow();
+        var scope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var fence = new ExecutionFence(scope, WorkloadClaimFence.from(reading.claim()));
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var store = mock(WorkloadClaimStore.class);
+        when(store.readPipeline(scope)).thenAnswer(call -> {
+            assertThat(Thread.currentThread().getName()).isEqualTo("tapstate-scoped-proof-read");
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return Optional.of(reading);
+        });
+        try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                store, WINDOW, nanos::get, () -> true); var caller = Executors.newSingleThreadExecutor()) {
+            try {
+                var response = caller.submit(() -> guard.observedAuthorization(fence));
+                assertThat(entered.await(1, TimeUnit.SECONDS)).isTrue();
+                assertThat(response.get(250, TimeUnit.MILLISECONDS)).isFalse();
+            } finally { release.countDown(); }
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2))
+                    .until(() -> guard.observedAuthorization(fence));
+            nanos.addAndGet(WINDOW.toNanos() + 1);
+            org.mockito.Mockito.doThrow(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "offline"), null))
+                    .when(store).readPipeline(scope);
+            org.junit.jupiter.api.Assertions.assertTimeout(Duration.ofMillis(250), () ->
+                    assertThat(guard.observedAuthorization(fence)).isFalse());
+        }
+    }
+
+    @Test void repeatedDisplayPollsRespectTheRefreshIntervalAfterAnAbsentClaim() {
+        submittedRun();
+        var reading = claims.read(new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow();
+        var scope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var fence = new ExecutionFence(scope, WorkloadClaimFence.from(reading.claim()));
+        var reads = new AtomicInteger();
+        var store = mock(WorkloadClaimStore.class);
+        when(store.readPipeline(scope)).thenAnswer(call -> { reads.incrementAndGet(); return Optional.empty(); });
+        try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                store, Duration.ofMinutes(1), nanos::get, () -> true)) {
+            assertThat(guard.observedAuthorization(fence)).isFalse();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(() -> reads.get() == 1);
+            for (int i = 0; i < 30; i++) {
+                assertThat(guard.observedAuthorization(fence)).isFalse();
+                java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(5));
+            }
+            assertThat(reads).as("display polling does not drive successful denied proof refreshes").hasValue(1);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"driver-timeout", "outer-timeout", "fenced", "outage"})
+    void scopedProofWaitsForBackgroundRecoveryButKeepsConfirmedFences(String fault) {
+        submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var reading = claims.read(key).orElseThrow();
+        var scope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var fence = new ExecutionFence(scope, WorkloadClaimFence.from(reading.claim()));
+        var store = mock(DeadlineWorkloadClaimStore.class);
+        when(store.withDeadline(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(call -> call.<java.util.function.Supplier<?>>getArgument(1).get());
+        var reads = new AtomicInteger();
+        when(store.readPipeline(scope)).thenAnswer(call -> {
+            assertThat(Thread.currentThread().getName()).isEqualTo("tapstate-scoped-proof-read");
+            int attempt = reads.incrementAndGet();
+            if (fault.equals("fenced")) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            if (!fault.equals("outage") && attempt == 2) return Optional.of(reading);
+            if (fault.equals("outer-timeout")) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,
+                    Map.of(), new java.util.concurrent.TimeoutException());
+            throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "MongoTimeoutException"), null);
+        });
+        var window = Duration.ofMillis(fault.equals("outage") ? 150 : 800);
+        try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                store, window, nanos::get, () -> true)) {
+            switch (fault) {
+                case "fenced" -> {
+                    assertThat(guard.authorized(fence)).isFalse();
+                    assertThat(reads).hasValue(1);
+                }
+                case "outage" -> {
+                    assertThatThrownBy(() -> guard.require(fence)).isInstanceOfSatisfying(TapstateException.class,
+                            e -> assertThat(e.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                    assertThat(reads.get()).isPositive().isLessThanOrEqualTo(16);
+                }
+                default -> {
+                    assertThat(guard.require(fence)).isEqualTo(WorkloadClaimFence.from(reading.claim()));
+                    assertThat(guard.requireLocal(fence)).isEqualTo(WorkloadClaimFence.from(reading.claim()));
+                    assertThat(reads).hasValue(2);
+                }
+            }
+        }
+    }
+
+    @Test void aSlowScopedProofIsSharedWithoutBlockingAnotherPipeline() throws Exception {
+        submittedRun();
+        var orders = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var inventory = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "inventory");
+        var acquired = claims.acquire(inventory, NODE_A, 7, TTL).claim();
+        claims.advanceExecution(acquired, 7, Set.of("node-a")).orElseThrow();
+        var orderReading = claims.read(orders).orElseThrow();
+        var inventoryReading = claims.read(inventory).orElseThrow();
+        var orderScope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var inventoryScope = new PipelineIntentScope("cluster-a", 1, "cache", "inventory", 1);
+        var orderFence = new ExecutionFence(orderScope, WorkloadClaimFence.from(orderReading.claim()));
+        var inventoryFence = new ExecutionFence(inventoryScope, WorkloadClaimFence.from(inventoryReading.claim()));
+        var store = mock(WorkloadClaimStore.class);
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var reads = new AtomicInteger();
+        when(store.readPipeline(orderScope)).thenAnswer(call -> {
+            reads.incrementAndGet();
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return Optional.of(orderReading);
+        });
+        when(store.readPipeline(inventoryScope)).thenReturn(Optional.of(inventoryReading));
+
+        try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                store, WINDOW, nanos::get, () -> true);
+             var workers = Executors.newFixedThreadPool(3)) {
+            try {
+                var first = workers.submit(() -> guard.require(orderFence));
+                assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                var second = workers.submit(() -> guard.require(orderFence));
+                var independent = workers.submit(() -> guard.require(inventoryFence));
+                assertThat(independent.get(2, TimeUnit.SECONDS)).isEqualTo(WorkloadClaimFence.from(inventoryReading.claim()));
+                assertThat(first.isDone()).isFalse();
+                assertThat(second.isDone()).isFalse();
+                release.countDown();
+                assertThat(first.get(2, TimeUnit.SECONDS)).isEqualTo(WorkloadClaimFence.from(orderReading.claim()));
+                assertThat(second.get(2, TimeUnit.SECONDS)).isEqualTo(WorkloadClaimFence.from(orderReading.claim()));
+                assertThat(reads).hasValue(1);
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test void aTimedOutCallerDoesNotOverlapTheStillRunningStoreRead() throws Exception {
+        submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var reading = claims.read(key).orElseThrow();
+        var scope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var fence = new ExecutionFence(scope, WorkloadClaimFence.from(reading.claim()));
+        var store = mock(DeadlineWorkloadClaimStore.class);
+        var reads = new AtomicInteger();
+        var calls = new AtomicInteger();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var timedOut = new CountDownLatch(1);
+
+        try (var workers = Executors.newFixedThreadPool(2);
+             var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                     store, Duration.ofMillis(600), nanos::get, () -> true)) {
+            try {
+                when(store.readPipeline(scope)).thenAnswer(call -> {
+                    if (reads.incrementAndGet() == 1) {
+                        entered.countDown();
+                        assertThat(release.await(3, TimeUnit.SECONDS)).isTrue();
+                    }
+                    return Optional.of(reading);
+                });
+                when(store.withDeadline(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any()))
+                        .thenAnswer(call -> {
+                            var operation = call.<java.util.function.Supplier<?>>getArgument(1);
+                            if (calls.incrementAndGet() != 1) return operation.get();
+                            workers.submit(operation::get);
+                            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+                            timedOut.countDown();
+                            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(),
+                                    new java.util.concurrent.TimeoutException());
+                        });
+
+                var waiter = workers.submit(() -> guard.require(fence));
+                assertThat(timedOut.await(2, TimeUnit.SECONDS)).isTrue();
+                Thread.sleep(450);
+                assertThat(reads).hasValue(1);
+                assertThat(calls).hasValue(1);
+                release.countDown();
+                assertThat(waiter.get(2, TimeUnit.SECONDS)).isEqualTo(WorkloadClaimFence.from(reading.claim()));
+                assertThat(reads).hasValue(2);
+            } finally { release.countDown(); }
+        }
+    }
 
     @Test void aLocalCompletionCheckNeverRefreshesAnAbsentOrExpiredProof() {
         var fence=submittedRun();var observed=org.mockito.Mockito.spy(claims);
@@ -171,6 +363,26 @@ class ExecutionAuthorizationTest {
                 .isSameAs(failure);
         WorkloadClaim marked = claims.read(new WorkloadClaimKey(
                 "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
+        assertThat(marked.failureClaimGeneration()).isEqualTo(fence.claimGeneration());
+        assertThat(marked.failureAfterMemberLoss()).isFalse();
+    }
+
+    @Test
+    void aDeferredSnapshotPreparationFailureMarksItsCurrentRun() {
+        ExecutionFence fence = submittedRun();
+        var sink = mock(SinkWriter.class);
+        var failure = new TapstateException(ConnectorError.WRITE_FAILED,
+                Map.of("connector", "mongodb", "detail", "empty snapshot target preparation failed"), null);
+        doThrow(failure).when(sink).snapshotDelivered("orders");
+
+        try (var authorization = guard(claims)) {
+            var writer = FencedSinkWriterFactory.guarded(sink, fence, authorization);
+            assertThatThrownBy(() -> writer.snapshotDelivered("orders")).isSameAs(failure);
+        }
+
+        verify(sink).snapshotDelivered("orders");
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var marked = claims.read(key).orElseThrow().claim();
         assertThat(marked.failureClaimGeneration()).isEqualTo(fence.claimGeneration());
         assertThat(marked.failureAfterMemberLoss()).isFalse();
     }
@@ -720,6 +932,45 @@ class ExecutionAuthorizationTest {
     }
 
     /** A run of `orders` submitted by node A, fenced by the generations the store handed it. */
+    @Test
+    void aStoreLeaseHeldUnderAReadingIsDroppedWhenTheReadingLosesTheClaimAndKeptWhileItHolds() {
+        ExecutionFence fence = submittedRun();
+        AtomicInteger dropped = new AtomicInteger();
+        io.tapstate.spi.store.LeasedStateStore store = dropped::incrementAndGet;
+        try (ExecutionAuthorization guard = guard(claims)) {
+            guard.require(fence);
+            guard.holdLease(fence, store);
+
+            // A refresh that finds the same live claim is no reason to prove the store's lease again.
+            nanos.addAndGet(WINDOW.toNanos());
+            guard.require(fence);
+            assertThat(dropped).hasValue(0);
+
+            // The claim runs out and another member takes it over; the next reading drops the lease.
+            claims.elapse(TTL.plusSeconds(1));
+            assertThat(ownership(NODE_B).permit("orders").granted()).isTrue();
+            nanos.addAndGet(WINDOW.toNanos());
+            assertThatThrownBy(() -> guard.require(fence)).isInstanceOf(TapstateException.class);
+            assertThat(dropped.get()).isPositive();
+        }
+        int beforeClose = dropped.get();
+        assertThat(beforeClose).isPositive();
+        java.lang.ref.Reference.reachabilityFence(store);
+    }
+
+    @Test
+    void closingTheGuardDropsEveryLeaseItHolds() {
+        ExecutionFence fence = submittedRun();
+        AtomicInteger dropped = new AtomicInteger();
+        io.tapstate.spi.store.LeasedStateStore store = dropped::incrementAndGet;
+        ExecutionAuthorization guard = guard(claims);
+        guard.require(fence);
+        guard.holdLease(fence, store);
+        guard.close();
+        assertThat(dropped).hasValue(1);
+        java.lang.ref.Reference.reachabilityFence(store);
+    }
+
     private ExecutionFence submittedRun() {
         PipelineActuationOwnership nodeA = ownership(NODE_A);
         assertThat(nodeA.permit("orders").granted()).isTrue();

@@ -11,11 +11,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -199,13 +195,9 @@ class APositionSaysWhichPositionItIsIT {
     }
 
     private static String fingerprintOf(String position) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(position.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest, 0, 8);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("every Java platform provides SHA-256", e);
-        }
+        assertThat(position).as("the metrics wire carries an opaque fingerprint")
+                .matches("opaque-v1:[0-9a-f]{64}");
+        return position.substring("opaque-v1:".length(), "opaque-v1:".length() + 16);
     }
 
     /** Everything up to and including the start. */

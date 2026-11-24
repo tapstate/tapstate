@@ -17,16 +17,19 @@ public final class MapSpec implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final List<MapRule> rules;
+    // The column marking deleted rows, or null where deletes stay deletes.
+    private final String softDelete;
 
-    private MapSpec(List<MapRule> rules) {
+    private MapSpec(List<MapRule> rules, String softDelete) {
         this.rules = rules;
+        this.softDelete = softDelete;
     }
 
     /** Translates a parsed map projection into its serializable rule list, preserving declared order. */
     public static MapSpec from(TransformBody.MapProjection projection) {
         List<MapRule> rules = new ArrayList<>();
         projection.fields().forEach((output, rule) -> rules.add(toRule(output, rule)));
-        return new MapSpec(List.copyOf(rules));
+        return new MapSpec(List.copyOf(rules), projection.softDelete());
     }
 
     private static MapRule toRule(String output, FieldRule rule) {
@@ -41,5 +44,10 @@ public final class MapSpec implements Serializable {
     /** The rules in declared order. */
     List<MapRule> rules() {
         return rules;
+    }
+
+    /** The column marking deleted rows, or null where a delete leaves the step as a delete. */
+    String softDelete() {
+        return softDelete;
     }
 }

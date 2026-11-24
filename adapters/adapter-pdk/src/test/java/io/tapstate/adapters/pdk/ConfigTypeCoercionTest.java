@@ -110,7 +110,7 @@ class ConfigTypeCoercionTest {
                 () -> open(dir, "port", "not-a-number"), TapstateException.class);
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("connector.config-type-mismatch");
+        assertThat(thrown.code().code()).isEqualTo("TS0060018");
         assertThat(thrown.args())
                 .containsEntry("connector", "demo")
                 .containsEntry("field", "port")
@@ -124,7 +124,7 @@ class ConfigTypeCoercionTest {
                 () -> open(dir, "port", "1e309"), TapstateException.class);
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("connector.config-type-mismatch");
+        assertThat(thrown.code().code()).isEqualTo("TS0060018");
         assertThat(thrown.args()).containsEntry("field", "port").containsEntry("value", "1e309");
     }
 
@@ -142,7 +142,7 @@ class ConfigTypeCoercionTest {
                 () -> open(dir, "ssl", "yes"), TapstateException.class);
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("connector.config-type-mismatch");
+        assertThat(thrown.code().code()).isEqualTo("TS0060018");
         assertThat(thrown.args()).containsEntry("field", "ssl").containsEntry("expected", "boolean");
     }
 

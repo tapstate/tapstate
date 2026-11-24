@@ -50,6 +50,31 @@ class ValidationFullScanTest {
                 (observation,guard)->{checked.incrementAndGet();return result(observation);})),()->{},check->{});
         assertThatThrownBy(scan::run).isInstanceOf(TapstateException.class).hasMessageContaining("physicalTable");assertThat(checked).hasValue(0);
     }
+    @Test void recoverablePairFailureClosesBothReadersBeforeRecordingTheResult() {
+        var f = new Fixture();
+        var source = new Rows(2);
+        var target = new Rows(2);
+        var finished = new AtomicBoolean();
+        var diagnosed = new ArrayList<String>();
+        var cause = new TapstateException(ValidationError.READ_FAILED, Map.of("table", "orders"), null);
+        var mapping = new ValidationFullScan.Mapping("mapping", guard -> merge(source, target),
+                (observation, guard) -> { throw new ValidationPairException(ValidationTableFailure.Side.TARGET, cause); });
+        var scan = new ValidationFullScan(f.identity, f.spec, List.of(mapping), () -> {},
+                check -> fail("an incomplete comparison cannot publish a result"),
+                (id, failure) -> {
+                    assertThat(finished).isTrue();
+                    assertThat(failure.diagnosis()).isSameAs(cause);
+                    diagnosed.add(id);
+                },
+                () -> {
+                    assertThat(source.closed).isTrue();
+                    assertThat(target.closed).isTrue();
+                    finished.set(true);
+                });
+        scan.run();
+        assertThat(diagnosed).containsExactly("mapping");
+        assertThat(scan.complete()).isTrue();
+    }
     static ValidationRootCheck result(ValidationObservation observation) {
         var b=builder(observation,ValidationMethod.FULL_COLUMN,ValidationCheckEvent.Participation.SHOULD_EXIST,TargetPresence.PRESENT,RESULT);
         var boundary=new ValidationCheckEvent.ReadBoundary("source","test-read-v1",Instant.EPOCH,Instant.EPOCH);

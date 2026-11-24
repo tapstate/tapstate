@@ -32,18 +32,29 @@ public final class SourceProjectionService {
 
     /** Lists stored Sources in stable id order. */
     public List<SourceView> list() {
-        var managed = artifacts.managedDefaultSourceId();
-        return artifacts.listResources().stream()
+        var inventory = artifacts.resourceInventory("source");
+        var managed = inventory.managedDefaultSourceId();
+        var renderer = inventory.connectorCatalog().map(representation::withCatalog).orElse(representation);
+        return inventory.resources().stream()
                 .filter(stored -> stored.resource() instanceof SourceResource)
                 .sorted(Comparator.comparing(stored -> stored.resource().id()))
-                .map(stored -> view(stored, managed))
+                .map(stored -> view(stored, managed, renderer))
                 .toList();
     }
 
     /** Returns a Source typed view or the stable Source not-found diagnostic. */
     public SourceView get(String id) {
         Objects.requireNonNull(id, "id");
-        return view(requireSource(id), artifacts.managedDefaultSourceId());
+        var inventory = artifacts.resourceInventory("source", id);
+        var stored = inventory.resources().stream().findFirst()
+                .orElseThrow(() -> error(SourceError.NOT_FOUND, Map.of("id", id)));
+        var managed = inventory.managedDefaultSourceId();
+        var metadata = stored.resource().metadata();
+        if (managed.isEmpty() && metadata != null && metadata.labels().containsKey("store")) {
+            managed = artifacts.managedDefaultSourceId();
+        }
+        return view(stored, managed,
+                inventory.connectorCatalog().map(representation::withCatalog).orElse(representation));
     }
 
     /** Maps structured input, plans the full artifact workspace, then creates the Source conditionally. */
@@ -99,6 +110,10 @@ public final class SourceProjectionService {
                     Map.of("reason", "the managed default target cannot be changed through authoring"), null);
     }
     private SourceView view(StoredResource stored, java.util.Optional<String> managed) {
+        return view(stored, managed, representation);
+    }
+
+    private SourceView view(StoredResource stored, java.util.Optional<String> managed, SourceRepresentation renderer) {
         var resource = source(stored.resource());
         if (managed.isPresent()) {
             var metadata = resource.metadata();
@@ -110,7 +125,7 @@ public final class SourceProjectionService {
             resource = new SourceResource(resource.id(), display, resource.connector(), resource.config(), resource.mode(),
                     resource.tables(), resource.srs(), resource.execution(), resource.experimental());
         }
-        return representation.toView(resource, stored.contentHash());
+        return renderer.toView(resource, stored.contentHash());
     }
 
     private static SourceResource source(Resource resource) {

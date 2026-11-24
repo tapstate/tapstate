@@ -10,6 +10,7 @@ import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.*;
 import java.io.*;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -112,7 +113,7 @@ class ScopedSrsSinkAckFactoryTest {
         var permitted = new AtomicBoolean(); var unused = mock(SrsConsumerStore.class);
         var follower = new ScopedSrsConsumerAccess.Bound(RUN,unused,first.models(),() -> {
             if (!permitted.get()) throw ScopedSrsConsumerAccess.refused(RUN);
-        },first.reads());
+        },first.reads(),unused,first.authorization(),first.fence(),first.writerProof());
         var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
         when(f.store.progress(RUN.context())).thenAnswer(call -> {
             entered.countDown(); assertThat(release.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); return Optional.of(original);
@@ -249,6 +250,24 @@ class ScopedSrsSinkAckFactoryTest {
         verify(privateStore).advanceWriter(context,9,"mixed-run","other","writer",new WriterProgress(point.order(),point),FENCE);
         verify(privateStore).advanceWriter(context,9,"mixed-run","other","writer",new WriterProgress(new SourceOrder(9,20),null),FENCE);
         verify(f.store,never()).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+
+        try (var writes = new CheckpointProgressWrites(4, 4096, 4, Duration.ofDays(1))) {
+            f.context.put(CheckpointProgressWrites.USER_CONTEXT_KEY,writes);
+            var buffered = copy.resolve(f.member).forWriter("writer");
+            clearInvocations(f.store,privateStore);
+            buffered.advance("source.orders",point,FENCE);
+            buffered.advance("private.other",point,FENCE);
+            buffered.bounded("private.other",new SourceOrder(9,20),FENCE);
+            buffered.flush(false);
+            verifyNoInteractions(f.store,privateStore);
+
+            writes.flush();
+            buffered.flush(true);
+            verify(f.store).advanceWriter(RUN.context(),RUN.membershipRevision(),"mixed-run","orders","writer",
+                    new WriterProgress(point.order(),point),FENCE);
+            verify(privateStore).advanceWriter(context,9,"mixed-run","other","writer",
+                    new WriterProgress(new SourceOrder(9,20),point),FENCE);
+        }
     }
 
     @Test void deserializedFactoryBindsOnlyTheOriginalMembershipAndFullClaimOnItsActualMember() throws Exception {
@@ -312,6 +331,26 @@ class ScopedSrsSinkAckFactoryTest {
         assertThatThrownBy(() -> ack.advance("source.orders",new ChainPosition(new SourceOrder(1,2),"t2"),FENCE)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
         verify(f.store,never()).find(any()); verify(f.store,never()).attach(any(),anyLong(),anySet(),any());
     }
+
+    @Test void aNativeWriterOffersOrdinaryProgressAndReportsAFalseReceiptOnItsOriginalWriter() {
+        var f = new Fixture();
+        when(f.store.advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any())).thenReturn(false);
+        try (var writes = new CheckpointProgressWrites(4, 4096, 4, Duration.ofDays(1))) {
+            f.context.put(CheckpointProgressWrites.USER_CONTEXT_KEY,writes);
+            var resolved = factory().resolve(f.member);
+            var original = resolved.forWriter("writer");
+            var point = new ChainPosition(new SourceOrder(9,12),"token");
+            original.advance("source.orders",point,FENCE);
+            original.flush(false);
+            verify(f.store,never()).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+
+            writes.flush();
+            assertThatThrownBy(() -> original.flush(false)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+            resolved.forWriter("replacement").flush(true);
+            verify(f.store,times(1)).advanceWriter(RUN.context(),4,"original-run","orders","writer",
+                    new WriterProgress(point.order(),point),FENCE);
+        }
+    }
     @Test void missingTypedStoreOrScopedAuthorizationNeverFallsBackToLegacyNoOp() {
         var f = new Fixture(); f.context.remove(SrsStoreViews.USER_CONTEXT_KEY); f.context.put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY,mock(SrsMetaStore.class));
         assertThatThrownBy(() -> factory().resolve(f.member)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
@@ -341,8 +380,10 @@ class ScopedSrsSinkAckFactoryTest {
         var point = new WriterProgress(SourceOrder.snapshotRow(7),null);
         var writers = new SrsConsumerWriterRun(4,FENCE,"original-run",Map.of("orders",List.of("writer","slow")),Map.of("orders",Map.of("writer",point)));
         f.held.set(progress(4,List.of(),writers)); assertThat(landings.stillLanding(List.of(awaited))).isEmpty();
+        assertThat(factory().completedSnapshotInputs(f.member, java.util.Set.of("source.orders"))).isEmpty();
         assertThat(landings.stillLanding(List.of(new AwaitedLoad("sink","source.orders",List.of("writer","slow"))))).hasSize(1);
         f.held.set(progress(4,List.of("orders"),null)); assertThat(landings.stillLanding(List.of(awaited))).isEmpty();
+        assertThat(factory().completedSnapshotInputs(f.member, java.util.Set.of("source.orders"))).containsExactly("source.orders");
         f.held.set(progress(5,List.of("orders"),null)); assertThatThrownBy(() -> landings.stillLanding(List.of(awaited))).satisfies(ScopedSrsSinkAckFactoryTest::refused);
     }
     @Test void operatorReplayFloorUsesOnlyTheSameOriginalTableSinkConfirmation() throws Exception {
@@ -376,7 +417,17 @@ class ScopedSrsSinkAckFactoryTest {
         final AtomicReference<SrsConsumerProgress> held = new AtomicReference<>();
         Fixture() {
             when(member.getUserContext()).thenReturn(context);
-            when(authorization.require(any())).thenAnswer(call -> { if (!active.get()) throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline","pipeline"),null); return FENCE; });
+            Runnable requireActive = () -> {
+                if (!active.get()) throw ScopedSrsConsumerAccess.refused(RUN);
+            };
+            when(authorization.require(any())).thenAnswer(call -> {
+                requireActive.run();
+                return FENCE;
+            });
+            when(authorization.localProofGuard(any())).thenAnswer(call -> {
+                requireActive.run();
+                return requireActive;
+            });
             context.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);
             SrsStoreViews views = (scope,guard) -> {
                 assertThat(scope).isEqualTo(RUN.cacheScope()); guard.run();

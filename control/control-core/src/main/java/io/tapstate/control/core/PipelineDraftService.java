@@ -7,6 +7,7 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslException;
+import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
@@ -16,6 +17,7 @@ import io.tapstate.spi.store.PipelineDraftSummary;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -109,6 +111,7 @@ public final class PipelineDraftService {
         if (!Objects.equals(draft.baseArtifactHash(), baseArtifactHash)) {
             return PipelineDraftMutation.ARTIFACT_CONFLICT;
         }
+        validateSourceNodeConfigs(draft);
         return store.create(new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), 1, draft.mode(),
                 draft.name(), draft.description(), draft.graph(), draft.wizard(), baseArtifactHash, null, null,
                 now, now, draft.updatedBy()));
@@ -140,12 +143,31 @@ public final class PipelineDraftService {
         if (current.mode() != replacement.mode()) {
             return PipelineDraftMutation.MODE_CONFLICT;
         }
+        validateSourceNodeConfigs(replacement);
         PipelineDraft serverOwned = new PipelineDraft(pipelineId, replacement.schemaVersion(),
                 expectedRevision + 1, current.mode(), replacement.name(), replacement.description(),
                 replacement.graph(), replacement.wizard(), current.baseArtifactHash(),
                 current.publishedDraftRevision(), current.publishedArtifactHash(), current.createdAt(),
                 Instant.now(clock), requirePrincipal(principal));
         return store.replace(pipelineId, expectedRevision, serverOwned);
+    }
+
+    private void validateSourceNodeConfigs(PipelineDraft draft) {
+        if (validation != null) {
+            Map<String, String> inputs = new java.util.LinkedHashMap<>();
+            Map<String, Map<String, Object>> configs;
+            if (draft.graph() != null) {
+                draft.graph().nodes().stream().filter(node -> "source".equals(node.type()))
+                        .forEach(node -> inputs.put(node.id(), node.sourceId()));
+                configs = draft.graph().sourceNodeConfigs();
+            } else {
+                var wizard = draft.wizard();
+                if (wizard.root() != null) inputs.put(wizard.root().id(), wizard.root().sourceId());
+                wizard.related().forEach(node -> inputs.put(node.id(), node.sourceId()));
+                configs = wizard.sourceNodeConfigs();
+            }
+            validation.validateDraftSourceNodeConfigs(inputs, configs);
+        }
     }
 
     public PipelineDraftMutation discard(String principal, String pipelineId, long expectedRevision) {
@@ -272,16 +294,18 @@ public final class PipelineDraftService {
             return new PublishResult(PipelineDraftMutation.ARTIFACT_CONFLICT, null, null);
         }
         PipelineResource candidate = compile(pipelineId, draft);
-        ApplyPlan plan = validation == null ? null : validation.planDraftPublication(updatedBy, candidate);
+        var planned = validation == null ? null : validation.captureDraftPublication(updatedBy, candidate);
+        ApplyPlan plan = planned == null ? null : planned.plan();
         PipelineResource artifact = plan == null ? candidate
                 : (PipelineResource) plan.artifacts().getFirst().resource();
         String artifactHash = CanonicalHash.of(artifact);
         PipelineDraft.Publication publication = new PipelineDraft.Publication(
                 pipelineId, expectedDraftRevision, draft.baseArtifactHash(), artifact, artifactHash,
                 Instant.now(clock), updatedBy, plan == null ? java.util.Map.of() : plan.workspacePreconditions());
-        PipelineDraftMutation outcome = store.publish(publication);
-        List<ValidationDiagnostic> warnings = outcome == PipelineDraftMutation.PUBLISHED && validation != null
-                ? validation.refreshPublishedPipeline(pipelineId) : List.of();
+        var written = store.publishWithGeneration(publication);
+        PipelineDraftMutation outcome = written.mutation();
+        List<ValidationDiagnostic> warnings = outcome == PipelineDraftMutation.PUBLISHED && planned != null
+                ? validation.refreshPublishedPipeline(pipelineId, planned.inputs(), written.stateGeneration()) : List.of();
         return new PublishResult(outcome, outcome == PipelineDraftMutation.PUBLISHED ? artifact : null,
                 outcome == PipelineDraftMutation.PUBLISHED ? artifactHash : null, warnings);
     }
@@ -326,7 +350,7 @@ public final class PipelineDraftService {
         if (path instanceof String value && !value.isBlank()) {
             reason.append(" at ").append(value);
         }
-        if ("dsl.upsert-needs-key".equals(diagnostic.code())) {
+        if (DslError.UPSERT_NEEDS_KEY.code().equals(diagnostic.code())) {
             Object source = diagnostic.params().get("source");
             Object table = diagnostic.params().get("table");
             if (source instanceof String sourceId && table instanceof String tableName) {

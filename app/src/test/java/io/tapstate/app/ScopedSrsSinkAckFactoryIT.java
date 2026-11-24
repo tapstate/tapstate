@@ -45,7 +45,7 @@ class ScopedSrsSinkAckFactoryIT {
                 var target = new SourceResource(StorageBinding.defaultSourceId(StorageBinding.Mode.OP),null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null);
                 var committed = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster","installation","setup",1),StorageBinding.Mode.OP,endpoint,target);
                 cache.prepareFirstAuth(committed.firstCreation().orElseThrow()); var business = cache.prepareInitialBusiness(committed.preparation(),() -> {});
-                var claims = cache.workloadClaims(business); var owner = new WorkloadOwner("node","boot");
+                var claims = (DeadlineWorkloadClaimStore) cache.workloadClaims(business); var owner = new WorkloadOwner("node","boot");
                 var node = claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),owner,1,Duration.ofMinutes(2)).claim();
                 var source = new SourceResource("source",null,"fixture",Map.of(),io.tapstate.core.model.SourceMode.CDC,
                         Set.of("orders").stream().sorted().<io.tapstate.core.model.TableRef>map(io.tapstate.core.model.TableRef::literal).toList(),new io.tapstate.core.model.Srs("chain","retention",null,null,true),null);
@@ -77,7 +77,8 @@ class ScopedSrsSinkAckFactoryIT {
                 var run = SrsConsumerRun.of(physical,membership); var readerFactory = new ScopedSrsReadCursorPublisherFactory(run,"orders"); var factory = copied(new ScopedSrsSinkAckFactory(
                         Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(run,"orders")),"original-run"));
                 var member = mock(HazelcastInstance.class); var local = new ConcurrentHashMap<String,Object>(); when(member.getUserContext()).thenReturn(local);
-                try (var authorization = ExecutionAuthorization.scoped(business,claims,Duration.ofSeconds(2),System::nanoTime,() -> true)) {
+                try (var claimDrain = (AutoCloseable) () -> PipelineDirectPreparationIT.closeCacheClaims(cache, claims);
+                     var authorization = ExecutionAuthorization.scoped(business,claims,Duration.ofSeconds(2),System::nanoTime,() -> true)) {
                     local.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization); local.put(SrsStoreViews.USER_CONTEXT_KEY,cache);
                     factory.beginRun(member,Map.of("source.orders",List.of("fast","slow")),original);
                     var reader = readerFactory.resolve(member); reader.accept(99);
@@ -102,55 +103,69 @@ class ScopedSrsSinkAckFactoryIT {
                         assertThatThrownBy(() -> reader.accept(100)).isInstanceOf(TapstateException.class);
                         assertThat(stores.consumers().progress(context)).contains(confirmed);
                     } else {
-                        var admin = observer.getDatabase("admin");
-                        long entered = ((Number) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand")
-                                .append("mode", new org.bson.Document("times", 1)).append("data", new org.bson.Document("failCommands", List.of("update"))
-                                        .append("namespace", cacheName + ".workload_claims").append("appName", "tapstate/" + application)
-                                        .append("blockConnection", true).append("blockTimeMS", 15000))).get("count")).longValue();
-                        try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
-                            try {
-                                var late = executor.submit(() -> {
-                                    try { slow.advance("source.orders",new ChainPosition(new SourceOrder(7,99),"late"),original); return null; }
-                                    catch (TapstateException refused) { return refused.code(); }
-                                });
-                                admin.runCommand(new org.bson.Document("waitForFailPoint", "failCommand")
-                                        .append("timesEntered", entered + 1).append("maxTimeMS", 5000));
-                                var held = admin.runCommand(new org.bson.Document("currentOp", 1).append("$all", true))
-                                        .getList("inprog", org.bson.Document.class).stream().filter(op -> ("tapstate/" + application).equals(op.getString("appName")))
-                                        .filter(op -> op.get("command") instanceof org.bson.Document command && "workload_claims".equals(command.getString("update")))
-                                        .findFirst().orElseThrow();
-                                assertThat(held.get("command", org.bson.Document.class)).containsEntry("autocommit", false)
-                                        .doesNotContainKey("startTransaction");
-                                assertThat(late.isDone()).isFalse();
-                                assertThat(claims.release(running)).isTrue();
-                                var nextOwner = new WorkloadOwner("replacement-node", "replacement-boot");
-                                claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,nextOwner.nodeId()),nextOwner,2,Duration.ofMinutes(2));
-                                var taken = claims.acquirePipeline(physical,nextOwner,2,Duration.ofMinutes(2)).claim();
-                                assertThat(taken.claimGeneration()).isGreaterThan(running.claimGeneration());
-                                var nextClaim = WorkloadClaimFence.from(claims.advanceExecution(taken,2,Set.of(nextOwner.nodeId())).orElseThrow());
-                                var nextMembership = stores.consumers().attach(context,membership.revision(),Set.of("orders"),nextClaim).orElseThrow();
-                                var nextRun = SrsConsumerRun.of(physical,nextMembership);
-                                var nextFactory = new ScopedSrsSinkAckFactory(Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(nextRun,"orders")),"replacement-run");
-                                nextFactory.beginRun(member,Map.of("source.orders",List.of("fast","slow")),nextClaim);
-                                var nextAck = nextFactory.resolve(member);
-                                var newPosition = new ChainPosition(new SourceOrder(7,6),"replacement-6");
-                                nextAck.forWriter("fast").advance("source.orders",newPosition,nextClaim);
-                                nextAck.forWriter("slow").advance("source.orders",newPosition,nextClaim);
-                                var nextProgress = stores.consumers().progress(context).orElseThrow();
-                                assertThat(nextProgress.cursor().sinkAcked()).isEqualTo(newPosition);
-                                var rawClaims = observer.getDatabase(cacheName).getCollection("workload_claims");
-                                var originalNextClaim = rawClaims.find(new org.bson.Document("resourceType", "PIPELINE_ACTUATION")).first();
-                                assertThat(originalNextClaim).isNotNull().containsEntry("ownerNodeId",nextOwner.nodeId())
-                                        .containsEntry("ownerBootId",nextOwner.bootId()).containsEntry("claimGeneration",nextClaim.claimGeneration());
-                                assertThat(late.isDone()).isFalse();
-                                assertThat(admin.runCommand(new org.bson.Document("currentOp", 1).append("$all", true)).getList("inprog",org.bson.Document.class))
-                                        .anySatisfy(op -> assertThat(op).containsEntry("opid",held.get("opid")));
-                                assertThat(late.get(25,java.util.concurrent.TimeUnit.SECONDS))
-                                        .isIn(IoError.WORKLOAD_CLAIM_FENCED,io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED);
-                                assertThat(stores.consumers().progress(context)).contains(nextProgress);
-                                assertThat(rawClaims.find(new org.bson.Document("resourceType", "PIPELINE_ACTUATION")).first()).isEqualTo(originalNextClaim);
-                                assertThatThrownBy(() -> reader.accept(100)).isInstanceOf(TapstateException.class);
-                            } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
+                        // The replacement represents a different member, with its own checkpoint writer.
+                        try (var replacementCache = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(5), application + "-replacement")) {
+                            var replacementClaims = (DeadlineWorkloadClaimStore) replacementCache.workloadClaims(business);
+                            var replacementStores = replacementCache.srs(business, () -> {});
+                            try (var replacementDrain = (AutoCloseable) () ->
+                                        PipelineDirectPreparationIT.closeCacheClaims(replacementCache, replacementClaims);
+                                 var replacementAuthorization = ExecutionAuthorization.scoped(
+                                         business, replacementClaims, Duration.ofSeconds(2), System::nanoTime, () -> true);
+                                 var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+                                var replacementMember = mock(HazelcastInstance.class);
+                                var replacementContext = new ConcurrentHashMap<String, Object>();
+                                replacementContext.put(ExecutionAuthorization.USER_CONTEXT_KEY, replacementAuthorization);
+                                replacementContext.put(SrsStoreViews.USER_CONTEXT_KEY, replacementCache);
+                                when(replacementMember.getUserContext()).thenReturn(replacementContext);
+                                var admin = observer.getDatabase("admin");
+                                long entered = ((Number) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand")
+                                        .append("mode", new org.bson.Document("times", 1)).append("data", new org.bson.Document("failCommands", List.of("update"))
+                                                .append("namespace", cacheName + ".pipeline_state").append("appName", "tapstate/" + application)
+                                                .append("blockConnection", true).append("blockTimeMS", 15000))).get("count")).longValue();
+                                try {
+                                    var late = executor.submit(() -> {
+                                        try { slow.advance("source.orders",new ChainPosition(new SourceOrder(7,99),"late"),original); return null; }
+                                        catch (TapstateException refused) { return refused.code(); }
+                                    });
+                                    admin.runCommand(new org.bson.Document("waitForFailPoint", "failCommand")
+                                            .append("timesEntered", entered + 1).append("maxTimeMS", 5000));
+                                    var held = admin.runCommand(new org.bson.Document("currentOp", 1).append("$all", true))
+                                            .getList("inprog", org.bson.Document.class).stream().filter(op -> ("tapstate/" + application).equals(op.getString("appName")))
+                                            .filter(op -> op.get("command") instanceof org.bson.Document command && "pipeline_state".equals(command.getString("update")))
+                                            .findFirst().orElseThrow();
+                                    assertThat(held.get("command", org.bson.Document.class)).containsEntry("autocommit", false)
+                                            .doesNotContainKey("startTransaction");
+                                    assertThat(late.isDone()).isFalse();
+                                    assertThat(replacementClaims.release(running)).isTrue();
+                                    var nextOwner = new WorkloadOwner("replacement-node", "replacement-boot");
+                                    replacementClaims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,nextOwner.nodeId()),nextOwner,2,Duration.ofMinutes(2));
+                                    var taken = replacementClaims.acquirePipeline(physical,nextOwner,2,Duration.ofMinutes(2)).claim();
+                                    assertThat(taken.claimGeneration()).isGreaterThan(running.claimGeneration());
+                                    var nextClaim = WorkloadClaimFence.from(replacementClaims.advanceExecution(taken,2,Set.of(nextOwner.nodeId())).orElseThrow());
+                                    var nextMembership = replacementStores.consumers().attach(context,membership.revision(),Set.of("orders"),nextClaim).orElseThrow();
+                                    var nextRun = SrsConsumerRun.of(physical,nextMembership);
+                                    var nextFactory = new ScopedSrsSinkAckFactory(Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(nextRun,"orders")),"replacement-run");
+                                    nextFactory.beginRun(replacementMember,Map.of("source.orders",List.of("fast","slow")),nextClaim);
+                                    var nextAck = nextFactory.resolve(replacementMember);
+                                    var newPosition = new ChainPosition(new SourceOrder(7,6),"replacement-6");
+                                    nextAck.forWriter("fast").advance("source.orders",newPosition,nextClaim);
+                                    nextAck.forWriter("slow").advance("source.orders",newPosition,nextClaim);
+                                    var nextProgress = replacementStores.consumers().progress(context).orElseThrow();
+                                    assertThat(nextProgress.cursor().sinkAcked()).isEqualTo(newPosition);
+                                    var rawClaims = observer.getDatabase(cacheName).getCollection("workload_claims");
+                                    var originalNextClaim = rawClaims.find(new org.bson.Document("resourceType", "PIPELINE_ACTUATION")).first();
+                                    assertThat(originalNextClaim).isNotNull().containsEntry("ownerNodeId",nextOwner.nodeId())
+                                            .containsEntry("ownerBootId",nextOwner.bootId()).containsEntry("claimGeneration",nextClaim.claimGeneration());
+                                    assertThat(late.isDone()).isFalse();
+                                    assertThat(admin.runCommand(new org.bson.Document("currentOp", 1).append("$all", true)).getList("inprog",org.bson.Document.class))
+                                            .anySatisfy(op -> assertThat(op).containsEntry("opid",held.get("opid")));
+                                    assertThat(late.get(25,java.util.concurrent.TimeUnit.SECONDS))
+                                            .isIn(IoError.WORKLOAD_CLAIM_FENCED,io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED);
+                                    assertThat(stores.consumers().progress(context)).contains(nextProgress);
+                                    assertThat(rawClaims.find(new org.bson.Document("resourceType", "PIPELINE_ACTUATION")).first()).isEqualTo(originalNextClaim);
+                                    assertThatThrownBy(() -> reader.accept(100)).isInstanceOf(TapstateException.class);
+                                } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
+                            }
                         }
                     }
                 }

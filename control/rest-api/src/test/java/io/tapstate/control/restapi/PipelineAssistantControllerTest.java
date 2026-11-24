@@ -7,6 +7,10 @@ import io.tapstate.control.core.AiProviderService;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.CredentialAuthentication;
+import io.tapstate.control.core.Scope;
+import io.tapstate.control.core.TapstatePrincipal;
+import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.ApplyService;
@@ -28,6 +32,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.security.core.context.SecurityContextHolder;
 import tools.jackson.databind.json.JsonMapper;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -46,6 +52,107 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.*;
 
 class PipelineAssistantControllerTest {
+    @Test
+    void assistantCandidatesKeepNodeSettingsOnTheSameInputAndHideThemFromProviderContext() {
+        var config = Map.of("custom-root", Map.of("preImage", false), "child", Map.of("preImage", true));
+        var wire = Map.<String, Object>of(
+                "root", Map.of("id", "custom-root", "sourceId", "src", "table", "orders", "key", List.of("id")),
+                "related", List.of(Map.of("id", "child", "parentId", "custom-root", "sourceId", "src", "table", "items")),
+                "sourceNodeConfigs", config);
+
+        var providerView = AssistantWizardJson.view(wire);
+        assertThat(providerView).doesNotContainKey("sourceNodeConfigs");
+        assertThat(AssistantWizardJson.list(providerView.get("relations"))).hasSize(1);
+        providerView.put("destinationTable", "archived_orders");
+        var candidate = AssistantWizardJson.wire(providerView, wire);
+        assertThat(candidate).containsEntry("sourceNodeConfigs", config);
+        assertThat(AssistantWizardJson.object(AssistantWizardJson.candidateView(candidate).get("root")))
+                .containsEntry("nodeId", "custom-root");
+
+        var root = new java.util.LinkedHashMap<>(AssistantWizardJson.object(providerView.get("root")));
+        root.put("source", "replacement");
+        providerView.put("root", root);
+        providerView.put("sourceNodeConfigs", Map.of("custom-root", Map.of("preImage", true)));
+        assertThat(AssistantWizardJson.wire(providerView, wire))
+                .containsEntry("sourceNodeConfigs", Map.of("child", Map.of("preImage", true)));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void onPremStreamPublishesOnlyWhileTheOriginalAuthenticationIsActive(boolean retire) throws Exception {
+        var drafts = new PipelineApiTest.FakePipelineDraftStore();
+        var base = draft();
+        drafts.create(base);
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
+        var schema = new DiscoveredSourceModel("src", "mysql", 1,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()))));
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) {
+                return "src".equals(id) ? Optional.of(schema) : Optional.empty();
+            }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var mapper = JsonMapper.builder().build();
+        var candidate = AssistantWizardJson.view(
+                AssistantWizardJson.object(PipelineDraftJson.write(mapper, base).get("wizard")));
+        candidate.put("destinationTable", "customer_orders");
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(drafts,
+                new PipelineApiTest.TestApp().artifactQueryService(artifacts), audit, apply));
+        beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
+        beans.registerSingleton("mode", AuthenticationMode.ON_PREM);
+        var providerService = org.mockito.Mockito.mock(AiProviderService.class);
+        org.mockito.Mockito.when(providerService.require("[\"on-prem\"]"))
+                .thenReturn(new AiProviderSettings("openai-compatible", "https://api.openai.com/v1", "model", "test-key"));
+        beans.registerSingleton("providerService", providerService);
+
+        var active = new AtomicBoolean(true);
+        AiProviderClient client = new AiProviderClient() {
+            public void check(AiProviderSettings settings) { }
+
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                if (retire) active.set(false);
+                text.accept("Provider output");
+                return Optional.of(candidate);
+            }
+        };
+        var providers = new AiProviderController(beans.getBeanProvider(AiProviderService.class), null,
+                beans.getBeanProvider(AuthenticationMode.class), client);
+        var assistant = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), providers, client,
+                mapper);
+        var token = new VerifiedToken("operator", Scope.WRITE);
+        var original = new CredentialAuthentication(token, Optional.empty(), Optional.empty(), () -> {
+            if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
+        });
+        SecurityContextHolder.getContext().setAuthentication(new TapstateAuthentication(TapstatePrincipal.humanJwt(token), original));
+        org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody stream;
+        try {
+            stream = assistant.assistant("orders", Map.of("revision", 1,
+                    "messages", List.of(Map.of("role", "user", "text", "Suggest a pipeline"))),
+                    new MockHttpServletRequest(), new MockHttpServletResponse()).getBody();
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+        var output = new ByteArrayOutputStream();
+        stream.writeTo(output);
+        String events = output.toString(StandardCharsets.UTF_8);
+        if (retire) {
+            assertThat(events).contains(ControlError.UNAUTHENTICATED.code(), "[DONE]")
+                    .doesNotContain("Provider output", "data-proposal");
+        } else {
+            assertThat(events).contains("Provider output", "data-proposal", "customer_orders", "[DONE]");
+        }
+    }
+
     @Test void malformedMessageEntryIsRejectedWithCodedRequestErrorBeforeStreaming() {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         store.create(draft());
@@ -60,19 +167,19 @@ class PipelineAssistantControllerTest {
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant");
 
         assertThatThrownBy(() -> controller.assistant("orders",
-                Map.of("revision", 1, "messages", List.of("bad-entry")), request))
+                Map.of("revision", 1, "messages", List.of("bad-entry")), request, new org.springframework.mock.web.MockHttpServletResponse()))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
         assertThatThrownBy(() -> controller.assistant("orders",
-                Map.of("revision", 2, "messages", List.of(Map.of("role", "user", "text", "proposal"))), request))
+                Map.of("revision", 2, "messages", List.of(Map.of("role", "user", "text", "proposal"))), request, new org.springframework.mock.web.MockHttpServletResponse()))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(PipelineDraftError.REVISION_CONFLICT));
         assertThatThrownBy(() -> controller.assistant("orders",
-                Map.of("revision", 1.5, "messages", List.of(Map.of("role", "user", "text", "proposal"))), request))
+                Map.of("revision", 1.5, "messages", List.of(Map.of("role", "user", "text", "proposal"))), request, new org.springframework.mock.web.MockHttpServletResponse()))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
         assertThatThrownBy(() -> controller.assistant("orders",
-                Map.of("revision", 1, "messages", List.of(Map.of("role", "system", "text", "proposal"))), request))
+                Map.of("revision", 1, "messages", List.of(Map.of("role", "system", "text", "proposal"))), request, new org.springframework.mock.web.MockHttpServletResponse()))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
         assertThat(store.get("orders")).contains(draft());
@@ -150,7 +257,7 @@ class PipelineAssistantControllerTest {
 
         var response = controller.assistant("blank", Map.of("revision", 1,
                 "messages", List.of(Map.of("role", "user", "text", "How do I start?"))),
-                new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant"));
+                new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant"), new org.springframework.mock.web.MockHttpServletResponse());
         var output = new ByteArrayOutputStream();
         response.getBody().writeTo(output);
 
@@ -215,7 +322,7 @@ class PipelineAssistantControllerTest {
 
         var response = controller.assistant("union", Map.of("revision", 1,
                 "messages", List.of(Map.of("role", "user", "text", "Add a filter to orders"))),
-                new MockHttpServletRequest("POST", "/pipelines/union/draft:assistant"));
+                new MockHttpServletRequest("POST", "/pipelines/union/draft:assistant"), new org.springframework.mock.web.MockHttpServletResponse());
         response.getBody().writeTo(new ByteArrayOutputStream());
         Map<String, Object> candidate = AssistantWizardJson.view(
                 AssistantWizardJson.object(PipelineDraftJson.write(mapper, base).get("wizard")));
@@ -288,7 +395,7 @@ class PipelineAssistantControllerTest {
                 providerController(fake), fake, JsonMapper.builder().build());
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant");
         var response = controller.assistant("blank", Map.of("revision", 1,
-                "messages", List.of(Map.of("role", "user", "text", "Help me create a pipeline"))), request);
+                "messages", List.of(Map.of("role", "user", "text", "Help me create a pipeline"))), request, new org.springframework.mock.web.MockHttpServletResponse());
         var output = new ByteArrayOutputStream();
         response.getBody().writeTo(output);
         String stream = output.toString(StandardCharsets.UTF_8);
@@ -310,7 +417,7 @@ class PipelineAssistantControllerTest {
         assertThat(schemaReads.get()).isEqualTo(sourceCount > 3 ? 0 : discovered ? sourceCount : 0);
         assertThat(stream).contains("Connect a PostgreSQL or MySQL Source", "data-status", "complete",
                 "\"finishReason\":\"stop\"")
-                .doesNotContain("data-proposal", "control.malformed-request", "\\\"type\\\":\\\"error\\\"");
+                .doesNotContain("data-proposal", "TS0210001", "\\\"type\\\":\\\"error\\\"");
         if (sourceCount == 2 && tableCount == 1) {
             var candidate = AssistantWizardJson.view(AssistantWizardJson.object(
                     PipelineDraftJson.write(JsonMapper.builder().build(), configured).get("wizard")));
@@ -371,7 +478,7 @@ class PipelineAssistantControllerTest {
 
         var response = controller.assistant("orders", Map.of("revision", 1,
                 "messages", List.of(Map.of("role", "user", "text", "How should I configure this pipeline?"))),
-                new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"));
+                new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"), new org.springframework.mock.web.MockHttpServletResponse());
         var output = new ByteArrayOutputStream();
         response.getBody().writeTo(output);
 
@@ -454,7 +561,7 @@ class PipelineAssistantControllerTest {
             var output = new ByteArrayOutputStream();
             controller.assistant("orders", Map.of("revision", 1,
                     "messages", List.of(Map.of("role", "user", "text", "Merge archive orders"))),
-                    new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"))
+                    new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"), new org.springframework.mock.web.MockHttpServletResponse())
                     .getBody().writeTo(output);
             assertThat(output.toString(StandardCharsets.UTF_8))
                     .contains(PipelineDraftError.INVALID.code(), "wizard union input duplicates an existing pipeline input",
@@ -478,6 +585,17 @@ class PipelineAssistantControllerTest {
 
     private static void verifyValidatedStream(String connector, boolean missingTransformId,
             boolean revokeDuringValidation) throws Exception {
+        verifyValidatedStream(connector, missingTransformId, revokeDuringValidation, false);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"mysql", "postgres"})
+    void managedPipelineAssistantStreamsAndValidatesAProposalAcrossTurns(String connector) throws Exception {
+        verifyValidatedStream(connector, false, false, true);
+    }
+
+    private static void verifyValidatedStream(String connector, boolean missingTransformId,
+            boolean revokeDuringValidation, boolean managed) throws Exception {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         PipelineDraft base = draft(); store.create(base);
         var artifacts = new PipelineApiTest.FakeArtifactStore();
@@ -536,6 +654,13 @@ class PipelineAssistantControllerTest {
             public void check(AiProviderSettings ignored) { }
             public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
+                if (managed) {
+                    assertThat(settings.model()).isEqualTo("global.moonshotai.kimi-k3");
+                    assertThat(settings.apiKey()).isNull();
+                    assertThat(messages.size()).isEqualTo(3);
+                    assertThat(messages.get(1)).containsEntry("role", "assistant")
+                            .containsEntry("content", "I found the orders table.");
+                }
                 providerCalls.incrementAndGet();
                 sentContext.set(context);
                 text.accept("I used the selected schema.");
@@ -543,20 +668,40 @@ class PipelineAssistantControllerTest {
                 return Optional.of(proposedCandidate.get());
             }
         };
+        var byok = managed ? org.mockito.Mockito.mock(AiProviderClient.class) : fake;
+        Runnable guard = () -> {
+            if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
+        };
+        AiProviderController providers;
+        if (managed) {
+            var managedService = org.mockito.Mockito.mock(AiProviderService.class);
+            beans.registerSingleton("mode", AuthenticationMode.CLOUD);
+            beans.registerSingleton("managed", new io.tapstate.control.core.ManagedAiProvider(new AiProviderSettings(
+                    "bedrock-managed", "https://bedrock-runtime.ap-southeast-1.amazonaws.com/openai/v1",
+                    "global.moonshotai.kimi-k3", null), fake));
+            providers = new AiProviderController(null, null, beans.getBeanProvider(AuthenticationMode.class),
+                    byok, null, beans.getBeanProvider(io.tapstate.control.core.ManagedAiProvider.class), "manager") {
+                @Override Workspace workspace(jakarta.servlet.http.HttpServletRequest request) {
+                    return new Workspace("workspace", guard);
+                }
+                @Override AiProviderService service() { return managedService; }
+            };
+        } else providers = providerController(fake, guard);
         var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
                 beans.getBeanProvider(SourceProjectionService.class),
                 beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
-                providerController(fake, () -> {
-                    if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
-                }), fake, mapper);
+                providers, byok, mapper);
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant");
         Map<String, Object> body = Map.of("revision", 1,
-                "messages", List.of(Map.of("role", "user", "text", "Rename the destination")));
+                "messages", managed ? List.of(Map.of("role", "user", "text", "Find the orders table"),
+                        Map.of("role", "assistant", "text", "I found the orders table."),
+                        Map.of("role", "user", "text", "Rename the destination"))
+                        : List.of(Map.of("role", "user", "text", "Rename the destination")));
         if (revokeDuringValidation) {
             for (int attempt = 0; attempt < 5; attempt++) {
                 active.set(true);
                 var output = new ByteArrayOutputStream();
-                controller.assistant("orders", body, request).getBody().writeTo(output);
+                controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse()).getBody().writeTo(output);
                 assertThat(active).isFalse();
                 assertThat(output.toString(StandardCharsets.UTF_8))
                         .contains(ControlError.UNAUTHENTICATED.code(), "\"finishReason\":\"error\"", "[DONE]")
@@ -566,7 +711,7 @@ class PipelineAssistantControllerTest {
         }
         var responses = new java.util.ArrayList<org.springframework.http.ResponseEntity<org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody>>();
 
-        for (int index = 0; index < 5; index++) responses.add(controller.assistant("orders", body, request));
+        for (int index = 0; index < 5; index++) responses.add(controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse()));
 
         assertThat(responses.getFirst().getHeaders().getContentType()).isNotNull();
         assertThat(responses.getFirst().getHeaders().getContentType().isCompatibleWith(MediaType.TEXT_EVENT_STREAM)).isTrue();
@@ -631,7 +776,7 @@ class PipelineAssistantControllerTest {
                 proposedCandidate.set(incompleteCandidate);
 
                 var missingIdOutput = new ByteArrayOutputStream();
-                controller.assistant("orders", body, request).getBody().writeTo(missingIdOutput);
+                controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse()).getBody().writeTo(missingIdOutput);
                 String missingIdStream = missingIdOutput.toString(StandardCharsets.UTF_8);
                 assertThat(missingIdStream).contains("data-proposal", "\"finishReason\":\"stop\"")
                         .doesNotContain(ControlError.AI_INVALID_PROPOSAL.code());
@@ -646,7 +791,7 @@ class PipelineAssistantControllerTest {
         }
 
         proposedCandidate.set(Map.of());
-        var emptyCandidateResponse = controller.assistant("orders", body, request);
+        var emptyCandidateResponse = controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse());
         var emptyCandidateOutput = new ByteArrayOutputStream();
         emptyCandidateResponse.getBody().writeTo(emptyCandidateOutput);
         String emptyCandidateStream = emptyCandidateOutput.toString(StandardCharsets.UTF_8);
@@ -655,7 +800,7 @@ class PipelineAssistantControllerTest {
         assertThat(store.get("orders")).contains(base);
         providerFailure.set(true);
         var failedOutput = new ByteArrayOutputStream();
-        controller.assistant("orders", body, request).getBody().writeTo(failedOutput);
+        controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse()).getBody().writeTo(failedOutput);
         String failedStream = failedOutput.toString(StandardCharsets.UTF_8);
         assertThat(failedStream).contains(ControlError.AI_INVALID_PROPOSAL.code(), "\"finishReason\":\"error\"")
                 .doesNotContain("data-proposal", "customer_orders");
@@ -668,7 +813,7 @@ class PipelineAssistantControllerTest {
                 if (writes.incrementAndGet() == 5) throw new IOException("disconnected");
             }
         };
-        controller.assistant("orders", body, request).getBody().writeTo(disconnected);
+        controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse()).getBody().writeTo(disconnected);
         assertThat(providerCalls).hasValue(8 + (missingTransformId ? 2 : 0));
         assertThat(failedStream).doesNotContain("sk-test");
         assertThat(store.get("orders")).contains(base);
@@ -679,9 +824,9 @@ class PipelineAssistantControllerTest {
                 "config", Map.of("filter", Map.of("expr", "afterr.region == 'US'")))));
         proposedCandidate.set(invalidExpressionCandidate);
         var invalidExpressionStreamOutput = new ByteArrayOutputStream();
-        controller.assistant("orders", body, request).getBody().writeTo(invalidExpressionStreamOutput);
+        controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse()).getBody().writeTo(invalidExpressionStreamOutput);
         String invalidExpressionStream = invalidExpressionStreamOutput.toString(StandardCharsets.UTF_8);
-        assertThat(invalidExpressionStream).contains("dsl.illegal-expression", "transforms[0].expr", "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
+        assertThat(invalidExpressionStream).contains("TS0010010", "transforms[0].expr", "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
                 .doesNotContain("data-proposal", "afterr.region");
         assertThat(invalidExpressionStream).doesNotContain("\"type\":\"error\"");
         assertThat(store.get("orders")).contains(base);
@@ -835,7 +980,7 @@ class PipelineAssistantControllerTest {
         List<?> expressionDiagnostics = (List<?>) expressionValidation.get("diagnostics");
         assertThat(expressionDiagnostics).hasSize(1);
         Map<String, Object> expressionDiagnostic = AssistantWizardJson.object(expressionDiagnostics.getFirst());
-        assertThat(expressionDiagnostic).containsEntry("code", "dsl.illegal-expression");
+        assertThat(expressionDiagnostic).containsEntry("code", "TS0010010");
         assertThat(AssistantWizardJson.object(expressionDiagnostic.get("params")))
                 .containsEntry("path", "transforms[0].expr")
                 .doesNotContainKeys("expr", "detail");
@@ -925,16 +1070,25 @@ class PipelineAssistantControllerTest {
         assertThat(store.get("orders")).contains(unfinished);
     }
 
-    @Test void oversizedDiscoveredSchemaIsOmittedFromProviderContext() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+        "false,125000,true", "true,115000,true", "true,50000,true", "true,115000,false"
+    })
+    void oversizedDiscoveredSchemaIsOmittedFromProviderContext(boolean managed, int fieldLength,
+            boolean oversizedSelectedTable) throws Exception {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         PipelineDraft base = draft(); store.create(base);
         var artifacts = new PipelineApiTest.FakeArtifactStore();
         artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nmode: cdc\nconfig: {}\n");
         artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
-        String oversizedField = "field_" + "x".repeat(125_000);
-        var schema = new DiscoveredSourceModel("src", "mysql", 1,
-                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
-                        List.of(new io.tapstate.spi.store.SourceField(oversizedField, "string")), List.of(), List.of()))));
+        String oversizedField = "field_" + (fieldLength == 50_000 ? "\u4e2d" : "x").repeat(fieldLength);
+        String prompt = managed ? "Explain this schema. " + "x".repeat(23_000) : "How do I start?";
+        var largeTable = new io.tapstate.spi.store.SourceTable(oversizedSelectedTable ? "orders" : "archive",
+                List.of(new io.tapstate.spi.store.SourceField(oversizedField, "string")), List.of(), List.of());
+        var tables = oversizedSelectedTable ? List.of(largeTable) : List.of(largeTable,
+                new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of(), List.of()));
+        var schema = new DiscoveredSourceModel("src", "mysql", 1, new io.tapstate.spi.store.SourceModel(tables));
         SchemaStore schemaStore = new SchemaStore() {
             public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
             public Optional<DiscoveredSourceModel> get(String id) { return Optional.of(schema); }
@@ -951,11 +1105,21 @@ class PipelineAssistantControllerTest {
         beans.registerSingleton("drafts", new PipelineDraftService(store, services.artifactQueryService(artifacts), audit, apply));
         beans.registerSingleton("sources", sources);
         beans.registerSingleton("schemas", schemas);
+        var bedrock = io.tapstate.control.core.ManagedAiProvider.bedrock("ap-southeast-1",
+                "global.moonshotai.kimi-k3", 30, (request, uri, json) -> {
+                    throw new AssertionError("measuring the request must not sign it");
+                });
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
             public void check(AiProviderSettings ignored) { }
+            public boolean proposalRequestFits(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context) {
+                return !managed || bedrock.client().proposalRequestFits(bedrock.settings(), messages, context);
+            }
             public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
+                assertThat(proposalRequestFits(settings, messages, context)).as("upstream request fits").isTrue();
+                if (managed) assertThat(messages).containsExactly(Map.of("role", "user", "content", prompt));
                 sentContext.set(context);
                 text.accept("Choose a smaller schema selection to generate a proposal.");
                 return Optional.empty();
@@ -966,12 +1130,19 @@ class PipelineAssistantControllerTest {
                 beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
                 providerController(fake), fake, JsonMapper.builder().build());
         var response = controller.assistant("orders", Map.of("revision", 1,
-                "messages", List.of(Map.of("role", "user", "text", "How do I start?"))),
-                new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"));
+                "messages", List.of(Map.of("role", "user", "text", prompt))),
+                new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"), new org.springframework.mock.web.MockHttpServletResponse());
         var output = new ByteArrayOutputStream(); response.getBody().writeTo(output);
 
-        assertThat(sentContext.get()).containsEntry("sources", List.of()).containsEntry("proposalEnabled", false)
-                .containsEntry("schemaUnavailable", "selected schema is too large to include");
+        assertThat(sentContext.get()).containsEntry("proposalEnabled", !oversizedSelectedTable);
+        if (oversizedSelectedTable) {
+            assertThat(sentContext.get()).containsEntry("sources", List.of())
+                    .containsEntry("schemaUnavailable", "selected schema is too large to include");
+        } else {
+            assertThat(sentContext.get()).doesNotContainKeys("schemaUnavailable", "scopeSelectionRequired");
+            assertThat(io.tapstate.core.common.JsonWriter.write(sentContext.get().get("sources")))
+                    .contains("orders").doesNotContain("archive", "field_");
+        }
         assertThat(output.toString(StandardCharsets.UTF_8)).contains("Choose a smaller schema selection")
                 .doesNotContain("data-proposal", oversizedField);
         assertThat(store.get("orders")).contains(base);
@@ -1045,13 +1216,27 @@ class PipelineAssistantControllerTest {
         try {
             MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant");
             var response = controller.assistant("blank", Map.of("revision", 1,
-                    "messages", List.of(Map.of("role", "user", "text", "How do I start?"))), request);
+                    "messages", List.of(Map.of("role", "user", "text", "How do I start?"))), request, new org.springframework.mock.web.MockHttpServletResponse());
             assertThat(schemaReads).hasValue(0);
             var output = new ByteArrayOutputStream();
             response.getBody().writeTo(output);
             String stream = output.toString(StandardCharsets.UTF_8);
             assertThat(stream).contains(ControlError.AI_OVERLOADED.code(), "\"finishReason\":\"error\"", "[DONE]")
                     .doesNotContain("data-proposal");
+            var mapper = JsonMapper.builder().build();
+            var frames = stream.lines().filter(line -> line.startsWith("data: {")).map(line ->
+                    mapper.readTree(line.substring(6))).toList();
+            assertThat(frames).hasSize(3);
+            assertThat(frames.getFirst().path("type").asText()).isEqualTo("data-status");
+            var failure = frames.getFirst().path("data");
+            var rendered = io.tapstate.messages.MessageCatalog.bundled().render(ControlError.AI_OVERLOADED,
+                    Map.of(), java.util.Locale.ENGLISH);
+            assertThat(failure.path("code").asText()).isEqualTo(ControlError.AI_OVERLOADED.code());
+            assertThat(failure.path("params").isObject()).isTrue();
+            assertThat(failure.path("message").asText()).isEqualTo(rendered.message());
+            assertThat(failure.path("solution").asText()).isEqualTo(rendered.solution());
+            assertThat(frames.get(1).path("errorText").asText()).isEqualTo(ControlError.AI_OVERLOADED.code());
+            assertThat(frames.getLast().path("finishReason").asText()).isEqualTo("error");
             assertThat(schemaReads).hasValue(0);
             assertThat(capacity.availablePermits()).isZero();
         } finally {
@@ -1061,17 +1246,65 @@ class PipelineAssistantControllerTest {
         for (int attempt = 0; attempt < 2; attempt++) {
             var response = controller.assistant("blank", Map.of("revision", 1,
                     "messages", List.of(Map.of("role", "user", "text", "How do I start?"))),
-                    new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant"));
+                    new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant"), new org.springframework.mock.web.MockHttpServletResponse());
             response.getBody().writeTo(new ByteArrayOutputStream());
             assertThat(capacity.availablePermits()).isEqualTo(4);
         }
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "AI_MANAGED_PROVIDER_AUTH_FAILED,en", "AI_MANAGED_PROVIDER_AUTH_FAILED,zh-CN",
+            "AI_MANAGED_PROVIDER_AUTH_FAILED,zh-TW", "AI_MANAGED_PROVIDER_INPUT_LIMIT,en",
+            "AI_MANAGED_PROVIDER_INPUT_LIMIT,zh-CN", "AI_MANAGED_PROVIDER_INPUT_LIMIT,zh-TW"})
+    void streamFailuresUseTheHttpErrorProjection(ControlError code, String language) throws Exception {
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        store.create(draft());
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(store));
+        var checks = new AtomicInteger();
+        var failure = new TapstateException(code, Map.of(), new IllegalStateException("private-provider-detail"));
+        var client = new OpenAiCompatibleClient();
+        var providers = providerController(client, () -> {
+            if (checks.incrementAndGet() > 1) throw failure;
+        });
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), providers,
+                client, JsonMapper.builder().build());
+        var request = new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant");
+        request.addHeader("Accept-Language", language);
+        var output = new ByteArrayOutputStream();
+        controller.assistant("orders", Map.of("revision", 1, "messages",
+                List.of(Map.of("role", "user", "text", "Explain the pipeline"))), request,
+                new MockHttpServletResponse()).getBody().writeTo(output);
+        String wire = output.toString(StandardCharsets.UTF_8);
+        var mapper = JsonMapper.builder().build();
+        var status = wire.lines().filter(line -> line.startsWith("data: {")).map(line ->
+                mapper.readTree(line.substring(6))).filter(frame -> "data-status".equals(frame.path("type").asText()))
+                .findFirst().orElseThrow().path("data");
+        var expected = io.tapstate.messages.MessageCatalog.bundled().render(code, Map.of(),
+                java.util.Locale.forLanguageTag(language));
+        assertThat(status.path("code").asText()).isEqualTo(code.code());
+        assertThat(status.path("params").isObject()).isTrue();
+        assertThat(status.path("message").asText()).isEqualTo(expected.message());
+        assertThat(status.path("solution").asText()).isEqualTo(expected.solution()).isNotBlank();
+        assertThat(wire).contains("\"errorText\":\"" + code.code() + "\"", "[DONE]")
+                .doesNotContain("private-provider-detail");
+        assertThat(checks).hasValue(2);
+        String directory = System.getProperty("tapstate.assistant.failure-stream-dir");
+        if (directory != null) {
+            var path = Path.of(directory);
+            Files.createDirectories(path);
+            Files.writeString(path.resolve(code.code() + "-" + language + ".sse"), wire, StandardCharsets.UTF_8);
+        }
+    }
+
     @Test void missingDraftCannotProduceAProposal() {
         var controller = controller(new PipelineDraftService(new PipelineApiTest.FakePipelineDraftStore()));
         assertThatThrownBy(() -> controller.validate("orders", 1, Map.of()))
                 .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(PipelineDraftError.NOT_FOUND));
     }
-    private static PipelineDraft draft() {
+    static PipelineDraft draft() {
         return new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.WIZARD, "Orders", null, null,
                 new PipelineDraft.Wizard(new PipelineDraft.Root("root", "src", "orders", List.of("id"), List.of()),
                         List.of(), List.of(), new PipelineDraft.Output("atlas", Map.of("sourceId", "dst", "table", "orders", "writeMode", "upsert"))),
@@ -1093,7 +1326,7 @@ class PipelineAssistantControllerTest {
         return providerController(client, () -> {});
     }
 
-    private static AiProviderController providerController(AiProviderClient client, Runnable active) {
+    static AiProviderController providerController(AiProviderClient client, Runnable active) {
         AiProviderSettingsStore store = new AiProviderSettingsStore() {
             public java.util.Optional<AiProviderSettingsStore.Settings> get(String owner) {
                 return java.util.Optional.of(new AiProviderSettingsStore.Settings("openai-compatible", "https://api.openai.com/v1", "model", "sk-test"));

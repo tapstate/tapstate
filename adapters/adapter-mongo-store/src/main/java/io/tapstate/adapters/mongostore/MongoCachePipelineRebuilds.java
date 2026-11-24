@@ -23,7 +23,8 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private static final List<SystemCollections> COLD = List.of(SystemCollections.CACHE_NEST_STATE, SystemCollections.CACHE_JOIN_FACTS,
-            SystemCollections.CACHE_JOIN_DIMENSIONS, SystemCollections.CACHE_JOIN_INDEXES, SystemCollections.CACHE_JOIN_WRITERS);
+            SystemCollections.CACHE_JOIN_DIMENSIONS, SystemCollections.CACHE_JOIN_INDEXES, SystemCollections.CACHE_JOIN_WRITERS,
+            SystemCollections.CACHE_AGGREGATE_STATE);
     private final MongoClient client;
     private final MongoDatabase database;
     private final CacheBusinessScope business;
@@ -108,7 +109,7 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
         if (!business.equals(new CacheBusinessScope(old.clusterId(), old.bindingVersion(), old.cacheIncarnation()))) throw MongoCacheBusinessIdentity.businessFenced();
         Objects.requireNonNull(currentNode, "currentNode"); Objects.requireNonNull(ttl, "ttl"); Objects.requireNonNull(touchTime, "touchTime");
         if (ttl.isZero() || ttl.isNegative() || ttl.toMillis() < 1) throw new IllegalArgumentException("rebuild ttl must be at least one millisecond");
-        return StoreIo.call(() -> {
+        var result = MongoCachePipelineStateStore.writeTransaction(client, old.pipelineId(), () -> StoreIo.call(() -> {
             try {
                 active(original);
                 try (var session = client.startSession()) {
@@ -164,12 +165,10 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                                 .append("pipelineSources", MongoPipelineSourcePreparations.encode(request.inputs()))
                                 .append("sinkPreparations",MongoSinkPreparationStore.initial(original.preparationId())).append("pipelineRebuild", marker(receipt));
                         if (claims.updateOne(session, expected, new Document("$set", values)).getMatchedCount() != 1) throw fenced();
-                        if (SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session,
-                                new Document("_id", old.pipelineId()).append("scope", state.get("scope")).append("epoch", state.getLong("epoch"))
-                                        .append("runtimeWriteFence", state.getLong("runtimeWriteFence")),
-                                new Document("$set", new Document("scope", MongoPipelinePreparationFacts.scope(target)).append("stateJson", StateJson.of(PipelineState.STOPPED))
-                                        .append("epoch", epoch).append("runtimeWriteFence", writeFence).append("touchMillis", touchTime.toEpochMilli()))).getMatchedCount() != 1) throw fenced();
-                        discardObservation(session, old);
+                        var checkpoint = new Document("scope", MongoPipelinePreparationFacts.scope(target))
+                                .append("stateJson", StateJson.of(PipelineState.STOPPED)).append("epoch", epoch)
+                                .append("runtimeWriteFence", writeFence).append("touchMillis", touchTime.toEpochMilli());
+                        if (!MongoCachePipelineStateStore.update(database, session, state, new Document("$set", checkpoint))) throw fenced();
                         MongoOperatorInventory.prepareInitial(session, database, target, original.preparationId());
                         MongoPipelineSourcePreparations.seedInitial(session, database, target, request.inputs());
                         MongoSnapshotStateStore.seedInitial(session,database,target);
@@ -177,7 +176,9 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                     }, TRANSACTION);
                 }
             } catch (RuntimeException failure) { active(original); throw failure; }
-        });
+        }));
+        MongoCachePipelineObservationStore.reap(database, MongoCachePipelineObservationStore.scopeFilter(old));
+        return result;
     }
 
     private Receipt retained(ClientSession session, PipelineRebuildPreparation original, Document row, WorkloadClaim claim) {
@@ -210,7 +211,6 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
             MongoOperatorInventory.requireRetired(session, database, original);
             MongoPipelineSourcePreparations.verifyInitial(session, database, target, original.request().inputs());
             MongoSnapshotStateStore.verifyInitial(session,database,target);
-            if (SystemCollections.CACHE_PIPELINE_OBSERVATION.on(database).find(session, new Document("_id", target.pipelineId())).first() != null) throw rebuild(target);
             return receipt;
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw rebuild(target); }
     }
@@ -235,14 +235,6 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
     }
     private void absent(ClientSession session, SystemCollections table, Document filter, PipelineIntentScope target) {
         if (table.on(database).find(session, filter).projection(new Document("_id", 1)).first() != null) throw rebuild(target);
-    }
-    private void discardObservation(ClientSession session, PipelineIntentScope old) {
-        var table = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(database);
-        var row = table.find(session, new Document("_id", old.pipelineId())).first();
-        if (row == null) return;
-        // This diagnostic projection is replaceable; its complete physical scope is still mandatory.
-        if (!(row.get("scope") instanceof Document scope) || !MongoPipelinePreparationFacts.scope(old).equals(scope)) throw rebuild(old);
-        table.deleteOne(session, new Document("_id", old.pipelineId()).append("scope", scope));
     }
     private static PipelineIntentScope storedScope(Document row, PipelineIntentScope expected) {
         try { return MongoPipelinePreparationFacts.scope(row.get("pipelineScope", Document.class)); }

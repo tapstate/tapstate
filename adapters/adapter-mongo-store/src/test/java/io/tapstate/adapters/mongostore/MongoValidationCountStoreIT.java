@@ -19,6 +19,12 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class MongoValidationCountStoreIT {
     @Container static final MongoDBContainer MONGO=new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    private static String mongoUri() {
+        var fresh = MONGO.getDockerClient().inspectContainerCmd(MONGO.getContainerId()).exec();
+        var binding = fresh.getNetworkSettings().getPorts().getBindings()
+                .get(com.github.dockerjava.api.model.ExposedPort.tcp(27017))[0];
+        return MONGO.getReplicaSetUrl().replace(":" + MONGO.getMappedPort(27017), ":" + binding.getHostPortSpec());
+    }
     @Test void exactCountsAndZeroArePersistedWithoutSyntheticRootsAndReplayCannotReplaceFacts() {
         try(var f=new Fixture()) {
             var first=f.write("one",9007199254740993L,9007199254740992L);
@@ -32,6 +38,90 @@ class MongoValidationCountStoreIT {
             assertThat(report.getLong("resultBytes")).isEqualTo(report.getLong("countSummaryBytes")).isPositive();
             assertThat(report.getLong("rootCount")).isZero();
             assertThat(SystemCollections.VALIDATION_DIFFERENCES.on(f.database).countDocuments()).isZero();
+        }
+    }
+    @Test void failedTableAndSuccessfulCountSurviveTheSameCompletedReport() {
+        try(var f=new Fixture()) {
+            var report=f.start.report();
+            var failure=new ValidationTableFailure("one",ValidationTableFailure.Side.TARGET,ValidationError.READ_FAILED.code(),"Table read failed");
+            var write=new ValidationResultStore.TableFailureWrite(report,f.spec,failure);
+            assertThat(f.first.publishTableFailure(write)).isEqualTo(ValidationResultStore.Publication.APPLIED);
+            assertThat(f.second.publishTableFailure(write)).isEqualTo(ValidationResultStore.Publication.DUPLICATE);
+            var conflicting=new ValidationResultStore.TableFailureWrite(report,f.spec,
+                    new ValidationTableFailure("one",ValidationTableFailure.Side.SOURCE,ValidationError.READ_FAILED.code(),"Table read failed"));
+            assertThatThrownBy(()->f.second.publishTableFailure(conflicting)).isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("conflictingTableFailureReplay");
+            assertThatThrownBy(()->f.second.publishCount(f.write("one",1,1))).isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("conflictingTableOutcome");
+            assertThat(f.second.publishCount(f.write("two",2,2))).isEqualTo(ValidationResultStore.Publication.APPLIED);
+            var successful=new ValidationResultStore.TableFailureWrite(report,f.spec,
+                    new ValidationTableFailure("two",ValidationTableFailure.Side.TARGET,ValidationError.READ_FAILED.code(),"Table read failed"));
+            assertThatThrownBy(()->f.first.publishTableFailure(successful)).isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("conflictingTableOutcome");
+            assertThat(f.first.seal(report)).isEqualTo(ValidationResultStore.Seal.SEALED);
+            var terminal=new Document("formatVersion",1).append("state","COMPLETED").append("countingGeneration",1L)
+                    .append("knownAt",Instant.EPOCH.toString());
+            SystemCollections.VALIDATION_REPORTS.on(f.database).updateOne(
+                    new Document("_id",MongoValidationAdmissionStore.reportId(f.start.run())),
+                    new Document("$set",new Document("terminalMetadata",terminal)));
+
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,"run",f.task.generation(),1);
+            var stored=f.second.find(reference).orElseThrow();
+            assertThat(stored.tableFailures()).containsExactly(failure);
+            assertThat(stored.counts()).extracting(ValidationCountCheck::mappingId).containsExactly("two");
+            assertThat(stored.terminal()).isEqualTo(ValidationRunState.COMPLETED);
+            assertThat(f.report().getList("tableFailures",Document.class)).singleElement()
+                    .satisfies(row->assertThat(row).containsEntry("ordinal",0).doesNotContainKey("mappingId"));
+            assertThat(f.first.publishTableFailure(write)).isEqualTo(ValidationResultStore.Publication.CLOSED_OR_EXPIRED);
+        }
+    }
+    @Test void legacyAndProductFailuresSurviveRestartAndRemainReadableWithoutRewriting() throws Exception {
+        try (var f = new Fixture()) {
+            var failures = List.of(
+                    new ValidationTableFailure("one", ValidationTableFailure.Side.SOURCE, "validation.read-failed", "Old retained failure"),
+                    new ValidationTableFailure("two", ValidationTableFailure.Side.TARGET, ValidationError.READ_FAILED.code(), "New retained failure"));
+            for (var failure : failures)
+                assertThat(f.first.publishTableFailure(new ValidationResultStore.TableFailureWrite(f.start.report(), f.spec, failure)))
+                        .isEqualTo(ValidationResultStore.Publication.APPLIED);
+            assertThat(f.first.seal(f.start.report())).isEqualTo(ValidationResultStore.Seal.SEALED);
+            var original = f.report();
+            MONGO.getDockerClient().restartContainerCmd(MONGO.getContainerId()).exec();
+            try (var reopened = MongoClients.create(mongoUri())) {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+                boolean ready = false;
+                while (System.nanoTime() < deadline) {
+                    try {
+                        ready = Boolean.TRUE.equals(reopened.getDatabase("admin").runCommand(new Document("hello", 1)).getBoolean("isWritablePrimary"));
+                        if (ready) break;
+                    } catch (com.mongodb.MongoException waiting) { }
+                    Thread.sleep(100);
+                }
+                assertThat(ready).as("restarted replica set becomes writable").isTrue();
+                var reader = new MongoValidationResultStore(reopened, reopened.getDatabase(f.database.getName()), "cluster", () -> {});
+                var reference = new ValidationReports.Reference("flow", "task", ValidationMode.FULL, "run", f.task.generation(), 1);
+                assertThat(reader.find(reference).orElseThrow().tableFailures()).containsExactlyElementsOf(failures);
+                assertThat(SystemCollections.VALIDATION_REPORTS.on(reopened.getDatabase(f.database.getName()))
+                        .find(new Document("_id", original.get("_id"))).first()).isEqualTo(original);
+            }
+            verifyReaderArtifact(f, "validation.recovery.classpath", "ValidationRecoveryProbe",
+                    "RECOVERED_MIXED_REPORT [validation.read-failed, TS0300015]");
+            verifyReaderArtifact(f, "validation.legacy.classpath", "ValidationLegacyReaderProbe",
+                    "LEGACY_READER_REJECTED_PRODUCT_CODE");
+        }
+    }
+    private static void verifyReaderArtifact(Fixture f, String property, String main, String expected) throws Exception {
+        String classpath = System.getProperty(property);
+        if (classpath == null) return;
+        var process = new ProcessBuilder(System.getProperty("java.home") + "/bin/java", "-cp", classpath,
+                "io.tapstate.adapters.mongostore." + main, mongoUri(),
+                f.database.getName(), f.task.generation().toString()).redirectErrorStream(true).start();
+        try {
+            assertThat(process.waitFor(60, TimeUnit.SECONDS)).isTrue();
+            var output = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            assertThat(process.exitValue()).as(output).isZero();
+            assertThat(output).contains(expected);
+        } finally {
+            if (process.isAlive()) process.destroyForcibly();
         }
     }
     @Test void publishCompetesWithSealAndCannotResurrectAnExpiredReport()throws Exception {
@@ -67,7 +157,7 @@ class MongoValidationCountStoreIT {
         }
     }
     static final class Fixture implements AutoCloseable {
-        final MongoClient client=MongoClients.create(MONGO.getReplicaSetUrl()),other=MongoClients.create(MONGO.getReplicaSetUrl());
+        final MongoClient client=MongoClients.create(mongoUri()),other=MongoClients.create(mongoUri());
         final MongoDatabase database=client.getDatabase("count_results_"+UUID.randomUUID().toString().replace("-",""));
         final ValidationReportAdmission.Task task=new ValidationReportAdmission.Task("cluster","flow","task",UUID.randomUUID());
         final MongoValidationAdmissionStore admission=new MongoValidationAdmissionStore(client,database,"cluster",()->{});
@@ -103,6 +193,6 @@ class MongoValidationCountStoreIT {
             return new ValidationResultStore.CountWrite(start.report(),spec,new ValidationCountCheck(start.run(),mapping,"out",source,target,left,right));
         }
         Document report(){return SystemCollections.VALIDATION_REPORTS.on(database).find(new Document("_id",MongoValidationAdmissionStore.reportId(start.run()))).first();}
-        public void close(){try{database.drop();}finally{other.close();client.close();}}
+        public void close(){try(var cleanup=MongoClients.create(mongoUri())){cleanup.getDatabase(database.getName()).drop();}finally{other.close();client.close();}}
     }
 }

@@ -21,14 +21,17 @@ public record ValidationOperation(Context context,String pipeline,String task,UU
     /** A read observation only; the owner-fenced reservation still decides admission. */
     public enum OwnerLease { LIVE,NOT_LIVE,UNKNOWN }
     public record Table(String mapping,String phase) implements Serializable {
-        public Table {name(mapping);if(phase==null||!Set.of("PENDING","READING","READ_COMPLETE").contains(phase))throw invalid("table");}
+        public Table {name(mapping);if(phase==null||!Set.of("PENDING","READING","READ_COMPLETE","READ_FAILED").contains(phase))throw invalid("table");}
     }
     public record Status(ValidationOperation original,String run,Outcome outcome,String state,boolean admitted,boolean waiting,
             boolean controlUnknown,boolean retired,Drain drain,String reason,List<Table> tables) implements Serializable {
         public Status {
             if(original==null||outcome==null||drain==null||tables==null||tables.size()>ValidationTaskSpec.MAX_MAPPINGS)throw invalid("status");
             if(run!=null)name(run);if(state!=null)io.tapstate.core.validation.ValidationRunState.valueOf(state);
-            if(reason!=null&&!reason.matches("[a-z][a-z0-9.-]{0,127}"))throw invalid("reason");tables=List.copyOf(tables);
+            if (reason != null && !reason.matches("(?:[a-z][a-z0-9.-]{0,127}|TS(?!000)[0-9]{3}(?!0000)[0-9]{4})")) {
+                throw invalid("reason");
+            }
+            tables = List.copyOf(tables);
         }
     }
     /** Request-scoped ownership of the bounded status and logical table projection through serialization. */

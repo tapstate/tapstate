@@ -42,6 +42,16 @@ public interface CaptureListener {
     default void onError(Throwable error) {
     }
 
+    /** The same original failure accompanied by a safe snapshot from this capture's fixed context. */
+    default void onError(Throwable error, java.util.Map<String, Object> diagnostic) {
+        onError(error);
+    }
+
+    /** Delivers one owner-captured failure without separating its safe public fields. */
+    default void onFailure(io.tapstate.core.common.FailureFact failure) {
+        onError(failure.cause(), failure.diagnostic());
+    }
+
     /**
      * Called when a position the stream's subscription was {@linkplain Subscription#acknowledge told is
      * durable} has been handed to the source, and the source took it without complaint.

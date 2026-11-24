@@ -20,7 +20,7 @@ class UnwindColumnCollisionTest {
         Throwable failure = catchThrowable(() -> derive(ordinal, elementKey));
         assertThat(failure).isInstanceOf(TapstateException.class);
         TapstateException refusal = (TapstateException) failure;
-        assertThat(refusal.code().code()).isEqualTo("dsl.unwind-column-already-exists");
+        assertThat(refusal.code().code()).isEqualTo("TS0010027");
         assertThat(refusal.args()).containsEntry("column", column).containsEntry("option", option);
     }
 

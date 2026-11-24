@@ -16,16 +16,51 @@ final class MongoCacheBusinessIdentity {
     MongoCacheBusinessIdentity(MongoDatabase database, CacheBusinessScope scope) { this.database = database; this.scope = scope; }
     void requireReady(ClientSession session) { readyIdentity(session); }
 
+    /** Keeps the original readiness predicates within the caller's transaction snapshot. */
+    void requireReadyCombined(ClientSession session) {
+        var result = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                MongoPipelineObservationRead.match(new Document("_id", "cluster")),
+                MongoPipelineObservationRead.boundedRow(), MongoPipelineObservationRead.originalRow(),
+                MongoPipelineObservationRead.one(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"))).first();
+        if (result != null && !MongoPipelineObservationRead.overflow(result, "schema", 1)) {
+            var identity = result.get("body", Document.class);
+            if (identity.containsKey("_id")) {
+                requireObservedReady(identity, MongoPipelineObservationRead.single(result, "schema"), scope);
+                return;
+            }
+        }
+        requireReady(session);
+    }
+
     private Document readyIdentity(ClientSession session) { return readyIdentity(session, null); }
 
     void requireValidationPreparation(ClientSession session, String operation) { readyIdentity(session, java.util.Objects.requireNonNull(operation)); }
 
     private Document readyIdentity(ClientSession session, String maintenance) {
         Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+        requireReadyIdentity(identity, scope);
+        Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+        requireReadySchema(identity, schema, scope, maintenance);
+        return identity;
+    }
+
+    static void requireObservedAdmission(Document identity, Document schema, CacheBusinessScope scope) {
+        requireObservedReady(identity, schema, scope);
+        admissionRevision(identity);
+    }
+
+    static void requireObservedReady(Document identity, Document schema, CacheBusinessScope scope) {
+        requireReadyIdentity(identity, scope);
+        requireReadySchema(identity, schema, scope, null);
+    }
+
+    private static void requireReadyIdentity(Document identity, CacheBusinessScope scope) {
         if (identity == null || !scope.clusterId().equals(identity.get("clusterId")) || !Long.valueOf(scope.bindingVersion()).equals(identity.get("bindingVersion"))
                 || !scope.cacheIncarnation().equals(identity.get("cacheIncarnation")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
                 || !MongoCacheIdentity.READY.equals(identity.get("businessPhase"))) throw businessFenced();
-        Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+    }
+
+    private static void requireReadySchema(Document identity, Document schema, CacheBusinessScope scope, String maintenance) {
         if (schema == null || !(schema.get("installedVersion") instanceof Integer version)) throw unreadable();
         if (version > MongoValidationSchema.VERSION) throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY,
                 Map.of("installed", String.valueOf(version), "supported", String.valueOf(MongoValidationSchema.VERSION)), null);
@@ -38,7 +73,6 @@ final class MongoCacheBusinessIdentity {
         }
         if (!(identity.get("businessPreparationId") instanceof String operation) || operation.isBlank()
                 || !operation.equals(schema.get("operationId")) || !(schema.get("epoch") instanceof Long epoch) || epoch < 1) throw unreadable();
-        return identity;
     }
 
     /** Claim admission is infrequent; protected event writes continue to contend on their own claim. */

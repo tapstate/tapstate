@@ -1,0 +1,62 @@
+{
+  "TS0440001": {
+    "message": "Pipeline {pipeline} has no running job to act on.",
+    "solution": "Start the pipeline before pausing or resuming it, and check the id for typos."
+  },
+  "TS0440002": {
+    "message": "Chain {chain} reached generation {epoch} position {seq}, past what the engine encodes an ordering value in.",
+    "solution": "Report this with the pipeline: the range is a build-time width, and no configuration widens it."
+  },
+  "TS0440003": {
+    "message": "This member may no longer act for pipeline `{pipeline}`: its run is not the current one.",
+    "solution": "Let the member that holds the pipeline's claim run it; check cluster connectivity to the coordination store if no member is running it."
+  },
+  "TS0440004": {
+    "message": "Pipeline {pipeline} stopped because its execution lease expired or was replaced.",
+    "solution": "Check the current run owner and coordination-store connectivity; confirm the current run state before acting."
+  },
+  "TS0440005": {
+    "message": "Pipeline {pipeline} stopped because it could not confirm renewal of its execution lease.",
+    "solution": "Restore coordination-store connectivity and confirm the current run owner before deciding whether to restart."
+  },
+  "TS0440006": {
+    "message": "Pipeline {pipeline} could not be started: its previous run was still ending after {seconds}s.",
+    "solution": "Wait for the previous run to finish stopping and start the pipeline again; if it never does, check the member's logs for a processor that is not shutting down."
+  },
+  "TS0440007": {
+    "message": "View {view} cannot apply a {operation} because its earlier row does not carry the selected alternate key {key}.",
+    "solution": "Configure the source so update and delete before images carry {key}, then start the pipeline again."
+  },
+  "TS0440008": {
+    "message": "Pipeline {pipeline} stopped because its job failed: {cause}.",
+    "solution": "Check the pipeline's logs for the failure, fix what it reports, then start the pipeline again."
+  },
+  "TS0440009": {
+    "message": "Pipeline {pipeline} stopped because the engine ran out of memory and shut down.",
+    "solution": "The server reports itself unhealthy until it is restarted. Restart it with a larger Java heap (for example -XX:MaxRAMPercentage or -Xmx), or run fewer pipelines at once, then start the pipeline again."
+  },
+  "TS0440010": {
+    "message": "Chain {chain} has not advanced its durable position for {minutes} minutes ({cause}; the bound combined for it has run {gap} ahead).",
+    "solution": "The source keeps its log from that position onwards, so act before the log's retention passes it: if the chain is waiting on changes still pending upstream, find what is holding them; if it is starved of positions, the sink has nothing to advance to and the source must supply them."
+  },
+  "TS0440011": {
+    "message": "A second row of join source {source} arrived under key {key}, replacing the row already filed under it; that row is now unreachable and every row matching this key joins to the new one.",
+    "solution": "The join matches {source} on a column that does not identify its rows, so two of them share one key. Match it on a column that is unique in that source, or narrow the source so only one row can hold the key. Until then the target holds fewer rows than the query describes."
+  },
+  "TS0440012": {
+    "message": "A change on stream {stream} reached node {node} without its key ({columns}), so it cannot be routed to the processor that holds the other changes of its row.",
+    "solution": "Make sure every change on {stream} carries {columns} - in the later image, or in the earlier one for a removal - or set execution.parallelism to 1 on {node}."
+  },
+  "TS0440013": {
+    "message": "An update on stream {stream} changed its row's key at node {node}, which runs on several processors; the change cannot be kept in order with both keys.",
+    "solution": "Set execution.parallelism to 1 on {node} if rows on {stream} change their key; one processor applies such changes in order."
+  },
+  "TS0440014": {
+    "message": "Pipeline {pipeline} was planned for {planned} members but started on {actual}; it was stopped before any processor ran.",
+    "solution": "Nothing to do: the next start works the plan out again for the members present then."
+  },
+  "TS0440015": {
+    "message": "The cluster refused operations on operator state `{state}` for {seconds}s, so the run stopped.",
+    "solution": "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."
+  }
+}

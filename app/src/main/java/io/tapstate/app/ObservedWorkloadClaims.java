@@ -18,6 +18,7 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
         private final DeadlineWorkloadClaimStore bounded;
         Bounded(DeadlineWorkloadClaimStore bounded,BiConsumer<Boolean,Throwable> observer){super(bounded,observer);this.bounded=bounded;}
         public <T>T withDeadline(long deadline,Runnable active,Supplier<T> operation){return bounded.withDeadline(deadline,active,operation);}
+        public <T>T withRenewalDeadline(long deadline,Runnable active,Supplier<T> operation){return bounded.withRenewalDeadline(deadline,active,operation);}
         public void awaitQuiescence(long deadline){bounded.awaitQuiescence(deadline);}
     }
     private <T>T call(boolean write,Supplier<T> action){
@@ -29,6 +30,9 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
     private void report(boolean write,Throwable failure){try{observer.accept(write,failure);}catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Storage operation collection is degraded");}}
     public WorkloadClaimAttempt acquire(WorkloadClaimKey key,WorkloadOwner owner,long revision,Duration ttl){return call(true,()->delegate.acquire(key,owner,revision,ttl));}
     public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope scope,WorkloadOwner owner,long revision,Duration ttl){return call(true,()->delegate.acquirePipeline(scope,owner,revision,ttl));}
+    @Override public WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node, long revision) {
+        return call(true, () -> delegate.acquireNodeBackedPipeline(scope, node, revision));
+    }
     public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope){return call(false,()->delegate.readPipeline(scope));}
     public Optional<WorkloadClaim> renew(WorkloadClaim expected,Duration ttl){return call(true,()->delegate.renew(expected,ttl));}
     public boolean release(WorkloadClaim expected){return call(true,()->delegate.release(expected));}

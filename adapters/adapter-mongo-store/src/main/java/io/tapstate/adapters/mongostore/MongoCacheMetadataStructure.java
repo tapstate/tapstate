@@ -22,7 +22,7 @@ import com.mongodb.client.cursor.TimeoutMode;
 final class MongoCacheMetadataStructure {
     private static final List<SystemCollections> TABLES = List.of(SystemCollections.CACHE_SOURCE_SCHEMAS,
             SystemCollections.CACHE_CONNECTOR_CATALOG, SystemCollections.CACHE_CONNECTOR_SPECS,
-            SystemCollections.CACHE_CONNECTION_TEST_RESULTS, SystemCollections.CACHE_CONNECTOR_ARTIFACTS,
+            SystemCollections.CACHE_CONNECTION_TEST_RESULTS,
             SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY);
     private static final List<SystemCollections> BUSINESS_TABLES = java.util.stream.Stream.concat(TABLES.stream(), java.util.stream.Stream.of(
             SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION,
@@ -31,7 +31,7 @@ final class MongoCacheMetadataStructure {
             SystemCollections.DIRECT_CHANNEL_OFFSETS, SystemCollections.DIRECT_BATCHES,
             SystemCollections.CACHE_CLUSTER_MEMBERSHIP, SystemCollections.CACHE_NEST_STATE, SystemCollections.CACHE_JOIN_FACTS,
             SystemCollections.CACHE_JOIN_DIMENSIONS, SystemCollections.CACHE_JOIN_INDEXES, SystemCollections.CACHE_JOIN_WRITERS,
-            SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_SINK_PREPARATIONS,
+            SystemCollections.CACHE_AGGREGATE_STATE, SystemCollections.CACHE_NEST_SHAPES, SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_SINK_PREPARATIONS,
             SystemCollections.CACHE_SNAPSHOT_ORDERS,SystemCollections.CACHE_SNAPSHOT_COUNTS)).toList();
     private static final SystemCollections.IndexSpec FILE_NAMES = new SystemCollections.IndexSpec(
             List.of("filename", "uploadDate"), false, "filename_1_uploadDate_1");
@@ -56,7 +56,8 @@ final class MongoCacheMetadataStructure {
      * structures are only verified; a partial set is unknown and is never repaired by this helper.
      */
     void prepareInTransaction(ClientSession session, Runnable requireActive) {
-        prepareInTransaction(session, requireActive, TABLES);
+        prepareInTransaction(session, requireActive, java.util.stream.Stream.concat(TABLES.stream(),
+                java.util.stream.Stream.of(SystemCollections.CACHE_CONNECTOR_ARTIFACTS)).toList());
     }
 
     void prepareBusinessInTransaction(ClientSession session, Runnable requireActive) {
@@ -81,6 +82,26 @@ final class MongoCacheMetadataStructure {
         requireActive.run();
     }
 
+    boolean hasAggregateState() {
+        return !collections(Set.of(SystemCollections.CACHE_AGGREGATE_STATE.collectionName())).isEmpty();
+    }
+
+    void prepareRetainedAggregateStateInTransaction(ClientSession session,
+            io.tapstate.spi.store.CacheBusinessScope scope, Runnable requireActive) {
+        if (hasAggregateState()) return;
+        verify(BUSINESS_TABLES.stream().filter(table -> table != SystemCollections.CACHE_AGGREGATE_STATE).toList());
+        var referenced = new Document("_id.clusterId", scope.clusterId()).append("_id.bindingVersion", scope.bindingVersion())
+                .append("_id.cacheIncarnation", scope.cacheIncarnation())
+                .append("placements.resource", io.tapstate.spi.store.OperatorPlacement.Resource.AGGREGATE_STATE.name());
+        if (SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, referenced)
+                .projection(new Document("_id", 1)).first() != null) throw unreadable("collections");
+        prepareInTransaction(session, requireActive, List.of(SystemCollections.CACHE_AGGREGATE_STATE));
+    }
+
+    void prepareLegacyConnectorArtifactsInTransaction(ClientSession session, Runnable requireActive) {
+        prepareInTransaction(session, requireActive, List.of(SystemCollections.CACHE_CONNECTOR_ARTIFACTS));
+    }
+
     /** Load-only validation: neither missing collections nor missing or changed indexes cause DDL. */
     void verify() { verify(TABLES); }
 
@@ -93,10 +114,32 @@ final class MongoCacheMetadataStructure {
         verify(List.of(table), remainingMillis);
     }
 
-    void verifySrs() {
-        verify(List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.SRS_CHAINS,
-                SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS,
-                SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS));
+    private static final List<SystemCollections> SRS_TABLES = List.of(
+            SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.SRS_CHAINS,
+            SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS,
+            SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS);
+
+    void verifySrs() { verify(SRS_TABLES); }
+
+    void verifySrsRuntime() {
+        var tables = new java.util.ArrayList<>(SRS_TABLES);
+        tables.add(SystemCollections.CACHE_PIPELINE_STATE);
+        verify(tables);
+    }
+
+    static boolean simpleCollations(MongoDatabase database, List<SystemCollections> tables) {
+        var names = tables.stream().map(SystemCollections::collectionName).toList();
+        var found = MongoCollectionMetadata.matching(database, names);
+        // An absent optional collection has no collation and contributes no rows.
+        return found.stream().allMatch(row -> {
+            var options = row.get("options", Document.class);
+            return options == null || !options.containsKey("collation")
+                    || "simple".equals(options.get("collation", Document.class).get("locale"));
+        });
+    }
+
+    void verifyObservation() {
+        verify(List.of(SystemCollections.CACHE_SNAPSHOT_COUNTS, SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_SOURCE_SCHEMAS));
     }
 
     void verifyDirect() {

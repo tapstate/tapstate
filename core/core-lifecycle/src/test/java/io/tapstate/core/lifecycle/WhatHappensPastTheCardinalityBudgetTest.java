@@ -78,6 +78,15 @@ class WhatHappensPastTheCardinalityBudgetTest {
     void theBudgetTableIsTheDocumentedOne() {
         assertThat(Arrays.stream(CardinalityBudget.values()).map(CardinalityBudget::instrument))
                 .containsExactlyInAnyOrder(
+                        "tapstate.pipeline.aggregate.rows",
+                        "tapstate.pipeline.aggregate.groups",
+                        "tapstate.pipeline.aggregate.state.entries",
+                        "tapstate.pipeline.aggregate.tombstones",
+                        "tapstate.pipeline.aggregate.group.rows.largest",
+                        "tapstate.pipeline.aggregate.groups.failed",
+                        "tapstate.pipeline.aggregate.inputs",
+                        "tapstate.pipeline.aggregate.state.writes",
+                        "tapstate.pipeline.aggregate.order_conflicts",
                         "tapstate.pipeline.records",
                         "tapstate.pipeline.bytes",
                         "tapstate.pipeline.lag",
@@ -91,6 +100,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.entries",
                         "tapstate.pipeline.nest.accesses",
+                        "tapstate.pipeline.nest.read.keys",
+                        "tapstate.pipeline.nest.write.keys",
                         "tapstate.pipeline.nest.backfills",
                         "tapstate.pipeline.nest.key.accesses",
                         "tapstate.pipeline.nest.cold.keys",
@@ -98,7 +109,17 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.nest.pending.high_water",
                         "tapstate.pipeline.nest.stored",
                         "tapstate.pipeline.nest.dead_lettered",
+                        "tapstate.pipeline.nest.roots.rendered",
                         "tapstate.pipeline.nest.namespace.info",
+                        "tapstate.pipeline.state.commit.groups",
+                        "tapstate.pipeline.state.commit.keys",
+                        "tapstate.pipeline.state.commit.round_trips",
+                        "tapstate.pipeline.state.commit.duration",
+                        "tapstate.pipeline.state.evictions",
+                        "tapstate.pipeline.state.document.bytes",
+                        "tapstate.pipeline.state.document.bytes.max",
+                        "tapstate.pipeline.state.commit.bytes",
+                        "tapstate.pipeline.nest.rollup.fold.duration",
                         "tapstate.pipeline.join.recompute.rows",
                         "tapstate.pipeline.join.recompute.rows.total",
                         "tapstate.pipeline.records.driven",
@@ -126,6 +147,14 @@ class WhatHappensPastTheCardinalityBudgetTest {
         for (CardinalityBudget budget : List.of(CardinalityBudget.JOIN_RECOMPUTE_ROWS,
                 CardinalityBudget.JOIN_RECOMPUTE_ROWS_TOTAL)) {
             assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.JOIN_NAMESPACE);
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
+        }
+        for (CardinalityBudget budget : List.of(CardinalityBudget.AGGREGATE_ROWS, CardinalityBudget.AGGREGATE_GROUPS,
+                CardinalityBudget.AGGREGATE_STATE_ENTRIES, CardinalityBudget.AGGREGATE_TOMBSTONES,
+                CardinalityBudget.AGGREGATE_LARGEST_GROUP, CardinalityBudget.AGGREGATE_FAILED_GROUPS,
+                CardinalityBudget.AGGREGATE_INPUTS, CardinalityBudget.AGGREGATE_STATE_WRITES,
+                CardinalityBudget.AGGREGATE_ORDER_CONFLICTS)) {
+            assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.AGGREGATE_STEP);
             assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
         }
         assertThat(CardinalityBudget.ERRORS.openDimension()).contains(CODE);
@@ -477,10 +506,12 @@ class WhatHappensPastTheCardinalityBudgetTest {
                 .filter(budget -> budget.fold() == CardinalityBudget.Fold.HIGHEST)
                 .map(CardinalityBudget::instrument))
                 .containsExactlyInAnyOrder(
+                        "tapstate.pipeline.aggregate.group.rows.largest",
                         "tapstate.pipeline.lag",
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
+                        "tapstate.pipeline.state.document.bytes.max",
                         "tapstate.pipeline.nest.namespace.info",
                         "tapstate.pipeline.reconcile.failures.streak");
     }

@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * workspace validation status, and the reference relationships in both directions (what it references
  * and who references it). This suite drives the one-shot surface and the REPL session wiring: the
  * per-kind summaries, the {@code valid} / {@code invalid} validation status, the forward / reverse
- * references, the {@code -o json|yaml} envelope, the {@code cli.resource-not-found} coded miss, and
+ * references, the {@code -o json|yaml} envelope, the {@code TS0330017} coded miss, and
  * that {@code desc} is registered as an offline verb.
  */
 class DescCmdTest {
@@ -191,7 +191,7 @@ class DescCmdTest {
         Run r = run("desc", "p1", "-w", ws.toString());
         // desc describes the resource regardless; validation is reported as invalid with the code
         assertThat(r.code()).isZero();
-        assertThat(r.out()).containsIgnoringCase("invalid").contains("dsl.missing-reference");
+        assertThat(r.out()).containsIgnoringCase("invalid").contains("TS0010005");
     }
 
     // ---- references: forward and reverse -----------------------------------------------
@@ -270,7 +270,7 @@ class DescCmdTest {
         scaffoldReuseAssembly(ws);
         Run r = run("desc", "nope", "-w", ws.toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.resource-not-found").contains("nope");
+        assertThat(r.all()).contains("TS0330017").contains("nope");
     }
 
     @Test
@@ -278,7 +278,7 @@ class DescCmdTest {
         scaffoldReuseAssembly(ws);
         Run r = run("desc", "nope", "-o", "json", "-w", ws.toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.out()).contains("\"code\": \"cli.resource-not-found\"");
+        assertThat(r.out()).contains("\"code\": \"TS0330017\"");
         // the failure envelope carries the top-level status discriminator, like new / validate
         assertThat(r.out()).contains("\"status\": \"error\"");
     }
@@ -287,7 +287,7 @@ class DescCmdTest {
     void descInEmptyWorkspaceIsResourceNotFound(@TempDir Path empty) {
         Run r = run("desc", "anything", "-w", empty.toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.resource-not-found");
+        assertThat(r.all()).contains("TS0330017");
     }
 
     // ---- honesty: unreadable / malformed ------------------------------------------------
@@ -301,7 +301,7 @@ class DescCmdTest {
         assertThat(r.code()).isZero();
         assertThat(r.all()).containsIgnoringCase("unreadable");
         // its validation is the coded malformed-yaml — never a raw snakeyaml stack at the user boundary
-        assertThat(r.all()).contains("dsl.malformed-yaml");
+        assertThat(r.all()).contains("TS0010017");
         assertThat(r.all()).doesNotContain("org.yaml.snakeyaml");
     }
 
@@ -318,7 +318,7 @@ class DescCmdTest {
         Run r = run("desc", "src_ok", "-w", ws.toString());
         // describing a readable resource must not crash on a malformed neighbour the validate run hits
         assertThat(r.code()).isZero();
-        assertThat(r.all()).contains("dsl.malformed-yaml");
+        assertThat(r.all()).contains("TS0010017");
         assertThat(r.all()).doesNotContain("org.yaml.snakeyaml");
     }
 
@@ -330,7 +330,7 @@ class DescCmdTest {
         assertThat(r.code()).isZero();
         // the machine shape is honest: readable:false and NO summary key (which would claim a shape it lacks)
         assertThat(r.out()).contains("\"readable\": false").doesNotContain("\"summary\"");
-        assertThat(r.out()).contains("dsl.malformed-yaml");
+        assertThat(r.out()).contains("TS0010017");
     }
 
     @Test
@@ -348,7 +348,7 @@ class DescCmdTest {
         // no source-only fields nor a summary leak under the pipeline discriminator
         assertThat(r.out()).doesNotContain("connector").doesNotContain("\"summary\"");
         // and validation surfaces the same conflict as a coded kind-dir mismatch
-        assertThat(r.out()).contains("cli.kind-dir-mismatch");
+        assertThat(r.out()).contains("TS0330016");
     }
 
     @Test

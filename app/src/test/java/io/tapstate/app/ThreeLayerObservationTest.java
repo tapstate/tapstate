@@ -27,6 +27,7 @@ class ThreeLayerObservationTest {
         f.mapping.set(new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.REBUILDING, "purge"));
         var artifacts = mock(ArtifactStore.class);
         when(artifacts.get("pipeline")).thenReturn(Optional.of(new PipelineResource("pipeline", null, List.of(), null, null, null, null, null)));
+        when(artifacts.readableInventory("pipeline", "pipeline")).thenCallRealMethod();
         var query = new ArtifactQueryService(artifacts);
         var drafts = mock(PipelineDraftService.class);
         when(drafts.find("pipeline")).thenReturn(Optional.empty());
@@ -74,6 +75,69 @@ class ThreeLayerObservationTest {
         var f = new Fixture();
         assertThat(f.port.observations().read("pipeline")).contains(f.observed);
         verify(f.cache).pipelineObservations(f.scope);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = IoError.class, names = {"DOCUMENT_UNREADABLE", "PIPELINE_STATE_REBUILD_REQUIRED"})
+    void aRecordedStartFailureUsesOnlyItsKnownPipelineIdentity(IoError code) {
+        var f = new Fixture();
+        var pending = new PipelinePreparation("pipeline", 1,
+                PipelinePreparation.Phase.UNASSIGNED, null, null, null);
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), pending,
+                Optional.empty(), Optional.empty(), false, Optional.of(code), 1);
+        when(f.configuration.pipelineDisplayHeaders(List.of("pipeline"), false))
+                .thenReturn(Map.of("pipeline", header));
+        var observation = f.port.observations().readAll(List.of("pipeline")).get("pipeline");
+        assertThat(observation.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(observation.failure().code()).isEqualTo(code.code());
+        assertThat(observation.failure().params()).isEqualTo(code == IoError.PIPELINE_STATE_REBUILD_REQUIRED
+                ? Map.of("pipeline", "pipeline") : Map.of());
+        assertThat(observation.failure().diagnostic()).isEmpty();
+        verifyNoInteractions(f.cache);
+    }
+
+    @Test void aRecordedStartFailureProjectsTheStoredDocumentAndField() {
+        var f = new Fixture();
+        var pending = new PipelinePreparation("pipeline", 1, PipelinePreparation.Phase.UNASSIGNED, null, null, null);
+        var params = Map.of("id", "doc-42", "field", "revision");
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), pending,
+                Optional.empty(), Optional.empty(), false, Optional.of(IoError.DOCUMENT_UNREADABLE), 1, params);
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeaders(ids, true)).thenReturn(Map.of("pipeline", header));
+
+        var failure = f.port.pipelineCatalogStates(ids).get("pipeline").observation().orElseThrow().failure();
+        assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+        assertThat(failure.params()).isEqualTo(params);
+        verifyNoInteractions(f.cache);
+    }
+
+    @Test void aBatchCannotPublishAnObservationAfterItsConfigurationFenceChanges() {
+        var f = new Fixture();
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(),
+                f.preparations.read("pipeline").orElseThrow(), Optional.empty(), Optional.empty(), false);
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeaders(ids, false))
+                .thenReturn(Map.of("pipeline", header), Map.of());
+        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any(), eq(false))).thenAnswer(call -> {
+            f.mapping.set(new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.REBUILDING, "purge"));
+            return Map.of("pipeline", new MongoCacheDomain.PipelineObservationReading(Optional.of(f.observed), false));
+        });
+
+        assertThat(f.port.observations().readAll(ids)).isEmpty();
+        verify(f.cache, never()).pipelineObservations(any());
+    }
+
+    @Test void aCoherentBatchKeepsTheObservedStateAndDoesNotRereadEachPipeline() {
+        var f = new Fixture();
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(),
+                f.preparations.read("pipeline").orElseThrow(), Optional.empty(), Optional.empty(), false);
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeaders(ids, false)).thenReturn(Map.of("pipeline", header));
+        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any(), eq(false)))
+                .thenReturn(Map.of("pipeline", new MongoCacheDomain.PipelineObservationReading(Optional.of(f.observed), false)));
+
+        assertThat(f.port.observations().readAll(ids)).containsEntry("pipeline", f.observed);
+        verify(f.cache, never()).pipelineObservations(any());
     }
 
     @Test void aRebuildThatOvertakesAnObservationReadCannotPublishTheOldGeneration() {

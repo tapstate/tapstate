@@ -7,6 +7,7 @@ import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.*;
 import io.tapstate.core.dsl.DslParser;
@@ -16,6 +17,12 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
 import io.tapstate.testsupport.RequiresDocker;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -23,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -136,7 +144,15 @@ class ThreeLayerRestartContinuationIT {
                 Await.until("the real bounded job and target writes to complete",BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.COMPLETED::equals).isPresent(),() -> control.logs(PIPELINE));
                 awaitRows(mongo,source,target,"the completed bounded target values");
-                assertThat(control.snapshotTable(PIPELINE,TABLE)).contains(new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true));
+                var expectedSnapshot = new TableSnapshot(8, 8L, 100, true);
+                var completedSnapshot = new AtomicReference<Map<String, TableSnapshot>>(Map.of());
+                // The completion checkpoint precedes publication of the final snapshot observation.
+                Await.until("the completed bounded snapshot observation", BOUND, () -> {
+                    var reading = control.snapshotTables(PIPELINE);
+                    completedSnapshot.set(reading);
+                    return expectedSnapshot.equals(reading.get(TABLE));
+                }, () -> "pipeline=" + control.state(PIPELINE) + ", snapshot=" + completedSnapshot.get());
+                assertThat(completedSnapshot.get()).containsEntry(TABLE, expectedSnapshot);
                 var observed=Await.answered("the completed observation timestamp",BOUND,() -> control.observedAt(PIPELINE));
                 mongo.insert(source,TABLE,List.of(Map.of("id",99L,"seq",999L)));
                 lastObservation=Await.answered("another completed pass after capture cleanup",BOUND,
@@ -372,11 +388,12 @@ class ThreeLayerRestartContinuationIT {
                     originalConfiguration = installationFacts(configuration);
                     assertThat(chains.countDocuments()).isOne(); originalChain = chains.find().first();
                     assertThat(originalChain.get("checkpoint", Document.class)).isNotEmpty();
+                    long outageLogOffset = Files.size(first.output());
                     CACHE.getDockerClient().pauseContainerCmd(CACHE.getContainerId()).exec(); paused = true;
                     mongo.update(source, TABLE, Map.of("id", 2L), Map.of("seq", 222L));
                     mongo.delete(source, TABLE, Map.of("id", 3L));
                     Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
-                            () -> first.tail().contains("Node session lost:"), first::tail);
+                            () -> recordedNodeSessionLoss(first.output(), outageLogOffset), first::tail);
                     assertThat(first.isAlive()).isTrue();
                     if (!together) {
                         assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
@@ -516,6 +533,16 @@ class ThreeLayerRestartContinuationIT {
                 "--tapstate.cluster.id=" + cluster, "--tapstate.cluster.node-id=restart-node",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--SDK_STATUS_SENDER_ENABLED=false", "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds")));
+    }
+
+    private static boolean recordedNodeSessionLoss(Path output, long outageLogOffset) {
+        try (var input = Files.newInputStream(output);
+             var reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            input.skipNBytes(outageLogOffset);
+            return reader.lines().anyMatch(line -> line.contains("Node session lost:"));
+        } catch (IOException e) {
+            throw new UncheckedIOException("could not read server output at " + output, e);
+        }
     }
 
     private static ControlPlane login(RealProcessServer server) {

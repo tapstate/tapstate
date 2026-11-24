@@ -85,8 +85,13 @@ class MongoValidationReportsIT {
             }
             var last=runs.getLast();var known=last.reservation().access().control().read(last.run().identity().owner(),last.run()).orElseThrow();
             var reports=f.configuration.validationReports(()->{});
-            var cleaned=reports.retain(new ValidationReports.Retention(create.task(),ValidationMode.FULL,1,List.of(known)));
+            var retention = new ValidationReports.Retention(create.task(), ValidationMode.FULL, 1, List.of(known));
+            long before = f.configuration.configurationRevision();
+            var cleaned = reports.retain(retention);
             assertThat(cleaned.removed()).isEqualTo(2);assertThat(cleaned.blocked()).isFalse();
+            assertThat(f.configuration.configurationRevision()).isEqualTo(before + 1);
+            assertThat(reports.retain(retention).removed()).isZero();
+            assertThat(f.configuration.configurationRevision()).isEqualTo(before + 1);
             assertThat(reports.history("flow",create.task().taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).items()).hasSize(1);
             assertThat(reports.find(reference(runs.getFirst().reservation().start()))).isEmpty();
             assertThat(runs.getFirst().reservation().access().admissions().open(new ValidationReportAdmission.Open(runs.getFirst().reservation().start(),runs.getFirst().run().snapshot())))

@@ -20,6 +20,9 @@ public final class SecretRedactor {
     private static final Pattern WORD = Pattern.compile("[\\p{L}\\p{N}_]+");
     private static final Pattern WORD_BOUNDARY = Pattern.compile("(?<![\\p{L}\\p{N}_])%s(?![\\p{L}\\p{N}_])");
 
+    private static final Pattern HTTP_AUTHORIZATION = Pattern.compile(
+            "(?i)(\\bAuthorization\"?\\h*+[:=]\\h*+[\"\\[]?\\h*+(?:Basic|Bearer)\\h++)[A-Za-z0-9._~+/\\-]+=*");
+
     private final Map<String, List<String>> valuesByOwner = new LinkedHashMap<>();
     private final AtomicReference<List<String>> snapshot = new AtomicReference<>(List.of());
 
@@ -65,6 +68,15 @@ public final class SecretRedactor {
         return redact(MongoLogSanitizer.redact(text));
     }
 
+    /** Hides connection credentials and the admitted operation's known secret values. */
+    public static String redactConnectionDiagnostic(String text, Collection<String> values) {
+        if (text == null) {
+            return null;
+        }
+        String safe = HTTP_AUTHORIZATION.matcher(text).replaceAll("$1" + MongoUriUserInfo.REDACTED);
+        return redactValues(MongoLogSanitizer.redactReport(safe), values, MongoUriUserInfo.REDACTED);
+    }
+
     /** Redacts supplied values using the same matcher as the process-wide log registry. */
     public static String redactValues(String text, Collection<String> values, String replacement) {
         if (text == null) {
@@ -94,6 +106,10 @@ public final class SecretRedactor {
     }
 
     private static String replaceOutsideMarkers(String text, String secret, String replacement) {
+        if (!EXISTING_MARKERS.contains(secret) && EXISTING_MARKERS.stream().anyMatch(secret::contains)) {
+            // A complete admitted credential outranks marker-like text contained within it.
+            return text.replace(secret, replacement);
+        }
         StringBuilder result = new StringBuilder(text.length());
         int segmentStart = 0;
         int cursor = 0;

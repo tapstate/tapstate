@@ -19,7 +19,7 @@ class MongoPipelineDraftStoreTest {
                 "Orders", "draft", new PipelineDraft.Graph(
                         List.of(new PipelineDraft.Node("source", "source", "crm", "orders",
                                 Map.of("selected", true), Map.of("label", "Orders"))),
-                        List.of(), new PipelineDraft.Viewport(1, 2, 0.75)), null,
+                        List.of(), new PipelineDraft.Viewport(1, 2, 0.75), Map.of("crm", Map.of("preImage", false))), null,
                 "hash-1", 2L, "hash-1", Instant.parse("2026-09-21T00:00:00Z"),
                 Instant.parse("2026-09-21T01:00:00Z"), "author");
 
@@ -61,7 +61,8 @@ class MongoPipelineDraftStoreTest {
                                         PipelineDraft.Shape.ARRAY, "items", List.of("item_id"), List.of("item_id")),
                                 List.of(new PipelineDraft.Transform("keep-items", "filter",
                                         Map.of("expr", "active == true"))))),
-                        List.of(new PipelineDraft.Transform("post-map", "map", Map.of("count", 1))), null),
+                        List.of(new PipelineDraft.Transform("post-map", "map", Map.of("count", 1))), null,
+                        Map.of("mysql", Map.of("preImage", false))),
                 null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
 
         PipelineDraft restored = MongoPipelineDraftStore.fromDocument(MongoPipelineDraftStore.toDocument(draft));
@@ -73,6 +74,29 @@ class MongoPipelineDraftStoreTest {
                         new PipelineDraft.FieldPair("tenant_id", "tenant_id"));
         assertThat(restored.wizard().root().preTransforms().getFirst().fields())
                 .containsEntry("customer", "$customer_name").containsEntry("discard", false);
+    }
+
+    @Test
+    void roundTripsRollupFieldsOnWizardRelations() {
+        Map<String, Object> rollup = new LinkedHashMap<>();
+        rollup.put("item_count", Map.of("count", true));
+        rollup.put("latest", Map.of("last", Map.of("value", "$sku", "by", List.of("$created_at", "$id"))));
+        PipelineDraft draft = new PipelineDraft("orders", 1, 4, PipelineDraft.Mode.WIZARD,
+                "Orders", "", null,
+                new PipelineDraft.Wizard(
+                        new PipelineDraft.Root("orders", "mysql", "orders", List.of("id"), List.of()),
+                        List.of(new PipelineDraft.Related("items", "orders", "mysql", "order_items",
+                                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("item_id"), rollup, false),
+                                List.of())),
+                        List.of(), null),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+
+        PipelineDraft restored = MongoPipelineDraftStore.fromDocument(MongoPipelineDraftStore.toDocument(draft));
+
+        assertThat(restored).isEqualTo(draft);
+        assertThat(restored.wizard().related().getFirst().relation().rollup()).containsOnlyKeys("item_count", "latest");
+        assertThat(restored.wizard().related().getFirst().relation().trackKeyChanges()).isFalse();
     }
 
     @Test

@@ -50,6 +50,14 @@ class CliMainFreshProcessTest {
     private static final String ISSUER = "urn:tapstate:cluster:TEST";
 
     @Test
+    void statusHelpWorksWithoutAContext(@TempDir Path home) throws Exception {
+        ProcessResult result = runCli(home, home, Map.of(), "status", "--help");
+
+        assertThat(result.exitCode()).as("status --help stderr: %s", result.stderr()).isZero();
+        assertThat(result.stdout()).contains("Usage: tapstate status", "--rate");
+    }
+
+    @Test
     void defaultInstallWithUmask022AllowsContextResolution(@TempDir Path temporary) throws Exception {
         Assumptions.assumeTrue(Files.getFileStore(temporary).supportsFileAttributeView("posix"));
         Path home = Files.createDirectory(temporary.resolve("home"));
@@ -97,16 +105,16 @@ class CliMainFreshProcessTest {
         assertThat(Files.getOwner(configDirectory)).isEqualTo(Files.getOwner(home));
         Set<PosixFilePermission> installedMode = Files.getPosixFilePermissions(configDirectory);
 
-        ProcessResult installed = runCli(home, home, Map.of(), "apply", "--help");
+        ProcessResult installed = runCli(home, home, Map.of(), "apply");
 
         // Capture the existing missing-context behavior when only the directory mode changes.
         Files.setPosixFilePermissions(configDirectory, Set.of(PosixFilePermission.OWNER_READ,
                 PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
-        ProcessResult ownerOnly = runCli(home, home, Map.of(), "apply", "--help");
-        assertThat(ownerOnly.stderr()).contains("error: cli.context-required")
-                .doesNotContain("cli.context-config-permissions");
+        ProcessResult ownerOnly = runCli(home, home, Map.of(), "apply");
+        assertThat(ownerOnly.stderr()).contains("error: TS0330054")
+                .doesNotContain("TS0330037");
         assertThat(installed.stderr())
-                .withFailMessage("apply --help must accept the installer-created directory (mode %s): %s",
+                .withFailMessage("apply must accept the installer-created directory (mode %s): %s",
                         installedMode, installed.stderr())
                 .isEqualTo(ownerOnly.stderr());
     }
@@ -348,7 +356,7 @@ class CliMainFreshProcessTest {
 
         assertThat(result.stderr())
                 .withFailMessage("the line was not refused, so this is not the reported run: %s", result.stderr())
-                .contains("error: cli.context-required");
+                .contains("error: TS0330054");
         assertThat(result.exitCode())
                 .withFailMessage("a refused line left the session exiting %s: stdout=%s stderr=%s",
                         result.exitCode(), result.stdout(), result.stderr())

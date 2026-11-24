@@ -91,6 +91,86 @@ class MongoCachePipelinePreparationsIT {
         });
     }
 
+    @Test void actuationReturnsTheOriginalObservationRevisionAndRejectsASupersededFrame() {
+        withFixture(f -> {
+            var grant = f.issue();
+            var reservation = f.preparations().reserveFirst(grant, TTL);
+            f.configuration.preparations().complete(f.preparations().seed(reservation, f.configuration.preparations(), AT));
+            var intent = f.configuration.intents().loadForActuation("flow").orElseThrow();
+            long revision = f.version();
+            var commands = new ArrayList<String>();
+            // Warm the physical metadata proof. Both the intent and its version must then come from one command.
+            f.configuration.intents().readForActuation("flow").orElseThrow();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            io.tapstate.spi.store.PipelineIntentStore.ActuationReading reading;
+            try { reading = f.configuration.intents().readForActuation("flow").orElseThrow(); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(reading.intent()).isEqualTo(intent);
+            assertThat(reading.configurationRevision()).hasValue(revision);
+            assertThat(commands).containsExactly("aggregate:pipeline_intents");
+
+            SystemCollections.CONFIGURATION_VERSION.on(f.configDatabase).updateOne(new Document("_id", ConfigurationVersion.ID),
+                    new Document("$inc", new Document("revision", 1L)));
+            var after = f.configuration.observationConfiguration(reading, "views", Map.of("input",
+                    new MongoConfigurationDomain.ObservationCapture("input", "capture-a")));
+            assertThat(after.changed()).isTrue();
+            assertThat(after.configuration()).isEmpty();
+            assertThat(f.configuration.intents().readForActuation("flow").orElseThrow().configurationRevision()).hasValue(revision + 1);
+        });
+    }
+
+    @Test void actuationJoinAliasesCannotHideExtraPersistedIntentFields() {
+        withFixture(f -> {
+            var grant = f.issue();
+            var reservation = f.preparations().reserveFirst(grant, TTL);
+            f.configuration.preparations().complete(f.preparations().seed(reservation, f.configuration.preparations(), AT));
+            var rows = SystemCollections.PIPELINE_INTENTS.on(f.configDatabase);
+            var id = new Document("_id", "flow");
+            var before = rows.find(id).first();
+            for (String alias : List.of("mapping", "pipeline", "cluster", "setup", "binding", "recovery", "configuration", "body")) {
+                rows.replaceOne(id, new Document(before).append(alias, "unexpected"));
+                assertCode(() -> f.configuration.intents().readForActuation("flow"), IoError.DOCUMENT_UNREADABLE);
+            }
+        });
+    }
+
+    @Test void admittedActuationReadsDoNotRepeatTheSourceAuditButWritesStillDo() {
+        withFixture(f -> {
+            var grant=f.issue();var held=f.preparations().reserveFirst(grant,TTL);
+            f.configuration.preparations().complete(f.preparations().seed(held,f.configuration.preparations(),AT));
+            var current=f.configuration.intents().loadForActuation("flow").orElseThrow();
+            SystemCollections.SOURCES.on(f.configDatabase).deleteOne(new Document("_id",StorageBinding.defaultSourceId(StorageBinding.Mode.OP)));
+            assertThat(f.configuration.intents().loadForActuation("flow")).contains(current);
+            long before=f.version();
+            assertCode(()->f.configuration.intents().load("flow"),IoError.DOCUMENT_UNREADABLE);
+            assertCode(()->f.configuration.intents().compareAndSet(f.scope,current.intentRevision(),current.desired()),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.version()).isEqualTo(before);
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"cluster","binding","cache","generation","intent"})
+    void admittedActuationReadsStillObserveCurrentAuthority(String changed) {
+        withFixture(f -> {
+            var grant=f.issue();var held=f.preparations().reserveFirst(grant,TTL);
+            f.configuration.preparations().complete(f.preparations().seed(held,f.configuration.preparations(),AT));
+            assertThat(f.configuration.intents().loadForActuation("flow")).isPresent();
+            switch(changed) {
+                case "cluster" -> SystemCollections.CLUSTER_IDENTITY.on(f.configDatabase).updateOne(new Document(),new Document("$set",new Document("clusterId","foreign")));
+                case "binding" -> SystemCollections.STORAGE_BINDING.on(f.configDatabase).updateOne(new Document(),new Document("$inc",new Document("bindingVersion",1L)));
+                case "cache" -> SystemCollections.PIPELINE_INTENTS.on(f.configDatabase).updateOne(new Document(),new Document("$set",new Document("cacheIncarnation","foreign")));
+                case "generation" -> SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).updateOne(new Document(),new Document("$inc",new Document("stateGeneration",1L)));
+                case "intent" -> {
+                    var current=f.configuration.intents().load("flow").orElseThrow();
+                    assertThat(f.configuration.intents().compareAndSet(f.scope,current.intentRevision(),new DesiredState("flow",PipelineState.STOPPED,current.desired().revision(),false))).isTrue();
+                    assertThat(f.configuration.intents().loadForActuation("flow")).isEqualTo(f.configuration.intents().load("flow"));return;
+                }
+                default -> throw new AssertionError(changed);
+            }
+            assertThatThrownBy(()->f.configuration.intents().loadForActuation("flow")).isInstanceOf(TapstateException.class);
+        });
+    }
+
     @Test void invocationIsConsumedBeforeTheCacheGuardAndCannotBeRepeatedAfterReentry() {
         withFixture(f -> {
             var grant = f.issue();

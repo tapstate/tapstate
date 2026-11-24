@@ -4,6 +4,7 @@ import io.tapstate.core.event.Op;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
@@ -20,6 +21,8 @@ import io.tapstate.core.lifecycle.InitialLoad;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
+import io.tapstate.core.lifecycle.StateCommitReading;
+import io.tapstate.core.lifecycle.StateWeightReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StageReading;
@@ -35,6 +38,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -43,6 +47,8 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -122,6 +128,22 @@ public final class ObservationPublisher {
     private static final String NEST_STORED_PREFIX = "nestStateStored.";
 
     /**
+     * How many whole documents a nest's root level has sent since its count began. Published only for the
+     * root level, the one that renders, so every other namespace is absent rather than zero. It is the unit a
+     * reader of a load wants - documents, which is what the target counts - and the one this product's own
+     * progress view reads, so the two cannot disagree.
+     */
+    private static final String NEST_ROOTS_RENDERED_PREFIX = "nestRootsRendered.";
+
+    /**
+     * How many commit groups a namespace's state became durable in, and how many entries memory let go of
+     * to be read back later. The three per-group distributions beside them have no flat spelling, as no
+     * distribution on this face does.
+     */
+    private static final String STATE_COMMIT_GROUPS_PREFIX = "stateCommitGroups.";
+    private static final String STATE_EVICTIONS_PREFIX = "stateEvictions.";
+
+    /**
      * How many changes the namespace could never place in a document. Published only for a namespace that
      * discarded any, so that nothing discarded is an absence rather than a zero - the one reading here whose
      * quiet state and whose unwired state would otherwise be spelled the same way.
@@ -153,6 +175,8 @@ public final class ObservationPublisher {
      */
     private static final String FRONTIER_GAP_METRIC = "tapstate.pipeline.frontier.gap";
     private static final String FRONTIER_STALL_METRIC = "tapstate.pipeline.frontier.stall";
+    private static final String NEST_READ_KEYS_METRIC = "tapstate.pipeline.nest.read.keys";
+    private static final String NEST_WRITE_KEYS_METRIC = "tapstate.pipeline.nest.write.keys";
     private static final String NEST_ENTRIES_METRIC = "tapstate.pipeline.nest.entries";
     private static final String NEST_ACCESSES_METRIC = "tapstate.pipeline.nest.accesses";
     private static final String NEST_BACKFILLS_METRIC = "tapstate.pipeline.nest.backfills";
@@ -161,6 +185,25 @@ public final class ObservationPublisher {
     private static final String NEST_BACKFILL_TIME_METRIC = "tapstate.pipeline.nest.backfill.time";
     private static final String NEST_PENDING_HIGH_WATER_METRIC = "tapstate.pipeline.nest.pending.high_water";
     private static final String NEST_STORED_METRIC = "tapstate.pipeline.nest.stored";
+    /**
+     * The one nest count that accumulates with a start: documents sent by a root level. A counter rather
+     * than a reading because the start travels with it, so a restart is a new series and not a decrease.
+     */
+    static final String NEST_ROOTS_RENDERED_METRIC = "tapstate.pipeline.nest.roots.rendered";
+    /**
+     * How operator state is made durable, named for the state rather than for the operator: the same facts
+     * describe any stateful step's state, so a later stateful operator reports under the same names. All
+     * accumulate from one start per namespace.
+     */
+    static final String STATE_COMMIT_GROUPS_METRIC = "tapstate.pipeline.state.commit.groups";
+    static final String STATE_COMMIT_KEYS_METRIC = "tapstate.pipeline.state.commit.keys";
+    static final String STATE_COMMIT_ROUND_TRIPS_METRIC = "tapstate.pipeline.state.commit.round_trips";
+    static final String STATE_COMMIT_DURATION_METRIC = "tapstate.pipeline.state.commit.duration";
+    static final String STATE_DOCUMENT_BYTES_METRIC = "tapstate.pipeline.state.document.bytes";
+    static final String STATE_DOCUMENT_BYTES_MAX_METRIC = "tapstate.pipeline.state.document.bytes.max";
+    static final String STATE_COMMIT_BYTES_METRIC = "tapstate.pipeline.state.commit.bytes";
+    static final String ROLLUP_FOLD_DURATION_METRIC = "tapstate.pipeline.nest.rollup.fold.duration";
+    static final String STATE_EVICTIONS_METRIC = "tapstate.pipeline.state.evictions";
     /**
      * Where each namespace comes from in the pipeline's definition, as one reading of 1 per namespace whose
      * attributes are the step, level and map. A mapping rather than more attributes on the counts: names a
@@ -264,6 +307,30 @@ public final class ObservationPublisher {
     private static final String CHAIN_ID_ATTRIBUTE = MetricAttributes.CHAIN_ID;
     private static final String NEST_NAMESPACE_ATTRIBUTE = MetricAttributes.NEST_NAMESPACE;
     private static final String JOIN_NAMESPACE_ATTRIBUTE = MetricAttributes.JOIN_NAMESPACE;
+    private static final String AGGREGATE_STEP_ATTRIBUTE = MetricAttributes.AGGREGATE_STEP;
+
+    /** One family of what an aggregate step reports: its flat prefix, its canonical name and its unit. */
+    private record AggregateFamily(String prefix, String metric, String unit) {
+    }
+
+    /**
+     * What an aggregate step reports about itself, by the prefix its reading arrives under, which is also
+     * its flat key with the step appended. The sizes are as of the last pass the step finished over its
+     * state and are absent until one has, so an absence is "not measured yet". The count of inputs not
+     * applied is absent until there is one, for the reason the discarded changes of a nest are.
+     */
+    private static final List<AggregateFamily> AGGREGATE_FAMILIES = List.of(
+            new AggregateFamily("aggregateRows.", "tapstate.pipeline.aggregate.rows", "{row}"),
+            new AggregateFamily("aggregateGroups.", "tapstate.pipeline.aggregate.groups", "{group}"),
+            new AggregateFamily("aggregateStateEntries.", "tapstate.pipeline.aggregate.state.entries", "{entry}"),
+            new AggregateFamily("aggregateTombstones.", "tapstate.pipeline.aggregate.tombstones", "{entry}"),
+            new AggregateFamily("aggregateLargestGroupRows.", "tapstate.pipeline.aggregate.group.rows.largest",
+                    "{row}"),
+            new AggregateFamily("aggregateFailedGroups.", "tapstate.pipeline.aggregate.groups.failed", "{group}"),
+            new AggregateFamily("aggregateInputs.", "tapstate.pipeline.aggregate.inputs", "{event}"),
+            new AggregateFamily("aggregateStateWrites.", "tapstate.pipeline.aggregate.state.writes", "{commit}"),
+            new AggregateFamily("aggregateOrderConflicts.", "tapstate.pipeline.aggregate.order_conflicts",
+                    "{event}"));
     private static final String DIRECTION_ATTRIBUTE = MetricAttributes.DIRECTION;
     private static final String OP_ATTRIBUTE = MetricAttributes.OP;
     private static final String INBOUND = "in";
@@ -281,7 +348,7 @@ public final class ObservationPublisher {
      * <p>Collapsing is not the same as dropping and is recorded separately by the projection, so what a
      * reader of this face is actually looking at stays answerable.
      */
-    static final Map<String, FlatReduction> FLAT_REDUCTIONS = Map.ofEntries(
+    private static final Map<String, FlatReduction> NAMED_REDUCTIONS = Map.ofEntries(
             Map.entry(RECORDS_METRIC, keyed("records.", DIRECTION_ATTRIBUTE)),
             Map.entry(BYTES_METRIC, keyed("bytes.", DIRECTION_ATTRIBUTE)),
             Map.entry(LAG_METRIC, keyed("lag.", TABLE_ID_ATTRIBUTE)),
@@ -298,6 +365,8 @@ public final class ObservationPublisher {
             // dimension became an attribute -- the change is in what is carried, not in what anybody reads.
             Map.entry(FRONTIER_GAP_METRIC, keyed(FRONTIER_GAP_PREFIX, CHAIN_ID_ATTRIBUTE)),
             Map.entry(FRONTIER_STALL_METRIC, keyed(FRONTIER_STALLED_PREFIX, CHAIN_ID_ATTRIBUTE)),
+            Map.entry(NEST_READ_KEYS_METRIC, keyed("nestStateReadKeys.", NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_WRITE_KEYS_METRIC, keyed("nestStateWriteKeys.", NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_ENTRIES_METRIC, keyed(NEST_ENTRIES_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_ACCESSES_METRIC, keyed(NEST_ACCESSES_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_BACKFILLS_METRIC, keyed(NEST_BACKFILLS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
@@ -307,6 +376,9 @@ public final class ObservationPublisher {
             Map.entry(NEST_PENDING_HIGH_WATER_METRIC,
                     keyed(NEST_PENDING_HIGH_WATER_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_STORED_METRIC, keyed(NEST_STORED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_ROOTS_RENDERED_METRIC, keyed(NEST_ROOTS_RENDERED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(STATE_COMMIT_GROUPS_METRIC, keyed(STATE_COMMIT_GROUPS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(STATE_EVICTIONS_METRIC, keyed(STATE_EVICTIONS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_DEAD_LETTERED_METRIC, keyed(NEST_DEAD_LETTERED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_METRIC, keyed(JOIN_RECOMPUTE_DONE_PREFIX, JOIN_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_TOTAL_METRIC,
@@ -315,6 +387,16 @@ public final class ObservationPublisher {
             // canonical fact does, and the flat face keeps their bare keys.
             Map.entry(RECORDS_DRIVEN_METRIC, attributes -> RECORDS_DRIVEN_FLAT),
             Map.entry(RECONCILE_STREAK_METRIC, attributes -> RECONCILE_STREAK_FLAT));
+
+    /** Every rule above, and one per family an aggregate step reports: its prefix and then the step. */
+    static final Map<String, FlatReduction> FLAT_REDUCTIONS = flatReductions();
+
+    private static Map<String, FlatReduction> flatReductions() {
+        Map<String, FlatReduction> reductions = new HashMap<>(NAMED_REDUCTIONS);
+        AGGREGATE_FAMILIES.forEach(family ->
+                reductions.put(family.metric(), keyed(family.prefix(), AGGREGATE_STEP_ATTRIBUTE)));
+        return Map.copyOf(reductions);
+    }
 
     /**
      * A rule spelling a point's flat key as {@code prefix} and the value of {@code dimension}, and
@@ -367,6 +449,7 @@ public final class ObservationPublisher {
     private static final Map<String, String> OP_NAMES = Arrays.stream(Op.values())
             .collect(Collectors.toUnmodifiableMap(Op::symbol, op -> op.name().toLowerCase(Locale.ROOT)));
 
+    private final StoredObservationFacts storedFacts = new StoredObservationFacts();
     private final StateStore state;
     private final ObservationStore observations;
     private final Function<String, OptionalLong> recordCounts;
@@ -374,6 +457,8 @@ public final class ObservationPublisher {
     private final Function<String, SnapshotReading> snapshots;
     private final Function<String, SnapshotReading> runSnapshots;
     private final Function<String, InitialLoad> initialLoads;
+    private final AtomicReference<Function<String, Map<String, Long>>> aggregateReadings =
+            new AtomicReference<>(id -> Map.of());
     private final Function<String, Map<String, Long>> frontierGaps;
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
@@ -730,6 +815,32 @@ public final class ObservationPublisher {
     }
 
     /**
+     * This publisher, also reporting what the aggregate steps of a pipeline's live run say about
+     * themselves. {@code readings} yields them keyed by a kind's prefix and then the step; a pipeline
+     * with no aggregate step yields none.
+     */
+    public ObservationPublisher withAggregateReadings(Function<String, Map<String, Long>> readings) {
+        this.aggregateReadings.set(Objects.requireNonNull(readings, "readings"));
+        return this;
+    }
+
+    /** One fact per family that reported, one point per step. */
+    static List<MetricFact> aggregateFacts(String pipelineId, Instant at, Map<String, Long> readings) {
+        List<MetricFact> facts = new ArrayList<>();
+        for (AggregateFamily family : AGGREGATE_FAMILIES) {
+            Map<String, Long> bySteps = new java.util.TreeMap<>();
+            readings.forEach((name, value) -> {
+                if (name.startsWith(family.prefix())) {
+                    bySteps.put(name.substring(family.prefix().length()), value);
+                }
+            });
+            readingsAt(pipelineId, family.metric(), family.unit(), at, AGGREGATE_STEP_ATTRIBUTE, bySteps)
+                    .ifPresent(facts::add);
+        }
+        return facts;
+    }
+
+    /**
      * Publishes the pipeline's latest observation from its actual state; a no-op, answering empty, if it
      * has no checkpoint.
      */
@@ -747,7 +858,7 @@ public final class ObservationPublisher {
      * the reason its previous run died of the moment it leaves FAILED.
      */
     public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
-        return publish(pipelineId, failure, state, observations, false);
+        return publish(pipelineId, failure, state, observations, false, null);
     }
 
     /** Projects through the fixed state and original-claim observation views captured by this pass. */
@@ -755,18 +866,59 @@ public final class ObservationPublisher {
             ObservationStore scopedObservations, ObservationFailure failure) {
         Objects.requireNonNull(scope, "scope");
         return publish(scope.pipelineId(), failure, Objects.requireNonNull(scopedState, "scopedState"),
-                Objects.requireNonNull(scopedObservations, "scopedObservations"), true);
+                Objects.requireNonNull(scopedObservations, "scopedObservations"), true, scope);
+    }
+
+    /**
+     * Publishes a periodic RUNNING reading for the checkpoint and claim captured by convergence.
+     * A stale request never measures the successor by pipeline ID or refreshes its last observation.
+     */
+    public Optional<Observation> publishRunningScoped(PipelineIntentScope scope, CheckpointDoc checkpoint,
+            ObservationStore observations, BooleanSupplier stillCurrent) {
+        if (!scope.pipelineId().equals(checkpoint.pipelineId())
+                || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING) {
+            throw new IllegalArgumentException("periodic observations require the original running checkpoint");
+        }
+        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent, scope, null);
+    }
+
+    /** Capture facts obtained together for the current execution and checked against its checkpoint. */
+    public record CaptureSample(SnapshotReading loaded, SnapshotReading run, Map<String, String> positions,
+            InitialLoad initialLoad) {
+        public CaptureSample {
+            Objects.requireNonNull(loaded); Objects.requireNonNull(run); positions = Map.copyOf(positions);
+        }
+    }
+
+    public Optional<Observation> publishRunning(PipelineIntentScope scope, CheckpointDoc checkpoint,
+            ObservationStore store, CaptureSample capture, BooleanSupplier stillCurrent) {
+        if (!scope.pipelineId().equals(checkpoint.pipelineId()) || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING)
+            throw new IllegalArgumentException("a combined observation requires its running checkpoint");
+        return publishCheckpoint(Optional.of(checkpoint), null, store, true, stillCurrent, scope,
+                Objects.requireNonNull(capture));
     }
 
     private Optional<Observation> publish(String pipelineId, ObservationFailure failure, StateStore state,
-            ObservationStore observations, boolean requirePreparedState) {
+            ObservationStore observations, boolean requirePreparedState, PipelineIntentScope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         var current = state.read(pipelineId);
         if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
-        return current.map(checkpoint -> {
+        return publishCheckpoint(current, failure, observations, requirePreparedState, () -> true, scope, null);
+    }
+
+    private Optional<Observation> publishCheckpoint(Optional<CheckpointDoc> expected, ObservationFailure failure,
+            ObservationStore observations, boolean requirePreparedState, BooleanSupplier stillCurrent,
+            PipelineIntentScope scope, CaptureSample capture) {
+        return expected.flatMap(checkpoint -> {
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
+            String pipelineId = checkpoint.pipelineId();
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
             if (actual == PipelineState.COMPLETED) {
-                Optional<Observation> previous = observations.read(pipelineId);
+                Optional<Observation> previous = observations.read(pipelineId)
+                        .filter(last -> last.state() == PipelineState.COMPLETED && last.observedAt() != null);
+                if (previous.isEmpty()) previous = observations.beforeCompletion(pipelineId, checkpoint.epoch());
                 if (previous.isPresent()) {
                     Observation last = previous.get();
                     List<MetricFact> retained = last.facts().stream()
@@ -776,8 +928,8 @@ public final class ObservationPublisher {
                     Observation terminal = new Observation(pipelineId, actual,
                             retainedMetrics, last.snapshot(),
                             last.positions(), null, observedNow(), retained, terminalLoad(pipelineId, last));
-                    observations.save(terminal);
-                    return terminal;
+                    save(observations, terminal, requirePreparedState ? checkpoint.epoch() : null, scope);
+                    return Optional.of(terminal);
                 }
             }
             ObservationFailure carried = failure;
@@ -803,14 +955,17 @@ public final class ObservationPublisher {
                 readings = nestStateReadings.apply(pipelineId);
                 gaps = frontierGaps.apply(pipelineId);
                 pinned = frontierStalls.apply(pipelineId);
-                SnapshotReading loaded = snapshots.apply(pipelineId);
-                SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
-                List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
+                SnapshotReading loaded = capture == null ? snapshots.apply(pipelineId) : capture.loaded();
+                SnapshotReading readThisRun = capture == null ? runSnapshots.apply(pipelineId) : capture.run();
+                List<MetricFact> measured = new ArrayList<>(facts(pipelineId, actual, at, readings, gaps, pinned,
                         nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                        joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
+                        joinRecomputeExpected.apply(pipelineId), loaded, readThisRun));
+                measured.addAll(aggregateFacts(pipelineId, at, aggregateReadings.get().apply(pipelineId)));
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                        loaded.byTable(), positions.apply(pipelineId), carried, at, measured, initialLoadAt(pipelineId, at));
+                        loaded.byTable(), capture == null ? positions.apply(pipelineId) : capture.positions(), carried, at, measured,
+                        capture == null ? initialLoadAt(pipelineId, at)
+                                : capture.initialLoad() == null ? null : capture.initialLoad().at(at));
                 measuredSuccessfully = true;
             } catch (TapstateException unavailable) {
                 if (actual != PipelineState.FAILED) throw unavailable;
@@ -827,14 +982,25 @@ public final class ObservationPublisher {
             }
             // Both paths use the original observation port. Its scope, checkpoint and claim checks
             // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.
-            observations.save(published);
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
+            save(observations, published, requirePreparedState ? checkpoint.epoch() : null, scope);
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
             if (measuredSuccessfully) {
-                coldLayer.saw(pipelineId, readings);
-                frontierStall.saw(pipelineId, pinned, gaps);
+                var committedReadings = readings;
+                var committedPinned = pinned;
+                var committedGaps = gaps;
+                observations.afterSave(() -> {
+                    coldLayer.saw(pipelineId, committedReadings);
+                    frontierStall.saw(pipelineId, committedPinned, committedGaps);
+                });
             }
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
-            return published;
+            return Optional.of(published);
         });
     }
 
@@ -867,7 +1033,7 @@ public final class ObservationPublisher {
         } catch (RuntimeException unavailable) {
             // This path must still report when the state store itself is what the pass could not read.
         }
-        publishReconcileFailure(pipelineId, consecutiveFailures, observations, current);
+        publishReconcileFailure(pipelineId, consecutiveFailures, observations, current, null, null);
     }
 
     /** A failed pass still uses its original ports, including when no projection has been made yet. */
@@ -877,14 +1043,21 @@ public final class ObservationPublisher {
         Objects.requireNonNull(scopedState, "scopedState");
         Objects.requireNonNull(scopedObservations, "scopedObservations");
         var current = scopedState.read(scope.pipelineId()).orElseThrow(() -> missingCheckpoint(scope.pipelineId()));
-        publishReconcileFailure(scope.pipelineId(), consecutiveFailures, scopedObservations, StateJson.parse(current.stateJson()));
+        publishReconcileFailure(scope.pipelineId(), consecutiveFailures, scopedObservations,
+                StateJson.parse(current.stateJson()), current.epoch(), scope);
     }
 
     private void publishReconcileFailure(String pipelineId, long consecutiveFailures, ObservationStore observations,
-            PipelineState unpublishedState) {
+            PipelineState unpublishedState, Long checkpointEpoch, PipelineIntentScope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation previous = observations.read(pipelineId).orElse(null);
-        PipelineState lastState = unpublishedState == PipelineState.COMPLETED ? PipelineState.COMPLETED
+        if (checkpointEpoch != null && unpublishedState == PipelineState.STOPPED
+                && (previous == null || previous.state() != PipelineState.STOPPED)) {
+            // The checkpoint is written before the actuator drains or rebuilds. A failed pass
+            // cannot be the witness that stopping finished.
+            return;
+        }
+        PipelineState lastState = checkpointEpoch != null || unpublishedState == PipelineState.COMPLETED ? unpublishedState
                 : previous != null ? previous.state() : unpublishedState;
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
@@ -900,10 +1073,21 @@ public final class ObservationPublisher {
                     .forEach(measured::add);
         }
         measured.add(readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
-        observations.save(new Observation(pipelineId, lastState,
-                FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
+        // Stored facts may have folded away a table dimension. Retain the original flat values
+        // rather than feeding an overflow series back through a per-table flat reduction.
+        Map<String, Long> flat = keepLoad ? new LinkedHashMap<>(previous.metrics()) : new LinkedHashMap<>();
+        flat.put(RECONCILE_STREAK_FLAT, consecutiveFailures);
+        var observation = new Observation(pipelineId, lastState, flat,
                 keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured,
-                keepLoad ? previous.initialLoad() : null));
+                keepLoad ? previous.initialLoad() : null);
+        save(observations, observation, checkpointEpoch, scope);
+    }
+
+    private void save(ObservationStore store, Observation observation, Long checkpointEpoch,
+            PipelineIntentScope scope) {
+        var stored = storedFacts.project(observation, scope);
+        if (checkpointEpoch == null) store.save(stored);
+        else store.save(stored, checkpointEpoch);
     }
 
     private static TapstateException missingCheckpoint(String pipelineId) {
@@ -998,6 +1182,8 @@ public final class ObservationPublisher {
         // distinguishable from an assembler that is not; a namespace reporting nothing is absent rather
         // than present at zero, which would read as a state layer that had emptied. Each quantity is its
         // own instrument, read against the others rather than added to them.
+        Map<String, Long> readKeys = new LinkedHashMap<>();
+        Map<String, Long> writeKeys = new LinkedHashMap<>();
         Map<String, Long> entries = new LinkedHashMap<>();
         Map<String, Long> accesses = new LinkedHashMap<>();
         Map<String, Long> backfills = new LinkedHashMap<>();
@@ -1007,6 +1193,10 @@ public final class ObservationPublisher {
         Map<String, Long> pendingHighWater = new LinkedHashMap<>();
         Map<String, Long> stored = new LinkedHashMap<>();
         nestReadings.forEach((namespace, reading) -> {
+            if (reading.keyAccess() != null && reading.keyAccess().available()) {
+                readKeys.put(namespace, reading.keyAccess().reads());
+                writeKeys.put(namespace, reading.keyAccess().writes());
+            }
             entries.put(namespace, reading.entries());
             accesses.put(namespace, reading.accesses());
             backfills.put(namespace, reading.backfills());
@@ -1016,6 +1206,8 @@ public final class ObservationPublisher {
             pendingHighWater.put(namespace, reading.pendingHighWater());
             reading.stored().ifPresent(whole -> stored.put(namespace, whole));
         });
+        readingsAt(pipelineId, NEST_READ_KEYS_METRIC, "{key}", at, NEST_NAMESPACE_ATTRIBUTE, readKeys).ifPresent(facts::add);
+        readingsAt(pipelineId, NEST_WRITE_KEYS_METRIC, "{key}", at, NEST_NAMESPACE_ATTRIBUTE, writeKeys).ifPresent(facts::add);
         readingsAt(pipelineId, NEST_ENTRIES_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, entries)
                 .ifPresent(facts::add);
         readingsAt(pipelineId, NEST_ACCESSES_METRIC, "{access}", at, NEST_NAMESPACE_ATTRIBUTE, accesses)
@@ -1032,6 +1224,9 @@ public final class ObservationPublisher {
                 pendingHighWater).ifPresent(facts::add);
         readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
                 .ifPresent(facts::add);
+        rootsRendered(pipelineId, at, nestReadings).ifPresent(facts::add);
+        facts.addAll(stateCommits(pipelineId, at, nestReadings));
+        facts.addAll(stateWeights(pipelineId, at, nestReadings));
         nestOrigins(pipelineId, at, nestReadings).ifPresent(facts::add);
         // One point per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
@@ -1052,6 +1247,99 @@ public final class ObservationPublisher {
         spent(pipelineId, at, stages.apply(pipelineId)).ifPresent(facts::add);
         load(pipelineId, at, loaded).forEach(facts::add);
         runLoad(pipelineId, at, readThisRun).ifPresent(facts::add);
+        return facts;
+    }
+
+    /** One accumulating point per root level that has sent anything, each from its own start. */
+    private static Optional<MetricFact> rootsRendered(String pipelineId, Instant at,
+            Map<String, NestStateReading> nestReadings) {
+        List<MetricPoint> points = new ArrayList<>();
+        nestReadings.forEach((namespace, reading) -> reading.rootsRendered().ifPresent(rendered ->
+                points.add(MetricPoint.accumulated(
+                        Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, NEST_NAMESPACE_ATTRIBUTE, namespace),
+                        reading.rootsRenderedSince(), at, rendered))));
+        return points.isEmpty() ? Optional.empty()
+                : Optional.of(new MetricFact(NEST_ROOTS_RENDERED_METRIC, MetricType.COUNTER, "{document}", points));
+    }
+
+    /**
+     * The state facts, one point per namespace whose reporter measured its commits: two counters and three
+     * distributions, every one from that namespace's own start. Nothing at all for a pipeline with none.
+     */
+    private static List<MetricFact> stateCommits(String pipelineId, Instant at,
+            Map<String, NestStateReading> nestReadings) {
+        List<MetricPoint> groups = new ArrayList<>();
+        List<MetricPoint> keys = new ArrayList<>();
+        List<MetricPoint> trips = new ArrayList<>();
+        List<MetricPoint> took = new ArrayList<>();
+        List<MetricPoint> evicted = new ArrayList<>();
+        nestReadings.forEach((namespace, reading) -> {
+            StateCommitReading commits = reading.commits();
+            if (commits == null) {
+                return;
+            }
+            Map<String, String> attributes =
+                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, NEST_NAMESPACE_ATTRIBUTE, namespace);
+            Instant since = commits.countingSince();
+            groups.add(MetricPoint.accumulated(attributes, since, at, commits.groups()));
+            keys.add(MetricPoint.distribution(attributes, since, at, commits.keys()));
+            trips.add(MetricPoint.distribution(attributes, since, at, commits.roundTrips()));
+            took.add(MetricPoint.distribution(attributes, since, at, commits.duration()));
+            evicted.add(MetricPoint.accumulated(attributes, since, at, commits.evictions()));
+        });
+        if (groups.isEmpty()) {
+            return List.of();
+        }
+        return List.of(
+                new MetricFact(STATE_COMMIT_GROUPS_METRIC, MetricType.COUNTER, "{group}", groups),
+                new MetricFact(STATE_COMMIT_KEYS_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_KEYS.unit(), keys),
+                new MetricFact(STATE_COMMIT_ROUND_TRIPS_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_ROUND_TRIPS.unit(), trips),
+                new MetricFact(STATE_COMMIT_DURATION_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_DURATION.unit(), took),
+                new MetricFact(STATE_EVICTIONS_METRIC, MetricType.COUNTER, "{entry}", evicted));
+    }
+
+    /**
+     * How heavy each namespace's state is to keep, one point per namespace that has written any: bytes per
+     * written key (at a root level, per document), the largest of them, bytes per commit group, and where a level
+     * renders rollup fields, how long folding them took. Nothing at all for a pipeline that has written nothing.
+     */
+    private static List<MetricFact> stateWeights(String pipelineId, Instant at,
+            Map<String, NestStateReading> nestReadings) {
+        List<MetricPoint> documents = new ArrayList<>();
+        List<MetricPoint> largest = new ArrayList<>();
+        List<MetricPoint> groups = new ArrayList<>();
+        List<MetricPoint> folds = new ArrayList<>();
+        nestReadings.forEach((namespace, reading) -> {
+            StateWeightReading weight = reading.weight();
+            if (weight == null) {
+                return;
+            }
+            Map<String, String> attributes =
+                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, NEST_NAMESPACE_ATTRIBUTE, namespace);
+            Instant since = weight.countingSince();
+            documents.add(MetricPoint.distribution(attributes, since, at, weight.documentBytes()));
+            largest.add(MetricPoint.reading(attributes, at, weight.largestDocumentBytes()));
+            groups.add(MetricPoint.distribution(attributes, since, at, weight.commitBytes()));
+            if (weight.foldDuration() != null) {
+                folds.add(MetricPoint.distribution(attributes, since, at, weight.foldDuration()));
+            }
+        });
+        if (documents.isEmpty()) {
+            return List.of();
+        }
+        List<MetricFact> facts = new ArrayList<>(List.of(
+                new MetricFact(STATE_DOCUMENT_BYTES_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_DOCUMENT_BYTES.unit(), documents),
+                new MetricFact(STATE_DOCUMENT_BYTES_MAX_METRIC, MetricType.GAUGE, "By", largest),
+                new MetricFact(STATE_COMMIT_BYTES_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_BYTES.unit(), groups)));
+        if (!folds.isEmpty()) {
+            facts.add(new MetricFact(ROLLUP_FOLD_DURATION_METRIC, MetricType.HISTOGRAM,
+                    HistogramBounds.ROLLUP_FOLD_DURATION.unit(), folds));
+        }
         return facts;
     }
 
@@ -1139,6 +1427,7 @@ public final class ObservationPublisher {
     public void forgetPipelinesOutside(Collection<String> live) {
         Objects.requireNonNull(live, "live");
         failuresByPipelineAndCode.keySet().retainAll(Set.copyOf(live));
+        storedFacts.retain(live);
     }
 
     /**

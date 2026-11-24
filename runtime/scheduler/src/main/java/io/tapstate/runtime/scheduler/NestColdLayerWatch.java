@@ -4,8 +4,10 @@ import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.NestStateWindow;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -33,8 +35,7 @@ import java.util.Set;
  * be differenced against each other's counts — and a joined name would answer that with a separator that
  * has to be absent from every pipeline id there will ever be.
  *
- * <p>Not thread-safe, and does not need to be: it is fed from the pass that publishes observations, which
- * is one caller at a time.
+ * <p>Protects the accumulated readings from concurrent publishers. Notifications run outside the lock.
  */
 public final class NestColdLayerWatch {
 
@@ -55,42 +56,82 @@ public final class NestColdLayerWatch {
     public void saw(String pipelineId, Map<String, NestStateReading> readings) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(readings, "readings");
-        Map<String, Seen> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
-        held.keySet().retainAll(readings.keySet());
-        readings.forEach((namespace, reading) -> judge(pipelineId, held, namespace, reading));
-        if (held.isEmpty()) {
-            byPipeline.remove(pipelineId);
+        List<Runnable> notices = new ArrayList<>();
+        synchronized (byPipeline) {
+            Map<String, Seen> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
+            held.keySet().retainAll(readings.keySet());
+            readings.forEach((namespace, reading) -> judge(pipelineId, held, namespace, reading, notices));
+            if (held.isEmpty()) {
+                byPipeline.remove(pipelineId);
+            }
         }
+        Throwable failure = null;
+        for (var notice : notices) {
+            try { notice.run(); }
+            catch (RuntimeException | Error problem) {
+                if (failure == null) failure = problem;
+                else if (problem instanceof Error && !(failure instanceof Error)) {
+                    problem.addSuppressed(failure);
+                    failure = problem;
+                } else if (failure != problem) failure.addSuppressed(problem);
+            }
+        }
+        if (failure instanceof Error fatal) throw fatal;
+        if (failure instanceof RuntimeException refused) throw refused;
     }
 
     /** Which namespaces are currently held, as pipeline and namespace together — what a caller asserts on. */
     Set<String> watching() {
         Set<String> held = new HashSet<>();
-        byPipeline.forEach((pipelineId, namespaces) ->
-                namespaces.keySet().forEach(namespace -> held.add(pipelineId + "/" + namespace)));
+        synchronized (byPipeline) {
+            byPipeline.forEach((pipelineId, namespaces) ->
+                    namespaces.keySet().forEach(namespace -> held.add(pipelineId + "/" + namespace)));
+        }
         return held;
     }
 
-    private void judge(String pipelineId, Map<String, Seen> held, String namespace, NestStateReading reading) {
+    private void judge(String pipelineId, Map<String, Seen> held, String namespace, NestStateReading reading,
+            List<Runnable> notices) {
         Seen before = held.get(namespace);
         boolean wasOver = before != null && before.over();
+        if (reading.keyAccess() != null && !reading.keyAccess().available()) {
+            // Do not retain a partial delta or manufacture a healthy zero from a missing field.
+            held.put(namespace, new Seen(reading, null, wasOver, 0));
+            return;
+        }
+        boolean changedSource = before != null && (reading.keyAccess() != null || before.latest().keyAccess() != null)
+                && (reading.keyAccess() == null || !reading.keyAccess().follows(before.latest().keyAccess()));
+        if (changedSource) {
+            held.put(namespace, new Seen(reading, reading, wasOver, 0));
+            return;
+        }
         NestStateReading baseline = before == null || restarted(before.latest(), reading)
                 ? null : before.baseline();
         NestStateWindow window = baseline == null
                 ? NestStateWindow.fromStart(reading)
                 : NestStateWindow.between(baseline, reading);
-        if (window.accesses() < pressure.leastAccesses() || window.servedFromCold().isEmpty()) {
+        if (window.pressureAccesses() < pressure.leastAccesses() || window.servedFromCold().isEmpty()) {
             // Retain the last judged boundary, so several small samples can make a real window.
             // An idle or undersized sample says nothing about recovery from the previous pressure.
-            held.put(namespace, new Seen(reading, baseline, wasOver));
+            held.put(namespace, new Seen(reading, baseline, wasOver, before == null ? 0 : before.healthyWindows()));
+            return;
+        }
+        if (reading.keyAccess() != null && window.coldKeys().getAsLong() > window.keyAccesses().getAsLong()) {
+            held.put(namespace, new Seen(reading, reading, wasOver, 0));
             return;
         }
         boolean nowOver = pressure.isOver(window);
-        held.put(namespace, new Seen(reading, reading, nowOver));
+        int healthy = 0;
+        if (wasOver && !nowOver) {
+            boolean belowRecovery = window.servedFromCold().orElse(1) < pressure.servedFromCold() * 0.8;
+            healthy = belowRecovery ? before.healthyWindows() + 1 : 0;
+            nowOver = healthy < 2;
+        }
+        held.put(namespace, new Seen(reading, reading, nowOver, healthy));
         if (nowOver && !wasOver) {
-            alert.crossed(pipelineId, namespace, window);
+            notices.add(() -> alert.crossed(pipelineId, namespace, window));
         } else if (!nowOver && wasOver) {
-            alert.cleared(pipelineId, namespace, window);
+            notices.add(() -> alert.cleared(pipelineId, namespace, window));
         }
     }
 
@@ -102,6 +143,6 @@ public final class NestColdLayerWatch {
     }
 
     /** Observe resets on every sample while accumulating traffic since the last judged boundary. */
-    private record Seen(NestStateReading latest, NestStateReading baseline, boolean over) {
+    private record Seen(NestStateReading latest, NestStateReading baseline, boolean over, int healthyWindows) {
     }
 }

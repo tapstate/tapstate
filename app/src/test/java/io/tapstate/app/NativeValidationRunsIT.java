@@ -288,7 +288,11 @@ class NativeValidationRunsIT {
             });
             assertThat(entered.await(4,TimeUnit.SECONDS)).isTrue();runs.close();release.countDown();
             long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);
-            while(f.tasks.read("flow","task").orElseThrow().full().permission().phase()!=ValidationTaskStore.Phase.CLOSED&&System.nanoTime()-until<0)Thread.sleep(10);
+            while (System.nanoTime() - until < 0) {
+                var permission = f.tasks.read("flow", "task").orElseThrow().full().permission();
+                if (permission != null && permission.phase() == ValidationTaskStore.Phase.CLOSED) break;
+                Thread.sleep(10);
+            }
             assertThat(f.tasks.read("flow","task").orElseThrow().full().permission().phase()).isEqualTo(ValidationTaskStore.Phase.CLOSED);
             until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);while(f.resources.snapshot().metadataFrames()!=0&&System.nanoTime()-until<0)Thread.sleep(10);
             assertThat(f.resources.snapshot().metadataFrames()).isZero();assertThat(f.resources.snapshot().processors()).isZero();

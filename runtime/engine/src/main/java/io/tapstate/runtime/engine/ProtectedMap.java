@@ -126,6 +126,38 @@ public final class ProtectedMap<K, V> {
         return waitingOut(() -> map.executeOnKeys(keys, processor));
     }
 
+    /**
+     * Applies a bounded set of independent atomic entry mutations and awaits every submitted result.
+     * Single-key operations retain their loaded value even when the map cannot retain it in memory.
+     * A bulk entry operation may otherwise observe only resident records after its bulk-load phase.
+     * Every submitted mutation settles before a failure escapes or a protected retry starts.
+     */
+    public <R> void executeOnKeys(Map<K, EntryProcessor<K, V, R>> processors) {
+        waitingOut(() -> {
+            var pending = new java.util.ArrayList<java.util.concurrent.CompletableFuture<R>>();
+            Throwable failure = null;
+            try {
+                for (var entry : processors.entrySet())
+                    pending.add(map.submitToKey(entry.getKey(), entry.getValue()).toCompletableFuture());
+            } catch (RuntimeException | Error raised) {
+                failure = raised;
+            }
+            for (var result : pending) {
+                try { result.join(); }
+                catch (RuntimeException | Error raised) {
+                    Throwable cause = raised instanceof java.util.concurrent.CompletionException
+                            && raised.getCause() != null ? raised.getCause() : raised;
+                    if (failure == null || cause instanceof Error && !(failure instanceof Error)
+                            || isRefusal(failure) && !isRefusal(cause)) failure = cause;
+                }
+            }
+            if (failure instanceof RuntimeException raised) throw raised;
+            if (failure instanceof Error raised) throw raised;
+            if (failure != null) throw new IllegalStateException("unexpected checked entry mutation failure", failure);
+            return null;
+        });
+    }
+
     /** This member's own statistics of the map, which no protection guards. */
     public LocalMapStats getLocalMapStats() {
         return map.getLocalMapStats();

@@ -133,19 +133,21 @@ final class MongoValidationTaskCodec {
     static Document comparison(ValidationTaskSpec spec) {
         var dependencies = spec.dependencyHashes().entrySet().stream()
                 .map(entry -> new Document("id", entry.getKey()).append("hash", entry.getValue())).toList();
-        return new Document("formatVersion", 1).append("pipelineId", spec.pipelineId()).append("mappingRevision", spec.mappingRevision())
+        int format = spec.mappings().stream().anyMatch(mapping -> mapping.keys() != null && mapping.keys().deferred()) ? 2 : 1;
+        return new Document("formatVersion", format).append("pipelineId", spec.pipelineId()).append("mappingRevision", spec.mappingRevision())
                 .append("comparisonRulesVersion", spec.comparisonRulesVersion()).append("dependencies", dependencies)
                 .append("mappings", spec.mappings().stream().map(mapping -> new Document("mappingId", mapping.mappingId())
                         .append("outputKind", mapping.outputKind().name()).append("outputId", mapping.outputId())
                         .append("source", table(mapping.source())).append("target", table(mapping.target()))
-                        .append("keys", mapping.keys() == null ? null : new Document("confirmationId", mapping.keys().confirmationId())
-                                .append("source", keys(mapping.keys().source())).append("target", keys(mapping.keys().target())))).toList())
+                        .append("keys", encodeKeys(mapping.keys()))).toList())
                 .append("fingerprint", spec.fingerprint());
     }
 
     static ValidationTaskSpec comparison(Document row) {
         try {
-            fields(row, "formatVersion", "pipelineId", "mappingRevision", "comparisonRulesVersion", "dependencies", "mappings", "fingerprint"); version(row);
+            fields(row, "formatVersion", "pipelineId", "mappingRevision", "comparisonRulesVersion", "dependencies", "mappings", "fingerprint");
+            int format = integer(row, "formatVersion");
+            if (format != 1 && format != 2) throw unreadable();
             var dependencies = new TreeMap<String, String>();
             for (var value : documents(row, "dependencies", 1024)) {
                 fields(value, "id", "hash");
@@ -156,8 +158,13 @@ final class MongoValidationTaskCodec {
                 fields(value, "mappingId", "outputKind", "outputId", "source", "target", "keys");
                 var keys = value.get("keys", Document.class); ValidationTaskSpec.Keys bound = null;
                 if (keys != null) {
-                    fields(keys, "confirmationId", "source", "target");
-                    bound = new ValidationTaskSpec.Keys(keys.getString("confirmationId"), keys(keys, "source"), keys(keys, "target"));
+                    if (format == 2 && keys.containsKey("sourcePaths")) {
+                        fields(keys, "confirmationId", "sourcePaths", "targetPaths");
+                        bound = ValidationTaskSpec.Keys.deferred(keys.getString("confirmationId"), paths(keys, "sourcePaths"), paths(keys, "targetPaths"));
+                    } else {
+                        fields(keys, "confirmationId", "source", "target");
+                        bound = new ValidationTaskSpec.Keys(keys.getString("confirmationId"), keys(keys, "source"), keys(keys, "target"));
+                    }
                 }
                 mappings.add(new ValidationTaskSpec.Mapping(value.getString("mappingId"), ValidationTaskSpec.OutputKind.valueOf(value.getString("outputKind")),
                         value.getString("outputId"), table(value.get("source", Document.class)), table(value.get("target", Document.class)), bound));
@@ -166,6 +173,28 @@ final class MongoValidationTaskCodec {
             if (!comparison(result).equals(row)) throw unreadable();
             return result;
         } catch (NullPointerException | ClassCastException | IllegalArgumentException | java.time.DateTimeException | TapstateException invalid) { throw unreadable(); }
+    }
+
+    private static Document encodeKeys(ValidationTaskSpec.Keys value) {
+        if (value == null) return null;
+        var row = new Document("confirmationId", value.confirmationId());
+        return value.deferred() ? row.append("sourcePaths", value.sourcePaths()).append("targetPaths", value.targetPaths())
+                : row.append("source", keys(value.source())).append("target", keys(value.target()));
+    }
+
+    private static List<List<String>> paths(Document row, String field) {
+        if (!(row.get(field) instanceof List<?> paths) || paths.size() > ValidationKey.MAX_COMPONENTS) throw unreadable();
+        var result = new ArrayList<List<String>>(paths.size());
+        for (Object value : paths) {
+            if (!(value instanceof List<?> path) || path.isEmpty()) throw unreadable();
+            var components = new ArrayList<String>(path.size());
+            for (Object component : path) {
+                if (!(component instanceof String text)) throw unreadable();
+                components.add(text);
+            }
+            result.add(List.copyOf(components));
+        }
+        return List.copyOf(result);
     }
 
     static Document run(ValidationRunSpec spec) {

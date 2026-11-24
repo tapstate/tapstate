@@ -66,9 +66,11 @@ class CloudExternalConfigStartupIT {
     private static final String READY = "Tapstate application is ready";
     private static final String PASSWORD = NativeAppStorage.PASSWORD;
     private static final Set<String> CONNECTORS = Set.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy");
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Pattern HTTP_PORT = Pattern.compile("Tomcat started on port (\\d+)");
+    private static final Pattern BUNDLED_REGISTRATION = Pattern.compile(
+            "SeedSweepRunner\\s*: Seed(?:ed)? connector '([^']+)' \\(([0-9a-f]{64})\\)");
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(1)).build();
 
@@ -115,12 +117,12 @@ class CloudExternalConfigStartupIT {
     }
 
     enum Mismatch {
-        CLOUD_EMPTY(Distribution.CLOUD, 0, "boot.web-profile-mode-mismatch"),
-        CLOUD_PARTIAL(Distribution.CLOUD, 1, "boot.cloud-config-incomplete"),
-        ON_PREM_COMPLETE(Distribution.ON_PREM, 4, "boot.web-profile-mode-mismatch"),
-        ON_PREM_PARTIAL(Distribution.ON_PREM, 1, "boot.cloud-config-incomplete"),
-        MISSING_PROFILE(Distribution.MISSING, 4, "boot.web-profile-invalid"),
-        UNKNOWN_PROFILE(Distribution.UNKNOWN, 4, "boot.web-profile-invalid");
+        CLOUD_EMPTY(Distribution.CLOUD, 0, "TS0310006"),
+        CLOUD_PARTIAL(Distribution.CLOUD, 1, "TS0310002"),
+        ON_PREM_COMPLETE(Distribution.ON_PREM, 4, "TS0310006"),
+        ON_PREM_PARTIAL(Distribution.ON_PREM, 1, "TS0310002"),
+        MISSING_PROFILE(Distribution.MISSING, 4, "TS0310005"),
+        UNKNOWN_PROFILE(Distribution.UNKNOWN, 4, "TS0310005");
 
         private final Distribution distribution;
         private final int settings;
@@ -192,6 +194,7 @@ class CloudExternalConfigStartupIT {
         first.awaitReady();
         assertVersion(first);
         awaitStatusReport(0, first);
+        var registered = assertBundledConnectors(first);
         Document storedWitness;
         String keyring;
         SourceResource witness = new SourceResource("restart_witness",
@@ -203,7 +206,7 @@ class CloudExternalConfigStartupIT {
             assertThat(selectedDb.listCollectionNames().into(new ArrayList<>()))
                     .contains(SystemCollections.SOURCES.collectionName());
             assertDefaultSource(selectedDb, StorageBinding.Mode.CLOUD);
-            assertConnectors(raw.getDatabase(storage.cacheDatabase()), CONNECTORS);
+            assertNoBundledConnectorCopies(raw.getDatabase(storage.cacheDatabase()));
             assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
             try (var connection = metadataConnection(selected)) {
                 assertThat(connection.artifacts().create(witness)).isEqualTo(ArtifactMutation.CREATED);
@@ -219,6 +222,7 @@ class CloudExternalConfigStartupIT {
         Running restarted = start(carrier, values, MONGO.getReplicaSetUrl(ignored), seed);
         restarted.awaitReady();
         assertVersion(restarted);
+        assertThat(assertBundledConnectors(restarted)).isEqualTo(registered);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             assertThat(raw.getDatabase(selected).getCollection(SystemCollections.SOURCES.collectionName())
                     .find(new Document("_id", witness.id())).first()).isEqualTo(storedWitness);
@@ -230,7 +234,7 @@ class CloudExternalConfigStartupIT {
                             StorageBinding.defaultSourceId(StorageBinding.Mode.CLOUD), witness.id());
             assertThat(keyringFingerprint(raw.getDatabase(selected))).isEqualTo(keyring);
             assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
-            assertConnectors(raw.getDatabase(storage.cacheDatabase()), CONNECTORS);
+            assertNoBundledConnectorCopies(raw.getDatabase(storage.cacheDatabase()));
         }
         try (var connection = metadataConnection(selected)) {
             assertThat(connection.artifacts().get(witness.id()))
@@ -312,8 +316,13 @@ class CloudExternalConfigStartupIT {
                 try (var raw = MongoClients.create(MONGO.getReplicaSetUrl(database))) {
                     assertThat(raw.getDatabase(database).listCollectionNames().into(new ArrayList<>()))
                             .contains(SystemCollections.SOURCES.collectionName());
-                    assertConnectors(raw.getDatabase(storage.cacheDatabase()),
-                            distribution == Distribution.CLOUD ? CONNECTORS : Set.of());
+                    var cache = raw.getDatabase(storage.cacheDatabase());
+                    if (distribution == Distribution.CLOUD) {
+                        assertBundledConnectors(running);
+                        assertNoBundledConnectorCopies(cache);
+                    } else {
+                        assertConnectors(cache, Set.of());
+                    }
                     assertDefaultSource(raw.getDatabase(database), distribution == Distribution.CLOUD
                             ? StorageBinding.Mode.CLOUD : StorageBinding.Mode.OP);
                 }
@@ -343,7 +352,7 @@ class CloudExternalConfigStartupIT {
                     LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
                 }
                 gate.release();
-                running.awaitUnavailable("store.unreachable", "UNAVAILABLE");
+                running.awaitUnavailable("TS0470001", "UNAVAILABLE");
                 assertThat(running.get("/version").body()).contains("\"dataVersion\":null");
                 assertDatabaseUntouched(database);
                 assertDatabaseUntouched(database + "_operator");
@@ -402,7 +411,7 @@ class CloudExternalConfigStartupIT {
     void cloudCannotStartWithoutItsMandatoryConnectorRelease() throws Exception {
         String uri = prepareNative(uniqueDatabase("missing_cloud_seeds"), true).configurationUri();
         Running running = start(Carrier.FILE, cloudValues(uri), uri);
-        running.awaitUnavailable("boot.cloud-connectors-invalid", "LOGIN");
+        running.awaitUnavailable("TS0310013", "LOGIN");
         assertThat(cloudRequests.get()).as("unexpected Cloud calls: %s", cloudPaths).isZero();
         assertSafeOutput(running, uri);
     }
@@ -440,7 +449,7 @@ class CloudExternalConfigStartupIT {
         Map<String, String> values = cloudValues(MONGO.getReplicaSetUrl(selected));
         values.remove("tapstate.cloud.cluster-id");
         Running running = start(carrier, values, MONGO.getReplicaSetUrl(ignored));
-        running.awaitFailure("boot.cloud-config-incomplete");
+        running.awaitFailure("TS0310002");
         assertUntouched(ignored);
         assertUntouched(selected);
         assertSafeOutput(running, values.get("tapstate.cloud.atlas-uri"));
@@ -452,7 +461,7 @@ class CloudExternalConfigStartupIT {
         Map<String, String> values = cloudValues(MONGO.getReplicaSetUrl(uniqueDatabase("invalid_selected")));
         values.put("tapstate.cloud.base-url", "https://accidental-user:base-password-sentinel@cloud.example");
         Running running = start(Carrier.JVM, values, MONGO.getReplicaSetUrl(ignored));
-        running.awaitFailure("boot.cloud-base-url-invalid");
+        running.awaitFailure("TS0310003");
         assertUntouched(ignored);
         assertSafeOutput(running, values.get("tapstate.cloud.atlas-uri"));
         assertAbsent(running, "base-password-sentinel", "accidental-user");
@@ -464,7 +473,7 @@ class CloudExternalConfigStartupIT {
         String uri = "mongodb://unreachable-user:atlas-password-sentinel@127.0.0.1:1/metadata";
         Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored),
                 "--tapstate.store.mongo.server-selection-timeout=500ms");
-        running.awaitUnavailable("store.unreachable", "UNAVAILABLE");
+        running.awaitUnavailable("TS0470001", "UNAVAILABLE");
         assertDatabaseUntouched(ignored);
         assertOnlyDeniedConfigurationClaim();
         assertSafeOutput(running, uri);
@@ -477,7 +486,7 @@ class CloudExternalConfigStartupIT {
         String selected = uniqueDatabase("disabled_selected");
         Running running = start(Carrier.FILE, cloudValues(MONGO.getReplicaSetUrl(selected)),
                 MONGO.getReplicaSetUrl(ignored), "--tapstate.store.mongo.enabled=false");
-        running.awaitFailure("boot.cloud-store-required");
+        running.awaitFailure("TS0310008");
         assertUntouched(ignored);
         assertUntouched(selected);
         assertSafeOutput(running, MONGO.getReplicaSetUrl(selected));
@@ -488,7 +497,7 @@ class CloudExternalConfigStartupIT {
         String ignored = uniqueDatabase("invalid_atlas_ignored");
         String uri = "https://accidental-user:atlas-uri-password-sentinel@atlas.example/metadata";
         Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored));
-        running.awaitFailure("boot.cloud-atlas-uri-invalid");
+        running.awaitFailure("TS0310004");
         assertUntouched(ignored);
         assertSafeOutput(running, uri);
         assertAbsent(running, "atlas-uri-password-sentinel");
@@ -549,7 +558,7 @@ class CloudExternalConfigStartupIT {
     void anOnPremProcessCannotEnableCloudStatusReporting() throws Exception {
         Running running = start(Carrier.FILE, Map.of(), MONGO.getReplicaSetUrl(uniqueDatabase("status_onprem")),
                 "--SDK_STATUS_SENDER_ENABLED=true");
-        running.awaitFailure("boot.cloud-status-mode-required");
+        running.awaitFailure("TS0310011");
         assertThat(cloudRequests.get()).as("unexpected Cloud calls: %s", cloudPaths).isZero();
         assertSafeOutput(running, null);
     }
@@ -565,7 +574,8 @@ class CloudExternalConfigStartupIT {
     }
 
     private void awaitStatusReport(int previousCount, Running running) throws IOException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        // If storage is briefly unavailable on Ready, the next real heartbeat runs after 30 seconds.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
         while (statusReports.size() <= previousCount && running.process().isAlive() && System.nanoTime() < deadline) {
             LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
         }
@@ -616,6 +626,19 @@ class CloudExternalConfigStartupIT {
         String token = JSON.readTree(response.body()).path("token").asText();
         assertThat(token).isNotBlank();
         running.awaitBusiness(token);
+    }
+
+    private static Map<String, String> assertBundledConnectors(Running running) throws IOException {
+        // The seed runner emits these outcomes only after checking each exact registration in the runtime registry.
+        var registrations = BUNDLED_REGISTRATION.matcher(running.safeOutput()).results().collect(
+                java.util.stream.Collectors.toMap(match -> match.group(1), match -> match.group(2)));
+        assertThat(registrations.keySet()).containsExactlyInAnyOrderElementsOf(CONNECTORS);
+        return registrations;
+    }
+
+    private static void assertNoBundledConnectorCopies(com.mongodb.client.MongoDatabase database) {
+        assertConnectors(database, Set.of());
+        assertThat(SystemCollections.CACHE_CONNECTOR_ARTIFACTS.chunksOn(database).countDocuments()).isZero();
     }
 
     private static void assertConnectors(com.mongodb.client.MongoDatabase database, Set<String> expected) {

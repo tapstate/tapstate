@@ -12,6 +12,7 @@ import io.tapstate.testsupport.RequiresDocker;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.atomic.*;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -47,6 +48,36 @@ class AlertEvaluationHostIT {
                 var view=reopened.alerts(f.storeHost,BuiltinAlarmTypes.catalog(),f.clock);
                 assertThat(view.state(binding.key(),f.reads()).orElseThrow()).isEqualTo(retained);
                 assertThat(view.evaluationStates(null,1).rows()).containsExactly(retained);
+            }
+        });
+    }
+    @Test void hotReadsCheckTheLiveMarkerAndBackgroundVerificationDetectsIndexDrift() {
+        withFixture(f->{
+            var key=f.binding(()->null).key();
+            try(var client=MongoClients.create(f.settings().uri())){
+                var db=client.getDatabase(new com.mongodb.ConnectionString(f.settings().uri()).getDatabase());
+                var schema=db.getCollection("schema_migrations");
+                var filter=new Document("_id","config");
+                var marker=schema.find(filter).first().get("alerting",Document.class);
+                schema.updateOne(filter,new Document("$set",new Document("alerting.operationId","schema-fence-test")));
+                try {
+                    assertThatThrownBy(()->f.store().state(key,f.reads())).isInstanceOfSatisfying(
+                            TapstateException.class,error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                } finally {schema.updateOne(filter,new Document("$set",new Document("alerting",marker)));}
+                var episodes=db.getCollection("alert_episodes");
+                var index=episodes.listIndexes().into(new ArrayList<>()).stream()
+                        .filter(row->"alert_cleanup".equals(row.getString("name"))).findFirst().orElseThrow();
+                episodes.dropIndex("alert_cleanup");
+                try {
+                    await().atMost(Duration.ofSeconds(12)).untilAsserted(()->assertThatThrownBy(
+                            ()->f.store().state(key,f.reads())).isInstanceOfSatisfying(TapstateException.class,
+                            error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE)));
+                } finally {
+                    episodes.createIndex(index.get("key",Document.class),new com.mongodb.client.model.IndexOptions().name("alert_cleanup"));
+                }
+                await().ignoreExceptionsMatching(error->error instanceof TapstateException coded
+                        && coded.code()==IoError.DOCUMENT_UNREADABLE).atMost(Duration.ofSeconds(12))
+                        .untilAsserted(()->assertThat(f.store().state(key,f.reads())).isEmpty());
             }
         });
     }

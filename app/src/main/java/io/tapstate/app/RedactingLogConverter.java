@@ -25,6 +25,9 @@ public final class RedactingLogConverter extends CompositeConverter<ILoggingEven
 
     @Override
     protected String transform(ILoggingEvent event, String text) {
-        return redactor(getContext()).redactLog(text);
+        var redactor = redactor(getContext());
+        var diagnostic = PipelineLogAppender.diagnostic(event, redactor);
+        String details = diagnostic.isEmpty() ? "" : "diagnostic=" + diagnostic + System.lineSeparator();
+        return redactor.redactLog(text) + details;
     }
 }

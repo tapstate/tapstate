@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.*;
 import io.tapstate.spi.store.*;
@@ -20,6 +21,10 @@ final class NativeValidationRuns implements AutoCloseable {
     private volatile boolean closed;
     private final java.time.Clock clock;
     private final io.tapstate.core.logging.SecretRedactor redactor;
+    ValidationReportMetadata.Failure tableDiagnosis(TapstateException failure) {
+        return NativeValidationReportFailure.capture(failure, redactor);
+    }
+
     NativeValidationRuns(NativeValidationOwnerReservations owners,ValidationMemberResources.Member resources,
             ValidationMemberResources process,ValidationOwnerTimers timers) {
         this(owners,resources,process,timers,java.time.Clock.systemUTC(),new io.tapstate.core.logging.SecretRedactor());
@@ -109,7 +114,10 @@ final class NativeValidationRuns implements AutoCloseable {
         final io.tapstate.core.logging.SecretRedactor reportRedactor;
         Actor(ValidationControlStore.Run original,NativeValidationOwnerReservations.Reservation reservation,ValidationRunLifecycle.Activation activation,java.time.Instant scheduledDue) {
             this.original=original;this.reservation=reservation;allocation=reservation.resources();control=allocation.controlExecutor();
-            reports=reservation.access().reports();var secrets=new ArrayList<String>();var sources=new ArrayList<String>();
+            var access = reservation.access();
+            var countHandles = access.countHandles();
+            reports = countHandles.map(handles -> handles.reports()).orElseGet(access::reports);
+            var secrets=new ArrayList<String>();var sources=new ArrayList<String>();
             for(var resource:reservation.declarations.artifacts().list())if(resource instanceof io.tapstate.core.model.SourceResource source){sources.add(source.id());secretScalars(source.config(),secrets);}
             reportRedactor=redactor.fork(sources);reportRedactor.replace("original-inputs",secrets);
             var factory=new ValidationRunLifecycle.Activation(){
@@ -128,7 +136,10 @@ final class NativeValidationRuns implements AutoCloseable {
                     }
                 }
             };
-            lifecycle=new ValidationRunLifecycle(original,reservation.access().admissions(),reservation.access().control(),factory,this,scheduledDue);
+            lifecycle = new ValidationRunLifecycle(original,
+                    countHandles.map(handles -> handles.admissions()).orElseGet(access::admissions),
+                    countHandles.map(handles -> handles.control()).orElseGet(access::control),
+                    factory, this, scheduledDue);
             observed=lifecycle.status();
         }
         void dispatch() {
@@ -150,7 +161,9 @@ final class NativeValidationRuns implements AutoCloseable {
                             }
                             if(expired)return;
                             if(shared!=null&&!lifecycle.status().retired())shared.quota.reconcileLimit();
-                            observed=lifecycle.advance();
+                            observed=observed.state()==ValidationRunState.STARTING
+                                    ? MongoConfigurationDomain.duringValidationStartup(lifecycle::advance)
+                                    : lifecycle.advance();
                             if(observed.state()==ValidationRunState.RUNNING&&!sealed.get()&&delays!=null)applySavedDelay();
                         });
                     }

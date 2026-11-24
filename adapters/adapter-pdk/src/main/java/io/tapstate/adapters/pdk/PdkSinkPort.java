@@ -104,9 +104,8 @@ public final class PdkSinkPort implements SinkPort {
     private PdkSinkPort(ConnectorProvisioner provisioner,KeyedStateStore stateStore,SharedSinkConnectors sharing,
             PipelineNode.Purpose purpose,ConnectorNoteScopes noteScopes,WorkloadClaimFence execution,
             PdkSinkPreparations preparations,Map<String,TargetIdentityPlan> plannedIdentities) {
-        if(preparations!=null)preparations.requireClaim(execution);
         this.plannedIdentities=plannedIdentities==null?null:Map.copyOf(plannedIdentities);
-        this.preparations=preparations;
+        this.preparations = preparations == null ? null : preparations.forExecution(execution);
         if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
             throw new IllegalArgumentException("sink purpose must be view or sync");
         }
@@ -126,28 +125,29 @@ public final class PdkSinkPort implements SinkPort {
 
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
         requireInputs(config);requireActive();
+        requireDeferredSupport(config, targets);
         ConnectorRef ref = provisioner.resolve(config.connectorId());
         return open(config, ref, targets, false, configuredDrive(config, ref));
     }
 
     /**
-     * A writer for tables prepared before it opened, by {@link #prepare}: refused, before any connector is opened,
-     * unless each one was; then it only writes rows. Several writers of one sink open this way, and none of them
-     * clears a table another has started writing.
+     * Opens a writer after checking the receipts for the tables prepared by {@link #prepare}.
+     * Deferred tables use the same scoped receipts at the first write or delivered snapshot boundary.
      *
      * <p>Each opens a connector of its own, unless the artifact is certified to be shared: then the writers of a
      * sink on this member share one, started by the first of them and stopped by the last.
      */
     public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets) {
         requireInputs(config);requireActive();
+        requireDeferredSupport(config, targets);
         if(preparations!=null) {
             if(plannedIdentities!=null && !plannedIdentities.keySet().equals(targets.keySet()))
                 throw new IllegalArgumentException("frozen identities must cover every input stream");
             var physical=plannedIdentities==null?targets.values():plannedIdentities.values().stream().map(TargetIdentityPlan::target).toList();
-            for(var target:physical)preparations.requireReady(target);
+            preparations.requireReady(physical.stream().filter(target -> !target.hasDeferredDecimal()).toList());
         }
         ConnectorRef ref = provisioner.resolve(config.connectorId());
-        ConfiguredDrive drive = configuredDrive(config, ref);
+        ConfiguredDrive drive = configuredDrive(config, ref, true);
         SharedSinkConnectors.NoteIdentity identity = drive.identity();
         if(preparations==null)PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values(), purpose);
         if (sharing == null || config.node() == null || !ref.shareSafe()) {
@@ -209,6 +209,7 @@ public final class PdkSinkPort implements SinkPort {
      */
     public void prepare(SinkConfig config, Map<String, TargetTable> targets) {
         requireInputs(config);requireActive();
+        requireDeferredSupport(config, targets);
         ConnectorRef ref = provisioner.resolve(config.connectorId());
         PdkWritePolicies.select(config.connectorId(),ref.spec(),config.writeMode());
         ConfiguredDrive drive = configuredDrive(config, ref);
@@ -226,11 +227,12 @@ public final class PdkSinkPort implements SinkPort {
                 PdkTargetIdentityPlanner.requireSame(config, plannedIdentities, identities);
                 for (TargetIdentityPlan identity : identities.values()) {
                     TargetTable target = identity.target();
+                    if (target.hasDeferredDecimal()) continue;
                     TapTable table = TargetTapTable.build(target);
                     connector.resolveTargetTypes(table);
                     preparation.prepare(target, table);
                 }
-                PdkTargetIdentityPlanner.verifyPrepared(connector, config, targets, identities,operationObserver);
+                PdkTargetIdentityPlanner.verifyEagerTargets(connector, config, targets, identities, operationObserver);
                 return null;
             });
         } catch (TapstateException e) {
@@ -239,6 +241,14 @@ public final class PdkSinkPort implements SinkPort {
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         } finally {
             try {connector.stopQuietly();connector.close();}finally{operationObserver.close();}
+        }
+    }
+
+    private void requireDeferredSupport(SinkConfig config, Map<String, TargetTable> targets) {
+        if (targets.values().stream().anyMatch(TargetTable::hasDeferredDecimal)
+                && (preparations == null || !PdkTargetIdentityPlanner.hasFlexibleColumns(config.connectorId()))) {
+            throw PdkSinkWriter.writeFailed(config.connectorId(), new IllegalStateException(
+                    "an undecided script decimal requires a flexible target and scoped preparation"));
         }
     }
 
@@ -311,6 +321,10 @@ public final class PdkSinkPort implements SinkPort {
     private record ConfiguredDrive(SharedSinkConnectors.NoteIdentity identity, ConnectorNoteScopes scopes) { }
 
     private ConfiguredDrive configuredDrive(SinkConfig config, ConnectorRef ref) {
+        return configuredDrive(config, ref, false);
+    }
+
+    private ConfiguredDrive configuredDrive(SinkConfig config, ConnectorRef ref, boolean writerOpening) {
         if (noteScopes == null) return new ConfiguredDrive(null, null);
         requireActive();
         if (config.node() == null || execution.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
@@ -326,17 +340,18 @@ public final class PdkSinkPort implements SinkPort {
                 || primary.owner().bindingVersion() != global.owner().bindingVersion()) {
             throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
         }
-        var origin = noteScopes.store().origin(primary);
+        var prior = writerOpening && preparations != null ? preparations.openedNotes() : null;
+        var origin = prior != null && prior.execution().equals(execution)
+                && prior.primary().equals(primary) && prior.global().equals(global)
+                ? prior.origin() : noteScopes.store().origin(primary);
         if (!origin.equals(ConnectorNoteOrigin.capture(config.connectorId(), ref.contentHash(), config.settings()))) {
             throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
         }
         requireActive();
         var identity = new SharedSinkConnectors.NoteIdentity(execution, primary, global, origin);
-        ConnectorNoteScopes fixed = ConnectorNoteScopes.of(noteScopes.store(), namespace -> {
-            if (namespace.equals(primary.owner().namespace())) return primary;
-            if (namespace.equals(global.owner().namespace())) return global;
-            throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
-        }, noteScopes::requireActive);
+        if (writerOpening && preparations != null) preparations.rememberOpenedNotes(identity);
+        ConnectorNoteScopes fixed = ConnectorNoteScopes.forBoundRun(noteScopes.store(),
+                ConnectorStateNamespace.of(config.node(), purpose), primary, global, noteScopes::requireActive);
         return new ConfiguredDrive(identity, fixed);
     }
 

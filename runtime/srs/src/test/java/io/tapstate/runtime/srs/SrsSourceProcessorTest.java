@@ -154,7 +154,10 @@ class SrsSourceProcessorTest {
             later = hz.getJet().newJob(graph, new com.hazelcast.jet.config.JobConfig().setName("arrival-later"));
             awaitSize(hz.getList("out-arrival-later"), 2);
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
-            while (later.getMetrics().get("sourceRowsIn.i.orders").isEmpty() && System.nanoTime() < deadline) Thread.sleep(50);
+            while ((first.getMetrics().get("sourceRowsIn.i.orders").stream()
+                    .mapToLong(value -> value.value()).sum() != 3
+                    || later.getMetrics().get("sourceRowsIn.i.orders").isEmpty())
+                    && System.nanoTime() < deadline) Thread.sleep(50);
             assertThat(first.getMetrics().get("sourceRowsIn.i.orders").stream().mapToLong(value -> value.value()).sum()).isEqualTo(3);
             assertThat(later.getMetrics().get("sourceRowsIn.i.orders").stream().mapToLong(value -> value.value()).sum()).isOne();
             assertThat(later.getMetrics().get("sourceRowsIn.r.orders").stream().mapToLong(value -> value.value()).sum()).isOne();
@@ -191,7 +194,7 @@ class SrsSourceProcessorTest {
             long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
             while(out.isEmpty()&&!job.getFuture().isDone()&&System.nanoTime()<deadline) Thread.sleep(10);
             assertThat(checks.get()).as("the member model check ran before projection").isPositive();
-            assertThatThrownBy(() -> job.getFuture().get(10,TimeUnit.SECONDS)).hasStackTraceContaining("io.srs-event-model-unavailable");
+            assertThatThrownBy(() -> job.getFuture().get(10,TimeUnit.SECONDS)).hasStackTraceContaining("TS0480019");
             assertThat(out).isEmpty();assertThat(cursor.get()).isEqualTo(-1);
         } finally {
             if(!job.getFuture().isDone())job.cancel();hz.getUserContext().remove(MODEL_CHECKS);hz.getUserContext().remove(MODEL_CURSOR);out.destroy();

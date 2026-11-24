@@ -2,7 +2,9 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.lifecycle.DesiredState;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /** Configuration-owned latest intents; cache epochs are meaningful only within the captured scope. */
 public interface PipelineIntentStore {
@@ -21,8 +23,43 @@ public interface PipelineIntentStore {
     }
 
 
+    /** The configuration revision belongs to the same snapshot as this runtime intent, when supported. */
+    record ActuationReading(PipelineIntentSnapshot intent, java.util.OptionalLong configurationRevision) {}
+
+    default Optional<ActuationReading> readForActuation(String pipelineId) {
+        return loadForActuation(pipelineId).map(intent -> new ActuationReading(intent, java.util.OptionalLong.empty()));
+    }
+
     /** Expected zero means never written; a refusal leaves the latest value and all versions unchanged. */
     boolean compareAndSet(PipelineIntentScope scope, long expectedIntentRevision, DesiredState desired);
+
+    /** Explicit starts publish their binding selection request in the same CONFIG transaction. */
+    default boolean compareAndSetExplicitStart(PipelineIntentScope scope, long expected, DesiredState desired) {
+        return compareAndSet(scope, expected, desired);
+    }
+
+    default ConnectorBindingStore connectorBindings() {
+        throw new UnsupportedOperationException("connector bindings are not supported");
+    }
+
+    /** A durable request to prepare exactly the definition and intent that HTTP accepted. */
+    record PendingStart(PipelineIntentSnapshot intent, PipelinePreparationInputs inputs) {}
+
+    default boolean compareAndSetStart(PipelineIntentScope scope, long expected, DesiredState desired,
+            PipelinePreparationInputs inputs) {
+        throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
+    default Optional<PendingStart> pendingStart(String pipelineId) { return Optional.empty(); }
+
+    default void failStart(PendingStart pending, IoError error) {
+        throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
+    /** Records an optional public diagnostic for the same pending start and under the same fence. */
+    default void failStart(PendingStart pending, IoError error, Map<String, Object> params) {
+        failStart(pending, error);
+    }
 
     /** Only the current native full-recovery permission may publish its first RUNNING intent. */
     default boolean startRecovered(CacheRecoveryStore.FullPreparation confirmation,long expectedIntentRevision,String pipelineHash) {
@@ -31,6 +68,16 @@ public interface PipelineIntentStore {
 
     /** Retains only the next revision and coordinates, and removes the id from the reconcile set. */
     boolean remove(PipelineIntentScope scope, long expectedIntentRevision);
+
+    /** Scheduling hints only; the admitted pass still reads its original intent and proves ownership. */
+    record DispatchSnapshot(List<String> pipelineIds, Set<String> stopping) {
+        public DispatchSnapshot {
+            pipelineIds = List.copyOf(pipelineIds);
+            stopping = Set.copyOf(stopping);
+        }
+    }
+
+    default Optional<DispatchSnapshot> dispatchSnapshot() { return Optional.empty(); }
 
     /** Projects live ids only, without decoding intent bodies. */
     List<String> pipelineIds();

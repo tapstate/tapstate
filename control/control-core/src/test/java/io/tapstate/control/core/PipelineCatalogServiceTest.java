@@ -37,7 +37,7 @@ class PipelineCatalogServiceTest {
         var stored = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, at);
         observations.save(stored);
         var calls = new java.util.concurrent.atomic.AtomicInteger();
-        var failure = new io.tapstate.core.lifecycle.ObservationFailure("engine.out-of-memory", Map.of("pipeline", "orders"));
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0440009", Map.of("pipeline", "orders"));
         var query = new PipelineObservationQueryService(artifacts, observations,
                 io.tapstate.core.lifecycle.ExecutionPlans.NONE, List::of, (pipeline, state) -> {
                     calls.incrementAndGet(); desired.save(intent("orders", PipelineState.STOPPED)); return Optional.of(failure);
@@ -84,7 +84,7 @@ class PipelineCatalogServiceTest {
                 new PipelineObservationQueryService(artifacts,observations),id -> id.equals("recover"));
         var item=service.find("recover").orElseThrow();
         assertThat(item.status().displayState()).isEqualTo(PipelineCatalogItem.UiState.RECOVERY_REQUIRED);
-        assertThat(item.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.UNAVAILABLE);
+        assertThat(item.status().state()).isNull();
         assertThat(item.status().desiredState()).isEqualTo(PipelineState.STOPPED);
         assertThat(item.status().observedState()).isNull();assertThat(item.status().observedAt()).isNull();
     }

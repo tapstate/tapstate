@@ -8,6 +8,8 @@ import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -25,9 +27,16 @@ import org.bson.Document;
 /** Actual task and session ownership survives a bounded claim caller. */
 final class MongoClaimOperations {
     private final MongoClient client;
+    final MongoStructureProof structures = new MongoStructureProof();
     private final ThreadPoolExecutor workers = new ThreadPoolExecutor(4, 4, 100, TimeUnit.MILLISECONDS,
             new LinkedBlockingQueue<>(), action -> {
                 var thread = new Thread(action, "mongo-claim-io");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private final ThreadPoolExecutor renewals = new ThreadPoolExecutor(1, 1, 100, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(), action -> {
+                var thread = new Thread(action, "mongo-pipeline-renewal-io");
                 thread.setDaemon(true);
                 return thread;
             });
@@ -35,18 +44,44 @@ final class MongoClaimOperations {
     private final Set<Transaction> transactions = ConcurrentHashMap.newKeySet();
     private final ThreadLocal<MongoReadBudget> current = new ThreadLocal<>();
     private final ThreadLocal<Runnable> active = new ThreadLocal<>();
+    private final ThreadLocal<WorkloadClaimKey> renewalKey = new ThreadLocal<>();
+    private final ThreadLocal<Boolean> renewalLane = new ThreadLocal<>();
     private boolean closed;
     private boolean stopping;
     private volatile boolean replicaSet;
     private volatile boolean routed;
 
-    MongoClaimOperations(MongoClient client) {
+    MongoClaimOperations(MongoClient client){this(client,false);}
+    MongoClaimOperations(MongoClient client,boolean retainedByDomain) {
         this.client = client;
         observeTopology();
-        workers.allowCoreThreadTimeOut(true);
+        workers.allowCoreThreadTimeOut(!retainedByDomain);
+        renewals.allowCoreThreadTimeOut(!retainedByDomain);
     }
 
     MongoReadBudget budget() { return current.get(); }
+
+    <T> T pipelineRenewal(WorkloadClaimKey key, Supplier<T> action) {
+        var budget = budget();
+        if (budget == null || renewalLane.get() == null) return action.get();
+        for (var transaction : transactions) {
+            if (!key.equals(transaction.renewalKey)) continue;
+            try {
+                abort(transaction, budget);
+            } catch (RuntimeException unconfirmed) {
+                throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                        "previous Pipeline renewal transaction remains unresolved");
+            }
+        }
+        renewalKey.set(key);
+        try {
+            return action.get();
+        } finally {
+            renewalKey.remove();
+        }
+    }
+
+    boolean pipelineRenewal() { return renewalKey.get() != null; }
     private void observeTopology() {
         var topology = client.getClusterDescription();
         if (topology.getType() == com.mongodb.connection.ClusterType.REPLICA_SET) {
@@ -70,6 +105,18 @@ final class MongoClaimOperations {
     }
 
     <T> T call(long deadline,Runnable guard,Supplier<T> action) {
+        return call(deadline, guard, action, workers);
+    }
+
+    <T> T renew(long deadline, Runnable guard, Supplier<T> action) {
+        return call(deadline, guard, () -> {
+            renewalLane.set(true);
+            try { return action.get(); }
+            finally { renewalLane.remove(); }
+        }, renewals);
+    }
+
+    private <T> T call(long deadline,Runnable guard,Supplier<T> action,ThreadPoolExecutor lane) {
         requireAdmission();
         var inherited = current.get();
         if (inherited != null) {
@@ -80,15 +127,15 @@ final class MongoClaimOperations {
             try {check();var result=action.get();check();return result;}
             finally { current.set(inherited);active.set(previous); }
         }
-        return result(submit(deadline, guard,action,false), deadline);
+        return result(submit(deadline, guard,action,false,lane), deadline);
     }
 
-    private synchronized <T> Call<T> submit(long deadline,Runnable guard,Supplier<T> action,boolean cleanup) {
+    private synchronized <T> Call<T> submit(long deadline,Runnable guard,Supplier<T> action,boolean cleanup,ThreadPoolExecutor lane) {
         if (closed || stopping&&!cleanup) throw MongoCacheWorkloadClaimStore.claimFenced();
         remaining(deadline);
         var call = new Call<T>(deadline,guard, action);
         calls.add(call);
-        try { workers.execute(call); }
+        try { lane.execute(call); }
         catch (RuntimeException rejected) { calls.remove(call); notifyAll(); throw rejected; }
         return call;
     }
@@ -101,7 +148,7 @@ final class MongoClaimOperations {
             throw MongoCacheWorkloadClaimStore.claimFenced();
         } catch (TimeoutException expired) {
             call.cancelPending();
-            throw MongoCacheWorkloadClaimStore.claimFenced();
+            throw deadlineExceeded(expired);
         } catch (ExecutionException failed) {
             if (failed.getCause() instanceof Error error) throw error;
             if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
@@ -114,9 +161,14 @@ final class MongoClaimOperations {
 
     private static long remaining(long deadline) {
         long remaining = deadline - System.nanoTime();
-        if (remaining <= 0 || Thread.currentThread().isInterrupted())
-            throw MongoCacheWorkloadClaimStore.claimFenced();
+        if (Thread.currentThread().isInterrupted()) throw MongoCacheWorkloadClaimStore.claimFenced();
+        if (remaining <= 0) throw deadlineExceeded(new TimeoutException());
         return remaining;
+    }
+
+    private static io.tapstate.core.common.TapstateException deadlineExceeded(TimeoutException cause) {
+        return new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED,
+                java.util.Map.of(), cause);
     }
 
     private final class Call<T> implements Runnable {
@@ -131,6 +183,7 @@ final class MongoClaimOperations {
         void cancelPending() {
             if (state.compareAndSet(0, 2)) {
                 workers.remove(this);
+                renewals.remove(this);
                 finished();
                 result.completeExceptionally(MongoCacheWorkloadClaimStore.claimFenced());
             }
@@ -156,6 +209,7 @@ final class MongoClaimOperations {
 
     final class Transaction {
         private final ClientSession session;
+        private final WorkloadClaimKey renewalKey = MongoClaimOperations.this.renewalKey.get();
         private long number;
         private BsonDocument recoveryToken;
         private Call<Void> cleanup;
@@ -273,7 +327,7 @@ final class MongoClaimOperations {
                 synchronized (transaction) {
                     if (!transactions.contains(transaction)) continue;
                     if (transaction.cleanup == null || transaction.cleanup.result.isDone())
-                        transaction.cleanup = submit(deadline,()->{}, () -> { abort(transaction, budget()); return null; },true);
+                        transaction.cleanup = submit(deadline,()->{}, () -> { abort(transaction, budget()); return null; },true,workers);
                     cleanup = transaction.cleanup;
                 }
                 result(cleanup, deadline);
@@ -286,5 +340,6 @@ final class MongoClaimOperations {
         if (!calls.isEmpty() || !transactions.isEmpty()) throw MongoCacheWorkloadClaimStore.claimFenced();
         closed = true;
         workers.shutdown();
+        renewals.shutdown();
     }
 }

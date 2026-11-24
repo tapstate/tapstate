@@ -315,7 +315,7 @@ class ConnectorCatalogViewTest {
 
         assertThatThrownBy(() -> view.detail("missing"))
                 .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("connector.not-found"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0380001"));
     }
 
     @Test

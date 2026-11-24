@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.core.catalog.ConnectorForm;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.JsonReader;
 import io.tapdata.entity.codec.TapCodecsRegistry;
@@ -33,12 +34,9 @@ import java.util.Map;
  * per-operation drive (init / read / write / stop) and its own coded failures belong to the ports.
  *
  * <p>The connector is driven with its own class loader installed as the thread context loader, the way
- * a real connector reaches its isolated runtime. That loader is the one every open of the same artifact
- * shares for the life of the process ({@link ConnectorClassLoader#shared}), so {@link #close()} releases
- * this handle and leaves the loader to the others: a connector that loads a JNI library can load it only
- * through the first loader that does, and each test, discovery and pipeline open of it must find that
- * loader again. Constructing a
- * real connector bootstraps the PDK runtime through the host loader, so the host must carry it: the
+ * a real connector reaches its isolated runtime. This handle leases the shared loader while in use.
+ * For connectors with process-wide native state, the loader can stay open after its last handle closes.
+ * Constructing a real connector bootstraps the PDK runtime through the host loader, so the host must carry it: the
  * assembly root does, so a real connector constructs here. A build whose host omits the runtime drives
  * only synthetic connectors that bind to the frozen contract alone.
  */
@@ -56,13 +54,14 @@ final class PdkConnector implements AutoCloseable {
     }
 
     private final String connectorId;
-    private final ConnectorClassLoader loader;
+    private final ConnectorClassLoader.SharedUse loaderUse;
     private final TapConnector connector;
     private final ConnectorFunctions functions;
     private final TapConnectorContext context;
     private final String stateNamespace;
     /** The pipeline this handle was opened for, or null for a drive that names none. */
     private final String pipelineId;
+    private final long logStateGeneration;
     private final TapCodecsRegistry codecs;
     private final PdkValueConversions conversions;
     /** Volatile because the thread that stops an instance is rarely the thread that drove it. */
@@ -71,20 +70,23 @@ final class PdkConnector implements AutoCloseable {
     private final ConnectorTrustMaterial trust;
     private final Runnable driveGuard;
     private final String specification;
+    private PdkRuntimeDiagnostic runtimeDiagnostic;
 
-    private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
+    private PdkConnector(String connectorId, ConnectorClassLoader.SharedUse loaderUse, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
-                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes, Runnable driveGuard, ConnectorTrustMaterial trust,
+                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, long logStateGeneration,
+                         Runnable closeNotes, Runnable driveGuard, ConnectorTrustMaterial trust,
                          String specification) {
         this.specification=specification;
         this.trust = trust;
         this.connectorId = connectorId;
-        this.loader = loader;
+        this.loaderUse = loaderUse;
         this.connector = connector;
         this.functions = functions;
         this.context = context;
         this.stateNamespace = stateNamespace;
         this.pipelineId = pipelineId;
+        this.logStateGeneration = logStateGeneration;
         this.codecs = codecs;
         this.closeNotes = closeNotes;
         this.driveGuard = driveGuard;
@@ -180,6 +182,7 @@ final class PdkConnector implements AutoCloseable {
         Map<String, Object> effectiveSettings = settings;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredState = null;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredGlobal = null;
+        long logGeneration = noteScopes == null ? 0 : noteScopes.logStateGeneration();
         if (noteScopes != null) {
             if (stateNamespace == null) {
                 throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
@@ -190,8 +193,15 @@ final class PdkConnector implements AutoCloseable {
                 }
             });
             var primary = captured.open(stateNamespace);
-            List<RequiredNoteCarry> prepared = notes == null ? List.of() : captured.store().carries(primary);
-            boolean blocked = notes != null && captured.store().allCarryBlocked(primary);
+            var owner = primary.owner();
+            if (owner.kind() == io.tapstate.spi.store.RequiredNoteOwner.Kind.PIPELINE
+                    && owner.ownerId().equals(pipelineId)) {
+                logGeneration = owner.stateGeneration();
+            }
+            var startup = notes != null && captured.batchSharedStartup() ? captured.store().sharedStartup(primary) : null;
+            List<RequiredNoteCarry> prepared = startup != null ? startup.carries()
+                    : notes == null ? List.of() : captured.store().carries(primary);
+            boolean blocked = startup != null ? startup.blocked() : notes != null && captured.store().allCarryBlocked(primary);
             if (prepared.stream().anyMatch(carry -> !carry.shared().equals(primary))
                     || prepared.stream().map(carry -> carry.source().owner().namespace()).distinct().count() != prepared.size()
                     || (!blocked && carriedFrom.stream().anyMatch(namespace -> prepared.stream()
@@ -200,7 +210,8 @@ final class PdkConnector implements AutoCloseable {
             }
             var earlier = blocked ? List.<io.tapstate.spi.store.RequiredNoteScope>of()
                     : prepared.stream().map(RequiredNoteCarry::source).toList();
-            var origin = captured.store().origin(primary);
+            // Opening a connector must revalidate the fixed scope even after sink preflight.
+            var origin = startup != null ? startup.origin() : captured.store().origin(primary);
             var requestedOrigin = ConnectorNoteOrigin.capture(connectorId, ref.contentHash(), settings);
             if (!origin.equals(requestedOrigin)) {
                 throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
@@ -211,10 +222,10 @@ final class PdkConnector implements AutoCloseable {
             configuredGlobal = new ScopedDurableStateMap(captured.store(), global, List.of(), false, captured::requireActive);
         }
 
-        ConnectorClassLoader loader;
+        ConnectorClassLoader.SharedUse loaderUse;
         try {
             PdkJsonProvider.prepareRuntime();
-            loader = ConnectorClassLoader.shared(ref.classpath());
+            loaderUse = ref.acquireLoader();
         } catch (RuntimeException | LinkageError e) {
             if (strictDefaultTest) {
                 if (e instanceof RuntimeException runtime) throw runtime;
@@ -228,7 +239,7 @@ final class PdkConnector implements AutoCloseable {
             material = ConnectorTrustMaterial.open(connectorId, effectiveSettings);
             effectiveSettings = material.settings();
             driveGuard.run();
-            Class<? extends TapConnector> connectorClass = loadConnectorClass(connectorId, loader, ref.className(), strictDefaultTest);
+            Class<? extends TapConnector> connectorClass = loadConnectorClass(connectorId, loaderUse.loader(), ref.className(), strictDefaultTest);
             ClassLoader restore = Thread.currentThread().getContextClassLoader();
             TapConnector connector;
             ConnectorFunctions functions = new ConnectorFunctions();
@@ -267,7 +278,7 @@ final class PdkConnector implements AutoCloseable {
             Map<String, Object> config = ConfigTypeCoercion.coerce(connectorId, ref.spec(), effectiveSettings);
             TapConnectorContext context = new TapConnectorContext(
                     specification, DataMap.create(config), nodeConfigFrom(ref.spec(), config),
-                    new ConnectorLog(connectorId, pipelineId));
+                    new ConnectorLog(connectorId, pipelineId, logGeneration));
             // A connector reaches what it keeps for itself through the context's state maps during init,
             // discovery and the drive; the context leaves them null, so give it live ones or the first
             // touch NPEs. The map handed over here is the same reference for as long as this handle
@@ -291,8 +302,9 @@ final class PdkConnector implements AutoCloseable {
             // on the actual drive thread; other operations retain the connector's defaults.
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
-                    connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId,
+                    connectorId, loaderUse, connector, functions, context, codecs, stateNamespace, pipelineId, logGeneration,
                     () -> notesActive.set(false), driveGuard, material, ref.spec());
+            result.runtimeDiagnostic = PdkRuntimeDiagnostic.bind(connectorId, ref, settings, node, purpose);
             try {
                 result.requireActive();
             } catch (RuntimeException | Error failure) {
@@ -304,10 +316,10 @@ final class PdkConnector implements AutoCloseable {
             return result;
         } finally {
             // Release the loader on every failure path — a coded load/class error, an escaping VM error,
-            // anything. A shared loader stays open for the artifact's other opens; this is a no-op on it.
+            // anything. Other handles keep their own leases.
             if (!opened) {
                 notesActive.set(false);
-                closeQuietly(loader);
+                loaderUse.close();
                 if (material != null) material.close();
             }
         }
@@ -464,7 +476,8 @@ final class PdkConnector implements AutoCloseable {
         if (settings == null || settings.isEmpty()) {
             return nodeConfig;
         }
-        Map<String, Map<?, ?>> declared = ConnectorForm.NODE.items(spec);
+        Map<String, Map<?, ?>> declared = spec != null && JsonReader.parse(spec) instanceof Map<?, ?> root
+                ? ConnectorForm.NODE.itemsIn(root) : Map.of();
         settings.forEach((name, value) -> {
             if (declared.containsKey(name)) {
                 nodeConfig.put(name, value);
@@ -517,6 +530,15 @@ final class PdkConnector implements AutoCloseable {
         driveGuard.run();
     }
 
+    io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        return runtimeDiagnostic == null ? io.tapstate.core.common.FailureFact.unavailable(failure)
+                : runtimeDiagnostic.failureFact(failure);
+    }
+
+    Map<String, Object> diagnostic(Throwable failure) {
+        return runtimeDiagnostic == null ? Map.of() : runtimeDiagnostic.capture(failure);
+    }
+
     <T> T underLoader(Action<T> action) throws Throwable {
         requireActive();
         return underLoaderForCleanup(action);
@@ -524,14 +546,14 @@ final class PdkConnector implements AutoCloseable {
 
     private <T> T underLoaderForCleanup(Action<T> action) throws Throwable {
         ClassLoader restore = Thread.currentThread().getContextClassLoader();
-        String previousPipeline = pipelineId == null ? null : ConnectorAttribution.claim(pipelineId);
+        var previous = pipelineId == null ? null : ConnectorAttribution.claim(pipelineId, logStateGeneration);
         try {
             Thread.currentThread().setContextClassLoader(connector.getClass().getClassLoader());
             return action.run();
         } finally {
             Thread.currentThread().setContextClassLoader(restore);
-            if (pipelineId != null) {
-                ConnectorAttribution.restore(previousPipeline);
+            if (previous != null) {
+                previous.close();
             }
         }
     }
@@ -554,7 +576,12 @@ final class PdkConnector implements AutoCloseable {
     /** Recovery cannot treat a plugin stop failure as proof that its original source resources ended. */
     void stopForCleanup() throws Throwable {
         stopped = true;
-        underLoaderForCleanup(() -> { connector.stop(context); return null; });
+        try {
+            underLoaderForCleanup(() -> { connector.stop(context); return null; });
+        } catch (Throwable failure) {
+            loaderUse.keep();
+            throw failure;
+        }
     }
 
     /**
@@ -575,22 +602,15 @@ final class PdkConnector implements AutoCloseable {
 
     @Override
     public void close() {
-        closeNotes.run();
-        closeQuietly(loader);
-        trust.close();
+        try {
+            closeNotes.run();
+            trust.close();
+        } finally {
+            loaderUse.close();
+        }
     }
 
     void closeDefaultTest() {
-        closeNotes.run();
-        try { loader.close(); }
-        finally { trust.close(); }
-    }
-
-    private static void closeQuietly(ConnectorClassLoader loader) {
-        try {
-            loader.close();
-        } catch (RuntimeException ignore) {
-            // best-effort: the loader is being discarded; a close failure must not mask the real error
-        }
+        close();
     }
 }

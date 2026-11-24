@@ -57,7 +57,7 @@ class NestPendingLimitFailsTheJobIT {
     private static final String PARENT_TABLE = "orders";
     private static final String CHILD_TABLE = "order_items";
     private static final String PIPELINE_ID = "pending_orders";
-    private static final String EXPECTED_CODE = "nest.pending-limit-exceeded";
+    private static final String EXPECTED_CODE = "TS0490021";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,
@@ -129,11 +129,11 @@ class NestPendingLimitFailsTheJobIT {
                                 + "%d.%n  documents: %s%n  metrics: %s", ORPHANS, ABSENT_ROOT, PENDING_LIMIT,
                                 mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE).size(), control.metrics(pipelineId))
                         .contains(PipelineState.FAILED);
+                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.errorCount(pipelineId))
                         .as("the failure is counted, not only entered")
                         .contains(1L);
 
-                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.failureCode(pipelineId))
                         .as("which bound it was. A run that died of anything else satisfies the state "
                                 + "above and says nothing about this one.%n  logs: %s",

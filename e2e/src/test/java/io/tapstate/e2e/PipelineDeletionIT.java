@@ -38,7 +38,7 @@ class PipelineDeletionIT {
 
             ControlPlane.Refusal refusal = control.deletePipelineExpectingRefusal(id, before.contentHash(), revision);
             assertThat(refusal.status()).isEqualTo(409);
-            assertThat(refusal.code()).isEqualTo("artifact.pipeline-not-stopped");
+            assertThat(refusal.code()).isEqualTo("TS0240005");
             assertThat(control.artifact(id)).contains(before);
             assertThat(control.pipelineDraft(id)).contains(draft);
             assertThat(control.pipelineCatalogIds()).contains(id);

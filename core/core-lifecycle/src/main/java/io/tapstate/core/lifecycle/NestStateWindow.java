@@ -32,12 +32,17 @@ import java.util.OptionalLong;
  * @param coldKeys keys requested by completed cold loaders during the window, where measured
  */
 public record NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
-        OptionalLong stored, OptionalLong keyAccesses, OptionalLong coldKeys) {
+        OptionalLong stored, OptionalLong keyAccesses, OptionalLong coldKeys, NestKeyAccess keyAccess) {
 
     /** Compatibility window without key instrumentation. */
     public NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
             OptionalLong stored) {
         this(accesses, backfills, backfillMillis, entries, stored, OptionalLong.empty(), OptionalLong.empty());
+    }
+
+    public NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
+            OptionalLong stored, OptionalLong keyAccesses, OptionalLong coldKeys) {
+        this(accesses, backfills, backfillMillis, entries, stored, keyAccesses, coldKeys, null);
     }
 
     public NestStateWindow {
@@ -59,7 +64,8 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
                 current.backfills() - previous.backfills(),
                 current.backfillMillis() - previous.backfillMillis(),
                 current.entries(), current.stored(), difference(previous.keyAccesses(), current.keyAccesses()),
-                difference(previous.coldKeys(), current.coldKeys()));
+                difference(previous.coldKeys(), current.coldKeys()),
+                current.keyAccess() == null ? null : current.keyAccess().since(previous.keyAccess()));
     }
 
     /**
@@ -71,7 +77,7 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
     public static NestStateWindow fromStart(NestStateReading current) {
         Objects.requireNonNull(current, "current");
         return new NestStateWindow(current.accesses(), current.backfills(), current.backfillMillis(),
-                current.entries(), current.stored(), current.keyAccesses(), current.coldKeys());
+                current.entries(), current.stored(), current.keyAccesses(), current.coldKeys(), current.keyAccess());
     }
 
     /**
@@ -82,6 +88,11 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
         return keyAccesses.isEmpty() || coldKeys.isEmpty() || keyAccesses.getAsLong() == 0
                 ? OptionalDouble.empty()
                 : OptionalDouble.of((double) coldKeys.getAsLong() / keyAccesses.getAsLong());
+    }
+
+    /** Split key readings apply the pressure floor in keys. Older reporters retain the logical floor. */
+    public long pressureAccesses() {
+        return keyAccess == null ? accesses : keyAccesses.orElse(-1);
     }
 
     private static OptionalLong difference(OptionalLong previous, OptionalLong current) {

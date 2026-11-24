@@ -8,6 +8,7 @@ import io.tapstate.core.catalog.OfficialConnectors;
 import io.tapstate.core.catalog.SpecNormalizer;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.spi.store.BundledConnectorIcon;
 import io.tapstate.spi.store.CapabilityDeriver;
 import io.tapstate.spi.store.ConnectorCapabilities;
 import io.tapstate.spi.store.ConnectorCatalogStore;
@@ -29,7 +30,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.jar.JarFile;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 /**
  * Registers a connector artifact on disk into the distribution store by what the artifact itself
@@ -83,7 +87,8 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     private final CapabilityDeriver capabilityDeriver;
     private final ConnectorCatalogStore catalogStore;
     private final ConnectorSpecStore specStore;
-    private final List<String> acceptedConnectorIds;
+    private final Supplier<List<String>> supportedConnectorIds;
+    private final List<String> alsoAccept;
 
     /** Registers with the release's own accepted set — what every shipped artifact uses. */
     public ConnectorArtifactRegistrar(ConnectorRegistry registry, ConnectorIntrospector introspector,
@@ -101,27 +106,32 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     public ConnectorArtifactRegistrar(ConnectorRegistry registry, ConnectorIntrospector introspector,
                                       CapabilityDeriver capabilityDeriver, ConnectorCatalogStore catalogStore,
                                       ConnectorSpecStore specStore, List<String> alsoAccept) {
+        this(registry, introspector, capabilityDeriver, catalogStore, specStore,
+                ConnectorArtifactRegistrar::officialConnectorIds, alsoAccept);
+    }
+
+    /** Uses the current server support manifest for registration admission. */
+    public ConnectorArtifactRegistrar(ConnectorRegistry registry, ConnectorIntrospector introspector,
+                                      CapabilityDeriver capabilityDeriver, ConnectorCatalogStore catalogStore,
+                                      ConnectorSpecStore specStore, Supplier<List<String>> supportedConnectorIds,
+                                      List<String> alsoAccept) {
         java.util.Arrays.setAll(registrationLocks, ignored -> new Object());
         this.registry = Objects.requireNonNull(registry, "registry");
         this.introspector = Objects.requireNonNull(introspector, "introspector");
         this.capabilityDeriver = Objects.requireNonNull(capabilityDeriver, "capabilityDeriver");
         this.catalogStore = Objects.requireNonNull(catalogStore, "catalogStore");
         this.specStore = Objects.requireNonNull(specStore, "specStore");
-        Objects.requireNonNull(alsoAccept, "alsoAccept");
-        if (alsoAccept.isEmpty()) {
-            // The shipped path accepts that list itself rather than a copy of it, so no edit can move
-            // one without the other.
-            this.acceptedConnectorIds = OfficialConnectors.IDS;
-        } else {
-            List<String> accepted = new ArrayList<>(OfficialConnectors.IDS);
-            accepted.addAll(alsoAccept);
-            this.acceptedConnectorIds = List.copyOf(accepted);
-        }
+        this.supportedConnectorIds = Objects.requireNonNull(supportedConnectorIds, "supportedConnectorIds");
+        this.alsoAccept = List.copyOf(alsoAccept);
     }
 
-    /** The ids this registrar accepts: the official set, widened by whatever the deployment named. */
+    /** The ids this registrar accepts: the effective set, widened by whatever the deployment named. */
     List<String> acceptedConnectorIds() {
-        return acceptedConnectorIds;
+        List<String> supported = supportedConnectorIds.get();
+        if (alsoAccept.isEmpty()) return supported;
+        var accepted = new ArrayList<>(supported);
+        accepted.addAll(alsoAccept);
+        return List.copyOf(accepted);
     }
 
     /** Registers the artifact at {@code artifact} if its content hash is not already registered. */
@@ -175,6 +185,46 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         return outcome;
     }
 
+    /** Publishes an image seed after the Cloud release gate has verified the local file. */
+    public RegistrationOutcome registerBundled(Path artifact, PdkCapabilityDeriver deriver) {
+        IntrospectedConnector introspected = introspector.introspect(List.of(artifact));
+        Object specTree = parseSpecTree(introspected, artifact);
+        String connectorId = declaredId(specTree, introspected, artifact);
+        rejectUnofficialConnector(connectorId);
+        String hash = hashOf(artifact);
+        synchronized (registrationLocks[Math.floorMod(connectorId.hashCode(), registrationLocks.length)]) {
+            if (Thread.currentThread().isInterrupted()) throw artifactUnreadable(artifact);
+            rejectConflictingArtifact(connectorId, hash);
+            String specHash = storeSpecSource(introspected);
+            var registration = new ConnectorRegistration(connectorId, hash, introspected.pdkApiVersion(),
+                    RegistrationSource.SEED);
+            if (catalogStore.bundledRegistration(connectorId).filter(registration::equals).isPresent()) {
+                return new RegistrationOutcome(registration, false);
+            }
+            var ref = new ConnectorRef(List.of(artifact), introspected.className(), introspected.pdkApiVersion(),
+                    null, introspected.spec(), hash, false);
+            var row = catalogRow(introspected, specTree, specHash, deriver.derive(connectorId, ref));
+            catalogStore.upsertBundled(row, registration, bundledIcon(artifact, row.icon()));
+            return new RegistrationOutcome(registration, true);
+        }
+    }
+
+    static Optional<BundledConnectorIcon> bundledIcon(Path artifact, String declaredPath) {
+        if (declaredPath == null || declaredPath.isBlank()) return Optional.empty();
+        String path = declaredPath.startsWith("/") ? declaredPath.substring(1) : declaredPath;
+        try (JarFile jar = new JarFile(artifact.toFile())) {
+            var entry = jar.getJarEntry(path);
+            if (entry == null || entry.isDirectory()) return Optional.empty();
+            try (var input = jar.getInputStream(entry)) {
+                byte[] bytes = input.readNBytes(BundledConnectorIcon.MAX_BYTES + 1);
+                return bytes.length > BundledConnectorIcon.MAX_BYTES ? Optional.empty()
+                        : Optional.of(new BundledConnectorIcon(BundledConnectorIcon.mediaTypeFor(path), bytes));
+            }
+        } catch (IOException e) {
+            throw artifactUnreadable(artifact);
+        }
+    }
+
     /**
      * Registers the artifact carried by {@code artifact} bytes — the entry the runtime register
      * operation uses, since a remote caller hands over bytes rather than a server path. The bytes are
@@ -206,6 +256,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
      * per-jar failure the sweep reports and carries on from, exactly like any other defective artifact.
      */
     private void rejectUnofficialConnector(String connectorId) {
+        List<String> acceptedConnectorIds = acceptedConnectorIds();
         if (acceptedConnectorIds.contains(connectorId)) {
             return;
         }
@@ -266,7 +317,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     }
 
     /** Parses the spec text to its object tree, refusing coded when it is not valid JSON. */
-    private static Object parseSpecTree(IntrospectedConnector introspected, Path artifact) {
+    static Object parseSpecTree(IntrospectedConnector introspected, Path artifact) {
         try {
             return JsonReader.parse(introspected.spec());
         } catch (IllegalArgumentException e) {
@@ -275,7 +326,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     }
 
     /** The connector id the spec declares under {@code properties.id} — the registration identity. */
-    private static String declaredId(Object specTree, IntrospectedConnector introspected, Path artifact) {
+    static String declaredId(Object specTree, IntrospectedConnector introspected, Path artifact) {
         if (specTree instanceof Map<?, ?> root
                 && root.get("properties") instanceof Map<?, ?> properties
                 && properties.get("id") instanceof String id
@@ -330,11 +381,14 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
             // swallowed.
             return;
         }
+        catalogStore.upsert(catalogRow(introspected, specTree, specHash, capabilities));
+    }
+
+    static ConnectorCatalogEntry catalogRow(IntrospectedConnector introspected, Object specTree,
+                                                    String specHash, ConnectorCapabilities capabilities) {
         NormalizedSpec normalized = SpecNormalizer.normalize(asSpecObject(specTree));
-        ConnectorCatalogEntry row = CatalogEntryAssembler.assemble(
-                normalized, capabilities.capabilityIds(), OVERLAY,
+        return CatalogEntryAssembler.assemble(normalized, capabilities.capabilityIds(), OVERLAY,
                 introspected.specPath(), specHash);
-        catalogStore.upsert(row);
     }
 
     @SuppressWarnings("unchecked")
@@ -352,7 +406,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
                 cause);
     }
 
-    private static String hashOf(Path artifact) {
+    static String hashOf(Path artifact) {
         try (var bytes = Files.newInputStream(artifact)) {
             return ContentHash.of(bytes);
         } catch (IOException failure) {
@@ -360,7 +414,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         }
     }
 
-    private static TapstateException artifactUnreadable(Path artifact) {
+    static TapstateException artifactUnreadable(Path artifact) {
         return new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
                 Map.of("artifact", artifact.getFileName().toString()), null);
     }

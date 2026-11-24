@@ -1,6 +1,8 @@
 package io.tapstate.adapters.mongostore;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.MigrationErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 
 import java.util.Set;
@@ -29,7 +31,7 @@ public enum MigrationError implements TapstateErrorCode {
      * moved forward is not opened by a binary that predates the move. Downgrading across a system-data
      * version is not supported: the way back is the backup taken before the upgrade.
      */
-    DATA_NEWER_THAN_BINARY("migration.data-newer-than-binary", Set.of("installed", "supported")),
+    DATA_NEWER_THAN_BINARY(MigrationErrorDefinitions.DATA_NEWER_THAN_BINARY),
 
     /**
      * Another member has held the migration lock for longer than this one is prepared to wait, and the
@@ -37,35 +39,20 @@ public enum MigrationError implements TapstateErrorCode {
      * {@code since} when it took it -- both are what an operator needs to go and look at that member,
      * which is where the answer is.
      */
-    LOCK_TIMEOUT("migration.lock-timeout", Set.of("holder", "since")),
+    LOCK_TIMEOUT(MigrationErrorDefinitions.LOCK_TIMEOUT),
 
     /**
      * A changeset failed. {@code changeset} names it and {@code cause} carries what went wrong
      * underneath. The recorded version stays at the changeset before this one, so a start that gets
      * past the cause resumes from here rather than from the beginning.
      */
-    CHANGESET_FAILED("migration.changeset-failed", Set.of("changeset", "cause"));
+    CHANGESET_FAILED(MigrationErrorDefinitions.CHANGESET_FAILED);
 
-    private final String code;
-    private final Set<String> placeholders;
+    private final ProductErrorDefinition definition;
 
-    MigrationError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    MigrationError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

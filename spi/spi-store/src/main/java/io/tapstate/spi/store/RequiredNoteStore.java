@@ -1,6 +1,7 @@
 package io.tapstate.spi.store;
 
 import java.util.List;
+import java.util.Optional;
 
 /** Necessary PDK notes, namespace generations and carry barriers in one configuration transaction domain. */
 public interface RequiredNoteStore {
@@ -13,6 +14,24 @@ public interface RequiredNoteStore {
     /** Opens an existing scope for the captured persistent owner; missing or inconsistent facts refuse. */
     RequiredNoteScope open(RequiredNoteOwner owner);
 
+    record CaptureScopes(RequiredNoteScope primary, RequiredNoteScope global) {}
+
+    default CaptureScopes openCaptureScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {
+        return new CaptureScopes(open(primary), open(global));
+    }
+
+    record SharedStartup(List<RequiredNoteCarry> carries, boolean blocked, RequiredNoteOrigin origin) {
+        public SharedStartup { carries = List.copyOf(carries); }
+    }
+
+    default SharedStartup sharedStartup(RequiredNoteScope scope) {
+        return new SharedStartup(carries(scope), allCarryBlocked(scope), origin(scope));
+    }
+
+    default RequiredNoteOrigin prepareSharedOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin) {
+        return prepareOrigin(scope, origin);
+    }
+
     RequiredNoteValue read(RequiredNoteScope scope, String key);
 
     /** Explicit preparation before plugin code; a retained or missing published origin is never overwritten. */
@@ -20,6 +39,23 @@ public interface RequiredNoteStore {
 
     /** Load the exact prepared context without repairing missing facts or following a newer scope. */
     RequiredNoteOrigin origin(RequiredNoteScope scope);
+
+    /** Reports an existing original binding without creating one. */
+    default Optional<RequiredNoteOrigin> originIfPresent(RequiredNoteScope scope) { return Optional.empty(); }
+
+    /** Prepares isolated connector notes for a verified local artifact without changing the prior scope. */
+    default RequiredNoteScope prepareArtifactBinding(RequiredNoteOwner candidate, RequiredNoteOrigin expected,
+            RequiredNoteScope previous) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);
+    }
+
+    /** Verifies the captured original binding before allowing a legacy artifact migration. */
+    default boolean localArtifactReady(RequiredNoteScope scope, RequiredNoteOrigin expected) { return false; }
+
+    /** Records local recovery for the captured original binding after verified installation. */
+    default void markLocalArtifactReady(RequiredNoteScope scope, RequiredNoteOrigin expected) {
+        throw new UnsupportedOperationException("Artifact migration requires a CONFIG origin");
+    }
 
     /** Explicit authorized preparation, before a shared drive can use earlier private notes. */
     RequiredNoteCarry prepareCarry(RequiredNoteCarry carry);

@@ -131,7 +131,9 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
                         () -> "rows at the target: " + LANDED + " " + files.count(targetAddress, LANDED) + ", "
                                 + LOADING + " " + files.count(targetAddress, LOADING) + "; the pipeline is "
                                 + survivor.state(PIPELINE));
-                assertThat(survivor.state(PIPELINE)).contains(PipelineState.RUNNING);
+                Await.until("the surviving execution to publish RUNNING", Duration.ofMinutes(1),
+                        () -> survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> "state = " + survivor.state(PIPELINE));
                 assertThat(survivor.executionGenerationOf(PIPELINE).orElseThrow())
                         .as("the run that died was replaced").isGreaterThan(generation);
                 assertThat(loadsRead(reads, LANDED) - landedReadsBefore)

@@ -34,16 +34,25 @@ final class MongoCacheMetadataAccess {
     private final CacheBusinessScope scope;
     private final SystemCollections table;
     private final Runnable requireActive;
+    private final boolean verifyReads;
     final MongoCollection<Document> collection;
 
     MongoCacheMetadataAccess(MongoClient client, MongoDatabase database, CacheBusinessScope scope, SystemCollections table, Runnable requireActive) {
+        this(client, database, scope, table, requireActive, true);
+    }
+
+    MongoCacheMetadataAccess(MongoClient client, MongoDatabase database, CacheBusinessScope scope,
+            SystemCollections table, Runnable requireActive, boolean verifyReads) {
+        this.verifyReads = verifyReads;
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.table = Objects.requireNonNull(table, "table");
         this.requireActive = Objects.requireNonNull(requireActive, "requireActive"); this.collection = table.indexTargetOn(database);
         if (table.database() != SystemCollections.Database.CACHE) throw new IllegalArgumentException("metadata must use its CACHE resource");
     }
-    void verify() { read(session -> null); }
-    <T> T read(Function<ClientSession, T> action) { return transaction(false, TRANSACTION, null, action); }
+    void verify() {
+        transaction(false, TRANSACTION, null, true, session -> null);
+    }
+    <T> T read(Function<ClientSession, T> action) { return transaction(false, TRANSACTION, null, verifyReads, action); }
     <T> T read(Duration budget, Function<ClientSession, T> action) {
         Objects.requireNonNull(budget, "budget");
         if (budget.isNegative() || budget.isZero()) throw new IllegalArgumentException("read budget must be positive");
@@ -55,9 +64,9 @@ final class MongoCacheMetadataAccess {
             return Math.max(1L, TimeUnit.NANOSECONDS.toMillis(left));
         };
         return transaction(false, transactionOptions()
-                .timeout(Math.max(1L, budget.toMillis()), TimeUnit.MILLISECONDS).build(), remaining, action);
+                .timeout(Math.max(1L, budget.toMillis()), TimeUnit.MILLISECONDS).build(), remaining, verifyReads, action);
     }
-    <T> T write(Function<ClientSession, T> action) { return transaction(true, TRANSACTION, null, action); }
+    <T> T write(Function<ClientSession, T> action) { return transaction(true, TRANSACTION, null, true, action); }
     Document stamp(Document payload) { return new Document(payload).append(SCOPE, scopeDocument()); }
     Document payload(Document row) { var payload = new Document(row); payload.remove(SCOPE); return payload; }
 
@@ -73,7 +82,7 @@ final class MongoCacheMetadataAccess {
     private Document scopeDocument() { return new Document("clusterId", scope.clusterId()).append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation()); }
     static TapstateException unreadable(String id, String field) { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", field), null); }
 
-    private <T> T transaction(boolean mutation, TransactionOptions options, LongSupplier remaining, Function<ClientSession, T> action) {
+    private <T> T transaction(boolean mutation, TransactionOptions options, LongSupplier remaining, boolean verifyStructure, Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -83,7 +92,8 @@ final class MongoCacheMetadataAccess {
                         if (remaining != null) remaining.getAsLong();
                         var identity = new MongoCacheBusinessIdentity(database, scope);
                         if (mutation) identity.admitMetadataWrite(session); else identity.requireAdmissionState(session);
-                        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(table, remaining);
+                        if (verifyStructure)
+                            new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(table, remaining);
                         T value = action.apply(session);
                         if (remaining != null) remaining.getAsLong();
                         requireActive.run(); return value;

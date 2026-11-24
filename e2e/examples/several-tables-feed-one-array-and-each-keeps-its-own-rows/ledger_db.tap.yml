@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: ledger_db
+connector: mysql
+config: { host: "${LEDGER_HOST}", port: ${LEDGER_PORT}, database: "${LEDGER_DATABASE}", username: "${LEDGER_USERNAME}", password: "${LEDGER_PASSWORD}" }
+mode: cdc
+tables: [ ledger_players, ledger_points, ledger_comps, ledger_awards, "/^ledger_session[0-9]$/" ]

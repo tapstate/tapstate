@@ -1,5 +1,5 @@
 # Build a pinned release candidate or the next main-line version for Cloud development validation.
-# Main owns the mutable -dev tag; branch builds use their source SHA in the tag.
+# All branch builds publish the same mutable -dev tag and catalog version.
 # Configure cloud-ghcr-dev with VITE_CLOUD_CONSOLE_URL and reuse the Public
 # tapstate-cloud package with workflow write access. The repository's
 # RELEASE_SATELLITE_TOKEN supplies private Web reads; no plaintext artifacts are uploaded.
@@ -96,7 +96,6 @@ jobs:
         with:
           node-version: "22"
       - name: validate the dev version registration configuration
-        if: inputs.version != '' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
         env:
           CLOUD_RELEASE_API_URL: ${{ vars.CLOUD_RELEASE_API_URL }}
           CLOUD_RELEASE_CODE: ${{ vars.CLOUD_RELEASE_CODE }}
@@ -164,6 +163,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ -f deploy/cloud/stage-published-connectors.py ]]; then
+            PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-published-connectors.py \
+              --boot-jar app/target/app-*-boot.jar --profile cloud \
+              --stage-dir "$RUNNER_TEMP/cloud-stage"
+          else
           mkdir -p "$RUNNER_TEMP/cloud-jars"
           assets="$(jq -r '.connectors[].id + "-connector.jar", .licenseFiles[].name' deploy/cloud/connectors.lock.json)"
           patterns=()
@@ -175,6 +179,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py \
             --lock deploy/cloud/connectors.lock.json --jar-dir "$RUNNER_TEMP/cloud-jars" \
             --stage-dir "$RUNNER_TEMP/cloud-stage"
+          fi
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: build the dual-platform Cloud OCI archive
@@ -210,7 +215,7 @@ jobs:
           mkdir "$RUNNER_TEMP/cloud-layout"
           tar -xf "$RUNNER_TEMP/cloud-image.tar" -C "$RUNNER_TEMP/cloud-layout"
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/verify-image.py \
-            --oci-layout "$RUNNER_TEMP/cloud-layout" --lock deploy/cloud/connectors.lock.json \
+            --oci-layout "$RUNNER_TEMP/cloud-layout" --lock "$RUNNER_TEMP/cloud-stage/release/connectors.lock.json" \
             --boot-jar "${boot_jars[0]}" --web-profile cloud --cloud-console-url "$CLOUD_CONSOLE_URL"
           PYTHONDONTWRITEBYTECODE=1 python3 .github/scripts/web-provenance.py create \
             --oci-layout "$RUNNER_TEMP/cloud-layout" --output "$RUNNER_TEMP/cloud-provenance.json" \
@@ -227,16 +232,11 @@ jobs:
           CLOUD_GHCR_TOKEN: ${{ secrets.CLOUD_GHCR_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.source.outputs.version }}
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-          RELEASE_VERSION: ${{ inputs.version }}
           DIGEST: ${{ steps.verify.outputs.digest }}
         run: |
-          args=(publish-dev --archive "$RUNNER_TEMP/cloud-image.tar" \
-            --version "$VERSION" --expected-digest "$DIGEST")
-          if [[ -z "$RELEASE_VERSION" && "$GITHUB_REF" != refs/heads/main ]]; then
-            args+=(--dev-source-sha "$SOURCE_SHA")
-          fi
-          bash deploy/cloud/ghcr-publish.sh "${args[@]}"
+          bash deploy/cloud/ghcr-publish.sh publish-dev \
+            --archive "$RUNNER_TEMP/cloud-image.tar" \
+            --version "$VERSION" --expected-digest "$DIGEST"
       - name: report the dev deployment image
         env:
           IMAGE: ${{ steps.publish.outputs.image }}
@@ -248,7 +248,6 @@ jobs:
           printf "Dev image: \`%s\`\n\nDigest reference: \`%s\`\n\nTapstate source: \`%s\`\n\nWeb source: \`%s\`\n" \
             "$TAG" "$IMAGE" "$TAPSTATE_SHA" "$WEB_SHA" >> "$GITHUB_STEP_SUMMARY"
       - name: register the checked image in the dev Cloud version catalog
-        if: inputs.version != '' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
         env:
           DEV_VERSION: ${{ steps.source.outputs.version }}
           DEV_SHA: ${{ steps.source.outputs.sha }}
@@ -267,7 +266,7 @@ jobs:
         run: |
           {
             echo "Validate the dev image above in Cloud dev, using its digest reference."
-            echo "A repeated dev version may retain an older catalog record; verify the running image digest."
+            echo "Confirm that a new Cluster runs the digest verified in the catalog registration receipt."
             echo "Then review the draft release and use Review deployments to Approve or Reject this run."
             echo "Reject stops the release; the dev image and catalog entry remain available for diagnosis."
           } >> "$GITHUB_STEP_SUMMARY"

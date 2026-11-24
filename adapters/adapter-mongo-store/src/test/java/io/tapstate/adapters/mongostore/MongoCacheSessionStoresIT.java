@@ -23,6 +23,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -52,8 +53,8 @@ class MongoCacheSessionStoresIT {
             try (var adminClient = MongoClients.create(MONGO.getReplicaSetUrl()); var worker = Executors.newSingleThreadExecutor()) {
                 var admin = adminClient.getDatabase("admin");
                 long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
-                        .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
-                                .append("namespace", database.getName() + "." + table.collectionName())
+                        .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of(table == SystemCollections.CLOUD_SESSIONS ? "find" : "aggregate"))
+                                .append("namespace", database.getName() + "." + SystemCollections.CLOUD_SESSIONS.collectionName())
                                 .append("blockConnection", true).append("blockTimeMS", 20000))).get("count")).longValue();
                 var result = worker.submit(() -> table == SystemCollections.CLOUD_SESSIONS
                         ? sessions.find(CLOUD, "bounded")
@@ -74,6 +75,58 @@ class MongoCacheSessionStoresIT {
             assertThat(SystemCollections.CACHE_IDENTITY.on(database).find().first()).isEqualTo(identity);
             assertThat(SystemCollections.CLOUD_REVOCATIONS.on(database).countDocuments()).isZero();
             assertThat(root.cloudSessions(scope).find(CLOUD, "bounded")).contains(cloud("bounded"));
+        });
+    }
+
+    @Test void requestAdmissionUsesFourCacheCommandsAndRetainsCredentialsRevocationAndGeneration() {
+        withCache(StorageBinding.Mode.CLOUD, (root, database, binding, scope) -> {
+            var management = root.cloudSessions(scope); management.create(cloud("request"));
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                assertThat(root.cloudSessions(scope, new MongoReadBudget(Duration.ofSeconds(5)))
+                        .authenticate(CLOUD, "request", HASH, CREATED, CREATED.plusSeconds(60))).isPresent();
+                assertThat(((Number)((Map<?,?>)diagnostics.snapshot().get("mongo")).get("started")).intValue()).isEqualTo(4);
+                assertThat(diagnostics.snapshot().get("complete")).isEqualTo(true);
+            }
+            assertThat(root.cloudSessions(scope, new MongoReadBudget(Duration.ofSeconds(5)))
+                    .authenticate(CLOUD, "request", "wrong-secret", CREATED, CREATED.plusSeconds(60))).isEmpty();
+            management.invalidate(CLOUD, "request", CREATED);
+            assertThat(root.cloudSessions(scope, new MongoReadBudget(Duration.ofSeconds(5)))
+                    .authenticate(CLOUD, "request", HASH, CREATED, CREATED.plusSeconds(60))).isEmpty();
+            var previous = root.cloudSessions(scope, new MongoReadBudget(Duration.ofSeconds(5)));
+            root.advanceAuthGeneration(scope, 2, "request-reset", ACTIVE);
+            assertThatThrownBy(() -> previous.authenticate(CLOUD, "request", HASH, CREATED, CREATED.plusSeconds(60)))
+                    .satisfies(MongoCacheSessionStoresIT::fenced);
+        });
+    }
+
+    @Test void requestSchemaFailureRollsBackItsAtomicFenceAndSession() {
+        withCache(StorageBinding.Mode.CLOUD, (root, database, binding, scope) -> {
+            root.cloudSessions(scope).create(cloud("schema"));
+            var identity = SystemCollections.CACHE_IDENTITY.on(database).find().first();
+            var record = SystemCollections.CLOUD_SESSIONS.on(database).find().first();
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).updateOne(new Document("_id", "auth"),
+                    new Document("$set", new Document("phase", "PREPARING")));
+            assertThatThrownBy(() -> root.cloudSessions(scope, new MongoReadBudget(Duration.ofSeconds(5)))
+                    .authenticate(CLOUD, "schema", HASH, CREATED, CREATED.plusSeconds(60)))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(SystemCollections.CACHE_IDENTITY.on(database).find().first()).isEqualTo(identity);
+            assertThat(SystemCollections.CLOUD_SESSIONS.on(database).find().first()).isEqualTo(record);
+        });
+    }
+
+    @Test void independentClientsSerializeRequestAdmissionAgainstRevocation() {
+        withCache(StorageBinding.Mode.CLOUD, (root, database, binding, scope) -> {
+            root.cloudSessions(scope).create(cloud("admission-race"));
+            try (var other = connect(binding); var workers = Executors.newFixedThreadPool(2)) {
+                var request = root.cloudSessions(scope, new MongoReadBudget(Duration.ofSeconds(10)));
+                var revoker = other.cloudSessions(scope);
+                var gate = new CountDownLatch(1);
+                var admitted = workers.submit(() -> { gate.await(); return request.authenticate(CLOUD, "admission-race", HASH, CREATED, CREATED.plusSeconds(60)); });
+                var revoked = workers.submit(() -> { gate.await(); revoker.invalidate(CLOUD, "admission-race", CREATED); return true; });
+                gate.countDown(); admitted.get(20, TimeUnit.SECONDS); assertThat(revoked.get(20, TimeUnit.SECONDS)).isTrue();
+                assertThat(root.cloudSessions(scope, new MongoReadBudget(Duration.ofSeconds(5)))
+                        .authenticate(CLOUD, "admission-race", HASH, CREATED, CREATED.plusSeconds(60))).isEmpty();
+            }
         });
     }
 

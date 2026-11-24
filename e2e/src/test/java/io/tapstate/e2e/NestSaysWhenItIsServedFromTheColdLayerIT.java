@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -16,9 +17,9 @@ import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -51,13 +52,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NestSaysWhenItIsServedFromTheColdLayerIT {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(180);
-    private static final Duration POLL = Duration.ofMillis(250);
     private static final String PARENT_TABLE = "orders";
     private static final String CHILD_TABLE = "order_items";
     private static final String PIPELINE_ID = "alerting_orders";
 
     /** The code the product names this condition by; the alert is the code, not a sentence about it. */
-    private static final String EXPECTED_CODE = "nest.state-served-from-cold-layer";
+    private static final String EXPECTED_CODE = "TS0490025";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,
@@ -108,15 +108,12 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
 
                 control.lifecycle(pipelineId, LifecycleVerb.START);
 
-                await(() -> mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE).size() == ROOTS);
-                await(() -> control.logs(pipelineId).contains(EXPECTED_CODE));
-
-                assertThat(control.logs(pipelineId))
-                        .as("the pipeline's own logs face, where an operator would look. A run under this "
-                                + "much pressure has to say it is being served from behind its memory - "
-                                + "nothing else moves when that happens.%n  metrics: %s",
-                                control.metrics(pipelineId))
-                        .contains(EXPECTED_CODE);
+                Await.until("every root to reach the view", TIMEOUT,
+                        () -> mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE).size() == ROOTS,
+                        () -> control.metrics(pipelineId));
+                Await.until("the pipeline logs to contain the cold-layer warning", TIMEOUT,
+                        () -> hasColdLayerWarning(control.logs(pipelineId)),
+                        () -> control.logs(pipelineId));
 
                 // The other half: said without dying. An implementation that only reports at the point of
                 // failure satisfies the assertion above only by failing, which these two forbid.
@@ -130,17 +127,18 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
         }
     }
 
-    private static void await(BooleanSupplier reached) {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (System.nanoTime() - deadline < 0) {
-            if (reached.getAsBoolean()) {
-                return;
-            }
-            sleep();
-        }
+    private boolean hasColdLayerWarning(String response) {
+        if (!response.startsWith("200 ")) return false;
+        if (!(JsonReader.parse(response.substring(4)) instanceof Map<?, ?> logs)
+                || !pipelineId.equals(logs.get("pipelineId"))
+                || !(logs.get("lines") instanceof List<?> lines)) return false;
+        return lines.stream().anyMatch(entry -> entry instanceof Map<?, ?> line
+                && "WARN".equals(line.get("level"))
+                && line.get("message") instanceof String message
+                && message.startsWith(EXPECTED_CODE + " "));
     }
 
-    /** More roots than the budget, one child each, so every root is worth reading back. */
+    /** Each root is a first touch. Child arrivals would revisit hot roots and dilute the cold share. */
     private static void seedMysql(MySQLContainer<?> mysql) throws Exception {
         try (Connection connection =
                 DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword())) {
@@ -155,16 +153,6 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
                 for (long id = 1; id <= ROOTS; id++) {
                     insert.setLong(1, id);
                     insert.setString(2, "order-" + id);
-                    insert.addBatch();
-                }
-                insert.executeBatch();
-            }
-            try (PreparedStatement insert = connection.prepareStatement(
-                    "INSERT INTO " + CHILD_TABLE + " (id, order_id, sku) VALUES (?, ?, ?)")) {
-                for (long id = 1; id <= ROOTS; id++) {
-                    insert.setLong(1, id);
-                    insert.setLong(2, id);
-                    insert.setString(3, "sku-" + id);
                     insert.addBatch();
                 }
                 insert.executeBatch();
@@ -247,12 +235,4 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
                 .formatted(pipelineId, MEMORY_BUDGET);
     }
 
-    private static void sleep() {
-        try {
-            Thread.sleep(POLL.toMillis());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted while waiting for the condition to be reported", e);
-        }
-    }
 }

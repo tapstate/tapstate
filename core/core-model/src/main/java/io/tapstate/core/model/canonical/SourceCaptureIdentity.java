@@ -13,8 +13,30 @@ public final class SourceCaptureIdentity {
     public static String resolve(String connector,Map<String,Object> settings,String key) {
         return key != null && !key.isBlank() ? "mck-"+key : physical(connector,settings);
     }
+    /** A local node setting can qualify a keyed chain without changing its shared Source's key. */
+    public static String resolve(String connector, Map<String, Object> settings, String key,
+            Map<String, Object> nodeConfig) {
+        if (nodeConfig == null || nodeConfig.isEmpty() || key == null || key.isBlank()) {
+            return resolve(connector, settings, key);
+        }
+        var input = new StringBuilder();
+        token(input, key);
+        token(input, physical(connector, settings));
+        return "mcn-" + CanonicalHash.ofText(input.toString());
+    }
     public static String sharedCapture(String chainId) {
         named(chainId);return "capture-"+CanonicalHash.ofText(chainId+"|tail:ring");
+    }
+    public static String versionedSharedChain(String canonical, String artifactHash, String handoff) {
+        named(canonical);
+        if (artifactHash == null || !artifactHash.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("invalid shared capture artifact hash");
+        }
+        var input = new StringBuilder();
+        token(input, canonical);
+        token(input, artifactHash);
+        token(input, handoff == null ? "" : handoff);
+        return "mcv-" + CanonicalHash.ofText(input.toString());
     }
     public static String snapshotCapture(String chainId,Collection<String> streams) {
         named(chainId);var input=new StringBuilder(chainId).append("|snapshot");
@@ -23,13 +45,21 @@ public final class SourceCaptureIdentity {
         return "capture-"+CanonicalHash.ofText(input.toString());
     }
     public static String directChannel(String connector,Map<String,Object> settings,String key,String pipeline,String source) {
+        return directChannel(connector,settings,key,pipeline,source,Map.of());
+    }
+    public static String directChannel(String connector,Map<String,Object> settings,String key,String pipeline,String source,
+            Map<String,Object> nodeConfig) {
         named(pipeline); named(source); var input = new StringBuilder();
-        token(input,resolve(connector,settings,key)); token(input,pipeline); token(input,source);
+        token(input,resolve(connector,settings,key,nodeConfig)); token(input,pipeline); token(input,source);
         return "mcd-"+CanonicalHash.ofText(input.toString());
     }
     public static String directCapture(String connector,Map<String,Object> settings,String key,String pipeline,String source,String start,Collection<String> streams) {
+        return directCapture(connector,settings,key,pipeline,source,start,streams,Map.of());
+    }
+    public static String directCapture(String connector,Map<String,Object> settings,String key,String pipeline,String source,String start,Collection<String> streams,
+            Map<String,Object> nodeConfig) {
         named(pipeline); named(source); String axis = "tail:direct:"+startAxis(start)+'|'+pipeline.length()+':'+pipeline+'|'+source.length()+':'+source;
-        var input = new StringBuilder(resolve(connector,settings,key)).append('|').append(axis);
+        var input = new StringBuilder(resolve(connector,settings,key,nodeConfig)).append('|').append(axis);
         var sorted = new ArrayList<>(streams); sorted.sort(String::compareTo); input.append('|').append(sorted.size());
         for (String stream : sorted) input.append('|').append(stream.length()).append(':').append(stream);
         return "capture-"+CanonicalHash.ofText(input.toString());

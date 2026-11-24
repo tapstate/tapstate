@@ -33,6 +33,24 @@ class OperatorMapBindingsTest {
     private static void fenced(org.assertj.core.api.ThrowableAssert.ThrowingCallable action) { assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class,
         failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED)); }
 
+    @Test void rootReadClassificationRequiresThePublishedOriginalBinding() {
+        var place = OperatorMapCoordinates.nest(SCOPE, "cache", "step", List.of(),
+                OperatorMapCoordinates.NestMap.STATE, null);
+        var first = binding(place, 1); var next = binding(place, 2);
+        var registry = OperatorMapBindings.bindTo(member(), (original, active) -> new RecordingStore());
+        registry.initializingNest(first.mapName(), "cache");
+        fenced(() -> registry.isRootNestState(first.mapName()));
+        registry.install(List.of(first));
+        assertThat(registry.isRootNestState(first.mapName())).isTrue();
+        registry.install(List.of(next));
+        fenced(() -> registry.isRootNestState(first.mapName()));
+        assertThat(registry.isRootNestState(next.mapName())).isTrue();
+        assertThat(registry.release(next)).isTrue();
+        fenced(() -> registry.isRootNestState(next.mapName()));
+        registry.close();
+        fenced(() -> registry.isRootNestState(next.mapName()));
+    }
+
     @Test void hotNamesChangeByAttemptWhileColdCoordinatesAndConfigurationStayFixed() {
         var place = placement(OperatorPlacement.Resource.NEST_STATE,"root"); var first = binding(place,1); var second = binding(place,2);
         assertThat(first.mapName()).isNotEqualTo(second.mapName()); assertThat(first.configurationPattern()).isEqualTo(second.configurationPattern());

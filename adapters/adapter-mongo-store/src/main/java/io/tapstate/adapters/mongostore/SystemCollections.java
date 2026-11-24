@@ -201,10 +201,15 @@ public enum SystemCollections {
     CONFIG_PIPELINE_DRAFTS("pipeline_drafts", Database.CONFIG, MongoConfigurationDraftStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("revision"), false, "pipeline_drafts_revision"),
             new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at")),
-    VALIDATION_TASKS("validation_tasks", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2),
-    VALIDATION_REPORTS("validation_reports", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2),
+    VALIDATION_TASKS("validation_tasks", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.clusterId", "_id.pipelineId", "_id.taskId"), false, "validation_tasks_pipeline_task")),
+    VALIDATION_REPORTS("validation_reports", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.clusterId", "_id.pipelineId", "_id.taskId", "admission.mode",
+                    "terminalMetadata.endedAt.seconds", "terminalMetadata.endedAt.nanos", "_id.runId"),
+                    List.of(1, 1, 1, 1, -1, -1, 1), false, "validation_reports_history")),
     VALIDATION_DIFFERENCES("validation_differences", Database.CONFIG, MongoValidationResultStore.class, Strategy.MIGRATED, 2,
-            new IndexSpec(List.of("_id.report"), false, "validation_differences_report")),
+            new IndexSpec(List.of("_id.report"), false, "validation_differences_report"),
+            new IndexSpec(List.of("_id.report", "openVersion", "_id.rootHash"), false, "validation_differences_page")),
     VALIDATION_RUNS("validation_runs", Database.CACHE, MongoValidationControlStore.class, Strategy.MIGRATED, 2,
             new IndexSpec(List.of("_id.clusterId", "_id.pipelineId"), false, "validation_runs_pipeline")),
     CACHE_IDENTITY("cache_identity", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
@@ -238,6 +243,8 @@ public enum SystemCollections {
     CACHE_SOURCE_SCHEMAS("source_schemas", Database.CACHE, MongoCacheSchemaStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_CATALOG("connector_catalog", Database.CACHE, MongoCacheConnectorCatalogStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_SPECS("connector_specs", Database.CACHE, MongoCacheConnectorSpecStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_ARTIFACT_HOLDINGS("connector_artifact_holdings", Database.CACHE,
+            MongoCacheConnectorArtifactHoldings.class, Strategy.OWNED_ELSEWHERE, 0),
     CACHE_CONNECTION_TEST_RESULTS("connection_test_results", Database.CACHE, MongoCacheConnectionTestResultStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_ARTIFACTS("connector_artifacts", Database.CACHE, MongoCacheConnectorRegistry.class, Strategy.IMMUTABLE, 1, Kind.GRIDFS_BUCKET,
             new IndexSpec(List.of("metadata.connectorId"), false)),
@@ -256,6 +263,8 @@ public enum SystemCollections {
     CACHE_JOIN_INDEXES("join_indexes", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
     CACHE_JOIN_WRITERS("join_writers", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_AGGREGATE_STATE("aggregate_state", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
     CACHE_NEST_SHAPES("nest_shapes", Database.CACHE, MongoCacheNestShapeStore.class, Strategy.MIGRATED, 1),
     CACHE_OPERATOR_CLEANUP("operator_cleanup", Database.CACHE, MongoOperatorInventory.class, Strategy.MIGRATED, 1,
@@ -300,7 +309,8 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
     ALERT_NODE_LIFECYCLES("alert_node_lifecycles", Database.CONFIG, MongoAlertNodeLifecycleStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("authorityId","clusterId","phase","nodeId","bootId"), false, "alert_query_node_lifecycle")),
-    CONFIG_AI_PROVIDER_SETTINGS("ai_provider_settings", Database.CONFIG, MongoConfigurationAiProviderSettingsStore.class, Strategy.MIGRATED, 2);
+    CONFIG_AI_PROVIDER_SETTINGS("ai_provider_settings", Database.CONFIG, MongoConfigurationAiProviderSettingsStore.class, Strategy.MIGRATED, 2),
+    CONFIG_RETRY_SETTINGS("retry_settings", Database.CONFIG, MongoRetrySettingsStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
@@ -324,13 +334,16 @@ public enum SystemCollections {
     public enum Database { STORE, NEST, CONFIG, CACHE }
 
     /**
-     * An index a query shape needs. Keys are in order and all ascending: nothing here sorts, and a
-     * descending key would only matter to a query that did.
+     * An index a query shape needs. Existing declarations default to ascending keys; ordered
+     * declarations also describe mixed-direction query sorts.
      */
     public record IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds, String declaredName,
-            String partialFilterJson) {
+            String partialFilterJson, List<Integer> directions) {
         public IndexSpec {
             keys = List.copyOf(keys);
+            directions = List.copyOf(directions);
+            if (directions.size() != keys.size() || directions.stream().anyMatch(value -> value != 1 && value != -1))
+                throw new IllegalArgumentException("index directions must match its keys");
             if (expireAfterSeconds != null && (expireAfterSeconds < 0 || keys.size() != 1)) {
                 throw new IllegalArgumentException("an expiring index is over one date field and a non-negative"
                         + " number of seconds: " + keys + " / " + expireAfterSeconds);
@@ -338,6 +351,20 @@ public enum SystemCollections {
             if (declaredName != null && declaredName.isBlank()) {
                 throw new IllegalArgumentException("an explicit index name must not be blank");
             }
+        }
+
+        public IndexSpec(List<String> keys, boolean unique, Long expiry, String name, String partial) {
+            this(keys, unique, expiry, name, partial, java.util.Collections.nCopies(keys.size(), 1));
+        }
+
+        public IndexSpec(List<String> keys, List<Integer> directions, boolean unique, String name) {
+            this(keys, unique, null, name, null, directions);
+        }
+
+        public Document keyDocument() {
+            var result = new Document();
+            for (int i = 0; i < keys.size(); i++) result.append(keys.get(i), directions.get(i));
+            return result;
         }
 
         public IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds, String declaredName) {
@@ -551,7 +578,9 @@ public enum SystemCollections {
             return "-";
         }
         return indexes.stream()
-                .map(index -> String.join("+", index.keys()) + (index.unique() ? " (unique)" : "")
+                .map(index -> java.util.stream.IntStream.range(0, index.keys().size())
+                        .mapToObj(i -> index.keys().get(i) + (index.directions().get(i) == -1 ? " (desc)" : ""))
+                        .collect(java.util.stream.Collectors.joining("+")) + (index.unique() ? " (unique)" : "")
                         + (index.expireAfterSeconds() == null ? "" : " (ttl " + index.expireAfterSeconds() + "s)")
                         + (index.partialFilterJson() == null ? "" : " (partial " + index.partialFilterJson() + ")"))
                 .reduce((a, b) -> a + ", " + b)

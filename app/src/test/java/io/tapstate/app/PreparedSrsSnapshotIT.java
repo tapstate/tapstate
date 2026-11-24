@@ -150,6 +150,61 @@ class PreparedSrsSnapshotIT {
             } finally { member.shutdown(); }
         });
     }
+    @Test void nativeTailReplaysFromTheLastSavedPositionThenFlushesTheNewPrefix() throws Exception {
+        withFixture(f -> {
+            String chain = "mck-chain";
+            String ring = io.tapstate.runtime.srs.SrsRingbuffer.ringName(chain, "t1");
+            var scope = new CacheBusinessScope(f.run.scope().clusterId(), f.run.scope().bindingVersion(), f.run.scope().cacheIncarnation());
+            var firstMember = member(f.stores.log());
+            String resumeAt;
+            try (var unit = new io.tapstate.runtime.srs.NativeSrsCaptureRunUnit(scope, f.stores, firstMember)) {
+                f.stores.chains().requestTables(chain, Set.of("t1", "t2"), f.capture);
+                assertThat(f.stores.chains().publishServingTables(chain, 1, Set.of("t1", "t2"), f.capture)).isTrue();
+                var opened = f.stores.chains().load(chain).orElseThrow();
+                var port = f.port();
+                var tail = unit.startTail(scope, opened, f.capture, f.config(), io.tapstate.spi.capture.CaptureStart.present(),
+                        writer -> port.withStreamPreparation(writer::prepare), () -> {});
+                streamEnded(f, tail.health());
+                assertThat(f.stores.log().load(ring, 0)).isPresent();
+                var saved = f.stores.chains().load(chain).orElseThrow().checkpoint();
+                assertThat(saved.tables().get("t1").sequence()).isEqualTo(-1);
+                resumeAt = saved.position().token();
+                // Abort the original tail before its timer saves the pending source token.
+                tail.close();
+            } finally { firstMember.shutdown(); }
+
+            var nextMember = member(f.stores.log());
+            try (var unit = new io.tapstate.runtime.srs.NativeSrsCaptureRunUnit(scope, f.stores, nextMember)) {
+                assertThat(f.stores.chains().openEpoch(chain, 1, f.capture)).hasValue(2);
+                assertThat(f.stores.chains().publishServingTables(chain, 2, Set.of("t1", "t2"), f.capture)).isTrue();
+                f.state.put("streamEnded", new java.util.concurrent.CountDownLatch(1));
+                var opened = f.stores.chains().load(chain).orElseThrow();
+                assertThat(opened.resumeToken()).isEqualTo(resumeAt);
+                var start = io.tapstate.spi.capture.CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(resumeAt));
+                var port = f.port();
+                try (var tail = unit.startTail(scope, opened, f.capture, f.config(), start,
+                        writer -> port.withStreamPreparation(writer::prepare), () -> {})) {
+                    streamEnded(f, tail.health());
+                    assertThat(((AtomicReference<?>) f.state.get("streamOffset")).get()).isEqualTo("actual-session-seam");
+                    var first = f.stores.log().load(ring, 0).orElseThrow();
+                    var replayed = f.stores.log().load(ring, 1).orElseThrow();
+                    assertThat(replayed.after()).isEqualTo(first.after());
+                    assertThat(replayed.epoch()).isEqualTo(2);
+                    long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(15);
+                    SrsCaptureCheckpoint saved;
+                    do {
+                        assertThat(tail.health().failure()).isEmpty();
+                        saved = f.stores.chains().load(chain).orElseThrow().checkpoint();
+                        if (saved.tables().get("t1").sequence() == 1) break;
+                        Thread.sleep(100);
+                    } while (System.nanoTime() - deadline < 0);
+                    assertThat(saved.tables().get("t1").sequence()).isEqualTo(1);
+                    assertThat(saved.position().token()).isEqualTo(replayed.srcToken()).isNotEqualTo(resumeAt);
+                }
+            } finally { nextMember.shutdown(); }
+        });
+    }
+
     @Test void nativeProducerRejectsChangedDiscoveryBeforeReopeningTheSourceStream() throws Exception {
         withFixture(f -> {
             var member = member(f.stores.log());

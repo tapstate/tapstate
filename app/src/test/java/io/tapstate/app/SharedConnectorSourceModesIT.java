@@ -225,7 +225,7 @@ class SharedConnectorSourceModesIT {
                 .body(draft(cloud, fixture, fixture.settings("stale-sentinel"), "stale", List.of()))
                 .exchange((request, response) -> {
                     String body = response.bodyTo(String.class);
-                    assertThat(body).contains("source.version-conflict").doesNotContain(original, replacement, "stale-sentinel");
+                    assertThat(body).contains("TS0220005").doesNotContain(original, replacement, "stale-sentinel");
                     return response.getStatusCode().value();
                 });
         assertThat(conflict).isEqualTo(412);
@@ -354,6 +354,15 @@ class SharedConnectorSourceModesIT {
     @ConditionalOnProperty(prefix = "tapstate.test", name = "source-modes", havingValue = "true")
     @Import({StoreConfiguration.class, ControlPlaneConfiguration.class})
     static class Assembly {
+        @Bean
+        @ConditionalOnProperty(prefix = "tapstate.cloud", name = "base-url")
+        static org.springframework.beans.factory.config.BeanPostProcessor legacyCloudSeedRunner(
+                org.springframework.beans.factory.ObjectProvider<io.tapstate.adapters.pdk.ConnectorArtifactRegistrar> registrar,
+                org.springframework.beans.factory.ObjectProvider<ConnectorPluginProperties> properties) {
+            return CloudConnectorTestInputs.legacySeedRunner(registrar, properties);
+        }
+
+
         @Bean RecordingProbes recordingProbes() { return new RecordingProbes(); }
         @Bean @Primary ConnectionProbe controlledConnectionProbe(RecordingProbes probes) { return probes::test; }
         @Bean @Primary SchemaDiscoveryProbe controlledSchemaDiscoveryProbe(RecordingProbes probes) { return probes::discover; }

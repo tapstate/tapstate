@@ -72,7 +72,7 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                 .isInstanceOf(TapstateException.class)
                 .extracting(thrown -> ((TapstateException) thrown).code().code())
-                .isEqualTo("nest.state-paths-changed");
+                .isEqualTo("TS0490018");
     }
 
     @Test

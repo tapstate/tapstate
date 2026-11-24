@@ -110,6 +110,32 @@ class PipelineLogsApiTest {
     }
 
     @Test
+    void logsRoundTripsTheSafeDiagnosticThroughTheAuthenticatedRead() {
+        var diagnostic = Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        context.getBean(FakeLogSink.class).append("pl1", new LogLine(2L, "WARN", "safe failure", diagnostic));
+        var body = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+        assertThat(body.lines()).singleElement().satisfies(line -> assertThat(line.diagnostic()).isEqualTo(diagnostic));
+    }
+
+    @Test
+    void localizesTheSameCapturedLineOnEachRead() {
+        var fields = Map.<String, Object>of("code", "TS0360004", "codeSource", "tapstate-standard",
+                "params", Map.of("source", "orders"), "message", "Captured English cause");
+        context.getBean(FakeLogSink.class).append("pl1", new LogLine(2L, "WARN", "original log", fields));
+        for (var locale : List.of(java.util.Locale.SIMPLIFIED_CHINESE, java.util.Locale.ENGLISH)) {
+            var line = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                    .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                    .header("Accept-Language", locale.toLanguageTag()).retrieve().body(PipelineLogs.class).lines().getFirst();
+            var expected = io.tapstate.messages.MessageCatalog.bundled().render("TS0360004", Map.of("source", "orders"), locale);
+            assertThat(line.message()).isEqualTo("original log");
+            assertThat(line.diagnostic()).containsEntry("message", expected.message())
+                    .containsEntry("solution", expected.solution()).containsEntry("rawMessage", "Captured English cause");
+        }
+    }
+
+    @Test
     void logsHonorsTheRequestedLineLimit() {
         PipelineLogs body = client().get().uri("/api/pipelines/pl1/logs?limit=1")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
@@ -129,7 +155,7 @@ class PipelineLogsApiTest {
                         return response.bodyTo(ApiError.class);
                     });
 
-            assertThat(body.code()).isEqualTo("control.malformed-request");
+            assertThat(body.code()).isEqualTo("TS0210001");
         }
     }
 
@@ -158,7 +184,7 @@ class PipelineLogsApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     // ---- the logs endpoint is a derivation of the registry ----

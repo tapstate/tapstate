@@ -100,6 +100,7 @@ public final class MongoConfigurationBootstrap {
                             }
                             if (!mayCreate || !emptyTarget) throw refused();
                             SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.prepareCollectionOn(database, session);
+                            SystemCollections.CONFIG_RETRY_SETTINGS.prepareCollectionOn(database, session);
                             SystemCollections.CAPTURE_PREPARATIONS.prepareCollectionOn(database,session);
                             for(var index:SystemCollections.CAPTURE_PREPARATIONS.indexes())
                                 IndexEnsure.createInTransaction(session,SystemCollections.CAPTURE_PREPARATIONS.on(database),index);

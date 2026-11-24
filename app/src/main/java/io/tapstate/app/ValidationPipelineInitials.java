@@ -309,6 +309,10 @@ final class ValidationPipelineInitials implements SourceInitialLoadObserver, Aut
         volatile String failed;
         Entry(Original original) { this.original = original; }
     }
+    static SinkAckFactory underlying(SinkAckFactory factory) {
+        return factory instanceof ObservedFactory observed ? observed.actual : factory;
+    }
+
     private static final class ObservedFactory implements SinkAckFactory {
         private static final long serialVersionUID = 1L;
         private final SinkAckFactory actual; private final Original original;
@@ -319,6 +323,9 @@ final class ValidationPipelineInitials implements SourceInitialLoadObserver, Aut
         }
         @Override public SinkAck resolve(HazelcastInstance member) { return new ObservedAck(actual.resolve(member), of(member), original, null); }
         @Override public io.tapstate.core.lifecycle.LoadLandings loadLandings(HazelcastInstance member) { return actual.loadLandings(member); }
+        @Override public java.util.Set<String> completedSnapshotInputs(HazelcastInstance member, java.util.Set<String> streams) {
+            return actual.completedSnapshotInputs(member, streams);
+        }
     }
     private static final class ObservedAck implements SinkAck {
         private static final long serialVersionUID = 1L;
@@ -340,6 +347,8 @@ final class ValidationPipelineInitials implements SourceInitialLoadObserver, Aut
             actual.bounded(stream, through, fence);
             if (attempt != null && through.seq() == SourceOrder.SNAPSHOT_SEQ) service.enqueue(new Packet(original, attempt, "BOUND", stream, writer, null, through.epoch(), null, 0, null));
         }
+        @Override public void flush(boolean complete) { actual.flush(complete); }
+        @Override public void flushOnClose() { actual.flushOnClose(); }
     }
     private static final class Delivery implements Callable<Boolean>, Serializable, HazelcastInstanceAware {
         private static final long serialVersionUID = 1L; private final Packet packet; private transient HazelcastInstance member;

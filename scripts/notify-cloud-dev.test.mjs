@@ -3,6 +3,14 @@ import test from 'node:test';
 import { notifyCloudDev, validateCloudDevConfiguration } from './notify-cloud-dev.mjs';
 
 const digest = `sha256:${'a'.repeat(64)}`;
+
+test('confirms the saved digest for a repeated dev version', async () => {
+  const result = await notifyCloudDev(environment(), async (_url, options) => ({
+    status: 200, json: async () => receipt(options),
+  }));
+  assert.match(result, /Updated Cloud dev version 0\.7\.0-dev/);
+  assert.ok(result.includes(digest));
+});
 function environment(overrides = {}) {
   return {
     DEV_VERSION: '0.7.0', DEV_SHA: 'b'.repeat(40), DEV_WEB_SHA: 'c'.repeat(40),
@@ -46,34 +54,46 @@ test('registers only the checked dev image, with both pinned revisions and a ver
   assert.ok(!result.includes('private-dev-token'));
 });
 
-test('registers the develop source tag as a separate catalog version', async () => {
-  const env = environment({
-    DEV_BRANCH: 'develop',
-    CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'b'.repeat(12)}`,
+for (const branch of ['develop', 'feature/cloud-dev']) {
+  test(`registers the canonical dev image and actual branch for ${branch}`, async () => {
+    const version = '0.7.0-dev';
+    const imageTag = `ghcr.io/tapstate/tapstate-cloud:${version}`;
+    const result = await notifyCloudDev(environment({ DEV_BRANCH: branch, CLOUD_IMAGE_TAG: imageTag }),
+      async (_url, options) => {
+        const body = JSON.parse(options.body);
+        assert.equal(body.version, version);
+        assert.equal(body.git.branch, branch);
+        assert.equal(body.git.extra.imageTag, imageTag);
+        assert.equal(body.git.extra.buildVersion, '0.7.0');
+        return { status: 201, json: async () => receipt(options) };
+      });
+    assert.ok(result.includes(`Registered Cloud dev version ${version}`));
   });
-  let submitted;
-  const result = await notifyCloudDev(env, async (_url, options) => {
-    submitted = JSON.parse(options.body);
-    return { status: 201, json: async () => receipt(options) };
-  });
-  assert.equal(submitted.version, `0.7.0-dev-${'b'.repeat(12)}`);
-  assert.equal(submitted.git.branch, 'develop');
-  assert.equal(submitted.git.extra.imageTag, env.CLOUD_IMAGE_TAG);
-  assert.match(result, /Registered Cloud dev version 0\.7\.0-dev-b{12}/);
-});
+}
 
-test('rejects a develop tag whose hash does not match its source', async () => {
+test('rejects a source-suffixed branch image before sending', async () => {
   let calls = 0;
   await assert.rejects(notifyCloudDev(environment({
-    DEV_BRANCH: 'develop',
-    CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'d'.repeat(12)}`,
-  }), async () => { calls++; }));
+    DEV_BRANCH: 'develop', CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'b'.repeat(12)}`,
+  }), async () => { calls++; }), /must match its dev tag/);
   assert.equal(calls, 0);
+});
+
+test('rejects a branch registration receipt that reports main', async () => {
+  await assert.rejects(notifyCloudDev(environment({
+    DEV_BRANCH: 'develop',
+  }), async (_url, options) => ({
+    status: 201, json: async () => {
+      const saved = receipt(options);
+      saved.data.git.branch = 'main';
+      return saved;
+    },
+  })), /receipt does not match/);
 });
 
 for (const [name, value] of [
   ['DEV_VERSION', '0.7.0-dev'], ['DEV_VERSION', 'v0.7.0'], ['DEV_SHA', 'bbbbbbb'],
-  ['DEV_WEB_SHA', 'ccccccc'], ['DEV_BRANCH', 'release/0.7.0'],
+  ['DEV_WEB_SHA', 'ccccccc'],
   ['CLOUD_IMAGE_TAG', 'ghcr.io/tapstate/tapstate-cloud:0.7.0'],
   ['CLOUD_IMAGE_TAG', 'ghcr.io/tapstate/tapstate-cloud:0.8.0-dev'],
   ['CLOUD_IMAGE', `ghcr.io/other/cloud@${digest}`],
@@ -107,7 +127,7 @@ test('preflight checks only configuration, before expensive image construction',
   assert.throws(() => validateCloudDevConfiguration(environment({ CLOUD_CLUSTER_VERSION_RELEASE_TOKEN: '' })), /required/);
 });
 
-for (const status of [200, 301, 400, 401, 403, 500, 503]) {
+for (const status of [301, 400, 401, 403, 409, 500, 503]) {
   test(`does not retry or accept HTTP ${status}, or disclose its body`, async () => {
     let calls = 0;
     let reads = 0;
@@ -120,53 +140,19 @@ for (const status of [200, 301, 400, 401, 403, 500, 503]) {
   });
 }
 
-test('rebuilds retain the first catalog record when the API reports a duplicate version', async () => {
-  let saved;
-  const calls = [];
-  const fetchImpl = async (url, options) => {
-    calls.push({ url, method: options.method });
-    if (saved) {
-      return { status: 409, json: async () => ({ code: 'cluster.version-duplicate', msg: 'private-dev-token' }) };
-    }
-    saved = receipt(options).data;
-    return { status: 201, json: async () => ({ code: 'ok', data: saved }) };
-  };
-  await notifyCloudDev(environment(), fetchImpl);
-  const firstRecord = structuredClone(saved);
-  const rebuiltDigest = `sha256:${'d'.repeat(64)}`;
-  const result = await notifyCloudDev(environment({
-    DEV_SHA: 'e'.repeat(40), DEV_WEB_SHA: 'f'.repeat(40),
-    DEV_RUN_URL: 'https://github.com/tapstate/tapstate/actions/runs/456',
-    CLOUD_IMAGE_DIGEST: rebuiltDigest, CLOUD_IMAGE: `ghcr.io/tapstate/tapstate-cloud@${rebuiltDigest}`,
-  }), fetchImpl);
-  assert.deepEqual(saved, firstRecord);
-  assert.equal(saved.git.commitId, 'b'.repeat(40));
-  assert.equal(saved.git.extra.imageDigest, digest);
-  assert.equal(calls.length, 2);
-  assert.ok(calls.every(call => call.method === 'POST'));
-  assert.match(result, /0\.7\.0-dev already exists; kept the original catalog record/);
-  assert.ok(result.includes(rebuiltDigest));
-  assert.ok(!result.includes('private-dev-token'));
+test('rejects a successful update response that still contains the old digest', async () => {
+  await assert.rejects(notifyCloudDev(environment(), async (_url, options) => {
+    const saved = receipt(options);
+    saved.data.git.extra.imageDigest = `sha256:${'d'.repeat(64)}`;
+    return { status: 200, json: async () => saved };
+  }), /receipt does not match/);
 });
 
-for (const code of ['ok', 'cluster.version-not-active', undefined]) {
-  test(`rejects an unrecognized HTTP 409 code: ${code}`, async () => {
-    let calls = 0;
-    await assert.rejects(notifyCloudDev(environment(), async () => {
-      calls++;
-      return { status: 409, json: async () => ({ code, msg: 'private-dev-token' }) };
-    }), error => /HTTP 409/.test(error.message) && !error.message.includes('private-dev-token'));
-    assert.equal(calls, 1);
-  });
-}
-
-test('rejects an invalid conflict body without disclosing details or retrying', async () => {
-  let calls = 0;
-  await assert.rejects(notifyCloudDev(environment(), async () => {
-    calls++;
-    return { status: 409, json: async () => { throw new Error('private-dev-token'); } };
-  }), error => /invalid conflict response/.test(error.message) && !error.message.includes('private-dev-token'));
-  assert.equal(calls, 1);
+test('reports an updated record that remains offline', async () => {
+  const result = await notifyCloudDev(environment(), async (_url, options) => ({
+    status: 200, json: async () => receipt(options, { state: 'OFFLINE' }),
+  }));
+  assert.match(result, /Updated Cloud dev version .*\(OFFLINE\)/);
 });
 
 test('transport errors do not disclose credentials or automatically retry an uncertain write', async () => {

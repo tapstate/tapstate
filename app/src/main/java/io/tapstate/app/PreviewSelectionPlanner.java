@@ -17,7 +17,6 @@ import io.tapstate.spi.capture.BoundedQueryCancellation;
 import io.tapstate.spi.capture.BoundedSnapshotQueryPort;
 import io.tapstate.spi.capture.BoundedSnapshotQueryRequest;
 import io.tapstate.spi.capture.BoundedSnapshotQueryResult;
-import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
 
 import java.nio.charset.StandardCharsets;
@@ -106,21 +105,24 @@ final class PreviewSelectionPlanner {
             String factAlias = entry.getValue().plan().factSource().name();
             roots.add(context.lineage(aliases.aliases().get(factAlias)).sourceKey());
             for (String alias : entry.getValue().plan().from().sources().stream()
-                    .map(JoinTree.Source::name).toList()) {
+                    .map(JoinTree.Source::declared).toList()) {
                 if (!alias.equals(factAlias)) {
                     dimensions.add(context.lineage(aliases.aliases().get(alias)).sourceKey());
                 }
             }
         }
 
+        List<NestSelection> nests = new ArrayList<>();
         for (Step step : context.steps.values()) {
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest) {
                 if (!(step.from() instanceof FromClause.Aliases)) {
                     refuse("a Nest preview could not resolve its declared input aliases");
                 }
                 FromClause.Aliases aliases = (FromClause.Aliases) step.from();
-                roots.add(context.lineage(aliases.aliases().get(nest.root().from())).sourceKey());
-                collectNestDimensions(context, aliases, nest.root().embed(), dimensions);
+                Lineage root = context.lineage(aliases.aliases().get(nest.root().from()));
+                roots.add(root.sourceKey());
+                nests.add(new NestSelection(root,
+                        context.resolveRelations(aliases, nest.root().embed(), root, dimensions)));
             }
         }
 
@@ -153,9 +155,10 @@ final class PreviewSelectionPlanner {
             context.read(orderedRoots.get(index), new BoundedSnapshotQueryRequest.AllRows(), allocation, true);
         }
 
-        for (Step step : context.steps.values()) {
-            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest) {
-                context.loadNest(step, nest);
+        for (NestSelection nest : nests) {
+            List<Map<String, Object>> rootRows = context.logicalRows(nest.root());
+            for (RelationSelection relation : nest.relations()) {
+                context.loadRelation(relation, rootRows);
             }
         }
         for (Map.Entry<String, StoreBackedDagSource.CompiledJoin> entry : joins.entrySet()) {
@@ -178,14 +181,6 @@ final class PreviewSelectionPlanner {
                 context.queryCount, context.rootTruncated, context.repeatable,
                 context.sourceReads > 0 && context.cachedReads == context.sourceReads, context.cachedReads,
                 List.copyOf(selectedRoots));
-    }
-
-    private static void collectNestDimensions(Context context, FromClause.Aliases aliases,
-            List<Embed> embeds, Set<String> dimensions) {
-        for (Embed embed : embeds == null ? List.<Embed>of() : embeds) {
-            dimensions.add(context.lineage(aliases.aliases().get(embed.from())).sourceKey());
-            collectNestDimensions(context, aliases, embed.embed(), dimensions);
-        }
     }
 
     private final class Context {
@@ -252,7 +247,7 @@ final class PreviewSelectionPlanner {
             if (source != null) {
                 Map<String, String> fields = new LinkedHashMap<>();
                 source.model().fields().forEach(field -> fields.put(field.name(), field.name()));
-                return new Lineage(source.sourceKey(), Map.copyOf(fields));
+                return new Lineage(source.sourceKey(), Map.copyOf(fields), Map.of());
             }
             Step step = steps.get(name);
             if (!(step instanceof Step.Inline)) {
@@ -268,85 +263,130 @@ final class PreviewSelectionPlanner {
                 return upstream;
             }
             if (inline.body() instanceof TransformBody.MapProjection projection) {
-                return mapLineage(upstream, projection);
+                return mapLineage(upstream, projection, inline.id());
             }
             if (inline.body() instanceof TransformBody.Unwind unwind) {
                 Map<String, String> fields = new LinkedHashMap<>(upstream.physicalByLogical());
+                Map<String, DroppedField> drops = new LinkedHashMap<>(upstream.droppedByLogical());
                 if (unwind.elementKey() != null) {
                     fields.remove(unwind.elementKey());
+                    drops.remove(unwind.elementKey());
                 }
                 if (unwind.includeArrayIndex() != null) {
                     fields.remove(unwind.includeArrayIndex());
+                    drops.remove(unwind.includeArrayIndex());
                 }
-                return new Lineage(upstream.sourceKey(), Map.copyOf(fields));
+                return new Lineage(upstream.sourceKey(), Map.copyOf(fields), Map.copyOf(drops));
             }
             refuse("transform '" + name + "' does not expose reversible source-key lineage");
             throw new IllegalStateException("unreachable");
         }
 
-        private Lineage mapLineage(Lineage upstream, TransformBody.MapProjection projection) {
+        private Lineage mapLineage(Lineage upstream, TransformBody.MapProjection projection, String stepId) {
             Map<String, String> fields = new LinkedHashMap<>(upstream.physicalByLogical());
+            Map<String, DroppedField> drops = new LinkedHashMap<>(upstream.droppedByLogical());
             Set<String> consumed = new HashSet<>();
-            projection.fields().forEach((output, rule) -> {
+            projection.outputFields().forEach((output, rule) -> {
+                fields.remove(output);
+                drops.remove(output);
                 switch (rule) {
                     case FieldRule.Rename rename -> {
-                        String physical = upstream.physicalByLogical().get(rename.sourceField());
-                        fields.remove(output);
+                        String input = rename.sourceField();
+                        String physical = upstream.physicalByLogical().get(input);
                         if (physical != null) {
                             fields.put(output, physical);
+                        } else if (upstream.droppedByLogical().containsKey(input)) {
+                            drops.put(output, upstream.droppedByLogical().get(input));
                         }
-                        consumed.add(rename.sourceField());
+                        consumed.add(input);
                     }
-                    case FieldRule.Drop ignored -> fields.remove(output);
-                    case FieldRule.Literal ignored -> fields.remove(output);
-                    case FieldRule.Computed ignored -> fields.remove(output);
+                    case FieldRule.Drop ignored -> {
+                        DroppedField removed = upstream.physicalByLogical().containsKey(output)
+                                ? new DroppedField(stepId, output) : upstream.droppedByLogical().get(output);
+                        if (removed != null) {
+                            drops.put(output, removed);
+                        }
+                    }
+                    case FieldRule.Literal ignored -> { }
+                    case FieldRule.Computed ignored -> { }
                 }
             });
-            consumed.stream().filter(field -> !projection.fields().containsKey(field)).forEach(fields::remove);
-            return new Lineage(upstream.sourceKey(), Map.copyOf(fields));
+            consumed.stream().filter(field -> !projection.fields().containsKey(field)).forEach(field -> {
+                fields.remove(field);
+                drops.remove(field);
+            });
+            return new Lineage(upstream.sourceKey(), Map.copyOf(fields), Map.copyOf(drops));
         }
 
-        private void loadNest(Step step, TransformBody.Nest nest) {
-            FromClause.Aliases aliases = (FromClause.Aliases) step.from();
-            Lineage root = lineage(aliases.aliases().get(nest.root().from()));
-            List<Map<String, Object>> parentRows = logicalRows(root);
-            for (Embed embed : nest.root().embed() == null ? List.<Embed>of() : nest.root().embed()) {
-                loadEmbed(aliases, embed, root, parentRows);
+        private List<RelationSelection> resolveRelations(FromClause.Aliases aliases, List<Embed> embeds,
+                Lineage parent, Set<String> dimensions) {
+            if (embeds == null) {
+                return List.of();
             }
+            List<RelationSelection> relations = new ArrayList<>();
+            for (Embed embed : embeds) {
+                Lineage child = lineage(aliases.aliases().get(embed.from()));
+                dimensions.add(child.sourceKey());
+                if (embed.on().isEmpty()) {
+                    refuse("Nest relation '" + embed.from() + "' has no exact join keys");
+                }
+                List<List<RelationKey>> alternatives = new ArrayList<>();
+                for (Map<String, String> alternative : embed.alternatives()) {
+                    List<RelationKey> keys = new ArrayList<>();
+                    for (Map.Entry<String, String> pair : alternative.entrySet()) {
+                        String physical = requireRelationKey(embed.from(), child, pair.getKey());
+                        requireRelationKey(embed.from(), parent, pair.getValue());
+                        keys.add(new RelationKey(pair.getValue(), physical));
+                    }
+                    alternatives.add(keys);
+                }
+                relations.add(new RelationSelection(child, alternatives,
+                        resolveRelations(aliases, embed.embed(), child, dimensions)));
+            }
+            return relations;
         }
 
-        private void loadEmbed(FromClause.Aliases aliases, Embed embed, Lineage parent,
-                List<Map<String, Object>> parentRows) {
-            Lineage child = lineage(aliases.aliases().get(embed.from()));
-            if (embed.on().isEmpty()) {
-                refuse("Nest relation '" + embed.from() + "' has no exact join keys");
-            }
-            TupleSet tuples = new TupleSet();
-            for (Map<String, Object> row : parentRows) {
-                Map<String, Object> tuple = new LinkedHashMap<>();
-                boolean usable = true;
-                for (Map.Entry<String, String> pair : embed.on().entrySet()) {
-                    String physicalChild = child.physicalByLogical().get(pair.getKey());
-                    if (parent.physicalByLogical().get(pair.getValue()) == null || physicalChild == null) {
-                        refuse("Nest relation keys must resolve through source fields and direct Map renames");
-                    }
-                    Object value = row.get(pair.getValue());
-                    if (value == null) {
-                        usable = false;
-                        break;
-                    }
-                    tuple.put(physicalChild, value);
+        private String requireRelationKey(String relation, Lineage lineage, String field) {
+            String physical = lineage.physicalByLogical().get(field);
+            if (physical == null) {
+                DroppedField dropped = lineage.droppedByLogical().get(field);
+                if (dropped != null) {
+                    throw new TapstateException(ActuationError.PREVIEW_ASSOCIATION_KEY_DROPPED,
+                            Map.of("relation", relation, "field", field, "transform", dropped.transform(),
+                                    "droppedField", dropped.field()), null);
                 }
-                if (usable) {
-                    tuples.add(tuple);
-                }
+                refuse("Nest relation keys must resolve through source fields and direct Map renames");
             }
-            List<Envelope> childRows = read(child.sourceKey(),
-                    new BoundedSnapshotQueryRequest.ExactTuples(tuples.values()),
-                    Math.max(1, MAX_INPUT_ROWS - rowsRead), false);
-            List<Map<String, Object>> logicalChildren = logicalRows(child, childRows);
-            for (Embed nested : embed.embed() == null ? List.<Embed>of() : embed.embed()) {
-                loadEmbed(aliases, nested, child, logicalChildren);
+            return physical;
+        }
+
+        private void loadRelation(RelationSelection relation, List<Map<String, Object>> parentRows) {
+            // Each alternative needs a separate read because its tuples can use different child columns.
+            List<Envelope> childRows = new ArrayList<>();
+            for (List<RelationKey> alternative : relation.alternatives()) {
+                TupleSet tuples = new TupleSet();
+                for (Map<String, Object> row : parentRows) {
+                    Map<String, Object> tuple = new LinkedHashMap<>();
+                    boolean usable = true;
+                    for (RelationKey key : alternative) {
+                        Object value = row.get(key.parentField());
+                        if (value == null) {
+                            usable = false;
+                            break;
+                        }
+                        tuple.put(key.physicalChildField(), value);
+                    }
+                    if (usable) {
+                        tuples.add(tuple);
+                    }
+                }
+                childRows.addAll(read(relation.child().sourceKey(),
+                        new BoundedSnapshotQueryRequest.ExactTuples(tuples.values()),
+                        Math.max(1, MAX_INPUT_ROWS - rowsRead), false));
+            }
+            List<Map<String, Object>> logicalChildren = logicalRows(relation.child(), childRows);
+            for (RelationSelection nested : relation.children()) {
+                loadRelation(nested, logicalChildren);
             }
         }
 
@@ -375,6 +415,12 @@ final class PreviewSelectionPlanner {
             FromClause.Aliases aliases = (FromClause.Aliases) step.from();
             Map<String, Lineage> lineages = new LinkedHashMap<>();
             aliases.aliases().forEach((name, ref) -> lineages.put(name, lineage(ref)));
+            // an OR alternative the front end added samples the rows of the alias it stands in for
+            compiled.plan().from().sources().forEach(source -> {
+                if (!source.declared().equals(source.name()) && lineages.containsKey(source.declared())) {
+                    lineages.put(source.name(), lineages.get(source.declared()));
+                }
+            });
             Map<String, List<Map<String, Object>>> available = new LinkedHashMap<>();
             String fact = compiled.plan().factSource().name();
             available.put(fact, logicalRows(lineages.get(fact)));
@@ -586,7 +632,21 @@ final class PreviewSelectionPlanner {
         throw new TapstateException(ActuationError.PREVIEW_REFUSED, Map.of("reason", reason), null);
     }
 
-    private record Lineage(String sourceKey, Map<String, String> physicalByLogical) {
+    private record Lineage(String sourceKey, Map<String, String> physicalByLogical,
+            Map<String, DroppedField> droppedByLogical) {
+    }
+
+    private record DroppedField(String transform, String field) {
+    }
+
+    private record NestSelection(Lineage root, List<RelationSelection> relations) {
+    }
+
+    private record RelationSelection(Lineage child, List<List<RelationKey>> alternatives,
+            List<RelationSelection> children) {
+    }
+
+    private record RelationKey(String parentField, String physicalChildField) {
     }
 
     record Sample(Map<String, List<Envelope>> rowsBySourceKey, int rootRows, int inputRows,

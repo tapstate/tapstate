@@ -41,7 +41,7 @@ class PipelineStartServiceTest {
         StartRefusal refused = catchThrowableOfType(StartRefusal.class,
                 () -> bench.service().start("alice", "pl", List.of(), null));
 
-        assertThat(refused.code().code()).isEqualTo("lifecycle.start-needs-confirmation");
+        assertThat(refused.code().code()).isEqualTo("TS0280006");
         assertThat(refused.args()).containsEntry("pipeline", "pl").containsEntry("count", 1)
                 .containsEntry("check", "target-not-empty").containsEntry("subject", "warehouse/orders");
         assertThat(refused.report().outcome()).isEqualTo(StartCheckReport.Outcome.NEEDS_CONFIRMATION);
@@ -88,10 +88,7 @@ class PipelineStartServiceTest {
         assertThat(changed).isNotEqualTo(before);
         assertThat(outcome.desired().revision()).isEqualTo(changed);
         assertThat(outcome.report().contentHash()).isEqualTo(changed);
-        assertThat(outcome.report().findings()).singleElement().satisfies(finding -> {
-            assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.PASS);
-            assertThat(finding.code()).isEqualTo("start-check.target-set-to-clear");
-        });
+        assertThat(outcome.report().findings()).isEmpty();
         assertThat(outcome.decisionsApplied()).singleElement().satisfies(applied -> {
             assertThat(applied.action()).isEqualTo("clear");
             assertThat(applied.changes()).containsExactly(new StartAction.Change("out", "on_full_load", "append", "clear"));
@@ -129,7 +126,7 @@ class PipelineStartServiceTest {
         StartRefusal refused = catchThrowableOfType(StartRefusal.class, () -> bench.service()
                 .start("alice", "pl", List.of(new StartDecision(KEY, "keep")), hash));
 
-        assertThat(refused.code().code()).isEqualTo("lifecycle.start-blocked");
+        assertThat(refused.code().code()).isEqualTo("TS0280007");
         assertThat(refused.report().outcome()).isEqualTo(StartCheckReport.Outcome.BLOCKED);
         assertThat(bench.desiredById).isEmpty();
     }
@@ -140,7 +137,7 @@ class PipelineStartServiceTest {
         bench.holding("warehouse/orders", new TargetProbe.TargetRows(false, 5L, false));
         TapstateException refused = catchThrowableOfType(TapstateException.class, () -> bench.service()
                 .start("alice", "pl", List.of(new StartDecision(KEY, "truncate")), bench.hash("pl")));
-        assertThat(refused.code().code()).isEqualTo("lifecycle.invalid-start-decision");
+        assertThat(refused.code().code()).isEqualTo("TS0280008");
         assertThat(refused.args()).containsEntry("finding", KEY).containsEntry("action", "truncate");
     }
 
@@ -151,7 +148,7 @@ class PipelineStartServiceTest {
         TapstateException refused = catchThrowableOfType(TapstateException.class, () -> bench.service()
                 .start("alice", "pl", List.of(new StartDecision(KEY, "keep"), new StartDecision(KEY, "clear")),
                         bench.hash("pl")));
-        assertThat(refused.code().code()).isEqualTo("lifecycle.invalid-start-decision");
+        assertThat(refused.code().code()).isEqualTo("TS0280008");
     }
 
     @Test
@@ -177,7 +174,7 @@ class PipelineStartServiceTest {
         StartRefusal refused = catchThrowableOfType(StartRefusal.class, () -> bench.service()
                 .start("alice", "pl", List.of(new StartDecision(KEY, "clear")), before));
 
-        assertThat(refused.code().code()).isEqualTo("lifecycle.start-needs-confirmation");
+        assertThat(refused.code().code()).isEqualTo("TS0280006");
         assertThat(refused.args()).containsEntry("check", "asks-once-cleared");
         assertThat(refused.report().contentHash()).isEqualTo(before);
         assertThat(bench.hash("pl")).as("the definition is not rewritten").isEqualTo(before);
@@ -248,7 +245,7 @@ class PipelineStartServiceTest {
         assertThat(bench.service().checks("pl", StartIntent.RERUN).intent()).isEqualTo(StartIntent.RERUN);
         TapstateException plain = catchThrowableOfType(TapstateException.class,
                 () -> bench.service().checks("pl", StartIntent.START));
-        assertThat(plain.code().code()).isEqualTo("lifecycle.illegal-transition");
+        assertThat(plain.code().code()).isEqualTo("TS0280001");
     }
 
     @Test
@@ -265,7 +262,7 @@ class PipelineStartServiceTest {
                         new StartDecision("target-not-empty/warehouse/customers", "keep")), before));
 
         assertThat(refused).isNotNull();
-        assertThat(refused.code().code()).isEqualTo("lifecycle.invalid-start-decision");
+        assertThat(refused.code().code()).isEqualTo("TS0280008");
         assertThat(bench.hash("pl")).isEqualTo(before);
         assertThat(bench.desiredById).isEmpty();
         assertThat(bench.audit).isEmpty();
@@ -342,7 +339,7 @@ class PipelineStartServiceTest {
                         new StartDecision("target-not-empty/views/customers", "keep")), before));
 
         assertThat(refused).isNotNull();
-        assertThat(refused.code().code()).isEqualTo("lifecycle.invalid-start-decision");
+        assertThat(refused.code().code()).isEqualTo("TS0280008");
         assertThat(bench.hash("pl")).isEqualTo(before);
         assertThat(bench.desiredById).isEmpty();
         assertThat(bench.audit).isEmpty();

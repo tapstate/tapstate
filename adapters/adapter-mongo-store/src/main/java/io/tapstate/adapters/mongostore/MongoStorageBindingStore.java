@@ -1,5 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
+import io.tapstate.spi.store.CacheBusinessScope;
+
 import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
@@ -171,6 +173,81 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         var current = loaded.recovery().authentication();
         if (current.pending() || !current.preparation().equals(original)) throw refused();
     }
+
+    /** One snapshot command for request authority; business resources are validated by their own operations. */
+    void requireRequestAuthenticationPublished(CachePreparation original, MongoReadBudget budget) {
+        if (client.getClusterDescription().getServerDescriptions().stream().anyMatch(server -> server.getMaxWireVersion() < 13)) {
+            requireAuthenticationPublished(original, budget);
+            return;
+        }
+        StoreIo.run(() -> {
+            requireActive.run(); budget.requireRemaining();
+            var selected = budget.database(database).withReadConcern(ReadConcern.SNAPSHOT);
+            var pipeline = List.of(new Document("$match", new Document("_id", SINGLETON_ID)),
+                    new Document("$project", new Document("clusterId", 1).append("layoutId", 1).append(BINDING_VERSION, 1)),
+                    authorityLookup(SystemCollections.STORAGE_BINDING, "binding", new Document("_id", 1)
+                            .append("clusterId", 1).append("layoutId", 1).append(BINDING_VERSION, 1)
+                            .append("installationId", 1).append("operationId", 1).append("generation", 1)
+                            .append("mode", 1).append("defaultSourceId", 1)),
+                    authorityLookup(SystemCollections.STORAGE_SETUP, "setup", null),
+                    authorityLookup(SystemCollections.STORAGE_RECOVERY, "recovery", null));
+            Document row = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(selected).aggregate(pipeline).first();
+            if (row == null || !SINGLETON_ID.equals(row.get("_id"))) throw refused();
+            requireClusterIdentity(row);
+            var expected = original.authScope();
+            if (!expected.clusterId().equals(row.get("clusterId"))
+                    || !Long.valueOf(expected.bindingVersion()).equals(row.get(BINDING_VERSION))) throw refused();
+            Document bound = authorityDocument(row, "binding"), stage = authorityDocument(row, "setup");
+            try {
+                if (!expected.clusterId().equals(bound.get("clusterId"))
+                        || !MongoConfigurationDomain.LAYOUT.equals(bound.get("layoutId"))
+                        || !Long.valueOf(expected.bindingVersion()).equals(bound.get(BINDING_VERSION))
+                        || !expected.mode().name().equals(bound.get("mode"))) throw refused();
+                var owner = new StorageSetupScope(expected.clusterId(), bound.getString("installationId"),
+                        bound.getString("operationId"), bound.getLong("generation"));
+                requireBoundSetup(stage, owner, expected.bindingVersion(), StorageBinding.defaultSourceId(expected.mode()),
+                        requireSetupIdentity(stage, expected.clusterId()));
+                if (!StorageBinding.defaultSourceId(expected.mode()).equals(bound.get("defaultSourceId"))) throw refused();
+                var current = MongoStorageRecoveryStore.read(authorityDocument(row, "recovery"), owner,
+                        expected.mode(), expected.bindingVersion(), () -> stage).authentication();
+                if (current.pending() || !current.preparation().equals(original)) throw refused();
+            } catch (NullPointerException | IllegalArgumentException | ClassCastException malformed) { throw unreadable(); }
+            budget.requireRemaining(); requireActive.run();
+        });
+    }
+
+    StorageBinding observationBinding(CacheBusinessScope expected, Document bound, Document stage, Document recovery) {
+        try {
+            long version = expected.bindingVersion();
+            String cluster = expected.clusterId();
+            if (!cluster.equals(bound.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(bound.get("layoutId"))
+                    || !Long.valueOf(version).equals(bound.get(BINDING_VERSION))) throw refused();
+            var owner = new StorageSetupScope(cluster, bound.getString("installationId"),
+                    bound.getString("operationId"), bound.getLong("generation"));
+            var mode = StorageBinding.Mode.valueOf(bound.getString("mode"));
+            String defaultId = StorageBinding.defaultSourceId(mode);
+            requireBoundSetup(stage, owner, version, defaultId, requireSetupIdentity(stage, cluster));
+            if (!defaultId.equals(bound.get("defaultSourceId"))
+                    || !MongoStorageRecoveryStore.read(recovery, owner, mode, version, () -> stage)
+                            .preparation().businessScope().equals(expected)) throw refused();
+            String json = ciphers.current().decrypt(bindingContext(cluster), "cache-binding", bound.getString("cache"));
+            String hash = fingerprint(mode, json, bound.getString("sourceHash"));
+            if (!hash.equals(bound.get("candidateHash")) || !hash.equals(stage.get("candidateHash"))) throw refused();
+            return new StorageBinding(owner, mode, version, defaultId, decodeConnection(json));
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException malformed) { throw unreadable(); }
+    }
+
+    private static Document authorityLookup(SystemCollections table, String field, Document projection) {
+        var stages = new java.util.ArrayList<Document>(); stages.add(new Document("$limit", 2));
+        if (projection != null) stages.add(new Document("$project", projection));
+        return new Document("$lookup", new Document("from", table.collectionName()).append("pipeline", stages).append("as", field));
+    }
+
+    private static Document authorityDocument(Document row, String field) {
+        var values = row.getList(field, Document.class);
+        if (values == null || values.size() != 1 || !SINGLETON_ID.equals(values.getFirst().get("_id"))) throw unreadable();
+        return values.getFirst();
+    }
     private StorageBinding requireAuthenticationRecoveryConfiguration(ClientSession session) {
         var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
         var stage = setup.find(session, new Document("_id", SINGLETON_ID)).first();
@@ -312,9 +389,98 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return load(session).map(Loaded::cachePreparation);
     }
 
+    /** Rechecks the durable scope of a previously admitted runtime without reopening its connection. */
+    Optional<CachePreparation> admittedCachePreparation(ClientSession session) {
+        return admittedFacts(session, false).preparation();
+    }
+
+    record AdmittedFacts(Optional<CachePreparation> preparation, Document version) {}
+
+    AdmittedFacts admittedFacts(ClientSession session, boolean readVersion) {
+        if (!MongoBindingReadFacts.supported(client)) return new AdmittedFacts(cachePreparationForTransaction(session), null);
+        var stored = bindings.find(session, new Document("_id", SINGLETON_ID))
+                .projection(new Document("cache", 0)).first();
+        var facts = MongoBindingReadFacts.read(session, null, identity, setup, noteScopes, List.of(), readVersion ? versions : null);
+        return admittedFacts(facts.identity(), facts.setup(), stored, facts.version(),
+                (owner, mode, version, stage) -> MongoStorageRecoveryStore.read(session, database, owner, mode, version, stage).preparation());
+    }
+
+    private final MongoStructureProof actuationStructures = new MongoStructureProof();
+    private volatile boolean actuationCollations;
+
+    boolean supportsActuationBatch() {
+        if (!MongoReadBudget.supportsSnapshotReads(client)) return false;
+        actuationStructures.require(MongoStructureProof.Kind.OBSERVATION, () ->
+                actuationCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                        SystemCollections.PIPELINE_INTENTS, SystemCollections.OPERATOR_GENERATIONS, SystemCollections.PIPELINES,
+                        SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP, SystemCollections.STORAGE_BINDING,
+                        SystemCollections.STORAGE_RECOVERY, SystemCollections.CONFIGURATION_VERSION)));
+        return actuationCollations;
+    }
+
+    AdmittedFacts admittedObservationFacts(Document cluster, Document state, Document stored, Document version, Document recovery) {
+        return admittedFacts(cluster, state, stored, version, (owner, mode, binding, stage) ->
+                MongoStorageRecoveryStore.read(recovery, owner, mode, binding, () -> stage).preparation());
+    }
+
+    private interface RecoveryRead {
+        CachePreparation read(StorageSetupScope owner, StorageBinding.Mode mode, long version, Document stage);
+    }
+
+    private AdmittedFacts admittedFacts(Document cluster, Document state, Document stored, Document configuration, RecoveryRead recovery) {
+        requireClusterIdentity(cluster);
+        String clusterId = cluster.getString("clusterId");
+        long version = cluster.getLong(BINDING_VERSION);
+        if (version == 0) return new AdmittedFacts(Optional.empty(), null);
+        long generation = requireSetupIdentity(state, clusterId);
+        try {
+            if (stored == null || !clusterId.equals(stored.get("clusterId"))
+                    || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))
+                    || !Long.valueOf(version).equals(stored.get(BINDING_VERSION))) throw unreadable();
+            var owner = new StorageSetupScope(clusterId, stored.getString("installationId"),
+                    stored.getString("operationId"), stored.getLong("generation"));
+            var mode = StorageBinding.Mode.valueOf(stored.getString("mode"));
+            String defaultId = stored.getString("defaultSourceId");
+            requireBoundSetup(state, owner, version, defaultId, generation);
+            if (!StorageBinding.defaultSourceId(mode).equals(defaultId)
+                    || !(stored.get("candidateHash") instanceof String candidate)
+                    || !candidate.equals(state.get("candidateHash"))) throw unreadable();
+            return new AdmittedFacts(Optional.of(recovery.read(owner, mode, version, state)), configuration);
+        } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) {
+            throw unreadable();
+        }
+    }
+
+    record AlertHostFacts(Document setup,StorageBinding binding,Document schema,Document version,Document key,
+            Boolean deliveryIntentsEmpty) { }
+    AlertHostFacts admittedAlertHost(ClientSession session) {
+        return admittedAlertHost(session, false);
+    }
+    // Alert observations check live cluster, setup, binding, and recovery facts. Their callers validate the
+    // alert schema, version, and key. Full storage admission and alert writes audit the default source and
+    // global note scope independently.
+    AlertHostFacts admittedAlertHost(ClientSession session, boolean includeDelivery) {
+        return admittedAlertHost(session, includeDelivery, null);
+    }
+
+    AlertHostFacts admittedAlertHost(ClientSession session, boolean includeDelivery, MongoReadBudget budget) {
+        if(!MongoBindingReadFacts.supported(client))return null;
+        var facts=MongoBindingReadFacts.alertHost(session,database,includeDelivery,budget);var cluster=facts.identity();
+        requireClusterIdentity(cluster);long version=cluster.getLong(BINDING_VERSION);
+        // An unbound installation retains its full original admission checks.
+        if(version==0)return null;
+        long generation=requireSetupIdentity(facts.setup(),cluster.getString("clusterId"));
+        var bound = decodeBound(facts.binding(), cluster.getString("clusterId"), version, facts.setup(), generation);
+        if (facts.recovery() == null) MongoStorageRecoveryStore.read(session, budget == null ? database : budget.database(database), bound, facts.setup());
+        else MongoStorageRecoveryStore.read(facts.recovery(), bound.setup(), bound.mode(), version, facts::setup);
+        return new AlertHostFacts(facts.setup(), bound, facts.schema(), facts.version(), facts.key(), facts.deliveryIntentsEmpty());
+    }
+
     boolean belongsTo(MongoClient expectedClient, String expectedDatabase) {
         return client == expectedClient && database.getName().equals(expectedDatabase);
     }
+
+    void verifyObservationIndex() { verifyIndex(); }
 
     Optional<StorageBinding> loadForTransaction(ClientSession session) {
         verifyIndex();
@@ -370,33 +536,61 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         MongoStorageRecoveryStore.requireAbsent(session, database);
     }
 
+    /** Decodes a full binding audit with facts already read in the original CONFIG snapshot. */
+    CachePreparation auditedObservationBinding(Document cluster, Document stage, Document stored, Document recovery,
+            Document source, Document global, boolean conflictingResource) {
+        requireClusterIdentity(cluster);
+        String clusterId = cluster.getString("clusterId");
+        long version = cluster.getLong(BINDING_VERSION);
+        long generation = requireSetupIdentity(stage, clusterId);
+        var binding = decodeBound(stored, clusterId, version, stage, generation);
+        requireDefaultSource(stored, source, conflictingResource);
+        requireGlobalScope(global, clusterId);
+        if (recovery == null) throw unreadable();
+        return MongoStorageRecoveryStore.read(recovery, binding.setup(), binding.mode(), version, () -> stage).preparation();
+    }
+
     private TransactionFacts readBound(ClientSession session, Document stored, MongoBindingReadFacts.Facts facts,
             String clusterId, Long version, Document state, long currentGeneration) {
+        return readBound(session,stored,facts,clusterId,version,state,currentGeneration,true);
+    }
+    private TransactionFacts readBound(ClientSession session,Document stored,MongoBindingReadFacts.Facts facts,
+            String clusterId,Long version,Document state,long currentGeneration,boolean audit) {
+        var binding = decodeBound(stored, clusterId, version, state, currentGeneration);
+        if (audit) {
+            String defaultId = binding.defaultSourceId();
+            var source = sources.find(session, new Document("_id", defaultId)).first();
+            requireDefaultSource(stored, source, facts == null ? hasOtherResource(session, defaultId) : facts.conflictingResource());
+            var global = facts == null ? noteScopes.find(session, new Document("_id", new Document(BINDING_VERSION, version)
+                    .append("namespace", "pdk.global-state"))).first() : facts.global();
+            requireGlobalScope(global, clusterId);
+        }
+        return new TransactionFacts(Optional.of(new Loaded(binding, stored.getString("candidateHash"),
+                MongoStorageRecoveryStore.read(session, database, binding, state))), state);
+    }
+
+    private void requireDefaultSource(Document stored, Document source, boolean conflictingResource) {
+        if (source == null || !DEFAULT_ROLE.equals(source.get("systemRole")) || conflictingResource
+                || !CanonicalHash.of(codec.decode(source)).equals(stored.get("sourceHash"))) throw unreadable();
+    }
+
+    private StorageBinding decodeBound(Document stored, String clusterId, Long version, Document state, long currentGeneration) {
         try {
             if (stored == null || !clusterId.equals(stored.get("clusterId"))
                     || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))
                     || !version.equals(stored.get(BINDING_VERSION))) throw unreadable();
-            StorageSetupScope scope = new StorageSetupScope(clusterId, stored.getString("installationId"),
+            var scope = new StorageSetupScope(clusterId, stored.getString("installationId"),
                     stored.getString("operationId"), stored.getLong("generation"));
-            StorageBinding.Mode mode = StorageBinding.Mode.valueOf(stored.getString("mode"));
+            var mode = StorageBinding.Mode.valueOf(stored.getString("mode"));
             String defaultId = stored.getString("defaultSourceId");
             requireBoundSetup(state, scope, version, defaultId, currentGeneration);
-            Document source = sources.find(session, new Document("_id", defaultId)).first();
-            if (source == null || !DEFAULT_ROLE.equals(source.get("systemRole"))
-                    || (facts != null ? facts.conflictingResource() : hasOtherResource(session, defaultId))
-                    || !stored.get("sourceHash").equals(CanonicalHash.of(codec.decode(source)))) throw unreadable();
             String cacheJson = ciphers.current().decrypt(bindingContext(clusterId), "cache-binding", stored.getString("cache"));
-            StorageBinding.Connection cache = decodeConnection(cacheJson);
-            String candidateHash = fingerprint(mode, cacheJson, stored.getString("sourceHash"));
-            if (!candidateHash.equals(stored.get("candidateHash")) || !candidateHash.equals(state.get("candidateHash"))) throw unreadable();
-            Document global = facts != null ? facts.global() : noteScopes.find(session, new Document("_id", new Document(BINDING_VERSION, version)
-                    .append("namespace", "pdk.global-state"))).first();
-            requireGlobalScope(global, clusterId);
-            StorageBinding binding = new StorageBinding(scope, mode, version, defaultId, cache);
-            return new TransactionFacts(Optional.of(new Loaded(binding, candidateHash,
-                    MongoStorageRecoveryStore.read(session, database, binding, state))), state);
+            var cache = decodeConnection(cacheJson);
+            String candidate = fingerprint(mode, cacheJson, stored.getString("sourceHash"));
+            if (!candidate.equals(stored.get("candidateHash")) || !candidate.equals(state.get("candidateHash"))) throw unreadable();
+            return new StorageBinding(scope, mode, version, defaultId, cache);
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
-            // Stored or decrypted values may contain credentials. Never attach parser input or causes.
+            // Stored or decrypted values may contain credentials. Do not attach parser input or causes.
             throw unreadable();
         }
     }

@@ -1,10 +1,13 @@
 package io.tapstate.spi.store;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Resource;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * The artifact truth layer: the canonical, authoritative store of the resources a workspace applies.
@@ -19,6 +22,60 @@ import java.util.Optional;
  * unavailable.
  */
 public interface ArtifactStore {
+
+    /** Registers already resolved sources with read-side credential tracking. */
+    default java.util.function.Function<io.tapstate.core.model.SourceResource, Runnable> resolvedSourceTracking() {
+        return ignored -> () -> {};
+    }
+
+    /**
+     * One operation's readable resources and optional redaction catalog.
+     * Exact lookup IDs are keys the store resolved to those same resources in this snapshot.
+     */
+    record ReadableInventory(List<Resource> resources,
+            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog, Optional<String> managedDefaultSourceId,
+            Set<String> exactLookupIds) {
+        public ReadableInventory {
+            resources = List.copyOf(resources);
+            Objects.requireNonNull(connectorCatalog);
+            Objects.requireNonNull(managedDefaultSourceId);
+            exactLookupIds = Set.copyOf(exactLookupIds);
+        }
+        public ReadableInventory(List<Resource> resources, Optional<io.tapstate.core.catalog.TapstateCatalog> catalog,
+                Optional<String> managedDefaultSourceId) {
+            this(resources, catalog, managedDefaultSourceId, Set.of());
+        }
+        public ReadableInventory(List<Resource> resources, Optional<io.tapstate.core.catalog.TapstateCatalog> catalog) {
+            this(resources, catalog, Optional.empty());
+        }
+    }
+
+    default ReadableInventory readableInventory() {
+        return new ReadableInventory(listReadable(), Optional.empty());
+    }
+
+    /** A complete draft dependency slice, including the original target if it exists. */
+    default Optional<ReadableInventory> draftPublicationInventory(io.tapstate.core.model.PipelineResource candidate) {
+        return Optional.empty();
+    }
+
+    default Optional<ReadableInventory> startPlanningInventory(io.tapstate.core.model.PipelineResource pipeline) {
+        return draftPublicationInventory(pipeline);
+    }
+
+    /** Typed point read with the same display facts as the daily inventory. */
+    default ReadableInventory readableInventory(String kind, String id) {
+        var resource = get(id).filter(value -> kind.equals(value.kind()));
+        return new ReadableInventory(resource.stream().toList(), Optional.empty(),
+                "source".equals(kind) && resource.isPresent() ? managedDefaultSourceId() : Optional.empty());
+    }
+
+    /** Typed daily inventory; persistent adapters can select one physical collection directly. */
+    default ReadableInventory readableInventory(String kind) {
+        Objects.requireNonNull(kind, "kind");
+        return new ReadableInventory(listReadable().stream().filter(resource -> kind.equals(resource.kind())).toList(),
+                Optional.empty(), managedDefaultSourceId());
+    }
 
     /**
      * Atomically applies every requested resource write while evaluating each write's condition in the
@@ -174,6 +231,20 @@ public interface ArtifactStore {
 
     /** Lists every stored resource. */
     List<Resource> list();
+
+    /** Lists readable resources, skipping bodies that cannot be reconstructed. */
+    default List<Resource> listReadable() {
+        List<Resource> resources = new ArrayList<>();
+        for (StoredArtifactRecord row : listStored()) {
+            if (!row.readable()) continue;
+            try {
+                get(row.id()).ifPresent(resources::add);
+            } catch (TapstateException failure) {
+                if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure;
+            }
+        }
+        return List.copyOf(resources);
+    }
 
     /**
      * Lists the stored rows without requiring every canonical body to reconstruct as a {@link Resource}.

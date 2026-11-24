@@ -69,22 +69,16 @@ class TargetNotEmptyCheckTest {
     }
 
     @Test
-    void aTargetSetToBeClearedPasses() {
-        StartFinding finding = only(evaluate(plan(StartLoad.FULL_LOAD, entry("out", OnFullLoad.CLEAR, null)),
-                rows(1465L)));
-        assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.PASS);
-        assertThat(finding.code()).isEqualTo(StartCheckCode.TARGET_SET_TO_CLEAR);
-        assertThat(finding.params()).containsEntry("rows", 1465L).containsEntry("holding", "1465 rows");
+    void aTargetSetToBeClearedSkipsTheProbe() {
+        assertThat(evaluate(plan(StartLoad.FULL_LOAD, entry("out", OnFullLoad.CLEAR, null)),
+                (connection, table) -> { throw new AssertionError("clearing must not probe"); })).isEmpty();
     }
 
     @Test
-    void anyWriterConfiguredToClearWillClearTheTargetEvenIfAnotherAppends() {
-        StartFinding finding = only(evaluate(plan(StartLoad.FULL_LOAD,
-                entry("out", OnFullLoad.CLEAR, null), entry("shared", OnFullLoad.APPEND, "shared_view")), rows(5L)));
-
-        assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.PASS);
-        assertThat(finding.code()).isEqualTo(StartCheckCode.TARGET_SET_TO_CLEAR);
-        assertThat(finding.actions()).isEmpty();
+    void anAppendingWriterSharingAClearedTargetAlsoSkipsTheProbe() {
+        assertThat(evaluate(plan(StartLoad.FULL_LOAD,
+                entry("out", OnFullLoad.CLEAR, null), entry("shared", OnFullLoad.APPEND, "shared_view")),
+                (connection, table) -> { throw new AssertionError("clearing must not probe"); })).isEmpty();
     }
 
     @Test
@@ -133,7 +127,7 @@ class TargetNotEmptyCheckTest {
         assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.WARN);
         assertThat(finding.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
         assertThat(finding.code()).isEqualTo(StartCheckCode.TARGET_ROWS_UNKNOWN);
-        assertThat(finding.params()).containsEntry("reasonCode", "data-browser.connector-not-browsable");
+        assertThat(finding.params()).containsEntry("reasonCode", "TS0390004");
     }
 
     @Test

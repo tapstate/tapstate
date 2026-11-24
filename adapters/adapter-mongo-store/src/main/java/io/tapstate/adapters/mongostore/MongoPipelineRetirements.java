@@ -30,7 +30,13 @@ final class MongoPipelineRetirements implements PipelineRetirements {
         Objects.requireNonNull(guard);return new MongoPipelineRetirements(client,database,cluster,bindings,artifacts,notes,() -> {active.run();guard.run();});
     }
     @Override public PipelineRetirementPreparation begin(PipelineRetirementRequest original) {
+        return begin(original, null);
+    }
+    @Override public PipelineRetirementPreparation begin(PipelineRetirementRequest original, PipelineIntentSnapshot expectedIntent) {
         Objects.requireNonNull(original);
+        if (expectedIntent != null && (!original.scope().equals(expectedIntent.scope()) || expectedIntent.deleted()
+                || expectedIntent.desired().purgeState()
+                || expectedIntent.desired().targetState() != io.tapstate.core.lifecycle.PipelineState.STOPPED)) throw fenced();
         var validationClosing = UUID.randomUUID();
         return transaction(session -> {
             requireBusiness(session,original.scope());var row=mapping(session,original.scope().pipelineId());
@@ -39,6 +45,8 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             if(state.phase()!=PipelineStateMapping.Phase.ACTIVE || state.stateGeneration()!=original.scope().stateGeneration())throw fenced();
             MongoPipelineSharedRecoveryFacts.requireReady(session,database,row,original.scope());
             if(row.containsKey("retirement") && MongoPipelineRetirementFacts.read(row).request().operationId().equals(original.operationId()))throw fenced();
+            if (expectedIntent != null && new MongoPipelineIntentStore(client,database,cluster,bindings)
+                    .loadInTransaction(session,original.scope().pipelineId()).filter(expectedIntent::equals).isEmpty()) throw fenced();
             requireDefinition(session,original);var preparation=MongoPipelinePreparationFacts.decode(state.pipelineId(),row,cluster);
             Optional<PipelineRetiredState> predecessor=Optional.empty();
             if(preparation.phase()==PipelinePreparation.Phase.COMPLETE) {
@@ -99,6 +107,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             MongoValidationPreparations.requireRetired(session,database,cluster,pending.request().scope().pipelineId());
             artifacts.deleteRetiredPipeline(session,pending.request().scope().pipelineId(),pending.request().definitionHash());
             new MongoPipelineIntentStore(client,database,cluster,bindings).retire(session,pending.request().scope());
+            MongoRequiredDeadLetterStore.deleteRetiringGeneration(session, database, pending.request().scope());
             if(SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,new Document("_id",pending.request().scope().pipelineId())
                             .append("stateGeneration",pending.request().scope().stateGeneration()).append("phase","RETIRING")
                             .append("operationId",pending.request().operationId()).append("retirement",MongoPipelineRetirementFacts.encode(pending.fact)).append("noteWriteFence",fence),

@@ -147,7 +147,8 @@ class RealMysqlToMongoSharedPositionIT {
     private static void awaitIds(ControlPlane control, String pipeline, MongoEndpoints mongo,
             EndpointAddress target, String table, List<Long> expected) {
         Await.until("rows in " + table + " from " + pipeline,
-                () -> ids(mongo, target, table).equals(expected),
+                () -> ids(mongo, target, table).equals(expected)
+                        && control.state(pipeline).filter(PipelineState.RUNNING::equals).isPresent(),
                 () -> "rows=" + ids(mongo, target, table) + ", state=" + control.state(pipeline)
                         + ", logs=" + control.logs(pipeline));
         assertThat(control.state(pipeline)).contains(PipelineState.RUNNING);

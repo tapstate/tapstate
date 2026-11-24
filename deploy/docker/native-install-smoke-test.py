@@ -90,9 +90,9 @@ class Ownership(unittest.TestCase):
 
 class HttpDiagnostics(unittest.TestCase):
     def test_only_phase_status_and_a_catalog_code_leave_a_failed_response(self):
-        response = b'{"code":"control.unauthenticated","message":"private-token","params":{"password":"private-password"}}\n401'
+        response = b'{"code":"TS0210003","message":"private-token","params":{"password":"private-password"}}\n401'
         with patch.object(SMOKE, "command", return_value=response):
-            with self.assertRaisesRegex(RuntimeError, "test-CACHE failed.*HTTP 401, code control.unauthenticated") as failure:
+            with self.assertRaisesRegex(RuntimeError, "test-CACHE failed.*HTTP 401, code TS0210003") as failure:
                 SMOKE.request("fixture", "/api/storage/test", label="test-CACHE")
         self.assertNotIn("private", str(failure.exception))
 

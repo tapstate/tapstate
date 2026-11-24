@@ -2,36 +2,31 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
-import io.tapdata.pdk.apis.entity.TapExecuteCommand;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.spi.store.ConnectionConfig;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 /**
  * Independent native scalar reads for an already admitted, fixed connection and artifact. The
- * assembly selects the exact native operation from its semantics, never from a discovery estimate.
+ * reader uses the registered PDK count function in the connector's own connection context.
  * Construction is metadata-only. Call count on admitted blocking I/O and close on separate cleanup
  * I/O; neither method belongs on a cooperative processor or deadline thread. The caller reserves
  * connection and driver memory before count, retaining them through actual drain.
  */
 public final class PdkValidationCounts implements AutoCloseable {
-    /** Existing PDK operations, not a source allowlist or an automatic capability certificate. */
-    public enum Operation { PARTITION_FILTER, DOCUMENT_COUNT, NATIVE_PROTOCOL }
+    public enum Operation { PARTITION_FILTER }
 
-    public record Request(String table, String database, Operation operation) {
+    public record Request(String table) {
         public Request {
             ValidationError.fieldName(table, "count.table");
             if (table.isBlank() || table.length() > 512) throw invalid("table");
-            Objects.requireNonNull(operation);
-            if (database != null) ValidationError.fieldName(database, "count.database");
-            if (operation == Operation.DOCUMENT_COUNT && (database == null || database.isBlank())) throw invalid("database");
         }
     }
 
@@ -59,22 +54,26 @@ public final class PdkValidationCounts implements AutoCloseable {
         this.connection = Objects.requireNonNull(connection); this.artifact = Objects.requireNonNull(artifact);
         this.request = Objects.requireNonNull(request); this.requireCurrent = Objects.requireNonNull(requireCurrent);
         this.admitTable=Objects.requireNonNull(admitTable);
-        if (request.database() != null && !request.database().equals(connection.settings().get("database")))
-            throw invalid("databaseBinding");
     }
 
-    /** One original count attempt. Failure, cancellation or a missing table never becomes a zero count. */
-    public long count() { return attempt(false).count(); }
+    /** One original count attempt using the connector's native count contract. */
+    public long count() { return attempt(false, false).count(); }
+
+    /** An absent native count function leaves the scan on the PDK-ordered path. */
+    public OptionalLong countIfSupported() {
+        Long count = attempt(false, true).count();
+        return count == null ? OptionalLong.empty() : OptionalLong.of(count);
+    }
 
     /**
      * Independent metadata/capability inspection only: never invokes count, query or value discovery.
      * Method presence and native table enumeration are observations, not proof of a successful future
      * scalar read. The original handle still owns initialization/cleanup and may be attempted once.
      */
-    public Operation inspect() { return attempt(true).operation(); }
+    public Operation inspect() { return attempt(true, false).operation(); }
 
     private record Outcome(Operation operation,Long count) {}
-    private Outcome attempt(boolean metadataOnly) {
+    private Outcome attempt(boolean metadataOnly, boolean optional) {
         synchronized (state) {
             if(cancelled)throw new TapstateException(ValidationError.READ_CANCELLED,Map.of("table",request.table()),null);
             if (started || returned) throw invalid("alreadyAttempted");
@@ -90,30 +89,20 @@ public final class PdkValidationCounts implements AutoCloseable {
                 check(); opened.connector().init(opened.context()); check();
                 // COUNT never discovers value models: schema discovery may sample business rows.
                 var table = new TapTable(request.table());
-                requireTable(opened);
-                Operation operation=operation(opened);
-                if(operation==Operation.DOCUMENT_COUNT&&(request.database()==null||request.database().isBlank()))throw invalid("database");
-                if(operation==Operation.PARTITION_FILTER&&opened.functions().getCountByPartitionFilterFunction()==null)throw missing("count-by-partition-filter");
-                if(operation==Operation.DOCUMENT_COUNT&&opened.functions().getExecuteCommandFunction()==null)throw missing("execute-command-count");
-                if(metadataOnly){check();return new Outcome(operation,null);}
-                long count;
-                if (operation == Operation.PARTITION_FILTER) {
-                    var function = opened.functions().getCountByPartitionFilterFunction();
-                    if (function == null) throw missing("count-by-partition-filter");
-                    count = PdkValidationCounter.direct(request.table(),
-                            () -> function.countByPartitionFilter(opened.context(), table, TapAdvanceFilter.create()), this::check);
-                } else {
-                    var function = opened.functions().getExecuteCommandFunction();
-                    if (function == null) throw missing("execute-command-count");
-                    // Plugins may fill defaults into their own params. Never hand them immutable/shared maps.
-                    var params = new LinkedHashMap<String, Object>();
-                    params.put("database", request.database()); params.put("collection", request.table());
-                    params.put("filter", new LinkedHashMap<String, Object>());
-                    var command = TapExecuteCommand.create().command("count").params(params);
-                    count = PdkValidationCounter.callback(request.table(),
-                            sink -> function.execute(opened.context(), command, result -> sink.accept(result)), this::check);
+                if (metadataOnly) requireTable(opened);
+                var function = opened.functions().getCountByPartitionFilterFunction();
+                if (function == null) {
+                    if (optional) return new Outcome(null, null);
+                    throw missing("count-by-partition-filter");
                 }
-                requireTable(opened); check(); return new Outcome(operation,count);
+                if (metadataOnly) {
+                    check();
+                    return new Outcome(Operation.PARTITION_FILTER, null);
+                }
+                long count = PdkValidationCounter.direct(request.table(),
+                        () -> function.countByPartitionFilter(opened.context(), table, TapAdvanceFilter.create()), this::check);
+                check();
+                return new Outcome(Operation.PARTITION_FILTER, count);
             });
         } catch (Throwable failed) {
             record(failed);
@@ -132,20 +121,6 @@ public final class PdkValidationCounts implements AutoCloseable {
         }
         if(failures.get()!=null)throw failure();
         return Objects.requireNonNull(outcome,"count outcome");
-    }
-
-    /**
-     * Compatibility dispatch for the preserved document connector family, whose partition-count
-     * implementation uses a legacy count command. This selects a native protocol, not eligibility:
-     * the actual method, fixed namespace and exact scalar contract are still checked on this session.
-     * Logical connector IDs never grant a capability, and no missing command falls back to statistics.
-     */
-    @SuppressWarnings("java:S1872") // Connector implementations live in isolated loaders, without a host implementation dependency.
-    private Operation operation(PdkConnector opened){
-        if(request.operation()!=Operation.NATIVE_PROTOCOL)return request.operation();
-        for(Class<?> type=opened.connector().getClass();type!=null;type=type.getSuperclass())
-            if(type.getName().equals("io.tapdata.mongodb.MongodbConnector"))return Operation.DOCUMENT_COUNT;
-        return Operation.PARTITION_FILTER;
     }
 
     /** Actual host invocation exit, including cleanup. This does not certify opaque plugin threads. */

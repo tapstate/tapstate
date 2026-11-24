@@ -1,13 +1,14 @@
 package io.tapstate.spi.store;
 
 /**
- * An implementation-private, non-serializable authority returned only to the first CONFIG CAS winner.
- * Loading persistent preparation facts must never reconstruct this object.
+ * An implementation-private, non-serializable authority for one CACHE reservation attempt.
+ * Ordinary issuance returns it only to the CONFIG CAS winner. Deferred starts may issue another
+ * attempt only after checking the current durable intent and its original preparation inputs.
  */
 public interface FirstPipelineCreation {
     PipelinePreparation preparation();
 
-    /** The original CONFIG winner carries these immutable inputs only in memory. */
+    /** Immutable inputs captured for this reservation attempt. */
     PipelinePreparationInputs inputs();
 
     /** Consumes the sole CACHE logical invocation before callbacks or IO; a second call refuses. */

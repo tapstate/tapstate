@@ -150,6 +150,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     // Times each read of the ring that produced something, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.SOURCE);
     private SourceArrivals arrivals = SourceArrivals.of(null);
+    private java.util.function.Consumer<Throwable> failures;
 
     @Override
     public void holdChangesUntil(List<AwaitedLoad> awaited, LoadLandings landings) {
@@ -159,6 +160,25 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     @Override
     protected void init(Context context) {
+        failures = null;
+        var member = context.hazelcastInstance();
+        if (member != null) {
+            Object recorder = member.getUserContext().get(io.tapstate.core.lifecycle.ExecutionFailureRecorder.USER_CONTEXT_KEY);
+            if (recorder instanceof io.tapstate.core.lifecycle.ExecutionFailureRecorder bound) {
+                var jobConfig = context.jobConfig();
+                if (jobConfig != null) failures = bound.forProcessor(jobConfig.getName(), context.jobId(), context.executionId(),
+                        jobConfig.getArgument(io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT));
+            }
+        }
+        try {
+            initialize(context);
+        } catch (RuntimeException | Error failure) {
+            if (failures != null) failures.accept(failure);
+            throw failure;
+        }
+    }
+
+    private void initialize(Context context) {
         this.timer = StageTimer.of(stage(), context);
         this.arrivals = SourceArrivals.of(context);
         // Take what the capture side has already buffered for this ring before opening the ring reader, so
@@ -205,18 +225,19 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
             ring = new SrsRingbuffer(rb);
             cursor = ringTail.publisherFactory().resolve(context.hazelcastInstance());
-            var recovery = ringTail.publisherFactory().recoverySequence(context.hazelcastInstance());
+            var progress = ringTail.publisherFactory().recoveryProgress(context.hazelcastInstance());
+            var recovery = progress.sequence();
             recoveryAfter = ringTail.resumeAfter();
             if (recovery.isPresent()) recoveryAfter = recovery.getAsLong();
             if (recovery.isPresent() && ringTail.resumeAfter() != null && recovery.getAsLong() < ringTail.resumeAfter())
                 throw new TapstateException(CaptureError.RECOVERY_LOG_GAP,Map.of("ring",ringName,"sequence",recovery.getAsLong(),
                         "reason","the original saved recovery floor moved backwards"),null);
-            confirmed = ringTail.publisherFactory().confirmedPosition(context.hazelcastInstance()).orElse(null);
+            confirmed = progress.confirmed().orElse(null);
         }
         Object observer = context.hazelcastInstance().getUserContext().get(SourceInitialLoadObserver.USER_CONTEXT_KEY);
         if (observer instanceof SourceInitialLoadObserver receipt) {
             try {
-                receipt.started(context.hazelcastInstance(), context.jobConfig().getArgument(io.tapstate.runtime.engine.Engine.RUN_IDENTITY_ARGUMENT),
+                receipt.started(context.hazelcastInstance(), context.jobConfig().getArgument(io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT),
                         context.jobId(), context.executionId(), src, context.globalProcessorIndex(), initialMode, epoch);
                 initialObserver = receipt; observedJob = context.jobId(); observedExecution = context.executionId(); observedIndex = context.globalProcessorIndex();
             } catch (RuntimeException failedObservation) {
@@ -233,6 +254,15 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     @Override
     public boolean complete() {
+        try {
+            return drain();
+        } catch (RuntimeException | Error failure) {
+            if (failures != null) failures.accept(failure);
+            throw failure;
+        }
+    }
+
+    private boolean drain() {
         // Emit anything held back by earlier backpressure before reading more: the cursor only advances as
         // fill reads, so a change the outbox refused stays buffered until it is taken, never re-read nor lost.
         // A bound the outbox refused is offered again the same way, before anything more is read: it was
@@ -272,8 +302,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // for the loads they could overtake: the ring keeps them, in order, until the gate opens.
         if (ringTail != null && !awaitingSnapshot && !holding && openReader()) {
             try {
-                reader.fill((item, seq) -> {
-                    modelVerifier.verify(item,seq);
+                reader.fill(modelVerifier, (item, seq) -> {
                     SourceOrder order = orderOf(item, seq);
                     Envelope row = SrsProjection.toEnvelope(item, src, order);
                     arrivals.received(src, row);

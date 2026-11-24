@@ -36,6 +36,10 @@ final class NativeValidationMetadata {
     }
     Scope inspect(ValidationTaskStore.Selection selection,List<ValidationSelectedDeclarations.Choice> choices,
             ValidationMethod method,Map<String,Projection> projections,Instant deadline){
+        return inspect(selection,choices,method,projections,deadline,true);
+    }
+    Scope inspect(ValidationTaskStore.Selection selection,List<ValidationSelectedDeclarations.Choice> choices,
+            ValidationMethod method,Map<String,Projection> projections,Instant deadline,boolean inspectMetadata){
         Objects.requireNonNull(selection);Objects.requireNonNull(method);Objects.requireNonNull(projections);
         if(deadline==null||!deadline.isAfter(clock.instant())||deadline.isAfter(clock.instant().plusSeconds(60)))throw invalid("deadline");
         if(!method.supports(ValidationMode.FULL)||method==ValidationMethod.COUNT&&!projections.isEmpty()||projections.size()>ValidationTaskSpec.MAX_MAPPINGS)throw invalid("method");
@@ -51,6 +55,7 @@ final class NativeValidationMetadata {
             for(var declared:scope.selected.mappings()){
                 scope.require();
                 if(method!=ValidationMethod.COUNT)NativeValidationPdkRows.requireStaticScope(scope.selected.output(declared.mapping().outputId()),declared);
+                if (!inspectMetadata) continue;
                 var projection=projections.get(declared.mapping().mappingId());
                 var source=scope.read(declared,true,projection==null?List.of():projection.source());
                 var target=scope.read(declared,false,projection==null?List.of():projection.target());
@@ -77,10 +82,6 @@ final class NativeValidationMetadata {
         ValidationSelectedDeclarations declarations(){require();return selected;}
         ValidationMethod method(){require();return method;}
         Projection projection(String mapping){require();return projections.get(mapping);}
-        boolean nativeBson(String source){
-            require();var resource=StoredArtifacts.requireSource(selected.artifacts(),source);var ref=artifacts.get(resource.connector());
-            if(ref==null)throw invalid("unobservedArtifact");return ref.className().equals("io.tapdata.mongodb.MongodbConnector");
-        }
         List<Mapping> mappings(){require();return List.copyOf(results);}
         CompletionStage<Void> released(){return released.minimalCompletionStage();}
         private ConnectorRef artifact(SourceResource source){
@@ -105,7 +106,7 @@ final class NativeValidationMetadata {
             probe.released().whenComplete((ignored,failed)->{if(failed!=null)record(failed);synchronized(Scope.this){active.remove(probe);}releaseIfDone();});
             try{
                 if(method==ValidationMethod.COUNT){
-                    var reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(side.table(),side.database(),PdkValidationCounts.Operation.NATIVE_PROTOCOL),
+                    var reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(side.table()),
                             ()->{require();probe.require();},name->{if(source)ValidationDirectMappings.requireObservedSourceTable(declared,name);});
                     var drained=new CompletableFuture<Void>();
                     try{probe.retain(()->{try{reader.close();}finally{if(reader.drained())drained.complete(null);}},reader.callExited(),drained);}
@@ -115,7 +116,7 @@ final class NativeValidationMetadata {
                 }
                 var projection=method==ValidationMethod.FULL_COLUMN?List.<String>of():fields;
                 var reader=PdkValidationReads.inspect(connection,artifact,CanonicalHash.of(resource),side.table(),projection,
-                        ()->{require();probe.require();},probe.queryExecutor(),probe.decodeExecutor(),ROW);
+                        PdkValidationReads.ModelScope.STRUCTURAL,()->{require();probe.require();},probe.queryExecutor(),probe.decodeExecutor(),ROW);
                 try{probe.retain(reader,reader.workersExited(),CompletableFuture.allOf(
                         reader.rowsReleased().toCompletableFuture(),reader.cleanupCompleted().toCompletableFuture()));}
                 catch(RuntimeException|Error refused){closeUnsubmitted(reader,refused);throw refused;}

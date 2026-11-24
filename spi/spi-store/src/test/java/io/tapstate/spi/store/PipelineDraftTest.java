@@ -75,10 +75,22 @@ class PipelineDraftTest {
         assertThatThrownBy(() -> new PipelineDraft.Relation(List.of(), PipelineDraft.Shape.OBJECT,
                 "profile", List.of(), List.of("id")))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("arrayKey is only valid for array relations");
+                .hasMessage("arrayKey is only valid for array and rollup relations");
         assertThatThrownBy(() -> new PipelineDraft.Relation(List.of(), PipelineDraft.Shape.FLAT,
                 "profile", List.of(), List.of()))
-                .isInstanceOf(IllegalArgumentException.class).hasMessage("flat relations do not have a path");
+                .isInstanceOf(IllegalArgumentException.class).hasMessage("flat and rollup relations do not have a path");
+        assertThatThrownBy(() -> new PipelineDraft.Relation(List.of(), PipelineDraft.Shape.ROLLUP,
+                "totals", List.of(), List.of("id"), Map.of("n", Map.of("count", true))))
+                .isInstanceOf(IllegalArgumentException.class).hasMessage("flat and rollup relations do not have a path");
+        assertThatThrownBy(() -> new PipelineDraft.Relation(List.of(), PipelineDraft.Shape.OBJECT,
+                "profile", List.of(), List.of(), Map.of("n", Map.of("count", true))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("rollup fields are only valid on array and rollup relations");
+        PipelineDraft.Relation rollupOnly = new PipelineDraft.Relation(List.of(), PipelineDraft.Shape.ROLLUP,
+                null, List.of(), List.of("id"), Map.of("n", Map.of("count", true)));
+        assertThat(rollupOnly.rollup()).containsEntry("n", Map.of("count", true));
+        assertThat(new PipelineDraft.Relation(List.of(), PipelineDraft.Shape.ARRAY, "items", List.of(),
+                List.of("id"), Map.of()).rollup()).isNull();
         assertThatThrownBy(() -> new PipelineDraft.Related("child", "root", "mysql", "items", null, null))
                 .isInstanceOf(NullPointerException.class).hasMessage("relation");
         assertThatThrownBy(() -> new PipelineDraft.FieldPair(null, "id"))

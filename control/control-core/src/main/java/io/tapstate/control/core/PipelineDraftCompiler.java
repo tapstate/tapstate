@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FieldRule;
@@ -11,6 +12,7 @@ import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameSpec;
+import io.tapstate.core.model.RollupField;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
@@ -18,11 +20,11 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.WriteMode;
-import io.tapstate.core.sql.JoinTree;
 import io.tapstate.core.sql.SqlFrontEnd;
 import io.tapstate.spi.store.PipelineDraft;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -35,6 +37,8 @@ import java.util.regex.Pattern;
 /** Deterministic compiler from the server-owned Pipeline authoring model to a runnable Artifact. */
 public final class PipelineDraftCompiler {
 
+    /** Reads a relation's rollup fields under the same rules as a written nest embed's. */
+    private static final DslParser ROLLUP_READER = new DslParser();
     private static final int MAX_GRAPH_NODES = 512;
     private static final int MAX_GRAPH_EDGES = 2048;
     private static final int MAX_GRAPH_DEPTH = 128;
@@ -63,25 +67,26 @@ public final class PipelineDraftCompiler {
         requiredText(root.table(), "wizard root table");
         validateWizardIds(root, wizard.related());
 
-        LinkedHashSet<String> sourceIds = new LinkedHashSet<>();
-        sourceIds.add(root.sourceId());
-        wizard.related().forEach(related -> sourceIds.add(related.sourceId()));
-        addUnionSources(root.preTransforms(), sourceIds);
-        wizard.related().forEach(related -> addUnionSources(related.preTransforms(), sourceIds));
-        addUnionSources(wizard.transforms(), sourceIds);
-
+        Map<String, String> inputSources = new LinkedHashMap<>();
+        inputSources.put(root.id(), root.sourceId());
         Set<String> currentInputs = new LinkedHashSet<>();
         currentInputs.add(root.sourceId() + "." + root.table());
+        LinkedHashSet<String> unionSources = new LinkedHashSet<>();
+        addUnionSources(root.preTransforms(), unionSources);
         for (PipelineDraft.Related related : wizard.related()) {
-            requiredText(related.sourceId(), "related source");
-            requiredText(related.table(), "related table");
-            currentInputs.add(related.sourceId() + "." + related.table());
+            String sourceId = requiredText(related.sourceId(), "related source");
+            String table = requiredText(related.table(), "related table");
+            inputSources.put(related.id(), sourceId);
+            currentInputs.add(sourceId + "." + table);
+            addUnionSources(related.preTransforms(), unionSources);
         }
+        addUnionSources(wizard.transforms(), unionSources);
+        var bindings = sourceBindings(inputSources, unionSources, wizard.sourceNodeConfigs(), Map.of());
 
         LinkedHashMap<String, FromRef> aliases = new LinkedHashMap<>();
         List<Step> steps = new ArrayList<>();
         Map<String, String> outputAliases = new LinkedHashMap<>();
-        outputAliases.put(root.id(), compileBranch(root.id(), root.sourceId() + "." + root.table(),
+        outputAliases.put(root.id(), compileBranch(root.id(), bindings.get(root.id()).binding() + "." + root.table(),
                 root.preTransforms(), aliases, steps, currentInputs));
 
         Map<String, List<PipelineDraft.Related>> children = new LinkedHashMap<>();
@@ -91,7 +96,7 @@ public final class PipelineDraftCompiler {
             }
             children.computeIfAbsent(related.parentId(), ignored -> new ArrayList<>()).add(related);
             outputAliases.put(related.id(), compileBranch(related.id(),
-                    related.sourceId() + "." + related.table(), related.preTransforms(), aliases, steps,
+                    bindings.get(related.id()).binding() + "." + related.table(), related.preTransforms(), aliases, steps,
                     currentInputs));
         }
 
@@ -122,7 +127,7 @@ public final class PipelineDraftCompiler {
                 || firstText(wizard.output().config(), "table", "destinationTable") == null)
                 ? null : compileWizardOutput(wizard.output(), previous, root.table());
         return new PipelineResource(draft.pipelineId(), metadata(draft),
-                sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(), steps, null, serve, null, Map.of());
+                sourceRefs(bindings, unionSources), steps, null, serve, null, Map.of());
     }
 
     private static ServeBlock compileWizardOutput(PipelineDraft.Output output, String from, String inputTable) {
@@ -254,19 +259,26 @@ public final class PipelineDraftCompiler {
         return "map".equals(transform.type()) && transform.fields().isEmpty();
     }
 
+    private static String shapeName(PipelineDraft.Relation relation) {
+        return relation.shape().name().toLowerCase(java.util.Locale.ROOT);
+    }
+
     private static List<Embed> embedsFor(String parentId, Map<String, List<PipelineDraft.Related>> children) {
         List<Embed> result = new ArrayList<>();
         for (PipelineDraft.Related related : children.getOrDefault(parentId, List.of())) {
             PipelineDraft.Relation relation = related.relation();
-            if (relation.shape() == PipelineDraft.Shape.ARRAY && relation.arrayKey().isEmpty()) {
-                throw new IllegalArgumentException("array relation requires an array key");
+            if (relation.shape().holdsRows() && relation.arrayKey().isEmpty()) {
+                throw new IllegalArgumentException(shapeName(relation) + " relation requires an array key");
             }
-            if (relation.shape() == PipelineDraft.Shape.FLAT && relation.path() != null
+            if (!relation.shape().hasPath() && relation.path() != null
                     && !relation.path().isBlank()) {
-                throw new IllegalArgumentException("flat relation must not have a target path");
+                throw new IllegalArgumentException(shapeName(relation) + " relation must not have a target path");
             }
-            if (relation.shape() != PipelineDraft.Shape.FLAT && (relation.path() == null || relation.path().isBlank())) {
+            if (relation.shape().hasPath() && (relation.path() == null || relation.path().isBlank())) {
                 throw new IllegalArgumentException("object and array relations require a target path");
+            }
+            if (relation.shape() == PipelineDraft.Shape.ROLLUP && relation.rollup() == null) {
+                throw new IllegalArgumentException("rollup relation requires at least one rollup field");
             }
             if (relation.on().isEmpty()) {
                 throw new IllegalArgumentException("relation requires at least one association condition");
@@ -283,17 +295,21 @@ public final class PipelineDraftCompiler {
                 }
             });
             List<String> key = relation.key().isEmpty() ? null : relation.key();
-            List<String> arrayKey = relation.shape() == PipelineDraft.Shape.ARRAY ? relation.arrayKey() : null;
+            List<String> arrayKey = relation.shape().holdsRows() ? relation.arrayKey() : null;
             EmbedAs shape = switch (relation.shape()) {
                 case FLAT -> EmbedAs.FLAT;
                 case OBJECT -> EmbedAs.OBJECT;
                 case ARRAY -> EmbedAs.ARRAY;
+                case ROLLUP -> EmbedAs.ROLLUP;
             };
+            Map<String, RollupField> rollup = relation.rollup() == null ? null
+                    : ROLLUP_READER.rollupFieldsFromTree(relation.rollup(),
+                            "wizard.related[" + related.id() + "].relation");
             result.add(new Embed(related.id(), on,
                     shape,
-                    relation.shape() == PipelineDraft.Shape.FLAT ? null : relation.path(),
-                    key, arrayKey, null, null,
-                    embedsFor(related.id(), children)));
+                    relation.shape().hasPath() ? relation.path() : null,
+                    key, arrayKey, null, relation.tracksKeyChanges() ? Boolean.TRUE : null,
+                    embedsFor(related.id(), children), rollup));
         }
         return result;
     }
@@ -319,6 +335,49 @@ public final class PipelineDraftCompiler {
             default -> throw new IllegalArgumentException("unsupported wizard transform: " + transform.type());
         };
         return Step.inline(transform.id(), from, body, Map.of());
+    }
+
+    private static Map<String, SourceRef> sourceBindings(Map<String, String> nodes, Set<String> otherSources,
+            Map<String, Map<String, Object>> configs, Map<String, String> existingAliases) {
+        if (!nodes.keySet().containsAll(configs.keySet())) {
+            throw new IllegalArgumentException("sourceNodeConfigs must reference input nodes");
+        }
+        Map<String, Long> uses = nodes.values().stream().collect(java.util.stream.Collectors.groupingBy(
+                java.util.function.Function.identity(), java.util.stream.Collectors.counting()));
+        Set<String> occupied = new HashSet<>(otherSources);
+        nodes.forEach((node, source) -> {
+            if (!existingAliases.containsKey(node)
+                    && !requiresSourceAlias(source, uses, otherSources, configs.getOrDefault(node, Map.of()))) {
+                occupied.add(source);
+            }
+        });
+        for (String alias : existingAliases.values()) {
+            if (!occupied.add(alias)) throw new IllegalArgumentException("duplicate source binding: " + alias);
+        }
+        occupied.addAll(nodes.values()); // Generated names avoid all physical Source IDs as well.
+        Map<String, SourceRef> result = new LinkedHashMap<>();
+        nodes.forEach((node, source) -> {
+            String alias = existingAliases.get(node);
+            var config = configs.getOrDefault(node, Map.of());
+            if (alias == null && requiresSourceAlias(source, uses, otherSources, config)) {
+                alias = "input_" + io.tapstate.core.model.canonical.CanonicalHash.ofText(node);
+                while (!occupied.add(alias)) alias += "_";
+            }
+            result.put(node, SourceRef.of(source, null, config, alias));
+        });
+        return result;
+    }
+
+    private static boolean requiresSourceAlias(String source, Map<String, Long> uses, Set<String> otherSources,
+            Map<String, Object> config) {
+        return !config.isEmpty() && (uses.get(source) > 1 || otherSources.contains(source));
+    }
+
+    private static List<SourceRef> sourceRefs(Map<String, SourceRef> bindings, Set<String> otherSources) {
+        Map<String, SourceRef> refs = new LinkedHashMap<>();
+        bindings.values().forEach(ref -> refs.putIfAbsent(ref.binding(), ref));
+        otherSources.forEach(id -> refs.putIfAbsent(id, SourceRef.bare(id)));
+        return List.copyOf(refs.values());
     }
 
     private static void addUnionSources(List<PipelineDraft.Transform> transforms, Set<String> sourceIds) {
@@ -402,16 +461,20 @@ public final class PipelineDraftCompiler {
         if (graph.edges().size() > MAX_GRAPH_EDGES) {
             throw new IllegalArgumentException("graph exceeds the maximum edge count of " + MAX_GRAPH_EDGES);
         }
-        LinkedHashSet<String> sourceIds = new LinkedHashSet<>();
+        Map<String, String> inputSources = new LinkedHashMap<>();
+        Map<String, String> existingAliases = new LinkedHashMap<>();
         Map<String, PipelineDraft.Node> nodes = new LinkedHashMap<>();
         for (PipelineDraft.Node node : graph.nodes()) {
             if (nodes.put(node.id(), node) != null) {
                 throw new IllegalArgumentException("duplicate graph node: " + node.id());
             }
             if ("source".equals(node.type()) && node.sourceId() != null && !node.sourceId().isBlank()) {
-                sourceIds.add(node.sourceId());
+                inputSources.put(node.id(), node.sourceId());
+                String alias = optionalText(node.metadata(), "sourceAlias");
+                if (alias != null) existingAliases.put(node.id(), alias);
             }
         }
+        var bindings = sourceBindings(inputSources, Set.of(), graph.sourceNodeConfigs(), existingAliases);
         Map<String, List<String>> inputs = new LinkedHashMap<>();
         for (PipelineDraft.Edge edge : graph.edges()) {
             if (!nodes.containsKey(edge.source()) || !nodes.containsKey(edge.target())) {
@@ -419,7 +482,7 @@ public final class PipelineDraftCompiler {
             }
             inputs.computeIfAbsent(edge.target(), ignored -> new ArrayList<>()).add(edge.source());
         }
-        List<Step> steps = new ArrayList<>();
+        Map<String, Step.Inline> steps = new LinkedHashMap<>();
         Map<String, List<String>> outputs = new LinkedHashMap<>();
         Set<String> visiting = new HashSet<>();
         ViewBlock view = null;
@@ -429,7 +492,7 @@ public final class PipelineDraftCompiler {
                 if (view != null) {
                     throw new IllegalArgumentException("graph has more than one view node");
                 }
-                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
+                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps, bindings);
                 if (refs.size() != 1) {
                     throw new IllegalArgumentException("view node requires exactly one input: " + node.id());
                 }
@@ -444,12 +507,12 @@ public final class PipelineDraftCompiler {
                 if (serve != null) {
                     throw new IllegalArgumentException("graph has more than one target node");
                 }
-                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
+                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps, bindings);
                 if (refs.isEmpty()) {
                     throw new IllegalArgumentException("target node requires an input: " + node.id());
                 }
                 String targetSource = requiredNodeText(node.sourceId(), "target source", node.id());
-                RenameSpec rename = graphTargetRename(node, nodes, inputs);
+                RenameSpec rename = graphTargetRename(node, nodes, inputs, bindings, steps);
                 Set<String> occupiedIds = new HashSet<>(nodes.keySet());
                 for (PipelineDraft.Node candidate : graph.nodes()) {
                     if ("view".equals(candidate.type())) {
@@ -468,16 +531,16 @@ public final class PipelineDraftCompiler {
                         List.of(new SyncElement(node.id(), targetSource, writeMode(node.config(), node.id()), rename,
                                 null, onFullLoad(node.config(), node.id()))), null, null);
             } else {
-                graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
+                graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps, bindings);
             }
         }
         return new PipelineResource(draft.pipelineId(), metadata(draft),
-                sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(),
-                steps, view, serve, null, Map.of());
+                sourceRefs(bindings, Set.of()),
+                List.copyOf(steps.values()), view, serve, null, Map.of());
     }
 
     private static RenameSpec graphTargetRename(PipelineDraft.Node target, Map<String, PipelineDraft.Node> nodes,
-            Map<String, List<String>> inputs) {
+            Map<String, List<String>> inputs, Map<String, SourceRef> bindings, Map<String, Step.Inline> steps) {
         Map<String, String> tableMappings = graphTargetMappings(target);
         if (!tableMappings.isEmpty()) {
             return new RenameSpec(tableMappings, null, null, null);
@@ -487,7 +550,7 @@ public final class PipelineDraftCompiler {
         }
         Set<String> inputTables = new LinkedHashSet<>();
         for (String input : inputs.getOrDefault(target.id(), List.of())) {
-            collectOutputTables(input, nodes, inputs, new HashSet<>(), inputTables);
+            collectOutputTables(input, nodes, inputs, bindings, steps, new HashSet<>(), inputTables);
         }
         if (inputTables.size() != 1) {
             throw new IllegalArgumentException("target table requires exactly one upstream source table: " + target.id());
@@ -542,7 +605,8 @@ public final class PipelineDraftCompiler {
     }
 
     private static void collectOutputTables(String nodeId, Map<String, PipelineDraft.Node> nodes,
-            Map<String, List<String>> inputs, Set<String> visited, Set<String> tables) {
+            Map<String, List<String>> inputs, Map<String, SourceRef> bindings, Map<String, Step.Inline> steps,
+            Set<String> visited, Set<String> tables) {
         if (!visited.add(nodeId)) {
             return;
         }
@@ -553,83 +617,55 @@ public final class PipelineDraftCompiler {
             }
             return;
         }
-        if ("nest".equals(node.type())) {
-            collectNestRootTable(node, nodes, inputs, visited, tables);
-            return;
-        }
-        if ("join".equals(node.type())) {
-            collectJoinFactTable(node, nodes, inputs, visited, tables);
-            return;
-        }
-        for (String input : inputs.getOrDefault(nodeId, List.of())) {
-            collectOutputTables(input, nodes, inputs, visited, tables);
-        }
-    }
-
-    private static void collectNestRootTable(PipelineDraft.Node nest, Map<String, PipelineDraft.Node> nodes,
-            Map<String, List<String>> inputs, Set<String> visited, Set<String> tables) {
-        Object rootValue = nest.config().get("root");
-        if (!(rootValue instanceof Map<?, ?> root)) {
-            throw new IllegalArgumentException("graph nest requires a root object: " + nest.id());
-        }
-        String rootAlias = mapText(root, "from");
-        Object aliasesValue = nest.config().get("from");
-        if (rootAlias == null || !(aliasesValue instanceof Map<?, ?> aliases)) {
-            throw new IllegalArgumentException("graph nest requires a root from alias: " + nest.id());
-        }
-        String rootRef = mapText(aliases, rootAlias);
-        if (rootRef == null) {
-            throw new IllegalArgumentException("graph nest root alias is not declared: " + nest.id());
-        }
-        for (PipelineDraft.Node candidate : nodes.values()) {
-            if ("source".equals(candidate.type()) && sourceTableSelections(candidate).stream()
-                    .anyMatch(selection -> selection.reference(candidate.sourceId()).equals(rootRef))) {
-                collectOutputTables(candidate.id(), nodes, inputs, visited, tables);
-                return;
+        if ("nest".equals(node.type()) || "join".equals(node.type())) {
+            Step.Inline transform = steps.get(nodeId);
+            if (transform == null) {
+                throw new IllegalArgumentException("graph target requires a connected upstream step: " + nodeId);
             }
-            if (rootRef.equals(candidate.id()) || rootRef.equals(graphStepId(candidate))) {
-                collectOutputTables(candidate.id(), nodes, inputs, visited, tables);
-                return;
-            }
-        }
-        throw new IllegalArgumentException("graph nest root does not resolve to an upstream table: " + rootRef);
-    }
-
-    private static void collectJoinFactTable(PipelineDraft.Node join, Map<String, PipelineDraft.Node> nodes,
-            Map<String, List<String>> inputs, Set<String> visited, Set<String> tables) {
-        Object aliasesValue = join.config().get("from");
-        Object sqlValue = join.config().get("sql");
-        if (!(aliasesValue instanceof Map<?, ?> aliases) || !(sqlValue instanceof String sql)) {
-            throw new IllegalArgumentException("graph join requires source aliases and SQL: " + join.id());
-        }
-        JoinTree.Source fact;
-        try {
-            fact = SqlFrontEnd.factSource(sql);
-        } catch (RuntimeException error) {
-            throw new IllegalArgumentException("graph join fact table cannot be resolved: " + join.id(), error);
-        }
-        String factRef = mapText(aliases, fact.name());
-        if (factRef == null) {
-            throw new IllegalArgumentException("graph join fact alias is not declared: " + fact.name());
-        }
-        for (String inputId : inputs.getOrDefault(join.id(), List.of())) {
-            PipelineDraft.Node input = nodes.get(inputId);
-            if (input == null || !"source".equals(input.type())) {
-                continue;
-            }
-            for (SourceTableSelection selection : sourceTableSelections(input)) {
-                if (selection.reference(input.sourceId()).equals(factRef)) {
-                    tables.add(selection.renameKey());
+            String alias = switch (transform.body()) {
+                case TransformBody.Nest nest -> nest.root().from();
+                case TransformBody.Join join -> graphJoinFactAlias(nodeId, join.sql());
+                default -> throw new IllegalStateException("expected a Nest or Join step: " + node.id());
+            };
+            FromRef ref = ((FromClause.Aliases) transform.from()).aliases().get(alias);
+            List<String> candidates = "join".equals(node.type())
+                    ? inputs.getOrDefault(nodeId, List.of()) : List.copyOf(nodes.keySet());
+            for (String candidateId : candidates) {
+                PipelineDraft.Node candidate = nodes.get(candidateId);
+                SourceRef binding = bindings.get(candidateId);
+                if (binding != null) {
+                    for (SourceTableSelection selection : sourceTableSelections(candidate)) {
+                        if (graphFromRef(selection.reference(binding.binding())).equals(ref)) {
+                            tables.add(selection.renameKey());
+                            return;
+                        }
+                    }
+                } else if ("nest".equals(node.type()) && !candidateId.equals(nodeId)
+                        && (FromRef.literal(candidateId).equals(ref)
+                                || FromRef.literal(graphStepId(candidate)).equals(ref))) {
+                    collectOutputTables(candidateId, nodes, inputs, bindings, steps, visited, tables);
                     return;
                 }
             }
+            throw new IllegalArgumentException("graph " + node.type()
+                    + " output does not resolve to an upstream table: " + ref);
         }
-        throw new IllegalArgumentException("graph join fact table does not resolve to an upstream source: "
-                + factRef);
+        for (String input : inputs.getOrDefault(nodeId, List.of())) {
+            collectOutputTables(input, nodes, inputs, bindings, steps, visited, tables);
+        }
+    }
+
+    private static String graphJoinFactAlias(String nodeId, String sql) {
+        try {
+            return SqlFrontEnd.factSource(sql).name();
+        } catch (RuntimeException error) {
+            throw new IllegalArgumentException("graph join fact table cannot be resolved: " + nodeId, error);
+        }
     }
 
     private static List<String> graphOutputs(String nodeId, Map<String, PipelineDraft.Node> nodes,
-            Map<String, List<String>> inputs, Map<String, List<String>> outputs, Set<String> visiting, List<Step> steps) {
+            Map<String, List<String>> inputs, Map<String, List<String>> outputs, Set<String> visiting, Map<String, Step.Inline> steps,
+            Map<String, SourceRef> bindings) {
         List<String> existing = outputs.get(nodeId);
         if (existing != null) {
             return existing;
@@ -644,14 +680,15 @@ public final class PipelineDraftCompiler {
         PipelineDraft.Node node = nodes.get(nodeId);
         List<String> result;
         if ("source".equals(node.type())) {
-            String sourceId = requiredNodeText(node.sourceId(), "source id", node.id());
+            requiredNodeText(node.sourceId(), "source id", node.id());
+            String sourceId = bindings.get(node.id()).binding();
             result = sourceTableSelections(node).stream()
                     .map(selection -> selection.reference(sourceId))
                     .toList();
         } else {
             List<String> refs = new ArrayList<>();
             for (String input : inputs.getOrDefault(nodeId, List.of())) {
-                refs.addAll(graphOutputs(input, nodes, inputs, outputs, visiting, steps));
+                refs.addAll(graphOutputs(input, nodes, inputs, outputs, visiting, steps, bindings));
             }
             if ("view".equals(node.type()) || "target".equals(node.type())) {
                 result = List.copyOf(refs);
@@ -659,10 +696,11 @@ public final class PipelineDraftCompiler {
                 if (!isGraphTransform(node)) {
                     throw new IllegalArgumentException("unsupported graph node: " + node.type());
                 }
-                FromClause from = graphTransformFrom(node, refs);
+                FromClause from = graphTransformFrom(node, refs, graphInputRenames(
+                        inputs.getOrDefault(node.id(), List.of()), nodes, bindings));
                 TransformBody body = graphTransformBody(node);
                 String stepId = graphStepId(node);
-                steps.add(Step.inline(stepId, from, body, graphTransformExperimental(node)));
+                steps.put(nodeId, Step.inline(stepId, from, body, graphTransformExperimental(node)));
                 result = List.of(stepId);
             }
         }
@@ -683,10 +721,57 @@ public final class PipelineDraftCompiler {
                 ? node.id() : optionalText(node.metadata(), "stepId");
     }
 
-    private static FromClause graphTransformFrom(PipelineDraft.Node node, List<String> graphRefs) {
+    private static Map<String, List<String>> graphInputRenames(List<String> inputIds,
+            Map<String, PipelineDraft.Node> nodes, Map<String, SourceRef> bindings) {
+        if (inputIds.stream().map(bindings::get).noneMatch(ref -> ref != null && ref.alias() != null)) {
+            return Map.of();
+        }
+        Map<String, List<String>> renamed = new LinkedHashMap<>();
+        for (String inputId : inputIds) {
+            SourceRef ref = bindings.get(inputId);
+            if (ref == null) continue;
+            for (var selection : sourceTableSelections(nodes.get(inputId))) {
+                String reference = selection.reference(ref.binding());
+                renamed.computeIfAbsent(selection.reference(ref.id()), ignored -> new ArrayList<>()).add(reference);
+                renamed.computeIfAbsent(selection.unqualifiedReference(), ignored -> new ArrayList<>()).add(reference);
+            }
+        }
+        for (String inputId : inputIds) {
+            SourceRef ref = bindings.get(inputId);
+            if (ref == null || ref.alias() == null) continue;
+            for (var selection : sourceTableSelections(nodes.get(inputId))) {
+                String explicit = selection.reference(ref.binding());
+                renamed.put(explicit, List.of(explicit));
+            }
+        }
+        return renamed;
+    }
+
+    private static FromRef graphInputRef(String value, Map<String, List<String>> inputRenames,
+            Map<String, Integer> occurrences, Map<String, Integer> used) {
+        var candidates = inputRenames.get(value);
+        if (candidates == null || candidates.isEmpty()) return graphFromRef(value);
+        if (candidates.size() == 1) return graphFromRef(candidates.getFirst());
+        var remaining = candidates.stream().filter(candidate -> candidate.equals(value)
+                || !occurrences.containsKey(candidate)).toList();
+        if (occurrences.getOrDefault(value, 1) != remaining.size()) {
+            throw new IllegalArgumentException("graph transform reference matches multiple input nodes: " + value);
+        }
+        return graphFromRef(remaining.get(used.merge(value, 1, Integer::sum) - 1));
+    }
+
+    private static FromClause graphTransformFrom(PipelineDraft.Node node, List<String> graphRefs,
+            Map<String, List<String>> inputRenames) {
         Object configured = node.config().get("from");
         boolean aliasMap = "join".equals(node.type()) || "nest".equals(node.type());
         if (configured != null) {
+            Map<String, Integer> occurrences = new HashMap<>();
+            Map<String, Integer> used = new HashMap<>();
+            if (configured instanceof Map<?, ?> map) {
+                map.values().forEach(value -> { if (value instanceof String ref) occurrences.merge(ref, 1, Integer::sum); });
+            } else if (configured instanceof List<?> list) {
+                list.forEach(value -> { if (value instanceof String ref) occurrences.merge(ref, 1, Integer::sum); });
+            }
             if (aliasMap) {
                 if (!(configured instanceof Map<?, ?> aliases)) {
                     throw new IllegalArgumentException("graph " + node.type()
@@ -699,12 +784,12 @@ public final class PipelineDraftCompiler {
                         throw new IllegalArgumentException("graph transform from aliases must map names to refs: "
                                 + node.id());
                     }
-                    refs.put(alias, graphFromRef(ref));
+                    refs.put(alias, graphInputRef(ref, inputRenames, occurrences, used));
                 }
                 return FromClause.aliases(refs);
             }
             if (configured instanceof String ref && !ref.isBlank()) {
-                return FromClause.list(graphFromRef(ref));
+                return FromClause.list(graphInputRef(ref, inputRenames, occurrences, used));
             }
             if (configured instanceof List<?> values) {
                 List<FromRef> refs = new ArrayList<>();
@@ -713,7 +798,7 @@ public final class PipelineDraftCompiler {
                         throw new IllegalArgumentException("graph transform from must contain non-blank refs: "
                                 + node.id());
                     }
-                    refs.add(graphFromRef(ref));
+                    refs.add(graphInputRef(ref, inputRenames, occurrences, used));
                 }
                 if (!refs.isEmpty()) {
                     return new FromClause.Flow(refs);
@@ -811,6 +896,10 @@ public final class PipelineDraftCompiler {
     }
 
     private record SourceTableSelection(String table, boolean regex) {
+        private String unqualifiedReference() {
+            return regex && !isRegexReference(table) ? "/" + table + "/" : table;
+        }
+
         private String reference(String sourceId) {
             if (!regex) {
                 return sourceId + "." + table;

@@ -15,8 +15,10 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
+import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.bson.Document;
@@ -33,6 +35,8 @@ import java.util.function.BiFunction;
 
 /** One fixed business scope; no claim transition uses another client or an unbound transaction. */
 final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.DeadlineWorkloadClaimStore {
+    private static final System.Logger LOG = System.getLogger(MongoCacheWorkloadClaimStore.class.getName());
+    private static final String CLUSTER_ID = "clusterId";
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
@@ -70,6 +74,10 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return StoreIo.call(() -> operations.call(deadline,active,operation));
     }
 
+    @Override public <T> T withRenewalDeadline(long deadline,Runnable active,java.util.function.Supplier<T> operation) {
+        return StoreIo.call(() -> operations.renew(deadline,active,operation));
+    }
+
     @Override public void awaitQuiescence(long deadline) { StoreIo.run(() -> operations.await(deadline)); }
 
     @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
@@ -89,38 +97,192 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             return store.acquire(key,owner,topologyRevision,ttl);
         });
     }
+    @Override public Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        return acquireValidationExecution(key, owner, topologyRevision, ttl, null);
+    }
+
+    Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
+            long topologyRevision, Duration ttl, java.util.function.Consumer<WorkloadClaim> registerCountOwner) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.VALIDATION || validation == null || validation.closing()) throw claimFenced();
+        java.util.function.Consumer<Optional<WorkloadClaim>> verifyCommitted = registerCountOwner == null ? null : granted -> {
+            if (granted.isEmpty()) requireValidationAuthority();
+            else {
+                requireActive.run();
+                MongoValidationSchema.requireReady(database, false);
+                registerCountOwner.accept(granted.orElseThrow());
+                requireActive.run();
+            }
+        };
+        return transaction(true, null, (store, session) -> {
+            var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)
+                    .find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+            MongoValidationControlStore.requirePreparedClaim(session, database, row, key, scope, validation.subject(), true, true);
+            return store.acquireNewValidationExecution(store.decodeStored(row), owner, topologyRevision, ttl);
+        }, false, verifyCommitted);
+    }
+
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireScope(original);
         var key = pipelineKey(original);
-        return transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl));
+        return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl)));
+    }
+
+    @Override public WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope original, WorkloadClaimFence node,
+            long topologyRevision) {
+        requireScope(original);
+        if (topologyRevision != 1 || !node.owner().nodeId().equals(scope.clusterId())) throw claimFenced();
+        return MongoCachePipelineStateStore.writeTransaction(client, original.pipelineId(), () -> transaction(true, original, (store, session) -> {
+            MongoCachePipelinePreparations.proveNode(session, database, scope, node);
+            return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
+        }));
     }
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
         requireScope(original);
         var key = pipelineKey(original);
+        return operations.pipelineRenewal(key, () -> StoreIo.call(() -> {
+            try {
+                return readPipelineFacts(original, key);
+            } catch (RuntimeException failure) {
+                operations.structures.clear();
+                requireActive.run();
+                throw failure;
+            }
+        }));
+    }
+
+    private Optional<WorkloadClaimReading> readPipelineFacts(PipelineIntentScope original, WorkloadClaimKey key) {
+        if (operations.budget() == null) operations.requireAdmission();
+        requireActive.run();
+        requireValidationAuthority();
+        if (!MongoReadBudget.supportsSnapshotReads(client)) {
+            return readPipelineTransaction(original, key);
+        }
+        var budget = operations.budget();
+        if (budget != null) operations.check();
+        var db = budget == null ? database : budget.database(database);
+        var access = new MongoCachePipelineAccess(client, database, original, null, requireActive);
+        try (var session = client.startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())) {
+            requirePipelineReadingStructure(db, access, budget);
+            var observed = StoreIo.call(() ->
+                    SystemCollections.CACHE_IDENTITY.on(db).aggregate(session, pipelineReadingStages(original, key)).first());
+            MongoCacheBusinessIdentity.requireObservedAdmission(observed, observedRow(observed, "schema"), scope);
+            access.validateState(observedRow(observed, "state"));
+            var claim = observedRow(observed, "claim");
+            access.requirePreparedClaim(session, claim);
+            if (!original.equals(decodeScope(claim, key))) throw claimFenced();
+            var reading = MongoWorkloadClaimStore.observedPipelineReading(claim, observedRow(observed, "node"));
+            requireActive.run();
+            requireValidationAuthority();
+            if (budget != null) operations.check();
+            return Optional.of(reading);
+        } catch (TapstateException failure) {
+            if (failure.code() != IoError.DOCUMENT_TOO_LARGE) throw failure;
+        }
+        return readPipelineTransaction(original, key);
+    }
+
+    private Optional<WorkloadClaimReading> readPipelineTransaction(PipelineIntentScope original, WorkloadClaimKey key) {
         return transaction(false, original, (store, session) -> {
             var retained = storedScope(session, key);
             if (retained != null && !retained.equals(original)) throw claimFenced();
             return store.read(key);
         });
     }
+
+    private List<Document> pipelineReadingStages(PipelineIntentScope original, WorkloadClaimKey key) {
+        var nodeId = new Document(CLUSTER_ID, scope.clusterId())
+                .append("resourceType", WorkloadClaimType.NODE_SESSION.name()).append("resourceId", "$$owner");
+        var nodeFilter = match(new Document("$expr", new Document("$eq", List.of("$_id", nodeId))));
+        var node = new Document("$lookup", new Document("from", SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())
+                .append("let", new Document("owner", new Document("$arrayElemAt", List.of("$claim.ownerNodeId", 0))))
+                .append("pipeline", List.of(nodeFilter, MongoWorkloadClaimStore.leaseRemaining(true)))
+                .append("as", "node"));
+        return List.of(match(new Document("_id", "cluster")),
+                observedLookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business", false),
+                observedLookup(SystemCollections.CACHE_PIPELINE_STATE, "state", original.pipelineId(), false),
+                observedLookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", MongoWorkloadClaimStore.id(key), true),
+                node);
+    }
+
+    private static Document match(Document filter) {
+        return new Document("$match", filter);
+    }
+    private void requirePipelineReadingStructure(MongoDatabase db, MongoCachePipelineAccess access, MongoReadBudget budget) {
+        operations.structures.require(MongoStructureProof.Kind.CLAIMS, () -> requireCollection(db));
+        operations.structures.require(MongoStructureProof.Kind.PIPELINE_STATE, () -> access.verifyStateStructure(budget));
+    }
+
+    private static Document observedLookup(SystemCollections table,String name,Object id,boolean lease){
+        var stages=new java.util.ArrayList<Document>();stages.add(match(new Document("_id",id)));
+        if(lease)stages.add(MongoWorkloadClaimStore.leaseRemaining(true));
+        return new Document("$lookup",new Document("from",table.collectionName()).append("pipeline",stages).append("as",name));
+    }
+    private static Document observedRow(Document observed,String name){
+        if(observed==null)return null;var rows=observed.getList(name,Document.class);return rows.isEmpty()?null:rows.getFirst();
+    }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
+        if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION) return renewClaim(expected, ttl);
+        var previous = MongoCommandObservation.COLLECTIONS.get();
+        var stage = new java.util.concurrent.atomic.AtomicReference<String>();
+        MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+            if (previous != null) previous.accept(command, collection);
+            if (stage.getAndSet(command) == null) LOG.log(System.Logger.Level.DEBUG,
+                    "Pipeline renewal first Mongo command {0}, claim={1}, execution={2}, command={3}",
+                    expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(), command);
+        });
+        try {
+            return operations.pipelineRenewal(expected.key(), () -> renewClaim(expected, ttl));
+        } catch (TapstateException failure) {
+            LOG.log(System.Logger.Level.DEBUG,
+                    "Pipeline renewal last Mongo command {0}, claim={1}, execution={2}, command={3}, result={4}",
+                    expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(), stage.get(), failure.code().code());
+            throw failure;
+        } finally {
+            if (previous == null) MongoCommandObservation.COLLECTIONS.remove();
+            else MongoCommandObservation.COLLECTIONS.set(previous);
+        }
+    }
+
+    private Optional<WorkloadClaim> renewClaim(WorkloadClaim expected, Duration ttl) {
+        var firstMongoError = new java.util.concurrent.atomic.AtomicBoolean();
         return transaction(false, null, (store, session) -> {
-            var renewed = store.renewBeforeReads(expected, ttl);
-            if (renewed.isPresent()) {
-                var retained = storedScope(session, expected.key());
-                if (retained != null) validateState(session, retained);
-            } else validateMutationScope(session, store, expected);
-            return renewed;
+            try {
+                var renewed = store.renewBeforeReads(expected, ttl);
+                if (renewed.isPresent()) {
+                    var retained = expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                            ? decodeScope(renewed.orElseThrow().row(), expected.key()) : storedScope(session, expected.key());
+                    if (retained != null) validateState(session, retained);
+                } else validateMutationScope(session, store, expected);
+                return renewed.map(MongoWorkloadClaimStore.Renewal::claim);
+            } catch (MongoException failure) {
+                if (expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                        && firstMongoError.compareAndSet(false, true)) {
+                    LOG.log(System.Logger.Level.WARNING,
+                            "Pipeline renewal first Mongo error {0}, claim={1}, execution={2}, type={3}, code={4}, labels={5}",
+                            expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(),
+                            failure.getClass().getSimpleName(), failure.getCode(), failure.getErrorLabels());
+                }
+                if (operations.pipelineRenewal() && failure.getCode() == 112
+                        && failure.hasErrorLabel("TransientTransactionError")
+                        && !failure.hasErrorLabel("UnknownTransactionCommitResult")) throw new RenewalWriteConflict();
+                throw failure;
+            }
         }, true);
     }
     @Override public boolean release(WorkloadClaim expected) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, (store, session) -> {
+        java.util.function.Supplier<Boolean> change = () -> transaction(false, (store, session) -> {
             if (knownRetiredPipeline(session, expected.key())) return false;
-            storedScope(session, expected.key());
-            return store.release(expected);
+            var retained = storedScope(session, expected.key());
+            boolean released = store.release(expected);
+            if (released && retained != null) fenceProgress(session, retained);
+            return released;
         });
+        return expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                ? MongoCachePipelineStateStore.writeTransaction(client, expected.key().resourceId(), change) : change.get();
     }
     private boolean knownRetiredPipeline(ClientSession session, WorkloadClaimKey key) {
         if (key.type() != WorkloadClaimType.PIPELINE_ACTUATION) return false;
@@ -140,10 +302,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision, Set<String> nodeIds) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, (store, session) -> {
+        java.util.function.Supplier<Optional<WorkloadClaim>> change = () -> transaction(false, (store, session) -> {
             validateMutationScope(session, store, expected);
-            return store.advanceExecution(expected, topologyRevision, nodeIds);
+            var advanced = store.advanceExecution(expected, topologyRevision, nodeIds);
+            if (advanced.isPresent() && expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION)
+                fenceProgress(session, storedScope(session, expected.key()));
+            return advanced;
         });
+        return expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                ? MongoCachePipelineStateStore.writeTransaction(client, expected.key().resourceId(), change) : change.get();
     }
     @Override public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
@@ -194,6 +361,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         }
     }
 
+    private void fenceProgress(ClientSession session, PipelineIntentScope retained) {
+        var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
+        access.updateState(session, access.state(session), new Document(), false);
+    }
+
     private void validateState(ClientSession session, PipelineIntentScope retained) {
         var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
         access.verifyStateStructure(operations.budget()); access.state(session);
@@ -225,7 +397,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         try {
             if (!(row.get("pipelineScope") instanceof Document value) || !(value.get("bindingVersion") instanceof Long binding)
                     || !(value.get("stateGeneration") instanceof Long generation)) throw unreadableScope();
-            var decoded = new PipelineIntentScope(value.getString("clusterId"), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
+            var decoded = new PipelineIntentScope(value.getString(CLUSTER_ID), binding, value.getString("cacheIncarnation"), value.getString("pipelineId"), generation);
             if (!value.equals(scopeDocument(decoded)) || !key.resourceId().equals(decoded.pipelineId()) || !key.clusterId().equals(decoded.clusterId())
                     || !scope.equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadableScope();
             if (MongoCachePipelinePreparations.phase(row, decoded) != io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED) throw claimFenced();
@@ -234,7 +406,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
 
     private static Document scopeDocument(PipelineIntentScope value) {
-        return new Document("clusterId", value.clusterId()).append("bindingVersion", value.bindingVersion())
+        return new Document(CLUSTER_ID, value.clusterId()).append("bindingVersion", value.bindingVersion())
                 .append("cacheIncarnation", value.cacheIncarnation()).append("pipelineId", value.pipelineId()).append("stateGeneration", value.stateGeneration());
     }
     private static WorkloadClaimKey pipelineKey(PipelineIntentScope value) { return new WorkloadClaimKey(value.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, value.pipelineId()); }
@@ -251,25 +423,40 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     private <T> T transaction(boolean admission, PipelineIntentScope pipeline,
             BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation, boolean renewalFirst) {
+        return transaction(admission, pipeline, operation, renewalFirst, null);
+    }
+
+    private <T> T transaction(boolean admission, PipelineIntentScope pipeline,
+            BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation, boolean renewalFirst,
+            java.util.function.Consumer<T> verifyCommitted) {
         return StoreIo.call(() -> {
             try {
                 if(operations.budget()==null)operations.requireAdmission();
                 requireActive.run();
                 requireValidationAuthority();
                 var budget = operations.budget();
-                if (budget != null) return boundedTransaction(admission,pipeline,operation,renewalFirst,budget);
+                if (budget != null) {
+                    var result = boundedTransaction(admission,pipeline,operation,renewalFirst,budget);
+                    if (verifyCommitted != null) verifyCommitted.accept(result);
+                    return result;
+                }
                 for (int attempt = 0; ; attempt++) {
+                    T committed;
                     try (var session = client.startSession()) {
-                        var committed = session.withTransaction(() -> attempt(session,admission,pipeline,operation,renewalFirst,null), TRANSACTION);
-                        requireValidationAuthority();
-                        return committed;
+                        committed = session.withTransaction(() -> attempt(session,admission,pipeline,operation,renewalFirst,null), TRANSACTION);
                     } catch (MongoException conflict) {
                         // A duplicate-key error aborts its transaction; retry the original callback,
                         // never keep using that session or adopt another scope.
                         if (attempt >= 2 || ErrorCategory.fromErrorCode(conflict.getCode()) != ErrorCategory.DUPLICATE_KEY) throw conflict;
+                        continue;
                     }
+                    // CONFIG registration verifies the exact committed owner without replaying a CACHE write on failure.
+                    if (verifyCommitted == null) requireValidationAuthority();
+                    else verifyCommitted.accept(committed);
+                    return committed;
                 }
             } catch (RuntimeException failed) {
+                operations.structures.clear();
                 // A known closed/revoked owner is diagnosed before a driver's closed-client failure.
                 requireActive.run();
                 throw failed;
@@ -285,12 +472,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         if (!renewalFirst) {
             if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
         }
-        requireCollection(budget==null?database:budget.database(database));
+        // Admission may insert the first row, so a missing namespace must never be recreated implicitly.
+        if(admission)requireCollection(budget==null?database:budget.database(database));
+        else operations.structures.require(MongoStructureProof.Kind.CLAIMS,
+                ()->requireCollection(budget==null?database:budget.database(database)));
         var store = raw.inStrictSession(session);
         if (pipeline != null) {
             var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
-            access.verifyStateStructure(budget);
-            var current = access.state(session);
+            operations.structures.require(MongoStructureProof.Kind.PIPELINE_STATE,()->access.verifyStateStructure(budget));
+            var current = access.state(session,true);
             // A real per-Pipeline write serializes admission with controlled state replacement.
             if (admission) access.updateState(session, current, new Document(), false);
         }
@@ -358,6 +548,17 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                         if(safe!=failed)failed.addSuppressed(safe);
                     }
                 }
+                if (failed instanceof RenewalWriteConflict) {
+                    throw new WorkloadClaimRenewalException(owned.released()
+                            ? WorkloadClaimRenewalException.Reason.WRITE_CONFLICT
+                            : WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                            "Mongo Pipeline renewal WriteConflict code=112");
+                }
+                if (operations.pipelineRenewal() && failed instanceof MongoException mongo
+                        && mongo.hasErrorLabel("UnknownTransactionCommitResult")) {
+                    throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                            "Mongo Pipeline renewal UnknownTransactionCommitResult");
+                }
                 if(!committedAck && owned.released() && retryCommit) {budget.remainingMillis();continue;}
                 if(!committedAck && owned.released() && failed instanceof MongoException mongo
                         && !mongo.hasErrorLabel("UnknownTransactionCommitResult")
@@ -377,6 +578,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     private static final class UnresolvedTransaction extends RuntimeException {
         private final Throwable original;
         private UnresolvedTransaction(Throwable original){super(null,null,false,false);this.original=original;}
+    }
+
+    /** Ends the callback after abort instead of asking the driver to immediately replay it. */
+    private static final class RenewalWriteConflict extends RuntimeException {
+        private RenewalWriteConflict() { super(null, null, false, false); }
     }
 
     private void requireScope(PipelineIntentScope original) {

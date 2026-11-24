@@ -16,6 +16,11 @@ public interface DeadlineWorkloadClaimStore extends WorkloadClaimStore {
     /** Rechecks the original thread-safe admission guard before work and commit, including retries. */
     <T> T withDeadline(long deadlineNanos,Runnable requireActive,Supplier<T> operation);
 
+    /** Scoped Pipeline renewal can use a separate execution lane. */
+    default <T> T withRenewalDeadline(long deadlineNanos, Runnable requireActive, Supplier<T> operation) {
+        return withDeadline(deadlineNanos, requireActive, operation);
+    }
+
     /** Waits for those actual owners, retrying only cleanup, under the same shutdown deadline. */
     void awaitQuiescence(long deadlineNanos);
 }

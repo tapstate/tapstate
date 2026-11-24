@@ -97,11 +97,16 @@ public final class StartCheckEvaluator {
      */
     public StartEvaluation evaluate(String pipelineId, PipelineResource definition, String contentHash,
             Optional<DesiredState> prior, StartIntent intent) {
+        return evaluate(pipelineId, definition, contentHash, prior, intent, Optional.empty());
+    }
+
+    StartEvaluation evaluate(String pipelineId, PipelineResource definition, String contentHash,
+            Optional<DesiredState> prior, StartIntent intent, Optional<io.tapstate.spi.store.DesiredStore.StartIntent> original) {
         Instant started = clock.instant();
         StartPlan plan = null;
         TapstateException planUnavailable = null;
         try {
-            plan = planner.plan(definition, prior, intent);
+            plan = planner.plan(definition, prior, intent, original);
         } catch (TapstateException coded) {
             planUnavailable = coded;
         }
@@ -196,10 +201,10 @@ public final class StartCheckEvaluator {
         return new StartCheckReport.Finding(finding.key(), finding.check(),
                 new StartCheckReport.Subject(subject.kind(), subject.id(), subject.element(), subject.label()),
                 finding.behavior(), finding.evaluation(), finding.code().code(), finding.params(),
-                messages.render(finding.code(), finding.params()),
+                messages.renderText(finding.code(), finding.params()),
                 finding.actions().stream()
                         .map(action -> new StartCheckReport.Action(action.id(), action.kind(), action.destructive(),
-                                action.code().code(), messages.render(action.code(), action.params()),
+                                action.code().code(), messages.renderText(action.code(), action.params()),
                                 action.changes()))
                         .toList());
     }

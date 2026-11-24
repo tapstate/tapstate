@@ -1,5 +1,7 @@
 package io.tapstate.cli;
 
+import java.util.Map;
+
 /**
  * The outcome of a remote {@code POST /api/connections:test}. Either the server ran the test and returned
  * its structured report (whatever the connector concluded, pass or fail), the request was refused with a
@@ -14,7 +16,11 @@ sealed interface ConnectionTestOutcome {
     }
 
     /** The server refused the request with a coded reason already rendered to a message. */
-    record Rejected(String code, String message) implements ConnectionTestOutcome {
+    record Rejected(String code, String message, Map<String, Object> params,
+            Map<String, Object> diagnostic) implements ConnectionTestOutcome {
+        Rejected(String code, String message) {
+            this(code, message, Map.of(), Map.of());
+        }
     }
 
     /** The server could not be reached (connection refused, connect timeout, or a malformed target). */

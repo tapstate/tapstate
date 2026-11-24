@@ -5,7 +5,6 @@ import com.mongodb.client.*;
 import com.mongodb.event.*;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.model.*;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -165,7 +164,122 @@ class MongoCapturePreparationsIT {
         });
     }
 
-    @ParameterizedTest @ValueSource(strings = {"source", "preparation", "physical", "missing-current", "missing-notes"})
+    @Test
+    void aVersionedCaptureGrantRequiresTheExactPreparedRevisionAndRetainsItsArtifact() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var original = f.issue(f.request).preparation();
+            var scope = f.request.pipeline();
+            var store = f.configuration.intents();
+            var start = store.load(scope.pipelineId()).orElseThrow();
+            assertThat(store.compareAndSetExplicitStart(scope, start.intentRevision(), start.desired())).isTrue();
+            var restart = store.load(scope.pipelineId()).orElseThrow();
+            String hash = "b".repeat(64);
+            String chain = io.tapstate.core.model.canonical.SourceCaptureIdentity.versionedSharedChain(
+                    original.canonicalChainId(), hash,
+                    scope.pipelineId() + ":" + scope.stateGeneration() + ":" + restart.intentRevision());
+            String captureId = io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain);
+            var owner = new RequiredNoteOwner(scope.bindingVersion(), "pdk.chain." + chain,
+                    RequiredNoteOwner.Kind.CHAIN, chain, 0);
+            var candidate = new ConnectorRunBindings.Binding("input", PipelineNode.Purpose.CAPTURE, "mysql", "2.0",
+                    hash, new RequiredNoteScope(owner, 1), captureId, chain);
+
+            var request = new CapturePreparationRequest(scope, f.request.originalPipeline(), f.request.originalNode(),
+                    f.request.sourceId(), f.request.inputs(),
+                    new CapturePreparationRequest.SharedArtifact(hash, restart.intentRevision()));
+            var captures = f.configuration.capturePreparations();
+            assertCode(() -> captures.issueFirstCreate(request), IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.controls().countDocuments()).isEqualTo(1);
+            assertThat(captures.read(f.scope, captureId)).isEmpty();
+
+            var bindings = store.connectorBindings();
+            bindings.prepare(restart, List.of(candidate));
+            var versioned = f.issue(request).preparation();
+            assertThat(versioned.canonicalChainId()).isEqualTo(chain);
+            assertThat(versioned.captureId()).isEqualTo(captureId);
+            assertThat(f.controls().find(new Document("artifactHash", hash)).first()).isNotNull();
+            assertThat(captures.read(f.scope, original.captureId())).contains(original);
+            assertThat(f.issue(request).preparation()).isEqualTo(versioned);
+            assertThat(f.controls().countDocuments()).isEqualTo(2);
+
+            assertCode(() -> bindings.publish(restart), IoError.NOTE_SCOPE_UNAVAILABLE);
+            var notes = f.configuration.requiredNotes();
+            var required = new RequiredNoteOrigin("mysql", hash, new byte[]{3});
+            assertThat(notes.prepareOrigin(candidate.notes(), required)).isEqualTo(required);
+            notes.markLocalArtifactReady(candidate.notes(), required);
+            bindings.publish(restart);
+            bindings.complete(scope, restart.intentRevision());
+            assertThat(captures.issueFirstCreate(request)).isEqualTo(new CaptureCreationResult.AlreadyIssued(versioned));
+
+            var inputs = request.inputs();
+            String sourceHash = inputs.sourceHashes().get("input");
+            assertThat(captures.inspectSharedHistory(versioned, "input", sourceHash, scope.pipelineId(), inputs.pipelineHash()))
+                    .isEqualTo(new CaptureSharedHistory(versioned, false));
+            var previousCache = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), "previous-cache");
+            var previous = new CapturePreparation(previousCache, versioned.mode(), versioned.chainId(),
+                    versioned.captureId(), versioned.sourceIdentityHash(), UUID.randomUUID().toString());
+            var historyRow = MongoCapturePreparationFacts.withArtifact(MongoCapturePreparationFacts.row(previous), hash);
+            f.controls().insertOne(historyRow);
+            assertThat(captures.inspectSharedHistory(versioned, "input", sourceHash, scope.pipelineId(), inputs.pipelineHash()))
+                    .isEqualTo(new CaptureSharedHistory(versioned, true));
+            var historyKey = new Document("_id", historyRow.get("_id"));
+            f.controls().updateOne(historyKey, new Document("$set", new Document("artifactHash", "c".repeat(64))));
+            assertCode(() -> captures.inspectSharedHistory(versioned, "input", sourceHash,
+                    scope.pipelineId(), inputs.pipelineHash()), IoError.PIPELINE_INTENT_FENCED);
+
+            try (var reopened = MongoConfigurationDomain.open(f.settings, scope.clusterId())) {
+                assertThat(reopened.capturePreparations().read(f.scope, captureId)).contains(versioned);
+                assertThat(reopened.intents().connectorBindings().load(scope).orElseThrow().effective())
+                        .containsExactly(candidate);
+            }
+        });
+    }
+
+    @Test
+    void sharedNoteLookupsRespectPipelineNodeSettingsAndTheCurrentArtifactHash() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var inherited = f.issue(f.request).preparation();
+            var request = f.pipeline("overridden", CapturePreparation.Mode.SHARED_SRS, Set.of("orders"),
+                    Map.of("preImage", false));
+            var isolated = f.issue(request).preparation();
+            var source = (SourceResource) f.configuration.artifacts().get("input").orElseThrow();
+            var pipeline = (PipelineResource) f.configuration.artifacts().get("overridden").orElseThrow();
+            String sourceHash = CanonicalHash.of(source);
+            String pipelineHash = CanonicalHash.of(pipeline);
+            assertThat(isolated.canonicalChainId()).isNotEqualTo(inherited.canonicalChainId());
+
+            var notes = f.configuration.requiredNotes();
+            var owner = new RequiredNoteOwner(f.scope.bindingVersion(), "pdk.chain." + isolated.chainId(),
+                    RequiredNoteOwner.Kind.CHAIN, isolated.chainId(), 0);
+            var origin = new RequiredNoteOrigin(source.connector(), sourceHash, new byte[]{3});
+            notes.prepareOrigin(notes.open(owner), origin);
+            var captures = f.configuration.capturePreparations();
+            assertThat(captures.inspectSharedOrigin(f.scope, source.id(), sourceHash)).isEmpty();
+            assertThat(captures.inspectSharedOrigin(f.scope, source.id(), sourceHash, pipeline.id(), pipelineHash))
+                    .contains(origin);
+            assertThat(captures.inspectSharedHistory(isolated, source.id(), sourceHash, pipeline.id(), pipelineHash))
+                    .isEqualTo(new CaptureSharedHistory(isolated, false));
+            assertCode(() -> captures.inspectSharedHistory(isolated, source.id(), sourceHash),
+                    IoError.PIPELINE_INTENT_FENCED);
+            String stale = "f".repeat(64);
+            assertCode(() -> captures.inspectSharedOrigin(f.scope, source.id(), sourceHash, pipeline.id(), stale),
+                    IoError.PIPELINE_INTENT_FENCED);
+            assertCode(() -> captures.inspectSharedOrigin(f.scope, source.id(), sourceHash, null, pipelineHash),
+                    IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.controls().countDocuments()).isEqualTo(2);
+        });
+    }
+
+    @Test
+    void sharedHistoryInspectionRejectsAConflictingPriorPhysicalIdentity() {
+        sharedHistoryInspectionRefusesConflictingOrIncompleteFactsWithoutRepair("physical");
+    }
+
+    @Test
+    void sharedHistoryInspectionRejectsMissingNoteScope() {
+        sharedHistoryInspectionRefusesConflictingOrIncompleteFactsWithoutRepair("missing-notes");
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"source", "preparation", "missing-current"})
     void sharedHistoryInspectionRefusesConflictingOrIncompleteFactsWithoutRepair(String damage) {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var original = f.issue(f.request).preparation();
@@ -314,6 +428,20 @@ class MongoCapturePreparationsIT {
             SystemCollections.SRS_CHAINS.on(f.cache).deleteMany(new Document());var before=f.snapshot();
             assertCode(() -> f.preparations().load(original),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
             assertCode(() -> f.domain.srs(f.scope,ACTIVE).chains().prepare(original.chainId(),null,WorkloadClaimFence.from(claim)),IoError.SRS_CHECKPOINT_UNPROVEN);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void firstCaptureRejectsAnOrphanedSrsModelBeforeCreatingClaimOrChain() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var grant = f.issue(f.request);
+            var original = grant.preparation();
+            SystemCollections.SRS_MODELS.on(f.cache).insertOne(
+                    new Document("_id", new Document("chain", original.chainId()).append("fixture", "orphan")));
+            var before = f.snapshot();
+            assertCode(() -> f.preparations().createFirst(grant), IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertThat(f.captureRows()).isEmpty();
+            assertThat(SystemCollections.SRS_CHAINS.on(f.cache).countDocuments()).isZero();
             assertThat(f.snapshot()).isEqualTo(before);
         });
     }
@@ -495,8 +623,15 @@ class MongoCapturePreparationsIT {
     private record Fixture(MongoConfigurationDomain configuration,MongoDatabase config,MongoClient cacheAdmin,MongoDatabase cache,MongoCacheDomain domain,MongoConnectionSettings settings,
             StorageBinding.Connection connection,CacheBusinessScope scope,WorkloadClaimFence node,CapturePreparationRequest request) {
         CapturePreparationRequest pipeline(String id,CapturePreparation.Mode mode,Set<String> tables) {
-            String readMode=mode==CapturePreparation.Mode.SNAPSHOT_ONLY?"snapshot_only":"snapshot_and_cdc";
-            var pipeline=(PipelineResource)new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: "+id+"\nsource: [{id: input, srs: "+(mode!=CapturePreparation.Mode.DIRECT)+"}]\nsettings: {read_mode: "+readMode+"}\n");
+            return pipeline(id, mode, tables, Map.of());
+        }
+        CapturePreparationRequest pipeline(String id,CapturePreparation.Mode mode,Set<String> tables,
+                Map<String, Object> nodeConfig) {
+            ReadMode readMode = mode == CapturePreparation.Mode.SNAPSHOT_ONLY
+                    ? ReadMode.SNAPSHOT_ONLY : ReadMode.SNAPSHOT_AND_CDC;
+            var pipeline = new PipelineResource(id, null,
+                    List.of(SourceRef.of("input", mode != CapturePreparation.Mode.DIRECT, nodeConfig)),
+                    null, null, null, new Settings(null, null, null, null, readMode, null), null);
             configuration.artifacts().create(pipeline);var original=new PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),id,1);
             configuration.intents().compareAndSet(original,0,new DesiredState(id,PipelineState.RUNNING,CanonicalHash.of(pipeline),false));
             var source=(SourceResource)configuration.artifacts().get("input").orElseThrow();var inputs=PipelinePreparationInputs.of(original,pipeline,Map.of("input",source),Map.of("input",tables));

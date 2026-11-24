@@ -23,9 +23,22 @@ public final class DataBrowserTargetProbe implements TargetProbe {
 
     @Override
     public TargetRows rows(String connection, String table) {
+        return rows(() -> browser.find(connection, table, null, null, 1), () -> browser.stats(connection, table));
+    }
+
+    @Override public java.util.function.Function<io.tapstate.core.model.SourceResource, Runnable> resolvedSourceTracking() {
+        return browser.resolvedSourceTracking();
+    }
+
+    @Override public TargetRows rows(io.tapstate.core.model.SourceResource source, String table) {
+        return rows(() -> browser.firstRow(source, table), () -> browser.stats(source, table));
+    }
+
+    private TargetRows rows(java.util.function.Supplier<DataBrowserPreviewReport> preview,
+            java.util.function.Supplier<DataBrowserStatsReport> stats) {
         DataBrowserPreviewReport first;
         try {
-            first = browser.find(connection, table, null, null, 1);
+            first = preview.get();
         } catch (TapstateException refused) {
             if (refused.code() == DataBrowserError.UNKNOWN_COLLECTION) {
                 return TargetRows.EMPTY;
@@ -38,7 +51,7 @@ public final class DataBrowserTargetProbe implements TargetProbe {
         Long count = first.approximateTotal();
         if (count == null || count < 1) {
             try {
-                count = browser.stats(connection, table).numOfRows();
+                count = stats.get().numOfRows();
             } catch (TapstateException unknown) {
                 count = null;
             }

@@ -25,8 +25,10 @@ import java.util.function.Function;
 
 /** One current owner-bound provider setting over the original CONFIG client and persistent key. */
 final class MongoConfigurationAiProviderSettingsStore implements AiProviderSettingsStore {
+    static final String MANAGED = "managedSelected";
+    private static final String FORMAT_VERSION = "formatVersion";
     private static final int MAX_BYTES = 256 * 1024;
-    private static final Set<String> FIELDS = Set.of("_id", "formatVersion", "owner", "providerId", "baseUrl", "model", "secret");
+    private static final Set<String> FIELDS = Set.of("_id", FORMAT_VERSION, "owner", "providerId", "baseUrl", "model", "secret");
     private static final TransactionOptions TX = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
@@ -55,10 +57,11 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         if (settings.apiKey() == null || settings.apiKey().isBlank() || settings.apiKey().length() > 8192
                 || settings.apiKey().chars().anyMatch(value -> value < 32 || value == 127)) throw invalid("apiKey");
         var cipher = keys.currentForWrite();
-        var captured = new Document("_id", MongoAiProviderSettingsStore.id(owner)).append("formatVersion", 1)
+        var captured = new Document("_id", MongoAiProviderSettingsStore.id(owner)).append(FORMAT_VERSION, 1)
                 .append("owner", owner).append("providerId", settings.providerId()).append("baseUrl", settings.baseUrl())
                 .append("model", settings.model()).append("secret", cipher.providerSecrets().encrypt(owner,
                         context(settings.providerId(), settings.baseUrl(), settings.model()), settings.apiKey()));
+        if (settings.managedSelected()) captured.append(MANAGED, true);
         size(captured);
         transaction(session -> {
             var previous = original(session, owner, cipher);
@@ -70,6 +73,25 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
                 throw new IllegalStateException("provider setting disappeared inside its CONFIG transaction");
             return null;
         });
+    }
+
+    @Override public boolean selectManaged(String owner, boolean selected) {
+        requireOwner(owner);
+        return transaction(session -> {
+            var cipher = keys.currentForWrite();
+            var previous = original(session, owner, cipher);
+            if (previous.isEmpty()) return false;
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
+            if (!keys.fenceWrite(new SourceConfigWriteScope(session), cipher.activeKeyId())) throw invalid("key");
+            return SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(database).updateOne(session,
+                    new Document("_id", MongoAiProviderSettingsStore.id(owner)), selectionUpdate(selected))
+                    .getMatchedCount() == 1;
+        });
+    }
+
+    static Document selectionUpdate(boolean selected) {
+        return selected ? new Document("$set", new Document(MANAGED, true))
+                : new Document("$unset", new Document(MANAGED, ""));
     }
 
     @Override public void delete(String owner) {
@@ -122,18 +144,24 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
 
     private Settings decode(Document row, String owner, SourceConfigCipher cipher) {
         try {
-            if (!row.keySet().equals(FIELDS) || !Integer.valueOf(1).equals(row.get("formatVersion"))
+            var required = new java.util.HashSet<>(row.keySet());
+            required.remove(MANAGED);
+            if (!required.equals(FIELDS) || row.containsKey(MANAGED) && !Boolean.TRUE.equals(row.get(MANAGED))
+                    || !Integer.valueOf(1).equals(row.get(FORMAT_VERSION))
                     || !owner.equals(row.get("owner")) || !MongoAiProviderSettingsStore.id(owner).equals(row.get("_id"))) throw invalid("owner");
             size(row);
             String provider = row.getString("providerId"), endpoint = row.getString("baseUrl"), model = row.getString("model");
             fields(provider, endpoint, model);
             String key = cipher.providerSecrets().decrypt(owner, context(provider, endpoint, model), row.getString("secret"));
             if (key.isBlank() || key.length() > 8192 || key.chars().anyMatch(value -> value < 32 || value == 127)) throw invalid("secret");
-            return new Settings(provider, endpoint, model, key);
+            return new Settings(provider, endpoint, model, key, Boolean.TRUE.equals(row.get(MANAGED)));
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw invalid("record"); }
     }
 
     private void requireOwner(String owner) {
+        if (ON_PREM_OWNER.equals(owner)) {
+            return;
+        }
         try {
             if (owner == null || owner.getBytes(StandardCharsets.UTF_8).length > 4096
                     || !(JsonReader.parse(owner) instanceof List<?> values) || values.size() != 3
@@ -142,7 +170,7 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw invalid("owner"); }
     }
     private static void fields(String provider, String endpoint, String model) {
-        if (!"openai-compatible".equals(provider) || endpoint == null || endpoint.isBlank()
+        if (!io.tapstate.spi.store.AiProviderSettingsStore.supportsProvider(provider) || endpoint == null || endpoint.isBlank()
                 || endpoint.getBytes(StandardCharsets.UTF_8).length > 4096 || model == null || model.isBlank() || model.length() > 200)
             throw invalid("settings");
     }

@@ -13,6 +13,20 @@ import java.util.Optional;
  */
 public interface ConnectionTestResultStore {
 
+    @FunctionalInterface
+    interface Publication {
+        /** Finishes this probe and returns the report from this execution. */
+        ConnectionTestResult publish(ConnectionTestResult result);
+    }
+
+    /** Captures the ordinary result's publication boundary before starting the probe. */
+    default Publication beginOrdinaryTest(String connectionId) {
+        return result -> {
+            save(result);
+            return result;
+        };
+    }
+
     /** Upserts the latest test result for its connection id; latest-only, a re-test overwrites. */
     void save(ConnectionTestResult result);
 
@@ -22,6 +36,11 @@ public interface ConnectionTestResultStore {
     /** Publishes only the still-current CHECKING attempt. Late success must be rejected at the write. */
     default boolean finishDefaultAttempt(DefaultSourceTestAttempt terminal, boolean controlledTimeout) {
         throw new UnsupportedOperationException("default Source attempts unsupported");
+    }
+
+    /** Returns the exact report published by this attempt, if its terminal write won. */
+    default Optional<ConnectionTestResult> publishDefaultReport(DefaultSourceTestAttempt terminal, boolean controlledTimeout) {
+        return finishDefaultAttempt(terminal, controlledTimeout) ? Optional.of(terminal.report()) : Optional.empty();
     }
 
     /** Reads diagnostics only; an absent or legacy report cannot authorize a new attempt. */

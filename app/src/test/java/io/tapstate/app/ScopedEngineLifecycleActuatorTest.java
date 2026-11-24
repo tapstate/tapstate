@@ -60,6 +60,7 @@ class ScopedEngineLifecycleActuatorTest {
             onDatabasePrepare.run(); ((Runnable)call.getArgument(4)).run(); return null;
         }).when(views).prepareOperatorDatabase(eq(SCOPE),anyString(),any(),anyString(),any());
         when(ownership.proveClaim(eq(SCOPE),any())).thenAnswer(call -> active.get() && held.get().equals(call.getArgument(1)));
+        when(ownership.proveStartClaim(eq(SCOPE),any())).thenAnswer(call -> active.get() && held.get().equals(call.getArgument(1)));
         when(engine.captureRun("p")).thenReturn(Optional.of(previous));
         when(previous.operatorManifest()).thenReturn(manifest(1));
         when(previous.awaitTerminal(any())).thenReturn(true); when(previous.isCarryingAJob()).thenReturn(true);
@@ -127,11 +128,308 @@ class ScopedEngineLifecycleActuatorTest {
         verify(engine).submitRun(eq("p"), any(), anyMap(), any(), any(OperatorRunManifest.class));
     }
 
+    @Test void aWaitingSharedRingKeepsTheDirectRetryOnItsOriginalDeadline() {
+        var time = new java.util.concurrent.atomic.AtomicLong();
+        var retry = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));
+        var fact = new io.tapstate.core.common.FailureFact(new java.io.IOException("source read was interrupted"));
+        var policy = new io.tapstate.core.common.RetryPolicy(true, Duration.ofSeconds(2), Duration.ofSeconds(8));
+        retry.interrupted(fact);
+        time.set(Duration.ofSeconds(3).toNanos());
+        var root = mock(ScopedPipelineCaptureCoordinator.class);
+        when(root.forRun(any(), any(), any())).thenReturn(fixedCapture);
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(1)))).thenReturn(Optional.of(retry));
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(2)))).thenReturn(Optional.of(retry));
+        when(root.streamRetryPolicy()).thenReturn(policy);
+        doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("shared-capture")))
+                .when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, root, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+        assertThat(actor.recoverSource("p", () -> true)).contains(new LifecycleActuator.SourceRecovery(null));
+        assertThat(retry.decision(policy)).isEqualTo(new CaptureReadRetry.Pending(fact, Duration.ofSeconds(2)));
+        verify(root).carryDirectRetries(new ExecutionFence(SCOPE, claim(1)), new ExecutionFence(SCOPE, claim(2)));
+        verify(root, never()).clearDirectRetries(SCOPE);
+        verify(engine, never()).submitRun(anyString(), any(DAG.class), anyMap(), any(NestSettings.class),
+                any(OperatorRunManifest.class));
+
+        time.set(Duration.ofSeconds(8).toNanos());
+        assertThat(retry.decision(policy)).isEqualTo(new CaptureReadRetry.Pending(fact, null));
+        assertThat(actor.recoverSource("p", () -> true)).contains(new LifecycleActuator.SourceRecovery(fact));
+        verify(root).clearDirectRetries(SCOPE);
+    }
+
+    @Test void aCancelledPredecessorKeepsTheAttemptedExecutionsRetryAndPartialCapture() {
+        var time = new java.util.concurrent.atomic.AtomicLong();
+        var retry = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));
+        var policy = new io.tapstate.core.common.RetryPolicy(true, Duration.ofSeconds(2), Duration.ofSeconds(8));
+        var failedRead = new io.tapstate.core.common.FailureFact(new java.io.IOException("source interrupted"));
+        retry.interrupted(failedRead);
+        time.set(Duration.ofSeconds(3).toNanos());
+        var unavailable = new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "replacement reader still unavailable"), null);
+        var replacementFailure = new io.tapstate.core.common.FailureFact(unavailable);
+        retry.interrupted(replacementFailure);
+        held.set(claim(2));
+        when(previous.status()).thenReturn(com.hazelcast.jet.core.JobStatus.FAILED);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(previous.failure()).thenReturn(Optional.empty());
+        var root = mock(ScopedPipelineCaptureCoordinator.class);
+        var partialCapture = mock(PipelineCaptureCoordinator.class);
+        var attempted = new ExecutionFence(SCOPE, claim(2));
+        var episodes = new java.util.concurrent.ConcurrentHashMap<ExecutionFence, CaptureReadRetry>();
+        episodes.put(attempted, retry);
+        when(root.forRun(any(), any(), any())).thenAnswer(call ->
+                attempted.equals(call.getArgument(2)) ? partialCapture : fixedCapture);
+        when(root.directRetry(any())).thenAnswer(call -> {
+            var episode = episodes.get(call.getArgument(0));
+            return episode != null && episode.waiting() ? Optional.of(episode) : Optional.empty();
+        });
+        when(root.hasDirectRetryFor(any(), any())).thenAnswer(call -> {
+            var episode = episodes.get(call.getArgument(0));
+            return episode != null && episode.waitingFor(call.getArgument(1));
+        });
+        when(root.streamRetryPolicy()).thenReturn(policy);
+        doAnswer(call -> {
+            var episode = episodes.remove(call.getArgument(0));
+            if (episode != null) episodes.put(call.getArgument(1), episode);
+            return null;
+        }).when(root).carryDirectRetries(any(), any());
+        doAnswer(call -> { episodes.clear(); return null; }).when(root).clearDirectRetries(SCOPE);
+        doAnswer(call -> {
+            retry.interrupted(replacementFailure);
+            throw unavailable;
+        }).when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        var nextPass = new PipelineConvergencePass(pass.intent(), held.get(), views, () -> {});
+        when(dags.prepareStart(eq(nextPass), eq("cache"))).thenReturn(preparation);
+        var actor = new ScopedEngineLifecycleActuator(nextPass, engine, dags, root, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+        verify(root).forRun(SCOPE, claim(2), attempted);
+        var state = mock(StateStore.class);
+        when(state.read("p")).thenReturn(Optional.of(new io.tapstate.core.lifecycle.CheckpointDoc("p",
+                io.tapstate.core.lifecycle.StateJson.of(PipelineState.RUNNING), 1,
+                java.time.Instant.parse("2026-11-24T00:00:00Z"))));
+        var converger = new io.tapstate.runtime.scheduler.PipelineConverger(mock(DesiredStore.class), state,
+                actor, Clock.systemUTC());
+
+        time.set(Duration.ofSeconds(4).toNanos());
+        var result = converger.convergeScoped(nextPass.intent(), state, actor,
+                io.tapstate.runtime.scheduler.RebuildAdmission.never(), ignored -> {}, () -> true);
+        assertThat(result.status()).isEqualTo(io.tapstate.runtime.scheduler.ConvergeStatus.RECOVERING);
+        assertThat(held.get()).isEqualTo(claim(2));
+        assertThat(retry.decision(policy)).isEqualTo(new CaptureReadRetry.Pending(replacementFailure, Duration.ofSeconds(1)));
+        verify(ownership, never()).beginExecution(eq(SCOPE), any());
+
+        time.set(Duration.ofSeconds(5).toNanos());
+        assertThat(actor.recoverSource("p", () -> true)).contains(new LifecycleActuator.SourceRecovery(null));
+        var order = inOrder(partialCapture, ownership);
+        order.verify(partialCapture).stopCapture("p", false);
+        order.verify(ownership).beginExecution(SCOPE, claim(2));
+        verify(root).carryDirectRetries(attempted, new ExecutionFence(SCOPE, claim(3)));
+        assertThat(episodes.get(new ExecutionFence(SCOPE, claim(3)))).isSameAs(retry);
+        verify(previous, never()).cancel();
+        verify(root, never()).clearDirectRetries(SCOPE);
+
+        time.set(Duration.ofSeconds(8).toNanos());
+        assertThat(actor.recoverSource("p", () -> true)).contains(new LifecycleActuator.SourceRecovery(replacementFailure));
+        assertThat(episodes).isEmpty();
+    }
+
+    @Test void aPendingRetryCannotDiscardALivePredecessorBeforeRetirement() {
+        held.set(claim(2));
+        when(previous.status()).thenReturn(com.hazelcast.jet.core.JobStatus.RUNNING);
+        var root = mock(ScopedPipelineCaptureCoordinator.class);
+        when(root.forRun(any(), any(), any())).thenReturn(fixedCapture);
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(2)))).thenReturn(Optional.of(new CaptureReadRetry()));
+        var nextPass = new PipelineConvergencePass(pass.intent(), held.get(), views, () -> {});
+        var actor = new ScopedEngineLifecycleActuator(nextPass, engine, dags, root, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+        verify(root).forRun(SCOPE, claim(2), new ExecutionFence(SCOPE, claim(1)));
+        actor.stop("p", false);
+        verify(previous).cancel();
+        verify(previous).awaitTerminal(any());
+    }
+
+    @Test void aCurrentTerminalJobKeepsItsOwnFailureWhileARetryIsPending() {
+        when(previous.status()).thenReturn(com.hazelcast.jet.core.JobStatus.FAILED);
+        var root = mock(ScopedPipelineCaptureCoordinator.class);
+        when(root.forRun(any(), any(), any())).thenReturn(fixedCapture);
+        var failed = new io.tapstate.core.common.FailureFact(new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "current job failed"), null));
+        when(previous.failureFact()).thenReturn(Optional.of(failed));
+        var retry = new CaptureReadRetry();
+        retry.interrupted(failed);
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(1)))).thenReturn(Optional.of(retry));
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, root, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+        assertThat(actor.failureFact("p")).containsSame(failed);
+        verify(root).forRun(SCOPE, claim(1), new ExecutionFence(SCOPE, claim(1)));
+    }
+
+    @Test void aSharedCaptureWaitReleasesItsUnsubmittedHotBindingsAcrossPasses() {
+        var placement = new OperatorPlacement(SCOPE, "cache", OperatorPlacement.Resource.NEST_STATE,
+                "nest", "[]", "state");
+        var capacity = new io.tapstate.runtime.engine.OperatorMapCapacity(placement, 512);
+        var coordinates = mock(OperatorCoordinatePlan.class);
+        when(coordinates.bind(any())).thenAnswer(call -> {
+            ExecutionFence fence = call.getArgument(0);
+            return new OperatorRunManifest("p", fence, List.of(new io.tapstate.runtime.engine.OperatorMapBinding(
+                    placement, fence, fence.operatorExecutionKey())));
+        });
+        when(coordinates.capacities()).thenReturn(List.of(capacity));
+        when(coordinates.nestDatabases()).thenReturn(Map.of());
+        preparation = new DagSource.StartPreparation(preparation.capacity(), preparation.stateLocations(),
+                preparation.artifactSnapshot(), preparation.planner(), preparation.sinkConnectors(), preparation.sourceModels(),
+                Optional.of(coordinates));
+        var member = mock(com.hazelcast.core.HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
+        when(member.getDistributedObjects()).thenReturn(List.of());
+        when(member.getConfig()).thenReturn(new com.hazelcast.config.Config());
+        var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,
+                (binding, active) -> mock(KeyedStateStore.class));
+        var installed = new ArrayList<OperatorRunManifest>();
+        var releasedHot = new ArrayList<OperatorRunManifest>();
+        var originalPorts = ports();
+        var recording = new ScopedEngineLifecycleActuator.Ports((original, capacities, members, guard) -> {
+            guard.run();
+            io.tapstate.runtime.engine.OperatorMapConfigurations.install(member, original, capacities);
+            installed.add(original);
+        }, original -> {
+            original.bindings().forEach(registry::release);
+            releasedHot.add(original);
+        }, originalPorts.rebuild(), originalPorts.plans());
+        doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("shared-owner-retrying")))
+                .when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), recording, submissions).start("p");
+        assertThat(registry.originals(SCOPE)).isEmpty();
+        assertThat(releasedHot).contains(installed.getFirst());
+        assertThat(installed.getFirst().executionIdentity()).isEqualTo(new ExecutionFence(SCOPE, claim(2)));
+
+        when(engine.captureRun("p")).thenReturn(Optional.empty());
+        var restartPass = new PipelineConvergencePass(pass.intent(), held.get(), views, () -> {});
+        when(dags.prepareStart(eq(restartPass), eq("cache"))).thenReturn(preparation);
+        new ScopedEngineLifecycleActuator(restartPass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), recording, submissions).start("p");
+        var stopIntent = new PipelineIntentSnapshot(SCOPE, 2,
+                new DesiredState("p", PipelineState.STOPPED, "hash", false));
+        var stopPass = new PipelineConvergencePass(stopIntent, held.get(), views, () -> {});
+        new ScopedEngineLifecycleActuator(stopPass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), recording, submissions).stop("p", false);
+        assertThat(registry.originals(SCOPE)).isEmpty();
+        assertThat(releasedHot).containsAll(installed);
+        assertThat(installed).hasSize(2);
+        verify(engine, never()).submitRun(anyString(), any(DAG.class), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
+    @Test void anUnreleasedWaitingManifestRemainsAvailableToFailedStartCleanup() {
+        doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("shared-owner-retrying")))
+                .when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        var attempts = new java.util.concurrent.atomic.AtomicInteger();
+        var unavailable = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "hot release interrupted"), null);
+        onRelease = () -> {
+            if (!prepared.isEmpty() && attempts.incrementAndGet() == 1) throw unavailable;
+        };
+        assertThatThrownBy(() -> actuator().start("p")).isSameAs(unavailable);
+        assertThat(attempts).hasValue(2);
+        assertThat(released).containsExactly(manifest(1), manifest(2));
+    }
+
+    @Test void aRefusedRecoveryBeforeReplacementSurfacesTheStartFailure() {
+        var time = new java.util.concurrent.atomic.AtomicLong();
+        var retry = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));
+        var otherSource = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));
+        retry.interrupted(new io.tapstate.core.common.FailureFact(new java.io.IOException("source interrupted")));
+        otherSource.interrupted(new io.tapstate.core.common.FailureFact(new java.io.IOException("another source interrupted")));
+        time.set(Duration.ofSeconds(3).toNanos());
+        var root = mock(ScopedPipelineCaptureCoordinator.class);
+        when(root.forRun(any(), any(), any())).thenReturn(fixedCapture);
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(1))))
+                .thenAnswer(call -> Optional.of(retry.waiting() ? retry : otherSource));
+        when(root.streamRetryPolicy()).thenReturn(new io.tapstate.core.common.RetryPolicy(
+                true, Duration.ofSeconds(2), Duration.ofSeconds(8)));
+        var refused = new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "recovery preparation refused"), null);
+        when(dags.prepareStart(eq(pass), eq("cache"))).thenThrow(refused);
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, root, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+
+        assertThat(actor.recoverSource("p", () -> true)).hasValueSatisfying(result ->
+                assertThat(result.failure()).isNotNull().satisfies(fact -> assertThat(fact.cause()).isSameAs(refused)));
+        verify(root).clearDirectRetries(SCOPE);
+        verify(ownership, never()).beginExecution(eq(SCOPE), any());
+    }
+
+    @Test void aMatchingReplacementFailureKeepsItsPendingRetry() {
+        var time = new java.util.concurrent.atomic.AtomicLong();
+        var retry = new CaptureReadRetry(new io.tapstate.core.common.RetryWindow(time::get));
+        var policy = new io.tapstate.core.common.RetryPolicy(true, Duration.ofSeconds(2), Duration.ofSeconds(8));
+        retry.interrupted(new io.tapstate.core.common.FailureFact(new java.io.IOException("source interrupted")));
+        time.set(Duration.ofSeconds(3).toNanos());
+        var root = mock(ScopedPipelineCaptureCoordinator.class);
+        when(root.forRun(any(), any(), any())).thenReturn(fixedCapture);
+        when(root.directRetry(new ExecutionFence(SCOPE, claim(1)))).thenReturn(Optional.of(retry));
+        when(root.streamRetryPolicy()).thenReturn(policy);
+        var failure = new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "source still unavailable"), null);
+        var fact = new io.tapstate.core.common.FailureFact(failure);
+        doAnswer(call -> {
+            retry.interrupted(fact);
+            throw failure;
+        }).when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        when(root.hasDirectRetryFor(eq(new ExecutionFence(SCOPE, claim(2))), any()))
+                .thenAnswer(call -> retry.waitingFor(call.getArgument(1)));
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, root, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+
+        assertThat(actor.recoverSource("p", () -> true)).contains(new LifecycleActuator.SourceRecovery(null));
+        assertThat(retry.decision(policy)).isEqualTo(new CaptureReadRetry.Pending(fact, Duration.ofSeconds(2)));
+        assertThat(retry.waitingFor(new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "source still unavailable"), null))).isFalse();
+        verify(root, never()).clearDirectRetries(SCOPE);
+    }
+
+    @Test void failedSubmissionKeepsItsDiagnosticReadableAfterInvalidatingActuation() {
+        var failure = new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "submission refused"), null);
+        var fact = io.tapstate.core.common.FailureFact.unavailable(failure);
+        when(fixedCapture.openingFailureFact("p", failure)).thenReturn(fact);
+        when(engine.submitRun(eq("p"), any(DAG.class), anyMap(), any(NestSettings.class), any(OperatorRunManifest.class)))
+                .thenThrow(failure);
+        var actor = actuator();
+        assertThatThrownBy(() -> actor.start("p")).isSameAs(failure);
+        assertThat(actor.actuationFailureFact("p", failure)).isSameAs(fact);
+        assertThatThrownBy(() -> actor.actuationFailureFact("other", failure)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> actor.stop("p", false)).isInstanceOf(TapstateException.class);
+    }
+
     @Test void targetAcknowledgementAloneCannotCompleteAStillRunningOriginalJob() {
         boundedCapture();
         assertThat(actuator().completed("p")).isFalse();
         verify(previous,never()).cancel();
         verify(fixedCapture,never()).stopCapture(anyString(),anyBoolean());
+    }
+
+    @Test void aSuccessfulBoundedJobStillCarriesThePipelineWhileItsReceiptsArrive() {
+        boundedCapture();
+        var actor = actuator();
+        assertThat(actor.completion("p")).isEmpty();
+
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(fixedCapture.loadDelivered("p")).thenReturn(false);
+        assertThat(actor.isCarryingAJob("p")).isTrue();
+        assertThat(actor.completion("p")).isEmpty();
+
+        when(fixedCapture.loadDelivered("p")).thenReturn(true);
+        assertThat(actor.completion("p")).contains(new LifecycleActuator.Completion("71", claim(1)));
+    }
+
+    @Test void aTerminalJobWithNoBoundedCaptureDoesNotCarryThePipeline() {
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(fixedCapture.isCapturing("p")).thenReturn(true);
+
+        assertThat(actuator().isCarryingAJob("p")).isFalse();
     }
 
     private void boundedCapture() {
@@ -280,11 +578,13 @@ class ScopedEngineLifecycleActuatorTest {
         doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("capture"))).when(fixedCapture)
                 .startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
         var currentFailure = new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "p"), null);
-        when(fixedCapture.captureFailure("p")).thenReturn(Optional.of(currentFailure));
+        when(fixedCapture.captureFailureFact("p")).thenReturn(Optional.of(new io.tapstate.core.common.FailureFact(currentFailure, Map.of("message", "current capture"))));
         var actor = actuator();
         actor.start("p");
 
         assertThat(actor.failure("p")).containsSame(currentFailure);
+        assertThat(actor.failureFact("p")).hasValueSatisfying(fact ->
+                assertThat(fact.diagnostic()).containsEntry("message", "current capture"));
         verify(previous, never()).failure();
         verify(engine, never()).submitRun(anyString(), any(), anyMap(), any(), any(OperatorRunManifest.class));
     }

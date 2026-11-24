@@ -22,6 +22,18 @@ class ValidationDirectMappingsTest {
         assertThat(compiled.toString()).doesNotContain("secret","password");
         assertThat(compiled.getFirst().source().config()).containsEntry("password","source-secret");
     }
+    @Test
+    void nativeValidationResolvesQualifiedAliasesOfTheSamePhysicalSource() {
+        var saved = saved("serve: { from: [root_input.orders, child_input.items], sync: [{ id: out, source: target }] }",
+                List.of("orders", "items"), List.of("orders", "items"), false, false,
+                "[{id: input, as: root_input}, {id: input, as: child_input}]");
+
+        var declarations = ValidationDirectMappings.declare(saved);
+        ValidationDirectMappings.requireObservedSourceTable(declarations.getFirst(), "orders");
+        assertThat(ValidationDirectMappings.compile(saved, ValidationDirectMappingsTest::metadata))
+                .extracting(mapping -> mapping.sourceModel().name()).containsExactly("orders", "items");
+    }
+
     @Test void transformationsAreRefusedBeforeAnyIndependentReadIncludingCount() {
         var saved=saved("""
                 transforms:
@@ -91,6 +103,17 @@ class ValidationDirectMappingsTest {
         assertThatThrownBy(()->ValidationDirectMappings.compile(excluded,ValidationDirectMappingsTest::metadata))
                 .isInstanceOf(TapstateException.class).hasMessageContaining("sourceTableScope");
     }
+    @Test void dynamicRenamesMustProveOneToOneScopeWithoutProbing() {
+        var saved = saved("serve: { from: input, sync: [{ id: out, source: target, rename: { case: lower } }] }",
+                List.of("orders"), List.of("orders"), true);
+        var reads = new AtomicInteger();
+        assertThatThrownBy(() -> ValidationDirectMappings.compile(saved, table -> {
+            reads.incrementAndGet();
+            return metadata(table);
+        })).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.args()).containsEntry("rule", "direct.table-scope-unknown"));
+        assertThat(reads).hasValue(0);
+    }
     @Test void aReturnedModelFromAnotherTableCannotSupplyTheSavedMapping() {
         var saved=saved("serve: { from: input.orders, sync: [{ id: out, source: target }] }",
                 List.of("orders"),List.of("orders"),false);
@@ -104,10 +127,15 @@ class ValidationDirectMappingsTest {
         return saved(body,sourceTables,targetTables,regex,false);
     }
     private static ValidationSavedDeclarations saved(String body,List<String> sourceTables,List<String> targetTables,boolean regex,boolean view) {
+        return saved(body, sourceTables, targetTables, regex, view, "[input]");
+    }
+
+    private static ValidationSavedDeclarations saved(String body, List<String> sourceTables,
+            List<String> targetTables, boolean regex, boolean view, String sourceRefs) {
         var input=new SourceResource("input",null,"fixture",Map.of("database","source","password","source-secret"),SourceMode.CDC,
                 regex?List.of(TableRef.regex("ord.*")):List.of(TableRef.literal("orders"),TableRef.literal("items")),null,null);
         var target=new SourceResource("target",null,"fixture",Map.of("database","target","password","target-secret"),null,null,null,null);
-        var pipeline=new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: [input]\n"+body+"\n");
+        var pipeline=new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: "+sourceRefs+"\n"+body+"\n");
         var resources=List.of(input,target,pipeline);var hashes=new TreeMap<String,String>();var canonical=new TreeMap<String,String>();
         resources.forEach(resource->{hashes.put(resource.id(),CanonicalHash.of(resource));canonical.put(resource.id(),new CanonicalWriter().write(resource));});
         var mappings=new ArrayList<ValidationTaskSpec.Mapping>();

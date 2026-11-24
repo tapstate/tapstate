@@ -425,7 +425,7 @@ class ManagedCloudSessionAssemblyIT {
                     assertThat(response.getStatusCode().value()).isEqualTo(401);
                     return response.bodyTo(String.class);
                 });
-        assertThat(body).contains("control.unauthenticated").doesNotContain(cookie);
+        assertThat(body).contains("TS0210003").doesNotContain(cookie);
     }
 
     private static void assertPipelineCatalog(RestClient client, String cookie, TwoUserPorts ports) {
@@ -631,6 +631,14 @@ class ManagedCloudSessionAssemblyIT {
     @Import({StoreConfiguration.class, ControlPlaneConfiguration.class, PreviewProbeAssembly.class})
     static class TwoUserAssembly {
         @Bean
+        static org.springframework.beans.factory.config.BeanPostProcessor legacyCloudSeedRunner(
+                org.springframework.beans.factory.ObjectProvider<io.tapstate.adapters.pdk.ConnectorArtifactRegistrar> registrar,
+                org.springframework.beans.factory.ObjectProvider<ConnectorPluginProperties> properties) {
+            return CloudConnectorTestInputs.legacySeedRunner(registrar, properties);
+        }
+
+
+        @Bean
         @Primary
         CloudAuthenticationService controlledTwoUserAuthentication(CloudSessionStore sessions,
                 TokenSecrets secrets, Clock clock, CloudRuntimeSettings settings, TwoUserPorts ports) {
@@ -676,6 +684,14 @@ class ManagedCloudSessionAssemblyIT {
     @ConditionalOnProperty(prefix = "tapstate.test", name = "managed-auth", havingValue = "true")
     @Import({StoreConfiguration.class, ControlPlaneConfiguration.class, PreviewProbeAssembly.class})
     static class Assembly {
+        @Bean
+        static org.springframework.beans.factory.config.BeanPostProcessor legacyCloudSeedRunner(
+                org.springframework.beans.factory.ObjectProvider<io.tapstate.adapters.pdk.ConnectorArtifactRegistrar> registrar,
+                org.springframework.beans.factory.ObjectProvider<ConnectorPluginProperties> properties) {
+            return CloudConnectorTestInputs.legacySeedRunner(registrar, properties);
+        }
+
+
         @Bean
         @Primary
         CloudAuthenticationService controlledAuthentication(

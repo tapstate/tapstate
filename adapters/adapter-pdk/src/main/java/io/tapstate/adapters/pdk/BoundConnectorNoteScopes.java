@@ -11,20 +11,46 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
     private final RequiredNoteStore guardedStore;
     private final Function<String, RequiredNoteScope> opener;
     private final Runnable active;
+    private final boolean batchSharedStartup;
+    private final String logicalPrimary;
+    private final String physicalPrimary;
+    private final long logStateGeneration;
 
     BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active) {
+        this(store, opener, active, false);
+    }
+
+    BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active,
+            boolean batchSharedStartup) {
+            this(store, opener, active, batchSharedStartup, 0);
+    }
+
+    BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active,
+                boolean batchSharedStartup, long logStateGeneration) {
+            this(store, opener, active, batchSharedStartup, null, null, logStateGeneration);
+    }
+
+    BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active,
+                boolean batchSharedStartup, String logicalPrimary, String physicalPrimary, long logStateGeneration) {
+            this.batchSharedStartup = batchSharedStartup;
+            this.logicalPrimary = logicalPrimary;
+            this.physicalPrimary = physicalPrimary;
+            this.logStateGeneration = logStateGeneration;
         this.originalStore = Objects.requireNonNull(store, "store");
         this.opener = Objects.requireNonNull(opener, "opener");
         this.active = Objects.requireNonNull(active, "active");
         this.guardedStore = store.guardedBy(active);
     }
 
+    @Override public boolean batchSharedStartup() { return batchSharedStartup; }
+    @Override public long logStateGeneration() { return logStateGeneration; }
     @Override public RequiredNoteStore store() { return guardedStore; }
     @Override public void requireActive() { active.run(); }
     @Override public RequiredNoteScope open(String namespace) {
         active.run();
-        var scope = Objects.requireNonNull(opener.apply(namespace), "scope");
-        if (!scope.owner().namespace().equals(namespace))
+        String physical = namespace.equals(logicalPrimary) ? physicalPrimary : namespace;
+        var scope = Objects.requireNonNull(opener.apply(physical), "scope");
+        if (!scope.owner().namespace().equals(physical))
             throw new IllegalStateException("the note opener returned another namespace");
         active.run();
         return scope;
@@ -33,7 +59,7 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
         Objects.requireNonNull(additionalGuard, "additionalGuard");
         return new BoundConnectorNoteScopes(originalStore, opener, () -> {
             active.run(); additionalGuard.run();
-        });
+        }, batchSharedStartup, logicalPrimary, physicalPrimary, logStateGeneration);
     }
 
     /** A release must retain the exact primary scope captured with its connector origin. */
@@ -42,10 +68,12 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
         String namespace = original.owner().namespace();
         if (scopes instanceof BoundConnectorNoteScopes bound) {
             return new BoundConnectorNoteScopes(bound.originalStore,
-                    requested -> namespace.equals(requested) ? original : bound.opener.apply(requested), bound.active);
+                    requested -> namespace.equals(requested) ? original : bound.opener.apply(requested), bound.active,
+                    false, bound.logicalPrimary, bound.physicalPrimary, bound.logStateGeneration);
         }
         // A custom provider owns its own checks; preserve its public contract when it cannot be unwrapped.
-        return ConnectorNoteScopes.of(scopes.store(),
-                requested -> namespace.equals(requested) ? original : scopes.open(requested), scopes::requireActive);
+        return ConnectorNoteScopes.forCapture(scopes.store(),
+                requested -> namespace.equals(requested) ? original : scopes.open(requested), scopes::requireActive,
+                false, scopes.logStateGeneration());
     }
 }

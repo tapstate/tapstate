@@ -16,13 +16,14 @@ final class PipelineInputClosure {
 
     static Map<String, String> dependencyHashes(ArtifactStore snapshot, PipelineResource authored, PipelinePreparationInputs inputs) {
         var dependencies = new HashMap<String, String>(); var queue = new ArrayDeque<Resource>(); var visited = new HashSet<String>();
+        var captureArtifacts = inputs.sourceArtifactHashes(authored);
         queue.add(authored);
         while (!queue.isEmpty()) {
             var resource = queue.remove(); if (!visited.add(resource.id())) continue;
             for (var edge : ReferenceGraph.declaredReferences(resource)) {
                 var required = snapshot.get(edge.id()).orElseThrow(PipelineInputClosure::fenced);
                 if (!edge.kind().equals(required.kind())) throw fenced(); queue.add(required);
-                if (!inputs.sourceHashes().containsKey(required.id())) dependencies.put(required.id(), CanonicalHash.of(required));
+                if (!captureArtifacts.containsKey(required.id())) dependencies.put(required.id(), CanonicalHash.of(required));
             }
         }
         return Map.copyOf(dependencies);

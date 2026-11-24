@@ -107,6 +107,7 @@ class StorageRootConfiguration {
     @Bean io.tapstate.control.restapi.StorageEntryStatus storageEntryStatus(StorageRoot root, ObjectProvider<OnPremInstallation> installations) {
         return () -> {
             var entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.UNAVAILABLE;
+            boolean businessReady = false;
             try {
                 var phase = root.phase();
                 var installation = installations.getIfAvailable();
@@ -120,23 +121,29 @@ class StorageRootConfiguration {
                         entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.SETUP_REQUIRED;
                     } else if (phase == StorageRoot.Phase.AUTH_READY || phase == StorageRoot.Phase.BUSINESS_READY) {
                         entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.LOGIN;
+                        businessReady = phase == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted();
                         if (installation != null && configuration.firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase() == FirstAdminStore.Phase.PENDING)
-                            entry = phase == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted() && installation.firstAdministratorReady()
+                            entry = businessReady && installation.firstAdministratorReady()
                                     ? io.tapstate.control.restapi.StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED
                                     : io.tapstate.control.restapi.StorageEntryStatus.Entry.UNAVAILABLE;
                     }
                 }
             } catch (io.tapstate.core.common.TapstateException unavailable) {
                 entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.UNAVAILABLE;
+                businessReady = false;
             }
-            return new io.tapstate.control.restapi.StorageEntryStatus.Summary(root.mode().name(), entry);
+            return new io.tapstate.control.restapi.StorageEntryStatus.Summary(root.mode().name(), entry, businessReady);
         };
     }
     @Bean @org.springframework.context.annotation.Lazy
     InstalledConnectorTests installedConnectorTests(ConnectorPluginProperties properties, Clock clock,
-            org.springframework.core.env.Environment environment) {
-        return new InstalledConnectorTests(properties, clock, CloudConnectorSeedReadiness.localSelectionFileNames(
-                "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY))));
+            org.springframework.core.env.Environment environment, CloudRuntimeSettings cloud) {
+        var selected = CloudConnectorSeedReadiness.localSelectionFileNames(
+                "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY)));
+        if (!cloud.cloud() && selected == null) {
+            selected = LocalConnectorRuntime.bundledFileNames(properties.getSeedDir());
+        }
+        return new InstalledConnectorTests(properties, clock, selected, cloud.cloud());
     }
     @Bean @org.springframework.context.annotation.Lazy
     StorageSetupService.DefaultTarget storageDefaultTarget(ObjectProvider<InstalledConnectorTests> connectors) {
@@ -178,7 +185,7 @@ class StorageRootConfiguration {
                 new AuditGate(configuration.audit(), clock), clock, root::requireActive,
                 committed -> {
                     if (root.mode() == StorageBinding.Mode.CLOUD)
-                        root.handoffActivation(committed, () -> root.continueCloudSetup(committed, target, original -> factories.getObject().create(original)));
+                        root.handoffCloudSetup(committed, target, original -> factories.getObject().create(original));
                 }, root::coordinateSetup, (expected, tested, active) -> {},
                 root.mode() == StorageBinding.Mode.CLOUD ? root.initializationProgress() : null);
     }

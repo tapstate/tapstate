@@ -271,7 +271,7 @@ class V2StructuredArtifactsIT {
                 .as("dropping is for a field this build retired; nothing here can invent a key nobody "
                         + "wrote, so this one is still refused -- but with what an operator acts on")
                 .hasMessageContaining("hr")
-                .hasMessageContaining("dsl.missing-field")
+                .hasMessageContaining("TS0010004")
                 .hasMessageContaining("primary_key");
         assertThat(thrown.getCause())
                 .as("the position and the stack survive the bare throw the runner re-codes")

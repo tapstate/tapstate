@@ -51,6 +51,11 @@ final class AlertEvaluationHost {
     AlertRetentionPolicy retentionPolicy(){return policy.value();}
 
     Result accept(Binding binding, long sequence, AlertInput input) {
+        return accept(binding, sequence, input, false, Optional.empty());
+    }
+
+    Result accept(Binding binding, long sequence, AlertInput input, boolean stateLoaded,
+            Optional<AlertStore.Stored<AlertStateRecord.Head>> cachedState) {
         binding.requireCurrent().run();
         var definition = binding.definition().validated(catalog);
         if (!(input instanceof AlertInput.Discontinuity)
@@ -66,7 +71,8 @@ final class AlertEvaluationHost {
         for (int retry = 0; retry < 3; retry++) {
             binding.requireCurrent().run();
             Instant now = clock.instant();
-            var retained = store.state(binding.key(), read);
+            var retained = retry == 0 && stateLoaded ? cachedState : store.state(binding.key(), read);
+            if(stateLoaded && !(input instanceof AlertInput.Freshness))sequence=retained.map(v->Math.incrementExact(v.value().snapshot().lastSequence())).orElse(0L);
             var before = retained.map(AlertStore.Stored::value).orElse(null);
             if (before != null && before.retiredAt() != null) return Result.IGNORED;
             if(input instanceof AlertInput.Operational op && op.domainToken()!=null) {
@@ -179,9 +185,17 @@ final class AlertEvaluationHost {
     }
 
     Result tick(Binding binding) {
+        return tick(binding, () -> store.state(binding.key(), read));
+    }
+
+    Result tick(Binding binding, Optional<AlertStore.Stored<AlertStateRecord.Head>> loaded) {
+        return tick(binding, () -> loaded);
+    }
+
+    private Result tick(Binding binding, java.util.function.Supplier<Optional<AlertStore.Stored<AlertStateRecord.Head>>> firstRead) {
         for (int retry = 0; retry < 3; retry++) {
             binding.requireCurrent().run();
-            var retained = store.state(binding.key(), read);
+            var retained = retry == 0 ? firstRead.get() : store.state(binding.key(), read);
             if (retained.isEmpty()) return Result.IGNORED;
             var before = retained.orElseThrow().value();
             if (before.retiredAt() != null) return Result.IGNORED;

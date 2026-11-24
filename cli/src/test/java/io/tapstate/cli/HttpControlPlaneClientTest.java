@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.JsonReader;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -12,9 +13,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 /**
  * The production HTTP reachability probe against a tiny in-JVM server: {@code GET /healthz} returning
@@ -23,24 +27,112 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class HttpControlPlaneClientTest {
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0280005", "lifecycle.unknown-pipeline"})
+    void codedUnknownPipelineDoesNotEnableTheUncheckedLegacyStartPath(String code) throws Exception {
+        HttpServer server = serverReplying("/api/pipelines/ghost/start-checks", 404,
+                "{\"code\":\"" + code + "\",\"params\":{\"pipeline\":\"ghost\"},\"message\":\"Not applied.\"}");
+        try {
+            var result = new HttpControlPlaneClient().startChecks(baseOf(server), "token", "ghost", "rerun");
+            assertThat(result).isInstanceOfSatisfying(StartChecksOutcome.Rejected.class, rejected -> {
+                assertThat(rejected.code()).isEqualTo(code);
+                assertThat(rejected.params()).containsEntry("pipeline", "ghost");
+            });
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void absentStartChecksResourceStillUsesTheLegacyCompatibilityOutcome() throws Exception {
+        HttpServer server = serverReplying("/api/pipelines/ghost/start-checks", 404, "{}");
+        try {
+            assertThat(new HttpControlPlaneClient().startChecks(baseOf(server), "token", "ghost", "rerun"))
+                    .isInstanceOf(StartChecksOutcome.NotSupported.class);
+        } finally { server.stop(0); }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0380001", "connector.not-found"})
+    void catalogRefusalDoesNotEnablePreviewFallback(String code) throws Exception {
+        HttpServer server = serverReplying("/api/connector-center/mysql:download", 404,
+                """
+                {"code":"%s","params":{"connector":"mysql"},"message":"Connector is unavailable."}
+                """.formatted(code));
+        try {
+            var result = new HttpControlPlaneClient().downloadConnector(baseOf(server), "token", "mysql");
+            assertThat(result).containsInstanceOf(ConnectorRegisterOutcome.Rejected.class);
+            assertThat(((ConnectorRegisterOutcome.Rejected) result.orElseThrow()).code()).isEqualTo(code);
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void absentConnectorDownloadRouteStillAllowsPreviewFallback() throws Exception {
+        HttpServer server = serverReplying("/api/connector-center/mysql:download", 404, "{}");
+        try {
+            assertThat(new HttpControlPlaneClient().downloadConnector(baseOf(server), "token", "mysql")).isEmpty();
+        } finally { server.stop(0); }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    @Timeout(10)
+    void readsTheFinalResultOfAnAcceptedConnectorDownload(boolean installed) throws Exception {
+        String hash = "a".repeat(64);
+        String operation = "242a7615-7ee0-46a7-84ce-d2cda0a4f17d";
+        String finalBody = installed ? """
+                {"state":"INSTALLED","connectorId":"mysql","sha256":"%s","pdkApiVersion":"2.0.11",
+                 "newlyRegistered":true}
+                """.formatted(hash) : """
+                {"state":"FAILED","errorCode":"TS0380002"}
+                """;
+        var polls = new AtomicInteger();
+        var methods = new java.util.concurrent.ConcurrentLinkedQueue<String>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/api/connector-center/mysql:download", exchange -> {
+            methods.add(exchange.getRequestMethod());
+            respond(exchange, 202, "{\"operationId\":\"" + operation + "\"}");
+        });
+        server.createContext("/api/connector-center/operations/" + operation, exchange -> {
+            methods.add(exchange.getRequestMethod());
+            respond(exchange, 200, polls.incrementAndGet() == 1 ? "{\"state\":\"PENDING\"}" : finalBody);
+        });
+        server.start();
+        try {
+            var result = new HttpControlPlaneClient().downloadConnector(baseOf(server), "token", "mysql");
+            if (installed) {
+                assertThat(result).contains(new ConnectorRegisterOutcome.Registered(
+                        new RegisteredConnector("mysql", hash, "2.0.11", true)));
+            } else {
+                assertThat(result).containsInstanceOf(ConnectorRegisterOutcome.Rejected.class);
+                assertThat(((ConnectorRegisterOutcome.Rejected) result.orElseThrow()).code()).isEqualTo("TS0380002");
+            }
+            assertThat(methods).containsExactly("POST", "GET", "GET");
+        } finally {
+            server.stop(0);
+        }
+    }
+
     private static HttpServer serverReplying(int status, String body) throws Exception {
         return serverReplying("/healthz", status, body);
     }
 
     private static HttpServer serverReplying(String path, int status, String body) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        server.createContext(path, exchange -> {
-            byte[] bytes = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
+        server.createContext(path, exchange -> respond(exchange, status, body));
+        server.start();
+        return server;
+    }
+
+    private static void respond(com.sun.net.httpserver.HttpExchange exchange, int status, String body)
+            throws java.io.IOException {
+        byte[] bytes = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
+        try (exchange) {
             exchange.sendResponseHeaders(status, bytes.length == 0 ? -1 : bytes.length);
             if (bytes.length > 0) {
                 try (OutputStream os = exchange.getResponseBody()) {
                     os.write(bytes);
                 }
             }
-            exchange.close();
-        });
-        server.start();
-        return server;
+        }
     }
 
     private static URI baseOf(HttpServer server) {
@@ -121,6 +213,33 @@ class HttpControlPlaneClientTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void anAggregateReportKeepsANullGroupValueApartFromAnEmptyOne() {
+        AggregateCheckOutcome.Found found = HttpControlPlaneClient.aggregateReport("""
+                {"pipeline":"pl1","step":"by_region","repaired":false,"groups":2,"next":"c1","conflicts":3,"withheld":1,
+                 "findings":[{"group":{"region":null,"kind":""},"verdict":"mismatch","fields":["revenue","(rows)"],
+                              "code":"aggregate.sum-out-of-range","field":"revenue"}]}""");
+
+        assertThat(found.groups()).isEqualTo(2);
+        assertThat(found.next()).isEqualTo("c1");
+        assertThat(found.conflicts()).isEqualTo(3);
+        assertThat(found.withheld()).isEqualTo(1);
+        AggregateCheckOutcome.Finding finding = found.findings().get(0);
+        assertThat(finding.group()).containsEntry("region", null).containsEntry("kind", "");
+        assertThat(finding.verdict()).isEqualTo("mismatch");
+        assertThat(finding.fields()).containsExactly("revenue", "(rows)");
+        assertThat(finding.code()).isEqualTo("aggregate.sum-out-of-range");
+        assertThat(finding.field()).isEqualTo("revenue");
+    }
+
+    @Test
+    void anAggregateAnswerThatIsNotAReportIsNotReadAsAnEmptyOne() {
+        // An empty report says every group matched; a body nobody could read must not say that.
+        assertThat(HttpControlPlaneClient.aggregateReport("{\"findings\":[]}")).isNull();
+        assertThat(HttpControlPlaneClient.aggregateReport(
+                "{\"groups\":1,\"findings\":[{\"group\":{},\"fields\":[]}]}")).isNull();
     }
 
     @Test
@@ -881,6 +1000,69 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    @Timeout(12)
+    void applyUsesTheHeavyBudgetWithoutRetryingTheWrite() throws Exception {
+        Duration probeBudget = Duration.ofMillis(500);
+        Duration heavyBudget = Duration.ofSeconds(3);
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        var executor = Executors.newVirtualThreadPerTaskExecutor();
+        server.setExecutor(executor);
+        server.createContext("/healthz", exchange -> {
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+        });
+        server.createContext("/api/artifacts:apply", exchange -> {
+            try (exchange) {
+                int request = requests.incrementAndGet();
+                exchange.getRequestBody().readAllBytes();
+                try {
+                    // The first response fits only the heavy budget; the second exceeds it too.
+                    Thread.sleep(request == 1 ? 1000 : 6000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                byte[] response = ("{\"outcomes\":[{\"id\":\"src_kfk\",\"kind\":\"source\","
+                        + "\"change\":\"CREATED\",\"contentHash\":\"h1\"}]}")
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, response.length);
+                exchange.getResponseBody().write(response);
+            }
+        });
+        server.start();
+        try (var client = new HttpControlPlaneClient(probeBudget, heavyBudget)) {
+            // Establish the connection before measuring server work against the read budgets.
+            assertThat(client.isHealthy(baseOf(server))).isTrue();
+            List<LocalDraft> drafts = List.of(new LocalDraft("src_kfk.tap.yml",
+                    "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
+            ApplyOutcome withinHeavyBudget = client.apply(baseOf(server), "tok", drafts);
+            int requestsAfterFirstApply = requests.get();
+            long started = System.nanoTime();
+            ApplyOutcome beyondHeavyBudget = client.apply(baseOf(server), "tok", drafts);
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
+
+            assertAll(
+                    () -> assertThat(withinHeavyBudget)
+                            .as("a valid apply response after the probe deadline but within the heavy budget")
+                            .isInstanceOfSatisfying(ApplyOutcome.Applied.class, applied ->
+                                    assertThat(applied.items()).containsExactly(
+                                            new ApplyOutcome.Item("src_kfk", "source", "CREATED"))),
+                    () -> assertThat(requestsAfterFirstApply).as("one request for the completed write").isEqualTo(1),
+                    () -> assertThat(beyondHeavyBudget).isInstanceOf(ApplyOutcome.Unreachable.class),
+                    () -> assertThat(elapsed).as("the ambiguous write waits for the heavy deadline")
+                            .isGreaterThanOrEqualTo(heavyBudget.minusMillis(500)),
+                    () -> assertThat(elapsed).as("the heavy deadline remains bounded")
+                            .isLessThan(heavyBudget.plusSeconds(2)),
+                    () -> assertThat(requests.get()).as("neither write is automatically retried").isEqualTo(2));
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            executor.close();
+        }
+    }
+
+    @Test
     void applyDecodesTheServerWarningsApartFromTheOutcomes() throws Exception {
         // The server carries an advisory finding as its code plus named params — the same shape the
         // validation diagnostics travel in — and the CLI renders it from its own bundled catalog.
@@ -1025,17 +1207,18 @@ class HttpControlPlaneClientTest {
         }
     }
 
-    @Test
-    void registerReturnsRejectedWithTheServerCodeAndMessageOnACodedError() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"connector.registration-conflict", "TS0060006"})
+    void registerReturnsRejectedWithTheServerCodeAndMessageOnACodedError(String code) throws Exception {
         HttpServer server = apiServer("/api/connectors:register", 400,
-                "{\"code\":\"connector.registration-conflict\",\"params\":{},"
+                "{\"code\":\"" + code + "\",\"params\":{},"
                         + "\"message\":\"A different artifact already holds that id.\"}",
                 new AtomicReference<>());
         try {
             ConnectorRegisterOutcome outcome =
                     new HttpControlPlaneClient().register(baseOf(server), "tok", new byte[] {9});
             assertThat(outcome).isEqualTo(new ConnectorRegisterOutcome.Rejected(
-                    "connector.registration-conflict", "A different artifact already holds that id."));
+                    code, "A different artifact already holds that id."));
         } finally {
             server.stop(0);
         }
@@ -1497,6 +1680,45 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void testAndLatestReadTheSameOptionalDiagnosticWithoutChangingLegacyChecks() throws Exception {
+        HttpServer server = apiServer("/api/connections", 200, """
+                {
+                  "connectionId": "orders",
+                  "connectorId": "mysql",
+                  "outcome": "FAILED",
+                  "testedAt": 1752000000000,
+                  "checks": [
+                    {"name": "Connect", "status": "FAILED", "message": "Try again",
+                     "diagnostic": {"code": "TS0060001", "causes": [
+                       {"code": "MYSQL43001", "arguments": ["orders", "primary"]},
+                       {"message": "Second cause", "references": [{"type": "connection", "id": "orders"}]}
+                     ], "futureField": "ignored"}},
+                    {"name": "Read log", "status": "WARNING", "reason": "Legacy reason",
+                     "diagnostic": {"cause": {"code": "DRIVER"}, "causes": [], "truncated": true}}
+                  ]
+                }
+                """, new AtomicReference<>());
+        try {
+            HttpControlPlaneClient client = new HttpControlPlaneClient();
+            ConnectionTestOutcome.Tested immediate = (ConnectionTestOutcome.Tested)
+                    client.test(baseOf(server), "tok", "orders", "mysql", Map.of());
+            ConnectionTestResultOutcome.Found latest = (ConnectionTestResultOutcome.Found)
+                    client.testResult(baseOf(server), "tok", "orders");
+
+            assertThat(latest.report()).isEqualTo(immediate.report());
+            assertThat(latest.report().checks()).containsExactly(
+                    new ConnectionReport.Check("Connect", "FAILED", "Try again", null, null, null,
+                            Map.of("code", "TS0060001", "causes", List.of(
+                                    Map.of("code", "MYSQL43001", "arguments", List.of("orders", "primary")),
+                                    Map.of("message", "Second cause", "references",
+                                            List.of(Map.of("type", "connection", "id", "orders")))))),
+                    new ConnectionReport.Check("Read log", "WARNING", null, "Legacy reason", null, null));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void testResultReturnsRejectedWithTheServerCodeAndMessageOnACodedErrorStatus() throws Exception {
         HttpServer server = apiServer("/api/connections/", 403,
                 "{\"code\":\"control.forbidden\",\"params\":{},\"message\":\"You lack the grade.\"}",
@@ -1516,6 +1738,29 @@ class HttpControlPlaneClientTest {
         assertThat(new HttpControlPlaneClient()
                 .testResult(unreachableBase(), "tok", "c"))
                 .isInstanceOf(ConnectionTestResultOutcome.Unreachable.class);
+    }
+
+    @Test
+    void preservesTheDiagnosticOfARefusedConnectionRequestInBothPaths() throws Exception {
+        HttpServer server = apiServer("/api/connections", 500, """
+                {"code":"TS0060001","message":"Unable to run the test",
+                 "params":{"connector":"postgres"},
+                 "diagnostic":{"causes":[{"code":"DRIVER"}],"truncated":true}}
+                """, new AtomicReference<>());
+        try {
+            var client = new HttpControlPlaneClient();
+            var params = Map.<String, Object>of("connector", "postgres");
+            var diagnostic = Map.<String, Object>of(
+                    "causes", List.of(Map.of("code", "DRIVER")), "truncated", true);
+            assertThat(client.test(baseOf(server), "tok", "orders", "postgres", Map.of()))
+                    .isEqualTo(new ConnectionTestOutcome.Rejected(
+                            "TS0060001", "Unable to run the test", params, diagnostic));
+            assertThat(client.testResult(baseOf(server), "tok", "orders"))
+                    .isEqualTo(new ConnectionTestResultOutcome.Rejected(
+                            "TS0060001", "Unable to run the test", params, diagnostic));
+        } finally {
+            server.stop(0);
+        }
     }
 
     // --- schema discovery: POST /api/connections:discover-schema, decodes the discovered model ---------
@@ -1719,20 +1964,50 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
-    void statusCarriesTheCodedFailureOfAPipelineWhoseJobDied() throws Exception {
+    void anUnobservedTransitionCanOmitRuntimeState() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
+                "{\"pipelineId\":\"pl1\",\"displayState\":\"STARTING\","
+                        + "\"desiredState\":\"RUNNING\",\"hasArtifact\":true}", new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new StatusOutcome.NoObservation());
+        } finally { server.stop(0); }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"engine.job-failed", "TS0440008"})
+    void statusCarriesTheCodedFailureOfAPipelineWhoseJobDied(String code) throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
-                "{\"pipelineId\":\"pl1\",\"state\":\"FAILED\",\"failure\":{\"code\":\"engine.job-failed\","
+                "{\"pipelineId\":\"pl1\",\"state\":\"FAILED\",\"failure\":{\"code\":\"" + code + "\","
                         + "\"params\":{\"cause\":\"sink refused\"},"
                         + "\"message\":\"Pipeline pl1 stopped because its job failed: sink refused.\"}}",
                 seen);
         try {
             StatusOutcome outcome = new HttpControlPlaneClient().status(baseOf(server), "tok-abc", "pl1");
 
-            assertThat(outcome).isEqualTo(new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
-                    "Pipeline pl1 stopped because its job failed: sink refused."));
+            assertThat(outcome).isEqualTo(new StatusOutcome.Found("pl1", "FAILED", code,
+                    "Pipeline pl1 stopped because its job failed: sink refused.", null,
+                    Map.of("cause", "sink refused"), Map.of()));
         } finally {
             server.stop(0);
+        }
+    }
+
+    @Test
+    void statusRetainsTheCapturedAttachmentAndDoesNotLoseFailureOnInvalidExtension() throws Exception {
+        for (String attachment : List.of("{\"cause\":{\"rawMessage\":\"safe cause\"}}", "{\"unexpected\":true}")) {
+            HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
+                    "{\"pipelineId\":\"pl1\",\"state\":\"FAILED\",\"failure\":{\"code\":\"TS0060027\","
+                            + "\"params\":{\"detail\":\"refused\"},\"message\":\"write refused\",\"diagnostic\":" + attachment + "}}",
+                    new AtomicReference<>());
+            try {
+                var found = (StatusOutcome.Found) new HttpControlPlaneClient().status(baseOf(server), "token", "pl1");
+                assertThat(found.failureCode()).isEqualTo("TS0060027");
+                assertThat(found.failureParams()).containsEntry("detail", "refused");
+                if (attachment.contains("unexpected")) assertThat(found.diagnostic()).isEmpty();
+                else assertThat(found.diagnostic()).containsEntry("cause", Map.of("rawMessage", "safe cause"));
+            } finally { server.stop(0); }
         }
     }
 
@@ -1750,18 +2025,19 @@ class HttpControlPlaneClientTest {
         }
     }
 
-    @Test
-    void statusOfAFailedPipelineSurvivesAFailureBlockWithNoMessage() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"engine.job-failed", "TS0440008"})
+    void statusOfAFailedPipelineSurvivesAFailureBlockWithNoMessage(String code) throws Exception {
         // A reply that names the code but carries no rendered sentence must still report the code rather
         // than dropping the whole status to unreachable: the code alone is the diagnosis worth keeping.
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
-                "{\"pipelineId\":\"pl1\",\"state\":\"FAILED\",\"failure\":{\"code\":\"engine.job-failed\"}}", seen);
+                "{\"pipelineId\":\"pl1\",\"state\":\"FAILED\",\"failure\":{\"code\":\"" + code + "\"}}", seen);
         try {
             StatusOutcome outcome = new HttpControlPlaneClient().status(baseOf(server), "tok-abc", "pl1");
 
             StatusOutcome.Found found = (StatusOutcome.Found) outcome;
-            assertThat(found.failureCode()).isEqualTo("engine.job-failed");
+            assertThat(found.failureCode()).isEqualTo(code);
             assertThat(found.failureMessage()).isNotNull();
         } finally {
             server.stop(0);
@@ -1771,13 +2047,13 @@ class HttpControlPlaneClientTest {
     @Test
     void statusReturnsRejectedWithTheServerCodeAndMessageOnACodedError() throws Exception {
         HttpServer server = apiServer("/api/pipelines/ghost/status", 404,
-                "{\"code\":\"monitor.no-observation\",\"params\":{\"pipeline\":\"ghost\"},"
+                "{\"code\":\"TS0400001\",\"params\":{\"pipeline\":\"ghost\"},"
                         + "\"message\":\"No observation is available for pipeline ghost.\"}",
                 new AtomicReference<>());
         try {
             StatusOutcome outcome = new HttpControlPlaneClient().status(baseOf(server), "tok", "ghost");
             assertThat(outcome).isEqualTo(new StatusOutcome.Rejected(
-                    "monitor.no-observation", "No observation is available for pipeline ghost."));
+                    "TS0400001", "No observation is available for pipeline ghost."));
         } finally {
             server.stop(0);
         }
@@ -1787,6 +2063,28 @@ class HttpControlPlaneClientTest {
     void statusReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
         assertThat(new HttpControlPlaneClient().status(unreachableBase(), "tok", "pl1"))
                 .isInstanceOf(StatusOutcome.Unreachable.class);
+    }
+
+    @Test
+    void explainDecodesWhatAnAggregateStepKeepsAndLeavesTheUnknownNull() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1/explain", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"RUNNING\",\"kind\":\"NO_MATCH\","
+                        + "\"message\":\"No diagnostic rule matched.\",\"freshness\":\"UNKNOWN\","
+                        + "\"evidence\":[],\"cannotSay\":[\"The observation has no time.\"],\"next\":null,"
+                        + "\"aggregates\":[{\"step\":\"by_region\",\"entriesPerRow\":3,"
+                        + "\"keptInputFields\":[\"most\"],\"inputRows\":1000,\"estimatedEntries\":3000},"
+                        + "{\"step\":\"by_day\",\"entriesPerRow\":2,\"storedEntries\":12}]}", seen);
+        try {
+            ExplainOutcome outcome = new HttpControlPlaneClient().explain(baseOf(server), "tok-abc", "pl1");
+
+            assertThat(outcome).isInstanceOf(ExplainOutcome.Found.class);
+            assertThat(((ExplainOutcome.Found) outcome).aggregates()).containsExactly(
+                    new ExplainOutcome.Aggregate("by_region", 3, List.of("most"), 1_000L, 3_000L, null),
+                    new ExplainOutcome.Aggregate("by_day", 2, List.of(), null, null, 12L));
+        } finally {
+            server.stop(0);
+        }
     }
 
     @Test
@@ -2084,6 +2382,22 @@ class HttpControlPlaneClientTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void logsKeepsValidDiagnosticButDropsOnlyTheMalformedAttachment() throws Exception {
+        var server = apiServer("/api/pipelines/pl1/logs", 200, """
+                {"pipelineId":"pl1","lines":[
+                  {"timestampMillis":1,"level":"WARN","message":"safe failure","diagnostic":{"code":"28000","codeSource":"jdbc-sqlstate","rawMessage":"access denied"}},
+                  {"timestampMillis":2,"level":"WARN","message":"original line","diagnostic":{"unsupported":true}}]}
+                """, new AtomicReference<>());
+        try {
+            var found = (LogsOutcome.Found) new HttpControlPlaneClient().logs(baseOf(server), "tok", "pl1");
+            assertThat(found.lines()).hasSize(2);
+            assertThat(found.lines().getFirst().diagnostic()).containsEntry("code", "28000");
+            assertThat(found.lines().getLast().diagnostic()).isEmpty();
+            assertThat(found.lines().getLast().message()).isEqualTo("original line");
+        } finally { server.stop(0); }
     }
 
     @Test

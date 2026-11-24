@@ -180,6 +180,10 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
     }
 
     @Override public PipelineDraftMutation publish(PipelineDraft.Publication publication) {
+        return publishWithGeneration(publication).mutation();
+    }
+
+    @Override public Published publishWithGeneration(PipelineDraft.Publication publication) {
         Objects.requireNonNull(publication, "publication");
         if (!(publication.artifact() instanceof PipelineResource)) throw new IllegalArgumentException("draft publication requires a Pipeline");
         var captured = (PipelineResource) new DslParser().parse(new CanonicalWriter().write(publication.artifact()));
@@ -189,26 +193,21 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
         try {
             return transaction(session -> {
                 Document row = drafts.find(session, new Document("_id", publication.pipelineId())).first();
-                if (row == null || deleted(row)) return PipelineDraftMutation.NOT_FOUND;
+                if (row == null || deleted(row)) return new Published(PipelineDraftMutation.NOT_FOUND, 0);
                 PipelineDraft current = codec.decode(row);
-                if (current.revision() != publication.expectedDraftRevision()) return PipelineDraftMutation.REVISION_CONFLICT;
-                var observed = artifacts.getInTransaction(session, captured.id());
-                if (observed.isPresent() && !(observed.orElseThrow() instanceof PipelineResource)) return PipelineDraftMutation.ARTIFACT_CONFLICT;
-                String hash = observed.map(CanonicalHash::of).orElse(null);
-                if (!Objects.equals(hash, publication.expectedArtifactHash())) return PipelineDraftMutation.ARTIFACT_CONFLICT;
-                ArtifactWrite write = (hash == null ? ArtifactWrite.createOnly(captured) : ArtifactWrite.replaceOnly(captured, hash))
-                        .guardedBy(publication.workspacePreconditions());
-                ConfigurationVersion.advance(session, versions, client);
-                artifacts.writeAllInTransaction(session, List.of(write));
+                if (current.revision() != publication.expectedDraftRevision()) return new Published(PipelineDraftMutation.REVISION_CONFLICT, 0);
+                long generation = artifacts.publishPipelineInTransaction(session, captured, publication.expectedArtifactHash(),
+                        publication.workspacePreconditions());
+                if (generation == 0) return new Published(PipelineDraftMutation.ARTIFACT_CONFLICT, 0);
                 var published = new PipelineDraft(current.pipelineId(), current.schemaVersion(), current.revision(), current.mode(),
                         current.name(), current.description(), current.graph(), current.wizard(), publication.publishedArtifactHash(),
                         publication.expectedDraftRevision(), publication.publishedArtifactHash(), current.createdAt(), publication.publishedAt(), publication.updatedBy());
                 drafts.replaceOne(session, new Document("_id", current.pipelineId()).append("revision", current.revision()).append("deleted", false),
                         codec.encode(published, session));
-                return PipelineDraftMutation.PUBLISHED;
+                return new Published(PipelineDraftMutation.PUBLISHED, generation);
             });
         } catch (MongoConfigurationArtifactStore.Refused conflict) {
-            return PipelineDraftMutation.ARTIFACT_CONFLICT;
+            return new Published(PipelineDraftMutation.ARTIFACT_CONFLICT, 0);
         }
     }
 

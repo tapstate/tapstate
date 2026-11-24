@@ -11,7 +11,7 @@
 #
 # - FAILED says the invalid operation was not silently accepted or dropped.
 # - failure_code says the expression boundary diagnosed it. The old leak also failed, but with
-#   connector.write-failed, so merely awaiting the lifecycle state would preserve the regression.
+#   TS0060027, so merely awaiting the lifecycle state would preserve the regression.
 # - The target stays empty. A transform that reported the error after forwarding the row would satisfy
 #   both readings above while still exposing an internal CEL value to the connector.
 name: a-null-joined-column-fails-with-an-expression-code
@@ -35,5 +35,5 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
-  - assert: { failure_code: transform.expression-failed }
+  - await: { failure_code: TS0450001 }
   - assert: { count: { views.order_state: 0 } }

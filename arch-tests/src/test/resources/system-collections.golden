@@ -52,9 +52,9 @@ audit | config | MongoConfigurationSecurityStores | migrated | 1 | -
 users | config | MongoFirstAdminStore | migrated | 1 | -
 op_bootstrap | config | MongoFirstAdminStore | migrated | 1 | -
 pipeline_drafts | config | MongoConfigurationDraftStore | migrated | 1 | revision, updatedAt
-validation_tasks | config | MongoValidationAdmissionStore | migrated | 2 | -
-validation_reports | config | MongoValidationAdmissionStore | migrated | 2 | -
-validation_differences | config | MongoValidationResultStore | migrated | 2 | _id.report
+validation_tasks | config | MongoValidationAdmissionStore | migrated | 2 | _id.clusterId+_id.pipelineId+_id.taskId
+validation_reports | config | MongoValidationAdmissionStore | migrated | 2 | _id.clusterId+_id.pipelineId+_id.taskId+admission.mode+terminalMetadata.endedAt.seconds (desc)+terminalMetadata.endedAt.nanos (desc)+_id.runId
+validation_differences | config | MongoValidationResultStore | migrated | 2 | _id.report, _id.report+openVersion+_id.rootHash
 validation_runs | cache | MongoValidationControlStore | migrated | 2 | _id.clusterId+_id.pipelineId
 cache_identity | cache | MongoCacheIdentity | migrated | 1 | -
 schema_migrations | cache | MongoCacheIdentity | migrated | 1 | -
@@ -78,6 +78,7 @@ pipeline_observation | cache | MongoCachePipelineObservationStore | migrated | 1
 source_schemas | cache | MongoCacheSchemaStore | migrated | 1 | -
 connector_catalog | cache | MongoCacheConnectorCatalogStore | migrated | 1 | -
 connector_specs | cache | MongoCacheConnectorSpecStore | migrated | 1 | -
+connector_artifact_holdings | cache | MongoCacheConnectorArtifactHoldings | owned-elsewhere | 0 | -
 connection_test_results | cache | MongoCacheConnectionTestResultStore | migrated | 1 | -
 connector_artifacts (gridfs) | cache | MongoCacheConnectorRegistry | immutable | 1 | metadata.connectorId
 derived_schemas | cache | MongoCacheDerivedSchemaStore | migrated | 1 | -
@@ -88,6 +89,7 @@ join_facts | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
 join_dimensions | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
 join_indexes | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
 join_writers | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
+aggregate_state | cache | MongoCacheOperatorStateStore | migrated | 1 | _id.placement
 nest_shapes | cache | MongoCacheNestShapeStore | migrated | 1 | -
 operator_cleanup | cache | MongoOperatorInventory | migrated | 1 | _id.clusterId+_id.bindingVersion+_id.cacheIncarnation+databases.database
 sink_preparations | cache | MongoSinkPreparationStore | migrated | 1 | _id.scope.clusterId+_id.scope.bindingVersion+_id.scope.cacheIncarnation+_id.scope.pipelineId+_id.scope.stateGeneration
@@ -107,3 +109,4 @@ alert_target_limits | config | MongoAlertNotificationStore | migrated | 2 | _id.
 alert_test_quotas | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
 alert_node_lifecycles | config | MongoAlertNodeLifecycleStore | migrated | 1 | authorityId+clusterId+phase+nodeId+bootId
 ai_provider_settings | config | MongoConfigurationAiProviderSettingsStore | migrated | 2 | -
+retry_settings | config | MongoRetrySettingsStore | migrated | 1 | -

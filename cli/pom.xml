@@ -259,7 +259,7 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
 
       The bundled resources read at runtime via getResourceAsStream are not reachable in a native
       image unless declared: the connector catalog (/catalog/*.json), the grammar JSON Schema
-      (/schema/*.json), the message catalog (/messages/*.yml) and the local development stack's
+      (/schema/*.json), the message catalogs (/messages/*.yml and /messages/*.json) and the local development stack's
       compose file (/local-stack/*.yml), demo recipes (/demo/*.tap.yml) and blank recipes
       (/blank/*.tap.yml). They are declared here as IncludeResources globs.
       Reflection config for the picocli command tree comes from the picocli-codegen processor
@@ -297,7 +297,7 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
                 <!-- bundled resources read via getResourceAsStream, declared so the image keeps them -->
                 <buildArg>-H:IncludeResources=catalog/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=schema/.*\.json</buildArg>
-                <buildArg>-H:IncludeResources=messages/.*\.yml</buildArg>
+                <buildArg>-H:IncludeResources=messages/.*\.(yml|json)</buildArg>
                 <buildArg>-H:IncludeResources=local-stack/.*\.yml</buildArg>
                 <buildArg>-H:IncludeResources=demo/.*\.tap\.yml</buildArg>
                 <buildArg>-H:IncludeResources=blank/.*\.tap\.yml</buildArg>

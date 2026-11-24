@@ -4,8 +4,10 @@ import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.adapters.pdk.ConnectorIntrospector;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.pdk.LocalConnectorArtifacts;
 import io.tapstate.adapters.pdk.PdkCapabilityDeriver;
 import io.tapstate.adapters.pdk.PdkConnectionTester;
 import io.tapstate.adapters.pdk.PdkDataBrowser;
@@ -18,6 +20,7 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
+import io.tapstate.control.core.AggregateSizingAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.ExecutionAdvisories;
 import io.tapstate.control.core.PlanAdvisories;
@@ -77,6 +80,7 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.ResourceAttributionPolicy;
 import io.tapstate.control.core.StateDatabasePolicy;
 import io.tapstate.control.core.DataBrowserFollows;
+import io.tapstate.control.core.AggregateStepChecks;
 import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.SourceConnectionResolver;
@@ -118,6 +122,7 @@ import io.tapstate.spi.store.DataBrowser;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.messages.ExplanationCatalog;
 import io.tapstate.messages.MessageCatalog;
+import io.tapstate.messages.ConnectionDiagnosticCatalog;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -426,8 +431,14 @@ class ControlPlaneConfiguration {
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories(),
-                        new ExecutionAdvisories()),
-                derivation, livePipelines, attribution, stateDatabasePolicy);
+                        new ExecutionAdvisories(),
+                        // What each aggregate step will keep in state. Said for every one, since the
+                        // state is the only copy of what its totals come from and its size is known
+                        // from the definition before anything is deployed.
+                        new AggregateSizingAdvisories()),
+                derivation, livePipelines, attribution, stateDatabasePolicy,
+                stateDatabasePolicy == StateDatabasePolicy.CLOUD ? DeploymentProfile.CLOUD : DeploymentProfile.ON_PREM,
+                connectorCatalogView::detail);
     }
 
     /** Preserves the direct assembly seam used by focused on-prem wiring tests. */
@@ -498,6 +509,13 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    AggregateStepChecks aggregateStepChecks(ObjectProvider<HazelcastInstance> member, AuditGate auditGate) {
+        // Answered by the running step on whichever member runs it; a node with no data plane has no
+        // member to ask through and says the step is not running.
+        return new ClusterAggregateStepChecks(member.getIfAvailable(), auditGate);
+    }
+
+    @Bean
     SourceDraftService sourceDraftService(ConnectorCatalogView connectorCatalogView) {
         return new SourceDraftService(connectorCatalogView::merged);
     }
@@ -506,9 +524,31 @@ class ControlPlaneConfiguration {
     // control-core service -> runtime probe -> adapter-pdk tester -> provisioner -> connector registry.
     // The PDK types stay inside the adapter-pdk beans; the runtime and control rings see only ports.
 
+    @Bean(destroyMethod = "close")
+    LocalConnectorRuntime localConnectorRuntime(StorePort storePort, ConnectorIntrospector introspector,
+            ConnectorPluginProperties properties, ClusterProperties cluster, ConnectorCatalogStore catalog,
+            ConnectorSpecStore specs, ConnectorCatalogBackground support, CloudRuntimeSettings cloud) throws java.io.IOException {
+        if (!(storePort instanceof ThreeLayerStorePort backed) || cluster.getProfile() != ClusterProperties.Profile.SINGLE)
+            return null;
+        if (cloud.cloud() && !java.nio.file.Files.isRegularFile(
+                properties.getSeedDir().toAbsolutePath().normalize().resolveSibling("release").resolve("connectors.lock.json")))
+            return null;
+        var local = new LocalConnectorArtifacts(properties.getPluginsDir(), introspector, catalog, specs,
+                backed.connectorHoldings(), cluster.getNodeId() == null ? "single-member" : cluster.getNodeId().trim(),
+                backed::copyLegacyConnectorArtifact, () -> java.util.stream.Stream.concat(
+                        support.admittedIds().stream(), properties.getAlsoAcceptIds().stream()).distinct().toList(),
+                ConnectorCatalogBackground.hostApiVersion());
+        return new LocalConnectorRuntime(local, properties.getSeedDir(), cloud.cloud() ? null : properties.getDropDir(),
+                () -> local.reclaim(support.loaderRetirementEligibleIds(), backed::retainedConnectorArtifacts));
+    }
+
     @Bean
-    ConnectorRegistry connectorRegistry(StorePort storePort) {
-        return storePort.connectors();
+    ConnectorRegistry connectorRegistry(StorePort storePort, ConnectorCatalogStore catalog,
+                                        ConnectorPluginProperties properties, CloudRuntimeSettings cloud,
+                                        org.springframework.beans.factory.ObjectProvider<LocalConnectorRuntime> local) {
+        var runtime = local.getIfAvailable();
+        if (runtime != null) return runtime.artifacts().registryView();
+        return cloud.cloud() ? new BundledConnectorRegistry(catalog, properties.getSeedDir()) : storePort.connectors();
     }
 
     @Bean
@@ -522,18 +562,21 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    CapabilityDeriver capabilityDeriver(ConnectorProvisioner provisioner) {
+    PdkCapabilityDeriver capabilityDeriver(ConnectorProvisioner provisioner) {
         return new PdkCapabilityDeriver(provisioner);
     }
 
     @Bean
     ConnectorCatalogView connectorCatalogView(
             ConnectorCatalogStore connectorCatalogStore, ConnectorSpecStore connectorSpecStore,
-            ConnectorRegistry connectorRegistry) {
+            ConnectorRegistry connectorRegistry, CloudRuntimeSettings cloud, ConnectorCatalogBackground support,
+            org.springframework.beans.factory.ObjectProvider<LocalConnectorRuntime> local) {
         // The online catalog view = the bundled snapshot overlaid with the rows derived for registered
         // connectors, read live; the offline native CLI keeps reading only the bundled snapshot.
-        return new ConnectorCatalogView(
-                TapstateCatalog.load(), connectorCatalogStore, connectorSpecStore, connectorRegistry);
+        var runtime = local.getIfAvailable();
+        return new ConnectorCatalogView(TapstateCatalog.load(),
+                runtime == null ? connectorCatalogStore : runtime.view(connectorCatalogStore, support),
+                connectorSpecStore, connectorRegistry, cloud.cloud() || runtime != null);
     }
 
     @Bean
@@ -548,39 +591,67 @@ class ControlPlaneConfiguration {
 
     @Bean
     ConnectorProvisioner connectorProvisioner(
-            ConnectorRegistry registry, ConnectorIntrospector introspector, ConnectorPluginProperties properties) {
-        return new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir(), properties.getSeedDir());
+            ConnectorRegistry registry, ConnectorIntrospector introspector, ConnectorPluginProperties properties,
+            CloudRuntimeSettings cloud, org.springframework.beans.factory.ObjectProvider<LocalConnectorRuntime> local) {
+        var runtime = local.getIfAvailable();
+        if (runtime != null) return runtime.artifacts();
+        return new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir(),
+                properties.getSeedDir(), cloud.cloud());
     }
 
     // The startup seed sweep: the release's connectors/ directory goes through the same
     // register-if-absent path an explicit register uses, so restarts and concurrent nodes are harmless.
 
+    @Bean(initMethod = "start", destroyMethod = "close")
+    ConnectorCatalogBackground connectorCatalogBackground(ConnectorPluginProperties properties, Clock clock) {
+        return new ConnectorCatalogBackground(properties.getPluginsDir().toAbsolutePath().normalize().getParent(), clock);
+    }
+
+    @Bean(destroyMethod = "close")
+    ConnectorCenterRuntime connectorCenterRuntime(ConnectorCatalogBackground remote, CloudRuntimeSettings cloud,
+            org.springframework.beans.factory.ObjectProvider<LocalConnectorRuntime> local) {
+        var runtime = local.getIfAvailable();
+        return runtime == null ? null : new ConnectorCenterRuntime(remote, runtime.artifacts(), cloud.cloud());
+    }
+
+    @Bean
+    io.tapstate.control.core.ConnectorCenterService connectorCenterService(AuditGate audit,
+            org.springframework.beans.factory.ObjectProvider<ConnectorCenterRuntime> center) {
+        var runtime = center.getIfAvailable();
+        return runtime == null ? null : new io.tapstate.control.core.ConnectorCenterService(runtime, audit);
+    }
+
     @Bean
     ConnectorArtifactRegistrar connectorArtifactRegistrar(
             ConnectorRegistry registry, ConnectorIntrospector introspector,
             CapabilityDeriver capabilityDeriver, ConnectorCatalogStore connectorCatalogStore,
-            ConnectorSpecStore connectorSpecStore, ConnectorPluginProperties properties) {
+            ConnectorSpecStore connectorSpecStore, ConnectorPluginProperties properties, ConnectorCatalogBackground catalog) {
         return new ConnectorArtifactRegistrar(
                 registry, introspector, capabilityDeriver, connectorCatalogStore, connectorSpecStore,
-                properties.getAlsoAcceptIds());
+                catalog::admittedIds, properties.getAlsoAcceptIds());
     }
 
     @Bean
-    SeedConnectorSweep seedConnectorSweep(ConnectorArtifactRegistrar registrar) {
-        return new SeedConnectorSweep(registrar, Math.max(1, Runtime.getRuntime().availableProcessors()));
+    SeedConnectorSweep seedConnectorSweep(ConnectorArtifactRegistrar registrar, PdkCapabilityDeriver deriver,
+                                         CloudRuntimeSettings cloud) {
+        int workers = Math.max(1, Runtime.getRuntime().availableProcessors());
+        return cloud.cloud() ? new SeedConnectorSweep(artifact -> registrar.registerBundled(artifact, deriver), workers)
+                : new SeedConnectorSweep(registrar, workers);
     }
 
     @Bean
     SeedSweepRunner seedSweepRunner(
             SeedConnectorSweep sweep, ConnectorPluginProperties properties, CloudRuntimeSettings cloud,
             ConnectorRegistry registry, ConnectorCatalogStore catalog, ConnectorSpecStore specs, CapabilityDeriver deriver,
-            org.springframework.core.env.Environment environment) {
+            ConnectorCatalogBackground support, org.springframework.core.env.Environment environment,
+            org.springframework.beans.factory.ObjectProvider<LocalConnectorRuntime> local) {
+        var runtime = local.getIfAvailable();
         var readiness = cloud.cloud()
                 ? CloudConnectorSeedReadiness.checkedRelease(
-                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver,
+                        properties.getSeedDir(), registry, runtime == null ? catalog : runtime.view(catalog, support), specs, deriver,
                         "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY)))
                 : null;
-        return new SeedSweepRunner(sweep, properties.getSeedDir(), readiness);
+        return new SeedSweepRunner(sweep, properties.getSeedDir(), readiness, runtime);
     }
 
     @Bean
@@ -598,20 +669,28 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    ConnectorRegisterService connectorRegisterService(ConnectorArtifactRegistrar registrar, AuditGate auditGate) {
-        // The register verb reaches the distribution store through the same registrar the seed sweep uses; it
-        // implements the spi ingestion port, so control-core drives it without depending on the adapters ring.
-        return new ConnectorRegisterService(registrar, auditGate);
+    ConnectorRegisterService connectorRegisterService(ConnectorArtifactRegistrar registrar, AuditGate auditGate,
+                                                       CloudRuntimeSettings cloud,
+                                                       org.springframework.beans.factory.ObjectProvider<LocalConnectorRuntime> local) {
+        var runtime = local.getIfAvailable();
+        return new ConnectorRegisterService(cloud.cloud() ? (artifact, source) -> {
+            throw new io.tapstate.core.common.TapstateException(ConnectorError.CLOUD_UPLOAD_DISABLED, java.util.Map.of(), null);
+        } : runtime == null ? registrar : runtime.artifacts(), auditGate);
     }
 
     @Bean
     ConnectionTester connectionTester(ConnectorProvisioner provisioner, Clock clock,
             org.springframework.beans.factory.ObjectProvider<DefaultSourceVerification> verification,
-            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots) {
+            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots,
+            org.springframework.beans.factory.ObjectProvider<IsolatedConnectionDiagnostics.Active> diagnostics) {
         java.util.function.Predicate<io.tapstate.spi.store.ConnectionConfig> managed = config -> {
             var current = verification.getIfAvailable(); return current != null && current.manages(config);
         };
         var slot = slots.getIfAvailable();
+        if (diagnostics.getIfAvailable() != null) {
+            return new PdkConnectionTester(provisioner, clock, managed, java.util.Objects.requireNonNull(slot),
+                    org.springframework.context.i18n.LocaleContextHolder::getLocale);
+        }
         return slot == null ? new PdkConnectionTester(provisioner, clock, managed) : new PdkConnectionTester(provisioner, clock, managed, slot);
     }
 
@@ -629,7 +708,8 @@ class ControlPlaneConfiguration {
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections,
-            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers, ConnectionTester tester) {
+            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers, ConnectionTester tester,
+            org.springframework.beans.factory.ObjectProvider<IsolatedConnectionDiagnostics.Active> diagnostics) {
         var observer = observers.getIfAvailable(() -> ignored -> ConnectionTestService.Attempt.NONE);
         var guarded = new ConnectionTestService.Observer() {
             @Override public boolean manages(io.tapstate.spi.store.ConnectionConfig config) { return observer.manages(config); }
@@ -640,7 +720,15 @@ class ControlPlaneConfiguration {
                 return observer.begin(config);
             }
         };
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections, guarded);
+        var catalog = MessageCatalog.bundled();
+        boolean candidate = diagnostics.getIfAvailable() != null;
+        java.util.function.UnaryOperator<String> testText = candidate
+                ? text -> catalog.renderConnectorTestText(text, org.springframework.context.i18n.LocaleContextHolder.getLocale())
+                : catalog::renderConnectorTestText;
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections,
+                guarded, testText, !candidate ? ignored -> java.util.Map.of()
+                        : failure -> ConnectionDiagnosticCatalog.bundled().snapshot(failure,
+                                org.springframework.context.i18n.LocaleContextHolder.getLocale()));
     }
 
     @Bean
@@ -769,7 +857,7 @@ class ControlPlaneConfiguration {
             PipelineObservationQueryService observations,
             StorePort storePort) {
         return new PipelineCatalogService(
-                artifacts, pipelineDrafts, storePort.desired(), observations,storePort::pipelineRecoveryRequired);
+                artifacts, pipelineDrafts, observations, storePort);
     }
 
     @Bean
@@ -838,9 +926,15 @@ class ControlPlaneConfiguration {
             PipelineWriteTargets pipelineWriteTargets, StorePort storePort, DataBrowserService dataBrowserService,
             ApplyService applyService, AuditGate auditGate, Clock clock, ConnectorProvisioner connectorProvisioner) {
         MessageCatalog catalog = MessageCatalog.bundled();
+        var meta = storePort.meta();
+        var planner = storePort instanceof ThreeLayerStorePort nativeStore
+                && pipelineChains instanceof StoreBackedPipelineChains chains
+                && pipelineWriteTargets instanceof StoreBackedPipelineWriteTargets targets
+                ? new StartPlanner((pipeline, scope) -> targets.capture(nativeStore, chains, pipeline, scope))
+                : new StartPlanner(pipelineChains, meta, pipelineWriteTargets);
         StartCheckEvaluator evaluator = new StartCheckEvaluator(StartChecks.registered(
                 new StoreBackedTargetIdentities(storePort, connectorProvisioner)),
-                new StartPlanner(pipelineChains, storePort.meta(), pipelineWriteTargets),
+                planner,
                 new DataBrowserTargetProbe(dataBrowserService),
                 (code, params) -> catalog.render(code, params).message(),
                 Executors.newVirtualThreadPerTaskExecutor(), clock);
@@ -889,8 +983,10 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    PipelineLogQueryService pipelineLogQueryService(LogSink logSink) {
-        return new PipelineLogQueryService(logSink);
+    PipelineLogQueryService pipelineLogQueryService(LogSink logSink, ObjectProvider<NativeBusinessContext> business) {
+        var nativeContext = business.getIfAvailable();
+        return nativeContext == null ? new PipelineLogQueryService(logSink)
+                : PipelineLogQueryService.scoped(logSink, nativeContext::pipelineLogWindow);
     }
 
     @Bean

@@ -20,8 +20,36 @@ interface NestStateGauge {
      * been seen holding for something that has not arrived. It travels with the rest because it is about the
      * same namespace and is wanted at the same time, not because it means the same kind of thing.
      */
+    /** Leaves {@code namespace}'s weight readings; a gauge that keeps none ignores them. */
+    default void weightReading(String namespace, NestStateStats.Weight weight) {
+    }
+
     void reading(String namespace, long entries, long accesses, long backfills, long backfillMillis,
             long pendingHighWater);
+
+    default void keyAccess(String namespace, io.tapstate.core.lifecycle.NestKeyAccess reading) {
+        if (reading.available()) keyReading(namespace, reading.attempts(), reading.coldLoads());
+    }
+
+    /** Called on the processor thread; the returned publisher may run on a partition loader. */
+    default java.util.function.Consumer<io.tapstate.core.lifecycle.NestKeyAccess> keyPublisher(String namespace) {
+        return reading -> keyAccess(namespace, reading);
+    }
+
+    /**
+     * How the namespace's state has been made durable since its counting began, and how many entries memory
+     * has let go of. Left only once the namespace has committed something.
+     */
+    default void commitReading(String namespace, NestStateStats.Commits commits, long evictions) {
+    }
+
+    /**
+     * How many whole documents the root level has sent since the run began. Only a level that renders
+     * documents ever leaves one; every other namespace leaves none, which is absence rather than zero.
+     * {@code countingSinceMillis} is when the count began, in epoch milliseconds.
+     */
+    default void rootsReading(String namespace, long rootsRendered, long countingSinceMillis) {
+    }
 
     /** Additional key-unit instruments; existing gauges may continue to publish only legacy readings. */
     default void keyReading(String namespace, long keyAccesses, long coldKeys) {
