@@ -156,6 +156,28 @@ class ADocumentFollowsTheFirstAlternativeThatMatchesTest {
                 .containsEntry(5, "-");
     }
 
+    @Test
+    void aReferencedPrimaryKeyMoveWakesExistingWalletsAndPreservesImmediateKeyReuse() {
+        var ada = row("loc_id", 100, "name", "Ada");
+        var moved = row("loc_id", 200, "name", "Ada");
+        var movedAgain = row("loc_id", 300, "name", "Ada");
+        var location = new Embed("l", Map.of("loc_id", "location_id"), EmbedAs.OBJECT, "location",
+                null, null, null, null);
+        run(location, List.of(Envelope.insert(1, LOCATIONS, ada, null)), List.of(
+                Envelope.insert(1, WALLETS, row("wallet_id", 1, "location_id", 100), null),
+                Envelope.insert(2, WALLETS, row("wallet_id", 2, "location_id", 200), null),
+                Envelope.insert(3, WALLETS, row("wallet_id", 3, "location_id", 300), null)));
+        await(() -> locationOf(1).equals("Ada"));
+
+        feed(LOCATIONS, Envelope.update(2, LOCATIONS, ada, moved, null));
+        await(() -> locationOf(1).equals("-") && locationOf(2).equals("Ada"));
+
+        feed(LOCATIONS, Envelope.update(3, LOCATIONS, moved, movedAgain, null));
+        feed(LOCATIONS, Envelope.insert(4, LOCATIONS, row("loc_id", 200, "name", "Grace"), null));
+        await(() -> locationOf(2).equals("Grace") && locationOf(3).equals("Ada"));
+        assertThat(latestByWallet()).containsEntry(1, "-").containsEntry(2, "Grace").containsEntry(3, "Ada");
+    }
+
     // ---- the job under test ------------------------------------------------------------
 
     /** Rows each source is due to send next, fed while the job runs. Static: the sources run on the member. */
@@ -166,12 +188,16 @@ class ADocumentFollowsTheFirstAlternativeThatMatchesTest {
     }
 
     private void run(List<Envelope> locations, List<Envelope> wallets) {
+        Embed location = new Embed("l", Map.of("locn_code", "loc_code"), EmbedAs.OBJECT, "location", null,
+                null, null, null, null, List.of(Map.of("hub_locn_id", "hub_id")));
+        run(location, locations, wallets);
+    }
+
+    private void run(Embed location, List<Envelope> locations, List<Envelope> wallets) {
         QUEUED.clear();
         locations.forEach(event -> feed(LOCATIONS, event));
         wallets.forEach(event -> feed(WALLETS, event));
 
-        Embed location = new Embed("l", Map.of("locn_code", "loc_code"), EmbedAs.OBJECT, "location", null,
-                null, null, null, null, List.of(Map.of("hub_locn_id", "hub_id")));
         TransformBody.Nest body = new TransformBody.Nest(null, null,
                 new NestRoot("w", List.of("wallet_id"), null, null, List.of(location)));
 

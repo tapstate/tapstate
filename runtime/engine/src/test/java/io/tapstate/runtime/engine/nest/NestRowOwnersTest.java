@@ -20,7 +20,14 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class NestRootInputsTest {
+class NestRowOwnersTest {
+    @Test
+    void aPartialUpdateCannotProveTheRowVacatedItsKey() throws Exception {
+        var withoutOldKey = Envelope.update(1, "customers", Map.of("name", "Ada"), Map.of("id", 2), null);
+        var withoutNewKey = Envelope.update(2, "customers", Map.of("id", 2), Map.of("name", "Grace"), null);
+        assertThat(throughOneSlot(withoutOldKey, withoutNewKey)).containsExactly(withoutOldKey, withoutNewKey);
+    }
+
     @Test
     void aRefusedArrivalStaysAheadOfOldKeyReuseAndTheProgressMarker() throws Exception {
         var position = new ChainPosition(new SourceOrder(1, 9), "p9");
@@ -58,8 +65,7 @@ class NestRootInputsTest {
     }
 
     private static List<Object> throughOneSlot(Object... items) throws Exception {
-        var root = new NestInbound(0, "customers", List.of(), List.of("id"), List.of("id"), true, "customers");
-        var processor = new NestRootInputs(root, "root-input-test");
+        var processor = new NestRowOwners(List.of("id"), "root-input-test");
         var outbox = new TestOutbox(new int[] {1, 1}, 1);
         processor.init(outbox, new TestProcessorContext());
         var inbox = new TestInbox(List.of(items));

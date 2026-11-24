@@ -171,8 +171,8 @@ public final class NestDag {
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
-        draw(dag, source, vertex, LookupProcessor.ROWS,
-                fieldKey(lookup.partitionKey(), lookup.mapName()), nextOutbound, width);
+        connectRowOwners(dag, vertex, source, lookup.partitionKey(), lookup.mapName(), LookupProcessor.ROWS,
+                ":row-owners", nextOutbound, width);
 
         List<Vertex> referrers = upstream.apply(lookup.referrerAlias());
         if (referrers == null || referrers.isEmpty()) {
@@ -192,14 +192,6 @@ public final class NestDag {
         // by what it carries, which lands it beside its twin, and is refused there rather than passed over.
         draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
                 leavingKey(lookup.referenceFields(), lookup.mapName()), nextOutbound, width);
-        if (lookup.alternative()) {
-            // Keyed by the alternative value each row held before, so a row that moved to another value is
-            // taken out from under the one it left by the instance holding that entry. Only an alternative
-            // needs it: everywhere else rows are filed by what identifies them, which an edit does not move.
-            draw(dag, source, vertex, LookupProcessor.DEPARTED_ROWS,
-                    leavingKey(lookup.partitionKey(), lookup.mapName()), nextOutbound, width);
-        }
-
         Vertex pointing = built.get(lookup.referrerPathId());
         if (pointing == null) {
             throw new IllegalStateException("nothing was built for the level pointing at "
@@ -273,20 +265,27 @@ public final class NestDag {
         }
         Vertex source = sources.size() == 1 ? sources.get(0)
                 : merged(dag, destination, rows, sources, nextOutbound, frontier);
-        Vertex owners = dag.newVertex(destination.getName() + ":root-owners",
+        Vertex owners = connectRowOwners(dag, destination, source, rows.keyFields(), namespace, rows.ordinal(),
+                ":root-owners", nextOutbound, width);
+        // Retain the logical control input and its frontier coverage. Data uses only output zero.
+        dag.edge(width.into(Edge.from(owners, 1).to(destination, departures.ordinal()),
+                destination.getName(), (Object item) -> SETTLED_POSITIONS_LANE));
+    }
+
+    private static Vertex connectRowOwners(DAG dag, Vertex destination, Vertex source, List<String> keyFields,
+            String namespace, int ordinal, String suffix, ToIntFunction<Vertex> nextOutbound, NodeWidth width) {
+        Vertex owners = dag.newVertex(destination.getName() + suffix,
                 ProcessorMetaSupplier.of(source.getMetaSupplier().preferredLocalParallelism(),
-                        () -> new NestRootInputs(rows, namespace)))
+                        () -> new NestRowOwners(keyFields, namespace)))
                 .localParallelism(source.getLocalParallelism());
         dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(owners).isolated());
         FunctionEx<Object, Object> key = item -> {
             if (item instanceof SettledPositions) return SETTLED_POSITIONS_LANE;
             if (item instanceof Tuple2<?, ?> departure) return departure.f0();
-            return NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), rows.keyFields(), namespace);
+            return NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), keyFields, namespace);
         };
-        dag.edge(width.into(Edge.from(owners, 0).to(destination, rows.ordinal()), destination.getName(), key));
-        // Retain the logical control input and its frontier coverage. Data uses only output zero.
-        dag.edge(width.into(Edge.from(owners, 1).to(destination, departures.ordinal()),
-                destination.getName(), (Object item) -> SETTLED_POSITIONS_LANE));
+        dag.edge(width.into(Edge.from(owners, 0).to(destination, ordinal), destination.getName(), key));
+        return owners;
     }
 
     private static void connect(DAG dag, Vertex destination, NestInbound edge, Map<List<String>, Vertex> built,
