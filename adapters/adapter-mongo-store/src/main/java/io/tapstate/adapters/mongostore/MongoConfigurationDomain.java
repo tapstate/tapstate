@@ -691,7 +691,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public record PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
             Optional<io.tapstate.core.lifecycle.DesiredState> desired,
             Optional<TapstateException> intentFailure, boolean recovering, Optional<IoError> startFailure,
-            long intentRevision, Map<String, String> startFailureParams) {
+            long intentRevision, Map<String, String> startFailureParams, boolean completedStopClear) {
         public PipelineDisplayHeader {
             startFailureParams = Map.copyOf(startFailureParams);
         }
@@ -699,7 +699,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
                 Optional<io.tapstate.core.lifecycle.DesiredState> desired, Optional<TapstateException> intentFailure,
                 boolean recovering, Optional<IoError> startFailure, long intentRevision) {
-            this(mapping, preparation, desired, intentFailure, recovering, startFailure, intentRevision, Map.of());
+            this(mapping, preparation, desired, intentFailure, recovering, startFailure, intentRevision, Map.of(), false);
         }
 
         public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
@@ -745,7 +745,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             var mapping = MongoPipelineStateMappings.decode(id, row);
             if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE) continue;
             var preparation = MongoPipelinePreparationFacts.decode(id, row, clusterId);
-            result.put(id, readDisplayHeader(mapping, preparation, row.containsKey("cacheRecovery"),
+            result.put(id, readDisplayHeader(row, mapping, preparation, row.containsKey("cacheRecovery"),
                     intentsById.get(id), intentScope, intentReader));
         }
         return Map.copyOf(result);
@@ -768,7 +768,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
     }
 
-    private static PipelineDisplayHeader readDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
+    private static PipelineDisplayHeader readDisplayHeader(Document row, PipelineStateMapping mapping, PipelinePreparation preparation,
             boolean recovering, Document intent, DisplayIntentScope scope, MongoPipelineIntentStore reader) {
         if (intent == null) return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.empty(), recovering);
         try {
@@ -780,7 +780,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     ? MongoPipelineIntentStore.startFailure(intent) : Optional.<IoError>empty();
             var params = code.map(value -> MongoPipelineIntentStore.startFailureParams(intent, value)).orElseGet(Map::of);
             return new PipelineDisplayHeader(mapping, preparation, Optional.of(snapshot.desired()), Optional.empty(), recovering,
-                    code, snapshot.intentRevision(), params);
+                    code, snapshot.intentRevision(), params,
+                    MongoPipelineStateRebuilds.completedStopClear(row, preparation, snapshot));
         } catch (TapstateException malformed) {
             if (malformed.code() != IoError.DOCUMENT_UNREADABLE) throw malformed;
             return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.of(malformed), recovering);

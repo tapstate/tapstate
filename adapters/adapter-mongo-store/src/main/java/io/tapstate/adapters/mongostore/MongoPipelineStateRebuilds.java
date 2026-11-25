@@ -8,6 +8,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.*;
 import org.bson.Document;
@@ -309,6 +310,18 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
     private void requireHandle(Pending pending) {
         if (pending.owner.client != client || !pending.owner.database.getName().equals(database.getName()) || !pending.owner.clusterId.equals(clusterId)) throw fenced();
         pending.owner.requireActive.run();
+    }
+
+    /** Reads the receipt from the mapping already loaded with the current intent. */
+    static boolean completedStopClear(Document mapping, PipelinePreparation prepared, PipelineIntentSnapshot intent) {
+        if (intent.desired().targetState() != PipelineState.STOPPED || intent.desired().purgeState()
+                || !prepared.scope().equals(intent.scope())
+                || !(mapping.get("stateRebuild") instanceof Document annex)
+                || !Integer.valueOf(2).equals(annex.get("formatVersion"))
+                || !(annex.get("result") instanceof Document result)
+                || !Long.valueOf(intent.intentRevision()).equals(result.get("intentRevision"))) return false;
+        requireCompletedPrior(mapping, prepared);
+        return true;
     }
 
     static void requireCompletedPrior(Document mapping, PipelinePreparation prepared) {

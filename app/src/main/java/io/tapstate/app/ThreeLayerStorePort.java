@@ -390,7 +390,7 @@ final class ThreeLayerStorePort implements StorePort {
                             && current.preparation().equals(header.preparation())) {
                         result.put(entry.getKey(), new PipelineCatalogState(entry.getValue().observation(),
                                 header.desired(), header.intentFailure(), entry.getValue().runningObservationUnavailable(),
-                                entry.getValue().checkpoint(), activeScope(entry.getKey(), header.mapping())));
+                                entry.getValue().checkpoint(), activeScope(entry.getKey(), header.mapping()), header.completedStopClear()));
                     }
                 }
             }
