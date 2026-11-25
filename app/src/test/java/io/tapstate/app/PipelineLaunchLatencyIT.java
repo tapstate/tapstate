@@ -449,7 +449,7 @@ class PipelineLaunchLatencyIT {
                                 });
                         var consumers = (SrsConsumerStore) java.lang.reflect.Proxy.newProxyInstance(SrsConsumerStore.class.getClassLoader(),
                                 new Class<?>[]{SrsConsumerStore.class}, (proxy, method, arguments) -> {
-                                    if (method.getName().equals("attachedWithChain")
+                                    if (method.getName().equals("retentionSnapshot")
                                             && Thread.currentThread().getName().startsWith("tapstate-capture-owner-")) {
                                         blocked.set(true); entered.countDown();
                                         try { release.await(); }
