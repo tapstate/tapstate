@@ -1,5 +1,5 @@
 # Build one Cloud cluster image from the branch pair an operator selects, then publish it
-# as ghcr.io/tapstate/tapstate-cloud:<next minor>-dev.
+# as ghcr.io/tapstate/tapstate-cloud:<next minor>-dev-<manifest hash>.
 #
 # The Tapstate branch supplies the server and its packaging scripts; the tapstate-web branch
 # supplies the Cloud Web bundle. Both are read at the exact commits checked out here, so the
@@ -208,7 +208,14 @@ jobs:
             "$RUNNER_TEMP/cloud-layout/index.json")"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - name: publish the verified dev image
+      - name: load the temporary image publisher from the workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: workflow-tools
+          sparse-checkout: deploy/cloud
+          persist-credentials: false
+      - name: publish the verified temporary image
         id: publish
         env:
           CLOUD_GHCR_USERNAME: ${{ vars.CLOUD_GHCR_USERNAME }}
@@ -218,7 +225,7 @@ jobs:
           DIGEST: ${{ steps.verify.outputs.digest }}
         run: |
           set -euo pipefail
-          bash deploy/cloud/ghcr-publish.sh publish-dev \
+          bash workflow-tools/deploy/cloud/ghcr-publish.sh publish-temporary \
             --archive "$RUNNER_TEMP/cloud-image.tar" \
             --version "$VERSION" --expected-digest "$DIGEST"
       - name: report the cluster image
@@ -247,4 +254,4 @@ jobs:
               image: $image, imageTag: $imageTag, imageDigest: $imageDigest,
               webCommitId: $webCommitId, actionUri: $actionUri}')"
           printf 'json=%s\n' "$json" >> "$GITHUB_OUTPUT"
-          printf '```json\n%s\n```\n' "$json" >> "$GITHUB_STEP_SUMMARY"
+          printf '~~~json\n%s\n~~~\n' "$json" >> "$GITHUB_STEP_SUMMARY"
