@@ -12,7 +12,12 @@ import java.util.List;
 sealed interface LogsOutcome {
 
     /** The read found the pipeline's recent log lines, oldest to newest; empty when it has logged nothing. */
-    record Found(String pipelineId, List<RemoteLogLine> lines) implements LogsOutcome {
+    record Found(String pipelineId, List<RemoteLogLine> lines, RemoteLogCursor nextCursor, boolean truncated)
+            implements LogsOutcome {
+
+        Found(String pipelineId, List<RemoteLogLine> lines) {
+            this(pipelineId, lines, null, false);
+        }
 
         public Found {
             lines = lines == null ? List.of() : List.copyOf(lines);

@@ -50,6 +50,23 @@ class PipelineLogQueryServiceTest {
     }
 
     @Test
+    void pagesStrictlyAfterTheReportedCursor() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+        sink.append("orders_sync", line("first"));
+        sink.append("orders_sync", line("second"));
+        sink.append("orders_sync", line("third"));
+        var service = new PipelineLogQueryService(sink);
+
+        PipelineLogs first = service.logs("orders_sync", null, 2);
+        PipelineLogs second = service.logs("orders_sync", first.nextCursor(), 2);
+
+        assertThat(first.lines()).extracting(LogLine::message).containsExactly("second", "third");
+        assertThat(first.nextCursor()).isNotNull();
+        assertThat(second.lines()).isEmpty();
+        assertThat(second.nextCursor()).isEqualTo(first.nextCursor());
+    }
+
+    @Test
     void scopesTheTailBeforeApplyingTheLimitAndHidesRetiredPipelines() {
         RingBufferLogSink sink = new RingBufferLogSink(8, 8);
         sink.append("orders_sync", 3, line("retired"));
@@ -104,6 +121,29 @@ class PipelineLogQueryServiceTest {
 
         assertThat(service.logs("orders").lines()).isEmpty();
         assertThat(scopes.get()).isEqualTo(3);
+
+    }
+
+    @Test
+    void cursorPagesHidePredecessorsAndResetAfterARecreatedLifetime() {
+        var sink = new RingBufferLogSink(8, 8);
+        var window = new java.util.concurrent.atomic.AtomicReference<>(new LogWindow(2, 2));
+        sink.append("orders", 1, line("retired"));
+        sink.append("orders", 2, line("current"));
+        var service = PipelineLogQueryService.scoped(sink, id -> Optional.of(window.get()));
+
+        PipelineLogs first = service.logs("orders", null, 1);
+        sink.append("orders", 2, line("next"));
+        sink.append("orders", 1, line("late predecessor"));
+        PipelineLogs next = service.logs("orders", first.nextCursor(), 10);
+        assertThat(next.lines()).extracting(LogLine::message).containsExactly("next");
+
+        sink.append("orders", 3, line("replacement"));
+        window.set(new LogWindow(3, 3));
+        PipelineLogs recreated = service.logs("orders", next.nextCursor(), 10);
+        assertThat(recreated.lines()).extracting(LogLine::message).containsExactly("replacement");
+        assertThat(recreated.truncated()).isTrue();
+        assertThat(service.logs("orders", recreated.nextCursor(), 10).lines()).isEmpty();
     }
 
     @Test
