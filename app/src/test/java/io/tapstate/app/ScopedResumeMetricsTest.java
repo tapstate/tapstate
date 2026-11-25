@@ -288,6 +288,7 @@ class ScopedResumeMetricsTest {
             when(root.forRun(eq(SCOPE), any(), any())).thenAnswer(call -> capture(call.getArgument(2)));
             var engine = new Engine(member);
             var dags = mock(DagSource.class);
+            when(dags.prepareStart(any(PipelineConvergencePass.class), eq("cache"), any())).thenCallRealMethod();
             var coordinates = OperatorCoordinatePlan.compile(SCOPE, (PipelineResource) artifacts.get(ID).orElseThrow(),
                     "cache", step -> null, Map.of(), NestSettings.defaults());
             when(dags.prepareStart(any(PipelineConvergencePass.class), eq("cache"))).thenReturn(
@@ -333,9 +334,12 @@ class ScopedResumeMetricsTest {
 
         private PipelineCaptureCoordinator capture(ExecutionFence execution) {
             var bound = mock(PipelineCaptureCoordinator.class);
+            when(bound.prepareCaptureStart(eq(ID), any(ArtifactStore.class), any(SourceModelSnapshot.class)))
+                    .thenCallRealMethod();
             when(bound.loadDelivered(ID)).thenAnswer(call -> loaded);
             when(bound.snapshotProgress(ID)).thenReturn(SnapshotReading.NONE);
             when(bound.runSnapshotProgress(ID)).thenReturn(SnapshotReading.NONE);
+            when(bound.measurements(eq(ID), any(), any(Instant.class))).thenCallRealMethod();
             when(bound.captureBindings()).thenReturn(new PipelineCaptureBindings(execution, Map.of(), false));
             doAnswer(call -> {
                 if (waitForRing) throw new RingNotOpenYet(new CaptureId("capture"));
