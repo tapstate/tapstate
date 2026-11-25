@@ -10,7 +10,6 @@ import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.dsl.aggregate.AggregateDefinition;
 import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.lifecycle.AwaitedLoad;
-import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
@@ -675,10 +674,9 @@ public final class PipelineDagBuilder {
     /**
      * Draws a sink that runs the same number of writers on every member, and the router in front of it.
      *
-     * <p>The router takes the sink's rows over a distributed edge partitioned by target table or row key.
-     * A keyed table's snapshot rows then go to whichever writer has room. Changes follow the same partition
-     * on both edges to keep their order. By default, a target table's changes stay together so updates can
-     * change keys. Both vertices use the sink's planned width and refuse any other member count.
+     * <p>A copy that can coordinate moves gathers a physical table's changes at its dispatcher before
+     * distributing them by row to the writers. Other inputs retain row partitioning on both edges.
+     * Keyed snapshot rows spread across available writers for either path.
      *
      * <p>A writer takes rows from every router instance over both edges, so it goes by bounds, combined over
      * the two edges - each of which carries every chain the sink receives.
@@ -690,13 +688,12 @@ public final class PipelineDagBuilder {
         String name = sink.name();
         Map<String, SinkTarget> targets = shape.sinkTargetsOf(name);
         int local = shape.localOf(name);
-        boolean orderChangesByTable = shape.nodes().get(name).origin() == NodeParallelism.Origin.NODE_DEFAULT;
         var preparation = sink.writers() instanceof PreparesTargets p ? p : null;
         boolean coordinated = preparation != null && preparation.supportsParallelKeyMoves()
                 && rawSources.containsAll(sink.upstream()) && targets.values().stream().map(SinkTarget::table)
                         .distinct().count() == targets.size();
-        var ingress = RoutingKeys.forSink(name, targets, coordinated || orderChangesByTable);
-        var writerLane = RoutingKeys.forSink(name, targets, !coordinated && orderChangesByTable);
+        var ingress = RoutingKeys.forSink(name, targets, coordinated);
+        var writerLane = RoutingKeys.forSink(name, targets, false);
         var inputs = chains == null ? null : chains.perOrdinal(sink.upstream());
         ProcessorMetaSupplier routing = coordinated
                 ? PreparedSinkLaneRouters.of(name, targets, preparation, axes, inputs, shape.plannedMembers())

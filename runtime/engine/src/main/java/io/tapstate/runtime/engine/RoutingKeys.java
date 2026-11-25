@@ -25,8 +25,8 @@ import java.util.Map;
  * stream and goes by the stream alone. Word that a chain got past positions with nothing to deliver belongs
  * to no row and goes to one fixed processor, as a hand-off rather than a copy per processor. And a change whose
  * key cannot be read, or that moves its row from one key to another, ends the run with a code: there is no
- * processor it could be sent to that keeps every change of both keys in order. A default sink routes changes
- * by target table instead, so both keys already share a writer.
+ * processor it could be sent to that keeps every change of both keys in order. A coordinated sink gathers a table before this split
+ * and sends a key move over the writer edge only as a fenced command.
  */
 final class RoutingKeys {
 
@@ -66,7 +66,7 @@ final class RoutingKeys {
     /**
      * The routing function for the edges into and within the sink {@code node}, whose streams write the
      * targets given. A row goes by its target table and, where partitioned by row, its key in that table.
-     * Default sinks send all changes for each target table to one writer so an update can move between keys.
+     * The ingress of a coordinated sink sends changes of one target table to the same dispatcher.
      * Keyed snapshot rows are still partitioned by key on the way to the router, which spreads them to the writers.
      */
     static FunctionEx<Object, Object> forSink(String node, Map<String, SinkTarget> targetsByStream,

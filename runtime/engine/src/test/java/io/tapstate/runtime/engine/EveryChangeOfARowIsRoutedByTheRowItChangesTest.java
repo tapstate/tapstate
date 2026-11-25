@@ -22,7 +22,7 @@ import org.junit.jupiter.api.Test;
  * the table alone.
  *
  * <p>A change whose key cannot be read ends the run with a code. A key move also ends the run on a
- * row-partitioned edge. Default sinks route changes by table so the old and new key share a writer.
+ * row-partitioned edge. The coordinated ingress routes changes by table so the old and new key share a dispatcher.
  */
 class EveryChangeOfARowIsRoutedByTheRowItChangesTest {
 
