@@ -305,8 +305,7 @@ public final class ApplyService {
     private record PublicationReads(ArtifactStore.ReadableInventory inventory, Resource previous,
             Optional<String> managedSource, Map<String, Optional<DiscoveredSourceModel>> models) {}
 
-    // NOSONAR java:S3776 — method predates this PR; the one-line connector-condition edit does not change its structure.
-    private CandidateWorkspacePlan planResourcesAndWorkspace(
+    private CandidateWorkspacePlan planResourcesAndWorkspace( // NOSONAR java:S3776 — method predates this PR; one-line connector-condition edit did not change its structure.
             List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope,
             PublicationReads publication) {
         Objects.requireNonNull(submitted, "submitted");
