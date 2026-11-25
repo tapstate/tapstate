@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.hazelcast.core.Hazelcast;
+import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
@@ -131,6 +133,8 @@ class PipelineLaunchLatencyIT {
             var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("launch_config"),
                     cache.getReplicaSetUrl("launch_cache"), cache.getReplicaSetUrl("launch_master"),
                     StorageBinding.Mode.CLOUD, NativeCloudAlertManagementIT.CLUSTER);
+            boolean blockPositionRead = blockPriorObservation && !blockMaintenance && !blockProof;
+            HazelcastInstance positionReadMember;
             try (var application = new SpringApplicationBuilder(Bootstrap.class,
                     NativeCloudAlertManagementIT.ControlledSdk.class, Measurements.class)
                     .environment(CloudFixtureEnvironment.isolated()).run(
@@ -151,7 +155,9 @@ class PipelineLaunchLatencyIT {
                         assertThat(application.getBean(StorageRoot.class).runtime().business())
                                 .as("phase=" + application.getBean(StorageRoot.class).phase()).isPresent());
                 NativeAppStorage.awaitBusiness(application);
-                var port = NativeAppStorage.business(application).getBean(StorePort.class);
+                var business = NativeAppStorage.business(application);
+                positionReadMember = blockPositionRead ? business.getBean(HazelcastInstance.class) : null;
+                var port = business.getBean(StorePort.class);
                 try (var data = com.mongodb.client.MongoClients.create(storage.masterUri())) {
                     for (String table : List.of("orders", "customers", "lines"))
                         data.getDatabase(storage.masterDatabase()).getCollection(table)
@@ -215,7 +221,7 @@ class PipelineLaunchLatencyIT {
                     }
                     try (var otherBarrier = blockProof ? new PositionReadBarrier(NativeAppStorage.business(application)
                             .getBean(PipelineActuationOwnership.class), ((ThreeLayerStorePort) port).scope("launch-0"))
-                            : blockPriorObservation && !blockMaintenance ? new PositionReadBarrier(publisher,"launch-0") : null;
+                            : blockPositionRead ? new PositionReadBarrier(publisher,"launch-0") : null;
                          var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
                         var barrier = maintenance == null ? otherBarrier : maintenance;
                         if (maintenance != null) maintenance.armMaintenance.set(true);
@@ -266,6 +272,12 @@ class PipelineLaunchLatencyIT {
                                         .isLessThanOrEqualTo(64);
                             }
                         } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
+                    } finally {
+                        if (blockPositionRead) {
+                            var observations = business.getBean(PeriodicObservations.class);
+                            org.awaitility.Awaitility.await("released launch-0 observation finishes before shutdown")
+                                    .atMost(Duration.ofSeconds(15)).until(() -> observations.idle("launch-0"));
+                        }
                     }
                     if (blockProof) org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                             assertThat(diagnostics.claimIo).anySatisfy(record -> {
@@ -310,6 +322,11 @@ class PipelineLaunchLatencyIT {
                         System.out.println("NATIVE_RESTART_TARGET_READY_MS " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested));
                     }
                 }
+            }
+            if (blockPositionRead) {
+                assertThat(Hazelcast.getAllHazelcastInstances())
+                        .as("the position-read fixture must release its own member when the context closes")
+                        .doesNotContain(positionReadMember);
             }
         }
     }
