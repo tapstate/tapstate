@@ -781,7 +781,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             var params = code.map(value -> MongoPipelineIntentStore.startFailureParams(intent, value)).orElseGet(Map::of);
             return new PipelineDisplayHeader(mapping, preparation, Optional.of(snapshot.desired()), Optional.empty(), recovering,
                     code, snapshot.intentRevision(), params,
-                    MongoPipelineStateRebuilds.completedStopClear(row, preparation, snapshot));
+                    MongoPipelinePreparationFacts.completedStopClear(row, preparation, snapshot));
         } catch (TapstateException malformed) {
             if (malformed.code() != IoError.DOCUMENT_UNREADABLE) throw malformed;
             return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.of(malformed), recovering);

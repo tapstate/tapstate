@@ -1,8 +1,10 @@
 package io.tapstate.adapters.mongostore;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.PipelinePreparation;
 import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -20,6 +22,19 @@ final class MongoPipelinePreparationFacts {
     private static final Set<String> SCOPE = Set.of("clusterId", "bindingVersion", "cacheIncarnation", "pipelineId", "stateGeneration");
     private static final Set<String> NODE = Set.of("clusterId", "nodeId", "bootId", "claimGeneration", "executionGeneration", "topologyRevision");
     private MongoPipelinePreparationFacts() {}
+
+    /** Reads the receipt from the mapping already loaded with the current intent. */
+    static boolean completedStopClear(Document mapping, PipelinePreparation prepared, PipelineIntentSnapshot intent) {
+        if (prepared.phase() != PipelinePreparation.Phase.COMPLETE
+                || intent.desired().targetState() != PipelineState.STOPPED || intent.desired().purgeState()
+                || !intent.scope().equals(prepared.scope())
+                || !(mapping.get("stateRebuild") instanceof Document annex)
+                || !Integer.valueOf(2).equals(annex.get("formatVersion"))
+                || !(annex.get("result") instanceof Document result)
+                || !Long.valueOf(intent.intentRevision()).equals(result.get("intentRevision"))) return false;
+        MongoPipelineStateRebuilds.requireCompletedPrior(mapping, prepared);
+        return true;
+    }
 
     static PipelinePreparation decode(String pipelineId, Document mapping, String clusterId) {
         PipelineStateMapping identity = MongoPipelineStateMappings.decode(pipelineId, mapping);
