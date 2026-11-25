@@ -4245,12 +4245,14 @@
       "writers": [
         "io.tapstate.cli.WorkspaceWrite",
         "io.tapstate.cli.NewCmd",
-        "io.tapstate.cli.ServerBinding"
+        "io.tapstate.cli.ServerBinding",
+        "io.tapstate.cli.Repl"
       ],
       "readers": [
         "io.tapstate.cli.WorkspaceWrite",
         "io.tapstate.cli.NewCmd",
-        "io.tapstate.cli.ServerBinding"
+        "io.tapstate.cli.ServerBinding",
+        "io.tapstate.cli.Repl"
       ],
       "recovery": "user-files",
       "consistency": "user-file",

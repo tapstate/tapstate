@@ -1,9 +1,9 @@
 # Connector catalog ingest report
 
-Spec SHA: `2d1defb`
+Spec SHA: `ebdb247`
 Capability SHA: `cc13816`
 
-> The capability face comes from an earlier upstream revision than the spec face: modes, sink and write semantics were derived at `cc13816`, while the structure below was read at `2d1defb`. A full refresh brings them back together.
+> The capability face comes from an earlier upstream revision than the spec face: modes, sink and write semantics were derived at `cc13816`, while the structure below was read at `ebdb247`. A full refresh brings them back together.
 Ingested connectors: 82
 
 ## Unclassified — no resolvable mode (need tapstate.modes)
