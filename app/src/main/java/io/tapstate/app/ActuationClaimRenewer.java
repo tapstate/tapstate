@@ -2,8 +2,11 @@ package io.tapstate.app;
 
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,11 +29,14 @@ final class ActuationClaimRenewer implements AutoCloseable {
 
     /** The longest a due renewal waits for a look, when the renewal interval does not look sooner. */
     private static final Duration LOOK = Duration.ofSeconds(1);
+    private static final int MAX_PARALLEL_RENEWALS = 4;
 
     private final ScheduledExecutorService renewer;
+    private final ThreadPoolExecutor dispatchers;
 
     private ActuationClaimRenewer() {
         this.renewer = null;
+        this.dispatchers = null;
     }
 
     /** A single-node run holds no claims, so nothing is renewed. */
@@ -46,17 +52,28 @@ final class ActuationClaimRenewer implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
+        this.dispatchers = new ThreadPoolExecutor(MAX_PARALLEL_RENEWALS, MAX_PARALLEL_RENEWALS,
+                1, TimeUnit.SECONDS, new SynchronousQueue<>(), runnable -> {
+                    var thread = new Thread(runnable, "tapstate-actuation-renewal-dispatch");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        dispatchers.allowCoreThreadTimeOut(true);
+        Executor dispatch = renewal -> dispatchers.execute(() -> {
+            try { renewal.run(); }
+            catch (RuntimeException unexpected) { LOG.warn("Could not renew a Pipeline actuation claim", unexpected); }
+        });
         long look = Math.max(1L, Math.min(renewInterval.toMillis(), LOOK.toMillis()));
-        renewer.scheduleWithFixedDelay(() -> renew(ownership), look, look, TimeUnit.MILLISECONDS);
+        renewer.scheduleWithFixedDelay(() -> renew(ownership, dispatch), look, look, TimeUnit.MILLISECONDS);
     }
 
     /**
      * One look. Whatever it throws is logged and the next look still comes: a scheduled task that throws is
      * never run again, and a renewer that stopped would leave every claim to the pass again, silently.
      */
-    private static void renew(PipelineActuationOwnership ownership) {
+    private static void renew(PipelineActuationOwnership ownership, Executor dispatch) {
         try {
-            ownership.renewDue();
+            ownership.dispatchDueRenewals(dispatch, MAX_PARALLEL_RENEWALS);
         } catch (RuntimeException unexpected) {
             LOG.warn("Could not renew this member's actuation claims; looking again shortly", unexpected);
         }
@@ -66,6 +83,7 @@ final class ActuationClaimRenewer implements AutoCloseable {
     public void close() {
         if (renewer != null) {
             renewer.shutdownNow();
+            dispatchers.shutdownNow();
         }
     }
 }

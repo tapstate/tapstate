@@ -34,6 +34,7 @@ import java.util.logging.Logger;
 public final class MongoPipelineDraftStore implements PipelineDraftStore {
 
     private static final String REVISION = "revision";
+    private static final int MAX_COMMIT_ATTEMPTS = 3;
     private static final Logger LOG = Logger.getLogger(MongoPipelineDraftStore.class.getName());
     private final MongoClient client;
     private final MongoCollection<Document> drafts;
@@ -281,23 +282,10 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                     return drafts.find(activeDraft(publication.pipelineId())).first() == null
                             ? PipelineDraftMutation.NOT_FOUND : PipelineDraftMutation.REVISION_CONFLICT;
                 }
-                while (true) {
-                    try {
-                        session.commitTransaction();
-                        break;
-                    } catch (MongoException commitError) {
-                        if (!commitError.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
-                            throw commitError;
-                        }
-                    }
-                }
+                commit(session, publication.pipelineId());
                 return PipelineDraftMutation.PUBLISHED;
             } catch (MongoException error) {
-                try {
-                    session.abortTransaction();
-                } catch (RuntimeException abortFailure) {
-                    error.addSuppressed(abortFailure);
-                }
+                abortAfterFailure(session, error);
                 if (ErrorCategory.fromErrorCode(error.getCode()) == ErrorCategory.DUPLICATE_KEY) {
                     return PipelineDraftMutation.ARTIFACT_CONFLICT;
                 }
@@ -310,11 +298,7 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 }
                 throw error;
             } catch (RuntimeException error) {
-                try {
-                    session.abortTransaction();
-                } catch (RuntimeException abortFailure) {
-                    error.addSuppressed(abortFailure);
-                }
+                abortAfterFailure(session, error);
                 throw error;
             }
         }
@@ -360,29 +344,42 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                         return PipelineDraftMutation.ARTIFACT_CONFLICT;
                     }
                 }
-                while (true) {
-                    try {
-                        session.commitTransaction();
-                        break;
-                    } catch (MongoException commitError) {
-                        if (!commitError.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
-                            throw commitError;
-                        }
-                    }
-                }
+                commit(session, change.pipelineId());
                 return PipelineDraftMutation.REPLACED;
             } catch (RuntimeException error) {
-                try {
-                    session.abortTransaction();
-                } catch (RuntimeException abortFailure) {
-                    error.addSuppressed(abortFailure);
-                }
+                abortAfterFailure(session, error);
                 if (error instanceof MongoException mongo
                         && mongo.hasErrorLabel(MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL)) {
                     return PipelineDraftMutation.ARTIFACT_CONFLICT;
                 }
                 throw error;
             }
+        }
+    }
+
+    private static void commit(ClientSession session, String pipelineId) {
+        for (int attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
+            try {
+                session.commitTransaction();
+                return;
+            } catch (MongoException error) {
+                if (!error.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
+                    throw error;
+                }
+            }
+        }
+        throw StoreIo.pipelineCommitOutcomeUnknown(pipelineId);
+    }
+
+    private static void abortAfterFailure(ClientSession session, RuntimeException error) {
+        // The commit may have taken effect. An abort cannot determine or undo its outcome.
+        if (error instanceof TapstateException diagnostic && diagnostic.code() == IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN) {
+            return;
+        }
+        try {
+            session.abortTransaction();
+        } catch (RuntimeException abortFailure) {
+            error.addSuppressed(abortFailure);
         }
     }
 

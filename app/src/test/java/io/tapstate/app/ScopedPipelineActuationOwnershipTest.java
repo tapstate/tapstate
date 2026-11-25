@@ -37,6 +37,247 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ScopedPipelineActuationOwnershipTest {
+    @Test void settledStopReleasesOnlyTheExactTenureAndANewStartAcquiresANewGeneration() {
+        var owner = ownership();
+        var original = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        try (var pass = owner.enterPass(FIRST)) {
+            var wrong = new WorkloadClaimFence(original.key(), original.owner(), original.claimGeneration() + 1,
+                    original.executionGeneration(), original.topologyRevision());
+            assertThat(pass.relinquishStopped(FIRST, wrong)).isNull();
+            assertThat(raw.read(KEY).orElseThrow().leased()).isTrue();
+            assertThat(pass.relinquishStopped(FIRST, original).status()).isEqualTo(PipelineActuationOwnership.StopReleaseStatus.CONFIRMED);
+        }
+        assertThat(raw.read(KEY).orElseThrow().leased()).isFalse();
+        assertThat(owner.finishStoppedRelease(FIRST.pipelineId())).isTrue();
+        var next = owner.permit(FIRST);
+        assertThat(next.granted()).isTrue();
+        assertThat(next.claim().claimGeneration()).isGreaterThan(original.claimGeneration());
+    }
+
+    @Test void naturalExpiryAloneDoesNotProveThatThisProcessReleasedAStoppedPipeline() {
+        var owner = ownership();
+        var original = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        raw.elapse(TTL.plusMillis(1));
+        try (var pass = owner.enterPass(FIRST)) {
+            assertThat(pass.relinquishStopped(FIRST, original).status())
+                    .isEqualTo(PipelineActuationOwnership.StopReleaseStatus.UNPROVEN);
+        }
+        verify(store, never()).release(any());
+    }
+
+    @Test void anAmbiguousStopReleaseNeedsAConfirmedShorterServerDeadlineOnTheOriginalFence() {
+        var owner = ownership();
+        var original = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        doAnswer(call -> {
+            assertThat(raw.release(call.getArgument(0))).isTrue();
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                    java.util.Map.of("detail", "unknown release"), null);
+        }).when(store).release(any());
+        PipelineActuationOwnership.StopRelease receipt;
+        try (var pass = owner.enterPass(FIRST)) { receipt = pass.relinquishStopped(FIRST, original); }
+        assertThat(receipt.status()).isEqualTo(PipelineActuationOwnership.StopReleaseStatus.PENDING);
+        assertThat(owner.finishStoppedRelease(FIRST.pipelineId())).isTrue();
+        assertThat(receipt.status()).isEqualTo(PipelineActuationOwnership.StopReleaseStatus.CONFIRMED);
+        verify(store, times(1)).release(any());
+    }
+
+    @Test void anUnknownStopReleaseIsReadBackWithoutReleasingASuccessor() {
+        var owner = ownership();
+        var original = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        doAnswer(call -> {
+            assertThat(raw.release(call.getArgument(0))).isTrue();
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE, java.util.Map.of("detail", "unknown release"), null);
+        }).when(store).release(any());
+        try (var pass = owner.enterPass(FIRST)) {
+            assertThat(pass.relinquishStopped(FIRST, original).status()).isEqualTo(PipelineActuationOwnership.StopReleaseStatus.PENDING);
+        }
+        var peer = raw.acquire(KEY, new WorkloadOwner("peer", "new-boot"), original.topologyRevision(), TTL).claim();
+        assertThat(owner.finishStoppedRelease(FIRST.pipelineId())).isTrue();
+        verify(store, times(1)).release(any());
+        assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(peer);
+        assertThat(raw.read(KEY).orElseThrow().leased()).isTrue();
+    }
+
+    @Test void releasingAStoppedClaimDoesNotHoldTheOwnershipMonitorDuringMongoIO() throws Exception {
+        var owner = ownership();
+        var other = new PipelineIntentScope(BUSINESS.clusterId(), BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "other", 1);
+        var otherKey = new WorkloadClaimKey(BUSINESS.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, "other");
+        doAnswer(call -> raw.acquire(call.<PipelineIntentScope>getArgument(0).equals(FIRST) ? KEY : otherKey,
+                call.getArgument(1), call.getArgument(2), call.getArgument(3)))
+                .when(store).acquirePipeline(any(), any(), anyLong(), any());
+        var original = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var proceed = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call -> {
+            entered.countDown();
+            if (!proceed.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("release read was blocked");
+            return raw.read(KEY);
+        }).when(store).readPipeline(FIRST);
+        try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var stopping = workers.submit(() -> {
+                try (var pass = owner.enterPass(FIRST)) { return pass.relinquishStopped(FIRST, original); }
+            });
+            try {
+                assertThat(entered.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var starting = workers.submit(() -> owner.permit(other));
+                assertThat(starting.get(1, java.util.concurrent.TimeUnit.SECONDS).granted()).isTrue();
+            } finally { proceed.countDown(); }
+            assertThat(stopping.get(3, java.util.concurrent.TimeUnit.SECONDS).status())
+                    .isEqualTo(PipelineActuationOwnership.StopReleaseStatus.CONFIRMED);
+        }
+    }
+
+    @Test void aLocalWriterLeaseIsBoundToItsExactRunAndOriginalDeadline() {
+        var owner = ownership();
+        var tenure = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var first = owner.beginExecution(FIRST, tenure);
+        assertThat(first.allowed()).isTrue();
+        assertThat(owner.hasLocalWriterLease(first.fence())).isTrue();
+
+        var second = owner.beginExecution(FIRST, first.claimFence());
+        assertThat(second.allowed()).isTrue();
+        assertThat(owner.hasLocalWriterLease(first.fence())).isFalse();
+        assertThat(owner.hasLocalWriterLease(second.fence())).isTrue();
+
+        nanos.set(TTL.toNanos());
+        assertThat(owner.hasLocalWriterLease(second.fence())).isFalse();
+    }
+
+    @Test void aBlockedAlertEvaluationDoesNotDelayAnUnrelatedHeldPermit() throws Exception {
+        var owner = ownership();
+        var other = new PipelineIntentScope(BUSINESS.clusterId(), BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "other", 1);
+        var otherKey = new WorkloadClaimKey(BUSINESS.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, "other");
+        doAnswer(call -> raw.acquire(call.<PipelineIntentScope>getArgument(0).pipelineId().equals("orders") ? KEY : otherKey,
+                call.getArgument(1), call.getArgument(2), call.getArgument(3)))
+                .when(store).acquirePipeline(any(), any(), anyLong(), any());
+        var first = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var second = owner.permit(other).claim();
+        org.mockito.Mockito.clearInvocations(store);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call -> { entered.countDown(); release.await(); return raw.read(KEY); }).when(store).readPipeline(FIRST);
+        try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var evaluation = workers.submit(() -> owner.evaluationProof(FIRST, first));
+            try {
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var permit = workers.submit(() -> owner.permit(other));
+                assertThat(permit.get(1, java.util.concurrent.TimeUnit.SECONDS).claim()).isEqualTo(second);
+                assertThat(release.getCount()).isEqualTo(1);
+                verify(store, never()).acquirePipeline(any(), any(), anyLong(), any());
+                verify(store, never()).renew(any(), any());
+                verify(store, never()).advanceExecution(any(), anyLong(), anySet());
+                verify(store, never()).readPipeline(other);
+            } finally { release.countDown(); }
+            evaluation.get(2, java.util.concurrent.TimeUnit.SECONDS).orElseThrow().run();
+        }
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"claim", "start", "evaluation"})
+    void anExecutionAdvanceDoesNotWaitForAProofAndRejectsItsOldReply(String route) throws Exception {
+        var owner = ownership();
+        var expected = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call -> { var reply = raw.read(KEY); entered.countDown(); release.await(); return reply; })
+                .when(store).readPipeline(FIRST);
+        try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var proof = workers.submit(() -> proof(owner, expected, route));
+            try {
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var advance = workers.submit(() -> owner.beginExecution(FIRST, expected));
+                assertThat(advance.get(1, java.util.concurrent.TimeUnit.SECONDS).allowed()).isTrue();
+                assertThat(release.getCount()).isEqualTo(1);
+            } finally { release.countDown(); }
+            assertThat(proof.get(2, java.util.concurrent.TimeUnit.SECONDS)).isFalse();
+        }
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"claim", "start", "evaluation"})
+    void shutdownDrainsTheActualProofReadAndRefusesLateAndNewProofs(String route) throws Exception {
+        var owner = ownership();
+        var expected = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var calls = new AtomicInteger();
+        doAnswer(call -> { calls.incrementAndGet(); var reply = raw.read(KEY); entered.countDown(); release.await(); return reply; })
+                .when(store).readPipeline(FIRST);
+        try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var proof = workers.submit(() -> {
+                try { return proof(owner, expected, route); }
+                catch (TapstateException refused) {
+                    assertThat(refused.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED);
+                    return false;
+                }
+            });
+            java.util.concurrent.Future<?> drained = null;
+            try {
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                owner.stopForShutdown();
+                drained = workers.submit(() -> owner.awaitStopped(System.nanoTime() + Duration.ofSeconds(5).toNanos()));
+                var waiting = drained;
+                assertThatThrownBy(() -> waiting.get(100, java.util.concurrent.TimeUnit.MILLISECONDS))
+                        .isInstanceOf(java.util.concurrent.TimeoutException.class);
+                assertThat(proof(owner, expected, route)).isFalse();
+                assertThat(calls).hasValue(1);
+            } finally { release.countDown(); }
+            assertThat(proof.get(2, java.util.concurrent.TimeUnit.SECONDS)).isFalse();
+            drained.get(2, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"claim", "start", "evaluation"})
+    void anInterruptedProofPreservesInterruptionWithoutStoreIo(String route) throws Exception {
+        var owner = ownership();
+        var expected = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        org.mockito.Mockito.clearInvocations(store);
+        try (var worker = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            assertThat(worker.submit(() -> {
+                Thread.currentThread().interrupt();
+                try { return !proof(owner, expected, route) && Thread.currentThread().isInterrupted(); }
+                finally { Thread.interrupted(); }
+            }).get(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        }
+        verify(store, never()).readPipeline(any());
+    }
+
+    private static boolean proof(PipelineActuationOwnership owner, WorkloadClaimFence expected, String route) {
+        return switch (route) {
+            case "claim" -> owner.proveClaim(FIRST, expected);
+            case "start" -> owner.proveStartClaim(FIRST, expected);
+            case "evaluation" -> owner.evaluationProof(FIRST, expected).isPresent();
+            default -> throw new AssertionError(route);
+        };
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void anUnrelatedFreshProofDoesNotWaitForAnotherPipelinesStoreRead(boolean starting) throws Exception {
+        var owner = ownership();
+        var other = new PipelineIntentScope(BUSINESS.clusterId(), BUSINESS.bindingVersion(), BUSINESS.cacheIncarnation(), "other", 1);
+        var otherKey = new WorkloadClaimKey(BUSINESS.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, "other");
+        doAnswer(call -> {
+            var scope = call.getArgument(0, PipelineIntentScope.class);
+            return raw.acquire(scope.pipelineId().equals("orders") ? KEY : otherKey,
+                    call.getArgument(1), call.getArgument(2), call.getArgument(3));
+        }).when(store).acquirePipeline(any(), any(), anyLong(), any());
+        var first = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var second = WorkloadClaimFence.from(owner.permit(other).claim());
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call -> {
+            if (call.getArgument(0).equals(FIRST)) { entered.countDown(); release.await(); return raw.read(KEY); }
+            return raw.read(otherKey);
+        }).when(store).readPipeline(any());
+        try (var readers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var blocked = readers.submit(() -> starting ? owner.proveStartClaim(FIRST, first) : owner.proveClaim(FIRST, first));
+            try {
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var independent = readers.submit(() -> starting ? owner.proveStartClaim(other, second) : owner.proveClaim(other, second));
+                assertThat(independent.get(1, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(release.getCount()).isEqualTo(1);
+            } finally { release.countDown(); }
+            assertThat(blocked.get(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        }
+    }
     @Test void evaluationProofIsPureAndExpiresWithoutAnotherStoreRead() {
         var owner=ownership();var permit=owner.permit(FIRST);var expected=WorkloadClaimFence.from(permit.claim());
         var guard=owner.evaluationProof(FIRST,expected).orElseThrow();int before=reads.get();
@@ -100,10 +341,11 @@ class ScopedPipelineActuationOwnershipTest {
         }).when(store).renew(any(),any());
         nanos.addAndGet(RENEW.toNanos());
         try(var executor=java.util.concurrent.Executors.newSingleThreadExecutor()) {
-            var result=executor.submit(()->owner.permit(FIRST));
+            var result=executor.submit(owner::renewDue);
             try {assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();membership.canCommit(Set.of("node-a"));}
             finally {release.countDown();}
-            assertThat(result.get(3,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            result.get(3,java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(owner.permit(FIRST).granted()).isFalse();
             membership.canCommit(Set.of("node-a","node-b"));
             assertThat(owner.permit(FIRST).granted()).isFalse();
         }finally {release.countDown();owner.stopForShutdown();}
@@ -139,9 +381,91 @@ class ScopedPipelineActuationOwnershipTest {
             assertThat(renewals).hasValue(1);
             assertThat(owner.proveExecution(run.fence())).isFalse();
         } else {
+            assertThat(renewals).hasValue(1);
+            assertThat(owner.permit(FIRST).granted()).isFalse();
+            raw.elapse(Duration.ofSeconds(1));
+            nanos.addAndGet(Duration.ofSeconds(1).toNanos());
+            owner.renewDue();
             assertThat(renewals).hasValue(2);
             assertThat(WorkloadClaimFence.from(owner.permit(FIRST).claim())).isEqualTo(run.claimFence());
         }
+        assertThat(acquisitions).hasValue(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"expired", "replacement", "missing", "membership", "shutdown"})
+    void anUnchangedConfirmationCannotReviveALostOriginalLeaseOnTheNextAttempt(String loss) {
+        var owner = ownership();
+        var permit = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(permit.claim()));
+        var original = raw.read(KEY).orElseThrow().claim();
+        var renewals = new AtomicInteger();
+        doAnswer(call -> {
+            if (renewals.incrementAndGet() == 1)
+                throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), new java.util.concurrent.TimeoutException());
+            assertThat(WorkloadClaimFence.from(call.<WorkloadClaim>getArgument(0))).isEqualTo(run.claimFence());
+            return raw.renew(call.getArgument(0), call.getArgument(1));
+        }).when(store).renew(any(), any());
+        raw.elapse(RENEW);nanos.addAndGet(RENEW.toNanos());owner.renewDue();
+        raw.elapse(Duration.ofSeconds(1));nanos.addAndGet(Duration.ofSeconds(1).toNanos());owner.renewDue();
+        assertThat(renewals).hasValue(1);
+        assertThat(owner.permit(FIRST).granted()).isFalse();
+        switch (loss) {
+            case "expired" -> { raw.elapse(TTL);nanos.addAndGet(TTL.toNanos()); }
+            case "replacement" -> {
+                assertThat(raw.release(original)).isTrue();
+                assertThat(raw.acquire(KEY, new WorkloadOwner("node-b", "replacement-boot"), 1, TTL).acquired()).isTrue();
+            }
+            case "missing" -> {
+                doReturn(java.util.Optional.empty()).when(store).renew(any(), any());
+                doReturn(java.util.Optional.empty()).when(store).readPipeline(FIRST);
+            }
+            case "membership" -> membership.canCommit(Set.of("node-a"));
+            case "shutdown" -> owner.stopForShutdown();
+            default -> throw new AssertionError(loss);
+        }
+        raw.elapse(Duration.ofSeconds(1));nanos.addAndGet(Duration.ofSeconds(1).toNanos());owner.renewDue();
+        assertThat(owner.proveExecution(run.fence())).isFalse();
+        assertThat(acquisitions).hasValue(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "expired", "replacement", "unavailable"})
+    void confirmationRefusalOrRepeatedTimeoutNeverWritesBeyondTheOriginalLease(String result) {
+        var owner = ownership();
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(owner.permit(FIRST).claim()));
+        var original = raw.read(KEY).orElseThrow().claim();
+        var renewals = new AtomicInteger();
+        doAnswer(call -> {
+            renewals.incrementAndGet();
+            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), new java.util.concurrent.TimeoutException());
+        }).when(store).renew(any(), any());
+        var confirmations = new AtomicInteger();
+        doAnswer(call -> {
+            confirmations.incrementAndGet();
+            return switch (result) {
+                case "missing" -> java.util.Optional.empty();
+                case "expired" -> { raw.elapse(TTL);yield raw.read(KEY); }
+                case "replacement" -> {
+                    assertThat(raw.release(original)).isTrue();
+                    raw.acquire(KEY, new WorkloadOwner("node-b", "replacement-boot"), 1, TTL);
+                    yield raw.read(KEY);
+                }
+                case "unavailable" -> throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,
+                        Map.of(), new java.util.concurrent.TimeoutException());
+                default -> throw new AssertionError(result);
+            };
+        }).when(store).readPipeline(FIRST);
+        raw.elapse(RENEW);nanos.addAndGet(RENEW.toNanos());owner.renewDue();
+        for (int second = 0; second < TTL.toSeconds() + 1; second++) {
+            raw.elapse(Duration.ofSeconds(1));nanos.addAndGet(Duration.ofSeconds(1).toNanos());owner.renewDue();
+        }
+        assertThat(renewals).hasValue(1);
+        if (!result.equals("unavailable")) assertThat(confirmations).hasValue(1);
+        int completed = confirmations.get();
+        nanos.addAndGet(TTL.toNanos());owner.renewDue();
+        assertThat(confirmations).hasValue(completed);
+        assertThat(owner.beginExecution(FIRST, run.claimFence()).allowed()).isFalse();
         assertThat(acquisitions).hasValue(1);
     }
 
@@ -209,6 +533,8 @@ class ScopedPipelineActuationOwnershipTest {
         var deadlines=new java.util.ArrayList<Long>();
         doAnswer(call->{deadlines.add(call.getArgument(0));((Runnable)call.getArgument(1)).run();return ((java.util.function.Supplier<?>)call.getArgument(2)).get();})
                 .when(bounded).withDeadline(anyLong(),any(),any());
+        org.mockito.Mockito.doCallRealMethod().when(bounded).withClaimAcquisition(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.doCallRealMethod().when(bounded).withClaimAcquisitionDeadline(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
         var observed=ObservedWorkloadClaims.observe(bounded,(write,failure)->{});
         var owner=PipelineActuationOwnership.scoped(BUSINESS,OWNER,membership,new ClusterWorkloadClaims(observed,membership),TTL,RENEW,nanos::get);
         var permit=owner.permit(FIRST);var run=owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
@@ -721,7 +1047,7 @@ class ScopedPipelineActuationOwnershipTest {
         membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
         membership.canCommit(Set.of("node-a","node-b"));
         raw.acquire(KEY, OWNER, 8, TTL);
-        raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
+        raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); owner.renewDue();
         assertThat(owner.permit(FIRST).granted()).isFalse();
         raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
         var reacquired = owner.permit(FIRST);
@@ -859,7 +1185,8 @@ class ScopedPipelineActuationOwnershipTest {
                 membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
                 membership.canCommit(Set.of("node-a","node-b"));
                 raw.acquire(KEY, OWNER, 8, TTL);
-                raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); assertThat(owner.permit(FIRST).granted()).isFalse();
+                raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); owner.renewDue();
+                assertThat(owner.permit(FIRST).granted()).isFalse();
                 raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
                 assertThat(owner.permit(FIRST).claim().topologyRevision()).isEqualTo(8);
             }

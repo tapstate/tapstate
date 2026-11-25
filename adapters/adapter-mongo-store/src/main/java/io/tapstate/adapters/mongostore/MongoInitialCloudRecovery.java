@@ -24,7 +24,7 @@ final class MongoInitialCloudRecovery {
     static SourceResource require(ClientSession session, MongoDatabase database, MongoStorageBindingStore bindings,
             MongoConfigurationArtifactStore artifacts, CacheAuthScope scope) {
         if (scope.mode() != StorageBinding.Mode.CLOUD || scope.authGeneration() < 2) throw MongoCachePipelineAccess.fenced();
-        var binding = bindings.loadForTransaction(session).orElseThrow(MongoCachePipelineAccess::fenced);
+        var binding = bindings.readForStorageLifecycle(session).loaded().map(MongoStorageBindingStore.Loaded::binding).orElseThrow(MongoCachePipelineAccess::fenced);
         var authentication = MongoStorageRecoveryStore.authentication(session, database, binding);
         if (authentication.pending() || !authentication.preparation().authScope().equals(scope)) throw MongoCachePipelineAccess.fenced();
         Document setup = SystemCollections.STORAGE_SETUP.on(database).find(session, new Document("_id", "cluster")).first();

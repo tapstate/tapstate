@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoException;
 import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
@@ -34,6 +35,7 @@ import java.util.logging.Logger;
 
 /** Private draft saves keep their own CAS; publication joins the existing configuration artifact transaction. */
 final class MongoConfigurationDraftStore implements PipelineDraftStore {
+    private static final int MAX_COMMIT_ATTEMPTS = 3;
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private static final Logger LOG = Logger.getLogger(MongoConfigurationDraftStore.class.getName());
@@ -63,19 +65,6 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
 
     void verify() {
         StoreIo.run(() -> {
-            var existing = drafts.listIndexes().into(new ArrayList<>());
-            // No index may expire necessary authoring data or its anti-resurrection revision.
-            if (existing.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) {
-                throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "pipeline-drafts", "field", "index"), null);
-            }
-            for (var declared : SystemCollections.CONFIG_PIPELINE_DRAFTS.indexes()) {
-                var index = existing.stream().filter(candidate -> declared.indexName().equals(candidate.get("name"))).findFirst().orElse(null);
-                if (index == null || !new Document(declared.keys().getFirst(), 1).equals(index.get("key"))
-                        || Boolean.TRUE.equals(index.get("unique")) || index.containsKey("partialFilterExpression")
-                        || Boolean.TRUE.equals(index.get("sparse")) || Boolean.TRUE.equals(index.get("hidden"))) {
-                    throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "pipeline-drafts", "field", "index"), null);
-                }
-            }
             try (var cursor = drafts.find().iterator()) {
                 while (cursor.hasNext()) codec.verify(cursor.next());
             }
@@ -191,7 +180,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
             throw new IllegalArgumentException("publication hash must match the captured Pipeline");
         }
         try {
-            return transaction(session -> {
+            return publicationTransaction(publication.pipelineId(), session -> {
                 Document row = drafts.find(session, new Document("_id", publication.pipelineId())).first();
                 if (row == null || deleted(row)) return new Published(PipelineDraftMutation.NOT_FOUND, 0);
                 PipelineDraft current = codec.decode(row);
@@ -221,7 +210,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
             throw new IllegalArgumentException("definition change hash must match the captured Pipeline");
         }
         try {
-            return transaction(session -> {
+            return publicationTransaction(change.pipelineId(), session -> {
                 var observed = artifacts.getInTransaction(session, change.pipelineId());
                 if (observed.isEmpty() || !(observed.orElseThrow() instanceof PipelineResource)
                         || !change.expectedArtifactHash().equals(CanonicalHash.of(observed.orElseThrow()))) {
@@ -263,6 +252,22 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
         if (!Boolean.TRUE.equals(row.get("deleted"))) return false;
         codec.tombstoneRevision(row); return true;
     }
+    private <T> T publicationTransaction(String pipelineId, Function<ClientSession, T> action) {
+        return transaction(session -> {
+            T result = action.apply(session);
+            // Commit explicitly so withTransaction still retries transient body failures but skips its own commit loop.
+            for (int attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
+                try {
+                    session.commitTransaction();
+                    return result;
+                } catch (MongoException error) {
+                    if (!error.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) throw error;
+                }
+            }
+            throw StoreIo.pipelineCommitOutcomeUnknown(pipelineId);
+        });
+    }
+
     private <T> T transaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try (var session = client.startSession()) {

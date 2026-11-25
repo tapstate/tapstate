@@ -547,7 +547,7 @@ class MongoCacheConnectorRegistryIT {
             var registry = f.registry(); registry.register("example", "1", RegistrationSource.SEED, JAR);
             f.domain.advanceAuthGeneration(AUTH, 2, "auth-reset", ACTIVE); assertThat(registry.artifact(HASH)).contains(JAR);
             SystemCollections.CACHE_CONNECTOR_ARTIFACTS.chunksOn(f.database).drop();
-            assertCode(() -> f.domain.connectors(SCOPE, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+            assertCode(() -> f.domain.connectors(SCOPE, ACTIVE).artifact(HASH), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("connector_artifacts.chunks");
             f.domain.retireBusiness(SCOPE, "retired", ACTIVE); assertCode(registry::list, IoError.CACHE_BUSINESS_FENCED);
             assertCode(() -> registry.register("example", "1", RegistrationSource.SEED, JAR), IoError.CACHE_BUSINESS_FENCED);
@@ -555,6 +555,64 @@ class MongoCacheConnectorRegistryIT {
     }
 
     private static Runnable guard(AtomicBoolean live) { return () -> { if (!live.get()) throw MongoCacheBusinessIdentity.businessFenced(); }; }
+    @Test void oneExactReadinessLookupUsesOneThreeCommandTransaction() {
+        withFixture(f -> {
+            var registered = f.registry().register("example", "1", RegistrationSource.SEED, JAR).registration();
+            var commands = new java.util.ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var observed = client(listener)) {
+                var registry = f.registry(observed, ACTIVE);
+                assertThat(registry.list()).containsExactly(registered);
+                assertThat(registry.findAll("example")).containsExactly(registered);
+                assertThat(commands).hasSize(6);
+                commands.clear();
+                assertThat(registry.findAll("example")).containsExactly(registered);
+                assertThat(commands).containsExactly("aggregate", "find", "commitTransaction");
+            }
+        });
+    }
+
+    @Test void captureAdmissionHonorsTheRegistrationCollectionsOwnComparison() {
+        withFixture(f -> {
+            var registry = f.registry();
+            var expected = registry.register("EXAMPLE", "1", RegistrationSource.SEED, JAR).registration();
+            var files = f.files();
+            var registrations = files.find().into(new ArrayList<>());
+            String name = files.getNamespace().getCollectionName();
+            files.drop();
+            f.database.createCollection(name, new com.mongodb.client.model.CreateCollectionOptions()
+                    .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                            .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            files.insertMany(registrations);
+            assertThat(registry.findAll("example")).containsExactly(expected);
+            assertThat(registry.findAllForCaptureStartup("example")).containsExactly(expected);
+        });
+    }
+
+    @Test void captureStartupRegistrationUsesOneSnapshotAndRejectsRetiredCache() {
+        withFixture(f -> {
+            var registered = f.registry().register("example", "1", RegistrationSource.SEED, JAR).registration();
+            var commands = new ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var registry = f.registry(observed, ACTIVE);
+                commands.clear();
+                assertThat(registry.findAllForCaptureStartup("example")).containsExactly(registered);
+                assertThat(commands).containsExactly("aggregate");
+                assertThat(registry.findAllForCaptureStartup("missing")).isEmpty();
+                SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("businessPhase", "RETIRED")));
+                assertCode(() -> registry.findAllForCaptureStartup("example"), IoError.CACHE_BUSINESS_FENCED);
+                System.out.println("CAPTURE_STARTUP_REGISTRATION commands=1");
+            }
+        });
+    }
+
     private static CommandListener publicationBarrier(CountDownLatch staged, CountDownLatch proceed) {
         var once = new AtomicBoolean(); return new CommandListener() { @Override public void commandStarted(CommandStartedEvent e) {
             if (updates(e, "cache_identity") && once.compareAndSet(false, true)) { staged.countDown(); await(proceed); }
