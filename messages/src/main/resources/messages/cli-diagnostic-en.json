@@ -73,7 +73,7 @@
   },
   "TS0330019": {
     "message": "The request to {server} timed out before the server answered.",
-    "solution": "The server may be busy or the upload large. It may have completed there anyway — re-running a register is safe (it is idempotent). Wait and retry, or check the server logs."
+    "solution": "The server may be busy or the upload large. It may have completed there anyway \u2014 re-running a register is safe (it is idempotent). Wait and retry, or check the server logs."
   },
   "TS0330020": {
     "message": "The `{verb}` command needs a connection to a Tapstate server.",

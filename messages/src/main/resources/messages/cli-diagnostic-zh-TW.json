@@ -1,262 +1,262 @@
 {
   "TS0330001": {
-    "message": "{path} 已存在製品。",
-    "solution": "選擇其他 ID 或 --out，或使用 --force 覆寫。"
+    "message": "{path} \u5df2\u5b58\u5728\u88fd\u54c1\u3002",
+    "solution": "\u9078\u64c7\u5176\u4ed6 ID \u6216 --out\uff0c\u6216\u4f7f\u7528 --force \u8986\u5beb\u3002"
   },
   "TS0330002": {
-    "message": "工作區的 {path} 已存在範例資源。",
-    "solution": "使用 -w 選擇其他工作區，或使用 --force 覆寫其中的範例檔案。"
+    "message": "\u5de5\u4f5c\u5340\u7684 {path} \u5df2\u5b58\u5728\u7bc4\u4f8b\u8cc7\u6e90\u3002",
+    "solution": "\u4f7f\u7528 -w \u9078\u64c7\u5176\u4ed6\u5de5\u4f5c\u5340\uff0c\u6216\u4f7f\u7528 --force \u8986\u5beb\u5176\u4e2d\u7684\u7bc4\u4f8b\u6a94\u6848\u3002"
   },
   "TS0330003": {
-    "message": "無法寫入 {path}：{reason}",
-    "solution": "檢查目錄存在且可寫入，並確保需要目錄的位置沒有一般檔案。本次寫入的範例檔案已移除，被覆寫的檔案已還原；本次建立的空目錄可能仍保留。"
+    "message": "\u7121\u6cd5\u5beb\u5165 {path}\uff1a{reason}",
+    "solution": "\u6aa2\u67e5\u76ee\u9304\u5b58\u5728\u4e14\u53ef\u5beb\u5165\uff0c\u4e26\u78ba\u4fdd\u9700\u8981\u76ee\u9304\u7684\u4f4d\u7f6e\u6c92\u6709\u4e00\u822c\u6a94\u6848\u3002\u672c\u6b21\u5beb\u5165\u7684\u7bc4\u4f8b\u6a94\u6848\u5df2\u79fb\u9664\uff0c\u88ab\u8986\u5beb\u7684\u6a94\u6848\u5df2\u9084\u539f\uff1b\u672c\u6b21\u5efa\u7acb\u7684\u7a7a\u76ee\u9304\u53ef\u80fd\u4ecd\u4fdd\u7559\u3002"
   },
   "TS0330004": {
-    "message": "無法讀取工作區 {path}：{reason}",
-    "solution": "檢查工作區目錄及其下每個目錄和 *.tap.yml 檔案均可讀取，再執行 tapstate up。"
+    "message": "\u7121\u6cd5\u8b80\u53d6\u5de5\u4f5c\u5340 {path}\uff1a{reason}",
+    "solution": "\u6aa2\u67e5\u5de5\u4f5c\u5340\u76ee\u9304\u53ca\u5176\u4e0b\u6bcf\u500b\u76ee\u9304\u548c *.tap.yml \u6a94\u6848\u5747\u53ef\u8b80\u53d6\uff0c\u518d\u57f7\u884c tapstate up\u3002"
   },
   "TS0330005": {
-    "message": "工作區 {path} 不含 Pipeline（kind: pipeline 的 *.tap.yml 檔案），沒有可啟動的內容。",
-    "solution": "執行 tapstate new 建立 Pipeline，或使用 -w 指向包含 Pipeline 的工作區。"
+    "message": "\u5de5\u4f5c\u5340 {path} \u4e0d\u542b Pipeline\uff08kind: pipeline \u7684 *.tap.yml \u6a94\u6848\uff09\uff0c\u6c92\u6709\u53ef\u555f\u52d5\u7684\u5167\u5bb9\u3002",
+    "solution": "\u57f7\u884c tapstate new \u5efa\u7acb Pipeline\uff0c\u6216\u4f7f\u7528 -w \u6307\u5411\u5305\u542b Pipeline \u7684\u5de5\u4f5c\u5340\u3002"
   },
   "TS0330006": {
-    "message": "{path} 已存在，且不是 tapstate 捷徑。",
-    "solution": "保留該檔案；tapstate 無需此捷徑也能執行。若要使用 tap 名稱，請自行移除該檔案，再執行 tapstate alias install。"
+    "message": "{path} \u5df2\u5b58\u5728\uff0c\u4e14\u4e0d\u662f tapstate \u6377\u5f91\u3002",
+    "solution": "\u4fdd\u7559\u8a72\u6a94\u6848\uff1btapstate \u7121\u9700\u6b64\u6377\u5f91\u4e5f\u80fd\u57f7\u884c\u3002\u82e5\u8981\u4f7f\u7528 tap \u540d\u7a31\uff0c\u8acb\u81ea\u884c\u79fb\u9664\u8a72\u6a94\u6848\uff0c\u518d\u57f7\u884c tapstate alias install\u3002"
   },
   "TS0330007": {
-    "message": "在 {path} 中未找到已安裝的 tapstate。",
-    "solution": "在 tapstate 安裝目錄執行，或將 TAPSTATE_INSTALL_DIR 設為該目錄；安裝程式也使用此變數。"
+    "message": "\u5728 {path} \u4e2d\u672a\u627e\u5230\u5df2\u5b89\u88dd\u7684 tapstate\u3002",
+    "solution": "\u5728 tapstate \u5b89\u88dd\u76ee\u9304\u57f7\u884c\uff0c\u6216\u5c07 TAPSTATE_INSTALL_DIR \u8a2d\u70ba\u8a72\u76ee\u9304\uff1b\u5b89\u88dd\u7a0b\u5f0f\u4e5f\u4f7f\u7528\u6b64\u8b8a\u6578\u3002"
   },
   "TS0330008": {
-    "message": "無法建立或移除 {path} 的 tap 捷徑：{reason}",
-    "solution": "檢查目錄存在且可寫入，再執行 tapstate alias install。tapstate 本身無需此捷徑也能執行。"
+    "message": "\u7121\u6cd5\u5efa\u7acb\u6216\u79fb\u9664 {path} \u7684 tap \u6377\u5f91\uff1a{reason}",
+    "solution": "\u6aa2\u67e5\u76ee\u9304\u5b58\u5728\u4e14\u53ef\u5beb\u5165\uff0c\u518d\u57f7\u884c tapstate alias install\u3002tapstate \u672c\u8eab\u7121\u9700\u6b64\u6377\u5f91\u4e5f\u80fd\u57f7\u884c\u3002"
   },
   "TS0330009": {
-    "message": "無法在 Docker 中執行本地開發環境：{reason}。",
-    "solution": "安裝包含 Compose v2 外掛的 Docker 並確保已啟動，再執行 tapstate up；也可使用 --server 將工作區指向既有伺服器。"
+    "message": "\u7121\u6cd5\u5728 Docker \u4e2d\u57f7\u884c\u672c\u5730\u958b\u767c\u74b0\u5883\uff1a{reason}\u3002",
+    "solution": "\u5b89\u88dd\u5305\u542b Compose v2 \u5916\u639b\u7684 Docker \u4e26\u78ba\u4fdd\u5df2\u555f\u52d5\uff0c\u518d\u57f7\u884c tapstate up\uff1b\u4e5f\u53ef\u4f7f\u7528 --server \u5c07\u5de5\u4f5c\u5340\u6307\u5411\u65e2\u6709\u4f3a\u670d\u5668\u3002"
   },
   "TS0330010": {
-    "message": "此工作區尚未繫結伺服器，目前無法互動詢問。",
-    "solution": "使用 --server <url> 指定伺服器，或使用 --start-local 在 {server} 啟動本地開發環境。"
+    "message": "\u6b64\u5de5\u4f5c\u5340\u5c1a\u672a\u7e6b\u7d50\u4f3a\u670d\u5668\uff0c\u76ee\u524d\u7121\u6cd5\u4e92\u52d5\u8a62\u554f\u3002",
+    "solution": "\u4f7f\u7528 --server <url> \u6307\u5b9a\u4f3a\u670d\u5668\uff0c\u6216\u4f7f\u7528 --start-local \u5728 {server} \u555f\u52d5\u672c\u5730\u958b\u767c\u74b0\u5883\u3002"
   },
   "TS0330011": {
-    "message": "登入 {server} 需要密碼，目前無法互動詢問。",
-    "solution": "設定環境變數 {variable}，或透過 --server 指定已登入的伺服器。"
+    "message": "\u767b\u5165 {server} \u9700\u8981\u5bc6\u78bc\uff0c\u76ee\u524d\u7121\u6cd5\u4e92\u52d5\u8a62\u554f\u3002",
+    "solution": "\u8a2d\u5b9a\u74b0\u5883\u8b8a\u6578 {variable}\uff0c\u6216\u900f\u904e --server \u6307\u5b9a\u5df2\u767b\u5165\u7684\u4f3a\u670d\u5668\u3002"
   },
   "TS0330012": {
-    "message": "登入 {server} 未傳回可用的持久工作階段。",
-    "solution": "檢查伺服器連線和相容性，再執行 tapstate up。"
+    "message": "\u767b\u5165 {server} \u672a\u50b3\u56de\u53ef\u7528\u7684\u6301\u4e45\u5de5\u4f5c\u968e\u6bb5\u3002",
+    "solution": "\u6aa2\u67e5\u4f3a\u670d\u5668\u9023\u7dda\u548c\u76f8\u5bb9\u6027\uff0c\u518d\u57f7\u884c tapstate up\u3002"
   },
   "TS0330013": {
-    "message": "目錄中沒有連接器 {connector}。",
-    "solution": "選擇目錄中的連接器 ID；互動執行 tapstate new 進行選擇。"
+    "message": "\u76ee\u9304\u4e2d\u6c92\u6709\u9023\u63a5\u5668 {connector}\u3002",
+    "solution": "\u9078\u64c7\u76ee\u9304\u4e2d\u7684\u9023\u63a5\u5668 ID\uff1b\u4e92\u52d5\u57f7\u884c tapstate new \u9032\u884c\u9078\u64c7\u3002"
   },
   "TS0330014": {
-    "message": "本版本安裝的連接器為 {official}。{connector} 在目錄中，但不屬於此集合。",
-    "solution": "選擇上面列出的連接器。受支援的集合隨連接器認證完成而擴充；未列出不代表該連接器有缺陷。"
+    "message": "\u672c\u7248\u672c\u5b89\u88dd\u7684\u9023\u63a5\u5668\u70ba {official}\u3002{connector} \u5728\u76ee\u9304\u4e2d\uff0c\u4f46\u4e0d\u5c6c\u65bc\u6b64\u96c6\u5408\u3002",
+    "solution": "\u9078\u64c7\u4e0a\u9762\u5217\u51fa\u7684\u9023\u63a5\u5668\u3002\u53d7\u652f\u63f4\u7684\u96c6\u5408\u96a8\u9023\u63a5\u5668\u8a8d\u8b49\u5b8c\u6210\u800c\u64f4\u5145\uff1b\u672a\u5217\u51fa\u4e0d\u4ee3\u8868\u8a72\u9023\u63a5\u5668\u6709\u7f3a\u9677\u3002"
   },
   "TS0330015": {
-    "message": "無法下載已發佈的連接器 {connector}：{reason}",
-    "solution": "檢查 GitHub Releases 網路存取，或將 TAPSTATE_CONNECTORS_URL 設為提供連接器製品的 HTTPS 鏡像後重試。仍可註冊本地 JAR 路徑。"
+    "message": "\u7121\u6cd5\u4e0b\u8f09\u5df2\u767c\u4f48\u7684\u9023\u63a5\u5668 {connector}\uff1a{reason}",
+    "solution": "\u6aa2\u67e5 GitHub Releases \u7db2\u8def\u5b58\u53d6\uff0c\u6216\u5c07 TAPSTATE_CONNECTORS_URL \u8a2d\u70ba\u63d0\u4f9b\u9023\u63a5\u5668\u88fd\u54c1\u7684 HTTPS \u93e1\u50cf\u5f8c\u91cd\u8a66\u3002\u4ecd\u53ef\u8a3b\u518a\u672c\u5730 JAR \u8def\u5f91\u3002"
   },
   "TS0330016": {
-    "message": "製品 {path} 宣告的類型為 {kind}，但位於 {dir} 目錄。",
-    "solution": "將其移入 {kind} 目錄，或修改宣告類型使其相符。"
+    "message": "\u88fd\u54c1 {path} \u5ba3\u544a\u7684\u985e\u578b\u70ba {kind}\uff0c\u4f46\u4f4d\u65bc {dir} \u76ee\u9304\u3002",
+    "solution": "\u5c07\u5176\u79fb\u5165 {kind} \u76ee\u9304\uff0c\u6216\u4fee\u6539\u5ba3\u544a\u985e\u578b\u4f7f\u5176\u76f8\u7b26\u3002"
   },
   "TS0330017": {
-    "message": "工作區中沒有 ID 為 {id} 的資源。",
-    "solution": "執行 tapstate ls 查看可用資源。"
+    "message": "\u5de5\u4f5c\u5340\u4e2d\u6c92\u6709 ID \u70ba {id} \u7684\u8cc7\u6e90\u3002",
+    "solution": "\u57f7\u884c tapstate ls \u67e5\u770b\u53ef\u7528\u8cc7\u6e90\u3002"
   },
   "TS0330018": {
-    "message": "無法存取種子位址中的任何 Tapstate 伺服器：{seeds}。",
-    "solution": "檢查位址正確且對應的 Tapstate 伺服器正在執行，再嘗試連線。"
+    "message": "\u7121\u6cd5\u5b58\u53d6\u7a2e\u5b50\u4f4d\u5740\u4e2d\u7684\u4efb\u4f55 Tapstate \u4f3a\u670d\u5668\uff1a{seeds}\u3002",
+    "solution": "\u6aa2\u67e5\u4f4d\u5740\u6b63\u78ba\u4e14\u5c0d\u61c9\u7684 Tapstate \u4f3a\u670d\u5668\u6b63\u5728\u57f7\u884c\uff0c\u518d\u5617\u8a66\u9023\u7dda\u3002"
   },
   "TS0330019": {
-    "message": "傳送至 {server} 的請求在伺服器回應前逾時。",
-    "solution": "伺服器可能忙碌或上傳較大，也可能已完成該請求。register 是冪等的，可再次執行；等待後重試，或檢查伺服器記錄。"
+    "message": "\u50b3\u9001\u81f3 {server} \u7684\u8acb\u6c42\u5728\u4f3a\u670d\u5668\u56de\u61c9\u524d\u903e\u6642\u3002",
+    "solution": "\u4f3a\u670d\u5668\u53ef\u80fd\u5fd9\u788c\u6216\u4e0a\u50b3\u8f03\u5927\uff0c\u4e5f\u53ef\u80fd\u5df2\u5b8c\u6210\u8a72\u8acb\u6c42\u3002register \u662f\u51aa\u7b49\u7684\uff0c\u53ef\u518d\u6b21\u57f7\u884c\uff1b\u7b49\u5f85\u5f8c\u91cd\u8a66\uff0c\u6216\u6aa2\u67e5\u4f3a\u670d\u5668\u8a18\u9304\u3002"
   },
   "TS0330020": {
-    "message": "命令 {verb} 需要連線至 Tapstate 伺服器。",
-    "solution": "先執行 connect <host:port>，或使用 tapstate -c <host:port> -u <user> 啟動。"
+    "message": "\u547d\u4ee4 {verb} \u9700\u8981\u9023\u7dda\u81f3 Tapstate \u4f3a\u670d\u5668\u3002",
+    "solution": "\u5148\u57f7\u884c connect <host:port>\uff0c\u6216\u4f7f\u7528 tapstate -c <host:port> -u <user> \u555f\u52d5\u3002"
   },
   "TS0330021": {
-    "message": "命令 {verb} 需要先登入。",
-    "solution": "執行 login <username>，或使用 tapstate -c <host:port> -u <user> 啟動。"
+    "message": "\u547d\u4ee4 {verb} \u9700\u8981\u5148\u767b\u5165\u3002",
+    "solution": "\u57f7\u884c login <username>\uff0c\u6216\u4f7f\u7528 tapstate -c <host:port> -u <user> \u555f\u52d5\u3002"
   },
   "TS0330022": {
-    "message": "命令 {verb} 已保留，但尚未實作。",
-    "solution": "暫時使用其基礎命令；help 列出此建置可用的命令。"
+    "message": "\u547d\u4ee4 {verb} \u5df2\u4fdd\u7559\uff0c\u4f46\u5c1a\u672a\u5be6\u4f5c\u3002",
+    "solution": "\u66ab\u6642\u4f7f\u7528\u5176\u57fa\u790e\u547d\u4ee4\uff1bhelp \u5217\u51fa\u6b64\u5efa\u7f6e\u53ef\u7528\u7684\u547d\u4ee4\u3002"
   },
   "TS0330023": {
-    "message": "{verb} 僅可在 Tapstate 工作階段中使用，不能作為單次命令執行。",
-    "solution": "不帶參數啟動 tapstate，在提示字元輸入 {verb}；help 列出工作階段命令。"
+    "message": "{verb} \u50c5\u53ef\u5728 Tapstate \u5de5\u4f5c\u968e\u6bb5\u4e2d\u4f7f\u7528\uff0c\u4e0d\u80fd\u4f5c\u70ba\u55ae\u6b21\u547d\u4ee4\u57f7\u884c\u3002",
+    "solution": "\u4e0d\u5e36\u53c3\u6578\u555f\u52d5 tapstate\uff0c\u5728\u63d0\u793a\u5b57\u5143\u8f38\u5165 {verb}\uff1bhelp \u5217\u51fa\u5de5\u4f5c\u968e\u6bb5\u547d\u4ee4\u3002"
   },
   "TS0330024": {
-    "message": "MCP 輔助程序無法使用：{reason}。",
-    "solution": "安裝完整的 Tapstate CLI 套件（包含 libexec/tapstate-mcp）後重試。"
+    "message": "MCP \u8f14\u52a9\u7a0b\u5e8f\u7121\u6cd5\u4f7f\u7528\uff1a{reason}\u3002",
+    "solution": "\u5b89\u88dd\u5b8c\u6574\u7684 Tapstate CLI \u5957\u4ef6\uff08\u5305\u542b libexec/tapstate-mcp\uff09\u5f8c\u91cd\u8a66\u3002"
   },
   "TS0330025": {
-    "message": "watch 原地重繪一行，需要終端機；目前輸出目標是管道或檔案。",
-    "solution": "需要可傳入管道的資料流時使用 tail <source>.<collection>；單次查看使用 <source>.<collection>.find(...)。"
+    "message": "watch \u539f\u5730\u91cd\u7e6a\u4e00\u884c\uff0c\u9700\u8981\u7d42\u7aef\u6a5f\uff1b\u76ee\u524d\u8f38\u51fa\u76ee\u6a19\u662f\u7ba1\u9053\u6216\u6a94\u6848\u3002",
+    "solution": "\u9700\u8981\u53ef\u50b3\u5165\u7ba1\u9053\u7684\u8cc7\u6599\u6d41\u6642\u4f7f\u7528 tail <source>.<collection>\uff1b\u55ae\u6b21\u67e5\u770b\u4f7f\u7528 <source>.<collection>.find(...)\u3002"
   },
   "TS0330026": {
-    "message": "{verb} 會清除 Pipeline 累積的狀態，但目前沒有終端機可供確認。",
-    "solution": "新增 -y 可免確認繼續，或執行 stop <pipeline-id> --keep-state 停止並保留全部狀態。"
+    "message": "{verb} \u6703\u6e05\u9664 Pipeline \u7d2f\u7a4d\u7684\u72c0\u614b\uff0c\u4f46\u76ee\u524d\u6c92\u6709\u7d42\u7aef\u6a5f\u53ef\u4f9b\u78ba\u8a8d\u3002",
+    "solution": "\u65b0\u589e -y \u53ef\u514d\u78ba\u8a8d\u7e7c\u7e8c\uff0c\u6216\u57f7\u884c stop <pipeline-id> --keep-state \u505c\u6b62\u4e26\u4fdd\u7559\u5168\u90e8\u72c0\u614b\u3002"
   },
   "TS0330027": {
-    "message": "--if-match 指定一個版本，但此次 apply 涉及 {count} 個資源。",
-    "solution": "僅套用正在編輯的單一檔案，或移除 --if-match，使此批次無條件套用。"
+    "message": "--if-match \u6307\u5b9a\u4e00\u500b\u7248\u672c\uff0c\u4f46\u6b64\u6b21 apply \u6d89\u53ca {count} \u500b\u8cc7\u6e90\u3002",
+    "solution": "\u50c5\u5957\u7528\u6b63\u5728\u7de8\u8f2f\u7684\u55ae\u4e00\u6a94\u6848\uff0c\u6216\u79fb\u9664 --if-match\uff0c\u4f7f\u6b64\u6279\u6b21\u7121\u689d\u4ef6\u5957\u7528\u3002"
   },
   "TS0330028": {
-    "message": "{pipeline} 保持原狀：有 {count} 個啟動檢查問題尚未回答，目前沒有終端機可供詢問。",
-    "solution": "在命令列回答這些問題：{commands}"
+    "message": "{pipeline} \u4fdd\u6301\u539f\u72c0\uff1a\u6709 {count} \u500b\u555f\u52d5\u6aa2\u67e5\u554f\u984c\u5c1a\u672a\u56de\u7b54\uff0c\u76ee\u524d\u6c92\u6709\u7d42\u7aef\u6a5f\u53ef\u4f9b\u8a62\u554f\u3002",
+    "solution": "\u5728\u547d\u4ee4\u5217\u56de\u7b54\u9019\u4e9b\u554f\u984c\uff1a{commands}"
   },
   "TS0330029": {
-    "message": "此伺服器不執行啟動檢查，因此 {option} 無法生效；未啟動任何工作。",
-    "solution": "升級伺服器，或不帶 {option} 啟動。"
+    "message": "\u6b64\u4f3a\u670d\u5668\u4e0d\u57f7\u884c\u555f\u52d5\u6aa2\u67e5\uff0c\u56e0\u6b64 {option} \u7121\u6cd5\u751f\u6548\uff1b\u672a\u555f\u52d5\u4efb\u4f55\u5de5\u4f5c\u3002",
+    "solution": "\u5347\u7d1a\u4f3a\u670d\u5668\uff0c\u6216\u4e0d\u5e36 {option} \u555f\u52d5\u3002"
   },
   "TS0330030": {
-    "message": "伺服器未執行啟動檢查便啟動了 {pipeline}；其版本可能早於此用戶端。",
-    "solution": "Pipeline 已啟動，請查看其狀態。若後續啟動需要依賴啟動檢查，請先升級伺服器。"
+    "message": "\u4f3a\u670d\u5668\u672a\u57f7\u884c\u555f\u52d5\u6aa2\u67e5\u4fbf\u555f\u52d5\u4e86 {pipeline}\uff1b\u5176\u7248\u672c\u53ef\u80fd\u65e9\u65bc\u6b64\u7528\u6236\u7aef\u3002",
+    "solution": "Pipeline \u5df2\u555f\u52d5\uff0c\u8acb\u67e5\u770b\u5176\u72c0\u614b\u3002\u82e5\u5f8c\u7e8c\u555f\u52d5\u9700\u8981\u4f9d\u8cf4\u555f\u52d5\u6aa2\u67e5\uff0c\u8acb\u5148\u5347\u7d1a\u4f3a\u670d\u5668\u3002"
   },
   "TS0330031": {
-    "message": "--decide {decide} 不是有效答案：請使用 <check>=<action>，或用 <check>/<subject>=<action> 回答單一問題。",
-    "solution": "使用 --decide <check>=<action>，或使用 --decide <check>/<subject>=<action> 回答單一檢查項目。"
+    "message": "--decide {decide} \u4e0d\u662f\u6709\u6548\u7b54\u6848\uff1a\u8acb\u4f7f\u7528 <check>=<action>\uff0c\u6216\u7528 <check>/<subject>=<action> \u56de\u7b54\u55ae\u4e00\u554f\u984c\u3002",
+    "solution": "\u4f7f\u7528 --decide <check>=<action>\uff0c\u6216\u4f7f\u7528 --decide <check>/<subject>=<action> \u56de\u7b54\u55ae\u4e00\u6aa2\u67e5\u9805\u76ee\u3002"
   },
   "TS0330032": {
-    "message": "無法採用 --decide {decide}：{findings} 不提供此答案。",
-    "solution": "使用各檢查項目提供的答案，以 --decide <check>/<subject>=<action> 分別回答。"
+    "message": "\u7121\u6cd5\u63a1\u7528 --decide {decide}\uff1a{findings} \u4e0d\u63d0\u4f9b\u6b64\u7b54\u6848\u3002",
+    "solution": "\u4f7f\u7528\u5404\u6aa2\u67e5\u9805\u76ee\u63d0\u4f9b\u7684\u7b54\u6848\uff0c\u4ee5 --decide <check>/<subject>=<action> \u5206\u5225\u56de\u7b54\u3002"
   },
   "TS0330033": {
-    "message": "--decide {decide} 回答的是拒絕啟動的檢查項目，任何答案都不能改變拒絕結果。",
-    "solution": "查看啟動檢查要求修改的內容，完成修改後再啟動。"
+    "message": "--decide {decide} \u56de\u7b54\u7684\u662f\u62d2\u7d55\u555f\u52d5\u7684\u6aa2\u67e5\u9805\u76ee\uff0c\u4efb\u4f55\u7b54\u6848\u90fd\u4e0d\u80fd\u6539\u8b8a\u62d2\u7d55\u7d50\u679c\u3002",
+    "solution": "\u67e5\u770b\u555f\u52d5\u6aa2\u67e5\u8981\u6c42\u4fee\u6539\u7684\u5167\u5bb9\uff0c\u5b8c\u6210\u4fee\u6539\u5f8c\u518d\u555f\u52d5\u3002"
   },
   "TS0330034": {
-    "message": "{pipeline} 的啟動請求已傳送至 {server}，但未及時收到回應；它可能已經啟動。",
-    "solution": "再次啟動前，先執行 tapstate status {pipeline} 檢查狀態。"
+    "message": "{pipeline} \u7684\u555f\u52d5\u8acb\u6c42\u5df2\u50b3\u9001\u81f3 {server}\uff0c\u4f46\u672a\u53ca\u6642\u6536\u5230\u56de\u61c9\uff1b\u5b83\u53ef\u80fd\u5df2\u7d93\u555f\u52d5\u3002",
+    "solution": "\u518d\u6b21\u555f\u52d5\u524d\uff0c\u5148\u57f7\u884c tapstate status {pipeline} \u6aa2\u67e5\u72c0\u614b\u3002"
   },
   "TS0330035": {
-    "message": "{path} 的環境設定不安全或無效：{reason}",
-    "solution": "修正或移除設定檔後，再執行環境管理器。無效檔案未被覆寫。"
+    "message": "{path} \u7684\u74b0\u5883\u8a2d\u5b9a\u4e0d\u5b89\u5168\u6216\u7121\u6548\uff1a{reason}",
+    "solution": "\u4fee\u6b63\u6216\u79fb\u9664\u8a2d\u5b9a\u6a94\u5f8c\uff0c\u518d\u57f7\u884c\u74b0\u5883\u7ba1\u7406\u5668\u3002\u7121\u6548\u6a94\u6848\u672a\u88ab\u8986\u5beb\u3002"
   },
   "TS0330036": {
-    "message": "{path} 的環境設定使用不受支援的結構版本 {version}。",
-    "solution": "使用相容的 tapstate 版本，或使用支援此結構版本的發行版遷移設定。"
+    "message": "{path} \u7684\u74b0\u5883\u8a2d\u5b9a\u4f7f\u7528\u4e0d\u53d7\u652f\u63f4\u7684\u7d50\u69cb\u7248\u672c {version}\u3002",
+    "solution": "\u4f7f\u7528\u76f8\u5bb9\u7684 tapstate \u7248\u672c\uff0c\u6216\u4f7f\u7528\u652f\u63f4\u6b64\u7d50\u69cb\u7248\u672c\u7684\u767c\u884c\u7248\u9077\u79fb\u8a2d\u5b9a\u3002"
   },
   "TS0330037": {
-    "message": "環境設定路徑 {path} 不是僅擁有者可存取：{reason}",
-    "solution": "還原擁有權及僅擁有者權限後重試。Tapstate 不會讀取或覆寫不安全的檔案。"
+    "message": "\u74b0\u5883\u8a2d\u5b9a\u8def\u5f91 {path} \u4e0d\u662f\u50c5\u64c1\u6709\u8005\u53ef\u5b58\u53d6\uff1a{reason}",
+    "solution": "\u9084\u539f\u64c1\u6709\u6b0a\u53ca\u50c5\u64c1\u6709\u8005\u6b0a\u9650\u5f8c\u91cd\u8a66\u3002Tapstate \u4e0d\u6703\u8b80\u53d6\u6216\u8986\u5beb\u4e0d\u5b89\u5168\u7684\u6a94\u6848\u3002"
   },
   "TS0330038": {
-    "message": "{path} 的認證快取不安全或無效：{reason}",
-    "solution": "檢查環境目標後重新登入。無效的認證檔案未被覆寫。"
+    "message": "{path} \u7684\u8a8d\u8b49\u5feb\u53d6\u4e0d\u5b89\u5168\u6216\u7121\u6548\uff1a{reason}",
+    "solution": "\u6aa2\u67e5\u74b0\u5883\u76ee\u6a19\u5f8c\u91cd\u65b0\u767b\u5165\u3002\u7121\u6548\u7684\u8a8d\u8b49\u6a94\u6848\u672a\u88ab\u8986\u5beb\u3002"
   },
   "TS0330039": {
-    "message": "{path} 的認證快取使用不受支援的結構版本 {version}。",
-    "solution": "使用相容的 tapstate 版本，或使用此版本重新登入。"
+    "message": "{path} \u7684\u8a8d\u8b49\u5feb\u53d6\u4f7f\u7528\u4e0d\u53d7\u652f\u63f4\u7684\u7d50\u69cb\u7248\u672c {version}\u3002",
+    "solution": "\u4f7f\u7528\u76f8\u5bb9\u7684 tapstate \u7248\u672c\uff0c\u6216\u4f7f\u7528\u6b64\u7248\u672c\u91cd\u65b0\u767b\u5165\u3002"
   },
   "TS0330040": {
-    "message": "認證快取路徑 {path} 不是僅擁有者可存取：{reason}",
-    "solution": "還原擁有權及僅擁有者權限後重試。Tapstate 不會讀取或覆寫不安全的認證檔案。"
+    "message": "\u8a8d\u8b49\u5feb\u53d6\u8def\u5f91 {path} \u4e0d\u662f\u50c5\u64c1\u6709\u8005\u53ef\u5b58\u53d6\uff1a{reason}",
+    "solution": "\u9084\u539f\u64c1\u6709\u6b0a\u53ca\u50c5\u64c1\u6709\u8005\u6b0a\u9650\u5f8c\u91cd\u8a66\u3002Tapstate \u4e0d\u6703\u8b80\u53d6\u6216\u8986\u5beb\u4e0d\u5b89\u5168\u7684\u8a8d\u8b49\u6a94\u6848\u3002"
   },
   "TS0330041": {
-    "message": "伺服器拒絕了 {principal} 的快取工作階段：{code}。",
-    "solution": "為此環境重新執行 tapstate auth login。"
+    "message": "\u4f3a\u670d\u5668\u62d2\u7d55\u4e86 {principal} \u7684\u5feb\u53d6\u5de5\u4f5c\u968e\u6bb5\uff1a{code}\u3002",
+    "solution": "\u70ba\u6b64\u74b0\u5883\u91cd\u65b0\u57f7\u884c tapstate auth login\u3002"
   },
   "TS0330042": {
-    "message": "伺服器無法連線，無法交換 {principal} 的快取工作階段。",
-    "solution": "檢查伺服器連線後重試，或重新執行 tapstate auth login。"
+    "message": "\u4f3a\u670d\u5668\u7121\u6cd5\u9023\u7dda\uff0c\u7121\u6cd5\u4ea4\u63db {principal} \u7684\u5feb\u53d6\u5de5\u4f5c\u968e\u6bb5\u3002",
+    "solution": "\u6aa2\u67e5\u4f3a\u670d\u5668\u9023\u7dda\u5f8c\u91cd\u8a66\uff0c\u6216\u91cd\u65b0\u57f7\u884c tapstate auth login\u3002"
   },
   "TS0330043": {
-    "message": "環境 {context} 的登入未傳回可用的持久工作階段。",
-    "solution": "檢查伺服器連線和相容性，再執行 tapstate auth login。"
+    "message": "\u74b0\u5883 {context} \u7684\u767b\u5165\u672a\u50b3\u56de\u53ef\u7528\u7684\u6301\u4e45\u5de5\u4f5c\u968e\u6bb5\u3002",
+    "solution": "\u6aa2\u67e5\u4f3a\u670d\u5668\u9023\u7dda\u548c\u76f8\u5bb9\u6027\uff0c\u518d\u57f7\u884c tapstate auth login\u3002"
   },
   "TS0330044": {
-    "message": "伺服器拒絕了 {principal} 的登入：{code}。",
-    "solution": "檢查使用者名稱和密碼，再執行 tapstate auth login。"
+    "message": "\u4f3a\u670d\u5668\u62d2\u7d55\u4e86 {principal} \u7684\u767b\u5165\uff1a{code}\u3002",
+    "solution": "\u6aa2\u67e5\u4f7f\u7528\u8005\u540d\u7a31\u548c\u5bc6\u78bc\uff0c\u518d\u57f7\u884c tapstate auth login\u3002"
   },
   "TS0330045": {
-    "message": "無法撤銷環境 {context} 的遠端工作階段；已保留本地快取。",
-    "solution": "伺服器可連線後重試，或使用 tapstate auth logout --local-only 僅移除本地快取。"
+    "message": "\u7121\u6cd5\u64a4\u92b7\u74b0\u5883 {context} \u7684\u9060\u7aef\u5de5\u4f5c\u968e\u6bb5\uff1b\u5df2\u4fdd\u7559\u672c\u5730\u5feb\u53d6\u3002",
+    "solution": "\u4f3a\u670d\u5668\u53ef\u9023\u7dda\u5f8c\u91cd\u8a66\uff0c\u6216\u4f7f\u7528 tapstate auth logout --local-only \u50c5\u79fb\u9664\u672c\u5730\u5feb\u53d6\u3002"
   },
   "TS0330046": {
-    "message": "登出期間，環境 {context} 的工作階段發生變化；已保留較新的本地工作階段。",
-    "solution": "執行 tapstate auth status 檢查目前工作階段，必要時再次登出。"
+    "message": "\u767b\u51fa\u671f\u9593\uff0c\u74b0\u5883 {context} \u7684\u5de5\u4f5c\u968e\u6bb5\u767c\u751f\u8b8a\u5316\uff1b\u5df2\u4fdd\u7559\u8f03\u65b0\u7684\u672c\u5730\u5de5\u4f5c\u968e\u6bb5\u3002",
+    "solution": "\u57f7\u884c tapstate auth status \u6aa2\u67e5\u76ee\u524d\u5de5\u4f5c\u968e\u6bb5\uff0c\u5fc5\u8981\u6642\u518d\u6b21\u767b\u51fa\u3002"
   },
   "TS0330047": {
-    "message": "儲存命令無效：{reason}。",
-    "solution": "查看儲存或設定說明，僅透過本地 JSON 檔案提供請求中的機密資訊。"
+    "message": "\u5132\u5b58\u547d\u4ee4\u7121\u6548\uff1a{reason}\u3002",
+    "solution": "\u67e5\u770b\u5132\u5b58\u6216\u8a2d\u5b9a\u8aaa\u660e\uff0c\u50c5\u900f\u904e\u672c\u5730 JSON \u6a94\u6848\u63d0\u4f9b\u8acb\u6c42\u4e2d\u7684\u6a5f\u5bc6\u8cc7\u8a0a\u3002"
   },
   "TS0330048": {
-    "message": "認證命令無效：{reason}。",
-    "solution": "使用 tapstate auth login [username]、tapstate auth status 或 tapstate auth logout [--local-only]。"
+    "message": "\u8a8d\u8b49\u547d\u4ee4\u7121\u6548\uff1a{reason}\u3002",
+    "solution": "\u4f7f\u7528 tapstate auth login [username]\u3001tapstate auth status \u6216 tapstate auth logout [--local-only]\u3002"
   },
   "TS0330049": {
-    "message": "環境管理器輸入無效：{reason}。",
-    "solution": "在互動終端機中執行 tapstate context，並選擇提供的操作。"
+    "message": "\u74b0\u5883\u7ba1\u7406\u5668\u8f38\u5165\u7121\u6548\uff1a{reason}\u3002",
+    "solution": "\u5728\u4e92\u52d5\u7d42\u7aef\u6a5f\u4e2d\u57f7\u884c tapstate context\uff0c\u4e26\u9078\u64c7\u63d0\u4f9b\u7684\u64cd\u4f5c\u3002"
   },
   "TS0330050": {
-    "message": "環境 {name} 無效：{reason}",
-    "solution": "使用非空名稱、至少一個絕對 HTTP(S) 種子位址及有效的環境設定。"
+    "message": "\u74b0\u5883 {name} \u7121\u6548\uff1a{reason}",
+    "solution": "\u4f7f\u7528\u975e\u7a7a\u540d\u7a31\u3001\u81f3\u5c11\u4e00\u500b\u7d55\u5c0d HTTP(S) \u7a2e\u5b50\u4f4d\u5740\u53ca\u6709\u6548\u7684\u74b0\u5883\u8a2d\u5b9a\u3002"
   },
   "TS0330051": {
-    "message": "不存在名為 {name} 的環境。",
-    "solution": "開啟環境管理器，選擇既有環境或建立此環境。"
+    "message": "\u4e0d\u5b58\u5728\u540d\u70ba {name} \u7684\u74b0\u5883\u3002",
+    "solution": "\u958b\u555f\u74b0\u5883\u7ba1\u7406\u5668\uff0c\u9078\u64c7\u65e2\u6709\u74b0\u5883\u6216\u5efa\u7acb\u6b64\u74b0\u5883\u3002"
   },
   "TS0330052": {
-    "message": "名為 {name} 的環境已存在。",
-    "solution": "編輯既有環境，或選擇其他名稱。"
+    "message": "\u540d\u70ba {name} \u7684\u74b0\u5883\u5df2\u5b58\u5728\u3002",
+    "solution": "\u7de8\u8f2f\u65e2\u6709\u74b0\u5883\uff0c\u6216\u9078\u64c7\u5176\u4ed6\u540d\u7a31\u3002"
   },
   "TS0330053": {
-    "message": "--connect 和 --context 選擇不同類型的目標，不能同時使用。",
-    "solution": "暫時目標保留 --connect；已儲存的環境保留 --context。"
+    "message": "--connect \u548c --context \u9078\u64c7\u4e0d\u540c\u985e\u578b\u7684\u76ee\u6a19\uff0c\u4e0d\u80fd\u540c\u6642\u4f7f\u7528\u3002",
+    "solution": "\u66ab\u6642\u76ee\u6a19\u4fdd\u7559 --connect\uff1b\u5df2\u5132\u5b58\u7684\u74b0\u5883\u4fdd\u7559 --context\u3002"
   },
   "TS0330054": {
-    "message": "命令 {verb} 需要伺服器環境，但尚未選擇目標。",
-    "solution": "使用 --context、設定 TAPSTATE_CONTEXT、繫結目前這個工作區，或使用 --connect 指定暫時目標。"
+    "message": "\u547d\u4ee4 {verb} \u9700\u8981\u4f3a\u670d\u5668\u74b0\u5883\uff0c\u4f46\u5c1a\u672a\u9078\u64c7\u76ee\u6a19\u3002",
+    "solution": "\u4f7f\u7528 --context\u3001\u8a2d\u5b9a TAPSTATE_CONTEXT\u3001\u7e6b\u7d50\u76ee\u524d\u9019\u500b\u5de5\u4f5c\u5340\uff0c\u6216\u4f7f\u7528 --connect \u6307\u5b9a\u66ab\u6642\u76ee\u6a19\u3002"
   },
   "TS0330055": {
-    "message": "伺服器種子位址 {seed} 在非回送位址上使用明文 HTTP。",
-    "solution": "遠端伺服器請使用 HTTPS；HTTP 僅允許用於回送位址上的開發伺服器。"
+    "message": "\u4f3a\u670d\u5668\u7a2e\u5b50\u4f4d\u5740 {seed} \u5728\u975e\u56de\u9001\u4f4d\u5740\u4e0a\u4f7f\u7528\u660e\u6587 HTTP\u3002",
+    "solution": "\u9060\u7aef\u4f3a\u670d\u5668\u8acb\u4f7f\u7528 HTTPS\uff1bHTTP \u50c5\u5141\u8a31\u7528\u65bc\u56de\u9001\u4f4d\u5740\u4e0a\u7684\u958b\u767c\u4f3a\u670d\u5668\u3002"
   },
   "TS0330056": {
-    "message": "伺服器種子位址 {seed} 未傳回匿名 Cluster 身分。",
-    "solution": "檢查種子位址可連線且提供 /.well-known/tapstate，再重試。"
+    "message": "\u4f3a\u670d\u5668\u7a2e\u5b50\u4f4d\u5740 {seed} \u672a\u50b3\u56de\u533f\u540d Cluster \u8eab\u5206\u3002",
+    "solution": "\u6aa2\u67e5\u7a2e\u5b50\u4f4d\u5740\u53ef\u9023\u7dda\u4e14\u63d0\u4f9b /.well-known/tapstate\uff0c\u518d\u91cd\u8a66\u3002"
   },
   "TS0330057": {
-    "message": "伺服器種子位址 {seed} 傳回了無效的 Cluster 身分（{reason}）。",
-    "solution": "檢查 URL 指向相容的 Tapstate 伺服器，且未被其他服務取代。"
+    "message": "\u4f3a\u670d\u5668\u7a2e\u5b50\u4f4d\u5740 {seed} \u50b3\u56de\u4e86\u7121\u6548\u7684 Cluster \u8eab\u5206\uff08{reason}\uff09\u3002",
+    "solution": "\u6aa2\u67e5 URL \u6307\u5411\u76f8\u5bb9\u7684 Tapstate \u4f3a\u670d\u5668\uff0c\u4e14\u672a\u88ab\u5176\u4ed6\u670d\u52d9\u53d6\u4ee3\u3002"
   },
   "TS0330058": {
-    "message": "伺服器種子位址 {seed} 拒絕匿名簽發者探索：{reason}",
-    "solution": "早於此 CLI 的伺服器不提供 /.well-known/tapstate；升級伺服器，或使用與伺服器版本相符的 CLI。"
+    "message": "\u4f3a\u670d\u5668\u7a2e\u5b50\u4f4d\u5740 {seed} \u62d2\u7d55\u533f\u540d\u7c3d\u767c\u8005\u63a2\u7d22\uff1a{reason}",
+    "solution": "\u65e9\u65bc\u6b64 CLI \u7684\u4f3a\u670d\u5668\u4e0d\u63d0\u4f9b /.well-known/tapstate\uff1b\u5347\u7d1a\u4f3a\u670d\u5668\uff0c\u6216\u4f7f\u7528\u8207\u4f3a\u670d\u5668\u7248\u672c\u76f8\u7b26\u7684 CLI\u3002"
   },
   "TS0330059": {
-    "message": "伺服器種子位址 {seed} 回報的簽發者為 {actual}，但要求的是 {expected}。",
-    "solution": "檢查環境種子位址，確認這是預期的 Cluster 後再重新登入。"
+    "message": "\u4f3a\u670d\u5668\u7a2e\u5b50\u4f4d\u5740 {seed} \u56de\u5831\u7684\u7c3d\u767c\u8005\u70ba {actual}\uff0c\u4f46\u8981\u6c42\u7684\u662f {expected}\u3002",
+    "solution": "\u6aa2\u67e5\u74b0\u5883\u7a2e\u5b50\u4f4d\u5740\uff0c\u78ba\u8a8d\u9019\u662f\u9810\u671f\u7684 Cluster \u5f8c\u518d\u91cd\u65b0\u767b\u5165\u3002"
   },
   "TS0330060": {
-    "message": "此 CLI 版本為 {cli}，所連線伺服器的版本為 {server}。",
-    "solution": "安裝與伺服器相符的 CLI，或連線至版本為 {cli} 的伺服器；兩者存在差異時，以伺服器行為為準。"
+    "message": "\u6b64 CLI \u7248\u672c\u70ba {cli}\uff0c\u6240\u9023\u7dda\u4f3a\u670d\u5668\u7684\u7248\u672c\u70ba {server}\u3002",
+    "solution": "\u5b89\u88dd\u8207\u4f3a\u670d\u5668\u76f8\u7b26\u7684 CLI\uff0c\u6216\u9023\u7dda\u81f3\u7248\u672c\u70ba {cli} \u7684\u4f3a\u670d\u5668\uff1b\u5169\u8005\u5b58\u5728\u5dee\u7570\u6642\uff0c\u4ee5\u4f3a\u670d\u5668\u884c\u70ba\u70ba\u6e96\u3002"
   },
   "TS0330061": {
-    "message": "無法確認發往 {server} 的請求結果。",
-    "solution": "重試寫入操作前請檢查資源的目前狀態。必要時恢復連線；伺服器可能已完成該請求。"
+    "message": "\u7121\u6cd5\u78ba\u8a8d\u767c\u5f80 {server} \u7684\u8acb\u6c42\u7d50\u679c\u3002",
+    "solution": "\u91cd\u8a66\u5beb\u5165\u64cd\u4f5c\u524d\u8acb\u6aa2\u67e5\u8cc7\u6e90\u7684\u76ee\u524d\u72c0\u614b\u3002\u5fc5\u8981\u6642\u6062\u5fa9\u9023\u7dda\uff1b\u4f3a\u670d\u5668\u53ef\u80fd\u5df2\u5b8c\u6210\u8a72\u8acb\u6c42\u3002"
   },
   "TS0330062": {
-    "message": "連線已中斷：沒有可存取的叢集成員。",
-    "solution": "恢復連線後重新連接叢集。上一次請求的結果可能尚未確認；重試寫入操作前請檢查資源的目前狀態。"
+    "message": "\u9023\u7dda\u5df2\u4e2d\u65b7\uff1a\u6c92\u6709\u53ef\u5b58\u53d6\u7684\u53e2\u96c6\u6210\u54e1\u3002",
+    "solution": "\u6062\u5fa9\u9023\u7dda\u5f8c\u91cd\u65b0\u9023\u63a5\u53e2\u96c6\u3002\u4e0a\u4e00\u6b21\u8acb\u6c42\u7684\u7d50\u679c\u53ef\u80fd\u5c1a\u672a\u78ba\u8a8d\uff1b\u91cd\u8a66\u5beb\u5165\u64cd\u4f5c\u524d\u8acb\u6aa2\u67e5\u8cc7\u6e90\u7684\u76ee\u524d\u72c0\u614b\u3002"
   },
   "TS0330063": {
-    "message": "連續 {attempts} 次連線均未收到任何影格即結束，已停止此資料流。",
-    "solution": "檢查串流端點與網路路徑後重新連線。這並不表示 Pipeline 正在執行或已經失敗。"
+    "message": "\u9023\u7e8c {attempts} \u6b21\u9023\u7dda\u5747\u672a\u6536\u5230\u4efb\u4f55\u5f71\u683c\u5373\u7d50\u675f\uff0c\u5df2\u505c\u6b62\u6b64\u8cc7\u6599\u6d41\u3002",
+    "solution": "\u6aa2\u67e5\u4e32\u6d41\u7aef\u9ede\u8207\u7db2\u8def\u8def\u5f91\u5f8c\u91cd\u65b0\u9023\u7dda\u3002\u9019\u4e26\u4e0d\u8868\u793a Pipeline \u6b63\u5728\u57f7\u884c\u6216\u5df2\u7d93\u5931\u6557\u3002"
   },
   "TS0330064": {
-    "message": "全螢幕工作台需要互動式終端機。",
-    "solution": "請在終端機中執行 tapstate。如需透過管線或重新導向輸出，請執行帶業務動詞的命令。"
+    "message": "\u5168\u87a2\u5e55\u5de5\u4f5c\u53f0\u9700\u8981\u4e92\u52d5\u5f0f\u7d42\u7aef\u6a5f\u3002",
+    "solution": "\u8acb\u5728\u7d42\u7aef\u6a5f\u4e2d\u57f7\u884c tapstate\u3002\u5982\u9700\u900f\u904e\u7ba1\u7dda\u6216\u91cd\u65b0\u5c0e\u5411\u8f38\u51fa\uff0c\u8acb\u57f7\u884c\u5e36\u696d\u52d9\u52d5\u8a5e\u7684\u547d\u4ee4\u3002"
   },
   "TS0330065": {
-    "message": "全螢幕工作台無法初始化目前的終端機。",
-    "solution": "請使用支援的互動式終端機重試。"
+    "message": "\u5168\u87a2\u5e55\u5de5\u4f5c\u53f0\u7121\u6cd5\u521d\u59cb\u5316\u76ee\u524d\u7684\u7d42\u7aef\u6a5f\u3002",
+    "solution": "\u8acb\u4f7f\u7528\u652f\u63f4\u7684\u4e92\u52d5\u5f0f\u7d42\u7aef\u6a5f\u91cd\u8a66\u3002"
   }
 }
