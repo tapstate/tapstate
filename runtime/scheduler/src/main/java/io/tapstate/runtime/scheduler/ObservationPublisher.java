@@ -6,6 +6,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FlatReduction;
@@ -1589,6 +1590,14 @@ public final class ObservationPublisher {
                 at, ageInSeconds(at, eventTime))));
         if (!ages.isEmpty()) {
             facts.add(new MetricFact(LAG_METRIC, MetricType.GAUGE, "s", ages));
+        }
+        if (delivered.cdcDelivery() != null) {
+            var cdc = delivered.cdcDelivery();
+            var scope = Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId);
+            facts.add(MetricFact.single(CdcDeliveryTotals.COUNT, MetricType.COUNTER, "{record}",
+                    MetricPoint.accumulated(scope, delivered.countingSince(), at, cdc.count())));
+            facts.add(MetricFact.single(CdcDeliveryTotals.TOTAL_MILLIS, MetricType.COUNTER, "ms",
+                    MetricPoint.accumulated(scope, delivered.countingSince(), at, cdc.totalMillis())));
         }
         // The distribution accumulates from the same start as the counts: it is over the same rows.
         delivered.start().ifPresent(start -> {

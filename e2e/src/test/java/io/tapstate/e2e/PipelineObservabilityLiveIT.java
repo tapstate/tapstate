@@ -125,8 +125,9 @@ class PipelineObservabilityLiveIT {
                     awaitState(control, PipelineState.RUNNING);
                     awaitCustomer(mongo, target, "seeded", "the snapshot to reach the real Mongo target");
 
-                    awaitHistory(first.baseUrl(), control.credential(), from,
+                    var snapshotHistory = awaitHistory(first.baseUrl(), control.credential(), from,
                             history -> pointCount(history) >= 1, "the first retained sample");
+                    assertThat(points(snapshotHistory)).noneMatch(point -> point.containsKey("cdcDelivery"));
                     update(mysql, "moving");
                     awaitCustomer(mongo, target, "moving", "a CDC update before the restart");
                     Map<String, Object> baseline = awaitHistory(first.baseUrl(), control.credential(), from,
@@ -136,9 +137,16 @@ class PipelineObservabilityLiveIT {
                     update(mysql, "moving-again");
                     awaitCustomer(mongo, target, "moving-again", "a second CDC update after the counter baseline");
                     Map<String, Object> moving = awaitHistory(first.baseUrl(), control.credential(), from,
-                            PipelineObservabilityLiveIT::hasPositiveOutputDelta,
-                            "a positive target-acknowledged output interval");
+                            history -> hasPositiveOutputDelta(history)
+                                    && points(history).stream().anyMatch(point -> point.containsKey("cdcDelivery")),
+                            "a positive target-acknowledged output interval with CDC delivery time");
                     assertThat(lagReadings(moving)).isNotEmpty();
+                    assertThat(points(moving)).anySatisfy(point -> {
+                        assertThat(point.get("cdcDelivery")).isInstanceOf(Map.class);
+                        Map<?, ?> delivery = (Map<?, ?>) point.get("cdcDelivery");
+                        assertThat(((Number) delivery.get("sampleCount")).longValue()).isPositive();
+                        assertThat(((Number) delivery.get("averageMillis")).doubleValue()).isNotNegative();
+                    });
 
                     Map<String, Object> normal = awaitExplanation(first.baseUrl(), control.credential(),
                             kind -> !"OBSERVATION_STALE".equals(kind) && !"CODED_FAILURE".equals(kind),

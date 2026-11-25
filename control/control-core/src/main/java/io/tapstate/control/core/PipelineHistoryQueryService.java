@@ -341,6 +341,9 @@ public final class PipelineHistoryQueryService {
         for (Entry current : entries) {
             Point point;
             StartReason boundary = previous == null ? null : boundary(previous.sample(), current.sample());
+            var cdc = HistoryAggregator.cdcDelta(previous == null ? null : previous.sample(),
+                    current.sample(), from, boundary);
+            var cdcReading = HistoryAggregator.cdcReading(cdc.count(), cdc.totalMillis());
             if (boundary != null) {
                 segment++;
                 reason = boundary;
@@ -352,17 +355,17 @@ public final class PipelineHistoryQueryService {
                     }
                 }
                 point = new Point(current.sample().observedAt(), current.sample().observedAt(),
-                        null, null, lag(current.sample(), tables));
+                        null, null, lag(current.sample(), tables), cdcReading);
             } else if (previous == null) {
                 point = new Point(current.sample().observedAt(), current.sample().observedAt(),
-                        null, null, lag(current.sample(), tables));
+                        null, null, lag(current.sample(), tables), cdcReading);
             } else {
                 Rate records = rawRate(previous.sample(), current.sample(), HistoryAggregator.RECORDS_OUT);
                 Rate bytes = rawRate(previous.sample(), current.sample(), HistoryAggregator.BYTES_OUT);
                 Instant start = records == null && bytes == null
                         ? current.sample().observedAt() : previous.sample().observedAt();
                 point = new Point(start, current.sample().observedAt(), records, bytes,
-                        lag(current.sample(), tables));
+                        lag(current.sample(), tables), cdcReading);
             }
             points.add(new Emitted(point, segment, reason, current.key(), current.sample().observedAt()));
             previous = current;

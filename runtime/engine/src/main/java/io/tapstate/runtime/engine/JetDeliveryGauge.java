@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramValue;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -57,6 +58,10 @@ final class JetDeliveryGauge implements DeliveryGauge {
     private final Map<String, JobStatistic> reachedByTable = new HashMap<>();
     private final Map<String, JobStatistic> durationParts = new HashMap<>();
     private final Map<String, JobStatistic> waitingByName = new HashMap<>();
+    static final String CDC_COUNT = "cdcDeliveryCount";
+    static final String CDC_TOTAL_MILLIS = "cdcDeliveryTotalMillis";
+    private JobStatistic cdcCount;
+    private JobStatistic cdcTotalMillis;
     private JobStatistic since;
 
     @Override
@@ -96,6 +101,16 @@ final class JetDeliveryGauge implements DeliveryGauge {
     public void reached(Map<String, Long> newestEventTimeByTable) {
         newestEventTimeByTable.forEach((table, eventTime) ->
                 reachedByTable.computeIfAbsent(table, JetDeliveryGauge::reachedMetricFor).set(eventTime));
+    }
+
+    @Override
+    public void cdcDelivered(CdcDeliveryTotals totals) {
+        if (cdcCount == null) {
+            cdcCount = new JobStatistic(CDC_COUNT);
+            cdcTotalMillis = new JobStatistic(CDC_TOTAL_MILLIS);
+        }
+        cdcCount.set(totals.count());
+        cdcTotalMillis.set(totals.totalMillis());
     }
 
     @Override

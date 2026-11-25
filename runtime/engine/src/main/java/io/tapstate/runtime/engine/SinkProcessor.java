@@ -11,8 +11,10 @@ import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
@@ -131,6 +133,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // average: the slow rows are the ones anybody reading a delivery time came for, and an average is
     // where they disappear.
     private final Map<String, DurationTotals> settledDurations = new LinkedHashMap<>();
+    private CdcDeliveryTotals cdcDelivery = CdcDeliveryTotals.ZERO;
     // The clock a row's delivery is measured against, at the moment its write is confirmed. A seam so a
     // duration can be witnessed at a known instant rather than by waiting for real time to pass.
     private final LongSupplier clock;
@@ -803,7 +806,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // Measured against the clock at this line and no earlier one: a row's delivery is how long it
             // was from the source's stamp until its write was known to have succeeded, and the wait in
             // this processor's queue and in flight at the target is part of that, not noise around it.
-            batch.delivered().foldDurationsInto(settledDurations, clock.getAsLong());
+            long settledAt = clock.getAsLong();
+            batch.delivered().foldDurationsInto(settledDurations, settledAt);
+            cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settledAt);
             reportDelivered(batch.delivered().tables());
             return true;
         });
@@ -873,6 +878,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             }
         }
         delivery.took(durations);
+        delivery.cdcDelivered(cdcDelivery);
         // Published with them and never alone: a total is readable only against what it accumulates from,
         // and the two arriving by different routes is how they come to disagree.
         delivery.countingSince(countingSince);
@@ -933,7 +939,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * and applied when the write succeeds, so nothing here depends on the envelopes still being reachable.
      */
     private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> bytes,
-            Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes) {
+            Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes, List<Long> cdcTimes) {
 
         /** The tables this batch settled rows of, which are the ones whose readings have moved. */
         Set<String> tables() {
@@ -945,6 +951,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             Map<String, Long> bytes = new LinkedHashMap<>();
             Map<String, Long> newest = new LinkedHashMap<>();
             Map<String, List<Long>> stamps = new LinkedHashMap<>();
+            List<Long> cdcTimes = new ArrayList<>();
             for (Envelope event : batch) {
                 rows.computeIfAbsent(event.src(), table -> new LinkedHashMap<>())
                         .merge(event.op().symbol(), 1L, Long::sum);
@@ -957,8 +964,15 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // write settles, and a batch that kept only its newest stamp would report the whole batch
                 // as fast as its freshest row.
                 stamps.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(event.ts());
+                // A transform can emit an insert for a snapshot row. Positions carry the original
+                // source order through that transformation. Leave mixed and unproven origins out.
+                if (event.ts() > 0 && event.op() != Op.READ && event.op() != Op.DDL && !event.positions().isEmpty()
+                        && event.positions().values().stream()
+                                .allMatch(position -> position.order() != null && position.order().seq() >= 0)) {
+                    cdcTimes.add(event.ts());
+                }
             }
-            return new DeliveredRows(rows, bytes, newest, stamps);
+            return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes);
         }
 
         void foldInto(Map<String, Map<String, Long>> totals, Map<String, Long> bytesByTable,
@@ -968,6 +982,18 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                             .merge(op, count, Long::sum)));
             bytes.forEach((table, size) -> bytesByTable.merge(table, size, Long::sum));
             newestEventTime.forEach((table, ts) -> newestByTable.merge(table, ts, Math::max));
+        }
+
+        CdcDeliveryTotals addCdcDurations(CdcDeliveryTotals previous, long settledAtMillis) {
+            long count = previous.count();
+            long total = previous.totalMillis();
+            for (long stamp : cdcTimes) {
+                if (stamp <= settledAtMillis) {
+                    count++;
+                    total += settledAtMillis - stamp;
+                }
+            }
+            return new CdcDeliveryTotals(count, total);
         }
 
         /** Buckets every row's age at {@code settledAtMillis} into its table's running distribution. */

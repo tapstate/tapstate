@@ -12,6 +12,7 @@ import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.HistogramValue;
@@ -760,6 +761,22 @@ public final class Engine {
     public Map<String, HistogramValue> deliveryDurations(String pipelineId) {
         Job job = liveJob(pipelineId);
         return job == null ? Map.of() : settledDurationsIn(job.getMetrics());
+    }
+
+    /** CDC-only measurements, summed over writers in the same job. */
+    public CdcDeliveryTotals cdcDelivery(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            return null;
+        }
+        JobMetrics metrics = job.getMetrics();
+        var counts = metrics.get(JetDeliveryGauge.CDC_COUNT);
+        var totals = metrics.get(JetDeliveryGauge.CDC_TOTAL_MILLIS);
+        if (counts.isEmpty() || counts.size() != totals.size()) {
+            return null;
+        }
+        return new CdcDeliveryTotals(counts.stream().mapToLong(Measurement::value).sum(),
+                totals.stream().mapToLong(Measurement::value).sum());
     }
 
     /**

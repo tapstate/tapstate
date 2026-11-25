@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -184,6 +185,11 @@ public final class RateSampler {
                 lag.put(key.substring(LAG_PREFIX.length()), value);
             }
         });
+        for (MetricFact fact : observation.facts()) {
+            if (CdcDeliveryTotals.COUNT.equals(fact.name()) || CdcDeliveryTotals.TOTAL_MILLIS.equals(fact.name())) {
+                counters.put(fact.name(), fact.points().getFirst().value());
+            }
+        }
         if (counters.isEmpty() && lag.isEmpty()) {
             return null;
         }

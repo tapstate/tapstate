@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.spi.sink.SinkWriter;
@@ -63,6 +64,32 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         assertThat(delivery.latestRows()).isEqualTo(Map.of("orders", Map.of("i", 2L)));
         // Two rows of {id: <number>} at ten bytes each: two for the field's name, eight for the number.
         assertThat(delivery.latestBytes()).isEqualTo(Map.of("orders", 20L));
+    }
+
+    @Test
+    void measures_cdc_output_at_confirmation_without_counting_snapshot_or_synthetic_rows() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(writer, delivery, () -> now);
+        ChainPosition change = new ChainPosition(new SourceOrder(1, 13), "change");
+        ChainPosition snapshot = new ChainPosition(SourceOrder.snapshotRow(1), null);
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(
+                row("orders", now - 300).withPosition(change),
+                update("orders", now - 600).withPosition(change),
+                row("orders", now - 800).withPosition(snapshot),
+                row("orders", now - 1_200).withPositions(Map.of("orders", change, "customers", snapshot)),
+                row("orders", now - 1_600),
+                delete("orders", now + 10).withPosition(change)));
+        processor.process(0, inbox);
+        assertThat(delivery.cdc).isEmpty();
+
+        writer.completeAll();
+        drain(processor);
+
+        assertThat(delivery.cdc.getLast()).isEqualTo(new CdcDeliveryTotals(2, 900));
+        assertThat(delivery.latestDurations().get("orders").count()).isEqualTo(6);
     }
 
     /**
@@ -411,6 +438,13 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         private final List<Map<String, Long>> bytes = new ArrayList<>();
         private final List<Map<String, Long>> eventTimes = new ArrayList<>();
         private final List<Map<String, HistogramValue>> durations = new ArrayList<>();
+        private final List<CdcDeliveryTotals> cdc = new ArrayList<>();
+
+        @Override
+        public void cdcDelivered(CdcDeliveryTotals totals) {
+            cdc.add(totals);
+        }
+
         private final List<Long> starts = new ArrayList<>();
         private final List<Map<String, Long>> queued = new ArrayList<>();
         private final List<Map<String, Long>> inFlight = new ArrayList<>();

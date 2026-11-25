@@ -1,11 +1,13 @@
 package io.tapstate.control.core;
 
+import io.tapstate.control.core.PipelineMetricsHistory.CdcDelivery;
 import io.tapstate.control.core.PipelineMetricsHistory.Gap;
 import io.tapstate.control.core.PipelineMetricsHistory.GapReason;
 import io.tapstate.control.core.PipelineMetricsHistory.Lag;
 import io.tapstate.control.core.PipelineMetricsHistory.Point;
 import io.tapstate.control.core.PipelineMetricsHistory.Rate;
 import io.tapstate.control.core.PipelineMetricsHistory.StartReason;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore.Entry;
 import io.tapstate.spi.store.RateHistoryStore.Key;
@@ -112,7 +114,7 @@ public final class HistoryAggregator {
             throw new IllegalStateException("rate-history entries are not in stable ascending order");
         }
         if (previous == null) {
-            addLag(current);
+            addFrame(current, cdcDelta(null, current.sample(), from, null));
         } else {
             processPair(previous, current, true);
         }
@@ -121,7 +123,7 @@ public final class HistoryAggregator {
 
     /**
      * Completes the projection. A right-boundary successor contributes only the clipped counter interval;
-     * its lag and key are never output or treated as consumed.
+     * its readings and key are never output or treated as consumed.
      */
     public Projection finish(Entry successor) {
         if (!full() && successor != null && previous != null) {
@@ -141,7 +143,7 @@ public final class HistoryAggregator {
         return emitted.size() >= outputCeiling;
     }
 
-    private void processPair(Entry left, Entry right, boolean includeRightLag) {
+    private void processPair(Entry left, Entry right, boolean includeRightFrame) {
         RateSample a = left.sample();
         RateSample b = right.sample();
         Duration elapsed = Duration.between(a.observedAt(), b.observedAt());
@@ -163,8 +165,8 @@ public final class HistoryAggregator {
                     gaps.add(new EmittedGap(segment, new Gap(gapStart, gapEnd, GapReason.SAMPLE_GAP)));
                 }
             }
-            if (includeRightLag && !full()) {
-                addLag(right);
+            if (includeRightFrame && !full()) {
+                addFrame(right, cdcDelta(a, b, from, boundary));
             }
             return;
         }
@@ -178,8 +180,8 @@ public final class HistoryAggregator {
                 addInterval(left.key(), intervalStart, intervalEnd, records, bytes);
             }
         }
-        if (includeRightLag && !full()) {
-            addLag(right);
+        if (includeRightFrame && !full()) {
+            addFrame(right, cdcDelta(a, b, from, null));
         }
     }
 
@@ -224,6 +226,42 @@ public final class HistoryAggregator {
         return after - before;
     }
 
+    /**
+     * CDC totals describe discrete deliveries. Attribute an intact sample pair to its right
+     * observation and never prorate records across a window, a gap, or a reset.
+     */
+    static CdcDeliveryTotals cdcDelta(RateSample left, RateSample right, Instant from, StartReason boundary) {
+        Instant start = right.countingSince();
+        Long count = right.counters().get(CdcDeliveryTotals.COUNT);
+        Long millis = right.counters().get(CdcDeliveryTotals.TOTAL_MILLIS);
+        if (start == null || start.isAfter(right.observedAt()) || count == null || millis == null) {
+            return CdcDeliveryTotals.ZERO;
+        }
+
+        if (left == null || !start.equals(left.countingSince())) {
+            if (start.isBefore(from) || left != null && !start.isAfter(left.observedAt())) {
+                return CdcDeliveryTotals.ZERO;
+            }
+        } else {
+            if (boundary != null || !left.observedAt().isBefore(right.observedAt()) || left.observedAt().isBefore(from)) {
+                return CdcDeliveryTotals.ZERO;
+            }
+            Long beforeCount = left.counters().get(CdcDeliveryTotals.COUNT);
+            Long beforeMillis = left.counters().get(CdcDeliveryTotals.TOTAL_MILLIS);
+            if (beforeCount == null || beforeMillis == null) {
+                return CdcDeliveryTotals.ZERO;
+            }
+            count -= beforeCount;
+            millis -= beforeMillis;
+        }
+        return count > 0 && millis >= 0 ? new CdcDeliveryTotals(count, millis) : CdcDeliveryTotals.ZERO;
+    }
+
+    static CdcDelivery cdcReading(long count, long totalMillis) {
+        return count == 0 ? null : new CdcDelivery(count, BigDecimal.valueOf(totalMillis)
+                .divide(BigDecimal.valueOf(count), INTERNAL_SCALE, RoundingMode.HALF_EVEN));
+    }
+
     private static CounterInterval counter(RateSample left, RateSample right, String name, Duration elapsed) {
         Long growth = growth(left, right, name);
         if (elapsed.isZero() || growth == null) {
@@ -262,7 +300,7 @@ public final class HistoryAggregator {
         }
     }
 
-    private void addLag(Entry entry) {
+    private void addFrame(Entry entry, CdcDeliveryTotals cdc) {
         Instant at = entry.sample().observedAt();
         if (at.isBefore(resumeFrom) || at.isBefore(from) || !at.isBefore(to) || full()) {
             return;
@@ -278,7 +316,7 @@ public final class HistoryAggregator {
         if (active == null) {
             active = new Bucket(segment, segmentReason, bucketStart);
         }
-        active.addFrame(at);
+        active.addFrame(at, cdc);
         active.addLag(at, entry.sample().lag(), tables);
     }
 
@@ -372,6 +410,8 @@ public final class HistoryAggregator {
         private Instant start;
         private Instant end;
         private boolean frame;
+        private long cdcCount;
+        private long cdcMillis;
 
         Bucket(int segment, StartReason reason, Instant bucketStart) {
             this.segment = segment;
@@ -400,8 +440,10 @@ public final class HistoryAggregator {
             }
         }
 
-        void addFrame(Instant at) {
+        void addFrame(Instant at, CdcDeliveryTotals cdc) {
             frame = true;
+            cdcCount += cdc.count();
+            cdcMillis += cdc.totalMillis();
             touch(at, at);
         }
 
@@ -414,7 +456,7 @@ public final class HistoryAggregator {
                     .sorted(Map.Entry.comparingByKey())
                     .map(entry -> entry.getValue().finish(entry.getKey()))
                     .toList();
-            return new Point(start, end, records.rate(), bytes.rate(), readings);
+            return new Point(start, end, records.rate(), bytes.rate(), readings, cdcReading(cdcCount, cdcMillis));
         }
 
         private void touch(Instant from, Instant to) {

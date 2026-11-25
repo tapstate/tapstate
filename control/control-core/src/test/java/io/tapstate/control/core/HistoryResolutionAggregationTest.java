@@ -1,8 +1,11 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
+import io.tapstate.core.lifecycle.RateSample;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -91,5 +94,33 @@ class HistoryResolutionAggregationTest {
         });
         assertThat(points.get(1).recordsOut().delta()).isEqualByComparingTo("60");
         assertThat(points.get(2).recordsOut()).isNull();
+    }
+    @Test
+    void cdcBucketsWeightEachRecordOnceAndOmitIdleIntervals() {
+        var store = new HistoryTestSupport.MutableHistory();
+        store.add(cdcSample("2026-09-21T10:00:00Z", 0, 0));
+        store.add(cdcSample("2026-09-21T10:01:00Z", 2, 600));
+        store.add(cdcSample("2026-09-21T10:02:00Z", 6, 3_600));
+        store.add(cdcSample("2026-09-21T10:03:00Z", 6, 3_600));
+        store.add(cdcSample("2026-09-21T10:08:00Z", 10, 30_000));
+        store.add(cdcSample("2026-09-21T10:09:00Z", 10, 30_000));
+        store.add(cdcSample("2026-09-21T10:10:00Z", 11, 30_000));
+
+        var answer = service(store, 2, 25_000).query(
+                query("2026-09-21T10:00:00Z", "2026-09-21T10:11:00Z",
+                        HistoryResolution.PT5M, 20, List.of(), null));
+        var readings = points(answer).stream().map(PipelineMetricsHistory.Point::cdcDelivery).toList();
+
+        assertThat(readings.getFirst().sampleCount()).isEqualTo(6);
+        assertThat(readings.getFirst().averageMillis()).isEqualByComparingTo("600");
+        assertThat(readings.get(1)).isNull();
+        assertThat(readings.getLast().sampleCount()).isEqualTo(1);
+        assertThat(readings.getLast().averageMillis()).isZero();
+    }
+
+    private static RateSample cdcSample(String at, long count, long totalMillis) {
+        return new RateSample("orders", Instant.parse(at), Map.of("records.out", count,
+                CdcDeliveryTotals.COUNT, count, CdcDeliveryTotals.TOTAL_MILLIS, totalMillis),
+                Map.of(), COUNTING_SINCE);
     }
 }
