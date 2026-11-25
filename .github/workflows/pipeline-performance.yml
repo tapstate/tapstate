@@ -89,10 +89,124 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  maven-seed:
+    name: Prepare Maven dependencies
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    cache-mode: write
+    permissions:
+      contents: read
+    outputs:
+      key: ${{ steps.seed.outputs.key }}
+    env:
+      STOP_AT: ${{ needs.prepare.outputs.measurement_stop }}
+    steps:
+      - name: Bound Maven preparation by the remaining budget
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/performance-maven-evidence"
+          mkdir -p "$evidence"
+          {
+            echo "STORE=$RUNNER_TEMP/performance-maven"
+            echo "EVIDENCE=$evidence"
+          } >> "$GITHUB_ENV"
+          now=$(date +%s)
+          if (( now >= STOP_AT )); then
+            echo 'No performance budget remains for Maven preparation.' | tee "$evidence/budget.log"
+            exit 124
+          fi
+          job_stop=$((now + 30 * 60))
+          if (( STOP_AT < job_stop )); then
+            job_stop="$STOP_AT"
+          fi
+          echo "SEED_STOP_AT=$job_stop" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+      - uses: actions/download-artifact@v4
+        with:
+          name: performance-inputs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/performance-inputs
+      - name: Bind the Maven cache to the build inputs
+        env:
+          MAVEN_INPUTS: ${{ hashFiles('**/pom.xml', '.mvn/**', '.github/scripts/setup-ci-maven.sh', 'benchmarks/actions_maven.py') }}
+        run: echo "CACHE_PREFIX=perf-maven-v1-${RUNNER_OS}-${RUNNER_ARCH}-${MAVEN_INPUTS}-" >> "$GITHUB_ENV"
+      - uses: actions/cache/restore@v5
+        id: previous
+        with:
+          path: ${{ env.STORE }}
+          key: ${{ env.CACHE_PREFIX }}bootstrap
+          restore-keys: ${{ env.CACHE_PREFIX }}
+      - uses: actions/cache/restore@v4
+        if: steps.previous.outputs.cache-matched-key == ''
+        id: legacy
+        with:
+          path: ~/.m2/repository
+          key: setup-java-Linux-x64-maven-${{ hashFiles('**/pom.xml') }}
+      - name: Bootstrap the pinned Maven distribution
+        if: steps.previous.outputs.cache-matched-key == ''
+        run: |
+          remaining=$((SEED_STOP_AT - $(date +%s)))
+          if (( remaining <= 0 )); then
+            exit 124
+          fi
+          timeout --kill-after=10 "$remaining" bash .github/scripts/setup-ci-maven.sh > "$EVIDENCE/maven-setup.log" 2>&1
+      - name: Refresh and verify the local Maven repository
+        id: seed
+        env:
+          WARM_KEY: ${{ steps.previous.outputs.cache-matched-key }}
+          LEGACY_HIT: ${{ steps.legacy.outputs.cache-hit }}
+        run: |
+          legacy=()
+          if [[ "$LEGACY_HIT" == 'true' ]]; then
+            legacy=(--legacy-hit)
+          fi
+          python3 -B benchmarks/actions_maven.py prepare \
+            --inputs "$RUNNER_TEMP/performance-inputs" --store "$STORE" --legacy "$HOME/.m2/repository" \
+            --evidence "$EVIDENCE" --prefix "$CACHE_PREFIX" --warm-key "$WARM_KEY" \
+            --stop-at "$SEED_STOP_AT" "${legacy[@]}"
+      - uses: actions/cache/restore@v5
+        id: existing
+        with:
+          path: ${{ env.STORE }}
+          key: ${{ steps.seed.outputs.key }}
+          lookup-only: true
+      - uses: actions/cache/save@v5
+        if: steps.existing.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.STORE }}
+          key: ${{ steps.seed.outputs.key }}
+      - name: Lookup the published Maven cache
+        id: published
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.STORE }}
+          key: ${{ steps.seed.outputs.key }}
+          lookup-only: true
+          fail-on-cache-miss: true
+      - name: Confirm the exact Maven cache is readable
+        env:
+          CACHE_HIT: ${{ steps.published.outputs.cache-hit }}
+        run: test "$CACHE_HIT" = 'true'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-maven-seed-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: ignore
+          retention-days: 30
+
   measure:
     name: measure (${{ matrix.batch }})
-    if: ${{ !cancelled() && github.run_attempt == '1' && needs.prepare.result == 'success' }}
-    needs: prepare
+    if: ${{ !cancelled() && github.run_attempt == '1' && needs.prepare.result == 'success' && needs.maven-seed.result == 'success' }}
+    needs: [prepare, maven-seed]
+    cache-mode: read
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     strategy:
@@ -102,12 +216,14 @@ jobs:
     env:
       STOP_AT: ${{ needs.prepare.outputs.measurement_stop }}
       BATCH: ${{ matrix.batch }}
+      MAVEN_CACHE_KEY: ${{ needs.maven-seed.outputs.key }}
     steps:
       - name: Check the remaining budget
         id: budget
         run: |
           now=$(date +%s)
           mkdir -p "$RUNNER_TEMP/performance-batch"
+          echo "STORE=$RUNNER_TEMP/performance-maven" >> "$GITHUB_ENV"
           printf 'Runner started at epoch %s. Round measurement cutoff %s.\n' "$now" "$STOP_AT" \
             > "$RUNNER_TEMP/performance-batch/batch-start.txt"
           if (( STOP_AT <= now )); then
@@ -132,19 +248,37 @@ jobs:
         with:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
-          cache: maven
       - uses: actions/download-artifact@v4
         if: steps.budget.outputs.run == 'true'
         with:
           name: performance-inputs-${{ github.run_attempt }}
           path: ${{ runner.temp }}/performance-inputs
-      - name: Set up Maven
+      - name: Restore the selected Maven cache
+        id: maven-cache
+        if: steps.budget.outputs.run == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.STORE }}
+          key: ${{ env.MAVEN_CACHE_KEY }}
+          fail-on-cache-miss: true
+      - name: Verify the selected Maven cache
         if: steps.budget.outputs.run == 'true'
         env:
           STOP_AT: ${{ steps.budget.outputs.stop-at }}
+          CACHE_HIT: ${{ steps.maven-cache.outputs.cache-hit }}
         run: |
-          bash .github/scripts/performance-with-budget.sh "Maven setup" bash .github/scripts/setup-ci-maven.sh \
-            > "$RUNNER_TEMP/performance-batch/maven-setup.log" 2>&1
+          set -euo pipefail
+          if [[ "$CACHE_HIT" != 'true' ]]; then
+            echo '::error::The restored Maven cache key is different from the selected key.'
+            exit 1
+          fi
+          evidence="$RUNNER_TEMP/performance-batch"
+          digest="$(bash .github/scripts/performance-with-budget.sh "Maven cache verification" \
+            python3 -B benchmarks/actions_maven.py verify "$STORE" "$MAVEN_CACHE_KEY")"
+          jq -n --arg key "$MAVEN_CACHE_KEY" --arg sha256 "$digest" '{key: $key, sha256: $sha256}' \
+            > "$evidence/maven-cache.json"
+          printf '%s\n' "$STORE/maven-home/bin" >> "$GITHUB_PATH"
+          echo "MAVEN_HOME=$STORE/maven-home" >> "$GITHUB_ENV"
       - name: Build and measure the fixed batch
         if: steps.budget.outputs.run == 'true'
         env:
@@ -172,7 +306,8 @@ jobs:
           bash "$budget_script" "MongoDB image pull" docker pull mongo:7.0 > "$output/mongo-pull.log" 2>&1
           bash "$budget_script" "MongoDB image inspection" \
             docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$output/mongo-image.json"
-          bash "$budget_script" "application build" mvn -B -pl app,e2e -am -DskipTests package > "$output/build.log" 2>&1
+          export MAVEN_ARGS="${MAVEN_ARGS:+$MAVEN_ARGS }-Dmaven.repo.local=$STORE/repository"
+          bash "$budget_script" "application build" mvn -B -o -pl app,e2e -am -DskipTests package > "$output/build.log" 2>&1
           sha256sum app/target/app-0.8.0-boot.jar "$RUNNER_TEMP/connectors/"*.jar > "$output/artifacts.sha256"
           if (( STOP_AT <= $(date +%s) )); then
             printf 'The batch budget expired before measurement.\n' > "$output/expired.txt"
@@ -180,7 +315,7 @@ jobs:
           fi
           python3 -B benchmarks/runner.py run \
             --manifest "$RUNNER_TEMP/performance-inputs/manifest.json" --batch "$BATCH" \
-            --stop-at-epoch-seconds "$STOP_AT" --endpoint-latency-probe \
+            --stop-at-epoch-seconds "$STOP_AT" --endpoint-latency-probe --offline \
             --connectors "$RUNNER_TEMP/connectors" --output "$output/run"
       - name: Upload batch evidence
         uses: actions/upload-artifact@v4
@@ -198,7 +333,7 @@ jobs:
 
   report:
     if: always() && (github.run_attempt != '1' || needs.prepare.result != 'skipped')
-    needs: [prepare, measure]
+    needs: [prepare, maven-seed, measure]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -229,6 +364,12 @@ jobs:
         with:
           pattern: performance-batch-${{ github.run_attempt }}-*
           path: ${{ runner.temp }}/performance-batches
+      - uses: actions/download-artifact@v4
+        if: github.run_attempt == '1'
+        continue-on-error: true
+        with:
+          name: performance-maven-seed-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/performance-batches/performance-maven-seed-${{ github.run_attempt }}
       - name: Read job timing evidence
         if: github.run_attempt == '1'
         continue-on-error: true
@@ -244,7 +385,7 @@ jobs:
       - name: Reconcile and publish
         if: github.run_attempt == '1'
         env:
-          PERFORMANCE_JOB_RESULTS: ${{ format('{{"prepare":"{0}","measure":"{1}"}}', needs.prepare.result, needs.measure.result) }}
+          PERFORMANCE_JOB_RESULTS: ${{ format('{{"prepare":"{0}","maven-seed":"{1}","measure":"{2}"}}', needs.prepare.result, needs.maven-seed.result, needs.measure.result) }}
         run: |
           python3 -B benchmarks/actions_report.py \
             --inputs "$RUNNER_TEMP/performance-inputs" --artifacts "$RUNNER_TEMP/performance-batches" \

@@ -17,6 +17,9 @@ import runner
 import verdict
 
 
+CACHE_SETUP_STEPS = {"Restore the selected Maven cache", "Verify the selected Maven cache"}
+
+
 def missing_batch_reason(folder, job):
     if (folder / "expired.txt").is_file():
         return "batch expired before measurement"
@@ -28,6 +31,25 @@ def missing_batch_reason(folder, job):
     if job.get("conclusion") == "failure":
         return "batch failed before writing a summary"
     return "batch summary missing or unreadable"
+
+
+def maven_seed_details(artifacts, attempt, manifest, job_results, jobs_by_name, artifact_index):
+    """Read same-attempt evidence, independently of whether the cache was saved."""
+    if not manifest or manifest["unallocated"] or "maven-seed" not in job_results:
+        return None, None
+    name = f"performance-maven-seed-{attempt['attempt']}"
+    result = {"name": name, **artifact_index.get(name, {}), "outcome": job_results["maven-seed"]}
+    receipt = object_or_empty(artifacts / name / "receipt.json")
+    if (receipt.get("github_attempt") == attempt and receipt.get("manifest_sha256") == manifest["manifest_sha256"]
+            and receipt.get("code_sha") == manifest["identity"]["code_sha"]):
+        result["receipt"] = receipt
+    else:
+        receipt = {}
+    if result["outcome"] != "success":
+        steps = jobs_by_name.get("Prepare Maven dependencies", {}).get("failed_steps", [])
+        reason = receipt.get("reason") or (steps[0] if steps else result["outcome"])
+        return result, f"Maven preparation failed ({reason})"
+    return result, None
 
 
 def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=None):
@@ -46,8 +68,20 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
     measurements = []
     accepted_artifacts = {}
     batch_evidence = {}
+    blocked_cache_batches = set()
     jobs_by_name = {job["name"]: job for job in jobs}
-    if manifest and not manifest["unallocated"]:
+    seed, seed_failure = maven_seed_details(artifacts, attempt, manifest, job_results, jobs_by_name,
+                                            artifact_index or {})
+    if seed_failure:
+        errors.append({"reason": seed_failure})
+    cache = (seed or {}).get("receipt", {})
+    selected_cache = None
+    if seed and not seed_failure:
+        if cache.get("cache_key") and cache.get("sha256"):
+            selected_cache = {"key": cache["cache_key"], "sha256": cache["sha256"]}
+        else:
+            errors.append({"reason": "Maven dependency cache receipt missing or mismatched"})
+    if manifest and not manifest["unallocated"] and not seed_failure:
         for batch in manifest["batches"]:
             index = batch["index"]
             artifact_name = f"performance-batch-{attempt['attempt']}-{index}"
@@ -55,8 +89,15 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
             batch_evidence[str(index)] = batch_details(folder, artifact_name, artifact_index or {})
             payload = object_or_empty(folder / "run" / "summary.json")
             if not payload:
-                reason = missing_batch_reason(folder, jobs_by_name.get(f"measure ({index})", {}))
+                job = jobs_by_name.get(f"measure ({index})", {})
+                failed_steps = job.get("failed_steps", [])
+                if failed_steps and failed_steps[0] in CACHE_SETUP_STEPS:
+                    blocked_cache_batches.add(index)
+                reason = missing_batch_reason(folder, job)
                 errors.append({"batch": index, "reason": reason})
+                continue
+            if selected_cache is not None and batch_evidence[str(index)].get("maven_cache") != selected_cache:
+                errors.append({"batch": index, "reason": "batch Maven cache binding mismatch"})
                 continue
             if (payload.get("batch") != index or payload.get("github_attempt") != attempt
                     or payload.get("manifest_sha256") != manifest["manifest_sha256"]
@@ -68,7 +109,7 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
             measurements.append(payload)
             accepted_artifacts[str(index)] = artifact_name
     reference, baseline_status = read_baseline(inputs, run, manifest)
-    if manifest and not manifest["unallocated"]:
+    if manifest and not manifest["unallocated"] and not seed_failure:
         batch_conditions = {
             int(index): {key: evidence[key] for key in ("cpu", "runner_image", "mongo_images") if key in evidence}
             for index, evidence in batch_evidence.items()
@@ -80,7 +121,8 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
         reasons = {item["id"]: item["reason"] for item in errors if "id" in item}
         unmeasured = [
             {"case_id": case["id"], "case_version": case["version"], "repeat": repeat, "status": "not-run",
-             "last_stage": "prepare", "reason": reasons.get(case["id"], "allocation incomplete"),
+             "last_stage": "maven-seed" if seed_failure else "prepare",
+             "reason": seed_failure or reasons.get(case["id"], "allocation incomplete"),
              "comparisons": {"status": "result-unavailable"}}
             for case in (manifest or {}).get("selected_cases", [])
             for repeat in range(1, case["repeats"] + 1)
@@ -96,6 +138,8 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
     result["job_results"] = job_results
     result["artifact_names"] = accepted_artifacts
     result["batch_evidence"] = batch_evidence
+    if seed:
+        result["maven_seed"] = seed
     result["report_artifact_name"] = f"performance-report-{attempt['attempt']}"
     result["generated_at"] = datetime.now(timezone.utc).isoformat()
     result["selected_ids"] = manifest["selected_ids"] if manifest else []
@@ -104,7 +148,10 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
     missing_reasons = {error["batch"]: error["reason"] for error in errors if "batch" in error}
     for row in result["results"]:
         batch = result["case_context"].get(row["case_id"], {}).get("batch")
-        if row["status"] == "missing":
+        if row["status"] == "missing" and batch in blocked_cache_batches:
+            row.update(status="not-run", last_stage="maven-cache", reason=missing_reasons[batch],
+                       comparisons={"status": "result-unavailable"})
+        elif row["status"] == "missing":
             row.update(last_stage="batch" if batch in missing_reasons else "reconcile",
                        reason=missing_reasons.get(batch, "Expected repeat absent from batch summary"))
         artifact = batch_evidence.get(str(batch))
@@ -113,6 +160,8 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
             row["evidence"] = {"artifact": artifact["name"], "artifact_id": artifact.get("id"),
                                "result_path": raw_path if (artifacts / artifact["name"] / raw_path).is_file()
                                else "run/summary.json"}
+    if blocked_cache_batches:
+        result["case_verdicts"] = verdict.case_verdicts(result["results"], reference)
     result["repeat_counts"] = dict(Counter(row["status"] for row in result["results"]))
     cases = result["case_verdicts"].values()
     result["case_counts"] = dict(Counter(row["execution"] for row in cases))
@@ -147,6 +196,9 @@ def comparison_coverage(case):
 
 def batch_details(folder, name, index):
     details = {"name": name, **index.get(name, {})}
+    cache = object_or_empty(folder / "maven-cache.json")
+    if cache:
+        details["maven_cache"] = cache
     try:
         environment = (folder / "environment.txt").read_text(encoding="utf-8")
     except (OSError, ValueError):
@@ -241,6 +293,14 @@ def summary(result, repository):
     for job in result.get("jobs", []):
         if job["elapsed_seconds"] is not None:
             lines.append(f"- {escape(job['name'])} elapsed {job['elapsed_seconds']:.0f}s ({job['conclusion']})")
+    if seed := result.get("maven_seed"):
+        lines.append(f"- Maven preparation {cell(seed['outcome'])} · {artifact_link(seed, repository, run_id)}")
+        if seed_receipt := seed.get("receipt"):
+            lines.append(f"- Maven seed source {cell(seed_receipt.get('source'))}, Central downloads "
+                         f"{cell(seed_receipt.get('central_download_requests'))}, attempts with HTTP 429 "
+                         f"{cell(seed_receipt.get('central_429_attempts'))}")
+            if seed_receipt.get("cache_key"):
+                lines.append(f"- Maven cache key {cell(seed_receipt['cache_key'])}")
     if result["repeat_counts"]:
         lines.append("- Repeat outcomes " + ", ".join(
             f"{status} {count}" for status, count in sorted(result["repeat_counts"].items())))
@@ -322,6 +382,8 @@ def case_label(context):
 
 
 def evidence_location(result, row, repository, run_id):
+    if row.get("last_stage") == "maven-seed" and result.get("maven_seed"):
+        return artifact_link(result["maven_seed"], repository, run_id)
     context = result["case_context"][row["case_id"]]
     artifact = result["batch_evidence"].get(str(context.get("batch")))
     if not artifact:
