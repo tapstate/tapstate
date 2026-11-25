@@ -120,6 +120,7 @@ public final class MongoConfigurationBootstrap {
                                             .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(key)));
                             SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(session,
                                     new Document("_id", "config").append("installedVersion", 2).append(MongoValidationSchema.AI_ONLY, true)
+                                            .append(MongoKeyMoveWindowStore.INSTALL_VERSION, 1)
                                             .append(MongoAlertStorageSchema.FIELD, MongoAlertStorageSchema.initialMarker(
                                                     clusterId, SourceConfigCipher.fingerprint(key), operationId))
                                             .append(MongoSourceIdentitySchema.FIELD, MongoSourceIdentitySchema.initial(

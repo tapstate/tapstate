@@ -29,20 +29,37 @@ class DefaultCopyPrimaryKeyUpdateIT {
 
     @Test
     void aPrimaryKeyUpdateDoesNotStopChangeDeliveryToAnotherTable() throws Exception {
-        verifyKeyMove(Map.of());
+        verifyKeyMove(Map.of(), false);
     }
 
     @Test
     void fourExplicitWritersPreserveTheMovedRowAndTheReplacement() throws Exception {
-        verifyKeyMove(Map.of("parallelism", 4, "batch", Map.of("max_records", 32, "max_wait", "20ms")));
+        verifyKeyMove(Map.of("parallelism", 4, "batch", Map.of("max_records", 32, "max_wait", "20ms")), false);
     }
 
-    private void verifyKeyMove(Map<String, Object> execution) throws Exception {
+    @Test
+    void aLegacyInstallWritesOrdinaryChangesAndRefusesOnlyTheMove() throws Exception {
+        verifyKeyMove(Map.of(), true);
+    }
+
+    private static ServerHandle launch(PreparedNativeStore store, boolean legacy) throws Exception {
+        if (legacy) {
+            try (var client = MongoClients.create(store.configurationUri())) {
+                var config = client.getDatabase(store.configurationDatabase());
+                config.getCollection("schema_migrations").updateOne(new Document("_id", "config"),
+                        new Document("$unset", new Document("pipelineKeyMoveWindowVersion", "")));
+                config.getCollection("pipeline_key_move_windows").drop();
+            }
+        }
+        return Tiers.IN_PROCESS.launch(store);
+    }
+
+    private void verifyKeyMove(Map<String, Object> execution, boolean legacy) throws Exception {
         DockerGate.require();
         RealConnectorGate.require("mysql", "mongodb");
         var mysql = SharedMySql.settings("key_change_" + UUID.randomUUID().toString().replace("-", ""));
         try (var connection = SharedMySql.connect(mysql); Statement sql = connection.createStatement();
-                var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                var storage = PreparedNativeStore.create(); ServerHandle server = launch(storage, legacy);
                 var mongo = new MongoEndpoints(); var targetClient = MongoClients.create(storage.masterUri())) {
             sql.execute("CREATE TABLE ACC_COMPOSITE (K1 INT, K2 VARCHAR(20), VAL INT, " +
                     "OWNER VARCHAR(20) NOT NULL UNIQUE, PRIMARY KEY (K1, K2))");
@@ -97,6 +114,15 @@ class DefaultCopyPrimaryKeyUpdateIT {
                     .fetch(target, COMPOSITE, ORIGINAL_KEY).filter(row -> "21".equals(String.valueOf(row.get("VAL"))))
                     .isPresent(), () -> control.pipelineStatus(PIPELINE).toString());
 
+            if (legacy) {
+                assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
+                Await.until("the legacy installation to refuse the move before dispatch",
+                        () -> control.failure(PIPELINE).filter(f -> f.code().equals("TS0480044")).isPresent(),
+                        () -> control.pipelineStatus(PIPELINE).toString());
+                assertThat(mongo.fetch(target, COMPOSITE, ORIGINAL_KEY)).isPresent();
+                assertThat(mongo.fetch(target, COMPOSITE, UPDATED_KEY)).isEmpty();
+                return;
+            }
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET OWNER='free' WHERE K1=3")).isEqualTo(1);
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1', OWNER='claimed' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET VAL=22 WHERE K1=2 AND K2='r1'")).isEqualTo(1);

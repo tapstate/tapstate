@@ -174,5 +174,9 @@
   "TS0480043": {
     "message": "Pipeline '{pipeline}' stopped before replay because a primary-key change may have reached its target.",
     "solution": "Check the old and new keys and the saved source position before resuming from a verified baseline."
+  },
+  "TS0480044": {
+    "message": "Pipeline '{pipeline}' stopped before dispatch because its installation does not support key moves.",
+    "solution": "Keep source keys stable on this installation or run the pipeline on a new installation with key-move support."
   }
 }

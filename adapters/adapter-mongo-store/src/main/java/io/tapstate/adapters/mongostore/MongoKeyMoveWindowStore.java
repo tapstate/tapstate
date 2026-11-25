@@ -22,6 +22,7 @@ import java.util.UUID;
 
 /** One majority-durable interval per pipeline. A new revision is issued on every admission. */
 final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
+    static final String INSTALL_VERSION = "pipelineKeyMoveWindowVersion";
     private final MongoDatabase database;
     private final MongoCollection<Document> rows;
     private final Runnable active;
@@ -37,6 +38,7 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
     @Override public Optional<Window> read(String pipelineId) {
         active.run();
         return StoreIo.call(() -> {
+            if (!installed(pipelineId)) return Optional.empty();
             var stored = rows.find(new Document("_id", pipelineId)).first();
             if (stored != null) return Optional.of(decode(stored));
             requireCollection(pipelineId);
@@ -44,9 +46,24 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
         });
     }
 
-    private BsonBinary requireCollection(String pipelineId) {
-        var collection = database.withReadPreference(ReadPreference.primary()).listCollections(BsonDocument.class)
+    private boolean installed(String pipelineId) {
+        var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database)
+                .withReadPreference(ReadPreference.primary()).withReadConcern(ReadConcern.LINEARIZABLE)
+                .find(new Document("_id", "config")).projection(new Document(INSTALL_VERSION, 1)).first();
+        if (schema == null) throw PipelineKeyMoveWindows.unresolved(pipelineId);
+        if (Integer.valueOf(1).equals(schema.get(INSTALL_VERSION))) return true;
+        if (schema.containsKey(INSTALL_VERSION) || collectionInfo() != null)
+            throw PipelineKeyMoveWindows.unresolved(pipelineId);
+        return false;
+    }
+
+    private BsonDocument collectionInfo() {
+        return database.withReadPreference(ReadPreference.primary()).listCollections(BsonDocument.class)
                 .filter(new Document("name", rows.getNamespace().getCollectionName())).first();
+    }
+
+    private BsonBinary requireCollection(String pipelineId) {
+        var collection = collectionInfo();
         if (collection == null || !collection.isDocument("info") || !collection.getDocument("info").isBinary("uuid")) {
             throw PipelineKeyMoveWindows.unresolved(pipelineId);
         }
@@ -87,6 +104,12 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
         return StoreIo.call(() -> {
             // A matching revision proves both the identity and all bounds used for this replacement.
             // Most batches extend their own last admission without a second round trip.
+            if (lastAdmission == null) {
+                active.run();
+                if (!installed(scope.pipelineId())) {
+                    throw new TapstateException(IoError.KEY_MOVE_NOT_INSTALLED, Map.of("pipeline", scope.pipelineId()), null);
+                }
+            }
             var previous = Optional.ofNullable(lastAdmission);
             for (;;) {
                 var ranges = new LinkedHashMap<Stream, Range>();

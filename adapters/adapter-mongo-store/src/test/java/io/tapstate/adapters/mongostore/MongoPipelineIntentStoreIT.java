@@ -90,6 +90,29 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void aLegacyConfigurationCanStartWithoutEnrollingInKeyMoves() {
+        withConfiguration((domain, database, scope) -> {
+            var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database);
+            var config = new Document("_id", "config");
+            schema.updateOne(config, new Document("$unset", new Document("pipelineKeyMoveWindowVersion", "")));
+            SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.on(database).drop();
+            var original = schema.find(config).first();
+            try (var reopened = MongoConfigurationDomain.openExisting(settings(database))) {
+                var windows = reopened.keyMoveWindows();
+                windows.requireClear(scope.pipelineId());
+                var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "source", "orders", null);
+                assertThatThrownBy(() -> windows.arm(scope, 42, "activation", stream,
+                        point(new io.tapstate.core.event.SourceOrder(1, 2)), null, () -> {}))
+                        .isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code().code()).isEqualTo("TS0480044"));
+                assertThat(windows.read(scope.pipelineId())).isEmpty();
+            }
+            assertThat(schema.find(config).first()).isEqualTo(original);
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .doesNotContain(SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.collectionName());
+        });
+    }
+
+    @Test
     void disappearanceOfTheWindowCollectionRefusesTheNextAdmission() {
         withConfiguration((domain, database, scope) -> {
             var windows = domain.keyMoveWindows();
