@@ -91,7 +91,14 @@ class NativeConnectorHandoffIT {
                     .defaultHeader("Authorization", "Bearer " + token).build();
 
             command(http, "reader_a", "start", Map.of());
-            assertDelivered(first, 1, "snapshot");
+            try {
+                assertDelivered(first, 1, "snapshot");
+            } catch (org.awaitility.core.ConditionTimeoutException timeout) {
+                var status = http.get().uri("/api/pipelines/reader_a/status").retrieve().body(Map.class);
+                throw new AssertionError("Initial reader_a snapshot did not arrive; shared=" + shared
+                        + ", sourceRows=" + source.countDocuments() + ", targetRows=" + first.countDocuments()
+                        + ", status=" + status, timeout);
+            }
             command(http, "reader_b", "start", Map.of());
             assertDelivered(second, 1, "snapshot");
             String oldChain = shared ? chain(cache, "reader_b") : null;

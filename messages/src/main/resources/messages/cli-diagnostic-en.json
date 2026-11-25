@@ -88,8 +88,8 @@
     "solution": "Use the commands it will be built from in the meantime; `help` lists what this build can do."
   },
   "TS0330023": {
-    "message": "`{verb}` works inside the Tapstate session, not as a one-shot command.",
-    "solution": "Start `tapstate` with no arguments and type `{verb}` at the prompt; `help` lists the session commands."
+    "message": "The `{verb}` action runs inside the Tapstate session.",
+    "solution": "Run `tapstate` in an interactive terminal, press F6 to open Shell, then enter `{verb}` at the `tapstate>` prompt."
   },
   "TS0330024": {
     "message": "The MCP sidecar is unavailable: {reason}.",
