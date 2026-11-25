@@ -17,12 +17,36 @@ import io.tapstate.runtime.engine.nest.NestLookup;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.runtime.engine.nest.NestVertex;
+import io.tapstate.spi.sink.TargetField;
+import io.tapstate.spi.sink.TargetIndex;
+import io.tapstate.spi.sink.TargetTable;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 class SourceMoveColumnsTest {
+    @Test
+    void aDirectCopyGuardsIsolatedUniqueValueChangesAndLeavesOrdinaryUpdatesUnarmed() {
+        var model = new TargetTable("orders", List.of(new TargetField("id", "bigint", true),
+                new TargetField("owner", "varchar", false), new TargetField("label", "varchar", false)),
+                List.of(new TargetIndex(List.of("id"), true), new TargetIndex(List.of("owner"), true),
+                        new TargetIndex(List.of("label"), false)));
+        var guarded = List.copyOf(SourceMoveColumns.uniqueColumns(model));
+        assertThat(guarded).containsExactlyInAnyOrder("id", "owner");
+        var before = Map.<String, Object>of("id", 1, "owner", "Ada", "label", "old");
+        var ordinary = Envelope.update(1, "orders", before,
+                Map.of("id", 1, "owner", "Ada", "label", "new"), null);
+        var move = Envelope.update(2, "orders", before,
+                Map.of("id", 1, "owner", "Bob", "label", "old"), null);
+        var missing = Envelope.update(3, "orders", Map.of("id", 1),
+                Map.of("id", 1, "owner", "Bob", "label", "old"), null);
+        assertThat(ScopedKeyMoveGuard.mayMove(move, List.of("id"))).isFalse();
+        assertThat(ScopedKeyMoveGuard.mayMove(move, guarded)).isTrue();
+        assertThat(ScopedKeyMoveGuard.mayMove(missing, guarded)).isTrue();
+        assertThat(ScopedKeyMoveGuard.mayMove(ordinary, guarded)).isFalse();
+    }
+
     @Test
     void directSourceAliasesProtectChangedStateKeysWithoutRegisteringProjectionOnlyUpdates() {
         var aliases = FromClause.aliases(Map.of("orders", FromRef.literal("one.rows"),

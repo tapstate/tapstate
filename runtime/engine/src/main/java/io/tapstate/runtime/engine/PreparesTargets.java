@@ -1,6 +1,8 @@
 package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.spi.sink.TargetKeyConstraints;
+import java.util.Map;
 
 /**
  * A sink's writer factory whose writers write only tables prepared for them before they open: created where
@@ -17,4 +19,15 @@ public interface PreparesTargets {
      * any writer of that execution exists.
      */
     void prepareTargets(HazelcastInstance coordinator);
+
+    /** Whether native parallel writes can use this factory's inspected equality constraints. */
+    default boolean supportsParallelKeyMoves() {
+        return false;
+    }
+
+    /** Prepares before reading the constraints the resulting target tables actually enforce. */
+    default Map<String, TargetKeyConstraints> prepareTargetConstraints(HazelcastInstance coordinator) {
+        prepareTargets(coordinator);
+        return Map.of();
+    }
 }

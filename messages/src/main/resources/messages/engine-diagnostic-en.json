@@ -62,5 +62,9 @@
   "TS0440016": {
     "message": "The target reported {accepted} accepted events for a batch of {expected} containing a key move.",
     "solution": "Check the target and connector write result before resuming. The batch may already have been partially applied."
+  },
+  "TS0440017": {
+    "message": "Parallel target {node} cannot establish key ordering for stream {stream}.",
+    "solution": "Check the target unique indexes, collations, and complete scalar key values in both row images. Check that the connector can read the target index definitions."
   }
 }

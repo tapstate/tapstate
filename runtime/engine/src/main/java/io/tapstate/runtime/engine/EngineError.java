@@ -147,7 +147,9 @@ public enum EngineError implements TapstateErrorCode {
      */
     CLUSTER_REFUSED_THE_STATE(EngineErrorDefinitions.CLUSTER_REFUSED_THE_STATE),
 
-    KEY_MOVE_WRITE_UNCONFIRMED(EngineErrorDefinitions.KEY_MOVE_WRITE_UNCONFIRMED);
+    KEY_MOVE_WRITE_UNCONFIRMED(EngineErrorDefinitions.KEY_MOVE_WRITE_UNCONFIRMED),
+
+    TARGET_KEY_ORDER_UNKNOWN(EngineErrorDefinitions.TARGET_KEY_ORDER_UNKNOWN);
 
     private final ProductErrorDefinition definition;
 

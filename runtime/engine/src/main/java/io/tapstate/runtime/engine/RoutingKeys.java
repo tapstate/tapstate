@@ -77,6 +77,7 @@ final class RoutingKeys {
 
     private static Object sinkKeyOf(String node, Map<String, SinkTarget> targetsByStream,
             boolean orderChangesByTable, Object item) {
+        if (item instanceof SinkLaneCommand command) return command.lane();
         if (item instanceof SettledPositions) {
             return SETTLED_POSITIONS_LANE;
         }
@@ -147,6 +148,13 @@ final class RoutingKeys {
         }
         JoinKey key = JoinKey.of(values);
         return key.matchable() ? key : null;
+    }
+
+    static String writerLane(String node, SinkTarget target, Envelope row, Map<String, Object> image) {
+        JoinKey key = keyFrom(image, target.keyColumns());
+        if (key == null) throw new TapstateException(EngineError.ROUTING_KEY_MISSING,
+                Map.of("node", node, "stream", row.src(), "columns", String.join(", ", target.keyColumns())), null);
+        return lane(target.table(), key.name());
     }
 
     private static String lane(String stream, String key) {

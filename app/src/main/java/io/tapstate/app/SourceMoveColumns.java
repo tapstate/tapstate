@@ -5,6 +5,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.sql.JoinTree;
 import io.tapstate.runtime.engine.nest.NestTopology;
+import io.tapstate.spi.sink.TargetTable;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -17,6 +18,14 @@ import java.util.function.Function;
 /** Input columns whose movement changes an operator's state owner before its effects reach the sink. */
 final class SourceMoveColumns {
     private SourceMoveColumns() {}
+
+    /** Source-known unique values can move independently of the row's primary identity. */
+    static Set<String> uniqueColumns(TargetTable source) {
+        var columns = new LinkedHashSet<String>();
+        source.indexes().stream().filter(io.tapstate.spi.sink.TargetIndex::unique)
+                .forEach(index -> columns.addAll(index.fields()));
+        return Set.copyOf(columns);
+    }
 
     static Map<String, Set<String>> forDirectInputs(Map<String, Step.Inline> steps,
             Map<String, StoreBackedDagSource.CompiledJoin> joins, Map<String, OperatorCoordinatePlan.NestStep> nests,

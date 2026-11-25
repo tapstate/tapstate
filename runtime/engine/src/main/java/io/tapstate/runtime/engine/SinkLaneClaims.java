@@ -1,0 +1,123 @@
+package io.tapstate.runtime.engine;
+
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.event.ConvertedValue;
+import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
+import io.tapstate.spi.sink.TargetKeyConstraints;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/** All values a row releases or acquires in its physical target, under proven simple equality. */
+final class SinkLaneClaims {
+    record Key(String table, List<String> columns, List<Object> value) {}
+    record Row(Envelope event, Set<Key> keys, List<String> fences, String destination, boolean reserved) {}
+
+    private final String node;
+    private final SinkTarget target;
+    private final TargetKeyConstraints constraints;
+    private final List<List<String>> secondary;
+
+    SinkLaneClaims(String node, SinkTarget target, TargetKeyConstraints constraints) {
+        this.node = node;
+        this.target = target;
+        this.constraints = constraints;
+        var keys = new ArrayList<>(constraints.uniqueKeys());
+        keys.removeIf(k -> k.equals(target.keyColumns()));
+        secondary = List.copyOf(keys);
+    }
+
+    boolean requiresReservation(Envelope e) {
+        if (!constraints.exactScalarEquality()) throw unsupported(e);
+        for (var column : target.keyColumns()) {
+            if (e.op() != Op.INSERT && !known(e.before(), column)
+                    || e.op() != Op.DELETE && !known(e.after(), column)) throw unsupported(e);
+        }
+        if (e.op() == Op.UPDATE && differs(e, target.keyColumns())) return true;
+        for (var columns : secondary) {
+            if (generated(columns, e)) continue;
+            if (e.op() != Op.UPDATE || differs(e, columns)) return true;
+            // A partial or non-scalar key cannot prove a secondary value was preserved.
+            for (String column : columns) {
+                if (!known(e.before(), column) || !known(e.after(), column)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean differs(Envelope row, List<String> columns) {
+        if (row.before() == null || row.after() == null) return false;
+        for (var col : columns) {
+            Object oldValue = ConvertedValue.unwrap(row.before().get(col));
+            Object newValue = ConvertedValue.unwrap(row.after().get(col));
+            if (!java.util.Objects.deepEquals(oldValue, newValue)) return true;
+        }
+        return false;
+    }
+
+    Row describe(Envelope e, boolean reserved) {
+        var keys = new HashSet<Key>();
+        var fences = new LinkedHashSet<String>();
+        var last = e.op() == Op.DELETE ? e.before() : e.after();
+        for (var image : images(e)) {
+            claim(keys, target.keyColumns(), image, e);
+            fences.add(RoutingKeys.writerLane(node, target, e, image));
+            for (var columns : secondary) {
+                if (!generated(columns, e)) claim(keys, columns, image, e);
+            }
+        }
+        if (e.op() == Op.UPDATE && (hasId(e.before()) || hasId(e.after()))
+                && !java.util.Objects.equals(e.before().get("_id"), e.after().get("_id"))) throw unsupported(e);
+        return new Row(e, keys, List.copyOf(fences), RoutingKeys.writerLane(node, target, e, last), reserved);
+    }
+
+    private Collection<Map<String, Object>> images(Envelope e) {
+        return switch (e.op()) {
+            case UPDATE -> {
+                if (e.before() == null || e.after() == null) throw unsupported(e);
+                yield List.of(e.before(), e.after());
+            }
+            case INSERT -> List.of(e.after());
+            case DELETE -> List.of(e.before());
+            default -> throw new IllegalArgumentException("expected a row mutation");
+        };
+    }
+
+    private void claim(Set<Key> keys, List<String> columns, Map<String, Object> image, Envelope e) {
+        var tuple = new ArrayList<>();
+        for (var column : columns) {
+            if (!known(image, column)) throw unsupported(e);
+            Object value = ConvertedValue.unwrap(image.get(column));
+            tuple.add(value instanceof Number n ? n.longValue() : value);
+        }
+        keys.add(new Key(target.table(), columns, List.copyOf(tuple)));
+    }
+
+    private boolean known(Map<String, Object> image, String column) {
+        if (image == null) return false;
+        Object v = ConvertedValue.unwrap(image.get(column));
+        var type = constraints.fieldTypes().get(column);
+        return type == TapstateType.STRING && v instanceof String || type == TapstateType.INT64
+                && (v instanceof Long || v instanceof Integer || v instanceof Short || v instanceof Byte);
+    }
+
+    private static boolean hasId(Map<String, Object> image) {
+        return image != null && image.containsKey("_id");
+    }
+
+    private boolean generated(List<String> columns, Envelope e) {
+        return constraints.generatedDocumentIdentity() && columns.equals(List.of("_id"))
+                && !hasId(e.before()) && !hasId(e.after());
+    }
+
+    private TapstateException unsupported(Envelope row) {
+        return new TapstateException(EngineError.TARGET_KEY_ORDER_UNKNOWN,
+                Map.of("node", node, "stream", row.src()), null);
+    }
+}

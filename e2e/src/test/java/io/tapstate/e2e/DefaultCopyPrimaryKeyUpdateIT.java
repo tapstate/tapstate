@@ -1,5 +1,9 @@
 package io.tapstate.e2e;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.model.IndexOptions;
+import org.bson.Document;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -7,6 +11,7 @@ import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.Test;
 
 import java.sql.Statement;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -24,15 +29,26 @@ class DefaultCopyPrimaryKeyUpdateIT {
 
     @Test
     void aPrimaryKeyUpdateDoesNotStopChangeDeliveryToAnotherTable() throws Exception {
+        verifyKeyMove(Map.of());
+    }
+
+    @Test
+    void fourExplicitWritersPreserveTheMovedRowAndTheReplacement() throws Exception {
+        verifyKeyMove(Map.of("parallelism", 4, "batch", Map.of("max_records", 32, "max_wait", "20ms")));
+    }
+
+    private void verifyKeyMove(Map<String, Object> execution) throws Exception {
         DockerGate.require();
         RealConnectorGate.require("mysql", "mongodb");
         var mysql = SharedMySql.settings("key_change_" + UUID.randomUUID().toString().replace("-", ""));
         try (var connection = SharedMySql.connect(mysql); Statement sql = connection.createStatement();
                 var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage);
-                var mongo = new MongoEndpoints()) {
-            sql.execute("CREATE TABLE ACC_COMPOSITE (K1 INT, K2 VARCHAR(20), VAL INT, PRIMARY KEY (K1, K2))");
+                var mongo = new MongoEndpoints(); var targetClient = MongoClients.create(storage.masterUri())) {
+            sql.execute("CREATE TABLE ACC_COMPOSITE (K1 INT, K2 VARCHAR(20), VAL INT, " +
+                    "OWNER VARCHAR(20) NOT NULL UNIQUE, PRIMARY KEY (K1, K2))");
             sql.execute("CREATE TABLE ACC_OTHER (ID INT PRIMARY KEY, STATUS VARCHAR(20))");
-            sql.executeUpdate("INSERT INTO ACC_COMPOSITE VALUES (2, 'k1', 20)");
+            sql.executeUpdate("INSERT INTO ACC_COMPOSITE VALUES (2, 'k1', 20, 'first')");
+            sql.executeUpdate("INSERT INTO ACC_COMPOSITE VALUES (3, 'third', 30, 'claimed')");
             sql.executeUpdate("INSERT INTO ACC_OTHER VALUES (1, 'snapshot')");
 
             var control = new ControlPlane(server.baseUrl());
@@ -55,16 +71,23 @@ class DefaultCopyPrimaryKeyUpdateIT {
                     config: { uri: "%s" }
                     """.formatted(storage.masterUri())));
             control.discoverSchema("acc-mysql", "mysql", mysql);
+            var sync = new LinkedHashMap<String, Object>(Map.of("source", "atlas-store", "write_mode", "upsert",
+                    "on_full_load", "clear", "rename", Map.of("prefix", "mysql_")));
+            if (!execution.isEmpty()) sync.put("execution", execution);
             control.sourceRequest("POST", "/api/pipelines", Map.of("id", PIPELINE, "sources", List.of("acc-mysql"),
-                    "serve", Map.of("from", "/.*/", "sync", List.of(Map.of("source", "atlas-store",
-                            "write_mode", "upsert", "on_full_load", "clear", "rename", Map.of("prefix", "mysql_"))))),
+                    "serve", Map.of("from", "/.*/", "sync", List.of(sync))),
                     null, 201);
+            var physical = targetClient.getDatabase(new ConnectionString(storage.masterUri()).getDatabase())
+                    .getCollection(COMPOSITE);
+            physical.createIndex(new Document("OWNER", 1), new IndexOptions().unique(true));
             control.lifecycle(PIPELINE, LifecycleVerb.START);
 
             var target = EndpointAddress.uri(storage.masterUri());
             Await.until("the two snapshots to reach MongoDB",
-                    () -> mongo.count(target, COMPOSITE) == 1 && mongo.count(target, OTHER) == 1,
+                    () -> mongo.count(target, COMPOSITE) == 2 && mongo.count(target, OTHER) == 1,
                     () -> control.pipelineStatus(PIPELINE).toString());
+            assertThat(physical.listIndexes().into(new java.util.ArrayList<>())).anyMatch(index ->
+                    new Document("OWNER", 1).equals(index.get("key")) && Boolean.TRUE.equals(index.get("unique")));
             assertThat(mongo.fetch(target, COMPOSITE, ORIGINAL_KEY).orElseThrow())
                     .containsKeys("K1", "K2", "VAL");
             assertThat(mongo.fetch(target, OTHER, OTHER_KEY).orElseThrow()).containsEntry("STATUS", "snapshot");
@@ -74,9 +97,10 @@ class DefaultCopyPrimaryKeyUpdateIT {
                     .fetch(target, COMPOSITE, ORIGINAL_KEY).filter(row -> "21".equals(String.valueOf(row.get("VAL"))))
                     .isPresent(), () -> control.pipelineStatus(PIPELINE).toString());
 
-            assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
+            assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET OWNER='free' WHERE K1=3")).isEqualTo(1);
+            assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1', OWNER='claimed' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET VAL=22 WHERE K1=2 AND K2='r1'")).isEqualTo(1);
-            assertThat(sql.executeUpdate("INSERT INTO ACC_COMPOSITE VALUES (2, 'k1', 99)")).isEqualTo(1);
+            assertThat(sql.executeUpdate("INSERT INTO ACC_COMPOSITE VALUES (2, 'k1', 99, 'first')")).isEqualTo(1);
             assertThat(sql.executeUpdate("UPDATE ACC_OTHER SET STATUS='after' WHERE ID=1")).isEqualTo(1);
 
             Await.until("the composite row to move to its new key and the unrelated update to reach MongoDB", () -> {
@@ -94,6 +118,10 @@ class DefaultCopyPrimaryKeyUpdateIT {
                     + " composite row at original key " + mongo.fetch(target, COMPOSITE, ORIGINAL_KEY)
                     + " composite row at updated key " + mongo.fetch(target, COMPOSITE, UPDATED_KEY)
                     + " unrelated MongoDB row " + mongo.fetch(target, OTHER, OTHER_KEY));
+            assertThat(mongo.fetch(target, COMPOSITE, Map.of("K1", 3)).orElseThrow()).containsEntry("OWNER", "free");
+            assertThat(mongo.fetch(target, COMPOSITE, UPDATED_KEY).orElseThrow()).containsEntry("OWNER", "claimed");
+            assertThat(mongo.fetch(target, COMPOSITE, ORIGINAL_KEY).orElseThrow()).containsEntry("OWNER", "first");
+            control.stop(PIPELINE, false);
         }
     }
 }

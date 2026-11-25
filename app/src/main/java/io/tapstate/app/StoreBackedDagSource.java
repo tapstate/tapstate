@@ -1437,6 +1437,36 @@ final class StoreBackedDagSource implements DagSource {
         return targets;
     }
 
+    /** Direct native copies guard source-known unique values before the first row-key fan-out. */
+    private Map<String, Set<String>> rawCopyMoveColumns(PipelineResource pipeline,
+            Map<String, SourceVertex> vertices, Map<String, String> keysByTable,
+            Map<String, List<String>> keysBySource, Set<String> steps, Map<String, TargetTable> models) {
+        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null) return Map.of();
+        boolean nativeUpsert = serve.sync().stream().anyMatch(sync -> {
+            if (writeMode(sync.writeMode()) != WriteMode.UPSERT || ddl(sync.ddl()) == DdlPolicy.APPLY) return false;
+            var sink = StoredArtifacts.requireSource(artifacts(), sync.source());
+            return Set.of("mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb")
+                    .contains(sink.connector());
+        });
+        if (!nativeUpsert) return Map.of();
+        var inputs = new LinkedHashSet<String>();
+        for (var ref : refsOf(serve.from())) {
+            var view = inlineViewNamed(pipeline, ref);
+            for (var producer : view == null ? List.of(ref) : refsOf(view.from())) {
+                inputs.addAll(upstreams(producer, keysByTable, keysBySource, vertices, steps));
+            }
+        }
+        if (!vertices.keySet().containsAll(inputs)) return Map.of();
+        var result = new LinkedHashMap<String, Set<String>>();
+        for (String input : inputs) {
+            var model = models.get(vertices.get(input).stream());
+            if (model == null || model.unwindIdentity() != null
+                    || model.fields().stream().noneMatch(TargetField::primaryKey)) return Map.of();
+            result.put(input, SourceMoveColumns.uniqueColumns(model));
+        }
+        return result;
+    }
+
     /**
      * The write-side model for what each nest in this pipeline emits, keyed by the stream it emits under.
      *
@@ -2405,8 +2435,9 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
+        var rawModels = sourceTargets(sourceVertices);
         Map<String, AggregateStepSpec> aggregates = compiledAggregates(
-                pipeline, sourceTargets(sourceVertices), sourceVertices, compiledJoins);
+                pipeline, rawModels, sourceVertices, compiledJoins);
         // Aggregate state is committed under the execution's claim; a run bound to no execution has none.
         AggregateStores aggregateStores = manifest != null ? AggregateStores.bound(manifest)
                 : (member, step, kind) -> {
@@ -2430,6 +2461,11 @@ final class StoreBackedDagSource implements DagSource {
                         operators == null ? Map.of() : operators.coordinates().nests(),
                         ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                         sourceVertices.keySet());
+        if (captureBindings != null && !snapshotOnly) {
+            rawCopyMoveColumns(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, rawModels)
+                    .forEach((source, columns) -> operatorKeys.computeIfAbsent(source, key -> new LinkedHashSet<>())
+                            .addAll(columns));
+        }
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), operatorKeys.getOrDefault(key, Set.of()),
                         axes, snapshotOnly, snapshotEpoch, freshStart,

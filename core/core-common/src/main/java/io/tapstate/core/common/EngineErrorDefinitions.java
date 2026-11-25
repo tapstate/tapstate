@@ -41,6 +41,9 @@ public final class EngineErrorDefinitions {
     public static final ProductErrorDefinition KEY_MOVE_WRITE_UNCONFIRMED =
             DEFINITIONS.define(16, Severity.ERROR, Set.of("expected", "accepted"));
 
+    public static final ProductErrorDefinition TARGET_KEY_ORDER_UNKNOWN =
+            DEFINITIONS.define(17, Severity.ERROR, Set.of("node", "stream"));
+
     private EngineErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

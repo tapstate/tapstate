@@ -402,6 +402,7 @@ public final class PipelineDagBuilder {
                 }
             }
         }
+        Set<String> rawSources = Set.copyOf(byKey.keySet());
         // The numbering comes from the binding rather than from what was accumulated here, because the
         // assembler stamping at its sources needs the same answer: an axis meaning one chain in the graph
         // and another at a source would have unrelated promises combined as though they were one.
@@ -541,7 +542,7 @@ public final class PipelineDagBuilder {
             verticesOf(sink.upstream(), byKey).forEach(upstream -> drawn.feeds(sink.name(), upstream.getName()));
             if (shape.isNative(sink.name())) {
                 drawNativeSink(dag, sink, sinkAck, axes, chains, shape, byKey, outboundOrdinal, inboundOrdinal,
-                        startsTheRun ? roster : null);
+                        startsTheRun ? roster : null, rawSources);
                 drawn.add(sink.name(), ROUTE_VERTEX_PREFIX + sink.name());
                 drawn.add(sink.name(), sink.name());
                 startsTheRun = false;
@@ -685,37 +686,44 @@ public final class PipelineDagBuilder {
     private static void drawNativeSink(DAG dag, SinkNode sink, SinkAckFactory sinkAck, ChainAxes axes,
             PipelineChains chains, ExecutionShape shape, Map<String, Vertex> byKey,
             Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal,
-            SinkAckFactory.RunWriters startsTheRun) {
+            SinkAckFactory.RunWriters startsTheRun, Set<String> rawSources) {
         String name = sink.name();
         Map<String, SinkTarget> targets = shape.sinkTargetsOf(name);
         int local = shape.localOf(name);
         boolean orderChangesByTable = shape.nodes().get(name).origin() == NodeParallelism.Origin.NODE_DEFAULT;
-        var byTarget = RoutingKeys.forSink(name, targets, orderChangesByTable);
-        Vertex router = dag.newVertex(ROUTE_VERTEX_PREFIX + name, SinkRouter.metaSupplier(targets, axes,
-                        chains == null ? null : chains.perOrdinal(sink.upstream()), shape.plannedMembers()))
-                .localParallelism(local);
+        var preparation = sink.writers() instanceof PreparesTargets p ? p : null;
+        boolean coordinated = preparation != null && preparation.supportsParallelKeyMoves()
+                && rawSources.containsAll(sink.upstream()) && targets.values().stream().map(SinkTarget::table)
+                        .distinct().count() == targets.size();
+        var ingress = RoutingKeys.forSink(name, targets, coordinated || orderChangesByTable);
+        var writerLane = RoutingKeys.forSink(name, targets, !coordinated && orderChangesByTable);
+        var inputs = chains == null ? null : chains.perOrdinal(sink.upstream());
+        ProcessorMetaSupplier routing = coordinated
+                ? PreparedSinkLaneRouters.of(name, targets, preparation, axes, inputs, shape.plannedMembers())
+                : SinkRouter.metaSupplier(targets, axes, inputs, shape.plannedMembers());
+        Vertex router = dag.newVertex(ROUTE_VERTEX_PREFIX + name, routing).localParallelism(local);
         for (Vertex upstream : verticesOf(sink.upstream(), byKey)) {
             int from = outboundOrdinal.merge(upstream, 1, Integer::sum) - 1;
             int to = inboundOrdinal.merge(router, 1, Integer::sum) - 1;
-            dag.edge(Edge.from(upstream, from).to(router, to).partitioned(byTarget).distributed());
+            dag.edge(Edge.from(upstream, from).to(router, to).partitioned(ingress).distributed());
         }
         List<String> carried = chains == null ? null : chains.union(sink.upstream());
         SupplierEx<LevelBounds> edges = axes == null || carried == null
                 ? null
                 : () -> new LevelBounds(Map.of(SinkRouter.SPREAD, carried, SinkRouter.BY_KEY, carried), axes,
                         LevelBounds.HOLDS_NOTHING);
-        ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
+        ProcessorMetaSupplier writers = SinkProcessor.nativeMetaSupplier(name, sink.writers(),
                 sinkAck, () -> SettledFloor.forRoutedWriter(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
                 shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis(),
-                chains == null ? Map.of() : chains.assembledOutputs(sink.upstream()), targets),
-                sink);
+                chains == null ? Map.of() : chains.assembledOutputs(sink.upstream()), targets, coordinated);
+        if (!coordinated) writers = preparingTargets(writers, sink);
         if (startsTheRun != null) {
             writers = WriterRunStart.of(writers, sinkAck, startsTheRun);
         }
         Vertex vertex = dag.newVertex(name, writers).localParallelism(local);
         dag.edge(Edge.from(router, SinkRouter.SPREAD).to(vertex, SinkRouter.SPREAD).distributed());
         dag.edge(Edge.from(router, SinkRouter.BY_KEY).to(vertex, SinkRouter.BY_KEY)
-                .partitioned(byTarget).distributed());
+                .partitioned(writerLane).distributed());
     }
 
     /**

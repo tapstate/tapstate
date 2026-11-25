@@ -102,6 +102,21 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
             ExecutionAuthorization.of(coordinator).require(fence);
             targets.prepareTargets(coordinator);
         }
+
+        @Override
+        public boolean supportsParallelKeyMoves() {
+            return targets.supportsParallelKeyMoves();
+        }
+
+        @Override
+        public java.util.Map<String, io.tapstate.spi.sink.TargetKeyConstraints> prepareTargetConstraints(
+                HazelcastInstance coordinator) {
+            var authorization = ExecutionAuthorization.of(coordinator);
+            authorization.require(fence);
+            var constraints = targets.prepareTargetConstraints(coordinator);
+            authorization.require(fence);
+            return constraints;
+        }
     }
 
     private static final class FencedSinkWriter implements SinkWriter {
