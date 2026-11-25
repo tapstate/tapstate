@@ -112,13 +112,14 @@ class MongoHttpDiagnosticsScopeTest {
 
     @Test void groupCardinalityAndLogFieldsAreBoundedWithoutLosingTotals() {
         try (var scope = MongoHttpDiagnosticsScope.open()) {
-            for (int i = 0; i < 50; i++) {
+            for (int i = 0; i < 150; i++) {
                 MongoHttpDiagnosticsScope.started(started(i, "db\n" + i, "table" + "x".repeat(200)));
                 MongoHttpDiagnosticsScope.finished(i, 1, false);
             }
             var value = scope.snapshot();
-            assertThat(value).containsEntry("complete", true).containsEntry("grouped_as_other", 18);
-            assertThat(values(value.get("mongo"))).containsEntry("completed", 50L);
+            assertThat(value).containsEntry("complete", true).containsEntry("grouped_as_other", 22);
+            assertThat(values(value.get("mongo"))).containsEntry("completed", 150L);
+            assertThat((java.util.List<?>) value.get("mongo_groups")).hasSize(129);
             assertThat(JsonWriter.write(value)).doesNotContain("\\n", "x".repeat(97));
         }
     }

@@ -120,11 +120,24 @@ final class PdkTargetPreparation {
         if (!verifiedReady.contains(target)) prepare(target, table);
     }
 
+    void prepareAtOpen(TargetTable target, TapTable table) throws Throwable {
+        prepare(target, table, true);
+    }
+
     void prepare(TargetTable target, TapTable table) throws Throwable {
+        prepare(target, table, false);
+    }
+
+    private void prepare(TargetTable target, TapTable table, boolean opening) throws Throwable {
         requireActive.run();
         if (receipts != null) {
             if (target == null || (preparedAhead && !target.hasDeferredDecimal()) || prepared.contains(target.name())) {
-                PdkSinkPreparations.host(() -> { receipts.requireReady(target); return null; });
+                PdkSinkPreparations.host(() -> {
+                    if (opening && preparedAhead && target != null) receipts.requireReady(java.util.List.of(target));
+                    else receipts.requireReady(target);
+                    return null;
+                });
+                // A prepared writer carries the frozen model and never issues preparation mutations.
                 // The caller still checks the exact execution immediately before writeRecord.
                 if (preparedAhead) verifiedReady.add(target);
                 return;

@@ -48,7 +48,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Per-step models use the original prepared Pipeline state and an actual live claim write. */
 @RequiresDocker
 class MongoCacheDerivedSchemaStoreIT {
-    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final PipelineIntentScope SCOPE = new PipelineIntentScope("cluster-a", 1, "cache-a", "orders", 1);
     private static final CacheBusinessScope BUSINESS = new CacheBusinessScope("cluster-a", 1, "cache-a");
     private static final WorkloadClaimKey KEY = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
@@ -245,11 +246,14 @@ class MongoCacheDerivedSchemaStoreIT {
             var writer = f.writer();
             record(writer, "text");
             writer.pin("orders", "source.orders", 0);
+            var catalogCommands = new java.util.concurrent.atomic.AtomicInteger();
             var historyReads = new java.util.concurrent.atomic.AtomicInteger();
             var historyWrites = new java.util.concurrent.atomic.AtomicInteger();
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) {
                     if (!event.getDatabaseName().equals(f.database.getName())) return;
+                    if (event.getCommandName().equals("listCollections") || event.getCommandName().equals("listIndexes"))
+                        catalogCommands.incrementAndGet();
                     var table = event.getCommand().get(event.getCommandName());
                     if (table == null || !table.isString()
                             || !table.asString().getValue().equals(SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())) return;
@@ -269,12 +273,243 @@ class MongoCacheDerivedSchemaStoreIT {
                         new DerivedSchemaStore.Change("source.customers", new io.tapstate.spi.store.DerivedSchema(
                                 0, columns("text"), "new", "source", "v1"))));
             }
+            assertThat(catalogCommands).hasValue(0);
             assertThat(historyReads).hasValue(1);
             assertThat(historyWrites).hasValue(1);
             assertThat(writer.pinned("orders", "source.orders").orElseThrow().derivedBy()).isEqualTo("v2");
             assertThat(writer.latest("orders", "source.orders").orElseThrow().version()).isEqualTo(1);
             assertThat(writer.latest("orders", "source.customers").orElseThrow().version()).isZero();
         });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"first-checkout", "after-claim-write", "before-commit", "twice", "ordinary-record"})
+    void poolClearanceRecoveryIsBoundedToTheOriginalUncommittedPublication(String stage) {
+        withFixture(f -> {
+            record(f.writer(), "old");
+            f.writer().pin("orders", "source.orders", 0);
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var pause = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var cleared = new java.util.concurrent.atomic.AtomicBoolean();
+            var failures = new java.util.concurrent.atomic.AtomicInteger();
+            var claimWrite = new java.util.concurrent.atomic.AtomicInteger();
+            var modelWrite = new java.util.concurrent.atomic.AtomicInteger();
+            var secondClear = new java.util.concurrent.atomic.AtomicBoolean();
+            long beforeClaimWrites = f.claimWrites();
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            failures.incrementAndGet();
+                            var restore = resume.get();
+                            if (restore != null) restore.run();
+                        }
+                    })).addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            commands.add(event.getCommandName());
+                            if (updates(event, "workload_claims")) claimWrite.set(event.getRequestId());
+                            if (updates(event, "derived_schemas")) modelWrite.set(event.getRequestId());
+                        }
+                        @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                            if ((stage.equals("after-claim-write") && event.getRequestId() == claimWrite.get()
+                                    || stage.equals("before-commit") && event.getRequestId() == modelWrite.get())
+                                    && cleared.compareAndSet(false, true)) pause.get().run();
+                            if (stage.equals("twice") && failures.get() == 1 && event.getCommandName().equals("aggregate")
+                                    && secondClear.compareAndSet(false, true)) pause.get().run();
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var pool = publicationPool(client);
+                pause.set(() -> poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null}));
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                var writer = f.writer(client, ACTIVE);
+                commands.clear();
+                if (stage.equals("first-checkout") || stage.equals("twice") || stage.equals("ordinary-record")) {
+                    cleared.set(true); pause.get().run();
+                }
+                var changes = List.of(new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(
+                        0, columns("wide"), "first", "source", "v1")),
+                        new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(
+                                0, columns("newest"), "second", "source", "v2")));
+                var failure = org.assertj.core.api.Assertions.catchThrowable(() -> {
+                    if (stage.equals("ordinary-record")) record(writer, "ordinary");
+                    else writer.recordAndPinMany("orders", changes);
+                });
+                assertThat(failures).hasValue(stage.equals("twice") ? 2 : 1);
+                var publicationCommands = List.copyOf(commands);
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                System.out.printf("DERIVED_POOL stage=%s failure=%s wire=%s connectivity=restored%n", stage,
+                        failure instanceof TapstateException coded ? coded.getMessage() : failure, publicationCommands);
+                if (stage.equals("twice") || stage.equals("ordinary-record")) {
+                    assertThat(failure).isInstanceOfSatisfying(TapstateException.class, coded -> {
+                        assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        assertThat(coded.args()).containsEntry("detail", "MongoConnectionPoolClearedException");
+                    });
+                    assertThat(f.claimWrites()).isEqualTo(beforeClaimWrites);
+                    assertThat(writer.pinned("orders", "source.orders").orElseThrow().version()).isZero();
+                    return;
+                }
+                assertThat(failure).isNull();
+                assertThat(f.claimWrites()).isEqualTo(beforeClaimWrites + 1);
+                if (stage.equals("before-commit")) assertThat(publicationCommands.stream().filter("aggregate"::equals).count()).isEqualTo(1);
+                assertThat(writer.latest("orders", "source.orders").orElseThrow().schema()).isEqualTo(columns("newest"));
+                assertThat(writer.pinned("orders", "source.orders").orElseThrow().version()).isEqualTo(2);
+                var stored = f.rows().find(new Document("_id", "orders.source.orders")).first();
+                assertThat(stored.getList("versions", Document.class)).hasSize(3);
+            }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"owner", "retirement", "guard"})
+    void publicationCheckoutRecoveryRechecksTheOriginalAuthority(String lost) {
+        withFixture(f -> {
+            record(f.writer(), "old"); f.writer().pin("orders", "source.orders", 0);
+            var live = new AtomicBoolean(true);
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var failures = new java.util.concurrent.atomic.AtomicInteger();
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            resume.get().run();
+                            if (failures.incrementAndGet() != 1) return;
+                            switch (lost) {
+                                case "owner" -> {
+                                    var claims = f.domain.workloadClaims(BUSINESS);
+                                    assertThat(claims.release(f.claim)).isTrue();
+                                    assertThat(claims.acquirePipeline(SCOPE, new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).acquired()).isTrue();
+                                }
+                                case "retirement" -> f.domain.retireBusiness(BUSINESS, "retire-after-checkout", ACTIVE);
+                                case "guard" -> live.set(false);
+                                default -> throw new AssertionError(lost);
+                            }
+                        }
+                    })).build();
+            try (var client = MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var pool = publicationPool(client);
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null});
+                var writer = f.writer(client, () -> { if (!live.get()) throw MongoCacheBusinessIdentity.businessFenced(); });
+                assertCode(() -> writer.recordAndPinMany("orders", publicationChanges()),
+                        lost.equals("owner") ? IoError.WORKLOAD_CLAIM_FENCED : IoError.CACHE_BUSINESS_FENCED);
+                assertThat(failures).hasValue(1);
+                assertThat(f.rows().find().first().getList("versions", Document.class)).hasSize(1);
+                System.out.printf("DERIVED_FENCE lost=%s retry=rejected original_history=true%n", lost);
+            }
+        });
+    }
+
+    @Test void publicationCheckoutRecoveryRetainsTheSameClientTimeoutWindow() {
+        withFixture(f -> {
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var failures = new java.util.concurrent.atomic.AtomicInteger();
+            var delayed = new AtomicBoolean();
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .timeout(1000, TimeUnit.MILLISECONDS)
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            failures.incrementAndGet(); resume.get().run();
+                            java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(600));
+                        }
+                    })).addCommandListener(new CommandListener() {
+                        @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                            if (event.getCommandName().equals("aggregate") && delayed.compareAndSet(false, true))
+                                java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(500));
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var pool = publicationPool(client);
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null});
+                long began = System.nanoTime();
+                assertThatThrownBy(() -> f.writer(client, ACTIVE).recordAndPinMany("orders", publicationChanges()))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                            assertThat(failure.args().get("detail").toString()).startsWith("MongoOperationTimeoutException");
+                        });
+                long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - began);
+                assertThat(millis).isLessThan(1800);
+                assertThat(failures).hasValue(1);
+                assertThat(f.rows().countDocuments()).isZero();
+                System.out.printf("DERIVED_DEADLINE original_ms=1000 elapsed_ms=%d rolled_back=true%n", millis);
+            }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void anUnknownPublicationCommitNeverReplaysTheHistoryCallback(boolean exhaustDeadline) {
+        withFixture(f -> {
+            record(f.writer(), "old"); f.writer().pin("orders", "source.orders", 0);
+            String app = "derived-commit-" + UUID.randomUUID();
+            var modelWrites = new java.util.concurrent.atomic.AtomicInteger();
+            var commits = new java.util.concurrent.atomic.AtomicInteger();
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applicationName(app).addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            if (updates(event, "derived_schemas")) modelWrites.incrementAndGet();
+                            if (event.getCommandName().equals("commitTransaction")) commits.incrementAndGet();
+                        }
+                    });
+            if (exhaustDeadline) settings.timeout(750, TimeUnit.MILLISECONDS);
+            try (var client = MongoClients.create(settings.build())) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var data = new Document("failCommands", List.of("commitTransaction")).append("appName", app)
+                        .append("writeConcernError", new Document("code", 64).append("errmsg", "test commit reply lost"));
+                if (exhaustDeadline) data.append("blockConnection", true).append("blockTimeMS", 100);
+                f.client.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", exhaustDeadline ? "alwaysOn" : new Document("times", 1)).append("data", data));
+                Throwable failure;
+                try {
+                    failure = org.assertj.core.api.Assertions.catchThrowable(() -> f.writer(client, ACTIVE)
+                            .recordAndPinMany("orders", publicationChanges()));
+                } finally {
+                    f.client.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+                if (exhaustDeadline) assertThat(failure).isInstanceOfSatisfying(TapstateException.class,
+                        coded -> assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                else assertThat(failure).isNull();
+                assertThat(modelWrites).hasValue(1);
+                assertThat(commits.get()).isGreaterThan(1);
+                var row = f.rows().find(new Document("_id", "orders.source.orders")).first();
+                assertThat(row.getList("versions", Document.class)).hasSize(3);
+                assertThat(row.getLong("pin")).isEqualTo(2);
+                System.out.printf("DERIVED_UNKNOWN_COMMIT exhausted=%s failure_reported=%s callbacks=1 commits=%d versions=3 pin=2%n",
+                        exhaustDeadline, failure != null, commits.get());
+            }
+        });
+    }
+
+    private static List<DerivedSchemaStore.Change> publicationChanges() {
+        return List.of(new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(
+                        0, columns("wide"), "first", "source", "v1")),
+                new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(
+                        0, columns("newest"), "second", "source", "v2")));
+    }
+
+    /** Pauses the actual pinned driver's pool while the real replica set stays available. */
+    private static Object publicationPool(MongoClient client) {
+        try {
+            var delegate = driverField(client, "delegate");
+            var cluster = driverField(delegate, "cluster");
+            var server = ((java.util.concurrent.atomic.AtomicReference<?>) driverField(cluster, "server")).get();
+            return driverField(server, "connectionPool");
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+    }
+    private static Object driverField(Object owner, String field) throws ReflectiveOperationException {
+        var value = owner.getClass().getDeclaredField(field);
+        value.setAccessible(true);
+        return value.get(owner);
+    }
+    private static void poolMethod(Object pool, String method, Class<?>[] types, Object[] args) {
+        try {
+            var call = pool.getClass().getMethod(method, types);
+            call.setAccessible(true);
+            call.invoke(pool, args);
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
     }
 
     @Test void readOnlyViewsAndUnknownPinsCannotMutateEitherTheClaimStateOrModels() {
@@ -439,7 +674,7 @@ class MongoCacheDerivedSchemaStoreIT {
             other.get("scope", Document.class).put("stateGeneration", 2L); f.rows().insertOne(other);
             f.writer().delete("orders"); assertThat(f.rows().countDocuments()).isEqualTo(1);
             assertThat(f.rows().find().first().getString("_id")).isEqualTo("orders.other");
-            f.rows().drop(); assertCode(() -> f.writer().latest("orders", "source.orders"), IoError.DOCUMENT_UNREADABLE);
+            f.rows().drop(); assertThat(f.writer().latest("orders", "source.orders")).isEmpty();
             assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("derived_schemas");
         });
     }

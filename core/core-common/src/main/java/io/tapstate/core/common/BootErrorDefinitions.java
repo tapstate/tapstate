@@ -70,6 +70,9 @@ public final class BootErrorDefinitions {
     public static final ProductErrorDefinition WEB_DEVELOPMENT_ARTIFACT_INVALID =
             DEFINITIONS.define(31, Severity.ERROR, Set.of("reason"));
 
+    public static final ProductErrorDefinition MIGRATION_MODE_CONFLICT =
+            DEFINITIONS.define(32, Severity.ERROR, Set.of());
+
     private BootErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

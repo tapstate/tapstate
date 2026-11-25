@@ -3,6 +3,11 @@ package io.tapstate.adapters.mongostore;
 /** Supplies the cached keyring for reads and a freshly verified keyring for each Source write. */
 interface SourceConfigCipherProvider {
 
+    /** Can verify the original key row from the same CONFIG snapshot as an encrypted Source. */
+    interface Snapshot extends SourceConfigCipherProvider {
+        SourceConfigCipher requireCurrent(org.bson.Document row);
+    }
+
     SourceConfigCipher current();
 
     SourceConfigCipher refresh();

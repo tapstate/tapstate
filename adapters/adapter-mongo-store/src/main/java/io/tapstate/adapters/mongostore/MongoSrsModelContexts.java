@@ -41,8 +41,12 @@ final class MongoSrsModelContexts {
     }
 
     Context find(ClientSession session, SrsModelKey key) { return find(session, contextId(key)); }
+    Context find(ClientSession session, SrsModelKey key, MongoSrsReadFacts facts) { return find(session, contextId(key), facts); }
     Context find(ClientSession session, Document id) {
-        Document row = SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session, new Document("_id", id)).first();
+        return find(session, id, null);
+    }
+    private Context find(ClientSession session, Document id, MongoSrsReadFacts facts) {
+        Document row = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_MODEL_CONTEXTS, new Document("_id", id));
         return row == null ? null : decode(row);
     }
 
@@ -56,14 +60,20 @@ final class MongoSrsModelContexts {
         return rows;
     }
     Context require(ClientSession session, Document id) {
-        Context context = find(session, id);
+        return require(session, id, null);
+    }
+    Context require(ClientSession session, Document id, MongoSrsReadFacts facts) {
+        Context context = find(session, id, facts);
         if (context == null) throw unavailable(identity(id));
         return context;
     }
 
     Context firstOnRing(ClientSession session, String ring) {
-        Document row = SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session,
-                new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)).first();
+        return firstOnRing(session, ring, null);
+    }
+    Context firstOnRing(ClientSession session, String ring, MongoSrsReadFacts facts) {
+        Document row = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_MODEL_CONTEXTS,
+                new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring));
         return row == null ? null : decode(row);
     }
 
@@ -73,9 +83,12 @@ final class MongoSrsModelContexts {
     }
 
     void requireAnchor(ClientSession session, Document chain, Context context) {
+        requireAnchor(session, chain, context, null);
+    }
+    void requireAnchor(ClientSession session, Document chain, Context context, MongoSrsReadFacts facts) {
         Document head = head(chain, context.key().table());
         if (head == null || !context.ring().equals(head.get("ringName"))) throw unavailable(context.key());
-        Context latest = require(session, head.get("contextId", Document.class));
+        Context latest = require(session, head.get("contextId", Document.class), facts);
         requireAnchor(chain, context, latest);
     }
 

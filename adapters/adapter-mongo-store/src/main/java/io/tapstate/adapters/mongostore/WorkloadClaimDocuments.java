@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import io.tapstate.spi.store.ProcessNodeSession;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
@@ -25,13 +26,15 @@ final class WorkloadClaimDocuments {
         Document id = new Document("clusterId", fence.key().clusterId())
                 .append("resourceType", fence.key().type().name())
                 .append("resourceId", fence.key().resourceId());
-        return new Document("_id", id)
+        var exact = new Document("_id", id)
                 .append("ownerNodeId", fence.owner().nodeId())
                 .append("ownerBootId", fence.owner().bootId())
                 .append("claimGeneration", fence.claimGeneration())
                 .append("executionGeneration", fence.executionGeneration())
-                .append("topologyRevision", fence.topologyRevision())
-                .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+                .append("topologyRevision", fence.topologyRevision());
+        if (ProcessNodeSession.owns(fence))
+            return exact.append("leaseUntil", java.util.Date.from(ProcessNodeSession.PROCESS_OWNED));
+        return exact.append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
     }
 
     static Document livePipeline(ClientSession session, MongoDatabase database, WorkloadClaimFence fence) {
@@ -41,6 +44,14 @@ final class WorkloadClaimDocuments {
     static Document livePipeline(ClientSession session, MongoCollection<Document> claims, WorkloadClaimFence fence) {
         return new MongoWorkloadClaimStore(claims).inStrictSession(session).nodeBackedFilter(fence)
                 .orElseGet(() -> live(fence));
+    }
+
+    static com.mongodb.client.result.UpdateResult proveCapture(ClientSession session, MongoCollection<Document> claims,
+            WorkloadClaimFence fence, Document update) {
+        var timed = claims.updateOne(session, live(fence), update);
+        if (timed.getMatchedCount() == 1 || !MongoWorkloadClaimStore.canUseNodeLease(fence)) return timed;
+        return new MongoWorkloadClaimStore(claims).inStrictSession(session).nodeBackedFilter(fence)
+                .map(filter -> claims.updateOne(session, filter, update)).orElse(timed);
     }
 
     static WorkloadClaimFence readNode(Document stored) {

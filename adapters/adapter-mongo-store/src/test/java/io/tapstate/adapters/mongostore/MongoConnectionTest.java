@@ -30,6 +30,38 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 class MongoConnectionTest {
 
     @Test
+    @org.junit.jupiter.api.parallel.ResourceLock(org.junit.jupiter.api.parallel.Resources.SYSTEM_PROPERTIES)
+    void configAndCacheHonorTheOptInIdleLimitAndAnExplicitUriWins() {
+        var key = MongoConnection.MAX_IDLE_TIME_PROPERTY;
+        var previous = System.getProperty(key);
+        var uri = "mongodb://localhost/test";
+        var setting = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+        var binding = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                uri, "test", null);
+        try (var config = MongoConnection.forConfiguration(setting);
+             var cache = MongoConnection.forCache(binding, Duration.ofSeconds(5), "idle-limit-test");
+             var other = new MongoConnection(setting)) {
+            System.clearProperty(key);
+            assertThat(idleMillis(config, uri)).isZero();
+            System.setProperty(key, "45000");
+            assertThat(idleMillis(config, uri)).isEqualTo(45000);
+            assertThat(idleMillis(cache, uri)).isEqualTo(45000);
+            assertThat(idleMillis(cache, uri + "?maxIdleTimeMS=0")).isZero();
+            assertThat(idleMillis(config, uri + "?maxIdleTimeMS=17000")).isEqualTo(17000);
+            assertThat(idleMillis(other, uri)).isZero();
+            System.setProperty(key, "-1");
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> idleMillis(config, uri)).isInstanceOf(IllegalArgumentException.class);
+        } finally {
+            if (previous == null) System.clearProperty(key); else System.setProperty(key, previous);
+        }
+    }
+
+    private static long idleMillis(MongoConnection connection, String uri) {
+        return connection.buildClientSettings(new ConnectionString(uri)).getConnectionPoolSettings()
+                .getMaxConnectionIdleTime(java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    @Test
     void unreachableTargetIsReportedAsACodedDiagnostic() {
         MongoConnectionSettings settings = new MongoConnectionSettings(
                 "mongodb://localhost:1/tapstate", null, Duration.ofMillis(300));

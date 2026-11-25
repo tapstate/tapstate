@@ -15,10 +15,28 @@ import java.util.function.Predicate;
  */
 interface PipelineCaptureCoordinator {
 
+    /** One observation may project several views of the same original capture facts. */
+    default io.tapstate.runtime.scheduler.CaptureMeasurements measurements(String pipeline,
+            io.tapstate.core.lifecycle.ExecutionPlan plan, java.time.Instant at) {
+        return new io.tapstate.runtime.scheduler.CaptureMeasurements(snapshotProgress(pipeline),
+                runSnapshotProgress(pipeline), initialLoad(pipeline, plan, at), Optional.empty());
+    }
+
     /** A retained source pin may supply frozen planning observations without replacing discovery storage. */
     default SourceModelSnapshot retainedPlanningModels(PipelineConvergencePass pass, ArtifactStore artifacts,
-            SourceModelSnapshot discovered) {
+            SourceModelSnapshot discovered, RetainedStartCheck check) {
+        check.hasPreparedModels(() -> pass.requirePipeline(pass.scope().pipelineId()));
         return discovered;
+    }
+
+    @FunctionalInterface
+    interface RetainedStartCheck {
+        boolean hasPreparedModels(Runnable requireActive);
+    }
+
+    /** Prepares read-only inputs; the returned action opens the original capture only after readiness. */
+    default Runnable prepareCaptureStart(String pipeline, ArtifactStore artifacts, SourceModelSnapshot models) {
+        return () -> startCapture(pipeline, artifacts, models);
     }
 
     /** A scoped lifecycle captures the original run separately from its current command authority. */
@@ -76,6 +94,12 @@ interface PipelineCaptureCoordinator {
      * position keeps that cost with it -- deliberately, because the position is the thing being kept.
      */
     void stopCapture(String pipelineId, boolean purgeState);
+
+    /** A coordinator reports an empty cleanup only when proved at the stop boundary. */
+    default boolean stopCaptureIfPresent(String pipelineId, boolean purgeState) {
+        stopCapture(pipelineId, purgeState);
+        return true;
+    }
 
     /**
      * Whether a capture started for the pipeline is still open on this member: started, and not stopped since.

@@ -158,27 +158,37 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
 
     @Override
     public boolean hasPreparedModels() {
-        return access.metadataTransaction(
-                SystemCollections.CACHE_SINK_PREPARATIONS,
-                false,
-                session -> {
-                    var control = marker(claim(session));
-                    if (control.get(TARGETS) == null) return false;
-                    var manifest = documents(control.get(TARGETS));
-                    verifyClosure(session, manifest, control.getString(PREPARATION_ID));
-                    if (manifest.isEmpty()) return false;
-                    for (var input : manifest) {
-                        var raw =
-                                SystemCollections.CACHE_SINK_PREPARATIONS
-                                        .on(access.database)
-                                        .find(
-                                                session,
-                                                new Document("_id", id(decodeInput(input).key())))
-                                        .first();
-                        if (storedModel(raw).isPresent()) return true;
-                    }
-                    return false;
-                });
+        return access.metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, false,
+                session -> hasPreparedModels(session, claim(session), false));
+    }
+
+    boolean hasPreparedModels(ClientSession session, Document preparedClaim) {
+        return hasPreparedModels(session, requireClaimScope(preparedClaim), true);
+    }
+
+    private boolean hasPreparedModels(ClientSession session, Document claim, boolean reuseRows) {
+        var control = marker(claim);
+        if (control.get(TARGETS) == null) return false;
+        var manifest = documents(control.get(TARGETS));
+        var rows = verifyClosure(session, manifest, control.getString(PREPARATION_ID));
+        for (var input : manifest) {
+            var key = decodeInput(input).key();
+            var expectedId = id(key);
+            var raw = rows.get(key);
+            if (!reuseRows || !sameBsonId(expectedId, raw.get("_id", Document.class))) {
+                raw = SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database)
+                        .find(session, new Document("_id", expectedId)).first();
+            }
+            if (storedModel(raw).isPresent()) return true;
+        }
+        return false;
+    }
+
+    private static boolean sameBsonId(Document expected, Document actual) {
+        // Embedded IDs used by Mongo point lookups are sensitive to field order.
+        var codec = new DocumentCodec();
+        return new RawBsonDocument(expected, codec).getByteBuffer().asNIO()
+                .equals(new RawBsonDocument(actual, codec).getByteBuffer().asNIO());
     }
 
     @Override
@@ -452,6 +462,8 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
     @Override
     public Snapshot load(Input original) {
         requireScope(original);
+        var snapshot = snapshotReceipt(original);
+        if (snapshot != null) return snapshot;
         return access.metadataTransaction(
                 SystemCollections.CACHE_SINK_PREPARATIONS,
                 false,
@@ -463,6 +475,10 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
         var inputs = List.copyOf(originals);
         inputs.forEach(this::requireScope);
         if (inputs.isEmpty()) return List.of();
+        if (inputs.size() == 1) {
+            var snapshot = snapshotReceipt(inputs.getFirst());
+            if (snapshot != null) return List.of(snapshot);
+        }
         return access.metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, false, session -> {
             var control = marker(claim(session));
             if (!(control.get(TARGETS) instanceof List<?> targets)) throw rebuild(access.scope);
@@ -494,24 +510,22 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
     public Attempt begin(Input original) {
         requireScope(original);
         requireWriter();
-        return access.metadataTransaction(
-                SystemCollections.CACHE_SINK_PREPARATIONS,
-                true,
-                session -> {
-                    Snapshot held = require(session, original);
-                    if (held.phase() != Phase.PREPARING || held.revision() != 0)
-                        throw rebuild(access.scope);
-                    var started =
-                            new Snapshot(
-                                    original,
-                                    held.operationId(),
-                                    1,
-                                    Phase.PREPARING,
-                                    access.originalClaim(),
-                                    null);
-                    replace(session, held, started);
-                    return new Issued(this, started);
-                });
+        return access.changeSinkReceipt(id(original.key()), (session, captured) -> {
+            var receipt = receiptRow(session, original, captured);
+            var held = receipt.snapshot();
+            if (held.phase() != Phase.PREPARING || held.revision() != 0)
+                throw rebuild(access.scope);
+            var started =
+                    new Snapshot(
+                            original,
+                            held.operationId(),
+                            1,
+                            Phase.PREPARING,
+                            access.originalClaim(),
+                            null);
+            replace(session, receipt.document(), started);
+            return new Issued(this, started);
+        });
     }
 
     @Override
@@ -521,47 +535,62 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
         Snapshot original = issued.original();
         requireWriter();
         if (!access.originalClaim().equals(original.originalClaim())) throw fenced();
-        return access.metadataTransaction(
-                SystemCollections.CACHE_SINK_PREPARATIONS,
-                true,
-                session -> {
-                    var held = require(session, original.input());
-                    var ready =
-                            new Snapshot(
-                                    original.input(),
-                                    original.operationId(),
-                                    2,
-                                    Phase.READY,
-                                    access.originalClaim(),
-                                    originalResult);
-                    if (held.equals(ready)) return held;
-                    if (!held.equals(original)) throw rebuild(access.scope);
-                    replace(session, original, ready);
-                    return ready;
-                });
+        return access.changeSinkReceipt(id(original.input().key()), (session, captured) -> {
+            var receipt = receiptRow(session, original.input(), captured);
+            var held = receipt.snapshot();
+            var ready =
+                    new Snapshot(
+                            original.input(),
+                            original.operationId(),
+                            2,
+                            Phase.READY,
+                            access.originalClaim(),
+                            originalResult);
+            if (held.equals(ready)) return held;
+            if (!held.equals(original)) throw rebuild(access.scope);
+            replace(session, receipt.document(), ready);
+            return ready;
+        });
     }
 
     private record Issued(MongoSinkPreparationStore owner, Snapshot original) implements Attempt {}
 
-    private void replace(ClientSession session, Snapshot before, Snapshot next) {
+    private void replace(ClientSession session, Document raw, Snapshot next) {
         var table = SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database);
-        var raw = table.find(session, new Document("_id", id(before.input().key()))).first();
-        if (!decode(raw).equals(before)) throw fenced();
         var bytes = storedModel(raw).orElse(null);
         var replacement = row(next, bytes);
         if (bytes != null) requireRowBudget(replacement, next.input().key().target());
         if (table.replaceOne(session, raw, replacement).getMatchedCount() != 1) throw fenced();
     }
 
-    private Snapshot require(ClientSession session, Input expected) {
-        var control = marker(claim(session));
+    private Snapshot snapshotReceipt(Input expected) {
+        var receipt = access.sinkReceipt(id(expected.key()));
+        if (receipt == null) return null;
+        var control = marker(requireClaimScope(receipt.authority().claim()));
+        requireManifestInput(expected, control);
+        return readReceipt(expected, control, receipt.row());
+    }
+
+    private void requireManifestInput(Input expected, Document control) {
         if (!(control.get(TARGETS) instanceof List<?> targets)
                 || !targets.contains(input(expected))) throw rebuild(access.scope);
-        var raw =
-                SystemCollections.CACHE_SINK_PREPARATIONS
-                        .on(access.database)
-                        .find(session, new Document("_id", id(expected.key())))
-                        .first();
+    }
+
+    private Snapshot require(ClientSession session, Input expected) {
+        return receiptRow(session, expected, null).snapshot();
+    }
+
+    private record ReceiptRow(Document document, Snapshot snapshot) {}
+
+    private ReceiptRow receiptRow(ClientSession session, Input expected, MongoPipelineProofFacts.SinkReceipt captured) {
+        var control = marker(captured == null ? claim(session) : requireClaimScope(captured.authority().claim()));
+        requireManifestInput(expected, control);
+        var raw = captured == null ? SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database)
+                .find(session, new Document("_id", id(expected.key()))).first() : captured.row();
+        return new ReceiptRow(raw, readReceipt(expected, control, raw));
+    }
+
+    private Snapshot readReceipt(Input expected, Document control, Document raw) {
         Snapshot held = decode(raw);
         if (!held.input().equals(expected)
                 || !held.operationId().equals(control.getString(PREPARATION_ID)))
@@ -609,6 +638,10 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
                         .on(access.database)
                         .find(session, new Document("_id", MongoWorkloadClaimStore.id(key)))
                         .first();
+        return requireClaimScope(claim);
+    }
+
+    private Document requireClaimScope(Document claim) {
         if (claim == null
                 || !MongoPipelinePreparationFacts.scope(access.scope)
                         .equals(claim.get("pipelineScope"))) throw rebuild(access.scope);

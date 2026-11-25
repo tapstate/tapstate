@@ -22,6 +22,48 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class ClusterWorkloadClaimsTest {
 
+    @Test void ordinaryAcquisitionsReachTheOriginalKeyBeforeDispatchThroughTheObservedStore() {
+        var gate = productionGate();
+        gate.install(new ClusterMembership("cluster-a", 1, Set.of("a", "b", "c")));
+        gate.canCommit(Set.of("a", "b"));
+        var raw = new RecordingClaims();
+        var store = org.mockito.Mockito.mock(io.tapstate.spi.store.DeadlineWorkloadClaimStore.class);
+        var keys = new java.util.ArrayList<WorkloadClaimKey>();
+        org.mockito.Mockito.doAnswer(call -> {
+            keys.add(call.getArgument(0));
+            call.<Runnable>getArgument(1).run();
+            return call.<java.util.function.Supplier<?>>getArgument(2).get();
+        }).when(store).withClaimAcquisition(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any());
+        var scope = new io.tapstate.spi.store.PipelineIntentScope("cluster-a", 1, "cache", "flow", 1);
+        var pipeline = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "flow");
+        var capture = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "source");
+        var validation = new WorkloadClaimKey("cluster-a", WorkloadClaimType.VALIDATION, "task");
+        var node = new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, OWNER.nodeId());
+        var held = raw.acquire(node, OWNER, 1, TTL);
+        var fence = io.tapstate.spi.store.WorkloadClaimFence.from(held.claim());
+        org.mockito.Mockito.when(store.acquire(capture, OWNER, 1, TTL)).thenReturn(raw.acquire(capture, OWNER, 1, TTL));
+        org.mockito.Mockito.when(store.acquire(node, OWNER, 1, TTL)).thenReturn(held);
+        org.mockito.Mockito.when(store.acquirePipeline(scope, OWNER, 1, TTL)).thenReturn(raw.acquire(pipeline, OWNER, 1, TTL));
+        org.mockito.Mockito.when(store.acquireNodeBackedPipeline(scope, fence, 1)).thenReturn(raw.acquire(pipeline, OWNER, 1, TTL));
+        var claims = new ClusterWorkloadClaims(ObservedWorkloadClaims.observe(store, (written, failure) -> {}), gate);
+        assertThat(claims.acquire(capture, OWNER, 1, TTL)).isPresent();
+        assertThat(claims.acquirePipeline(scope, OWNER, 1, TTL)).isPresent();
+        assertThat(claims.acquireNodeBackedPipeline(scope, fence, 1)).isPresent();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> claims.acquireValidationExecution(validation, OWNER, 1, TTL))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(claims.acquire(node, OWNER, 1, TTL)).isPresent();
+        claims.read(capture);
+        assertThat(keys).containsExactly(capture, pipeline, pipeline, validation);
+        var validationClaim = raw.acquire(validation, OWNER, 1, TTL).claim();
+        org.mockito.Mockito.when(store.acquireValidationExecution(validation, OWNER, 1, TTL))
+                .thenReturn(Optional.of(validationClaim));
+        assertThat(new ClusterWorkloadClaims(store, gate).acquireValidationExecution(validation, OWNER, 1, TTL))
+                .contains(validationClaim);
+        assertThat(keys).containsExactly(capture, pipeline, pipeline, validation, validation);
+    }
+
     @Test void deadlineCapabilityReceivesTheOriginalSharedAdmissionDeadlineAndCleanupBudget() {
         var gate=productionGate();gate.install(new ClusterMembership("cluster-a",1,Set.of("a","b","c")));
         gate.canCommit(Set.of("a","b"));
@@ -33,6 +75,8 @@ class ClusterWorkloadClaimsTest {
             ((Runnable)call.getArgument(1)).run();
             return ((java.util.function.Supplier<?>)call.getArgument(2)).get();
         }).when(store).withDeadline(org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.doCallRealMethod().when(store).withClaimAcquisition(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.doCallRealMethod().when(store).withClaimAcquisitionDeadline(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
         org.mockito.Mockito.doNothing().when(store).awaitQuiescence(org.mockito.ArgumentMatchers.anyLong());
         var port=org.mockito.Mockito.mock(ThreeLayerStorePort.class);
         org.mockito.Mockito.when(port.workloadClaims()).thenReturn(store);
@@ -46,6 +90,8 @@ class ClusterWorkloadClaimsTest {
         try {assertThat(claims.acquire(key,OWNER,1,TTL)).isPresent();claims.read(key);}
         finally {admission.leave();}
         assertThat(deadlines).containsExactly(original,original);
+        org.mockito.Mockito.verify(store).withClaimAcquisitionDeadline(org.mockito.ArgumentMatchers.eq(key),
+                org.mockito.ArgumentMatchers.eq(original), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
         long shutdown=System.nanoTime()+Duration.ofSeconds(1).toNanos();claims.awaitStopped(shutdown);
         org.mockito.Mockito.verify(store).awaitQuiescence(shutdown);
         admission.stop();
