@@ -26,8 +26,8 @@ class WorkbenchQuickDocProviderTest {
     void givesTheCurrentLineValidationFailurePriorityOverSchemaDocumentation() {
         assertThat(provider.document("kind: source\nunknown: value\n", 1))
                 .hasValueSatisfying(doc -> {
-                    assertThat(doc.validationError()).contains("dsl.unknown-field");
-                    assertThat(doc.entries()).contains("Validation error: dsl.unknown-field");
+                    assertThat(doc.validationError()).contains("TS0010002");
+                    assertThat(doc.entries()).contains("Validation error: TS0010002");
                 });
     }
 }
