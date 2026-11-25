@@ -1446,9 +1446,8 @@ final class StoreBackedDagSource implements DagSource {
         var inputs = new LinkedHashSet<String>();
         for (var ref : refsOf(serve.from())) {
             var view = inlineViewNamed(pipeline, ref);
-            for (var producer : view == null ? List.of(ref) : refsOf(view.from())) {
-                inputs.addAll(upstreams(producer, keysByTable, keysBySource, vertices, steps));
-            }
+            var producer = view == null ? ref : view.from();
+            inputs.addAll(upstreams(producer, keysByTable, keysBySource, vertices, steps));
         }
         if (!vertices.keySet().containsAll(inputs)) return Map.of();
         var result = new LinkedHashMap<String, Set<String>>();

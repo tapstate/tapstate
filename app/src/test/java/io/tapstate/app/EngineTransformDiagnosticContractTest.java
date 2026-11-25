@@ -16,7 +16,7 @@ class EngineTransformDiagnosticContractTest {
         codes.addAll(List.of(EngineError.values()));
         codes.addAll(List.of(TransformError.values()));
         codes.addAll(List.of(NestSizingError.values()));
-        assertThat(codes).hasSize(27);
+        assertThat(codes).hasSize(28);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String domain = code instanceof EngineError ? "engine" : code instanceof TransformError ? "transform" : "nest";
@@ -27,7 +27,7 @@ class EngineTransformDiagnosticContractTest {
                     || code == EngineError.JOIN_DIMENSION_ROW_DISPLACED || code == TransformError.UNWIND_ROWS_SHARE_A_KEY;
             assertThat(code.severity()).isEqualTo(warning ? Severity.WARNING : Severity.ERROR);
             assertThat(code.code()).matches("TS04[456](?!0000)[0-9]{4}");
-            if (code != EngineError.KEY_MOVE_WRITE_UNCONFIRMED) {
+            if (code != EngineError.KEY_MOVE_WRITE_UNCONFIRMED && code != EngineError.TARGET_KEY_ORDER_UNKNOWN) {
                 var historical = catalog.render(legacy, params);
                 assertThat(catalog.render(code.code(), params).message()).isEqualTo(historical.message());
                 if (code != EngineError.EXECUTION_LEASE_LOST && code != EngineError.EXECUTION_RENEWAL_FAILED)

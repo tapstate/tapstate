@@ -57,6 +57,20 @@ class SinkLaneRouterTest {
     }
 
     @Test
+    void aPartialOrDifferentlyTypedKeyStopsBeforeAnyTargetCommand() throws Exception {
+        try (var f = fixture(false, 1)) {
+            for (var oldRow : List.<Map<String, Object>>of(Map.of("label", "unknown"), Map.of("id", "01"))) {
+                var change = Envelope.update(10, "orders", oldRow, image(1, "one"), null);
+                org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                        f.router.process(0, new TestInbox(List.of(change))))
+                        .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+                assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+            }
+        }
+    }
+
+    @Test
     void bothKeyOwnersMustConfirmBeforeAMoveAndItsFollowersCanWrite() throws Exception {
         try (var f = fixture(false, 32)) {
             var move = update(10, 1, "one", 2, "one");
