@@ -71,14 +71,14 @@ final class CloudAlertSdkChannel implements NotificationChannel {
         };
         AlertChannelPolicy.requireDeliverable(deployment, capability);
         this.ssl = Objects.requireNonNull(ssl); this.clock = Objects.requireNonNull(clock);
-        if (!binding.scope().clusterId().matches("[a-fA-F0-9]{24}")
+        if (!binding.scope().clusterId().matches(OBJECT_ID_PATTERN)
                 || origin.getHost() == null || origin.getRawUserInfo() != null || origin.getRawQuery() != null || origin.getRawFragment() != null
                 || !(origin.getPath().isEmpty() || origin.getPath().equals("/"))
                 || !("https".equalsIgnoreCase(origin.getScheme()) || (localFixture && "http".equalsIgnoreCase(origin.getScheme()) && origin.getHost().equals("127.0.0.1")))
                 || token == null || token.isBlank() || token.length() > 4096 || token.codePoints().anyMatch(Character::isISOControl)
                 || trustedAddresses == null || trustedAddresses.length == 0 || trustedAddresses.length > 8
                 || timeout == null || timeout.isZero() || timeout.isNegative() || timeout.compareTo(Duration.ofSeconds(30)) > 0
-                || (expectedOrg != null && (!expectedOrg.matches("[a-fA-F0-9]{24}")))) { throw CloudAlertEventWire.invalid("sdkBinding"); }
+                || (expectedOrg != null && (!expectedOrg.matches(OBJECT_ID_PATTERN)))) { throw CloudAlertEventWire.invalid("sdkBinding"); }
         this.token = token; this.expectedOrg = expectedOrg; this.addresses = trustedAddresses.clone();
         for (InetAddress address : addresses) { Objects.requireNonNull(address); }
         this.totalTimeout = timeout;

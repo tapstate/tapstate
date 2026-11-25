@@ -15,6 +15,7 @@ import org.bson.Document;
 
 /** Composes the three alert fragments in the original CONFIG transaction and rechecks current authority. */
 final class MongoAlertCoordinator implements AlertStore {
+    private static final String CLUSTER_NODE_KIND = "cluster-node";
     private final MongoConfigurationDomain domain;private final MongoDatabase db;private final SourceConfigCipherProvider keys;
     private final MongoConfigurationArtifactStore artifacts;private final MongoConfigurationSecurityStores security;
     private final MongoStorageBindingStore bindings;private final Host host;private final Clock clock;private final AlarmTypeCatalog catalog;
@@ -294,7 +295,7 @@ final class MongoAlertCoordinator implements AlertStore {
         for(var row:page.rows()){
             var key=row.value().snapshot().rule().key();
             var resource=key.resource();
-            if (BuiltinAlarmTypes.retired(key.typeId()) || !nodeEvidenceReady && resource.kind().equals("cluster-node")) continue;
+            if (BuiltinAlarmTypes.retired(key.typeId()) || !nodeEvidenceReady && resource.kind().equals(CLUSTER_NODE_KIND)) continue;
             SystemCollections table = switch (resource.kind()) {
                 case "pipeline" -> SystemCollections.OPERATOR_GENERATIONS;
                 case "source" -> SystemCollections.SOURCES;
