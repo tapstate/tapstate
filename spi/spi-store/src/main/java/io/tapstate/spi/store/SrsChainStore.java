@@ -23,6 +23,12 @@ public interface SrsChainStore {
     /** Publishes an immutable callback selection only when it covers every current request. */
     boolean publishServingTables(String miningChainId, long epoch, Set<String> tables, WorkloadClaimFence originalCaptureFence);
 
+    /** Publishes only against the consumer revision used to determine the shared table demand. */
+    default Optional<SrsChainState> openServingEpochForStartup(String chain, long expectedEpoch,
+            long expectedConsumerRevision, Set<String> tables, WorkloadClaimFence fence) {
+        return openServingEpoch(chain, expectedEpoch, tables, fence);
+    }
+
     default Optional<SrsChainState> openServingEpoch(String chain, long expectedEpoch, Set<String> tables, WorkloadClaimFence fence) {
         throw new UnsupportedOperationException("combined Capture epoch opening is not supported");
     }

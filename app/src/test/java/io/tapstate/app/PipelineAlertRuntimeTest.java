@@ -56,6 +56,336 @@ class PipelineAlertRuntimeTest {
         return new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, fixture.host), intentStore,
                 (scope, claim) -> Optional.of(()->{}), () -> { }, fixture.clock);
     }
+    @Test void terminalReceiptWaitsForDurableAlertWorkAndRejectsLateEvidence() throws Exception {
+        var entered = new CountDownLatch(1);var release = new CountDownLatch(1);
+        doAnswer(call -> {
+            AlertStore.Commit commit = call.getArgument(0);var change = commit.state();
+            if (change.after().snapshot().rule().key().resource().id().equals("orders")) {
+                entered.countDown();assertThat(release.await(3, TimeUnit.SECONDS)).isTrue();
+            }
+            rows.compute(change.after().snapshot().rule().key(), (key, before) -> new AlertStore.Stored<>(before == null ? 1 : before.revision() + 1, change.after()));
+            return AlertStore.Outcome.STAGED;
+        }).when(fixture.store).commit(any());
+        try (var runtime = runtime()) {
+            runtime.tick();drained(runtime);
+            var pass = pass("orders");var observation = observation("orders", T, PipelineState.STOPPED);
+            var terminal = TerminalPublication.from(pass, 7, observation);
+            var receipt = runtime.terminalPublished(pass, terminal, observation, null, true);
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.PENDING);
+            var other = pass("other");var otherObservation = observation("other", T, PipelineState.STOPPED);
+            var independent = runtime.terminalPublished(other, TerminalPublication.from(other, 7, otherObservation), otherObservation, null, true);
+            await().atMost(Duration.ofSeconds(2)).until(() -> independent.status() == TerminalPublication.Status.COMPLETE);
+            release.countDown();
+            await().atMost(Duration.ofSeconds(2)).until(() -> receipt.status() == TerminalPublication.Status.COMPLETE);
+            assertThat(runtime.terminalPublished(pass, terminal, observation, null, true)).isSameAs(receipt);
+            fixture.now.set(T.plusSeconds(1));
+            runtime.published(pass, observation("orders", fixture.now.get(), PipelineState.RUNNING), null);
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+            drained(runtime);
+        } finally { release.countDown(); }
+    }
+
+    @Test void terminalReceiptRefusesUnknownRulesFailedCommitAndChangedProducer() {
+        var pass = pass("orders");var observation = observation("orders", T, PipelineState.STOPPED);
+        var terminal = TerminalPublication.from(pass, 7, observation);
+        try (var runtime = runtime()) {
+            assertThat(runtime.terminalPublished(pass, terminal, observation, null, true).status()).isEqualTo(TerminalPublication.Status.FAILED);
+            runtime.tick();drained(runtime);
+            doThrow(StorageRuntime.unavailable()).when(fixture.store).commit(any());
+            var receipt = runtime.terminalPublished(pass, terminal, observation, null, true);
+            await().atMost(Duration.ofSeconds(2)).until(() -> receipt.status() == TerminalPublication.Status.FAILED);
+        }
+        var healthy = new PipelineAlertRuntimeTest();
+        try (var runtime = healthy.runtime()) {
+            runtime.tick();healthy.drained(runtime);
+            var original = healthy.pass("orders");var receipt = runtime.terminalPublished(original,
+                    TerminalPublication.from(original, 7, observation), observation, null, true);
+            await().atMost(Duration.ofSeconds(2)).until(() -> receipt.status() == TerminalPublication.Status.COMPLETE);
+            runtime.expecting(healthy.pass("orders", 2));
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void aNewTerminalReceiptWaitsForAnOlderProducersActualWorker(boolean fatal) throws Exception {
+        var entered = new CountDownLatch(1);var release = new CountDownLatch(1);var held = new AtomicBoolean();
+        var originalWorker = new AtomicReference<Thread>();
+        try (var runtime = runtime()) {
+            runtime.tick();drained(runtime);var running = pass("orders");
+            when(intentStore.loadForActuation("orders")).thenAnswer(call -> {
+                if (held.compareAndSet(false, true)) {
+                    entered.countDown();assertThat(release.await(3, TimeUnit.SECONDS)).isTrue();
+                    if(fatal){originalWorker.set(Thread.currentThread());throw new AssertionError("original producer invariant");}
+                }
+                return Optional.ofNullable(intents.get("orders"));
+            });
+            runtime.published(running, observation("orders", T, PipelineState.RUNNING), null);
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+            fixture.now.set(T.plusSeconds(1));var stopped = pass("orders", 2);
+            var observation = observation("orders", fixture.now.get(), PipelineState.STOPPED);
+            var receipt = runtime.terminalPublished(stopped, TerminalPublication.from(stopped, 8, observation), observation, null, true);
+            await().atMost(Duration.ofSeconds(2)).until(() -> !rows.isEmpty());
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.PENDING);
+            release.countDown();
+            await().dontCatchUncaughtExceptions().atMost(Duration.ofSeconds(2)).until(()->runtime.health().queuedInputs()==0);
+            if(fatal)await().dontCatchUncaughtExceptions().atMost(Duration.ofSeconds(2)).until(()->originalWorker.get()!=null&&!originalWorker.get().isAlive());
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+            fixture.now.set(T.plusSeconds(2));var fresh = observation("orders", fixture.now.get(), PipelineState.STOPPED);
+            var retried = runtime.terminalPublished(stopped, TerminalPublication.from(stopped, 8, fresh), fresh, null, true);
+            await().atMost(Duration.ofSeconds(2)).until(() -> retried.status() == TerminalPublication.Status.COMPLETE);
+        } finally { release.countDown(); }
+    }
+
+    @Test void terminalReceiptIncludesTheFinalInputAfterAnIntentChange() {
+        try (var runtime = runtime()) {
+            runtime.tick();drained(runtime);
+            var running = pass("orders");runtime.published(running, observation("orders", T, PipelineState.RUNNING), null);drained(runtime);
+            fixture.now.set(T.plusSeconds(1));
+            var stopped = pass("orders", 2);
+            var observation = observation("orders", fixture.now.get(), PipelineState.STOPPED);
+            var receipt = runtime.terminalPublished(stopped, TerminalPublication.from(stopped, 8, observation), observation, null, true);
+            await().atMost(Duration.ofSeconds(2)).until(() -> receipt.status() != TerminalPublication.Status.PENDING);
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+        }
+    }
+
+    @Test void aSealedTerminalRejectsLatePublicationUntilTheNextNormalPass() {
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var pass=pass("orders");var observation=observation("orders",T,PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(pass,TerminalPublication.from(pass,7,observation),observation,null,true);
+            await().atMost(Duration.ofSeconds(2)).until(()->receipt.status()==TerminalPublication.Status.COMPLETE);
+            assertThat(receipt.seal()).isTrue();clearInvocations(intentStore);
+            fixture.now.set(T.plusSeconds(1));runtime.published(pass,observation("orders",fixture.now.get(),PipelineState.RUNNING),null);
+            assertThat(runtime.health().queuedInputs()).isZero();verifyNoInteractions(intentStore);
+            assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+            runtime.expecting(pass);assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+            runtime.published(pass,observation("orders",fixture.now.get(),PipelineState.STOPPED),null);drained(runtime);
+            verify(intentStore,atLeastOnce()).loadForActuation("orders");
+        }
+    }
+
+    @Test void claimBoundResourceInputsAndTheirProducerBlockSealUntilBothFinish() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var pass=pass("orders");
+            var dependency=runtime.pipelineGuard(new ExecutionFence(pass.scope(),pass.claim()),()->{
+                entered.countDown();try{assertThat(release.await(3,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}
+            });
+            runtime.resourceInput(new AlarmKey.Resource("source","erp","one"),"source.connection-failed",1,"producer",dependency,()->{},
+                    new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));
+            assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();
+            var observation=observation("orders",T,PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(pass,TerminalPublication.from(pass,7,observation),observation,null,true);
+            dependency.close();dependency.close();
+            assertThat(receipt.seal()).isFalse();assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.PENDING);
+            release.countDown();
+            await().atMost(Duration.ofSeconds(2)).until(()->receipt.status()==TerminalPublication.Status.COMPLETE);
+            assertThat(receipt.seal()).isTrue();
+            assertThatThrownBy(()->runtime.pipelineGuard(new ExecutionFence(pass.scope(),pass.claim()),()->{}))
+                    .isInstanceOf(TapstateException.class);
+            receipt.reopen();
+            try(var reopened=runtime.pipelineGuard(new ExecutionFence(pass.scope(),pass.claim()),()->{})){
+                assertThat(receipt.seal()).isFalse();
+            }
+            assertThat(receipt.seal()).isTrue();
+        }finally{release.countDown();}
+    }
+
+    @Test void aRefusedClaimBoundResourceInputCannotBeWashedAwayByAnotherTerminalPublication() {
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var pass=pass("orders");
+            var dependency=runtime.pipelineGuard(new ExecutionFence(pass.scope(),pass.claim()),()->{throw ThreeLayerStorePort.refused();});
+            runtime.resourceInput(new AlarmKey.Resource("source","erp","one"),"source.connection-failed",1,"producer",dependency,()->{},
+                    new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));
+            dependency.close();drained(runtime);
+            var observation=observation("orders",T,PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(pass,TerminalPublication.from(pass,7,observation),observation,null,true);
+            drained(runtime);assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);assertThat(receipt.seal()).isFalse();
+            runtime.expecting(pass);fixture.now.set(T.plusSeconds(1));var fresh=observation("orders",fixture.now.get(),PipelineState.STOPPED);
+            assertThat(runtime.terminalPublished(pass,TerminalPublication.from(pass,7,fresh),fresh,null,true).status())
+                    .isEqualTo(TerminalPublication.Status.FAILED);
+        }
+    }
+
+    @Test void disabledKnownRulesDoNotInventATerminalAlertObligation() {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var disabled=new AlertConfiguration.Rule(original.header(),original.name(),original.typeId(),1,
+                original.resources(),original.parameters(),original.severityOverride(),false,original.metric());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(disabled),null));
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var pass=pass("orders");var observation=observation("orders",T,PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(pass,TerminalPublication.from(pass,7,observation),observation,null,true);
+            drained(runtime);assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.COMPLETE);
+        }
+    }
+
+    @Test void anIgnoredClaimBoundInputIsNotAnAcknowledgedSourceAlert() {
+        useResourceRule();var host=spy(fixture.host);
+        doReturn(AlertEvaluationHost.Result.IGNORED).when(host).accept(any(),anyLong(),any(),anyBoolean(),any());
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,host),intentStore,
+                (scope,claim)->Optional.of(()->{}),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);var pass=pass("orders");
+            var dependency=runtime.pipelineGuard(new ExecutionFence(pass.scope(),pass.claim()),()->{});
+            runtime.resourceInput(new AlarmKey.Resource("source","a","uuid"),"source.connection-failed",1,"producer",dependency,()->{},
+                    new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));
+            dependency.close();drained(runtime);
+            var observation=observation("orders",T,PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(pass,TerminalPublication.from(pass,7,observation),observation,null,true);
+            drained(runtime);assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+        }
+    }
+
+    @Test void anIndependentNodeOrSourceQueueDoesNotBlockThisPipelineSeal() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);
+            runtime.resourceInput(new AlarmKey.Resource("source","unrelated","uuid"),"source.connection-failed",1,"independent",()->{
+                entered.countDown();try{assertThat(release.await(3,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}
+            },()->{},new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));
+            assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();
+            var pass=pass("orders");var observation=observation("orders",T,PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(pass,TerminalPublication.from(pass,7,observation),observation,null,true);
+            await().atMost(Duration.ofSeconds(2)).until(()->receipt.status()==TerminalPublication.Status.COMPLETE);
+            assertThat(runtime.health().queuedInputs()).isPositive();assertThat(receipt.seal()).isTrue();
+            release.countDown();drained(runtime);
+        }finally{release.countDown();}
+    }
+
+    @Test void anOlderPassCannotEraseUnknownEvidenceForAnAlreadyDeclaredNewerExecution() {
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var older=pass("orders");var claim=older.claim();
+            var newerClaim=new WorkloadClaimFence(claim.key(),claim.owner(),claim.claimGeneration(),claim.executionGeneration()+1,claim.topologyRevision());
+            var dependency=runtime.pipelineGuard(new ExecutionFence(older.scope(),newerClaim),()->{throw ThreeLayerStorePort.refused();});
+            runtime.resourceInput(new AlarmKey.Resource("source","erp","one"),"source.connection-failed",1,"producer",dependency,()->{},
+                    new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));dependency.close();drained(runtime);
+            runtime.expecting(older);
+            var newer=pass("orders",2);when(newer.claim()).thenReturn(newerClaim);runtime.expecting(newer);
+            var observation=observation("orders",T,PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(newer,TerminalPublication.from(newer,8,observation),observation,null,true);
+            drained(runtime);assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.FAILED);
+        }
+    }
+
+    @Test void aNeverExecutedActuationClaimRetainsItsOrdinaryAlertAndTerminalContract() {
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var pass=pass("orders");var original=pass.claim();
+            when(pass.claim()).thenReturn(new WorkloadClaimFence(original.key(),original.owner(),original.claimGeneration(),0,original.topologyRevision()));
+            runtime.expecting(pass);
+            var observation=observation("orders",T,PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(pass,TerminalPublication.from(pass,0,observation),observation,null,true);
+            await().atMost(Duration.ofSeconds(2)).until(()->receipt.status()==TerminalPublication.Status.COMPLETE);
+            assertThat(receipt.seal()).isTrue();
+        }
+    }
+
+    @Test void terminalCadenceTracksTheSameRuleSnapshotAndRetainsFailureTriggerWindows() {
+        var pass = pass("orders");
+        var original = AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule = new AlertConfiguration.Rule(original.header(), original.name(), original.typeId(), 1,
+                new AlertConfiguration.Resources(Set.of("pipeline"), false,
+                        Set.of(new AlarmKey.Resource("pipeline", "orders", "1"))),
+                Map.of("trigger-for", java.math.BigDecimal.valueOf(3)), null, true, null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(), null));
+        try (var runtime = runtime()) {
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isTrue();
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isTrue();
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isTrue();
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isFalse();
+            when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isTrue();
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isFalse();
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.FAILED)).isTrue();
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isFalse();
+            assertThat(runtime.needsFrequentTerminalSamples(new PipelineIntentScope("cluster", 1, "cache", "orders", 2))).isFalse();
+            for (int second = 0; second <= 3; second++) {
+                fixture.now.set(T.plusSeconds(second));
+                runtime.published(pass, observation("orders", fixture.now.get(), PipelineState.FAILED), null); drained(runtime);
+            }
+            assertThat(rows.values().iterator().next().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+            var disabled = new AlertConfiguration.Rule(rule.header(), rule.name(), rule.typeId(), 1,
+                    rule.resources(), rule.parameters(), rule.severityOverride(), false, rule.metric());
+            when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(disabled), null));
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isFalse();
+        }
+    }
+
+    @Test void aFailedRuleReloadCannotKeepTheStoppedCadenceHint() {
+        var pass = pass("orders");
+        try (var runtime = runtime()) {
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isFalse();
+            when(fixture.store.evaluationRules(any(), anyInt())).thenThrow(StorageRuntime.unavailable());
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isTrue();
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isTrue();
+        }
+    }
+
+    @Test void stoppedLifecycleHousekeepingDoesNotInventSamplesOrStaleQuality() {
+        try (var runtime = runtime()) {
+            runtime.tick(); drained(runtime);
+            var running = pass("orders");
+            runtime.published(running, observation("orders", T, PipelineState.FAILED), null); drained(runtime);
+            assertThat(rows.values().iterator().next().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+            var stopped = new PipelineIntentSnapshot(running.scope(), 2,
+                    new DesiredState("orders", PipelineState.STOPPED, "revision"));
+            intents.put("orders", stopped);
+            var next = mock(PipelineConvergencePass.class);
+            var scope = running.scope(); var claim = running.claim();
+            when(next.scope()).thenReturn(scope); when(next.claim()).thenReturn(claim); when(next.intent()).thenReturn(stopped);
+            fixture.now.set(T.plusSeconds(1));
+            runtime.published(next, observation("orders", fixture.now.get(), PipelineState.STOPPED), null); drained(runtime);
+            var before = rows.values().iterator().next().value().snapshot();
+            assertThat(before.quality()).isEqualTo(AlertSnapshot.Quality.UNKNOWN);
+            for (int second : new int[]{17, 32}) {
+                fixture.now.set(T.plusSeconds(second)); runtime.tick(); drained(runtime);
+                var after = rows.values().iterator().next().value().snapshot();
+                assertThat(after.quality()).isEqualTo(AlertSnapshot.Quality.UNKNOWN);
+                assertThat(after.status()).isEqualTo(AlertSnapshot.Status.FIRING);
+                assertThat(after.episode()).isEqualTo(before.episode());
+                assertThat(after.lastObservedAt()).isEqualTo(before.lastObservedAt());
+                assertThat(after.lastSequence()).isEqualTo(before.lastSequence());
+            }
+        }
+    }
+
+    @Test void aMetricRuleActivatedAfterReuseAdmissionCannotConsumeTheRetainedSample() {
+        var descriptor = new AlarmTypeCatalog.Type("test.gauge", 1, AlarmTypeCatalog.Kind.STATEFUL, Set.of("pipeline"),
+                "pipeline-observations", "threshold", List.of(), AlarmSeverity.MAJOR, true,
+                "test.condition", "test.recovery", "test.guidance");
+        var catalog = new AlarmTypeCatalog(List.of(descriptor));
+        var original = AlertEvaluationHostTest.definition("pipeline.failed");
+        var metric = new MetricAlertEvaluator.Rule("test.quantity", MetricType.GAUGE, "1", Map.of(),
+                MetricAlertEvaluator.Direction.ABOVE, java.math.BigDecimal.TEN, java.math.BigDecimal.ONE);
+        var rule = new AlertConfiguration.Rule(original.header(), "Gauge", "test.gauge", 1,
+                original.resources(), Map.of(), null, true, metric);
+        var host = new AlertEvaluationHost(fixture.store, catalog, AlertChannelPolicy.Deployment.ON_PREM,
+                fixture.clock, "owner-a", () -> { });
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(), null));
+        try (var runtime = new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, host, catalog),
+                intentStore, (scope, claim) -> Optional.of(() -> { }), () -> { }, fixture.clock)) {
+            runtime.tick(); drained(runtime);
+            var pass = pass("orders");
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isFalse();
+            when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isTrue();
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isTrue();
+            var point = MetricPoint.reading(Map.of(), T, 100);
+            var fact = MetricFact.single("test.quantity", MetricType.GAUGE, "1", point);
+            var observation = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(), null, T, List.of(fact));
+            runtime.published(pass, observation, null, false); drained(runtime);
+            assertThat(rows).isEmpty();
+            runtime.published(pass, observation, null, true); drained(runtime);
+            assertThat(rows).hasSize(1);
+            assertThat(rows.values().iterator().next().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+        }
+    }
 
     @Test void cloudAlertPreparationRetriesWithoutRestartingTheAlertRuntime() {
         var properties = new CloudProperties();

@@ -58,6 +58,21 @@ class NativeObservationSamplingTest {
         assertThat(f.sampling.hasPublishedRunning(f.pass, f.result)).isFalse();
     }
 
+    @Test void terminalPublicationRejectsLateRunningCallbacksButAllowsANewEpoch() {
+        var f = new Fixture();f.warm();
+        f.sampling.terminal(new TerminalPublication(SCOPE, 2, 5, CLAIM, Instant.EPOCH));
+        f.sampling.recordPublishedRunning(f.pass, CHECKPOINT);
+        assertThat(f.sampling.hasPublishedRunning(f.pass, f.result)).isFalse();
+        var called = new java.util.concurrent.atomic.AtomicBoolean();
+        assertThat(f.sampling.publishRunning(f.publisher, f.pass, CHECKPOINT, CONFIG, () -> true, () -> {},
+                () -> { called.set(true);return Optional.empty(); })).isEmpty();
+        assertThat(called).isFalse();
+        var newer = new CheckpointDoc(PIPELINE, "RUNNING", 6, Instant.EPOCH);
+        f.sampling.recordPublishedRunning(f.pass, newer);
+        when(f.result.checkpoint()).thenReturn(Optional.of(newer));
+        assertThat(f.sampling.hasPublishedRunning(f.pass, f.result)).isTrue();
+    }
+
     @Test void supersededConfigurationSuppressesBothPublishPaths() {
         var f = new Fixture();
         f.warm();

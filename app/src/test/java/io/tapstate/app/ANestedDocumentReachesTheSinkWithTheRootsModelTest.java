@@ -4,6 +4,7 @@ import io.tapstate.core.model.PipelineNode;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.dsl.DslParser;
@@ -92,6 +93,36 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
         assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
                 .as("the key an upsert matches a re-sent document on")
                 .containsExactly("id");
+    }
+
+    @Test
+    void aMapAfterNestPublishesItsProjectedFieldsTypesAndKeyToTheSyncTarget() {
+        String pipeline = PARSED_PIPELINE.replace("serve:\n  from: order_doc\n", """
+                  - id: project
+                    type: map
+                    from: order_doc
+                    fields: { order_key: $id, name: false, tag: x, amount: "=int(after.amount)" }
+                serve:
+                  from: project
+                """);
+        InMemoryStorePort store = parsedStore(pipeline, List.of(), List.of(
+                new DiscoveredSourceModel(PARENT_SOURCE, "mysql", 0L, new SourceModel(List.of(
+                        new SourceTable(PARENT_TABLE, List.of(
+                                new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("name", "varchar", TapstateType.STRING),
+                                new SourceField("amount", "varchar", TapstateType.STRING)),
+                                List.of("id"), List.of()))))));
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+
+        new StoreBackedDagSource(store, capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable target = bound.get().get(STEP);
+        assertThat(target.name()).isEqualTo(PARENT_TABLE);
+        assertThat(target.fields()).extracting(TargetField::name, TargetField::inferredType, TargetField::primaryKey)
+                .containsExactlyInAnyOrder(tuple("order_key", TapstateType.INT64, true),
+                        tuple("tag", TapstateType.STRING, false), tuple("amount", TapstateType.INT64, false));
+        assertThat(target.fields()).filteredOn(field -> field.name().equals("amount"))
+                .singleElement().satisfies(field -> assertThat(field.type()).isNull());
     }
 
     /**

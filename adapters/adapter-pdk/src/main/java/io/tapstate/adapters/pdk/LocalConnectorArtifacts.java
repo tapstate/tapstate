@@ -47,6 +47,8 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         }
     }
 
+    private static final String CONNECTOR_PARAMETER = "connector";
+
     private static final Comparator<Installed> RELEASE_ORDER = Comparator
             .comparing((Installed value) -> value.metadata().version(), PdkApiLevels::compareArtifactVersions)
             .thenComparing(value -> value.metadata().sha256());
@@ -102,8 +104,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         try {
             Files.createDirectories(directory);
             Path staged = Files.createTempFile(directory, ".connector-", ".jar");
-            boolean complete = false;
-            try {
+            try (var cleanup = new StagingCleanup(staged)) {
                 try (var file = FileChannel.open(staged, StandardOpenOption.WRITE);
                         var output = Channels.newOutputStream(file)) {
                     byte[] buffer = new byte[128 * 1024];
@@ -116,13 +117,11 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
                     }
                     file.force(true);
                 }
-                complete = true;
+                cleanup.keep();
                 return new StagedArtifact(staged);
-            } finally {
-                if (!complete) Files.deleteIfExists(staged);
             }
         } catch (IOException error) {
-            throw loadFailure("upload");
+            throw loadFailure("upload", error);
         }
     }
 
@@ -135,13 +134,34 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             try {
                 return installStaged(file, origin, expectedId, expectedHash);
             } catch (IOException error) {
-                throw loadFailure(expectedId == null ? "upload" : expectedId);
+                throw loadFailure(expectedId == null ? "upload" : expectedId, error);
             }
         }
 
         @Override public void close() {
             discard(file);
         }
+    }
+
+    private static final class StagingCleanup implements AutoCloseable {
+        private final Path file;
+        private boolean kept;
+
+        private StagingCleanup(Path file) {
+            this.file = file;
+        }
+
+        void keep() {
+            kept = true;
+        }
+
+        @Override public void close() throws IOException {
+            if (!kept) deleteStagingFile(file);
+        }
+    }
+
+    private static void deleteStagingFile(Path file) throws IOException {
+        Files.deleteIfExists(file);
     }
 
     private static void discard(Path file) {
@@ -162,7 +182,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             Files.delete(artifact);
             return result;
         } catch (IOException error) {
-            throw artifactUnreadable(artifact);
+            throw artifactUnreadable(artifact, error);
         }
     }
 
@@ -181,7 +201,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             bundled.put(sha256, file);
             return new RegistrationOutcome(selected.registration(), previous == null && newlyRegistered);
         } catch (IOException error) {
-            throw loadFailure(id);
+            throw loadFailure(id, error);
         }
     }
 
@@ -286,11 +306,11 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         if (checkAdmission) {
             List<String> supported = admission.get();
             if (!supported.contains(id)) throw new TapstateException(ConnectorError.NOT_OFFICIAL,
-                    Map.of("connector", id, "official", String.join(", ", supported)), null);
+                    Map.of(CONNECTOR_PARAMETER, id, "official", String.join(", ", supported)), null);
         }
         if (!PdkApiLevels.allows(hostApi, details.pdkApiVersion())) {
             throw new TapstateException(ConnectorError.API_LEVEL_UNKNOWN,
-                    Map.of("connector", id, "version", String.valueOf(details.pdkApiVersion())), null);
+                    Map.of(CONNECTOR_PARAMETER, id, "version", String.valueOf(details.pdkApiVersion())), null);
         }
         try (var jar = new JarFile(file.toFile())) {
             var manifest = jar.getManifest();
@@ -358,17 +378,15 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             }
             Files.createDirectories(directory);
             Path staged = Files.createTempFile(directory, ".legacy-connector-", ".jar");
-            try {
+            try (var cleanup = new StagingCleanup(staged)) {
                 try (var file = FileChannel.open(staged, StandardOpenOption.WRITE)) {
                     if (!legacy.copyTo(hash, Channels.newOutputStream(file))) throw loadFailure(id);
                     file.force(true);
                 }
                 installStaged(staged, Origin.LEGACY_GRIDFS, id, hash);
-            } finally {
-                Files.deleteIfExists(staged);
             }
         } catch (IOException error) {
-            throw loadFailure(id);
+            throw loadFailure(id, error);
         }
     }
 
@@ -439,7 +457,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         try (var input = Files.newInputStream(value.file())) {
             install(input, value.metadata().origin(), id, hash);
         } catch (IOException error) {
-            throw loadFailure(id);
+            throw loadFailure(id, error);
         }
     }
 
@@ -544,15 +562,19 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
     }
 
     private static TapstateException loadFailure(String id) {
-        return new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", id), null);
+        return loadFailure(id, null);
+    }
+
+    private static TapstateException loadFailure(String id, IOException cause) {
+        return new TapstateException(ConnectorError.LOAD_FAILED, Map.of(CONNECTOR_PARAMETER, id), cause);
     }
 
     private static TapstateException localUnavailable(String id, String hash) {
-        return new TapstateException(ConnectorError.LOCAL_ARTIFACT_UNAVAILABLE, Map.of("connector", id, "hash", hash), null);
+        return new TapstateException(ConnectorError.LOCAL_ARTIFACT_UNAVAILABLE, Map.of(CONNECTOR_PARAMETER, id, "hash", hash), null);
     }
 
     private static TapstateException notRegistered(String id) {
-        return new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", id), null);
+        return new TapstateException(ConnectorError.NOT_REGISTERED, Map.of(CONNECTOR_PARAMETER, id), null);
     }
 
     private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(LocalConnectorArtifacts.class);

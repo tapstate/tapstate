@@ -377,6 +377,122 @@ class MongoSourceIdentityIT {
         });
     }
 
+    @Test void sinkStartupReadsTheCurrentBindingWithinOneBudget() {
+        withConfiguration(false, fixture -> {
+            var original = source("views", null, "target");
+            fixture.domain().artifacts().create(original);
+            var expected = fixture.domain().artifacts().sourceBinding("views").orElseThrow();
+            var commands = new java.util.ArrayList<String>();
+            var slowFallback = new AtomicBoolean();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    var name = event.getCommandName();
+                    var value = event.getCommand().get(name);
+                    commands.add(name + ":" + (value != null && value.isString() ? value.asString().getValue() : "-"));
+                    long millis = slowFallback.get() && name.equals("aggregate") ? 4_450 : 640;
+                    java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(millis));
+                }
+            };
+            try (var client = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                var database = client.getDatabase(fixture.database().getName());
+                SourceConfigCipherProvider key = new SourceConfigCipherProvider() {
+                    @Override public SourceConfigCipher current() { return fixture.cipher(); }
+                    @Override public SourceConfigCipher refresh() { return fixture.cipher(); }
+                    @Override public SourceConfigCipher refresh(MongoReadBudget budget) {
+                        assertThat(SystemCollections.CLUSTER_KEYS.on(budget.database(database)).find().first()).isNotNull();
+                        return fixture.cipher();
+                    }
+                };
+                var store = new MongoConfigurationArtifactStore(client, database, key);
+                assertThatThrownBy(() -> store.sourceBinding("views"))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                            assertThat(failure.args()).containsEntry("detail", "MongoOperationTimeoutException");
+                        });
+                System.out.printf("SINK_STARTUP_BASELINE timeout=true commands=%s%n", commands);
+                commands.clear();
+
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    long start = System.nanoTime();
+                    assertThat(store.sourceBindingForSinkStartup("views")).contains(expected);
+                    assertThat(commands).containsExactly("aggregate:cluster_identity", "find:cluster_keys");
+                    System.out.printf("SINK_STARTUP_FAST attempt=%d commands=%d duration_ms=%d%n", attempt + 1,
+                            commands.size(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+                    commands.clear();
+                }
+
+                fixture.domain().artifacts().save(source("views", null, "changed-target"));
+                var changed = fixture.domain().artifacts().sourceBinding("views").orElseThrow();
+                assertThat(changed.identity()).isNotEqualTo(expected.identity());
+                assertThat(changed.contentHash()).isNotEqualTo(expected.contentHash());
+                assertThat(store.sourceBindingForSinkStartup("views")).contains(changed);
+
+                fixture.domain().artifacts().create(source("wide", null, "x".repeat(80 * 1024)));
+                var wide = fixture.domain().artifacts().sourceBinding("wide").orElseThrow();
+                assertThat(fixture.domain().sourceBindingForSinkStartup("wide")).contains(wide);
+
+                commands.clear();
+                slowFallback.set(true);
+                assertThatThrownBy(() -> store.sourceBindingForSinkStartup("wide"))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                            assertThat(failure.args()).containsEntry("detail", "MongoOperationTimeoutException");
+                        });
+                assertThat(commands).startsWith("aggregate:cluster_identity", "find:cluster_identity");
+                assertThat(commands).doesNotContain("find:cluster_keys");
+                System.out.printf("SINK_STARTUP_FALLBACK shared_budget=true commands=%s%n", commands);
+            }
+        });
+    }
+
+    @Test void sinkStartupRetainsIdentityAndSchemaRefusals() {
+        withConfiguration(false, fixture -> {
+            fixture.domain().artifacts().create(source("views", null, "target"));
+            var sources = SystemCollections.SOURCES.on(fixture.database());
+            var filter = new Document("_id", "views");
+            var original = sources.find(filter).first();
+            for (var damage : List.of(new Document("sourceIdentity.bindingRevision", 1),
+                    new Document("sourceIdentity.incarnation", "invalid-incarnation"),
+                    new Document("sourceIdentity.writeFence", -1L), new Document("contentHash", "f".repeat(64)))) {
+                sources.updateOne(filter, new Document("$set", damage));
+                var expected = catchThrowable(() -> fixture.domain().artifacts().sourceBinding("views"));
+                assertThat(expected).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> fixture.domain().artifacts().sourceBindingForSinkStartup("views"))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(((TapstateException) expected).code());
+                            assertThat(failure.args()).isEqualTo(((TapstateException) expected).args());
+                        });
+                sources.replaceOne(filter, original);
+            }
+            SystemCollections.SCHEMA_MIGRATIONS.on(fixture.database()).updateOne(new Document("_id", "config"),
+                    new Document("$set", new Document("sourceIdentity.phase", "PREPARING")));
+            assertThatThrownBy(() -> fixture.domain().artifacts().sourceBindingForSinkStartup("views"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.SOURCE_IDENTITY_UNAVAILABLE));
+        });
+        withConfiguration(true, fixture -> {
+            assertThatThrownBy(() -> fixture.domain().artifacts().sourceBindingForSinkStartup("unknown"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.SOURCE_IDENTITY_UNAVAILABLE));
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"identity", "schema"})
+    void sinkStartupFallsBackWhenMetadataWouldExceedTheJoinedDocumentLimit(String metadata) {
+        withConfiguration(false, fixture -> {
+            fixture.domain().artifacts().create(source("views", null, "x".repeat(32 * 1024)));
+            var table = metadata.equals("identity") ? SystemCollections.CONFIG_CLUSTER_IDENTITY : SystemCollections.SCHEMA_MIGRATIONS;
+            table.on(fixture.database()).updateOne(new Document("_id", metadata.equals("identity") ? "cluster" : "config"),
+                    new Document("$set", new Document("padding", "x".repeat(16_770_000))));
+            var expected = fixture.domain().artifacts().sourceBinding("views");
+            assertThat(expected).isPresent();
+            assertThat(fixture.domain().artifacts().sourceBindingForSinkStartup("views")).isEqualTo(expected);
+        });
+    }
+
     private record Fixture(MongoClient client, MongoDatabase database, MongoConfigurationDomain domain,
             MongoConnectionSettings settings, SourceConfigCipher cipher) {
         MongoConfigurationArtifactStore originalClientStore() { return new MongoConfigurationArtifactStore(client, database, cipher); }

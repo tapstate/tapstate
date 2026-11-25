@@ -29,7 +29,7 @@ class MongoStorageSetupStateStoreTest {
             when(client.startSession()).thenReturn(session);
             when(session.withTransaction(any(), any(TransactionOptions.class)))
                     .thenAnswer(call -> ((TransactionBody<?>) call.getArgument(0)).execute());
-            when(bindings.readForTransaction(session)).thenReturn(
+            when(bindings.readForStorageLifecycle(session)).thenReturn(
                     new MongoStorageBindingStore.TransactionFacts(Optional.empty(), row(1, "CONFIG_PREPARED")));
         }
     }
@@ -41,18 +41,18 @@ class MongoStorageSetupStateStoreTest {
         var preparation = new CachePreparation(SCOPE.operationId(), new CacheAuthScope("cluster", 1, StorageBinding.Mode.CLOUD, "incarnation", 1));
         var loaded = mock(MongoStorageBindingStore.Loaded.class);
         when(loaded.binding()).thenReturn(binding); when(loaded.cachePreparation()).thenReturn(preparation);
-        when(f.bindings.readForTransaction(f.session)).thenReturn(
+        when(f.bindings.readForStorageLifecycle(f.session)).thenReturn(
                 new MongoStorageBindingStore.TransactionFacts(Optional.of(loaded), row(1, "STORAGE_BOUND")));
         var view = f.store.requireCurrentView(SCOPE, StorageSetupStateStore.Purpose.SETUP);
         assertThat(view.status()).isEqualTo(new StorageSetupStateStore.Status(SCOPE, StorageSetupStateStore.Phase.STORAGE_BOUND, 1));
         assertThat(view.binding()).contains(binding); assertThat(view.cachePreparation()).contains(preparation);
-        verify(f.bindings, times(1)).readForTransaction(f.session);
+        verify(f.bindings, times(1)).readForStorageLifecycle(f.session);
         verify(f.bindings, never()).load(); verify(f.bindings, never()).cachePreparation();
     }
 
     @Test void transactionRetryRechecksTheNewGeneration() {
         var f = new Fixture();
-        when(f.bindings.readForTransaction(f.session)).thenReturn(
+        when(f.bindings.readForStorageLifecycle(f.session)).thenReturn(
                 new MongoStorageBindingStore.TransactionFacts(Optional.empty(), row(1, "CONFIG_PREPARED")),
                 new MongoStorageBindingStore.TransactionFacts(Optional.empty(), row(2, "CONFIG_PREPARED")));
         when(f.session.withTransaction(any(), any(TransactionOptions.class))).thenAnswer(call -> {
@@ -62,12 +62,12 @@ class MongoStorageSetupStateStoreTest {
         });
         assertThatThrownBy(() -> f.store.requireCurrentView(SCOPE, StorageSetupStateStore.Purpose.SETUP))
                 .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(StoreError.INITIALIZATION_REFUSED));
-        verify(f.bindings, times(2)).readForTransaction(f.session);
+        verify(f.bindings, times(2)).readForStorageLifecycle(f.session);
     }
 
     @Test void unreadableFactsCannotBecomeAnEmptyBinding() {
         var f = new Fixture();
-        when(f.bindings.readForTransaction(f.session)).thenThrow(
+        when(f.bindings.readForStorageLifecycle(f.session)).thenThrow(
                 new TapstateException(IoError.DOCUMENT_UNREADABLE, java.util.Map.of("id", "cluster", "field", "binding"), null));
         assertThatThrownBy(f.store::loadView).isInstanceOfSatisfying(TapstateException.class,
                 failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));

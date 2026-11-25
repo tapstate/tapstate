@@ -40,6 +40,272 @@ class MongoRequiredNoteStoreIT {
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
+    @Test void pipelineOriginPreparationPreservesForeignOriginCollationAndDamageRefusal() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var scope = f.initialize(pipeline("p1", 1));
+            var originRows = SystemCollections.PDK_NOTE_ORIGINS.on(f.database);
+            var stored = originRows.find().first();
+            var id = stored.get("_id", Document.class);
+            stored.put("_id", new Document(id).append("namespace", id.getString("namespace").toUpperCase(java.util.Locale.ROOT)));
+            String name = originRows.getNamespace().getCollectionName();
+            originRows.drop();
+            f.database.createCollection(name, new com.mongodb.client.model.CreateCollectionOptions().collation(
+                    com.mongodb.client.model.Collation.builder().locale("en").collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            originRows.insertOne(stored);
+            assertThat(f.notes.prepareOrigin(scope, origin("same-connection"))).isEqualTo(origin("same-connection"));
+            SystemCollections.PDK_NOTE_SCOPES.on(f.database).updateOne(new Document("_id", scopeMetadata(f, scope).get("_id")),
+                    new Document("$set", new Document("originGeneration", 0L)));
+            var before = scopeMetadata(f, scope);
+            assertThatThrownBy(() -> f.notes.prepareOrigin(scope, origin("same-connection")))
+                    .satisfies(MongoRequiredNoteStoreIT::unreadable);
+            assertThat(scopeMetadata(f, scope)).isEqualTo(before);
+        });
+    }
+
+    @Test void pipelineOriginPreparationHasABoundedSameSnapshotCommandBudget() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var scope = f.notes.initialize(pipeline("p1", 1));
+            for (int sibling = 0; sibling < 100; sibling++) {
+                f.pipelineGeneration("sibling-" + sibling, 1);
+                f.initialize(pipeline("sibling-" + sibling, 1));
+            }
+            var commands = new ArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) { commands.add(event.getCommandName()); }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var notes = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher());
+                commands.clear();
+                assertThat(notes.prepareOrigin(scope, origin("same-connection"))).isEqualTo(origin("same-connection"));
+                System.out.println("PIPELINE_ORIGIN_FIRST " + commands);
+                assertThat(commands).hasSize(7);
+                commands.clear();
+                assertThat(notes.prepareOrigin(scope, origin("same-connection"))).isEqualTo(origin("same-connection"));
+                System.out.println("PIPELINE_ORIGIN_AGAIN " + commands);
+                assertThat(commands).hasSize(4);
+                assertThat(scopeMetadata(f, scope)).containsEntry("writeFence", 2L).containsEntry("originGeneration", 1L);
+            }
+        });
+    }
+
+    @org.junit.jupiter.api.RepeatedTest(2)
+    void readingTheMysqlReaderIdentityRecoversOneUnsentCheckout() {
+        withNotes(f -> {
+            var scope = f.initialize(chain("reader-identity"));
+            assertThat(f.notes.compareAndSet(scope, "SERVER_NAME", 0, bytes("original-reader"), false)).isTrue();
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var failedCheckouts = new AtomicInteger();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            failedCheckouts.incrementAndGet();
+                            resume.get().run();
+                        }
+                    })).addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) { commands.add(event.getCommandName()); }
+                    });
+            try (var client = MongoClients.create(settings.build())) {
+                var notes = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher());
+                var expected = notes.read(scope, "SERVER_NAME");
+                var pool = notePool(client);
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                commands.clear();
+                poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null});
+                var result = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.RequiredNoteValue>();
+                var failure = org.assertj.core.api.Assertions.catchThrowable(() -> result.set(notes.read(scope, "SERVER_NAME")));
+                assertThat(failedCheckouts).hasValue(1);
+                assertThat(notes.read(scope, "SERVER_NAME")).isEqualTo(expected);
+                assertThat(commands).doesNotContain("insert", "update", "findAndModify", "delete");
+                assertThat(failure).isNull();
+                assertThat(result.get()).isEqualTo(expected);
+            }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "first-checkout,false", "twice,false", "guard,false", "owner,false", "deadline,false", "ordinary-write,false",
+            "twice,true", "guard,true", "owner,true", "deadline,true"})
+    void aReadRecoversOnlyOneCheckoutWithinItsOriginalAuthority(String stage, boolean readValue) {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var scope = f.initialize(stage.equals("owner") ? pipeline("p1", 1) : chain("pool-recovery"));
+            var before = scopeMetadata(f, scope);
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var pause = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var failures = new AtomicInteger();
+            var active = new AtomicBoolean(true);
+            var delayed = new AtomicBoolean();
+            var secondClear = new AtomicBoolean();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            failures.incrementAndGet();resume.get().run();
+                            if (stage.equals("guard")) active.set(false);
+                            if (stage.equals("owner")) f.pipelineGeneration("p1", 2);
+                            if (stage.equals("deadline")) java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(600));
+                        }
+                    })).addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            commands.add(event.getCommandName());
+                        }
+                        @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                            if (!event.getCommandName().equals("find")) return;
+                            if (stage.equals("twice") && failures.get() == 1 && secondClear.compareAndSet(false, true)) pause.get().run();
+                            if (stage.equals("deadline") && delayed.compareAndSet(false, true))
+                                java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(500));
+                        }
+                    });
+            if (stage.equals("deadline")) settings.timeout(1000, TimeUnit.MILLISECONDS);
+            try (var client = MongoClients.create(settings.build())) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var pool = notePool(client);
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                pause.set(() -> poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null}));
+                var notes = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher())
+                        .guardedBy(() -> { if (!active.get()) throw scopeFailure(); });
+                commands.clear();pause.get().run();
+                var opened = new java.util.concurrent.atomic.AtomicReference<RequiredNoteScope>();
+                long began = System.nanoTime();
+                var failure = org.assertj.core.api.Assertions.catchThrowable(() -> {
+                    if (stage.equals("ordinary-write")) notes.compareAndSet(scope, "late", 0, bytes("refused"), false);
+                    else if (readValue) notes.read(scope, "SERVER_NAME");
+                    else opened.set(notes.open(scope.owner()));
+                });
+                assertThat(failures).hasValue(stage.equals("twice") ? 2 : 1);
+                if (stage.equals("first-checkout")) {
+                    assertThat(failure).isNull();
+                    assertThat(opened.get()).isEqualTo(scope);
+                    assertThat(commands).containsExactly("find", "find", "commitTransaction");
+                } else if (stage.equals("guard") || stage.equals("owner")) {
+                    scopeUnavailable(failure);
+                    assertThat(opened.get()).isNull();
+                    if (stage.equals("guard")) assertThat(commands).isEmpty();
+                } else {
+                    assertThat(failure).isInstanceOfSatisfying(TapstateException.class, coded -> {
+                        assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        if (!stage.equals("deadline")) assertThat(coded.args()).containsEntry("detail", "MongoConnectionPoolClearedException");
+                        else assertThat(coded.args().get("detail").toString()).startsWith("MongoOperationTimeoutException");
+                    });
+                    assertThat(opened.get()).isNull();
+                    if (stage.equals("deadline")) assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - began)).isLessThan(1800);
+                }
+                assertThat(scopeMetadata(f, scope)).isEqualTo(before);
+                assertThat(SystemCollections.PDK_NOTES.on(f.database).countDocuments()).isZero();
+            }
+        });
+    }
+
+    @Test void anUnknownReadCommitDoesNotReplayTheRecoveredOpenCallback() {
+        withNotes(f -> {
+            var scope = f.initialize(chain("commit-recovery"));
+            var before = scopeMetadata(f, scope);
+            String app = "note-commit-" + UUID.randomUUID();
+            var resume = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+            var failures = new AtomicInteger();
+            var finds = new AtomicInteger();
+            var commits = new AtomicInteger();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applicationName(app).timeout(750, TimeUnit.MILLISECONDS)
+                    .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(new com.mongodb.event.ConnectionPoolListener() {
+                        @Override public void connectionCheckOutFailed(com.mongodb.event.ConnectionCheckOutFailedEvent event) {
+                            failures.incrementAndGet();resume.get().run();
+                        }
+                    })).addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            if (event.getCommandName().equals("find")) finds.incrementAndGet();
+                            if (event.getCommandName().equals("commitTransaction")) commits.incrementAndGet();
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                var pool = notePool(client);
+                resume.set(() -> poolMethod(pool, "ready", new Class<?>[0], new Object[0]));
+                var notes = new MongoRequiredNoteStore(client, client.getDatabase(f.database.getName()), f.cipher());
+                var data = new Document("failCommands", List.of("commitTransaction")).append("appName", app)
+                        .append("writeConcernError", new Document("code", 64).append("errmsg", "test commit reply lost"))
+                        .append("blockConnection", true).append("blockTimeMS", 100);
+                f.admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", "alwaysOn").append("data", data));
+                try {
+                    poolMethod(pool, "invalidate", new Class<?>[]{Throwable.class}, new Object[]{null});
+                    assertThatThrownBy(() -> notes.open(scope.owner())).isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                } finally {
+                    f.admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+                assertThat(failures).hasValue(1);
+                assertThat(finds).hasValue(2);
+                assertThat(commits.get()).isGreaterThan(1);
+                assertThat(scopeMetadata(f, scope)).isEqualTo(before);
+            }
+        });
+    }
+
+    private static Object notePool(MongoClient client) {
+        try {
+            var delegate = driverField(client, "delegate");
+            var cluster = driverField(delegate, "cluster");
+            var server = ((java.util.concurrent.atomic.AtomicReference<?>) driverField(cluster, "server")).get();
+            return driverField(server, "connectionPool");
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+    }
+    private static Object driverField(Object owner, String field) throws ReflectiveOperationException {
+        var value = owner.getClass().getDeclaredField(field);value.setAccessible(true);return value.get(owner);
+    }
+    private static void poolMethod(Object pool, String method, Class<?>[] types, Object[] args) {
+        try {
+            var call = pool.getClass().getMethod(method, types);call.setAccessible(true);call.invoke(pool, args);
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+    }
+
+    @Test void pipelineAndGlobalNoteScopesShareOneSnapshotWithoutWeakeningOwnerChecks() {
+        withNotes(f -> {
+            f.pipelineGeneration("p1", 1);
+            var primary = f.initialize(pipeline("p1", 1));
+            var shared = f.initialize(global());
+            var commands = new ArrayList<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var store = new MongoRequiredNoteStore(observed, observed.getDatabase(f.database.getName()), f.cipher());
+                commands.clear();
+                assertThat(store.open(primary.owner())).isEqualTo(primary);
+                assertThat(store.open(shared.owner())).isEqualTo(shared);
+                assertThat(commands).containsExactly("find", "find", "find", "commitTransaction",
+                        "find", "find", "commitTransaction");
+                commands.clear();
+                assertThat(store.openPipelineScopes(primary.owner(), shared.owner()))
+                        .isEqualTo(new RequiredNoteStore.PipelineScopes(primary, shared));
+                assertThat(commands).containsExactly("aggregate");
+                commands.clear();
+                assertThat(store.origin(primary)).isEqualTo(origin("same-connection"));
+                assertThat(commands).containsExactly("aggregate");
+                f.pipelineGeneration("p1", 2);
+                assertThatThrownBy(() -> store.origin(primary)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                assertThatThrownBy(() -> store.openPipelineScopes(primary.owner(),shared.owner()))
+                        .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                System.out.println("PIPELINE_NOTE_SCOPES original_commands=7 combined_commands=1 old_generation_rejected=true");
+            }
+        });
+    }
+
     @Test
     void repeatedClearsRetainTheOriginalConnectionBeyondTheBoxedLongCache() {
         withNotes(f -> {
@@ -712,11 +978,15 @@ class MongoRequiredNoteStoreIT {
     }
 
     @Test
-    void missingCarryIndexesRefuseReadOnlyOpenAndDoNotRecreateThem() {
+    void missingCarryIndexesDoNotPreventOrdinaryReads() {
         withNotes(f -> {
-            var shared = f.initialize(chain("c1"));
             SystemCollections.PDK_NOTE_CARRIES.on(f.database).dropIndex("pdk_note_carry_target");
-            assertThatThrownBy(() -> f.notes.carries(shared)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                var shared = f.notes.initialize(chain("c1"));
+                assertThat(f.notes.carries(shared)).isEmpty();
+                assertThat((List<?>) diagnostics.snapshot().get("mongo_groups")).noneSatisfy(group ->
+                        assertThat(((java.util.Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
             assertThat(IndexEnsure.existing(SystemCollections.PDK_NOTE_CARRIES.on(f.database),
                     SystemCollections.PDK_NOTE_CARRIES.indexes().getFirst())).isNull();
         });
@@ -774,6 +1044,46 @@ class MongoRequiredNoteStoreIT {
             assertThat(reopened.origin(scope)).isEqualTo(origin);
             assertThat(origin.toString()).isEqualTo("RequiredNoteOrigin[redacted]");
             assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(f.database).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void sharedStartupBatchesWarmScopesOriginFenceAndBarrierWithoutLosingGenerationChecks() {
+        withNotes(f -> {
+            var shared = f.initialize(chain("warm-start"));
+            var global = f.notes.initialize(global());
+            var expected = origin("same-connection");
+            var commands = new ArrayList<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var notes = new MongoRequiredNoteStore(observed, observed.getDatabase(f.database.getName()), f.cipher());
+                commands.clear();
+                assertThat(notes.openCaptureScopes(shared.owner(), global.owner()))
+                        .isEqualTo(new RequiredNoteStore.CaptureScopes(shared, global));
+                assertThat(commands).containsExactly("aggregate");
+                commands.clear();
+                assertThat(notes.prepareSharedOrigin(shared, expected)).isEqualTo(expected);
+                assertThat(commands).containsExactly("aggregate", "update", "commitTransaction");
+                commands.clear();
+                assertThat(notes.sharedStartup(shared)).isEqualTo(new RequiredNoteStore.SharedStartup(List.of(), false, expected));
+                assertThat(commands).containsExactly("aggregate");
+                assertThatThrownBy(() -> notes.prepareSharedOrigin(shared, origin("other")))
+                        .satisfies(MongoRequiredNoteStoreIT::originMismatch);
+                f.notes.compareAndSet(shared, "key", 0, bytes("payload"), false);
+                f.notes.compareAndSet(shared, "key", 1, null, true);
+                assertThat(notes.sharedStartup(shared).blocked()).isFalse();
+                f.notes.clear(shared, true);
+                assertThatThrownBy(() -> notes.sharedStartup(shared)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                assertThatThrownBy(() -> notes.prepareSharedOrigin(shared, expected)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+                System.out.println("CAPTURE_STARTUP_NOTES open=1 prepare=3 shared=1");
+            }
         });
     }
 
@@ -943,13 +1253,15 @@ class MongoRequiredNoteStoreIT {
     }
 
     @Test
-    void originIndexLossRefusesLoadingAndDoesNotRepairIt() {
+    void missingOriginIndexDoesNotPreventOrdinaryReads() {
         withNotes(f -> {
             f.pipelineGeneration("p1", 1);
-            var scope = f.initialize(pipeline("p1", 1));
             var origins = SystemCollections.PDK_NOTE_ORIGINS.on(f.database);
             origins.dropIndex("pdk_note_origin_scope");
-            assertThatThrownBy(() -> f.notes.origin(scope)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            var scope = f.notes.initialize(pipeline("p1", 1));
+            var original = origin("database-x");
+            assertThat(f.notes.prepareOrigin(scope, original)).isEqualTo(original);
+            assertThat(f.notes.origin(scope)).isEqualTo(original);
             assertThat(IndexEnsure.existing(origins, SystemCollections.PDK_NOTE_ORIGINS.indexes().getFirst())).isNull();
         });
     }

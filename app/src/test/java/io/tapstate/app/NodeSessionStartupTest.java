@@ -39,8 +39,8 @@ class NodeSessionStartupTest {
 
     @Test
     void aLeaseConstructionFailureReleasesTheReservedNodeClaim() {
-        assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), null))
-                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(failLeaseConstruction(Duration.ofDays(106_752), Duration.ofNanos(500_000), null))
+                .isInstanceOf(ArithmeticException.class);
     }
 
     @Test
@@ -52,8 +52,8 @@ class NodeSessionStartupTest {
     @Test
     void cleanupStillReleasesTheNodeClaimAndPreservesTheConstructionFailure() {
         IllegalStateException releaseFailure = new IllegalStateException("owned release failure");
-        assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), releaseFailure))
-                .isInstanceOf(IllegalArgumentException.class).hasSuppressedException(releaseFailure);
+        assertThat(failLeaseConstruction(Duration.ofDays(106_752), Duration.ofNanos(500_000), releaseFailure))
+                .isInstanceOf(ArithmeticException.class).hasSuppressedException(releaseFailure);
     }
 
     private static Throwable failLeaseConstruction(Duration ttl, Duration interval, RuntimeException releaseFailure) {
@@ -77,15 +77,16 @@ class NodeSessionStartupTest {
         return failure;
     }
 
-    @Test
-    void theReservedNodeSessionRenewsWhileTheMemberFactoryIsStillRunning() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(longs = {500_000, 10_000_000})
+    void theReservedNodeSessionRenewsWhileTheMemberFactoryIsStillRunning(long intervalNanos) {
         ClusterProperties cluster = new ClusterProperties();
         cluster.setId("startup-cluster");
         cluster.setNodeId("node-a");
         cluster.setProfile(ClusterProperties.Profile.PROCESS_FAILURE_ONLY);
         cluster.setBootstrapMinMembers(2);
         cluster.setNodeSessionTtl(Duration.ofSeconds(5));
-        cluster.setNodeSessionRenewInterval(Duration.ofMillis(10));
+        cluster.setNodeSessionRenewInterval(Duration.ofNanos(intervalNanos));
         HazelcastProperties properties = new HazelcastProperties();
         properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);
         properties.getDiscovery().getTcpIp().setSeeds(java.util.List.of("10.20.0.11:5701"));
@@ -189,9 +190,12 @@ class NodeSessionStartupTest {
         claims.holdRelease.set(true);
         NodeSessionStartup startup = startup(claims);
         CountDownLatch returned = new CountDownLatch(1);
+        startup.stateChanged(new LifecycleEvent(LifecycleEvent.LifecycleState.SHUTTING_DOWN));
+        assertThat(startup.isCurrent()).isTrue();
+        assertThat(claims.releases).hasValue(0);
         Thread callback = Thread.ofPlatform().daemon().name("owned-node-session-lifecycle-control").unstarted(() -> {
             try {
-                startup.stateChanged(new LifecycleEvent(LifecycleEvent.LifecycleState.SHUTTING_DOWN));
+                startup.stateChanged(new LifecycleEvent(LifecycleEvent.LifecycleState.SHUTDOWN));
             } finally {
                 returned.countDown();
             }
@@ -209,6 +213,20 @@ class NodeSessionStartupTest {
             startup.abort();
         }
         assertThat(claims.releases).hasValue(1);
+    }
+
+    @Test
+    void aFailedMemberStopLeavesTheReservationToExpire() {
+        var claims = new RecordingClaims();
+        var startup = startup(claims);
+        var failure = new IllegalStateException("owned member stop failed");
+        var member = org.mockito.Mockito.mock(HazelcastInstance.class);
+        org.mockito.Mockito.doThrow(failure).when(member).shutdown();
+        startup.handOff(member);
+
+        assertThatThrownBy(startup.lease()::close).isSameAs(failure);
+        assertThat(startup.isCurrent()).isFalse();
+        assertThat(claims.releases).hasValue(0);
     }
 
     private static NodeSessionStartup startup(RecordingClaims claims) {

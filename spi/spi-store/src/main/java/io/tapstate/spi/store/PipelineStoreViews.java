@@ -21,6 +21,10 @@ public interface PipelineStoreViews {
     default KeyedStateStore operatorState(OperatorPlacement placement) { throw unsupported(); }
 
     default KeyedStateStore operatorState(OperatorPlacement placement, WorkloadClaimFence original, Runnable requireActive) { throw unsupported(); }
+    /** Scoped single-node NEST may retain its placement proof for this exact execution. */
+    default KeyedStateStore executionBoundNestState(OperatorPlacement placement, WorkloadClaimFence original, Runnable requireActive) {
+        return operatorState(placement, original, requireActive);
+    }
 
     default RateHistoryStore pipelineRateHistory(PipelineIntentScope scope) { throw unsupported(); }
 

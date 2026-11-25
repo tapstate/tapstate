@@ -68,19 +68,22 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         Objects.requireNonNull(requireActive,"requireActive");requireActive.run();
         if(original.scope()==null || config.node()==null || !config.node().pipelineId().equals(original.pipelineId()))throw unavailable();
         var fixed=notes.guardedBy(requireActive);var scope=original.scope();
-        var primary=fixed.open(binding == null
-                ? RequiredNoteOwner.forNode(scope.bindingVersion(),config.node(),purpose,scope.stateGeneration())
-                : binding.notes().owner());
-        var global=fixed.open(new RequiredNoteOwner(scope.bindingVersion(),"pdk.global-state",RequiredNoteOwner.Kind.GLOBAL,scope.clusterId(),0));
+        var opened = fixed.openPipelineScopes(
+                binding == null ? RequiredNoteOwner.forNode(scope.bindingVersion(), config.node(), purpose, scope.stateGeneration()) : binding.notes().owner(),
+                new RequiredNoteOwner(scope.bindingVersion(), "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, scope.clusterId(), 0));
+        var primary = opened.primary();
+        var global = opened.global();
         var pinned = recoveryPinned ? fixed.origin(primary) : fixed.originIfPresent(primary).orElse(null);
         if (binding != null && (pinned == null || !binding.sha256().equals(pinned.artifactHash()))) throw unavailable();
         if (pinned != null && !pinned.equals(
                 ConnectorNoteOrigin.capture(config.connectorId(), pinned.artifactHash(), config.settings()))) throw unavailable();
-        var ref = pinned == null ? provisioner.resolve(config.connectorId()) : provisioner.resolveRetained(fixed, primary, pinned);
+        var ref = pinned == null ? provisioner.resolveStartup(config.connectorId()) : provisioner.resolveRetained(fixed, primary, pinned);
         requireActive.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),ref.contentHash(),config.settings());
         if (pinned == null) provisioner.retain(ref);
-        if(!expected.equals(fixed.prepareOrigin(primary,expected)))throw unavailable();
+        // The prepared binding already committed this exact origin and generation. Recheck any other path in storage.
+        boolean preparedBinding = binding != null && binding.notes().equals(primary) && expected.equals(pinned);
+        if (!preparedBinding && !expected.equals(fixed.prepareOrigin(primary, expected))) throw unavailable();
         if (pinned == null) provisioner.markBound(fixed, primary, expected);
         requireActive.run();return new ConfiguredSinkRun(original,config.node(),purpose,new Note(primary),new Note(global),ref.contentHash());
     }
@@ -96,7 +99,7 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
                 primary.token(), global.token(), active);
         ConnectorProvisioner exact=id -> {
             active.run();if(!config.connectorId().equals(id))throw unavailable();
-            var ref=provisioner.resolve(id,artifactHash);active.run();return ref;
+            var ref=provisioner.resolveStartup(id,artifactHash);active.run();return ref;
         };
         var claim=new WorkloadClaimFence(new WorkloadClaimKey(original.scope().clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,original.pipelineId()),
                 new WorkloadOwner(original.ownerNodeId(),original.ownerBootId()),original.claimGeneration(),original.executionGeneration(),original.topologyRevision());

@@ -59,10 +59,9 @@ class PipelineStopConvergenceTest {
         var claims = new InMemoryWorkloadClaimStore();
         var owner = new WorkloadOwner("node", "boot");
         for (String id : ids) actual.create(id, StateJson.of(PipelineState.RUNNING), clock.instant());
-        when(intents.dispatchSnapshot()).thenAnswer(call -> {
-            List<String> valid = listed.get();
-            return Optional.of(new PipelineIntentStore.DispatchSnapshot(valid, Set.copyOf(valid)));
-        });
+        when(intents.scanCandidates()).thenAnswer(call -> listed.get().stream()
+                .map(id -> new PipelineIntentStore.ScanCandidate(id, 0,
+                        new PipelineIntentScope("cluster", 1, "cache", id, 1), 1, PipelineState.STOPPED)).toList());
         when(intents.loadForActuation(anyString())).thenAnswer(call -> {
             String id = call.getArgument(0);
             if (blockedAt == Hold.INTENT_READ && held.contains(id)) hold(ioMonitors, id, entered, release);
@@ -122,8 +121,40 @@ class PipelineStopConvergenceTest {
                 driver.reconcile();
                 return stopped(scopedState, ids) && (blockedAt != Hold.PURGE_CLOSE || cleared.size() == 100);
             });
+            // A durable STOPPED state can precede the tail of its worker. Let all submitted
+            // operations return before the fixture closes the executor.
+            await().atMost(Duration.ofSeconds(7)).until(() -> ids.stream().noneMatch(work::stopping));
             assertThat(calls).hasSize(100).allSatisfy((id, count) -> assertThat(count).hasValue(1));
             verify(actuator, times(blockedAt == Hold.PURGE_CLOSE ? 100 : 0)).clearStopped(anyString());
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    void anOldStopHintCannotCancelANewerRunIntent() {
+        var intents = mock(PipelineIntentStore.class);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "pipeline", 1);
+        when(intents.scanCandidates()).thenReturn(List.of(
+                new PipelineIntentStore.ScanCandidate("pipeline", 0, scope, 1, PipelineState.STOPPED)));
+        var reads = new AtomicInteger();
+        when(intents.loadForActuation("pipeline")).thenAnswer(call -> {
+            reads.incrementAndGet();
+            return Optional.of(new PipelineIntentSnapshot(scope, 2,
+                    new DesiredState("pipeline", PipelineState.RUNNING, "new-definition")));
+        });
+        var states = mock(PipelineStoreViews.class);
+        var ownership = mock(PipelineActuationOwnership.class);
+        var actuator = mock(LifecycleActuator.class);
+        var scoped = new ConvergenceDriver.ScopedPorts(intents, states, () -> {},
+                ignored -> actuator, ignored -> RebuildAdmission.never(), ignored -> {});
+        var converger = new PipelineConverger(mock(DesiredStore.class), mock(StateStore.class),
+                actuator, Clock.systemUTC(), RebuildAdmission.never());
+        try (var work = new PipelineConvergences()) {
+            var driver = ConvergenceDriver.scoped(converger, mock(ObservationPublisher.class), null,
+                    MetricsExport.none(), () -> true, ownership, scoped, null, work);
+            driver.reconcile();
+            await().atMost(Duration.ofSeconds(3)).until(() -> reads.get() == 1 && !work.stopping("pipeline"));
+            verify(ownership, never()).permit(any(PipelineIntentScope.class));
+            verifyNoInteractions(states, actuator);
         }
     }
 

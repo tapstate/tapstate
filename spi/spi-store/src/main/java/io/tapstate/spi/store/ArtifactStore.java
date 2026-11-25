@@ -54,6 +54,11 @@ public interface ArtifactStore {
         return new ReadableInventory(listReadable(), Optional.empty());
     }
 
+    /** One background start's authored Pipeline, dependencies and managed binding in the same snapshot. */
+    default Optional<ReadableInventory> runtimeStartInventory(String pipelineId) {
+        return Optional.empty();
+    }
+
     /** A complete draft dependency slice, including the original target if it exists. */
     default Optional<ReadableInventory> draftPublicationInventory(io.tapstate.core.model.PipelineResource candidate) {
         return Optional.empty();
@@ -224,6 +229,11 @@ public interface ArtifactStore {
         Objects.requireNonNull(id, "id");
         throw new io.tapstate.core.common.TapstateException(IoError.SOURCE_IDENTITY_UNAVAILABLE,
                 Map.of("id", id), null);
+    }
+
+    /** Captures the current target Source for sink startup, retaining the ordinary read contract. */
+    default Optional<SourceBindingSnapshot> sourceBindingForSinkStartup(String id) {
+        return sourceBinding(id);
     }
 
     /** Verified deployment-owned target identity; absent only for a store without a storage binding. */
