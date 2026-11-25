@@ -6,13 +6,16 @@ import io.tapstate.testsupport.DockerGate;
 
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -80,7 +83,7 @@ class RestartResumesTheTailIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
-    void aRestartCarriesOnFromTheRecordedPositionInsteadOfReadingTheTableAgain(Tiers tier) throws Exception {
+    void aRestartCarriesOnFromTheRecordedPositionInsteadOfReadingTheTableAgain(Tiers tier, @TempDir Path plugins) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> source = SharedMySql.settings("restart_tail_src_" + suffix);
         seed(source);
@@ -92,7 +95,7 @@ class RestartResumesTheTailIT {
 
         long droveBefore;
         try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle server = tier.launch(storage)) {
+            try (ServerHandle server = launchRetainingConnectors(tier, storage, plugins)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
@@ -121,7 +124,7 @@ class RestartResumesTheTailIT {
             // by a run that comes back and reads on from where the last one stopped.
             update(source, 2, DURING_DOWNTIME);
 
-            try (ServerHandle server = tier.launch(storage)) {
+            try (ServerHandle server = launchRetainingConnectors(tier, storage, plugins)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 // The admin and every storage domain belong to the installation that outlived the server.
                 storage.loginAndAwaitBusiness(control);
@@ -150,6 +153,16 @@ class RestartResumesTheTailIT {
                         .isZero();
             }
         }
+    }
+
+    private static ServerHandle launchRetainingConnectors(Tiers tier, PreparedNativeStore storage, Path plugins) {
+        return switch (tier) {
+            case IN_PROCESS -> InProcessServer.startPrepared(storage,
+                    List.of("--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + plugins));
+            case REAL_PROCESS -> RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", plugins,
+                    port -> List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                            "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+        };
     }
 
     @ParameterizedTest
