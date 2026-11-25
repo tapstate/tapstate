@@ -21,8 +21,7 @@ class CliDiagnosticContractTest {
             assertThat(code.severity()).isEqualTo(code == CliError.START_CHECKS_NOT_RUN || code == CliError.VERSION_MISMATCH
                     ? Severity.WARNING : Severity.ERROR);
             assertThat(code.code()).matches("TS033(?!0000)[0-9]{4}");
-            boolean migrated = !Set.of(
-                    CliError.REQUEST_FAILED, CliError.CONNECTION_LOST, CliError.STREAM_NO_FRAMES,
+            boolean migrated = !Set.of(CliError.REQUEST_FAILED, CliError.CONNECTION_LOST, CliError.STREAM_NO_FRAMES,
                     CliError.WORKBENCH_NEEDS_A_TERMINAL, CliError.WORKBENCH_UNAVAILABLE).contains(code);
             if (migrated) assertThat(catalog.render(code.code(), params).message()).isEqualTo(catalog.render(legacy, params).message());
             if (catalog.render(legacy, params).solution() != null)
